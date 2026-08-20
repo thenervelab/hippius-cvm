@@ -1,0 +1,38 @@
+# Exclude build artefacts + scratch dirs from the Docker build
+# context. The `agent-builder` stage `COPY . /src` would otherwise
+# transfer the entire workspace including caches.
+target/
+**/target/
+.git/
+vali/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+node_modules/
+
+# Packer / UKI scratch. These dirs hold each build's output (incl. the
+# root-owned, mode-0600 rootfs.verity veritysetup writes); leaving them
+# in the context makes the SECOND (reproducibility) build's context
+# transfer fail with "error from sender: open … permission denied".
+# The reproducibility check builds into isolated `*-run-a` / `*-run-b`
+# siblings, so those must be excluded too (the rootfs-staging tree in
+# build-run-* carries root-owned, unreadable dirs like /etc/credstore).
+packer/kbs-uki/uki/output/
+packer/kbs-uki/uki/output-run-*/
+packer/kbs-uki/uki/fetched/
+packer/kbs-uki/uki/fetched-run-*/
+packer/kbs-uki/uki/build/
+packer/kbs-uki/uki/build-run-*/
+packer/kbs-uki/packer_cache/
+packer/tenant-uki/uki/output/
+packer/tenant-uki/uki/output-run-*/
+packer/tenant-uki/uki/fetched/
+packer/tenant-uki/uki/fetched-run-*/
+packer/tenant-uki/uki/build/
+packer/tenant-uki/uki/build-run-*/
+packer/tenant-uki-debian/uki/output/
+packer/tenant-uki-debian/uki/output-run-*/
+packer/tenant-uki-debian/uki/fetched/
+packer/tenant-uki-debian/uki/fetched-run-*/
+packer/tenant-uki-debian/uki/build/
+packer/tenant-uki-debian/uki/build-run-*/

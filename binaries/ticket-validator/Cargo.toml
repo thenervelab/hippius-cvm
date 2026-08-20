@@ -1,0 +1,73 @@
+[package]
+name = "hippius-ticket-validator"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "vali Django shell-out: three subcommands. `verify-ticket` parses COSE_Sign1 OrderTicket bytes (§6) — vali never verifies the L1 signature (KBS does, kbs-core). `verify-stopped-ack` verifies a SignedStoppedAck (§24/§25) against the guest lifecycle Ed25519 pubkey via `hippius_guest::verify_stopped_ack`. `read-miner-status` reads §23 pallet-compute-scoring state from a thebrain Substrate node over JSON-RPC for the PR-G4 scheduler. All modes emit structured JSON; all fail closed."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-ticket-validator"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable TLS in the registry reader so `read-miner-status` can reach an
+# HTTPS RPC endpoint. vali's image is built `--features tls` because its
+# RPC (the public Cloudflare-fronted testnet) is HTTPS and vali has the
+# `world:443` egress for it. OFF by default: a deploy pointing at a
+# plain-HTTP internal node stays rustls-free.
+tls = ["hippius-onchain-registry/tls"]
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+# `hippius-guest::verify_stopped_ack` is the byte-exact verifier for
+# §24/§25 guest-signed end-of-life ack envelopes — vali shells out
+# here so the canonical-CBOR + Ed25519 semantics stay identical
+# between the Rust + Python sides.
+hippius-guest = { path = "../../hippius-guest" }
+# PR-G4 `read-miner-status` reads §23 `pallet-compute-scoring` state
+# through the shared registry reader — the SAME crate the Edge
+# gateway's permissionless miner-auth poller uses, so the Substrate
+# storage-key derivation + SCALE decode + the blocking JSON-RPC client
+# have ONE definition and cannot drift between the two consumers. The
+# crate is HTTP-only (no rustls) so this binary stays rustls-free.
+hippius-onchain-registry = { path = "../../hippius-onchain-registry" }
+ciborium = "0.2"
+coset = "0.3"
+# `verify-live-attestation` digests the signed body so vali can dedupe
+# a replayed attestation on the exact same axis the KBS chains on
+# (`prev_attestation_hash` = SHA-256 of the previous body).
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+# §7 `gen-lifecycle-key`: OS-entropy CSPRNG for the per-VM Ed25519
+# lifecycle seed. Same crate + version `order-ticket-mint` already uses
+# for its ticket nonce (the workspace lock resolves `rand_core 0.6`).
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# PR-G5 `idempotency-record` / `idempotency-recall`: thin CLI
+# wrappers over `kbs_core::persist::FileIdempotencyStore` (PR #45) so
+# the durable §14 retry-dedup file format stays single-sourced in
+# kbs-core rather than reimplemented for the vali orchestrator.
+kbs-core = { path = "../../kbs-core" }
+# PR §E2 `encode-order` `launch` payload — decode the base64-encoded
+# `cose_ticket` field vali emits on the JSON wire into raw bytes for
+# the canonical-CBOR `Value::Bytes` entry the miner-agent re-decodes
+# into `LaunchOrder.cose_ticket: ByteBuf`. STANDARD alphabet (matches
+# the producer side `base64.b64encode` in `order_dispatch.py`).
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+# PR §E2 test only: decode the ticket bytes the encoder emits as a
+# CBOR byte-string back into a `ByteBuf` for an exact-eq assertion.
+# Mirrors the miner-agent's production `LaunchOrder.cose_ticket: ByteBuf`
+# decode path.
+serde_bytes = "0.11"

@@ -1,0 +1,143 @@
+---
+# Configures the private-segment LACP bond and assigns the host its static
+# private IP. Uses netplan on Ubuntu 24.04. The bond is created from
+# the two MACs declared in host_vars; the existing public NIC stays
+# untouched.
+#
+# Idempotency: netplan generates the same systemd-networkd config on
+# every run when the YAML inputs are identical. `netplan try` validates
+# before applying.
+
+- name: Configure private network LACP bond + static private IP
+  hosts: cc_nodes
+  gather_facts: true
+  become: true
+  vars:
+    netplan_file: "/etc/netplan/60-hippius-privnet.yaml"
+  tasks:
+    - name: Identify the interface holding the default route (must not be enslaved)
+      ansible.builtin.shell:
+        cmd: ip -o -4 route show to default | awk '{print $5; exit}'
+      register: default_route_iface
+      changed_when: false
+
+    # Resolve interface names by PERMANENT MAC (ethtool -P), not the
+    # current operational MAC. Once a NIC is enslaved into a Linux bond,
+    # its current address is rewritten to the bond's address, which
+    # breaks any matching based on ansible_facts.<iface>.macaddress.
+    - name: Enumerate (iface, permanent_mac) tuples
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for iface in $(ls /sys/class/net | grep -v -E '^(lo|wt|bond|docker|cni|veth|flannel|kube|cilium)'); do
+            perm=$(ethtool -P "$iface" 2>/dev/null | awk '{print tolower($NF)}')
+            [ -n "$perm" ] && printf '%s %s\n' "$iface" "$perm"
+          done
+        executable: /bin/bash
+      register: iface_perm_mac_table
+      changed_when: false
+
+    - name: Build expected MACs list (lowercase) and resolve matching ifaces
+      ansible.builtin.set_fact:
+        expected_perm_macs: "{{ privnet_bond_macs | map('lower') | list }}"
+        privnet_bond_interfaces: >-
+          {{
+            iface_perm_mac_table.stdout_lines
+            | map('split', ' ')
+            | selectattr(1, 'in', privnet_bond_macs | map('lower') | list)
+            | map(attribute=0)
+            | sort
+            | unique
+            | list
+          }}
+
+    - name: Assert exactly N bond members were resolved
+      ansible.builtin.assert:
+        that:
+          - privnet_bond_interfaces | length == (privnet_bond_macs | length)
+        fail_msg: |
+          Could not resolve exactly {{ privnet_bond_macs | length }} bond-member MACs.
+          Requested MACs : {{ privnet_bond_macs }}
+          Resolved ifaces: {{ privnet_bond_interfaces }}
+
+    - name: Refuse to enslave the default-route interface (would drop management access)
+      ansible.builtin.assert:
+        that:
+          - default_route_iface.stdout | trim not in privnet_bond_interfaces
+        fail_msg: |
+          One of the resolved bond members is the default-route interface
+          ({{ default_route_iface.stdout | trim }}). Enslaving it would drop
+          management access. Double-check privnet_bond_macs in host_vars.
+          Resolved members: {{ privnet_bond_interfaces }}
+
+    - name: Render netplan private network config
+      ansible.builtin.copy:
+        dest: "{{ netplan_file }}"
+        owner: root
+        group: root
+        mode: "0600"   # netplan requires 0600 since Ubuntu 24.04
+        content: |
+          # Managed by Ansible (deploy/ansible/playbooks/03-private-network.yml).
+          # Do not edit by hand — changes will be overwritten on next run.
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+          {% for iface in privnet_bond_interfaces | sort %}
+              {{ iface }}:
+                dhcp4: false
+                dhcp6: false
+                optional: true
+          {% endfor %}
+            bonds:
+              {{ privnet_bond_name }}:
+                interfaces:
+          {% for iface in privnet_bond_interfaces | sort %}
+                  - {{ iface }}
+          {% endfor %}
+                addresses:
+                  - {{ privnet_static_cidr }}
+                parameters:
+                  mode: {{ privnet_bond_mode }}
+                  lacp-rate: {{ privnet_bond_lacp_rate }}
+                  transmit-hash-policy: {{ privnet_bond_xmit_hash_policy }}
+                  mii-monitor-interval: 100
+      register: netplan_config
+
+    - name: Validate netplan config (netplan generate)
+      ansible.builtin.command:
+        cmd: netplan generate
+      when: netplan_config.changed
+      changed_when: false
+
+    # Connectivity-loss safety for this play does NOT rely on `netplan try`
+    # rollback — that command needs an interactive confirmation and a
+    # naive non-interactive auto-accept defeats the whole point of the
+    # rollback. We instead rely on two earlier guards which are stricter:
+    #   1. The default-route NIC enslavement assert above. Without an
+    #      enslaved default route NIC, the public SSH path stays up
+    #      independently of what the bond does.
+    #   2. The "wait for bond UP with the static IP" task below, which
+    #      fails the playbook loudly if the bond doesn't come up — at
+    #      which point the operator can revert from the backup netplan
+    #      file (the prior file on disk) and re-run.
+    #
+    # When a multi-master k8s deployment becomes the topology, the
+    # follow-up runbook (deploy/runbooks/04-add-general-worker.md) will
+    # cover a proper netplan-try-with-connectivity-probe sequence; for a
+    # single master with a separate public NIC, netplan apply is fine.
+    - name: Apply netplan config
+      ansible.builtin.command:
+        cmd: netplan apply
+      when: netplan_config.changed
+      changed_when: netplan_config.changed
+
+    - name: Wait for bond interface to be UP with the static IP
+      ansible.builtin.shell:
+        cmd: |
+          ip -br addr show {{ privnet_bond_name }} | grep -q "{{ privnet_static_cidr }}"
+      register: bond_check
+      retries: 12
+      delay: 5
+      until: bond_check.rc == 0
+      changed_when: false

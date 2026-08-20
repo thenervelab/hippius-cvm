@@ -1,0 +1,104 @@
+---
+# Installs k3s server with the locked flag set (Cilium-ready, no flannel,
+# no traefik, no servicelb, no local-storage), labels the node, and
+# fetches the kubeconfig back to the operator workstation.
+#
+# Pinned to versions.k3s in group_vars/all.yml. Idempotent: a second
+# run only re-applies the labels (k3s install script itself is a no-op
+# when the version + args are unchanged).
+
+- name: k3s server install
+  hosts: cc_nodes
+  gather_facts: true
+  become: true
+  tasks:
+    # TODO(PR-K-followup): install-flag drift detection. We currently
+    # only re-run the installer when the binary's version differs from
+    # `versions.k3s`. If `k3s_install_args` change (e.g. swap CNI, enable
+    # an addon) on an already-installed node, the diff is silently
+    # ignored. Health path should be: compare desired ExecStart against
+    # the running systemd unit and force a re-install if they drift.
+    - name: Check whether k3s is already installed at the target version
+      ansible.builtin.command:
+        cmd: /usr/local/bin/k3s --version
+      register: k3s_version_check
+      changed_when: false
+      failed_when: false
+
+    - name: Compute k3s install args string
+      ansible.builtin.set_fact:
+        k3s_exec_args: >-
+          {{ k3s_install_args | join(' ') }}
+          --node-name={{ inventory_hostname }}
+          {% for label in cc_node_labels %}--node-label={{ label }} {% endfor %}
+
+    - name: Show planned k3s exec args
+      ansible.builtin.debug:
+        msg: "INSTALL_K3S_EXEC={{ k3s_exec_args }}"
+
+    - name: Fetch k3s install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/src/k3s-install.sh
+        mode: "0755"
+      when: >
+        k3s_version_check.rc != 0
+        or versions.k3s not in (k3s_version_check.stdout | default(''))
+
+    - name: Run k3s install script (pinned version)
+      ansible.builtin.command:
+        cmd: /usr/local/src/k3s-install.sh
+      environment:
+        INSTALL_K3S_VERSION: "{{ versions.k3s }}"
+        INSTALL_K3S_EXEC: "{{ k3s_exec_args }}"
+      register: k3s_install
+      changed_when: >
+        k3s_version_check.rc != 0
+        or versions.k3s not in (k3s_version_check.stdout | default(''))
+      when: >
+        k3s_version_check.rc != 0
+        or versions.k3s not in (k3s_version_check.stdout | default(''))
+
+    - name: Ensure k3s service is enabled + started
+      ansible.builtin.systemd:
+        name: k3s
+        enabled: true
+        state: started
+
+    - name: Wait for k3s API to respond
+      ansible.builtin.shell:
+        cmd: kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get --raw '/readyz'
+      register: k3s_ready
+      retries: 30
+      delay: 5
+      until: k3s_ready.rc == 0 and 'ok' in (k3s_ready.stdout | lower)
+      changed_when: false
+
+    - name: Apply node labels (idempotent)
+      ansible.builtin.shell:
+        cmd: |
+          kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml \
+            label node {{ inventory_hostname }} {{ label }} --overwrite
+      loop: "{{ cc_node_labels }}"
+      loop_control:
+        loop_var: label
+      changed_when: false   # always reports unchanged; k3s tracks the label state
+
+    - name: Slurp kubeconfig
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_slurp
+
+    - name: Write kubeconfig to operator workstation (server URL rewritten)
+      ansible.builtin.copy:
+        content: >-
+          {{
+            kubeconfig_slurp.content
+            | b64decode
+            | replace('server: https://127.0.0.1:6443',
+                      'server: https://' + ansible_host + ':6443')
+          }}
+        dest: "{{ operator_secret_dir }}/kubeconfig-{{ inventory_hostname }}.yaml"
+        mode: "0600"
+      become: false
+      delegate_to: localhost

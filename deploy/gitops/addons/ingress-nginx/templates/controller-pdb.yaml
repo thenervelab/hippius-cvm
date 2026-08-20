@@ -1,0 +1,30 @@
+---
+# PodDisruptionBudget for the ingress-nginx controller — PR-K3, §K (#54).
+#
+# The ingress-nginx chart only renders a controller PDB when
+# `controller.replicaCount > 1`; on the single-node MVP the controller
+# is one replica, so the chart skips it and the locked "no replicas: 1
+# without a PodDisruptionBudget" rule (#1) requires an explicit one.
+#
+# `maxUnavailable: 1` consciously ALLOWS the singleton to be evicted —
+# correct for a single-node cluster (a `minAvailable` budget would
+# wedge `kubectl drain`). The selector matches the controller pods,
+# `instance` included — `{{ .Release.Name }}` resolves to whatever
+# release name Argo CD rendered this wrapper with.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingress-nginx-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ingress-nginx-controller-pdb
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: ingress
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/instance: {{ .Release.Name }}

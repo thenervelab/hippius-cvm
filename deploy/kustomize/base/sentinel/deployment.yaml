@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hippius-sentinel
+  labels:
+    app.kubernetes.io/name: hippius-sentinel
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/part-of: hippius-compute
+spec:
+  # Single replica. The sentinel is stateless but its outputs in
+  # PR-S5 (`gh issue create`, Slack webhook, signed-head publish) are
+  # not yet idempotent across instances — running multiple replicas
+  # would risk duplicate incidents. Re-evaluate when PR-S5 lands.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hippius-sentinel
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hippius-sentinel
+        app.kubernetes.io/component: observability
+        app.kubernetes.io/part-of: hippius-compute
+    spec:
+      serviceAccountName: hippius-sentinel
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sentinel
+          image: hippius-sentinel
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: healthz
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Anthropic API key. Required — `load_config()` refuses to
+            # boot without it (see `sentinel/agent.py`). Provisioned out
+            # of band (sealed secret or external-secrets, never in git).
+            - name: SENTINEL_ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-anthropic-api-key
+                  key: api-key
+            - name: SENTINEL_LOG_LEVEL
+              value: INFO
+            - name: SENTINEL_HEALTHZ_PORT
+              value: "8080"
+            - name: SENTINEL_LOOP_INTERVAL_S
+              value: "60"
+            # PR-S2: KBS audit-log + anchor publisher. The audit-log
+            # path must be a read-only mount of the KBS pod's audit
+            # volume (typically via a shared PVC). The Vault transit +
+            # S3 settings come from the cluster's external-secrets
+            # operator — see #57 PR-S2 for the secret provisioning.
+            - name: KBS_AUDIT_LOG_PATH
+              value: /var/lib/kbs/audit
+            - name: SENTINEL_ANCHOR_INTERVAL_S
+              value: "300"
+            - name: SENTINEL_ANCHOR_RETENTION_DAYS
+              value: "7"
+            - name: SENTINEL_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-vault
+                  key: addr
+            - name: SENTINEL_VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-vault
+                  key: token
+            - name: SENTINEL_VAULT_TRANSIT_MOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-vault
+                  key: transit-mount
+                  optional: true
+            - name: SENTINEL_ANCHOR_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-s3
+                  key: bucket
+            - name: SENTINEL_S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-s3
+                  key: endpoint-url
+                  optional: true
+            - name: SENTINEL_S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-s3
+                  key: region
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-s3
+                  key: secret-access-key
+            - name: SENTINEL_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # PR-S3 — vali Postgres read replica DSN. The DSN MUST
+            # point at a role with no INSERT/UPDATE/DELETE grants
+            # (replica role); the connection layer also sets
+            # `default_transaction_read_only=on` as belt-and-suspenders.
+            - name: VALI_DATABASE_READONLY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-vali-postgres
+                  key: dsn
+            # PR-S3 — thebrain JSON-RPC endpoint (HTTPS). Block-number
+            # width override is provided when the chain runtime declares
+            # `BlockNumber = u64` (FRAME stable2407 default is u32).
+            - name: THEBRAIN_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-thebrain
+                  key: rpc-url
+            - name: THEBRAIN_BLOCK_NUMBER_BITS
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-thebrain
+                  key: block-number-bits
+                  optional: true
+            # PR-S3 — NetBird read-only PAT. The token MUST be scoped
+            # read-only at provisioning time (the §S invariant);
+            # nothing here verifies that on the sentinel side.
+            - name: NETBIRD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-netbird
+                  key: api-token
+            - name: NETBIRD_API_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-netbird
+                  key: api-base
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            # Some stdlib paths (importlib cache, asyncio temp) want a
+            # writable tmpdir even though sentinel itself writes
+            # nothing on disk.
+            - name: tmp
+              mountPath: /tmp
+            # PR-S2: read-only mount of the KBS audit-log directory.
+            # The KBS pod owns the PVC; the sentinel only reads. The
+            # underlying access mode must support cross-pod read (RWX),
+            # so the PVC behind `kbs-audit-log` is provisioned on
+            # ceph-filesystem (see `kbs-server` manifests).
+            - name: kbs-audit-log
+              mountPath: /var/lib/kbs/audit
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: kbs-audit-log
+          persistentVolumeClaim:
+            claimName: kbs-audit-log
+            readOnly: true

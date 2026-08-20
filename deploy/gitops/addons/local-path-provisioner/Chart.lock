@@ -1,0 +1,6 @@
+dependencies:
+- name: local-path-provisioner
+  repository: file://charts/local-path-provisioner
+  version: 0.0.36
+digest: sha256:1ba9832033999db24ecb54c623e162511ede37872f7b949977ac766cc784a70a
+generated: "2026-05-22T00:25:41.75456+04:00"

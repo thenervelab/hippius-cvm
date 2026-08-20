@@ -1,0 +1,73 @@
+---
+# Argo CD Application — Hippius Edge gateway. PR-K8, §K (#54).
+#
+# Sync wave 11: after every addon (cilium / metallb / cert-manager /
+# ingress-nginx / external-secrets / kata — waves 1-5) and after the
+# KBS app (PR-K6). The Edge depends on the external-secrets addon (its
+# mTLS ExternalSecret) and on Cilium (its CiliumNetworkPolicy); it
+# does not depend on the KBS, but is sequenced after it.
+#
+# The Edge is the opaque relay, NOT a confidential workload — runc
+# pods on a general-workloads node, no Kata (#1 locked topology).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-edge-gateway
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-edge-gateway
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: edge-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # The external-secrets CRD defaults several optional spec fields on
+  # admission (remoteRef conversion/decoding/metadata/nullByte
+  # policies, target.deletionPolicy, target.template engineVersion +
+  # mergePolicy). The chart writes the minimal form, so without this
+  # Argo CD would report both ExternalSecrets perpetually OutOfSync
+  # against their own admission defaults.
+  ignoreDifferences:
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
+        - .spec.data[].remoteRef.nullBytePolicy
+        - .spec.target.deletionPolicy
+        - .spec.target.template.engineVersion
+        - .spec.target.template.mergePolicy
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/apps/edge-gateway
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: edge-gateway
+  syncPolicy:
+    # Argo CD creates the `edge-gateway` namespace (CreateNamespace=true)
+    # carrying this label, so the namespace-restricted `hippius-vault`
+    # ClusterSecretStore (PR-K11 — `namespaceSelector` on
+    # `hippius.network/vault-secrets`) admits this app's ExternalSecrets.
+    managedNamespaceMetadata:
+      labels:
+        hippius.network/vault-secrets: enabled
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

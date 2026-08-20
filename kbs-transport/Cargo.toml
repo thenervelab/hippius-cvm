@@ -1,0 +1,38 @@
+[package]
+name = "kbs-transport"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hippius Confidential Compute — Tier-0 KBS HTTP transport (axum) wiring the kbs-core release flow (spec: ARCHITECTURE.md §7/§17/§21)."
+
+[lints]
+workspace = true
+
+[dependencies]
+kbs-core = { path = "../kbs-core" }
+hippius-types = { path = "../hippius-types" }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.5", default-features = false, features = ["limit", "set-header"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+serde_bytes = "0.11"
+ciborium = "0.2"
+thiserror = "2"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+ciborium = "0.2"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+tempfile = "3"
+coset = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

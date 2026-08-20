@@ -1,0 +1,39 @@
+# `hippius-release.service` — initrd unit (dracut module 90hippius-luks)
+# that runs the Hippius §21 attestation + KBS release BEFORE
+# systemd-cryptsetup unlocks the root volume, staging the released KEK
+# as the /run keyfile the initrd crypttab references.
+#
+# Ordering: systemd ships `cryptsetup-pre.target` precisely for units
+# that must finish before any systemd-cryptsetup@*.service (each
+# generated unit is After=cryptsetup-pre.target). We pull the passive
+# target into the transaction (Wants=) and order Before= it.
+#
+# Fail-closed: FailureAction=poweroff-force — a failed release (header
+# tamper, KBS denial, attestation failure) powers the guest off rather
+# than dropping to an initrd emergency shell on a miner-visible serial
+# console. The miner learns only "the guest refused".
+
+[Unit]
+Description=Hippius KBS release — attest and stage the LUKS KEK keyfile
+DefaultDependencies=no
+Wants=cryptsetup-pre.target
+Before=cryptsetup-pre.target cryptsetup.target
+# The LUKS device must exist (udev-settled) before the header gate
+# reads it. /dev/vdd (Phase 2B) is deliberately NOT a dependency —
+# the core gracefully degrades when it is absent.
+Requires=dev-vda.device
+After=dev-vda.device systemd-udev-trigger.service systemd-modules-load.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/hippius-release-runner
+StandardOutput=kmsg+console
+StandardError=kmsg+console
+TimeoutStartSec=300
+FailureAction=poweroff-force
+
+[Install]
+WantedBy=initrd.target

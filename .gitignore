@@ -1,0 +1,71 @@
+/target
+**/*.rs.bk
+.antigravitycli/
+.DS_Store
+
+# Python (sentinel + vali)
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/
+
+# Transient lock file emitted by FileAuditSink when the fixture example
+# is regenerated. The fixture (audit.log + head.sha256) is committed;
+# audit.lock is not.
+sentinel/tests/fixtures/**/audit.lock
+
+# CycloneDX SBOMs emitted by `cargo cyclonedx` (PR-F6). Build artifacts
+# — the canonical, cosign-signed copies are produced by `sbom.yml` CI.
+**/*.cdx.json
+
+# Helm dependency tarballs fetched by `helm dependency build` (PR-K3
+# addon wrapper charts). Build artifacts — Argo CD's repo-server
+# regenerates them from each addon's committed `Chart.yaml` +
+# `Chart.lock` at render time.
+deploy/gitops/addons/*/charts/
+
+# Exception (PR-K4): local-path-provisioner has no official upstream Helm
+# repo, so its chart is vendored in-tree and content-pinned via Git — it
+# is source, not a build artifact. See its PROVENANCE.md. The `.tgz`
+# `helm dependency build` repackages it into stays ignored (build
+# artifact, like every other addon's).
+!deploy/gitops/addons/local-path-provisioner/charts/
+deploy/gitops/addons/local-path-provisioner/charts/*.tgz
+
+# Never commit: it describes the estate the publishability gate hides.
+.publish-denylist
+
+# Agent-tool runtime state. These paths are excluded on THIS clone via
+# `.git/info/exclude`, which is local and is not committed — so a fresh
+# clone, and therefore a published copy, has no such protection. A
+# contributor running an agent tool there would find `.claude/worktrees/`
+# (a full second checkout of this repo, 36 GB on the machine this was
+# written on) staged by a routine `git add -A`.
+#
+# Ignoring it in the committed file makes the protection travel with the
+# repository instead of living on one laptop.
+.claude/worktrees/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/routines/.state/
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock
+.claude/assistant-daemon-state.json
+.claude/first-run
+
+# Operational captures. Serial-console dumps, API timelines and check
+# transcripts get written into the repo root while debugging a live fleet,
+# and they carry node ids, VM ids and boot detail. On 2026-08-15 four of
+# them (4042 lines) were committed and pushed by a routine `git add -A` in
+# an unrelated PR; the branch had to be deleted rather than force-pushed.
+#
+# Root only, and `!` the one fixture that is deliberately committed — a
+# blanket `*.log` would silently drop the sentinel's known-good audit log
+# and the test that verifies its hash chain would start passing against
+# nothing.
+/*.log
+!sentinel/tests/fixtures/audit_known_good/audit.log

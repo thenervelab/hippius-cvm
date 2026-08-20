@@ -1,0 +1,41 @@
+[package]
+name = "hippius-guest-release"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Slim CLI that runs the §21 release exchange (X25519 keygen → /dev/sev-guest SNP report → POST /v1/kbs/release → verify_and_unwrap_release) and writes the unwrapped LUKS KEK to stdout. Designed to be invoked from a tenant cloud-image initramfs `keyscript=` field (see `scripts/initramfs/hippius-luks-keyscript`). The §257 production-ready BYO base-OS path replaces the legacy custom Rust agent-initramfs switch_root with `cryptsetup-initramfs` + this binary baked into the tenant distro's own initramfs."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-guest-release"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse every release-side primitive that already shipped in
+# `agent-initramfs`. The lib surface (`pub use stages::...`) exposes
+# the exact bytes-on-the-wire types so the BYO-OS keyscript path and
+# the legacy managed-rootfs path agree on the §6/§7/§19/§20 binding
+# gate.
+# `default-features = false` drops the `cryptsetup` feature (the C
+# libcryptsetup linkage): this CLI never opens a LUKS device itself —
+# the distro's cryptsetup does — so it can be linked as a fully
+# STATIC x86_64-unknown-linux-musl binary that runs in ANY distro
+# initramfs (Debian-family initramfs-tools or RHEL-family dracut)
+# regardless of the guest's glibc version.
+hippius-agent-initramfs = { path = "../agent-initramfs", default-features = false }
+hippius-guest = { path = "../../hippius-guest" }
+hippius-types = { path = "../../hippius-types" }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+zeroize = "1.8"
+# `kbs-core::volume_stamp` confirm mode encodes/decodes the tiny
+# `/v1/kbs/volume-stamp/confirm` CBOR bodies directly (mirroring
+# `kbs-transport::wire` field-for-field) rather than depending on
+# `kbs-transport`, which pulls in `axum`/`tokio` — deps this
+# musl-static binary must never link. Already a transitive dep of
+# `hippius-agent-initramfs`'s `kbs_client` stage; declared directly
+# here so this crate can use it too.
+ciborium = "0.2"

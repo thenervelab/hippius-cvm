@@ -1,0 +1,35 @@
+---
+# Grafana dashboard ConfigMap — embeds the panoramic "stack overview"
+# dashboard JSON. PR-K14, §K (#54), issue #128.
+#
+# The Grafana sidecar (../values.yaml `sidecar.dashboards.enabled`)
+# watches every namespace for ConfigMaps carrying the label
+# `grafana_dashboard: "1"` and imports any embedded JSON dashboard.
+# This is the dashboards-as-code path: the raw JSON lives at
+# `../dashboards/stack-overview.json` (editable as a real .json file
+# in IDE / `jq` / Grafana export round-trip) and Helm embeds it into
+# this ConfigMap at render time.
+#
+# Future per-component dashboards (PR-K14a..PR-K14e) drop their own
+# JSON either under this same `dashboards/` directory or under their
+# own component's `templates/` — Argo CD owns them via Git, the
+# sidecar imports them, operators do not edit dashboards live.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hippius-dashboard-stack-overview
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: stack-overview
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: dashboard
+    # Sidecar import gate — must match ../values.yaml
+    # `grafana.sidecar.dashboards.{label,labelValue}`.
+    grafana_dashboard: "1"
+  annotations:
+    # Folder the sidecar drops this dashboard into.
+    grafana_folder: hippius
+data:
+  stack-overview.json: |
+{{ .Files.Get "dashboards/stack-overview.json" | indent 4 }}

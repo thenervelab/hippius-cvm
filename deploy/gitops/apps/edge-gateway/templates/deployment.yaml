@@ -1,0 +1,256 @@
+---
+# Edge gateway — the HA pair. PR-K8, §K (#54).
+#
+# `replicaCount: 2` runc pods. HA is provided at the Kubernetes layer
+# (ReplicaSet + Service load-balancing + PodDisruptionBudget + soft
+# anti-affinity), NOT by the binary's `EDGE_PEER_ENDPOINT` peer link —
+# that peer link is the bare-metal-2-VM design and wiring it in k8s
+# needs per-pod peer identity (a StatefulSet + resolution step), which
+# is new logic out of PR-K8's scope. `EDGE_PEER_ENDPOINT` is therefore
+# left unset: each pod runs the binary's documented single-instance
+# mode. See README.md "HA model".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-gateway
+  namespace: edge-gateway
+  labels:
+    {{- include "edge-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "edge-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "edge-gateway.labels" . | nindent 8 }}
+    spec:
+      # Shutdown grace (PR-H8). A miner connection that is mid-relay
+      # when the pod is told to stop must finish so its §15 audit
+      # record is written — its forward to the inner plane can run up
+      # to the forward client's 30 s timeout. The binary drains
+      # in-flight connections within its own 40 s `SHUTDOWN_GRACE`
+      # (per-connection `GRACEFUL_DRAIN_TIMEOUT` is 35 s); this k8s
+      # grace is set above that so the kubelet does not SIGKILL the
+      # pod mid-drain. The default would be 30 s — too short.
+      terminationGracePeriodSeconds: 45
+      # Non-confidential opaque relay — any general-workloads node,
+      # NOT pinned to a SEV-SNP node and NOT a Kata RuntimeClass.
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The Edge never calls the Kubernetes API — no token to mount.
+      automountServiceAccountToken: false
+      # The image is in the private ghcr.io/thenervelab registry; this
+      # dockerconfigjson Secret is materialised from Vault by
+      # external-secret-regcred.yaml.
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # The audit emptyDir is chowned to this gid so the non-root
+        # process can write the hash-chained log.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Soft anti-affinity: spreads the two replicas across nodes once
+      # the cluster has more than one. On the single-node MVP both
+      # still schedule (2/2 Running, not 1/2 + Pending).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "edge-gateway.selectorLabels" . | nindent 20 }}
+      containers:
+        - name: edge-gateway
+          # Content-addressed — digest, never a floating tag.
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            # Hash-chained telemetry audit log (§15, mandatory — the
+            # binary is boot-fatal without it). emptyDir-backed.
+            - name: EDGE_AUDIT_DIR
+              value: /var/lib/hippius-edge/audit
+            # mTLS material — CA + Edge cert + key, materialised from
+            # Vault by the ExternalSecret. All three are required at
+            # boot (the binary fails closed otherwise).
+            - name: EDGE_MTLS_CA_PATH
+              value: /etc/hippius-edge/mtls/ca.pem
+            - name: EDGE_MTLS_CERT_PATH
+              value: /etc/hippius-edge/mtls/cert.pem
+            - name: EDGE_MTLS_KEY_PATH
+              value: /etc/hippius-edge/mtls/key.pem
+            # NOT set: EDGE_MTLS_CRL_PATH (no CRL distribution yet —
+            # PR-K13), EDGE_PEER_ENDPOINT (HA peer link off — see the
+            # header comment), EDGE_GATEWAY_CONFIG (baked defaults).
+            {{- if eq .Values.minerAuth.mode "onchain" }}
+            # Permissionless on-chain miner auth (docs/design/
+            # permissionless-miner-auth.md). The Edge admits a miner's
+            # SELF-SIGNED identity cert iff its node_id is registered +
+            # Active on `pallet-compute-scoring` (§23). The Edge pod's
+            # egress is locked (no chain RPC reach), so it polls the
+            # registered+Active set from vali — which has world:443
+            # egress and reads the chain — over plain in-cluster HTTP.
+            # The EDGE_MTLS_CA_PATH above still pins the Edge's OWN
+            # server cert (server auth unchanged; only client auth flips).
+            - name: EDGE_MINER_AUTH
+              value: "onchain"
+            - name: EDGE_REGISTRY_FEED_URL
+              value: {{ .Values.minerAuth.registryFeedUrl | quote }}
+            {{- with .Values.minerAuth.refreshSecs }}
+            - name: EDGE_REGISTRY_REFRESH_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.minerAuth.registryFeedPubkey }}
+            # Pinned Ed25519 pubkey the vali registry feed is signed with
+            # (audit M-registry-mTLS). Set ⇒ every poll's signature is
+            # verified fail-closed; a tampered/unsigned feed flips the
+            # store unhealthy → no new miner handshakes.
+            - name: EDGE_REGISTRY_FEED_PUBKEY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.orderSigning.enabled }}
+            # §H phase-2 order-signing seed (32-byte raw Ed25519 as
+            # 64 hex chars), materialised from Vault by the
+            # `edge-gateway-order-signing` ExternalSecret. Loaded once
+            # at boot by `OrderSigner::load` and held for the process
+            # lifetime; the `POST /v1/edge/order` route + the Edge →
+            # miner forwarder consume it in a follow-up PR.
+            - name: EDGE_ORDER_SIGNING_KEY_PATH
+              value: /etc/hippius-edge/order-signing/priv.hex
+            {{- if .Values.orderSigning.expectedPubkey }}
+            # Optional pin (Helm value `orderSigning.expectedPubkey`):
+            # the loader derives the pubkey from the seed and fails
+            # closed on mismatch. Same 64-hex value as Ansible's
+            # `edge_order_signing_pubkey` in group_vars/miner_nodes.yml
+            # — drift between the two sides is a misconfig the boot
+            # must catch before the first signed order goes out.
+            - name: EDGE_ORDER_SIGNING_EXPECTED_PUBKEY
+              value: {{ .Values.orderSigning.expectedPubkey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.valiIngestToken.enabled }}
+            # §23 served-receipt ingest bearer token. vali pins
+            # ServiceTokenAuthentication on the JSON telemetry-ingest path
+            # (served receipts); the raw-CBOR heartbeat path is token-exempt.
+            # `post_json` stamps this as `Authorization: Bearer <token>`.
+            # Materialised from Vault by the `edge-gateway-vali-ingest-token`
+            # ExternalSecret — never in Git, never a file.
+            - name: HIPPIUS_EDGE_VALI_INGEST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: edge-gateway-vali-ingest-token
+                  key: token
+            {{- end }}
+          ports:
+            # Miner-facing mTLS relay listener (PR-H7). The :443
+            # LoadBalancer Service maps to this container port.
+            - name: edge-relay
+              containerPort: 8443
+              protocol: TCP
+            # The read-only telemetry API. The HA peer link (9443) +
+            # Prometheus /metrics (9464) bind only when
+            # EDGE_PEER_ENDPOINT is set (HA peer link off — see header).
+            - name: edge-api
+              containerPort: 9465
+              protocol: TCP
+            # §24/§25 guest stopped-ack relay listener. TLS 1.3,
+            # server-cert-only (the Edge's OWN cert, NO client cert). The
+            # confidential guest's signed ack — relayed by its miner
+            # host's vsock-proxy reqwest client (which presents no client
+            # cert, so it cannot use the mTLS :8443 relay) — lands in
+            # vali's /v1/lifecycle/stopped ingress through this hop. The
+            # :443-style LoadBalancer maps an external port to this
+            # container port; the miner dials the Edge LB IP directly (the
+            # cert carries that IP as its SAN), so no public DNS / public
+            # cert is needed. Unconditional — the §25 split-brain fence
+            # depends on it.
+            - name: edge-lifecycle
+              containerPort: 8446
+              protocol: TCP
+            {{- if .Values.orderSigning.enabled }}
+            # §H phase-2 inner-plane order-dispatch listener (vali →
+            # Edge sign → miner forward). Plain HTTP, cluster-internal
+            # ONLY — reached via the dedicated `edge-gateway-inner`
+            # ClusterIP Service (service-inner.yaml), gated to the
+            # vali pod selector by the CiliumNetworkPolicy (the L3
+            # access control — vali has no client cert vs the Edge
+            # CA). The binary only binds this listener when the
+            # order-signing subsystem loaded successfully, so this
+            # containerPort is gated on the same Helm value.
+            - name: edge-order
+              containerPort: 8444
+              protocol: TCP
+            {{- end }}
+          # Liveness — cheap: `/v1/edge/pubkey` is a constant 200 while
+          # the API server is up.
+          livenessProbe:
+            httpGet:
+              path: /v1/edge/pubkey
+              port: edge-api
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness — `/v1/edge/audit/verify` chain-verifies the
+          # audit log; a tampered log returns 500 and pulls the pod
+          # out of the Service. Note (PR-H7): with the `:443` relay now
+          # behind this Service, pod readiness also gates the relay
+          # LoadBalancer — a deliberate §15 fail-closed coupling: an
+          # Edge that cannot verify its own audit chain must not serve
+          # miner traffic. A relay-specific readiness signal can be
+          # revisited when PR-H8 lands the envelope relay.
+          readinessProbe:
+            httpGet:
+              path: /v1/edge/audit/verify
+              port: edge-api
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- .Values.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # The binary writes only to $EDGE_AUDIT_DIR (an emptyDir).
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: audit
+              mountPath: /var/lib/hippius-edge/audit
+            - name: mtls
+              mountPath: /etc/hippius-edge/mtls
+              readOnly: true
+            {{- if .Values.orderSigning.enabled }}
+            - name: order-signing
+              mountPath: /etc/hippius-edge/order-signing
+              readOnly: true
+            {{- end }}
+      volumes:
+        # Per-pod, per-process-lifetime: the Edge mints a fresh signing
+        # key every boot, so the audit chain is not meant to outlive
+        # the pod — an emptyDir is correct, not a PVC.
+        - name: audit
+          emptyDir: {}
+        # CA + cert + key, owned by the ExternalSecret (external-secret.yaml).
+        # 0440 — readable by the process (gid 65532, via fsGroup), not
+        # world-readable: the private key must not be 0644 inside the pod.
+        - name: mtls
+          secret:
+            secretName: edge-gateway-mtls
+            defaultMode: 0440
+        {{- if .Values.orderSigning.enabled }}
+        # Order-signing seed, owned by external-secret-order-signing.yaml.
+        # Same 0440 mode as mTLS — the priv-hex MUST NOT be world-readable
+        # inside the pod.
+        - name: order-signing
+          secret:
+            secretName: edge-gateway-order-signing
+            defaultMode: 0440
+        {{- end }}

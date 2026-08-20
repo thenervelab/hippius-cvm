@@ -1,0 +1,38 @@
+# Secret / sensitive files that must never be committed.
+*-secret.yml
+*-secret.yaml
+vault.yml
+vault.yaml
+*.vault
+*.pem
+*.key
+*.crt
+kubeconfig*
+.netbird-*
+
+# Secret directories (any nesting level)
+vault/
+keys/
+**/vault/
+**/keys/
+
+# Operator-local overrides
+local.yml
+local.yaml
+
+# ── Infrastructure identity — never commit ──────────────────────────
+# A real inventory and its host_vars describe YOUR machines: hostnames,
+# public IPs, NIC MACs, mesh addresses, disk layout. They are not
+# secrets, but they are not publishable either. Copy the tracked
+# `*.example.yml` templates instead:
+#
+#   cp inventory.example.yml inventory.yml
+#   cp host_vars/miner.example.yml host_vars/<your-hostname>.yml
+#
+# (Same shape as `deploy/terraform/terraform.tfvars.example`.)
+inventory.yml
+inventory.yaml
+host_vars/*.yml
+host_vars/*.yaml
+!host_vars/*.example.yml
+!host_vars/*.example.yaml

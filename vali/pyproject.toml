@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vali"
+version = "0.0.1"
+description = "Hippius DePIN — validator-cluster Django orchestration service (greenfield, NOT hippius-backend). Drives OrderTicket intake, Packer triggers, scheduler, lifecycle (§24/§25). PR-G1 ships only the OrderTicket intake endpoint."
+requires-python = ">=3.11"
+dependencies = [
+    "Django>=5.0,<5.3",
+    "djangorestframework>=3.15,<4",
+    # OpenAPI 3 schema + Swagger-UI / ReDoc for the validator API (/v1/docs).
+    "drf-spectacular>=0.27,<0.29",
+    "psycopg[binary]>=3.2,<4",
+    "dj-database-url>=2.2,<3",
+    # WhiteNoise serves the Django admin's static assets (CSS/JS)
+    # straight from gunicorn (#152). The prod pod runs
+    # `readOnlyRootFilesystem: true` with no nginx sidecar, so an
+    # external static server is not an option.
+    "whitenoise>=6,<7",
+    # #334 Phase 2 — vali spawns k8s Jobs for per-tenant qcow2 bakes
+    # via the `apps.tenant_bake` POST endpoint. The official Python
+    # kubernetes client speaks the same in-cluster ServiceAccount /
+    # mounted-token auth pattern as `kubectl`. We pin a conservative
+    # range — the 30.x series tracks k8s API 1.30, comfortably within
+    # the RKE2 v1.34.3 fleet's skew tolerance (n-3).
+    "kubernetes>=30,<33",
+    # §25 migration — vali presigns the snapshot PUT + dest restore GET
+    # against the MinIO-compatible Hippius object store via the boto3
+    # S3 client (apps.storage.s3.BotoHippiusS3Client). boto3 ships
+    # botocore transitively; both are needed for SigV4 + path-style
+    # presigning. Without it the boto factory raises S3ClientUnavailable
+    # at the first snapshot presign and the migration stalls.
+    "boto3>=1.34,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-django>=4.9,<5",
+    "ruff>=0.6,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vali*", "apps*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "vali.settings_test"
+python_files = ["tests.py", "test_*.py", "*_tests.py"]
+filterwarnings = [
+    "error::DeprecationWarning:vali.*",
+    "error::DeprecationWarning:apps.*",
+    # WhiteNoise emits this `UserWarning` when STATIC_ROOT does not
+    # exist (e.g. local dev / CI before `collectstatic` runs). It is
+    # informational, not actionable from the test suite — silenced to
+    # keep real warnings from being buried in pytest output.
+    "ignore:No directory at:UserWarning:django.core.handlers.base",
+]
+# Reuse the test DB between runs for speed; tests build the schema on
+# first run via `--create-db` / fresh `pytest --create-db` after
+# migrations change.
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Generated Django migrations are not hand-maintained — don't lint them.
+extend-exclude = ["**/migrations/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "DJ"]
+ignore = [
+    # `assert` is the standard pytest idiom.
+    "S101",
+]

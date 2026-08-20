@@ -1,0 +1,79 @@
+---
+# Broker network policy — default-deny + explicit. #102 PR C.
+#
+# A CiliumNetworkPolicy (Cilium is the CNI). Selecting the broker pod
+# makes it default-deny for ingress AND egress; only the rules below
+# are permitted.
+#
+# Security model: the access control on the redeem path is the SNP
+# self-attestation (AMD chain + REPORT_DATA binding + KBS-measurement
+# allowlist + TCB/policy) — NOT this NetworkPolicy. The policy is
+# defence-in-depth: it scopes who can even open a TCP connection, and
+# — more importantly here — it bounds where the MINTED TOKEN can
+# travel: the response goes only to the KBS pod, and the broker's own
+# egress can reach only Vault (+ DNS / guest-pull).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: kbs-vault-broker
+  namespace: kbs
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "broker.selectorLabels" . | nindent 6 }}
+  ingress:
+    # kubelet startup / liveness / readiness probes (host → pod).
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    # The KBS — the broker's ONLY client. Same-namespace pod selector.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kbs
+            k8s:app.kubernetes.io/name: kbs-server
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+  egress:
+    # Public DNS — `dnsPolicy: None` points the pod at public
+    # resolvers (a kata SEV-SNP guest cannot reach the CoreDNS
+    # ClusterIP, PR-K5). Used by guest-pull for `ghcr.io`.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # HTTPS to the public internet — the kata-qemu-snp GUEST-PULL of
+    # the PUBLIC broker image from ghcr.io + GitHub's blob CDN at
+    # pod-create time. The binary itself makes no outbound 443.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    {{- if .Values.vault.egressCidr }}
+    # Vault — the broker's entire job: write the per-VM ACL policy +
+    # create the scoped child token.
+    #
+    # OPERATOR-SET: `vault.egressCidr` must cover the address behind
+    # `vault.address`. Empty ⇒ no explicit rule, which is correct ONLY
+    # when Vault is already reachable through the `world:443` rule
+    # above.
+    - toCIDR:
+        - {{ .Values.vault.egressCidr }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.vault.egressPort | quote }}
+              protocol: TCP
+    {{- end }}

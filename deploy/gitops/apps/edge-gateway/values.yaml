@@ -1,0 +1,185 @@
+# Values for the `edge-gateway` chart. PR-K8, §K (#54).
+
+image:
+  repository: ghcr.io/thenervelab/hippius-edge-gateway
+  # SHA-256 digest — NOT a tag (§F supply-chain discipline: the
+  # deployed image is content-addressed). Produced by the
+  # `edge-image.yml` workflow; see README.md "Image".
+  #
+  # Bumped to the main build at 50962e5 (#648 §23 served-receipt auth):
+  # the served-receipt JSON forward to vali now stamps `Authorization:
+  # Bearer <token>` from HIPPIUS_EDGE_VALI_INGEST_TOKEN (the
+  # edge-gateway-vali-ingest-token ExternalSecret below), so a relayed
+  # tenant-VM served-receipt is no longer 401'd by vali's
+  # ServiceTokenAuthentication. Inherits #560 (§25 stopped-ack relay) +
+  # #639 (served-receipt JSON-wrap forward).
+  #
+  # PIN CORRECTED 2026-07-28 — was sha256:5bb92136… (`sha-0c44985d6da4`,
+  # 2026-07-06), 3 weeks behind an out-of-band deploy. Reverting it would
+  # drop #852 (the read-only per-VM domain-state endpoint), plus #789
+  # (guest-boot progress relay) and the host-attestor channels #811/#814.
+  #
+  # The failure mode is SILENT, which is what makes it dangerous: without
+  # #852 the relay 404s, and `effects.poll_domain_running` folds every
+  # non-200 into `None` — the documented fail-safe boundary on which the
+  # caller takes NO recovery action. So reboot-recovery (ENABLED in
+  # production) neither errors nor alerts; it goes quietly inert, and tenants
+  # simply never come back after a host reboot. Keep this pin honest: it is
+  # the contract, not a comment.
+  # Re-pinned 2026-08-13 to what the cluster has ACTUALLY been running
+  # since 2026-08-10: the b2493cd pin above was 27 commits behind, and the
+  # live Deployment was carrying the mutable TAG `sha-7f93d33815bb`, which
+  # resolves to this digest. Arming ArgoCD against the old pin would have
+  # REVERTED production by 27 commits. The tag is the deeper defect — #927
+  # removed tag-pinning from the charts, but an out-of-band `set image`
+  # put one back on the running object.
+  digest: "sha256:9e0905fb1b90493d11c6d8a9439eac0ca3db8099e97c6d1661861606454c6bb7"
+  # ── Build provenance of the digest above (P3) ───────────────────────
+  # MACHINE-CHECKED, not a comment: `.github/scripts/verify_image_
+  # provenance.py` runs `cosign verify` with these exact values as
+  # `--certificate-identity` / `--certificate-github-workflow-sha`
+  # constraints, so a declaration that does not match the digest's
+  # Sigstore signature fails CI, and a digest bump without a matching
+  # declaration fails CI. The offline half runs in the required `rust`
+  # job (scripts/dev/image-provenance-test.sh). Purely declarative — no
+  # template reads `image.provenance`, so it cannot change what renders.
+  #
+  # This one was worth establishing rather than assuming. The digest was
+  # re-pinned by #975 from the LIVE pod's resolved `imageID`, i.e. from
+  # the cluster, NOT from a CI run — so "which source built it" was an
+  # inference off the mutable `sha-7f93d33815bb` tag the running
+  # Deployment carried. The signature confirms the inference: a
+  # `refs/heads/main` push build at 7f93d338 ("credit uptime only for
+  # time an SNP-attested LIVE guest proved", #904). The tag and the
+  # digest agree — the difference is that the agreement is now checked.
+  provenance:
+    # Fulcio SAN on the signature — workflow AND the git ref it ran on.
+    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/edge-image.yml@refs/heads/main"
+    # `githubWorkflowSha` on the signing cert — the exact source commit.
+    commitSha: "7f93d33815bb49657d90b650ea38ccb9d36d6b7b"
+    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/31368039521/attempts/1"
+    # false ⇒ built from a ref other than refs/heads/main, i.e. from a
+    # tree that is NOT in this repo's history.
+    mergedSource: true
+  # The image is in the PRIVATE ghcr.io/thenervelab registry. The
+  # kubelet pulls it with the `ghcr-pull-secret` dockerconfigjson
+  # Secret, materialised from Vault by external-secret-regcred.yaml.
+  pullSecret:
+    name: ghcr-pull-secret
+    # KV-v2 path holding a read-only GHCR PAT — properties `username`
+    # + `pull-token`. Operator-provisioned; see README.md.
+    vaultPath: hippius-compute/ghcr
+    refreshInterval: 1h
+
+# ── Miner-facing LoadBalancer — OPERATOR-SET ────────────────────────
+service:
+  # The address MetalLB pins to the Edge Service. It must fall inside
+  # the MetalLB pool (`deploy/gitops/addons/metallb/values.yaml::
+  # lbPool.addresses`) and must NOT collide with the ingress-nginx
+  # controller's address out of that same pool.
+  #
+  # This address is load-bearing beyond routing: it is the SAN the
+  # Edge's own server certificate carries, because miners reach the
+  # :8446 stopped-ack relay by IP over the NetBird mesh rather than by
+  # public DNS. Change it and you must re-issue that certificate and
+  # update `deploy/ansible/group_vars/miner_nodes.yml::
+  # miner_vali_lifecycle_url` in lockstep.
+  #
+  # ⚠️  The default is RFC 5737 TEST-NET-1 and routes nowhere.
+  loadBalancerIP: "192.0.2.10"
+  # Source range allowed to reach the LoadBalancer. Defence in depth
+  # only — see templates/service.yaml on why MetalLB L2 may not enforce
+  # it. The default is the RFC 6598 CGNAT range NetBird allocates from.
+  sourceRanges:
+    - "100.64.0.0/10"
+
+# Two replicas — the HA pair. On the single-node MVP both land on the
+# one node (soft anti-affinity, see deployment.yaml); a
+# PodDisruptionBudget keeps at least one up across a drain.
+replicaCount: 2
+
+# The Edge is lightweight — a current-thread Tokio runtime hosting a
+# few small listeners. Generous head-room, modest request.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+mtls:
+  # KV-v2 path under the `hippius-vault` ClusterSecretStore that the
+  # ExternalSecret reads the Edge CA + cert + key from. The values are
+  # operator-provisioned into Vault — never in Git. See README.md.
+  vaultPath: hippius-compute/edge-gateway/mtls
+  refreshInterval: 1h
+
+# §H phase-2: the Edge order-signing key (priv-seed → ExternalSecret →
+# `/etc/hippius-edge/order-signing/priv.hex` → `EDGE_ORDER_SIGNING_
+# KEY_PATH`). The matching pubkey is Ansible-rendered into every
+# miner's `/etc/hippius-miner/config.toml`. See README.md
+# "Order signing".
+# Permissionless on-chain miner auth (docs/design/permissionless-miner-
+# auth.md). `mode: ca` (chart default) keeps the legacy operator-CA
+# mTLS client verifier; `mode: onchain` flips the Edge to admit a
+# miner's SELF-SIGNED identity cert iff its node_id is registered +
+# Active on `pallet-compute-scoring` (§23). The Edge polls that set from
+# the vali feed (its egress is locked off the chain RPC); vali reads the
+# chain. THIS cluster is flipped to `onchain` once miner-1 + miner-3 are
+# registered on-chain and running the self-signing agent.
+minerAuth:
+  mode: onchain
+  # vali's in-cluster registry feed. The Edge's CiliumNetworkPolicy
+  # already allows egress to vali:8000; no policy change needed.
+  registryFeedUrl: "http://vali.vali.svc.cluster.local:8000/v1/edge/registry"
+  # Poll cadence (seconds). Kept above vali's feed-cache TTL so each
+  # poll still sees fresh data; an on-chain status change (quarantine /
+  # decommission / slash) takes effect within this window + a handshake.
+  refreshSecs: 30
+  # Pinned Ed25519 pubkey the vali registry feed is signed with (audit
+  # M-registry-mTLS). Verified fail-closed on every poll — a tampered /
+  # unsigned feed drops the store to unhealthy. vali holds the matching
+  # seed at Vault hippius-compute/vali/registry-feed.
+  registryFeedPubkey: "23c4ba96882f22adfd034c37fb0cb8a3bc928c77a8fed1669e04ff76113f1c1a"
+
+orderSigning:
+  # PER-ENVIRONMENT toggle for this cluster. PR #144 introduced the
+  # value (chart-default `false`); PR #147 flipped THIS cluster's
+  # values.yaml to `true` once the Vault seed was provisioned. With
+  # this on, the ExternalSecret + the deployment env / volume entries
+  # below render AND (added in this PR — §H phase-2 dispatch route)
+  # the inner-listener Service, container port :8444, and the
+  # NetworkPolicy ingress/egress rules render too. The Edge boot then
+  # both loads `OrderSigner` AND stands the inner listener up. Flip
+  # back to `false` to disable BOTH: the order-signing subsystem AND
+  # the inner-listener dispatch route — they ship together as one
+  # logical feature now.
+  enabled: true
+  # KV-v2 path under the `hippius-vault` ClusterSecretStore that the
+  # ExternalSecret reads the seed from (property `priv`, 64 hex chars).
+  # Operator-provisioned into Vault — NEVER in Git.
+  vaultPath: hippius-compute/edge-gateway/order-signing
+  refreshInterval: 1h
+  # Optional: pin the expected pubkey in deployment config to
+  # fail-close the Edge boot on Vault drift. Same value as
+  # `deploy/ansible/group_vars/miner_nodes.yml` `edge_order_signing_
+  # pubkey`; when set, the loader compares the derived pubkey and
+  # exits with `EXIT_ORDER_SIGNING` (`order-signing-pubkey-mismatch`)
+  # on mismatch. Empty string ⇒ skip the check (the boot log still
+  # emits the derived pubkey for visual confirmation).
+  expectedPubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf8820d2b25ca9"
+
+# §23 served-receipt ingest bearer token (uptime billing). vali pins
+# ServiceTokenAuthentication on the JSON telemetry-ingest path; the Edge
+# stamps this token so a relayed tenant-VM served-receipt POST is not
+# 401'd (the raw-CBOR heartbeat path stays token-exempt). With this on,
+# the ExternalSecret + the deployment env below render. Enabled on THIS
+# cluster once the token was minted (`ServiceToken.issue` for the
+# `edge-telemetry-relay` ServiceClient) and vault-written.
+valiIngestToken:
+  enabled: true
+  # KV-v2 path the ExternalSecret reads the token from (property `token`,
+  # ~43 url-safe chars). Operator-provisioned into Vault — NEVER in Git.
+  vaultPath: hippius-compute/edge-gateway/vali-ingest-token
+  refreshInterval: 1h

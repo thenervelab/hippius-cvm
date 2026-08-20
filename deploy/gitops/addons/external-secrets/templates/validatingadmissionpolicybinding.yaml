@@ -1,0 +1,22 @@
+---
+# `hippius-eso-gitops-only` ValidatingAdmissionPolicyBinding — PR-K11.
+#
+# Activates the `hippius-eso-gitops-only` ValidatingAdmissionPolicy in
+# `Deny` mode. There is deliberately no `matchResources` scoping — the
+# policy's own `matchConstraints` already restricts it to
+# `external-secrets.io` writes, and the guard must hold in every
+# namespace (a `ClusterSecretStore` is cluster-wide).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: hippius-eso-gitops-only
+  labels:
+    app.kubernetes.io/name: hippius-eso-gitops-only
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  policyName: hippius-eso-gitops-only
+  validationActions: ["Deny"]

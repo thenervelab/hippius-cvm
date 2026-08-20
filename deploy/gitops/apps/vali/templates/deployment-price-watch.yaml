@@ -1,0 +1,128 @@
+{{- if .Values.priceWatch.enabled }}
+---
+# §23 marketplace price-watch worker.
+#
+# A miner announces a price hike on-chain (`PendingPriceChange`, with a
+# notice window before it bites). Nothing periodically reacts to those
+# announcements — so a tenant VM would silently roll onto the higher
+# price the moment it takes effect, breaching the ceiling the tenant
+# agreed to. This Deployment runs the `vali_price_watch` management
+# command (a long-running loop, `VALI_PRICE_WATCH_INTERVAL_S`, default
+# 60s): each cycle reads the on-chain announcements (`read-pending-prices`),
+# and for every bound VM whose tenant ceiling (`Vm.max_price_per_unit`)
+# the new price would exceed, schedules a §25 migration onto a cheaper
+# miner — BEFORE the new price takes effect, while the VM is still
+# healthy. The actual migration is driven by the orchestration-tick
+# worker; this one only decides + enqueues.
+#
+# Same image + env as the vali web pod (shares the Django app, the
+# Postgres DB, the Vault creds, and the `VALI_THEBRAIN_RPC_URL` chain
+# read via `envFrom: vali-config`). A worker — no HTTP port, no probes;
+# the loop IS the process, a crash exits the container and the kubelet
+# restarts it. `replicas: 1` + `Recreate` so two watch loops never run
+# concurrently (start_migration is idempotent, but one writer is cleanest).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + the
+# migrations hook).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-price-watch
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: price-watch
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: price-watch
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: price-watch
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every tick times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        # Roll the worker whenever the rendered config changes (it reads
+        # vali-config via envFrom, snapshotted at container start) — same
+        # rationale as the web Deployment.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The watch loop does not call the Kubernetes API.
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: price-watch
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the watch loop.
+          command: ["python", "manage.py", "vali_price_watch"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            # The migration decision reads the chain + enqueues lifecycle
+            # work; carry the same Vault creds as the web pod so the
+            # shared code paths behave identically.
+            {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
+            {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            - name: VALI_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: vali-vault
+                  key: address
+          resources:
+            {{- .Values.priceWatch.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- include "vali.vaultTokenVolumeMount" . | nindent 12 }}
+            # `read-pending-prices` (the chain-read subprocess) + Python
+            # tempfiles need a writable /tmp under readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+            - name: vault-ca
+              mountPath: /etc/hippius/vault-ca
+              readOnly: true
+      volumes:
+        {{- include "vali.vaultTokenVolume" . | nindent 8 }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: vault-ca
+          configMap:
+            name: vault-ca
+{{- end }}

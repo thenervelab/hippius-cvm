@@ -1,0 +1,114 @@
+{{- if .Values.tokenRenew.enabled }}
+---
+# Weekly self-renewal of the periodic Vault tokens the KBS plane
+# authenticates with (audit H4). Two tokens live in this namespace:
+#   - `kbs-vault-creds` key `vault-token` — the KBS static Vault token
+#     (the one that boot-looped when it expired 2026-06-25);
+#   - `kbs-vault-broker-token` key `vault-token` — the kbs-vault-broker
+#     parent mint token (was NON-periodic, ~6d to expiry — fixed to
+#     periodic in H3).
+# Both are periodic but nothing renewed them, so each would silently
+# expire and take down KEK release. A periodic token renews ITSELF via
+# `auth/token/renew-self` (renew-self was added to the
+# `hippius-compute-kbs-read` + `kbs-vault-broker-mint` policies), resetting
+# the TTL to the full period — no root token, no write-back (the token
+# bytes are unchanged; renewal extends the same token in Vault).
+#
+# BEST-EFFORT per token: a token that is absent or can't self-renew (e.g.
+# after H5 replaces `kbs-vault-creds` with an empty/deny token) logs a
+# warning and the Job continues renewing the others. Talks ONLY to Vault
+# (no k8s API) → no RBAC; TLS verified against the pinned `kbs-vault-ca`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kbs-vault-token-renew
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kbs-vault-token-renew
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: kbs
+spec:
+  schedule: {{ .Values.tokenRenew.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: kbs-vault-token-renew
+            app.kubernetes.io/part-of: hippius-compute
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: renew
+              image: {{ .Values.tokenRenew.image | quote }}
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: VAULT_ADDR
+                  value: {{ .Values.tokenRenew.vaultAddr | quote }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  renew() {
+                    # $1 = mounted token file, $2 = label. Best-effort: a
+                    # missing/invalid token logs + returns 0 so one dead
+                    # token can't fail the whole Job.
+                    tok="$(cat "$1" 2>/dev/null || true)"
+                    if [ -z "$tok" ]; then
+                      echo "renew $2: token file empty/absent — skipping"
+                      return 0
+                    fi
+                    code=$(curl -sS --cacert /vault-ca/ca.pem \
+                      -o /tmp/resp.json -w '%{http_code}' \
+                      -H "X-Vault-Token: $tok" \
+                      -X POST "$VAULT_ADDR/v1/auth/token/renew-self" || echo 000)
+                    echo "renew $2: HTTP $code"
+                    grep -o '"lease_duration":[0-9]*' /tmp/resp.json 2>/dev/null || true
+                  }
+                  renew /kbs-token/vault-token kbs-vault-creds
+                  renew /broker-token/vault-token kbs-vault-broker-token
+              volumeMounts:
+                - name: kbs-token
+                  mountPath: /kbs-token
+                  readOnly: true
+                - name: broker-token
+                  mountPath: /broker-token
+                  readOnly: true
+                - name: vault-ca
+                  mountPath: /vault-ca
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: kbs-token
+              secret:
+                secretName: kbs-vault-creds
+                optional: true
+            - name: broker-token
+              secret:
+                secretName: kbs-vault-broker-token
+                optional: true
+            - name: vault-ca
+              configMap:
+                name: kbs-vault-ca
+            - name: tmp
+              emptyDir: {}
+{{- end }}

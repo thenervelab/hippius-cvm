@@ -1,0 +1,22 @@
+# cargo-audit (RustSec) configuration — read by the CI `audit` job
+# (.github/workflows/ci.yml). This is the dependency-vulnerability gate:
+# `cargo audit` FAILS the build on any advisory NOT listed under `ignore`,
+# so a new CVE in the dependency graph blocks the merge (RA-M-NEW-1).
+#
+# Only VULNERABILITIES fail the gate; `unmaintained` / `yanked` advisories
+# are reported as warnings (non-fatal) — tracked but not blocking, since
+# they carry no exploit and often have no drop-in replacement.
+
+[advisories]
+# Advisories intentionally allowed, each with an explicit rationale. Keep
+# this list minimal and re-evaluate on every dependency bump.
+ignore = [
+    # RUSTSEC-2023-0071 — RSA "Marvin" key-recovery timing side-channel in
+    # the `rsa` crate. Pulled in TRANSITIVELY by `sev` (SEV-SNP attestation),
+    # which uses RSA ONLY to VERIFY AMD's certificate chain (public-key
+    # verification; AMD holds the private keys). The Marvin oracle needs
+    # private-key decrypt/sign operations this codebase never performs, so
+    # it is not exploitable here. No fixed `rsa` release exists yet — revisit
+    # when `rsa` ships a patch or `sev` drops the dependency.
+    "RUSTSEC-2023-0071",
+]

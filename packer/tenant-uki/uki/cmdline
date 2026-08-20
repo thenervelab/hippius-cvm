@@ -1,0 +1,1 @@
+ro quiet console=ttyS0 panic=1 panic_on_oops=1 ds=nocloud init=/sbin/init-hippius hippius.kbs_url=https://kbs.hippius.network hippius.luks_device=/dev/vda hippius.rootfs_data=/dev/vdb hippius.rootfs_hash=/dev/vdc

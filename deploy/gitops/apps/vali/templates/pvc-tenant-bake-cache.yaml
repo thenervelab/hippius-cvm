@@ -1,0 +1,51 @@
+{{- if and .Values.tenantBake.enabled .Values.tenantBake.cache.enabled }}
+---
+# Stage-1 bake cache (perf) — shared by every `hippius-tenant-baker`
+# Job. Holds the tenant-INDEPENDENT half of the bake (customised
+# plaintext raw + kernel + initrd), content-addressed by a key over
+# every stage-1 input and sha256-verified on load by
+# `tenant-image-bake.sh::stage1_cache_load`. No tenant KEK or
+# per-tenant ciphertext ever lands here — the per-tenant LUKS
+# encrypt (stage 6) runs entirely in the Job's emptyDir workdir.
+#
+# accessModes is RWO: fine on a single-node deployment.
+# A multi-node cluster either switches to an RWX storage class or
+# accepts that concurrent bakes serialise onto the node holding the
+# volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.tenantBake.cache.pvcName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-bake-cache
+  annotations:
+    # local-path's volumeBindingMode is WaitForFirstConsumer: the
+    # claim stays Pending until the FIRST bake Job pod mounts it.
+    # Without these annotations ArgoCD's sync operation blocks at
+    # "waiting for healthy state of PersistentVolumeClaim/..." and
+    # never applies the rest of the app (observed 2026-06-09 —
+    # the #353 digest bump hung behind exactly this).
+    #
+    # SkipHealthCheck keeps the Pending claim out of the APP-level
+    # health aggregation, but ArgoCD's BETWEEN-WAVES health gate
+    # does not honor it (observed live on v3.4.2: the op still
+    # waited on this claim with the annotation applied). Hence the
+    # sync-wave: pushing the PVC into the LAST wave means no other
+    # resource ever waits behind it — the operation applies it and
+    # completes. Safe: nothing in the chart depends on the PVC
+    # being Bound at sync time; a genuinely broken claim surfaces
+    # loudly when the first bake Job pod fails to schedule.
+    argocd.argoproj.io/sync-options: SkipHealthCheck=true
+    argocd.argoproj.io/sync-wave: "99"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.tenantBake.cache.size }}
+  {{- if .Values.tenantBake.cache.storageClassName }}
+  storageClassName: {{ .Values.tenantBake.cache.storageClassName | quote }}
+  {{- end }}
+{{- end }}

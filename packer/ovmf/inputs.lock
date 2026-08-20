@@ -1,0 +1,21 @@
+# `packer/ovmf/inputs.lock` — pinned edk2 source for the AmdSevX64 build.
+#
+# `scripts/build-ovmf.sh` clones tianocore/edk2 at `EDK2_COMMIT` and
+# refuses to proceed if `git rev-parse HEAD` doesn't match. Every byte
+# that feeds the `OvmfPkg/AmdSev/AmdSevX64.dsc` build (edk2 source +
+# the pinned trixie toolchain in the Dockerfile + the operator-set
+# `SOURCE_DATE_EPOCH`) is therefore pinned upstream — the output
+# `OVMF.fd` is deterministic across hosts.
+#
+# Updating `EDK2_COMMIT` is a deliberate PR — the resulting OVMF.fd
+# has a different sha256 → a different SEV-SNP launch digest → the
+# §22 allowlist refuses release until its epoch is bumped in lockstep.
+# Pin to a TAGGED stable release (edk2-stable<YYYYMM>) rather than a
+# rolling commit so the commit↔release correspondence is auditable.
+
+# edk2-stable202511 (Nov 2025). edk2-stable202602 hits an
+# `EfiVfrParser.cpp` ANTLR-generated truncation under GCC 14 / Debian
+# trixie's BaseTools toolchain (a known PCCTS/`dlg` quirk that the
+# 202511 BaseTools release pre-dates / sidesteps).
+EDK2_TAG    = edk2-stable202511
+EDK2_COMMIT = 46548b1adac82211d8d11da12dd914f41e7aa775

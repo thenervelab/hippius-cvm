@@ -1,0 +1,358 @@
+# Values for the `kube-prometheus-stack` dependency (see Chart.yaml).
+# Nested under the `kube-prometheus-stack:` key — the dependency's name.
+#
+# Scope of this PR (PR-K14, issue #128 Phase 1 slice 1):
+#   * stand up Prometheus + Alertmanager + Grafana with a 30-day local
+#     retention,
+#   * scrape what already exposes Prometheus text format today
+#     (edge-gateway :9464, ingress-nginx, node-exporter, kube-state,
+#      kubelet, kube-apiserver),
+#   * one panoramic dashboard + the alerts we can fire without
+#     per-component instrumentation.
+#
+# Per-component `/metrics` endpoints on KBS, vali, miner-agent and
+# sentinel land in PR-K14a..PR-K14e — each adds its own ServiceMonitor
+# under this addon's `templates/` and a dedicated dashboard ConfigMap.
+kube-prometheus-stack:
+  # Fleet labels on every kube-prometheus-stack-rendered resource.
+  commonLabels:
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+
+  # Stable, short resource names — without this override the chart
+  # interpolates the Helm release name (the Argo CD Application name,
+  # `hippius-compute-kube-prometheus-stack`) into every workload, which
+  # is unwieldy and would force the local Ingress template to know that
+  # full string. With this override resources are
+  # `kube-prometheus-stack-grafana`, `…-prometheus`, `…-alertmanager`.
+  fullnameOverride: kube-prometheus-stack
+
+  # ── Images — digest-pinned ──────────────────────────────────────────
+  # Every image this chart renders defaults to a TAG-only reference. The
+  # chart exposes a per-component `image.sha` that it appends as
+  # `@sha256:<sha>`, so these values are BARE HEX — no `sha256:` prefix
+  # (the two exceptions, kube-state-metrics and prometheus-node-exporter,
+  # are flagged in their own blocks below).
+  #
+  # Digests are the multi-arch INDEX digests of what the cluster is
+  # already running, read back from the node (`k3s crictl inspecti <ref>`
+  # → `repoDigests`), so applying this changes no bytes — it only removes
+  # the ability for a mutable tag to change them later.
+  #
+  # Deliberately NOT pinned (they render nothing today):
+  #   * `prometheusOperator.thanosImage` — only becomes an image when a
+  #     Prometheus CR asks for a Thanos sidecar; today it is inert text
+  #     in the operator's `--thanos-default-base-image` flag.
+  #   * `prometheusOperator.admissionWebhooks.deployment.image` — the
+  #     deployment-mode admission webhook is disabled (patch mode is
+  #     used, and that Job's image IS pinned below).
+  #   * `crds.upgradeJob.image.{busybox,kubectl}` — `upgradeJob.enabled`
+  #     is false. Worth knowing that the chart's disabled default there
+  #     is `busybox:latest`; if that Job is ever enabled it must be
+  #     pinned first.
+
+  # ── CRDs ─────────────────────────────────────────────────────────────
+  # The chart renders its own CRDs as part of the release. We keep them
+  # under chart management (no separate kustomize); the
+  # `ServerSideApply=true` Argo CD sync option in `application.yaml`
+  # handles their large size.
+  crds:
+    enabled: true
+
+  # ── rke2 reality: bound to localhost on master nodes ─────────────────
+  # The default scrape targets for kube-controller-manager / kube-scheduler
+  # / kube-etcd point at component Services that rke2 does not expose
+  # (the components bind to 127.0.0.1 on each master). Enabling them
+  # produces persistent `up=0` noise with no fix available at this
+  # layer. kube-proxy is replaced by Cilium (PR-K3, `kubeProxyReplacement:
+  # true`) so its target is genuinely absent. Disable all four. They can
+  # be re-enabled in a follow-up that wires the rke2-specific scrape
+  # endpoints (a small manifest in this `templates/` directory).
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeEtcd:
+    enabled: false
+  kubeProxy:
+    enabled: false
+
+  # kubelet / kube-apiserver / coredns are scrapable as-is on rke2.
+  kubelet:
+    enabled: true
+    serviceMonitor:
+      # `https` exposes per-pod cadvisor + kubelet metrics — both load
+      # the Stack-overview dashboard's node-level panels.
+      https: true
+  kubeApiServer:
+    enabled: true
+  coreDns:
+    enabled: true
+
+  # ── kube-state-metrics + node-exporter (dependencies of the chart) ───
+  #
+  # Digest pins: both subcharts default to TAG-only references. Note the
+  # two subcharts disagree on the value format — kube-state-metrics
+  # renders `…:<tag>@{{ .sha }}` (so the value MUST carry the `sha256:`
+  # prefix), while prometheus-node-exporter renders `…:<tag>@{{ .digest }}`
+  # under a differently-named key and hard-`fail`s if you set `sha`.
+  # Everything else in this file uses the bare-hex `sha` convention.
+  kube-state-metrics:
+    image:
+      sha: "sha256:6b2f0b6f2f86ac5b1aa883a033a8dd55bb96c16d191ec973393bdaadaddac914"
+    podDisruptionBudget:
+      # NO `enabled:` here. The vendored kube-state-metrics subchart does
+      # `{{ toYaml .Values.podDisruptionBudget | indent 2 }}` under `spec:`,
+      # so every key lands in the PDB spec — and `enabled` is not a
+      # PodDisruptionBudgetSpec field. The last sync FAILED with
+      # "field not declared in schema", retried 5 times. A non-empty map
+      # already enables it.
+      maxUnavailable: 1
+  prometheus-node-exporter:
+    image:
+      digest: "sha256:6112664fd761bb964d8a2d3d0119d6c8402618a89edbb3a43c8f7b4090fb53c9"
+    # Runs on every node — no PDB needed (DaemonSet, not Deployment).
+    hostNetwork: true
+
+  # ── Default rules ────────────────────────────────────────────────────
+  # The chart ships a curated set of `PrometheusRule`s mapping the
+  # kube-prometheus rules upstream. Keep the ones we actually use; drop
+  # the ones tied to scrape targets we disabled above (etcd / kcm /
+  # kube-scheduler / kube-proxy) so the rule evaluator does not flap on
+  # missing time series.
+  defaultRules:
+    create: true
+    rules:
+      alertmanager: true
+      etcd: false
+      configReloaders: true
+      general: true
+      k8sContainerCpuUsageSecondsTotal: true
+      k8sContainerMemoryCache: true
+      k8sContainerMemoryRss: true
+      k8sContainerMemorySwap: true
+      k8sContainerResource: true
+      k8sContainerMemoryWorkingSetBytes: true
+      k8sPodOwner: true
+      kubeApiserverAvailability: true
+      kubeApiserverBurnrate: true
+      kubeApiserverHistogram: true
+      kubeApiserverSlos: true
+      kubeControllerManager: false
+      kubelet: true
+      kubeProxy: false
+      kubePrometheusGeneral: true
+      kubePrometheusNodeRecording: true
+      kubernetesApps: true
+      kubernetesResources: true
+      kubernetesStorage: true
+      kubernetesSystem: true
+      kubeSchedulerAlerting: false
+      kubeSchedulerRecording: false
+      kubeStateMetrics: true
+      network: true
+      node: true
+      nodeExporterAlerting: true
+      nodeExporterRecording: true
+      prometheus: true
+      prometheusOperator: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Prometheus
+  # ─────────────────────────────────────────────────────────────────────
+  prometheus:
+    # Don't render the chart's own Ingress — we own the Grafana Ingress
+    # in `templates/` and Prometheus stays cluster-internal (operators
+    # port-forward when they need to query raw PromQL).
+    ingress:
+      enabled: false
+    # Default the service to ClusterIP (no LoadBalancer / NodePort).
+    service:
+      type: ClusterIP
+    prometheusSpec:
+      # Digest pin (bare hex) — quay.io/prometheus/prometheus
+      # :v3.12.0-distroless. See the "Images" section at the top.
+      image:
+        sha: f39df5334dee301b885f77e0ff1159f5d8a43bf9db518f885544594799a1e3c2
+      replicas: 1
+      retention: 30d
+      # Headroom over the 30d retention so transient ingest spikes do
+      # not stall WAL writes. local-path-provisioner is the default
+      # StorageClass (PR-K4).
+      retentionSize: "40GiB"
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: local-path
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 50Gi
+      # ── Discover ServiceMonitors / PodMonitors / Rules cluster-wide ─
+      # Without these flips the operator's selector defaults to "match
+      # the chart's release label" — fine for ServiceMonitors we ship
+      # inside THIS addon, but it would silently exclude future
+      # ServiceMonitors that live under each component's own templates
+      # (e.g. the follow-up `apps/vali/templates/servicemonitor.yaml`).
+      # The cluster-wide discovery model is the standard one and is
+      # required for our follow-up PRs (PR-K14a..K14e) to land cleanly.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      # Resource floor — light enough on a single-node MVP, headroom for
+      # the per-component PRs that will add real scrape volume.
+      resources:
+        requests:
+          cpu: 250m
+          memory: 1Gi
+        limits:
+          cpu: 1500m
+          memory: 4Gi
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Alertmanager
+  # ─────────────────────────────────────────────────────────────────────
+  alertmanager:
+    ingress:
+      enabled: false
+    service:
+      type: ClusterIP
+    # The full Alertmanager config — including the Slack webhook URL —
+    # is delivered as a single Secret from Vault by the
+    # `templates/external-secret-alertmanager.yaml` ExternalSecret.
+    # `useExistingSecret: true` makes the chart skip rendering its
+    # default `alertmanager.yaml` and instead mount the Secret named
+    # below as the Alertmanager config file. The secret key MUST be
+    # `alertmanager.yaml` (the chart's hard-coded path).
+    alertmanagerSpec:
+      # Digest pin (bare hex) — quay.io/prometheus/alertmanager:v0.32.1.
+      # See the "Images" section at the top.
+      image:
+        sha: 51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286
+      replicas: 1
+      useExistingSecret: true
+      configSecret: alertmanager-config
+      storage:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: local-path
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 5Gi
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Grafana
+  # ─────────────────────────────────────────────────────────────────────
+  grafana:
+    # Digest pins (bare hex) — the Grafana server itself and the
+    # dashboard/datasource sidecar. See the "Images" section at the top.
+    # The sidecar is the one component here that watches ConfigMaps in
+    # ALL namespaces, so it is not a "reads metrics only" sidecar.
+    image:
+      sha: 2d1f9ae67c1778d33e291d4c3c759cd8b650e67491f02533499eb950e075eeb5
+
+    # The chart-rendered Ingress is disabled — we own
+    # `templates/ingress-grafana.yaml` so we can pin the NetBird
+    # `whitelist-source-range` annotation alongside cert-manager TLS,
+    # mirroring the Edge ingress pattern.
+    ingress:
+      enabled: false
+
+    # Admin password is delivered as a Secret from Vault by
+    # `templates/external-secret-grafana.yaml`. The chart wires
+    # `GF_SECURITY_ADMIN_PASSWORD` from that Secret. The chart's hard-
+    # coded keys are `admin-user` + `admin-password`.
+    admin:
+      existingSecret: grafana-admin
+      userKey: admin-user
+      passwordKey: admin-password
+
+    # ── Dashboards-as-code via the sidecar ───────────────────────────
+    # The Grafana chart ships a sidecar that watches ConfigMaps with a
+    # configurable label and imports any embedded JSON dashboards. We
+    # commit dashboards as ConfigMaps under this addon's `templates/`
+    # (and under follow-up component PRs); operators do not edit
+    # dashboards live — Argo CD owns them via Git.
+    sidecar:
+      # Digest pin (bare hex) — quay.io/kiwigrid/k8s-sidecar:2.7.3.
+      image:
+        sha: 694950d736c8b532eba4006527ccbdac98fefc9f30b3346ba2de50b6cad91c94
+      dashboards:
+        enabled: true
+        label: grafana_dashboard
+        labelValue: "1"
+        # Watch ALL namespaces so future component PRs (PR-K14a..) can
+        # drop a dashboard ConfigMap inside their own app's templates.
+        searchNamespace: ALL
+        folderAnnotation: grafana_folder
+        provider:
+          # Allow editing in-Grafana for prototyping, but the JSON is
+          # round-tripped through Git — the sidecar's reload will
+          # overwrite anything saved live (which is the intent).
+          allowUiUpdates: true
+          foldersFromFilesStructure: true
+      datasources:
+        enabled: true
+        defaultDatasourceEnabled: true
+        searchNamespace: ALL
+
+    # Persistence is OFF — dashboards live in Git, user state (preferences,
+    # saved playlists) is cheap to rebuild. Avoids one more PVC on the
+    # single-node MVP and removes a stateful surface from rolling updates.
+    persistence:
+      enabled: false
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Prometheus Operator
+  # ─────────────────────────────────────────────────────────────────────
+  prometheusOperator:
+    # Digest pins (bare hex). See the "Images" section at the top.
+    #   * `image` — the operator itself.
+    #   * `prometheusConfigReloader` — rendered into the operator's
+    #     `--prometheus-config-reloader` flag and then injected by the
+    #     operator as a sidecar into every Prometheus / Alertmanager pod,
+    #     so it is a real running image despite never appearing in a
+    #     PodSpec in this chart.
+    #   * `admissionWebhooks.patch.image` — a Helm-hook Job holding RBAC
+    #     to patch Validating/MutatingWebhookConfiguration objects. It is
+    #     also a third-party FORK (`ghcr.io/jkroepke/…`), not an upstream
+    #     Prometheus or Kubernetes image — the weakest provenance in this
+    #     addon and the strongest reason to pin it.
+    image:
+      sha: 9e53e13139218aca79ee000172de73355e9174ef2904585bfad9497fc71aae2d
+    prometheusConfigReloader:
+      image:
+        sha: 7d9e4eea5f1139e602508871f422b0116c60e87c662f3dcd234d5ab60cd0d8c1
+    admissionWebhooks:
+      patch:
+        image:
+          sha: 8ce13c365c8e9ced0aad5ef350a53c50b7ca5817f99d856b9eec895db1056728
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+    # The operator's admission webhook is generally not needed for the
+    # in-tree CRDs we use; the chart's `admissionWebhooks` block defaults
+    # to enabled. Leave it as-is — it is the chart's intended posture and
+    # disables itself gracefully if the cert-injection pipeline is not
+    # available. Revisit if it costs us churn.

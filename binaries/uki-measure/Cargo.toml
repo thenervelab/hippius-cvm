@@ -1,0 +1,50 @@
+[package]
+name = "hippius-uki-measure"
+version = "0.0.2"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Extracts a UKI's launch measurement + per-component (kernel/initrd/cmdline/ovmf/verity) fingerprints into a stable JSON envelope. Default build emits `measurement_kind = \"uki_sha384\"` (a content hash — pre-production). Built `--features snp` (PR-F3), it emits `measurement_kind = \"snp_launch_digest_v1\"`, the real AMD SEV-SNP launch digest computed by `sev::measurement::snp::snp_calc_launch_digest` over a pinned OVMF + the kernel/initrd/cmdline launch config (the IDBLOCK is scaffolded separately and is NOT an input to the digest). The §22 allowlist signer enforces the discriminator."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-uki-measure"
+path = "src/main.rs"
+
+[features]
+default = []
+# Real AMD SEV-SNP launch_digest (PR-F3). Linux-only: the `sev` crate
+# gates `sev::measurement` on `cfg(target_os = "linux")` and requires
+# its `openssl` feature. Kept a non-default, optional, target-gated
+# dependency — exactly the pattern `binaries/agent-initramfs` uses for
+# its own `sev` dep — so:
+#   * `cargo test --workspace` stays cross-platform green (macOS dev),
+#   * `agent-initramfs` is never feature-unified into pulling openssl,
+#   * the SNP path is exercised by a dedicated `cargo test -p
+#     hippius-uki-measure --features snp` on a Linux runner.
+snp = ["dep:sev"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+# `sev` provides `snp_calc_launch_digest`. Target-gated to Linux (the
+# `measurement` module does not exist on other targets) and optional
+# (only pulled in by the `snp` feature). `default-features = false` +
+# the explicit `snp`/`openssl` set is the minimum `sev::measurement`
+# compiles with; openssl resolves to the digest-pinned Debian base's
+# system libssl.
+[target.'cfg(target_os = "linux")'.dependencies]
+sev = { version = "7.1", default-features = false, features = [
+    "snp",
+    "openssl",
+], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

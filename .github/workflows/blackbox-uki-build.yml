@@ -1,0 +1,210 @@
+# `.github/workflows/blackbox-uki-build.yml` — host-attestor chantier
+# PR-6. Builds the DISKLESS "blackbox" host-attestor UKI end-to-end and
+# cosign-signs the artifact so PR-9's vali admin-release can verify its
+# provenance.
+#
+# Mirrors `uki-build.yml` (the tenant/kbs UKI) stage-for-stage:
+#   - always runs the SNP launch-digest KAT (`cargo test --features snp`),
+#     which now also gates the `--diskless` measure path,
+#   - builds the blackbox UKI (`make blackbox-uki`), double-builds it
+#     (`make blackbox-uki-reproducible-check`), and uploads the artifact,
+#   - cosign sign-blobs the signed UKI (keyless: GitHub OIDC → Fulcio +
+#     Rekor), same posture as `tenant-baker-image.yml`'s `cosign sign`.
+#
+# ## Guard — the heavy build self-skips until the measured pins resolve
+#
+# Identical to `uki-build.yml`: while any measured-boot pin
+# (inputs.lock / ovmf.lock / the UKI Dockerfile) is still a placeholder
+# (issue #84), the build self-skips with a loud NOTICE instead of
+# failing red. The moment the pins resolve, the full pipeline activates
+# with NO change to this workflow.
+#
+# ## KAT — pinned on the FIRST CI build, never auto-pinned from a miner
+#
+# The blackbox measurement is operator/CI-pinned (see
+# `test_vectors/uki/blackbox-REGENERATE.md`). Until
+# `test_vectors/uki/blackbox-measurement.json` exists this workflow
+# emits a NOTICE and skips the comparison; once pinned it diffs every
+# build against it and fails loudly on drift.
+#
+# Supply-chain discipline (§F): every GitHub Action is pinned by SHA.
+
+name: blackbox-uki-build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read the repo, and an OIDC token for cosign keyless blob signing.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  blackbox-uki-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # `fetch-depth: 0` — the Makefile's SOURCE_DATE_EPOCH is
+        # path-scoped to `packer/kbs-uki/`; a shallow clone would
+        # collapse it (see uki-build.yml for the full rationale).
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+
+      - name: Dependencies for the SNP launch-digest KAT
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install cosign (version pinned)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Detect unresolved §F measured pins
+        id: guard
+        run: |
+          set -euo pipefail
+          unresolved=""
+          for f in packer/kbs-uki/uki/inputs.lock \
+                   packer/kbs-uki/ovmf/ovmf.lock \
+                   packer/kbs-uki/uki/Dockerfile; do
+            if grep -vE '^[[:space:]]*#' "$f" \
+               | grep -Eq 'PLACEHOLDER-PIN-VIA-MAKE-PIN-APT|0{64}|<TIMESTAMP>|<VERSION>|<ARCH>|<PINNED-CONTENT-ADDRESSED-HOST>'; then
+              unresolved="${unresolved} ${f}"
+            fi
+          done
+          if [ -n "$unresolved" ]; then
+            echo "Measured-boot pins still placeholder in:${unresolved} — see issue #84."
+            echo "pins_resolved=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All measured-boot pins resolved — running the full blackbox UKI build."
+            echo "pins_resolved=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SEV-SNP launch-digest known-answer test (incl. --diskless)
+        # Always runs — independent of the pins. Gates both the tenant
+        # and the diskless measure paths.
+        run: cargo test -p hippius-uki-measure --features snp
+
+      - name: NOTICE — blackbox UKI build skipped (pins unresolved)
+        if: steps.guard.outputs.pins_resolved != 'true'
+        run: |
+          echo "::warning title=blackbox UKI build skipped::§F measured-boot pins are placeholders — resolve them (issue #84) to activate the full build."
+
+      - name: Install UKI build dependencies
+        if: steps.guard.outputs.pins_resolved == 'true'
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools cryptsetup-bin
+
+      - name: Build the blackbox UKI end-to-end
+        if: steps.guard.outputs.pins_resolved == 'true'
+        run: make -C packer/kbs-uki/uki blackbox-uki
+
+      - name: Chown build outputs back to the runner user
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # The docker container writes some outputs as root; chown so the
+        # non-root runner can read them for the diff / upload / sign
+        # steps (see uki-build.yml). Doing this at the workflow level
+        # keeps the path-scoped SDE basis stable.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            packer/kbs-uki/uki/output \
+            packer/kbs-uki/uki/build \
+            packer/kbs-uki/uki/fetched
+
+      - name: Compare the measurement against test_vectors/uki/ (if pinned)
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # The blackbox KAT is operator/CI-pinned on the first build
+        # (test_vectors/uki/blackbox-REGENERATE.md). Until it exists,
+        # emit a NOTICE instead of failing red; once pinned, any drift
+        # fails loudly.
+        run: |
+          set -euo pipefail
+          expected=test_vectors/uki/blackbox-measurement.json
+          got=packer/kbs-uki/uki/output/blackbox-measurement.json
+          if [ ! -f "$expected" ]; then
+            echo "::warning title=blackbox KAT not yet pinned::${expected} is absent — pin it per test_vectors/uki/blackbox-REGENERATE.md (couple to a §22 allowlist epoch). Built digest below:"
+            cat "$got"
+          else
+            diff -u "$expected" "$got"
+          fi
+
+      - name: Reproducibility check (double build, byte-identical)
+        if: steps.guard.outputs.pins_resolved == 'true'
+        run: |
+          set -euo pipefail
+          cd packer/kbs-uki/uki
+          rm -rf output-bb-a output-bb-b \
+                 fetched-bb-a fetched-bb-b \
+                 build-bb-a build-bb-b
+          make blackbox-uki \
+            OUTPUT_DIR="$(pwd)/output-bb-a" \
+            FETCHED_DIR="$(pwd)/fetched-bb-a" \
+            BUILD_DIR="$(pwd)/build-bb-a" >/dev/null
+          make blackbox-uki \
+            OUTPUT_DIR="$(pwd)/output-bb-b" \
+            FETCHED_DIR="$(pwd)/fetched-bb-b" \
+            BUILD_DIR="$(pwd)/build-bb-b" >/dev/null
+          sudo chown -R "$(id -u):$(id -g)" \
+            output-bb-a output-bb-b \
+            fetched-bb-a fetched-bb-b \
+            build-bb-a build-bb-b
+          if diff -r --exclude='*.uki.signed' output-bb-a output-bb-b; then
+            echo "blackbox-uki-reproducible-check: PASS — outputs are byte-identical."
+          else
+            echo "::error::blackbox-uki-reproducible-check: FAIL — outputs diverged"
+            exit 1
+          fi
+
+      # Upload the built UKI + measurement BEFORE signing so a cosign/OIDC
+      # hiccup can never lose the reproducible artifact (the measurement is
+      # the trust anchor; the signature is added below and re-uploaded).
+      - name: Upload the blackbox UKI + measurement (pre-sign, resilient)
+        if: steps.guard.outputs.pins_resolved == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blackbox-uki-${{ github.sha }}
+          path: packer/kbs-uki/uki/output/
+          if-no-files-found: error
+
+      - name: Cosign sign-blob the signed blackbox UKI (keyless)
+        # Keyless GitHub OIDC → Fulcio cert + Rekor transparency log,
+        # same trust model as tenant-baker-image.yml's `cosign sign`.
+        # The UKI is a raw PE blob (not an OCI image), so `sign-blob`
+        # is the correct verb; it emits a detached signature + the
+        # Fulcio cert, uploaded alongside the artifact so PR-9's vali
+        # admin-release can `cosign verify-blob` the provenance.
+        # cosign v3 requires an explicit --bundle output path (the empty
+        # default is what previously failed with "create bundle file:
+        # open :"); we keep the detached --output-signature/-certificate
+        # so vali's cosign_verify.py (verify-blob --signature/--certificate)
+        # stays compatible.
+        # Only on real pushes/tags (PR runs skip, matching the image
+        # workflows — fork PRs cannot mint the OIDC token).
+        if: steps.guard.outputs.pins_resolved == 'true' && github.event_name != 'pull_request'
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          UKI=$(ls -1 packer/kbs-uki/uki/output/blackbox-*.uki.signed | head -1)
+          cosign sign-blob \
+            --bundle "${UKI}.cosign.bundle" \
+            --output-signature "${UKI}.sig" \
+            --output-certificate "${UKI}.cert" \
+            "$UKI"
+          echo "cosign sign-blob: signed ${UKI}"
+          echo "  signature:   ${UKI}.sig"
+          echo "  certificate: ${UKI}.cert"
+          echo "  bundle:      ${UKI}.cosign.bundle"
+
+      - name: Upload the blackbox UKI + cosign provenance as a workflow artifact
+        if: steps.guard.outputs.pins_resolved == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blackbox-uki-signed-${{ github.sha }}
+          path: packer/kbs-uki/uki/output/
+          if-no-files-found: error

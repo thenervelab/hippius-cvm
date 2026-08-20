@@ -1,0 +1,109 @@
+#!/bin/sh
+# `hippius-net-teardown` — initramfs-tools `init-bottom` script
+# (`/scripts/init-bottom/hippius-net-teardown` inside the staged
+# initrd). Runs at the very end of the distro initramfs, just before
+# `switch_root` hands over to the tenant's PID-1.
+#
+# Why this exists (#289)
+# ----------------------
+# The distro initramfs brings up the NIC via `IP=dhcp` in
+# `/etc/initramfs-tools/initramfs.conf` (set at bake time by
+# `scripts/tenant-image-bake.sh`) so the `hippius-luks-keyscript` can
+# reach KBS. That DHCP client (`udhcpc` or `isc-dhcp-client`,
+# depending on what `scripts/initramfs/hippius-luks-hook` could stage
+# from the bake host) gets a lease and applies it to the interface.
+# The kernel netdev state — IP, default route, link-UP — lives at
+# the netdev, NOT at the DHCP process. `switch_root` `execve(2)`s the
+# guest init, but the netdev state SURVIVES the pivot.
+#
+# Then userspace cloud-init / systemd-networkd / netplan starts and
+# runs ITS OWN DHCP on the same NIC. dnsmasq, having an active lease
+# for that MAC, hands back the same (or a different) IP; the kernel
+# quietly appends it to the interface as `secondary`. End state — the
+# 2026-05-30 BYO tenant smoke (post-#277):
+#
+#     2: enp1s0:
+#        inet 192.168.122.253/24 scope global enp1s0        ← initramfs
+#        inet 192.168.122.85/24 metric 100 ... secondary     ← cloud-init
+#
+# This script tears the initramfs-side state down so userspace's
+# network manager starts clean.
+#
+# initramfs-tools contract
+# ------------------------
+# - `PREREQ=""` — no inter-script ordering dependencies. `init-bottom`
+#   scripts run AFTER cryptsetup-initramfs has opened the root LUKS
+#   volume and BEFORE the `init-bottom`'s `udev` stop step, so the
+#   interface and the kernel device-mapper state we touch here are
+#   both fully present.
+# - `prereqs` invocation must echo `$PREREQ` and exit 0.
+#
+# Why flush + route-delete instead of `link down`/`link up`
+# ---------------------------------------------------------
+# Setting the link `down` here would force userspace to re-`SET LINK
+# UP`, which on virtio_net has a small registration race (the same
+# one `binaries/agent-initramfs/src/stages/network.rs`
+# `netlink_set_link_up_retry` already chased on the legacy path).
+# Leaving the link UP avoids that race; flushing the IPv4 addresses
+# + the default route on the link is enough — cloud-init's network
+# bring-up doesn't care about pre-existing link state, only address
+# state.
+#
+# Idempotence + safety
+# --------------------
+# - Every `ip` call is `|| true`-guarded so a missing-by-design state
+#   (no default route, no addr) is not an error.
+# - Loopback is skipped explicitly so we never tear down `127.0.0.1`.
+# - Only IPv4 (`ip -4`) is touched — the bake doesn't bring up IPv6
+#   in initramfs.
+# - The script logs to stderr (forwarded to `/dev/kmsg`) so a future
+#   debug session can see which interface(s) it touched.
+
+PREREQ=""
+
+case "${1:-}" in
+    prereqs)
+        echo "$PREREQ"
+        exit 0
+        ;;
+esac
+
+. /scripts/functions
+
+# `ip` is staged by the bake's `hippius-luks-hook` into the initrd at
+# `/sbin/ip` (or `/usr/sbin/ip`, whichever the host has). Fail-quiet
+# if it's somehow not present — we'd rather leave the lease in place
+# than crash `init-bottom` and prevent `switch_root`.
+IP=
+for candidate in /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip; do
+    if [ -x "$candidate" ]; then
+        IP="$candidate"
+        break
+    fi
+done
+
+if [ -z "$IP" ]; then
+    log_warning_msg "hippius-net-teardown: ip(8) not found in initrd; skipping"
+    exit 0
+fi
+
+# Walk every non-loopback interface. Filtering to "interfaces that
+# have a global-scope IPv4 address" instead would also work, but the
+# `ip addr flush` semantics already no-op on an interface with no
+# addresses, so the simpler loop is fine.
+for iface in /sys/class/net/*; do
+    name="${iface##*/}"
+    if [ "$name" = "lo" ]; then
+        continue
+    fi
+    if [ ! -d "$iface" ]; then
+        # /sys/class/net/* with no match → glob is literal; bail.
+        continue
+    fi
+    log_begin_msg "hippius-net-teardown: flushing IPv4 state on $name"
+    "$IP" -4 route flush dev "$name" 2>/dev/null || true
+    "$IP" -4 addr  flush dev "$name" 2>/dev/null || true
+    log_end_msg
+done
+
+exit 0

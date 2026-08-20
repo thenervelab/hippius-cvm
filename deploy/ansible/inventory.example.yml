@@ -1,0 +1,57 @@
+---
+# EXAMPLE Ansible inventory — copy to `inventory.yml` and fill in.
+#
+#     cp inventory.example.yml inventory.yml
+#
+# `ansible.cfg` sets `inventory = inventory.yml`, and `inventory.yml` is
+# git-ignored (see `.gitignore`) because a real inventory is your own
+# infrastructure identity — hostnames, public IPs, SSH users. Keep it
+# out of any repository you publish. Same rule as
+# `deploy/terraform/terraform.tfvars.example`.
+#
+# Everything below uses placeholders that CANNOT be mistaken for real
+# config: `<...>` for values you must replace, and the RFC 5737
+# documentation range `192.0.2.0/24` for addresses.
+
+all:
+  children:
+    # ── cc_nodes ─────────────────────────────────────────────────────
+    # SEV-SNP capable nodes that form the confidential-compute control
+    # plane: k3s + KBS + the Argo CD GitOps stack in `deploy/gitops/`.
+    # These are TRUSTED hosts. Bootstrapped by `playbooks/site.yml`.
+    #
+    # Per-host settings (private-network bond MACs, data RAID devices)
+    # live in `host_vars/<hostname>.yml` — see
+    # `host_vars/cc-node.example.yml` for the schema.
+    cc_nodes:
+      hosts:
+        # Replace `<CC_NODE_HOSTNAME>` with your own name for the box.
+        # The name is what Ansible looks up in `host_vars/`.
+        <CC_NODE_HOSTNAME>:
+          # Reachable address for the first run (a public IP, or a mesh
+          # address once the host has joined). RFC 5737 placeholder.
+          ansible_host: 192.0.2.10
+          ansible_user: <SSH_USER>
+          ansible_ssh_private_key_file: ~/.ssh/<YOUR_SSH_KEY>
+
+    # ── general_workers ──────────────────────────────────────────────
+    # Non-confidential cluster workloads. Empty by default.
+    general_workers:
+      hosts: {}
+
+    # ── miner_nodes ──────────────────────────────────────────────────
+    # The UNTRUSTED miner fleet: SEV-SNP bare-metal hypervisors that run
+    # tenant CVMs. A miner joins the NetBird mesh but is NOT a k3s node,
+    # is NOT on the control plane's private network, and NEVER touches
+    # Vault. Bootstrapped by `playbooks/06-miner-bootstrap.yml` with the
+    # separate trust profile in `group_vars/miner_nodes.yml`.
+    #
+    # Connection vars live in `host_vars/<hostname>.yml` — see
+    # `host_vars/miner.example.yml` for the schema. To add a miner: copy
+    # that example to `host_vars/<your-hostname>.yml`, fill it in, list
+    # the hostname here, and run
+    # `06-miner-bootstrap.yml --limit <your-hostname>` (see README).
+    miner_nodes:
+      hosts:
+        <MINER_HOSTNAME_1>: {}
+        # <MINER_HOSTNAME_2>: {}

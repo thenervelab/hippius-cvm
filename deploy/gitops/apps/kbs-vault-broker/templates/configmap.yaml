@@ -1,0 +1,80 @@
+---
+# Broker config — rendered into `config.toml`. #102 PR C.
+#
+# The `hippius-kbs-vault-broker` binary loads exactly one TOML file
+# (argv[1]); every key maps to a `[section]` of its config schema
+# (binaries/kbs-vault-broker/src/config.rs). Every struct is
+# `deny_unknown_fields` — a stray key fails the pod closed.
+#
+# No secret value lives in this ConfigMap. The privileged Vault token
+# is the BROKER_VAULT_TOKEN env var (ExternalSecret); the VEK is a
+# mounted Secret file. The launch-policy integers are quoted strings
+# in values.yaml for the same Helm-float64 reason documented in the
+# KBS chart's values.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbs-vault-broker-config
+  namespace: kbs
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    # Top-level key — MUST precede every [section] (TOML scoping rule:
+    # placed later it would parse as a member of the preceding table
+    # and fail the `deny_unknown_fields` boot gate). Accepted KBS
+    # launch measurements; empty ⇒ the broker mints nothing
+    # (fail-closed) until the live measurement is pinned.
+    kbs_measurement_allowlist = [
+    {{- range .Values.kbsMeasurementAllowlist }}
+      "{{ . }}",
+    {{- end }}
+    ]
+
+    [listen]
+    addr = "0.0.0.0:{{ .Values.config.listenPort }}"
+    {{- if .Values.tls.enabled }}
+    # RA-KBS-M1 — serve the challenge/redeem transport over TLS. Both
+    # paths present ⇒ the broker installs the ring provider and binds
+    # rustls; the KBS pins this exact leaf. Mounted from the broker-tls
+    # Secret (external-secret-tls.yaml).
+    tls_cert_path = "/etc/kbs-vault-broker/tls/tls.crt"
+    tls_key_path = "/etc/kbs-vault-broker/tls/tls.key"
+    {{- end }}
+
+    [vault]
+    address = "{{ .Values.vault.address }}"
+    kv_mount = "{{ .Values.vault.kvMount }}"
+    child_token_ttl_secs = {{ .Values.vault.childTokenTtlSecs }}
+    token_role = "{{ .Values.vault.tokenRole }}"
+    {{- if .Values.vault.caCertPath }}
+    # PROD: verify the Vault server cert against the mounted CA bundle.
+    ca_cert_path = "{{ .Values.vault.caCertPath }}"
+    {{- else if .Values.vault.devSkipTlsVerify }}
+    # ⚠️  EXPLICIT non-production opt-in (audit H7) — the TLS skip below is
+    # default-DENY unless this is set AND vault.address is a loopback/private
+    # endpoint. A prod config never sets it.
+    dev_environment = true
+    # ⚠️  DEV-ONLY override that skips TLS server-cert verification on the
+    # Vault client. Fail-closed: refused unless dev_environment=true AND
+    # vault.address is a loopback/private endpoint.
+    dev_skip_tls_verify = true
+    {{- end }}
+
+    [snp]
+    generation = "{{ .Values.snp.generation }}"
+    {{- if .Values.snp.kdsUrl }}
+    kds_url = "{{ .Values.snp.kdsUrl }}"
+    {{- end }}
+    {{- if .Values.snp.mountedVekFallback }}
+    # Dev fallback only — the broker prefers the report-carried VEK.
+    vek_pem_path = "/etc/broker-vek/vek.pem"
+    {{- end }}
+
+    [policy]
+    min_tcb = {{ .Values.config.launchPolicy.minTcb }}
+    required_bits = {{ .Values.config.launchPolicy.requiredBits }}
+    allowed_mask = {{ .Values.config.launchPolicy.allowedMask }}
+
+    [challenge]
+    ttl_secs = {{ .Values.config.challengeTtlSecs }}

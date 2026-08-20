@@ -1,0 +1,61 @@
+---
+# KBS public ingress — exposes `kbs.hippius.network` for tenant guest
+# initramfs traffic. PR `ops/kbs-public-ingress`, §K (#54).
+#
+# Tenant guests boot via initramfs BEFORE joining the NetBird mesh
+# (the setup-key is in the sealed user-data, which only releases after
+# attestation). So they need a publicly-resolvable DNS pointing at a
+# reachable endpoint. The cmdline-baked `hippius.kbs_url=
+# https://kbs.hippius.network` is what they hit.
+#
+# DNS-side: a public A record for `publicIngress.hostname` pointing at
+# the ingress-nginx LoadBalancer address (MetalLB, out of the addon's
+# pool), in DNS-only mode — a CDN cannot proxy a private IP. The name
+# is publicly resolvable but the address is only reachable via the
+# NetBird subnet route advertised to the `miner` group; tenant guests
+# transit via their miner host's wt0 interface (libvirt NAT → host
+# route table).
+#
+# TLS cert: cert-manager Certificate is provisioned by the
+# `letsencrypt-prod-cloudflare` ClusterIssuer (DNS-01 via the
+# Cloudflare API token secret `cloudflare-api-token-secret` in
+# `cert-manager` namespace). The cert covers ONLY this hostname —
+# wildcards / SANs are a follow-up if more KBS hostnames land.
+#
+# Backend: plain HTTP to `kbs-server.kbs.svc:{{ .Values.config.listenPort }}`.
+# The KBS binary itself terminates no TLS — nginx-ingress is the TLS
+# boundary. The release path's cryptographic integrity (SNP report +
+# §22 allowlist + L1 sig verification) is end-to-end and does NOT
+# depend on this TLS termination layer.
+{{- if .Values.publicIngress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kbs-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.publicIngress.clusterIssuer | quote }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Tenant release payloads are small (HPKE-wrapped envelopes for a
+    # LUKS KEK + sealed user-data); 1 MiB cap is comfortable headroom.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: {{ .Values.publicIngress.ingressClassName | quote }}
+  tls:
+    - hosts:
+        - {{ .Values.publicIngress.hostname | quote }}
+      secretName: {{ printf "%s-tls" (.Values.publicIngress.hostname | replace "." "-") | quote }}
+  rules:
+    - host: {{ .Values.publicIngress.hostname | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kbs-server
+                port:
+                  number: {{ .Values.config.listenPort }}
+{{- end }}

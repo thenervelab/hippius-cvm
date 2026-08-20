@@ -1,0 +1,36 @@
+################################################################################
+#                                                                              #
+#   ⚠  THIS IDBLOCK IS A PLACEHOLDER — DO NOT TRUST IN PRODUCTION  ⚠           #
+#                                                                              #
+################################################################################
+
+`idblock.bin` and `id-auth.bin` in this directory are ALL-ZERO placeholders.
+
+They are NOT a real AMD SEV-SNP launch policy. They are signed by NO author
+key. A guest launched with these blocks has an UNAUTHENTICATED ID block: the
+hypervisor cannot prove the launch was authorised by the image owner.
+
+## Why this file exists — the third belt
+
+PR-F2 used the `measurement_kind` tag ("uki_sha384") as the "not for
+production" signal. PR-F3 legitimately reaches `measurement_kind =
+"snp_launch_digest_v1"` — the real launch digest — so that belt no longer
+flags a dev build.
+
+This marker file IS the replacement belt. While it exists next to an all-zero
+`idblock.bin`, the SEV-SNP launch is dev-only:
+
+  1. `measurement_kind` — the §22 ceremony signer still refuses to sign any
+     allowlist entry whose kind is not `snp_launch_digest_v1`.
+  2. **THIS FILE** — a real production turn-up MUST replace the placeholder
+     blocks with a real, signed launch policy and DELETE this marker. A
+     reviewer seeing this file deleted without a real IDBLOCK landing
+     alongside it is looking at the diff that breaks the production posture.
+  3. PR-F4 provenance — the signed provenance map records the IDBLOCK digest,
+     so an all-zero block reaching the §22 path is visible out-of-band too.
+
+## Producing a real IDBLOCK
+
+The real IDBLOCK binds the launch policy + the expected measurement and is
+signed by an **author key**. Provisioning that key (custody, ceremony) is a
+separate future PR — see `README.md`. Do not improvise it here.

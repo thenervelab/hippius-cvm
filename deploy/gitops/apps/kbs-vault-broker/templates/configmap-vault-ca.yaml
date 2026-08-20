@@ -1,0 +1,23 @@
+{{- if .Values.vault.caCert }}
+---
+# Vault CA bundle (PEM) — PROD TLS pin (#102 follow-up).
+#
+# The broker verifies the Vault server cert against EXACTLY this CA
+# instead of the dev `dev_skip_tls_verify` skip. A CA / server
+# certificate is PUBLIC, not a secret.
+#
+# OPERATOR-SET, rendered from `.Values.vault.caCert` and mounted
+# read-only at `.Values.vault.caCertPath`. Its SAN must match how
+# `vault.address` names the server: pinning by IP requires an IP SAN.
+# Empty ⇒ this ConfigMap is not rendered.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbs-vault-broker-vault-ca
+  namespace: kbs
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+data:
+  ca.pem: |
+    {{- .Values.vault.caCert | nindent 4 }}
+{{- end }}

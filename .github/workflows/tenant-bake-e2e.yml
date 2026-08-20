@@ -1,0 +1,216 @@
+name: tenant-bake-e2e
+
+# Nightly end-to-end BAKE test across the full multi-OS matrix. Runs the
+# published baker image's `tenant-image-bake.sh` against each supported
+# cloud image with a throwaway random KEK and asserts the encrypted
+# artifacts (LUKS2 + dm-integrity header, kernel, initrd, measurement).
+#
+# This is the bake half of the chain only — it needs no SNP hardware, no
+# Vault, no S3, no KBS. The attested-launch half is validated live on
+# miner-1 (see docs/operator/byo-base-os-bake-runbook.md). The dracut
+# module's kernel-module coverage has its own gate (dracut-module.yml);
+# this workflow proves the chroot + package install + initramfs build +
+# LUKS encrypt actually completes per distro and yields a mountable,
+# integrity-protected header.
+#
+# Self-maintaining: each leg downloads the (moving) cloud image, computes
+# its sha256 at runtime, and feeds that to the bake's mandatory
+# `--base-image-sha256` gate. The point is to exercise the bake
+# MECHANISM, not to pin production bytes (that pinning lives in the
+# operator runbook + the §22 allowlist).
+#
+# The `latest/` / `current/` URLs below are therefore DELIBERATE and are
+# the one legitimate use of a moving pointer: no hash is pinned against
+# them (the sha is derived from the bytes just fetched) and the baker is
+# handed a local `file://`, so nothing here can contradict a pin. Vali's
+# intake refuses moving URLs precisely because a bake row DOES pin one
+# (register #48) — do not "fix" these to dated URLs; that would silently
+# stop testing against the images tenants actually get.
+
+on:
+  workflow_dispatch:
+    inputs:
+      distros:
+        description: "Comma-separated subset to run (blank = all)"
+        required: false
+        default: ""
+  schedule:
+    # 03:30 UTC nightly — after the day's merges have published a fresh
+    # `:latest` baker image.
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: tenant-bake-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMG: ghcr.io/thenervelab/hippius-tenant-baker:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: ubuntu
+            url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+            family: debian
+          - id: debian
+            label: debian-12
+            url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+            family: debian
+          - id: debian
+            label: debian-13
+            url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+            family: debian
+          - id: centos
+            label: centos-stream-10
+            url: "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2"
+            family: rhel
+          - id: fedora
+            label: fedora-43
+            url: "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+            family: rhel
+    name: bake ${{ matrix.label || matrix.id }}
+    steps:
+      - name: Skip if not in requested subset
+        id: gate
+        run: |
+          want='${{ github.event.inputs.distros }}'
+          me='${{ matrix.label || matrix.id }}'
+          if [ -n "$want" ] && ! echo ",$want," | grep -q ",$me,"; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skip: $me not in '$want'"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.run == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Reclaim runner disk (the bake's raw+LUKS need ~30 GiB)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          # `/mnt` is NOT a separate disk on this runner image — it shares
+          # `/` (72 GiB total, only ~17 GiB free). The bake's intermediate
+          # raw + 10 GiB LUKS output overflow that, so drop the preinstalled
+          # SDKs/toolchains we don't use (~25 GiB).
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/share/swift "${AGENT_TOOLSDIRECTORY:-}" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "after:"; df -h /
+
+      - name: Prepare host (loop + nbd modules, work area)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo modprobe nbd max_part=8 || true
+          sudo modprobe loop || true
+          sudo mkdir -p /mnt/e2e/work /mnt/e2e/out /mnt/e2e/tmp
+          sudo chmod 777 /mnt/e2e /mnt/e2e/work /mnt/e2e/out /mnt/e2e/tmp
+
+      - name: Download base image + compute sha256
+        if: steps.gate.outputs.run == 'true'
+        id: img
+        run: |
+          set -euo pipefail
+          dest="/mnt/e2e/work/base.img"
+          echo "fetching ${{ matrix.url }}"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$dest" "${{ matrix.url }}"
+          sha=$(sha256sum "$dest" | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "base image sha256=$sha ($(du -h "$dest" | cut -f1))"
+
+      - name: Bake (random throwaway KEK, baker:latest)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          docker pull "$IMG"
+          # 32-byte throwaway KEK as a FILE (not stdin) — keeps the bake's
+          # stdin clean (a piped KEK collides with the chroot heredoc) and
+          # the file lives on the mounted big disk, never persisted beyond
+          # the run.
+          head -c 32 /dev/urandom > /mnt/e2e/work/kek.bin
+          # WORK_DIR (the bake's mktemp) follows /tmp → bind /tmp to the
+          # big disk so the ~30 GiB intermediate raw doesn't fill `/`.
+          docker run --rm --privileged \
+            -v /dev:/dev \
+            -v /mnt/e2e/work:/work \
+            -v /mnt/e2e/out:/out \
+            -v /mnt/e2e/tmp:/tmp \
+            --entrypoint /usr/local/bin/tenant-image-bake.sh \
+            "$IMG" \
+            --base-image-url "file:///work/base.img" \
+            --base-image-sha256 "${{ steps.img.outputs.sha256 }}" \
+            --hippius-release-bin /usr/sbin/hippius-guest-release \
+            --hippius-vsock-bin /usr/sbin/hippius-vsock-ticket \
+            --distro "${{ matrix.id }}" \
+            --output-dir /out \
+            --output-qcow2-gb 10 \
+            --kek-source file --kek-file /work/kek.bin \
+            > /mnt/e2e/out/bake.json
+          shred -u /mnt/e2e/work/kek.bin || rm -f /mnt/e2e/work/kek.bin
+          echo "=== bake JSON ==="
+          cat /mnt/e2e/out/bake.json
+
+      - name: Assert artifacts + LUKS2/integrity header
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -uo pipefail   # NOT -e: the asserts handle their own failures
+          OUT="/mnt/e2e/out"
+          fail() { echo "ASSERT FAIL: $1" >&2; exit 1; }
+
+          # 1. bake JSON shape. The bake emits a PRETTY-PRINTED (multi-line)
+          #    object on stdout; slice from the first `{` to its closing `}`
+          #    so any stray stderr-leak before/after is dropped.
+          sed -n '/^{/,/^}/p' "$OUT/bake.json" > "$OUT/bake.obj.json"
+          jq -e . "$OUT/bake.obj.json" >/dev/null 2>&1 || fail "bake stdout is not valid JSON"
+          jq -e '.luks_version == 2' "$OUT/bake.obj.json" >/dev/null || fail "luks_version != 2"
+          for k in qcow2_sha256 kernel_sha256 initrd_sha256 luks_header_sha256; do
+            jq -e --arg k "$k" '.[$k] | test("^[0-9a-f]{64}$")' "$OUT/bake.obj.json" >/dev/null \
+              || fail "bake.$k not 64-hex"
+          done
+          qcow2=$(jq -re '.qcow2_path' "$OUT/bake.obj.json")
+          echo "bake JSON OK (luks_version=2, all shas 64-hex)"
+
+          # 2. the four artifacts land under /out (host-mapped)
+          base=$(basename "$qcow2" .qcow2)
+          for ext in qcow2 vmlinuz initrd.img measurement.json; do
+            f="$OUT/${base}.${ext}"
+            [ -s "$f" ] || fail "missing/empty artifact: ${base}.${ext}"
+          done
+          echo "artifacts present for ${base}"
+
+          # 3. measurement.json carries the §296 header sha + kernel/initrd shas
+          m="$OUT/${base}.measurement.json"
+          for k in luks_header_sha256 kernel_sha256 initrd_sha256; do
+            jq -e --arg k "$k" '.[$k] | test("^[0-9a-f]{64}$")' "$m" >/dev/null \
+              || fail "measurement.$k not 64-hex"
+          done
+          jq -e '.luks_version == 2' "$m" >/dev/null || fail "measurement luks_version != 2"
+
+          # 4. independently confirm the on-disk qcow2 is a LUKS2 +
+          #    dm-integrity container. The runner has no qemu-nbd/cryptsetup,
+          #    so run the attach + luksDump INSIDE the baker image (which
+          #    ships both) — privileged + /dev for the nbd device.
+          dump=$(docker run --rm --privileged -v /dev:/dev -v "$OUT:/out" \
+            --entrypoint sh "${{ env.IMG }}" -c '
+              qemu-nbd --connect=/dev/nbd0 --read-only -f qcow2 "/out/'"${base}"'.qcow2" || exit 50
+              sleep 1
+              cryptsetup luksDump /dev/nbd0
+              rc=$?
+              qemu-nbd --disconnect /dev/nbd0 >/dev/null 2>&1 || true
+              exit $rc
+            ' 2>&1 || true)
+          echo "$dump" | grep -q "Version:.*2" || { echo "$dump" | tail -20; fail "qcow2 is not LUKS2"; }
+          echo "$dump" | grep -qiE "integrity:.*hmac" || { echo "$dump" | tail -20; fail "LUKS2 header lacks dm-integrity (hmac)"; }
+          echo "LUKS2 + dm-integrity header verified for ${base}"
+
+          echo "E2E BAKE OK: ${{ matrix.label || matrix.id }}"

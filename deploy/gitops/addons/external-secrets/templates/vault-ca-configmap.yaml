@@ -1,0 +1,42 @@
+{{- if .Values.vault.caCert }}
+---
+# Vault CA bundle — PR-K11, §K (#54).
+#
+# When the Vault server presents a PRIVATE / self-signed TLS certificate,
+# this ConfigMap carries the CA that signed it and the `hippius-vault`
+# ClusterSecretStore references it via `caProvider`, so ESO verifies the
+# Vault TLS connection against exactly that CA. TLS verification is
+# ENABLED, never `tls-skip-verify` (locked invariant).
+#
+# A CA / server certificate is PUBLIC, not a secret — putting one in a
+# values file is correct. Only the Vault *credential* is a secret, and
+# there isn't one: the store authenticates with a short-lived projected
+# ServiceAccount JWT (see clustersecretstore.yaml + README.md).
+#
+# Rendered from `.Values.vault.caCert`. Empty ⇒ this ConfigMap is not
+# rendered and `caProvider` is omitted, which is the right shape for a
+# Vault fronted by a publicly-trusted certificate.
+#
+# ⚠️  Certificates expire. ESO fails closed on an expired CA, so check
+# the validity window (`openssl x509 -noout -dates`) and regenerate this
+# value together with the Vault TLS material. The README documents the
+# expiry check.
+#
+# `sync-wave: "1"` — applied after the ESO chart (CRDs + operator, wave
+# 0) and before the ClusterSecretStore (wave 2) that consumes it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: vault-ca
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: vault-ca
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+data:
+  ca.crt: |
+    {{- .Values.vault.caCert | nindent 4 }}
+{{- end }}

@@ -1,0 +1,134 @@
+---
+# Nightly Postgres → Hippius S3 backup. PR-K7, §K (#54).
+#
+# Two containers, both upstream + digest-pinned, both non-root, NO
+# runtime package install:
+#  - initContainer `pg-dump` (the postgres image) writes a gzipped dump
+#    to a shared emptyDir;
+#  - container `s3-upload` (the official aws-cli image) copies it to
+#    the `backups/` prefix of the operator's `hippius-compute-images`
+#    bucket on Hippius S3 (no separate backups bucket is provisioned;
+#    the operator creds cannot CreateBucket — provisioning is
+#    out-of-band, see values.yaml `backup.s3Bucket`).
+#
+# Retention is by `successfulJobsHistoryLimit`; a failed run is retried
+# (`backoffLimit`) and kept for inspection (`failedJobsHistoryLimit`).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: vali-postgres-backup
+    app.kubernetes.io/component: postgres-backup
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  # Never overlap a slow backup with the next tick.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/name: vali-postgres-backup
+            app.kubernetes.io/component: postgres-backup
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          # ── pg_dump → shared emptyDir ───────────────────────────────
+          initContainers:
+            - name: pg-dump
+              image: {{ .Values.postgres.image | quote }}
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  set -eo pipefail
+                  echo "pg_dump postgres/{{ .Values.postgres.database }} → /backup/dump.sql.gz"
+                  pg_dump --no-owner --no-acl \
+                    -h postgres -U {{ .Values.postgres.user }} {{ .Values.postgres.database }} \
+                    | gzip > /backup/dump.sql.gz
+                  # Fail closed: `pipefail` aborts on a pg_dump error;
+                  # these catch a truncated / corrupt artifact before it
+                  # is ever uploaded.
+                  test -s /backup/dump.sql.gz
+                  gzip -t /backup/dump.sql.gz
+                  ls -l /backup/dump.sql.gz
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: password
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+          # ── upload the dump to Hippius S3 ───────────────────────────
+          containers:
+            - name: s3-upload
+              image: {{ .Values.backup.awsCliImage | quote }}
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  ts=$(date -u +%Y%m%d-%H%M%S)
+                  key="backups/vali/postgres/vali-${ts}.sql.gz"
+                  echo "aws s3 cp /backup/dump.sql.gz → s3://{{ .Values.backup.s3Bucket }}/${key}"
+                  aws s3 cp /backup/dump.sql.gz \
+                    "s3://{{ .Values.backup.s3Bucket }}/${key}" \
+                    --endpoint-url {{ .Values.backup.s3Endpoint }}
+                  echo "backup uploaded OK"
+              env:
+                # aws-cli writes to ~/.aws even with env-var creds —
+                # point HOME at the writable emptyDir (read-only rootfs).
+                - name: HOME
+                  value: /tmp
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-s3
+                      key: access-key
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-s3
+                      key: secret-key
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backup
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: tmp
+              emptyDir:
+                sizeLimit: 100Mi

@@ -1,0 +1,50 @@
+[package]
+name = "hippius-agent-keepalive"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Long-running guest daemon (#322 Phase B): inside a tenant SEV-SNP CVM, periodically asks `/dev/sev-guest` for a fresh SNP report bound to `(nonce, vm_id)` and POSTs it to KBS `/v1/attest/keepalive`. KBS verifies + signs an on-chain LiveAttestation the validator submits to pallet-compute-scoring::submit_live_attestation. The in-VM agent IS the trust anchor — a miner host cannot fake what the kernel reports through SNP, and KBS will not sign a report it cannot verify against AMD silicon root + §22 allowlist. A miner that lets a VM go down stops producing attestations + loses uptime weight for that epoch."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-agent-keepalive"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_agent_keepalive"
+path = "src/lib.rs"
+
+[dependencies]
+# Re-use the §20 `/dev/sev-guest` SNP report provider + the
+# `ReqwestHttpClient` already wired in `agent-initramfs`. Pulls in
+# the same `SnpReportProvider` trait + `MockSnpReportProvider`
+# (cfg(not(target_os="linux"))) so the keepalive agent is cross-
+# platform testable.
+hippius-agent-initramfs = { path = "../agent-initramfs" }
+hippius-types = { path = "../../hippius-types" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+thiserror = "2"
+# Same `rustls-tls` + `http2` posture as the other guest binaries —
+# blocking client, kept dep-light. The KBS endpoint is HTTP/1.1 +
+# HTTP/2; `rustls` floor at TLS 1.3.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
+# §23 — the synchronous `AF_VSOCK` client the keepalive agent uses to
+# push its KBS-signed live attestation to the host miner-agent (which
+# relays it to the Edge → vali's uptime-coverage ingest). `AF_VSOCK` is
+# Linux-only, so the crate is target-gated exactly like the tenant
+# telemetry agent's pusher: a non-Linux dev host still builds + tests
+# the frame encoding (generic over `std::io::Write`); only the dial is
+# Linux. A thin synchronous wrapper — no async runtime is added to the
+# measured guest TCB.
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
+
+[dev-dependencies]
+tempfile = "3"

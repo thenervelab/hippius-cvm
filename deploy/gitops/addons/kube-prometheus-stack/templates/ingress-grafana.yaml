@@ -1,0 +1,55 @@
+---
+# Grafana Ingress — `grafana.hippius.network`. PR-K14, §K (#54), issue #128.
+#
+# Operators reach Grafana over the NetBird mesh only — same access
+# model as every other in-cluster UI in this fleet. Two layers gate
+# external access:
+#
+#   1. `loadBalancerSourceRanges` on the ingress-nginx Service pins its
+#      MetalLB-allocated LB IP to the NetBird CGNAT range
+#      `100.64.0.0/10` (PR-K3 ingress-nginx values + the addon's
+#      defense-in-depth doc on MetalLB L2 LB IP rules).
+#   2. The `whitelist-source-range` annotation here re-asserts the
+#      CGNAT range at the nginx layer so a misconfigured LB does not
+#      silently expose Grafana.
+#
+# TLS termination is at the ingress (cert-manager Certificate resolved
+# from the `letsencrypt-prod-cloudflare` ClusterIssuer — same pattern
+# as KBS's public ingress, since the hostname is publicly resolvable
+# but the LB IP is private-only reachable via NetBird). Public DNS
+# carries `grafana.hippius.network` → that LB IP in DNS-only mode.
+#
+# Backend is the chart's Grafana Service (`kube-prometheus-stack-grafana`
+# — the `fullnameOverride` in ../values.yaml gives that stable name).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: dashboard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod-cloudflare
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Defense-in-depth — restrict at the nginx layer to NetBird CGNAT.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "100.64.0.0/10"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - grafana.hippius.network
+      secretName: grafana-hippius-network-tls
+  rules:
+    - host: grafana.hippius.network
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-grafana
+                port:
+                  number: 80

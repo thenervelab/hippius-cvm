@@ -1,0 +1,107 @@
+{{- if .Values.syntheticMonitor.light.enabled }}
+---
+# Synthetic monitor — LIGHT tier (apps.synthetic). Read-only fleet health
+# every ~15 min: vali API + KBS reachable, dispatchable == on-chain-active,
+# host-attestor coverage, dynamic-capacity sane (a fabricated over-report
+# cannot inflate it), no stuck launch/decommission jobs, epoch readable.
+# Launches NOTHING — it only reads the DB + does HTTP liveness probes and
+# pushes result metrics to the Pushgateway. Same image/env/identity as the
+# vali web pod (DB + chain-RPC egress via `vali.valiSelector`).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: synthetic-monitor-light
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: synthetic-monitor-light
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.syntheticMonitor.light.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: synthetic-monitor-light
+            # Postgres CNP :5432 ingress + chain-RPC egress on the vali
+            # identity (mirrors host-attestor-reconcile / scheduler-reeval).
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: synthetic-monitor-light
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_synthetic_monitor", "--tier", "light"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+                # Vault: the backstop REAPER force-erases (transit key + KV)
+                # + destroys any synthetic VM a killed run leaked, so it
+                # needs the same Vault access as the full tier's teardown.
+                {{- include "vali.vaultStaticTokenEnv" . | nindent 16 }}
+                {{- include "vali.vaultAuthEnv" . | nindent 16 }}
+                - name: VALI_VAULT_ADDR
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-vault
+                      key: address
+              resources:
+                {{- .Values.syntheticMonitor.light.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                {{- include "vali.vaultTokenVolumeMount" . | nindent 16 }}
+                {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 16 }}
+                - name: tmp
+                  mountPath: /tmp
+                - name: vault-ca
+                  mountPath: /etc/hippius/vault-ca
+                  readOnly: true
+          volumes:
+            {{- include "vali.vaultTokenVolume" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolume" . | nindent 12 }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+            - name: vault-ca
+              configMap:
+                name: vault-ca
+{{- end }}

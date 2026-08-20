@@ -1,0 +1,31 @@
+{{- if .Values.admin.enabled }}
+---
+# KBS admin Service — internal-only (§24/§25 lifecycle pre-registration).
+#
+# `ClusterIP` and SEPARATE from the public `kbs-server` Service: the
+# admin endpoint mutates lifecycle state and MUST NOT be reachable from
+# the public Ingress (`kbs.hippius.network`). The CiliumNetworkPolicy
+# (`networkpolicy.yaml`) restricts ingress to the vali pod only —
+# auth is the L1-signed OrderTicket in the request body, network ACL
+# is belt #2.
+#
+# DNS name: `kbs-server-admin.kbs.svc:8001`. vali's `kbs-admin-client`
+# subprocess hits this URL.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbs-server-admin
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: key-broker-admin
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "kbs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: admin
+      port: {{ .Values.admin.listenPort }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

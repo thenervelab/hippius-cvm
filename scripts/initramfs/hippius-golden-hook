@@ -1,0 +1,97 @@
+#!/bin/sh
+# `hippius-golden-hook` — initramfs-tools hook (golden-bake PR3),
+# installed at `/etc/initramfs-tools/hooks/hippius-golden` by
+# `scripts/tenant-image-bake.sh` ONLY when `--disk-mode
+# golden_verity_overlay`. It stages the GOLDEN-mode additions on top of
+# what `hippius-luks-hook` already stages (the shared §21 release
+# tooling: hippius-guest-release, hippius-vsock-ticket, curl, the CA
+# bundle, network tools, the SEV-SNP module chain, dm_integrity, ext4):
+#
+#   - the golden overlay library `/lib/hippius/hippius-golden-overlay.sh`,
+#   - the initramfs-tools boot script `/scripts/hippius-golden`
+#     (selected by the measured `boot=hippius-golden` cmdline token),
+#   - `veritysetup` + `mkfs.ext4` (+ deps) for the dm-verity lower open
+#     and the first-boot upper format,
+#   - the `dm_verity`, `overlay`, `squashfs` kernel modules.
+#
+# Legacy (`legacy_luks`) images never install this hook → their initrd
+# is byte-identical.
+#
+# §20: this hook NEVER touches plaintext secrets — it only stages
+# binaries, the overlay library, and the boot script.
+
+set -eu
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# ── Golden kernel modules ───────────────────────────────────────────
+# dm_verity: the RO golden lower open. overlay: overlayfs root.
+# squashfs: the golden rootfs.img filesystem. (dm_integrity + ext4 for
+# the guest-keyed upper are already staged by hippius-luks-hook.)
+for mod in dm_mod dm_verity overlay squashfs; do
+    manual_add_modules "$mod" 2>/dev/null || true
+done
+
+# ── Golden tooling ──────────────────────────────────────────────────
+# veritysetup: opens the dm-verity lower. mkfs.ext4: lays down the
+# first-boot filesystem on the guest-keyed upper. cryptsetup itself is
+# already staged by cryptsetup-initramfs.
+for bin in /usr/sbin/veritysetup /sbin/veritysetup \
+           /usr/sbin/mkfs.ext4 /sbin/mkfs.ext4 \
+           /usr/sbin/cryptsetup /sbin/cryptsetup \
+           /sbin/blockdev /usr/sbin/blockdev; do
+    if [ -x "$bin" ]; then
+        copy_exec "$bin"
+    fi
+done
+
+# ── busybox-shadow-proof mkfs.ext4 (first-boot upper format) ─────────
+# The `copy_exec` above stages `mkfs.ext4` at its stock path, but that is
+# NOT enough on distros whose busybox ships an `mke2fs` applet (Debian
+# trixie does). The `0_busybox` hook runs BEFORE this one and installs
+# busybox as `/usr/sbin/mke2fs`; `copy_exec`/`copy_file` is idempotent
+# (skips an already-present target — hook-functions `copy_file`) so the
+# REAL e2fsprogs `mke2fs` never lands, and `mkfs.ext4 -> mke2fs` resolves
+# to busybox (no `mkfs.ext4` applet → "applet not found") → the golden
+# first-boot format fails closed. Stage the REAL binary at a
+# hippius-private path busybox never touches; the overlay lib invokes it
+# by absolute path (`HIPPIUS_GOLDEN_MKFS`). (Ubuntu's busybox omits the
+# mke2fs applet, so its real mke2fs survives — this makes EVERY
+# initramfs-tools distro deterministic.)
+real_mkfs="$(readlink -f /usr/sbin/mkfs.ext4 2>/dev/null || true)"
+[ -x "$real_mkfs" ] || real_mkfs="$(readlink -f /sbin/mkfs.ext4 2>/dev/null || true)"
+if [ -x "$real_mkfs" ]; then
+    copy_exec "$real_mkfs" /lib/hippius/mkfs.ext4
+    # mke2fs reads /etc/mke2fs.conf for the ext4 feature profile; stage it
+    # so the private binary lays down a full-featured ext4 (mke2fs falls
+    # back to compiled defaults if it is absent, but the profile is nicer).
+    if [ -r /etc/mke2fs.conf ]; then
+        mkdir -p "${DESTDIR}/etc"
+        cp /etc/mke2fs.conf "${DESTDIR}/etc/mke2fs.conf"
+    fi
+else
+    echo "hippius-golden-hook: real mkfs.ext4/mke2fs (e2fsprogs) not found on base; rebake with e2fsprogs" >&2
+    exit 1
+fi
+
+# ── Golden overlay library + boot script ────────────────────────────
+OVERLAY_SRC="/etc/hippius/hippius-golden-overlay.sh"
+BOOT_SRC="/etc/hippius/hippius-golden-boot"
+[ -r "$OVERLAY_SRC" ] \
+    || { echo "hippius-golden-hook: missing $OVERLAY_SRC; rebake" >&2; exit 1; }
+[ -r "$BOOT_SRC" ] \
+    || { echo "hippius-golden-hook: missing $BOOT_SRC; rebake" >&2; exit 1; }
+
+mkdir -p "${DESTDIR}/lib/hippius" "${DESTDIR}/scripts"
+cp "$OVERLAY_SRC" "${DESTDIR}/lib/hippius/hippius-golden-overlay.sh"
+chmod 0644 "${DESTDIR}/lib/hippius/hippius-golden-overlay.sh"
+# The boot script is sourced by /init as `/scripts/${BOOT}` where
+# BOOT=hippius-golden (from the measured cmdline).
+cp "$BOOT_SRC" "${DESTDIR}/scripts/hippius-golden"
+chmod 0755 "${DESTDIR}/scripts/hippius-golden"

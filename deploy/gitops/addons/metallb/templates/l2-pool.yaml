@@ -1,0 +1,66 @@
+---
+# MetalLB L2 address pool — PR-K3, §K (#54).
+#
+# ⚠️  OPERATOR-SET: `lbPool.addresses` in values.yaml. This is the
+# address plan of YOUR cluster and the shipped value is an RFC 5737
+# documentation range that routes nowhere — you must replace it.
+#
+# Constraints when you choose a range:
+#   - it must be reachable on the L2 segment the nodes share, since
+#     MetalLB claims these addresses by gratuitous ARP;
+#   - it must NOT overlap the k3s pod CIDR or service CIDR (see
+#     `deploy/ansible/group_vars/all.yml::network`) — k3s defaults to
+# publishability-allow: cluster-net — k3s's documented default pod CIDR,
+# quoted to explain the carve-out; not an address of ours.
+#     `10.42.0.0/16` for pods, so carving an LB pool out of `10.42/16`
+#     means splitting it deliberately (e.g. pods in the high half,
+#     LB in the low half), not by accident;
+#   - the individual service allocations that depend on it
+#     (`edge-gateway`'s `service.loadBalancerIP`, the ingress-nginx
+#     controller address) must fall inside it.
+#
+# This is an address-plan definition (MetalLB's whole purpose), not a
+# hard-coded service IP.
+#
+# `sync-wave: "1"` is an INTRA-Application wave: it places these CRs
+# after the MetalLB CRDs + controller (wave 0, the chart default), so
+# the `IPAddressPool` CRD exists and the MetalLB validating webhook is
+# up before these objects are applied.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: hippius-lb-pool
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hippius-lb-pool
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: loadbalancer-pool
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  addresses:
+    {{- range .Values.lbPool.addresses }}
+    - {{ . }}
+    {{- end }}
+  # Do not hand out the network / broadcast addresses of the range.
+  avoidBuggyIPs: true
+---
+# Advertise the pool over L2 (gratuitous ARP from the speaker on the
+# node that owns each address). No node selector — single node today;
+# every future node is an eligible speaker.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: hippius-l2
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hippius-l2
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: loadbalancer-advertisement
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  ipAddressPools:
+    - hippius-lb-pool

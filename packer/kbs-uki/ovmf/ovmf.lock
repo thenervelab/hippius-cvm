@@ -1,0 +1,34 @@
+# `packer/kbs-uki/ovmf/ovmf.lock` — pinned OVMF firmware (PR-F3).
+#
+# The OVMF binary is a measured input to the AMD SEV-SNP launch
+# digest: `hippius-uki-measure --features snp` parses it and folds its
+# pages into `snp_calc_launch_digest`. A different OVMF → a different
+# launch measurement → the §22 allowlist refuses secret release.
+#
+# It MUST therefore be pinned by SHA-256, exactly like the kernel and
+# systemd-stub in `../uki/inputs.lock`. `scripts/fetch-inputs.sh`
+# downloads this URL and refuses to proceed if the digest mismatches.
+#
+# Format:
+#   OVMF_URL    = <url>
+#   OVMF_SHA256 = <hex digest>
+#
+# `OVMF_URL` MUST point at the OVMF firmware FILE directly (a `.fd`).
+# `scripts/fetch-inputs.sh` downloads it raw and SHA-256-verifies it —
+# it does NOT unpack archives.
+#
+# ## Why this OVMF (PR-F UKI build pins + publish)
+#
+# Standard Debian OVMF (`OvmfPkgX64`) does NOT emit the
+# `SNP_KERNEL_HASHES` section the `sev` crate folds the kernel /
+# initrd / cmdline measurements into. Only the `OvmfPkg/AmdSev/
+# AmdSevX64.dsc` build target does. We build that target reproducibly
+# from a pinned `edk2-stable202511` commit (see `packer/ovmf/`) and
+# re-host the resulting `OVMF.fd` at the content-addressed URL below.
+# The firmware is anonymous-readable; writes need the operator creds.
+#
+# Updating this digest is a deliberate PR — it shifts every launch
+# measurement and so must land in lockstep with a §22 allowlist epoch.
+
+OVMF_URL    = https://s3.hippius.com/hippius-compute-images/firmware/ovmf/162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c.fd
+OVMF_SHA256 = 162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c

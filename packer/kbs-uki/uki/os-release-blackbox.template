@@ -1,0 +1,5 @@
+NAME="Hippius Host-Attestor (blackbox)"
+ID=hippius-host-attestor
+PRETTY_NAME="Hippius blackbox host-attestor (diskless measured UKI)"
+VERSION_ID=@IMAGE_VERSION@
+HOME_URL="https://github.com/thenervelab/hippius-compute"

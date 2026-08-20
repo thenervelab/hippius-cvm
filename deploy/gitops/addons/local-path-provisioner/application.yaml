@@ -1,0 +1,45 @@
+---
+# Argo CD Application — local-path-provisioner. PR-K4, §K (#54).
+#
+# Sync wave 4: after the PR-K3 network/ingress stack (Cilium 1, MetalLB
+# 2, cert-manager + ingress-nginx 3) and before any workload that
+# requests a PVC. This addon installs THE cluster-default StorageClass,
+# so it must converge before `../apps/` (which use waves ≥100).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-local-path-provisioner
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-local-path-provisioner
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/addons/local-path-provisioner
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: local-path-storage
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

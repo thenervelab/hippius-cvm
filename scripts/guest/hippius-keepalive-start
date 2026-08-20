@@ -1,0 +1,120 @@
+#!/bin/sh
+# hippius-keepalive-start — ExecStart shim for hippius-keepalive.service.
+#
+# `hippius-agent-keepalive` takes its identity on argv, but the values are
+# PER-VM: they cannot be baked into a shared golden image. They arrive on
+# the MEASURED kernel command line, which vali writes at launch and the SNP
+# launch measurement covers — the same source the §23 telemetry agent and
+# the §24/§25 EOL hook read. This shim reads them and execs the daemon.
+#
+# ── Never take the guest down ───────────────────────────────────────────
+# Nothing here can wedge a boot: the unit is `Type=simple`, ordered
+# `Before=` nothing, and pulled in by a `Wants=` (not `Requires=`) from
+# multi-user.target. If the cmdline carries no Hippius identity this exits
+# 78 (EX_CONFIG) — a code the unit's `RestartPreventExitStatus=` treats as
+# terminal, so systemd stops rather than restart-loops, and the VM boots
+# and serves exactly as it would have. A miner that blocks the KBS path
+# only costs itself uncredited uptime; that incentive only holds if the
+# guest survives the block, so every failure here is inert.
+#
+# ── Cadence ─────────────────────────────────────────────────────────────
+# The tick interval MUST be <= vali's `uptimeLiveness.coverageSeconds`
+# (900 s): one sample vouches BACKWARD for exactly that span, so samples
+# further apart than the span leave uncovered gaps in genuinely-live time,
+# which the armed gate credits as ZERO. The default (300 s) is a third of
+# the span, leaving room for restarts and KBS hiccups. The relationship is
+# pinned by `scripts/dev/keepalive-unit-test.sh` against the CHART value,
+# so lowering `coverageSeconds` under the cadence fails CI instead of
+# silently un-crediting the fleet.
+set -eu
+
+EXIT_CONFIG=78
+
+# Test seam: the tests point this at a fixture. Production reads the real
+# measured cmdline.
+CMDLINE_FILE="${HIPPIUS_KEEPALIVE_CMDLINE_FILE:-/proc/cmdline}"
+# Test seam: the tests point this at a stub that prints its argv.
+AGENT_BIN="${HIPPIUS_KEEPALIVE_AGENT_BIN:-/usr/sbin/hippius-agent-keepalive}"
+# tmpfs, never the miner-backed disk.
+EPOCH_FILE="${HIPPIUS_KEEPALIVE_EPOCH_FILE:-/run/hippius/keepalive.epoch}"
+
+# Defaults; the unit's EnvironmentFile (/etc/hippius/keepalive.env, written
+# by the bake) may override them, and a cmdline token overrides that.
+INTERVAL_SECS="${HIPPIUS_KEEPALIVE_INTERVAL_SECS:-300}"
+RELAY_PORT="${HIPPIUS_KEEPALIVE_RELAY_PORT:-5000}"
+
+log() { echo "hippius-keepalive-start: $1" >&2; }
+
+# Print the value of `hippius.<key>=` from the cmdline, or nothing.
+# Word-splitting on whitespace is exactly the kernel's own tokenisation.
+cmdline_get() {
+    _key="$1"
+    _prefix="hippius.${_key}="
+    [ -r "${CMDLINE_FILE}" ] || return 0
+    # Deliberate word-splitting: whitespace separation IS the kernel's own
+    # cmdline tokenisation, so a `while read` line loop would be wrong.
+    # shellcheck disable=SC2013
+    for _tok in $(cat "${CMDLINE_FILE}"); do
+        case "${_tok}" in
+            "${_prefix}"*) printf '%s' "${_tok#"${_prefix}"}"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
+VM_ID="$(cmdline_get vm_id)"
+NODE_ID="$(cmdline_get node_id)"
+KBS_URL="$(cmdline_get kbs_url)"
+
+# Identity is required and has no default — an attestation naming the
+# wrong VM or miner is worse than none at all.
+for _pair in "vm_id:${VM_ID}" "node_id:${NODE_ID}" "kbs_url:${KBS_URL}"; do
+    if [ -z "${_pair#*:}" ]; then
+        log "fail-closed: cmdline-missing:hippius.${_pair%%:*} (not a Hippius tenant VM; keepalive disabled, boot unaffected)"
+        exit "${EXIT_CONFIG}"
+    fi
+done
+
+# Optional per-VM overrides, all measured. Written as `if` blocks, not
+# `[ … ] && …`: under `set -e` a false one-line AND-list would exit the
+# shim and silently disable the keepalive.
+_v="$(cmdline_get keepalive_interval_secs)"
+if [ -n "${_v}" ]; then INTERVAL_SECS="${_v}"; fi
+_v="$(cmdline_get keepalive_relay_port)"
+if [ -n "${_v}" ]; then RELAY_PORT="${_v}"; fi
+
+case "${INTERVAL_SECS}" in ''|*[!0-9]*|0) log "fail-closed: bad-interval"; exit "${EXIT_CONFIG}" ;; esac
+# Port 0 DISABLES the relay push: the attestation would be minted and
+# archived KBS-side but never reach vali, so the VM's uptime would read as
+# uncovered once the gate is armed. That is the "declared but not wired"
+# shape this whole change exists to close — refuse it.
+case "${RELAY_PORT}" in ''|*[!0-9]*|0) log "fail-closed: bad-relay-port"; exit "${EXIT_CONFIG}" ;; esac
+
+# `expiry_unix = now + 2 * interval`, so an attestation stays valid across
+# one missed tick but can never be re-submitted long after the fact. The
+# agent requires expiry_offset > interval; deriving it keeps that true for
+# any interval instead of pairing a tuned interval with a stale constant.
+EXPIRY_OFFSET_SECS="$((INTERVAL_SECS * 2))"
+
+# The billing epoch. vali stamps `hippius.telemetry_epoch` on the measured
+# cmdline at launch (the same value the §23 telemetry agent accrues to);
+# the guest has no chain access of its own. Seeded ONCE, and only if the
+# file is absent, so a future host-side refresher can keep it current
+# without this shim clobbering it on restart.
+mkdir -p "$(dirname "${EPOCH_FILE}")"
+if [ ! -e "${EPOCH_FILE}" ]; then
+    EPOCH="$(cmdline_get telemetry_epoch)"
+    case "${EPOCH}" in ''|*[!0-9]*) EPOCH=0 ;; esac
+    printf '%s\n' "${EPOCH}" > "${EPOCH_FILE}"
+    chmod 0644 "${EPOCH_FILE}"
+fi
+
+log "starting: vm_id=${VM_ID} interval=${INTERVAL_SECS}s relay_port=${RELAY_PORT}"
+exec "${AGENT_BIN}" \
+    --kbs-url "${KBS_URL}" \
+    --vm-id "${VM_ID}" \
+    --node-id-hex "${NODE_ID}" \
+    --epoch-file "${EPOCH_FILE}" \
+    --interval-secs "${INTERVAL_SECS}" \
+    --expiry-offset-secs "${EXPIRY_OFFSET_SECS}" \
+    --relay-vsock-port "${RELAY_PORT}"

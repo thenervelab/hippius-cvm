@@ -1,0 +1,67 @@
+#!/bin/sh
+# `hippius-golden-boot` — initramfs-tools BOOT SCRIPT (golden-bake PR3).
+#
+# Installed into a golden-mode BYO image's initrd at
+# `/scripts/hippius-golden` and selected by the MEASURED cmdline token
+# `boot=hippius-golden`. initramfs-tools' `/init` sources `/scripts/
+# ${BOOT}` and calls its `mountroot` — the SAME sanctioned override
+# mechanism `boot=nfs` / `boot=local` / casper's `boot=casper` use. This
+# lets golden mode OWN root assembly (dm-verity lower + guest-keyed
+# overlay upper) instead of the stock `/scripts/local` crypttab→ext4
+# mount, WITHOUT patching initramfs-tools internals.
+#
+# Legacy images never carry `boot=hippius-golden` (the token is added
+# only for `disk_mode=golden_verity_overlay` at bake time), so the
+# legacy `/scripts/local` path is byte-identical + untouched.
+#
+# initramfs-tools contract: a boot script defines `mountroot` (mount the
+# real root at ${rootmnt}) and MAY define `prereqs`. `/init` provides
+# ${rootmnt}. Fail-closed: any error → the boot aborts (the KBS release
+# is nonce-bound + spent, so a retry needs a fresh ticket).
+
+# The initramfs-tools hook (hippius-golden-hook) COPY_EXECs the release
+# tooling and copies these two libraries into the initrd.
+HIPPIUS_LIB_DIR="/lib/hippius"
+
+# `prereqs` is invoked by initramfs-tools before mountroot ordering.
+PREREQS=""
+prereqs() { echo "${PREREQS}"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+mountroot() {
+    # Permissive PATH: initramfs-tools runs boot scripts with a minimal
+    # environment; the staged /usr/sbin binaries + cryptsetup/veritysetup
+    # must resolve.
+    PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+    export PATH
+
+    HIPPIUS_LOG_TAG="hippius-golden-boot"
+
+    core="${HIPPIUS_LIB_DIR}/hippius-release-core.sh"
+    overlay="${HIPPIUS_LIB_DIR}/hippius-golden-overlay.sh"
+    for f in "${core}" "${overlay}"; do
+        [ -r "${f}" ] || {
+            printf 'hippius-golden-boot: FATAL: %s not staged (hook bug); rebake\n' "${f}" >&2
+            exit 1
+        }
+    done
+    # shellcheck source=scripts/initramfs/hippius-release-core.sh
+    . "${core}"
+    # shellcheck source=scripts/initramfs/hippius-golden-overlay.sh
+    . "${overlay}"
+
+    # Defense-in-depth: refuse to run the golden assembly if the cmdline
+    # does NOT actually signal golden (a mis-staged boot=hippius-golden
+    # on a legacy VM must fail closed, never silently overlay-mount).
+    hippius_is_golden_mode || hippius_die "boot=hippius-golden but cmdline is not golden — fail-closed"
+
+    # Assemble dm-verity lower + guest-keyed overlay upper at ${rootmnt}.
+    # initramfs-tools then move-mounts the API filesystems and
+    # `run-init`/`switch_root`s into ${rootmnt} as usual.
+    # `rootmnt` is exported by initramfs-tools' /init (the boot-script
+    # environment), not assigned here.
+    # shellcheck disable=SC2154
+    hippius_golden_run "${rootmnt}"
+}

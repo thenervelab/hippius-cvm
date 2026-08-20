@@ -1,0 +1,88 @@
+---
+# SEV-SNP GRUB cmdline — tasks file imported by 06-miner-bootstrap.yml
+# play "01". The handlers `run update-grub` + `reboot for SEV-SNP
+# cmdline` are defined in that play.
+#
+# Same logic as the cc-node `02-snp-kernel-prep.yml`, lifted into a
+# tasks file: ensure every `grub_cmdline_required` token is present and
+# no `grub_cmdline_forbidden` token (iommu=pt) remains. The reboot is
+# handler-gated on an actual change — a second run is a zero-diff
+# no-op. (No private-segment assumption here — a miner has a public IP only.)
+
+- name: Read the current GRUB_CMDLINE_LINUX
+  ansible.builtin.shell:
+    cmd: grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | head -1
+  register: miner_grub_line_raw
+  changed_when: false
+
+- name: Parse the current cmdline tokens
+  ansible.builtin.set_fact:
+    miner_current_cmdline_tokens: >-
+      {{
+        miner_grub_line_raw.stdout
+        | regex_replace('^GRUB_CMDLINE_LINUX="(.*)"$', '\1')
+        | split(' ')
+        | reject('equalto', '')
+        | list
+      }}
+
+- name: Compute the desired cmdline tokens (drop forbidden, add required)
+  ansible.builtin.set_fact:
+    miner_desired_cmdline_tokens: >-
+      {{
+        (miner_current_cmdline_tokens
+          | reject('in', grub_cmdline_forbidden)
+          | list)
+        + (grub_cmdline_required
+          | reject('in', miner_current_cmdline_tokens)
+          | list)
+      }}
+
+- name: Compute the desired GRUB_CMDLINE_LINUX string
+  ansible.builtin.set_fact:
+    miner_desired_cmdline_string: "{{ miner_desired_cmdline_tokens | join(' ') }}"
+
+- name: Show the planned cmdline diff
+  ansible.builtin.debug:
+    msg: |
+      current : {{ miner_current_cmdline_tokens | join(' ') }}
+      desired : {{ miner_desired_cmdline_string }}
+
+- name: Back up the grub file before an edit (one per change)
+  ansible.builtin.copy:
+    src: /etc/default/grub
+    dest: "/etc/default/grub.bak.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    force: false
+  when: >-
+    miner_current_cmdline_tokens
+    | symmetric_difference(miner_desired_cmdline_tokens)
+    | length > 0
+
+- name: Replace GRUB_CMDLINE_LINUX
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX='
+    line: 'GRUB_CMDLINE_LINUX="{{ miner_desired_cmdline_string }}"'
+    backrefs: false
+  notify:
+    - run update-grub
+    - reboot for SEV-SNP cmdline
+
+- name: Flush handlers so the reboot (if any) happens before the assert
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the sev_snp module parameter post-reboot
+  ansible.builtin.slurp:
+    src: /sys/module/kvm_amd/parameters/sev_snp
+  register: miner_sev_snp_post
+
+- name: Confirm SEV-SNP is enabled
+  ansible.builtin.assert:
+    that:
+      - (miner_sev_snp_post.content | b64decode | trim) == "Y"
+    fail_msg: |
+      Post-reboot kvm_amd.sev_snp != Y. Check:
+        - BIOS: SEV Control + SNP Memory (RMP Table) Coverage Enabled
+        - dmesg: 'kvm_amd: SEV-SNP enabled'
+        - /proc/cmdline has kvm_amd.sev_snp=1 and NOT iommu=pt

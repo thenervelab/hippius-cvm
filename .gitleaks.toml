@@ -1,0 +1,171 @@
+# `.gitleaks.toml` — Hippius DePIN compute secret-scan ruleset (PR-F6).
+#
+# Consumed by `.github/workflows/secret-scan.yml`, which runs a
+# version+SHA-256-pinned `gitleaks` over the commit range of every PR
+# and fails the PR if any rule matches.
+#
+# `useDefault = true` inherits gitleaks' full upstream ruleset (GitHub
+# / GitLab / Slack / Stripe tokens, generic high-entropy strings, …);
+# the `[[rules]]` below ADD explicit, named rules for the secret types
+# this architecture actually handles, so an auditor reading this file
+# sees the threat model directly instead of having to know the gitleaks
+# defaults. Spec of record: `ARCHITECTURE.md` §8 (Vault), §11
+# (enforced non-secret base-image contract), §20 (crypto profile).
+
+title = "Hippius DePIN compute — secret-scan ruleset"
+
+[extend]
+useDefault = true
+
+# ── AWS access keys ─────────────────────────────────────────────────
+# Hippius S3 backups + presigned image distribution (§11) ride
+# S3-compatible infrastructure; a committed AWS key id is a breach.
+[[rules]]
+id = "hippius-aws-access-key-id"
+description = "AWS access key id"
+regex = '''\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b'''
+keywords = ["akia", "asia", "abia", "acca"]
+
+# ── GCP service-account keys ────────────────────────────────────────
+# A deployment whose Vault Confidential VM runs there uses these; a
+# leaked service-account JSON key is full project access.
+[[rules]]
+id = "hippius-gcp-service-account"
+description = "GCP service-account key (JSON)"
+regex = '''"type"\s*:\s*"service_account"'''
+keywords = ["service_account"]
+
+# ── HashiCorp Vault tokens ──────────────────────────────────────────
+# §8: the KBS reads LUKS / user-data secrets from Vault, L1 signs
+# tickets via Vault transit. A Vault token in the repo bypasses the
+# entire attestation-bound auth path.
+[[rules]]
+id = "hippius-vault-token"
+description = "HashiCorp Vault token (service / batch / recovery)"
+regex = '''\bhv[sbr]\.[A-Za-z0-9_-]{20,}'''
+keywords = ["hvs.", "hvb.", "hvr."]
+
+# ── Ed25519 / PEM private keys ──────────────────────────────────────
+# §20: the KBS response-signing key, the L1 OrderTicket key, and the
+# §22 offline allowlist root are all Ed25519. PEM- / OpenSSH-encoded
+# private keys are regex-detectable here; raw 32/64-byte key files
+# cannot be (they are indistinguishable from any binary blob) — those
+# rely on the `packer/kbs-uki/keys/` `.gitignore` + the §11
+# enforced-non-secret contract instead.
+[[rules]]
+id = "hippius-private-key-block"
+description = "PEM / OpenSSH-encoded private key"
+regex = '''-----BEGIN (?:OPENSSH|EC|RSA|DSA|PGP|ENCRYPTED|)\s?PRIVATE KEY-----'''
+keywords = ["private key"]
+
+# ── NetBird personal access tokens ──────────────────────────────────
+# §5: Edge GW + miners join the NetBird mesh. A leaked PAT lets an
+# attacker enrol a rogue peer.
+[[rules]]
+id = "hippius-netbird-pat"
+description = "NetBird personal access token"
+regex = '''\bnbp_[A-Za-z0-9]{32,}'''
+keywords = ["nbp_"]
+
+# ── Hippius S3 secret keys ──────────────────────────────────────────
+# The audit-anchor bucket + `hippius-compute-backups` (§15 / §B). A
+# keyword-anchored rule — the secret-access-key has no distinctive
+# prefix, so it is matched only next to a `hippius_s3_*` identifier.
+[[rules]]
+id = "hippius-s3-secret-key"
+description = "Hippius S3 access / secret key assignment"
+regex = '''(?i)hippius[_-]?s3[_-]?(?:secret|access)[_-]?key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{20,})'''
+secretGroup = 1
+keywords = ["hippius"]
+
+# ── OVH API credentials ─────────────────────────────────────────────
+# publishability-allow: provider — a detection rule must name the vendor
+# it detects, exactly as the AWS and GCP rules do; naming OVH here says
+# nothing about where any particular deployment runs.
+#
+# A deployment whose bare-metal SEV-SNP hosts sit with this provider
+# manages them through its API. The application secret / consumer key are
+# 32-hex strings with no prefix — keyword-anchored, like the S3 rule.
+# Harmless (and cheap) to keep armed if you use another provider.
+[[rules]]
+id = "hippius-ovh-api-credential"
+description = "OVH API application secret / consumer key"
+regex = '''(?i)ovh[_-]?(?:application[_-]?secret|consumer[_-]?key|application[_-]?key)\s*[:=]\s*['"]?([a-f0-9]{32})\b'''
+secretGroup = 1
+keywords = ["ovh"]
+
+# ── Allowlist ───────────────────────────────────────────────────────
+# Scope is deliberately narrow — three paths, each justified:
+#
+#  - `packer/kbs-uki/keys/dev/` — the committed DEV signing keypair.
+#    It is exposed ON PURPOSE (reproducible `make uki` across dev + CI
+#    needs a deterministic key) and is defended from prod use by the
+#    documented three-belt defense in that directory's README, NOT by
+#    secrecy. Scanning it would fail every PR on the known dev key;
+#    allowlisting only this directory keeps every other path scanned.
+#  - `.gitleaks.toml` — this file. Its rule regexes contain token
+#    prefixes / shapes that the `useDefault` ruleset would otherwise
+#    self-flag.
+#  - `vendor/sev/` — vendored virtee/sev source carries PEM HEADER
+#    STRING constants (format-detection needles), not private keys
+#    (detailed at the `paths` entry below).
+#
+# Every path regex is START-anchored (`^`): gitleaks matches `paths`
+# entries as unanchored substrings, so an un-anchored
+# `packer/kbs-uki/keys/dev/` would also allowlist a sibling like
+# `evil/packer/kbs-uki/keys/dev/leaked.key`. Anchoring keeps the
+# exception to the three real paths and nothing else.
+[allowlist]
+description = "Hippius secret-scan allowlist — committed dev keypair + this config"
+paths = [
+    '''^packer/kbs-uki/keys/dev/''',
+    '''^\.gitleaks\.toml$''',
+    # `vendor/sev/` is virtee/sev 7.1.0 vendored in-tree (Apache-2.0,
+    # published crate bytes). The crate's source carries PEM HEADER
+    # STRINGS used as needle/prefix constants for format detection
+    # (`PEM_PREFIXES` in `src/measurement/idblock.rs`) — *not* private
+    # keys. gitleaks' `hippius-private-key-block` + `private-key`
+    # rules false-positive on these header literals. The tests/ dir
+    # (which ships throwaway test PEMs) is omitted from the vendor
+    # copy, so this allowlist exception is just for the source tree.
+    '''^vendor/sev/''',
+    # The redaction test is the one file whose PURPOSE is to hold secret
+    # shapes — including bare PEM headers, which are format needles, not
+    # keys. Scoped to that single reviewed file, never to
+    # `sentinel/tests/` as a whole: a directory-wide exception would
+    # blind the scanner to a real secret dropped beside it.
+    '''^sentinel/tests/test_output_redact\.py$''',
+]
+# ── Terraform false positives ───────────────────────────────────────
+# `deploy/terraform/` (PR-K1) makes the upstream `generic-api-key` rule
+# fire on two Terraform idioms that carry NO secret:
+#
+#  - HCL variable references — `secret_key = var.hippius_s3_secret_key`
+#    in a provider block is a pointer to a `sensitive` variable, never
+#    a literal (the literal lives only in git-ignored `*.tfvars`).
+#  - `REPLACE_ME_*` placeholders in the committed `*.tfvars.example`.
+#
+# Both regexes are FULLY anchored (`^…$`) and match against the
+# extracted secret: they allowlist a finding ONLY when its secret is
+# EXACTLY a `var.<name>` reference or a `REPLACE_ME_<name>` placeholder.
+# A real leaked credential can never be either string, so this narrows
+# nothing else.
+regexes = [
+    '''^var\.[A-Za-z0-9_]+$''',
+    '''^REPLACE_ME_[A-Za-z0-9_]+$''',
+    # ── Published example credentials ───────────────────────────────
+    # `sentinel/` implements secret REDACTION, so its tests must contain
+    # secret-shaped strings to prove the redactor removes them. Every
+    # value below is a vendor-published example or a sequential dummy —
+    # never a credential that could exist.
+    #
+    # Matched FULLY ANCHORED against the extracted secret, not by path:
+    # a leaked key can never be exactly `AKIAIOSFODNN7EXAMPLE` (AWS's own
+    # documented example), so this narrows nothing else. Path-scoping
+    # `sentinel/tests/` instead would have blinded the scanner to a REAL
+    # secret dropped in that directory.
+    '''^AKIAIOSFODNN7EXAMPLE$''',
+    '''^gh[ps]_0123456789abcdefABCDEF0123456789abcd$''',
+    '''^github_pat_11ABCDEFG0123456789_abcdefghij$''',
+    '''^hvs\.ABCDEFGHIJKLMNOPQRSTUVWX$''',
+]

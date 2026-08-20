@@ -1,0 +1,161 @@
+{{- $renewVali := not .Values.vaultAuth.jwt.enabled -}}
+{{- $renewBake := not .Values.tenantBake.vault.jwtRole -}}
+{{- if and .Values.tokenRenew.enabled (or $renewVali $renewBake) }}
+---
+# Weekly self-renewal of the periodic Vault tokens the VALI plane
+# authenticates with — the vali-namespace counterpart of the `kbs` and
+# `external-secrets` renewers.
+#
+# WHY THIS EXISTS (outage 2026-08-08). Two vali tokens live here:
+#   - `vali-vault` key `token` — the `vali-orchestrator` runtime token
+#     (stage tenant secrets, Transit wrap, sign the Edge registry feed);
+#   - `bake-vault-token` key `token` — the `tenant-baker` bake-Job token.
+# Both were minted periodic (32d) on 2026-07-06, but — unlike the kbs and
+# external-secrets tokens — NOTHING renewed them, so both silently expired
+# at the period boundary. The failure was invisible where it started and
+# loud three hops away: vali's `/v1/edge/registry` feed 500s (it cannot
+# read its signing seed) → the Edge's admission poller goes
+# `registry-unhealthy` → the Edge FAILS CLOSED and rejects every NEW miner
+# mTLS handshake. The fleet looked healthy because the miners that never
+# dropped their socket kept streaming; miner-2 rebooted, could not
+# re-handshake, and stayed dark for ~2 days.
+#
+# A periodic token renews ITSELF via `auth/token/renew-self` (in the
+# `default` policy both tokens carry), resetting the TTL to the full
+# period — no root token, and NO write-back: the token bytes are
+# unchanged, so nothing has to be re-staged and no pod has to restart.
+# That last property matters here: rolling the KBS pod is currently
+# gated on the PVC swap, and this design never needs to.
+#
+# BEST-EFFORT per token: one absent or unrenewable token logs a warning
+# and the Job carries on with the others. Talks ONLY to Vault (no k8s
+# API) → no RBAC; TLS verified against the pinned `vault-ca` ConfigMap.
+#
+# ── WHY IT IS GATED, AND NOT DELETED (drift D9, 2026-08-12) ──────────
+#
+# Neither token exists any more: #887 moved the vali plane to a
+# short-lived projected SA JWT (`Secret/vali-vault` now holds ONLY
+# `address`), and Phase 5 deleted `Secret/bake-vault-token` once the
+# baker got its own `tenant-baker` JWT role. Both volumes are
+# `optional: true`, so with the shipped values this CronJob would run
+# weekly and log "skipping" forever — and it has, in fact, NEVER existed
+# in the cluster.
+#
+# That is worse than absent. A green weekly Job history that renews
+# nothing is a renewal you BELIEVE is happening, which is precisely the
+# belief the 2026-08-08 outage above was made of. So it must not render
+# while there is nothing to renew.
+#
+# But deleting it outright would quietly break the OTHER direction:
+# `vaultAuth.jwt.enabled: false` (and `tenantBake.vault.jwtRole: ""`) are
+# documented, supported rollbacks that bring a periodic 32-day token
+# straight back — unrenewed, and the outage with it, one flag flip later.
+# Gating on the SAME switches that decide the credential regime makes the
+# renewer appear exactly when, and only when, a static token exists.
+# Nobody has to remember a second step during a rollback.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vali-vault-token-renew
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: vali-vault-token-renew
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: vali
+spec:
+  schedule: {{ .Values.tokenRenew.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: vali-vault-token-renew
+            app.kubernetes.io/part-of: hippius-compute
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: renew
+              image: {{ .Values.tokenRenew.image | quote }}
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: VAULT_ADDR
+                  value: {{ .Values.tokenRenew.vaultAddr | quote }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  # $1 = mounted token file, $2 = label. Best-effort: a
+                  # missing/invalid token logs + returns 0 so one dead
+                  # token can't fail the whole Job.
+                  renew() {
+                    tok="$(cat "$1" 2>/dev/null || true)"
+                    if [ -z "$tok" ]; then
+                      echo "renew $2: token file empty/absent — skipping"
+                      return 0
+                    fi
+                    code=$(curl -sS --cacert /vault-ca/ca.crt \
+                      -o /tmp/resp.json -w '%{http_code}' \
+                      -H "X-Vault-Token: $tok" \
+                      -X POST "$VAULT_ADDR/v1/auth/token/renew-self" || echo 000)
+                    echo "renew $2: HTTP $code"
+                    grep -o '"lease_duration":[0-9]*' /tmp/resp.json 2>/dev/null || true
+                  }
+                  {{- if $renewVali }}
+                  renew /vali-token/token vali-vault
+                  {{- end }}
+                  {{- if $renewBake }}
+                  renew /bake-token/token {{ .Values.tenantBake.vault.tokenSecret }}
+                  {{- end }}
+              volumeMounts:
+                {{- if $renewVali }}
+                - name: vali-token
+                  mountPath: /vali-token
+                  readOnly: true
+                {{- end }}
+                {{- if $renewBake }}
+                - name: bake-token
+                  mountPath: /bake-token
+                  readOnly: true
+                {{- end }}
+                - name: vault-ca
+                  mountPath: /vault-ca
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            {{- if $renewVali }}
+            - name: vali-token
+              secret:
+                secretName: vali-vault
+                optional: true
+            {{- end }}
+            {{- if $renewBake }}
+            - name: bake-token
+              secret:
+                secretName: {{ .Values.tenantBake.vault.tokenSecret | quote }}
+                optional: true
+            {{- end }}
+            - name: vault-ca
+              configMap:
+                name: vault-ca
+            - name: tmp
+              emptyDir: {}
+{{- end }}

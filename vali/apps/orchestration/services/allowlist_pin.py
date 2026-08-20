@@ -1,0 +1,863 @@
+"""§22 allowlist pin orchestration (production control-plane path).
+
+vali is the trusted §22 signing authority: it holds the allowlist-root
+Ed25519 seed in Vault and signs a fresh allowlist artifact whenever a
+launch needs a new measurement pinned. The KBS pins the matching root
+PUBKEY and verifies every artifact (COSE_Sign1 signature + monotonic
+epoch) — so the miner stays untrusted and vali's signature is the trust
+anchor. This is a normal authenticated control-plane operation; there is
+no dev gate (the per-launch `auto_pin_allowlist` intent flag is the
+control).
+
+Pipeline:
+  1. Read the current manifest TOML (the in-cluster copy at
+     `VALI_ALLOWLIST_MANIFEST_PATH`).
+  2. Increment `epoch` (only the integer line is touched).
+  3. Append one `[[entries]]` block per measurement that must be
+     allowed AFTER this pin — the CARRY-FORWARD set (every live VM's
+     measurement + every active host-attestor release) plus the new
+     one. See `_carry_forward_classes`.
+  4. Subprocess `hippius-kbs-allowlist-tool` to sign with the root seed
+     (fetched from Vault) and emit a fresh COSE.
+  5. Subprocess `aws s3 cp` to overwrite the S3 object the KBS init
+     container fetches on restart.
+  6. POST the bytes to the KBS `/v1/admin/allowlist/reload` so the live
+     in-memory allowlist advances immediately.
+
+CUMULATIVE, not incremental — the artifact is a full REPLACEMENT:
+`kbs_core::allowlist::InstalledAllowlist::install` swaps the whole
+active body (`*g = Some(Active{..})`); it does NOT merge with what was
+installed before. The static base manifest is a read-only ConfigMap
+that no pin ever writes back to, so building `base + 1 entry` EVICTS
+every previously auto-pinned measurement. The same allowlist gates the
+§21 KEK release (`kbs-core/src/release.rs` `pre_release_validate` +
+`offline.contains(&report.measurement)`), so an evicted VM cannot
+unlock its LUKS overlay on its next boot. Every pin therefore rebuilds
+`base ∪ carry-forward ∪ {new}`.
+
+§20 discipline:
+- The signing seed is fetched from Vault and materialized only into a
+  0600 file inside a per-attempt tmpfs workdir, removed with the dir.
+- AWS credentials come from the process env.
+- The TOML manipulations are pure string rewrites.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import subprocess
+import tempfile
+import tomllib
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from django.conf import settings
+
+from apps.orchestration.effects import EffectError, EffectUnavailable
+
+log = logging.getLogger("apps.orchestration.allowlist_pin")
+
+DEFAULT_SIGN_TIMEOUT_S = 30.0
+DEFAULT_S3_TIMEOUT_S = 60.0
+DEFAULT_KBS_RELOAD_TIMEOUT_S = 30.0
+
+# `l1-order-ticket-v1` hex — the PRODUCTION L1 OrderTicket kid (#587
+# Phase 1A). Its pubkey `4f8a1eb8…` is pinned in the KBS `l1Keys`
+# keyring; the auto-pin records this kid in every entry's
+# `accepted_l1_kids_hex` so a measurement only accepts prod-kid tickets.
+DEFAULT_L1_KID_HEX = "6c312d6f726465722d7469636b65742d7631"
+# `kbs-cc-1-response-v1` hex
+DEFAULT_KBS_RESPONSE_KID_HEX = "6b62732d63632d312d726573706f6e73652d7631"
+
+
+class AllowlistEpochConflict(EffectError):
+    """KBS rejected the reload with 409 — the most common cause is the
+    epoch HWM CAS (the installed epoch is ≥ the one we tried). The pin
+    loop catches this to retry at a higher epoch; a non-epoch 409
+    (signature / schema) re-raises the same way and exhausts the
+    bounded retries, surfacing the error after the attempts."""
+
+
+# How many times `pin_measurement` re-bumps the epoch + retries when
+# the KBS reload 409s. The static manifest ConfigMap's `epoch = N`
+# drifts behind the installed HWM after every successful pin (the
+# manifest is read-only; the bump lives only in the signed artifact),
+# so a fresh pin can start several epochs behind. 16 covers a long
+# run of un-resynced pins without masking a genuine sig/schema 409.
+_MAX_EPOCH_RETRIES = 16
+
+
+@dataclass(frozen=True)
+class PinResult:
+    """One epoch-bump + measurement-append + S3 upload + KBS reload."""
+
+    new_epoch: int
+    new_cose_sha256_hex: str
+    s3_url: str
+
+
+def _resolve_seed_hex() -> str:
+    """Resolve the §22 allowlist-root signing seed as a 64-hex string.
+
+    PRODUCTION: `VALI_KBS_ALLOWLIST_ROOT_SEED_VAULT_PATH` → fetch the
+    `seed` field from Vault (vali holds the root seed online — the
+    trusted control-plane signing authority).
+    TEST/dev affordance: `VALI_KBS_ALLOWLIST_ROOT_SEED_PATH` → read a
+    64-hex seed file.
+    Neither set ⇒ fail closed.
+
+    §20: the returned string is secret-bearing — the caller materializes
+    it into a 0600 tmpfs file and drops it promptly; never logged.
+    """
+    vault_path = getattr(settings, "VALI_KBS_ALLOWLIST_ROOT_SEED_VAULT_PATH", "")
+    if vault_path:
+        # Local import to avoid a module-load cycle (vault_kv imports settings).
+        from apps.orchestration.services.vault_kv import get_kv_field
+
+        mount = getattr(settings, "VALI_VAULT_KV_MOUNT", "secret")
+        seed_hex = get_kv_field(mount, vault_path, "seed").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", seed_hex):
+            raise EffectError(
+                "allowlist-root Vault seed is not 64 lower-case hex chars"
+            )
+        return seed_hex
+    seed_file = getattr(settings, "VALI_KBS_ALLOWLIST_ROOT_SEED_PATH", "")
+    if seed_file:
+        if not os.path.isfile(seed_file):
+            raise EffectUnavailable(
+                "VALI_KBS_ALLOWLIST_ROOT_SEED_PATH does not exist"
+            )
+        with open(seed_file, encoding="utf-8") as fh:
+            return fh.read().strip().lower()
+    raise EffectUnavailable(
+        "no allowlist-root signing seed configured "
+        "(set VALI_KBS_ALLOWLIST_ROOT_SEED_VAULT_PATH)"
+    )
+
+
+# ─── TOML manipulation (string-level) ────────────────────────────────
+
+
+_EPOCH_LINE_RE = re.compile(r"(?m)^epoch\s*=\s*(\d+)\s*$")
+
+
+def _bump_epoch_text(text: str, floor: int | None = None) -> tuple[str, int]:
+    """Return `(new_text, new_epoch)`. Raises if `epoch = N` is absent
+    or appears more than once at the top level.
+
+    `new_epoch = max(current + 1, floor)`. The `floor` lets the pin
+    loop force the epoch above a just-rejected value when the static
+    manifest ConfigMap lags the KBS's installed HWM (every successful
+    pin advances the HWM but the read-only manifest stays put, so a
+    fresh pin can start several epochs behind)."""
+    matches = list(_EPOCH_LINE_RE.finditer(text))
+    if len(matches) != 1:
+        raise EffectError(
+            f"allowlist-manifest: expected exactly one top-level "
+            f"`epoch = N` line, found {len(matches)}"
+        )
+    m = matches[0]
+    current = int(m.group(1))
+    new = current + 1
+    if floor is not None and floor > new:
+        new = floor
+    new_text = text[: m.start()] + f"epoch = {new}" + text[m.end():]
+    return new_text, new
+
+
+# §22 trust classes the pin may write into a manifest entry (mirrors the
+# Rust `kbs_core::snp::AllowlistClass` snake_case wire form). `tenant` is
+# the default and is written by OMITTING the `class` key (byte-identical to
+# every legacy entry — no golden/KAT drift); `host_attestor` writes an
+# explicit `class = "host_attestor"` so the KBS `class_of` gate namespaces
+# the blackbox host-attestor measurement APART from every tenant image (it
+# can never satisfy a tenant release, and vice-versa — blackbox host-
+# attestor security must-have #1). Any other value is refused fail-closed.
+ALLOWLIST_CLASS_TENANT = "tenant"
+ALLOWLIST_CLASS_HOST_ATTESTOR = "host_attestor"
+_VALID_CLASSES = frozenset({ALLOWLIST_CLASS_TENANT, ALLOWLIST_CLASS_HOST_ATTESTOR})
+
+
+def _append_entry(
+    text: str,
+    *,
+    measurement_hex: str,
+    l1_kids: Sequence[str],
+    kbs_kids: Sequence[str],
+    measurement_class: str = ALLOWLIST_CLASS_TENANT,
+) -> str:
+    """Append one `[[entries]]` block at the end of the manifest. The
+    Rust `dev-manifest.toml` ends with arrays of accepted kids; one
+    blank line + `[[entries]]` block parses cleanly.
+
+    `measurement_class` writes the §22 trust class: `tenant` (default)
+    OMITS the `class` key (byte-identical to legacy entries + the golden
+    `dev.cose`), while `host_attestor` writes an explicit
+    `class = "host_attestor"` line so the KBS namespaces the measurement
+    out of the tenant set."""
+    if measurement_class not in _VALID_CLASSES:
+        raise EffectError(
+            f"pin_measurement: unknown allowlist class {measurement_class!r}"
+        )
+    block = ["", "[[entries]]"]
+    block.append(f'measurement_hex = "{measurement_hex}"')
+    block.append(
+        "accepted_l1_kids_hex = ["
+        + ", ".join(f'"{k}"' for k in l1_kids)
+        + "]"
+    )
+    block.append(
+        "accepted_kbs_response_kids_hex = ["
+        + ", ".join(f'"{k}"' for k in kbs_kids)
+        + "]"
+    )
+    # Emit `class` ONLY for the non-default host-attestor class — a tenant
+    # entry omits it (the KBS back-fills the `Tenant` default), keeping the
+    # signed CBOR byte-identical to legacy tenant pins.
+    if measurement_class != ALLOWLIST_CLASS_TENANT:
+        block.append(f'class = "{measurement_class}"')
+    sep = "" if text.endswith("\n") else "\n"
+    return text + sep + "\n".join(block) + "\n"
+
+
+# ─── Subprocess + I/O helpers ────────────────────────────────────────
+
+
+def _run(
+    argv: Sequence[str],
+    *,
+    label: str,
+    timeout_s: float,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(  # noqa: S603 — argv list, no shell
+            list(argv),
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise EffectUnavailable(f"{label}: binary not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise EffectError(f"{label}: timeout after {timeout_s}s") from exc
+
+
+def _required_setting(name: str) -> str:
+    value = str(getattr(settings, name, "") or "").strip()
+    if not value:
+        raise EffectUnavailable(f"{name} is not configured")
+    return value
+
+
+def _installed_epoch_floor() -> int | None:
+    """The epoch to START the pin at — one past the highest epoch vali
+    has already installed, or `None` when vali has pinned nothing yet.
+
+    The static manifest's `epoch = N` line is FROZEN (it is a read-only
+    ConfigMap), while every successful reload advances the live KBS HWM
+    by one. So after more than `_MAX_EPOCH_RETRIES` successful pins the
+    whole `manifest_epoch + 1 … + _MAX_EPOCH_RETRIES` window falls at or
+    below the HWM and EVERY reload 409s (anti-rollback) — the +1 retry
+    loop can never climb far enough. vali holds the sole §22 allowlist
+    signing seed, so the highest epoch it has recorded in the
+    `MeasurementLedger` IS the live HWM; starting one past it lands the
+    first attempt strictly above the HWM. The retry loop then only has
+    to cover residual drift (e.g. a best-effort ledger write that lost
+    the last success), not the full accumulated gap.
+
+    Best-effort: a query failure returns `None` and the pin falls back
+    to the manifest-epoch behaviour + retry loop.
+    """
+    try:
+        from django.db.models import Max
+
+        from apps.orchestration.models import MeasurementLedger
+
+        mx = MeasurementLedger.objects.aggregate(mx=Max("allowlist_epoch"))["mx"]
+        return (int(mx) + 1) if mx else None
+    except Exception:  # noqa: BLE001 — floor is an optimisation, never load-bearing
+        return None
+
+
+# ─── Carry-forward: the measurements a re-pin must NOT evict ─────────
+
+
+_MEASUREMENT_RE = re.compile(r"[0-9a-f]{96}")
+
+# `lifecycle.VmState` values (LOWER-CASE in the DB) that mean "this VM
+# will never boot again" — the only rows whose measurement may be
+# dropped from the artifact. Everything else (active, migrating,
+# decommissioning) still has to be able to unlock its overlay.
+# `failed` is not a `VmState` today; listed so a future terminal state
+# with that name is treated as dead rather than carried forever.
+_DEAD_VM_STATES = frozenset({"destroyed", "failed"})
+
+# Hard ceiling on how many entries a single pin may CARRY (the base
+# manifest's own entries are on top of this). The carry set is bounded
+# by the live fleet, so blowing through this means the "live" filter
+# stopped filtering — fail closed rather than sign a multi-megabyte
+# artifact that quietly re-admits the whole history.
+_MAX_CARRY_FORWARD_ENTRIES = 512
+
+
+def _normalise_measurement(value: object) -> str | None:
+    """Lower-case a candidate measurement and return it iff it is a
+    well-formed 96-hex digest, else `None`.
+
+    Dropping a MALFORMED value is safe (not a silent eviction): a
+    measurement that is not 96 hex chars could never have been pinned —
+    `pin_measurement` rejects those before signing — so it cannot be in
+    the installed allowlist to begin with.
+    """
+    text = str(value or "").strip().lower()
+    return text if _MEASUREMENT_RE.fullmatch(text) else None
+
+
+def _manifest_entry_classes(text: str) -> dict[str, str]:
+    """`measurement_hex → §22 class` for every entry ALREADY in the base
+    manifest. Those entries are preserved verbatim by the rewrite, so the
+    map is what the appender must dedup against (the signing tool refuses
+    a manifest with a duplicate measurement — a duplicate would abort the
+    pin, not merely bloat it).
+
+    Fail-closed: an unparseable manifest, a malformed `measurement_hex`
+    or an unknown `class` raises.
+    """
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise EffectError("allowlist-manifest: base manifest is not valid TOML") from exc
+    out: dict[str, str] = {}
+    for raw in parsed.get("entries") or []:
+        if not isinstance(raw, dict):
+            raise EffectError("allowlist-manifest: [[entries]] item is not a table")
+        measurement = _normalise_measurement(raw.get("measurement_hex"))
+        if measurement is None:
+            raise EffectError(
+                "allowlist-manifest: an entry has a malformed measurement_hex"
+            )
+        cls = str(raw.get("class") or ALLOWLIST_CLASS_TENANT).strip().lower()
+        if cls not in _VALID_CLASSES:
+            raise EffectError(
+                f"allowlist-manifest: entry {measurement[:16]}… has unknown "
+                f"class {cls!r}"
+            )
+        out[measurement] = cls
+    return out
+
+
+def _carry_forward_classes() -> dict[str, str]:
+    """`measurement_hex → §22 class` for every measurement that MUST stay
+    allowed after this pin.
+
+    Because `install` REPLACES the active allowlist, anything missing
+    from the artifact is evicted — and an evicted measurement can no
+    longer satisfy `pre_release_validate`, i.e. that VM cannot unlock its
+    LUKS overlay on its next boot. Two POSITIVELY-CLASSED sources, each
+    enumerated from a table that also determines the class (the class is
+    never guessed and never defaults to `tenant`):
+
+    - TENANT — the measurements recorded for every `lifecycle.Vm` that is
+      not in a dead state, from `MeasurementLedger.launch_digest_hex`
+      (whose write is best-effort, so it has holes) UNIONED with the
+      latest `LaunchJob.result_json['emit']['measurement_hex']` for that
+      `vm_id` (which is how the live measurements were recovered when
+      this bug was diagnosed).
+    - HOST_ATTESTOR — `telemetry.HostAttestorRelease` rows that are still
+      `is_active` (the {current, previous} rolling-update grace window).
+      `release_service.admit_release` is the ONLY writer of a
+      `host_attestor`-class pin and it always records that row, so this
+      table IS the registry of host-attestor-class measurements. Rows
+      that have been trimmed OUT of the grace window are not carried but
+      are still a BLOCKLIST for the tenant class.
+
+    Two independent vetoes back the derivation up, both fail-closed: a
+    measurement that a live VM claims AND a host-attestor release
+    (active or trimmed) claims, and a measurement whose
+    `MeasurementLedger.measurement_class` (the class the pin actually
+    used) disagrees with the derived one.
+
+    Scoping to LIVE VMs is the growth bound: carrying every measurement
+    ever pinned would grow the trusted set forever and keep destroyed
+    VMs' images admissible.
+
+    Fail-closed, deliberately UNLIKE `_installed_epoch_floor`: if the set
+    cannot be computed we RAISE. Falling back to "base + 1" is exactly
+    the eviction bug this function exists to prevent, so a DB outage must
+    stop the pin, not silently narrow the allowlist. A measurement that
+    appears under BOTH classes also raises — re-emitting a host-attestor
+    measurement as `tenant` would let it satisfy a tenant release, which
+    is strictly worse than the availability bug.
+    """
+    try:
+        return _query_carry_forward_classes()
+    except EffectError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — mapped to a fail-closed EffectError
+        raise EffectError(
+            "allowlist carry-forward: could not compute the live measurement "
+            f"set ({type(exc).__name__}) — refusing to sign an allowlist that "
+            "would evict live VMs"
+        ) from exc
+
+
+def _query_carry_forward_classes() -> dict[str, str]:
+    """The DB half of `_carry_forward_classes` (separated so the caller
+    can map ANY failure to a fail-closed `EffectError`)."""
+    from django.apps import apps as django_apps
+
+    vm_model = django_apps.get_model("lifecycle", "Vm")
+    ledger_model = django_apps.get_model("orchestration", "MeasurementLedger")
+    launch_model = django_apps.get_model("orchestration", "LaunchJob")
+    release_model = django_apps.get_model("telemetry", "HostAttestorRelease")
+
+    # Live VMs. The state values are lower-case in the DB; normalise
+    # rather than trusting the case so a mixed-case row is not silently
+    # treated as dead (which would evict a live VM).
+    live_vm_ids = {
+        vm_id
+        for vm_id, state in vm_model.objects.values_list("vm_id", "state")
+        if str(state or "").strip().lower() not in _DEAD_VM_STATES
+    }
+
+    tenant: set[str] = set()
+    if live_vm_ids:
+        rows = ledger_model.objects.filter(vm_id__in=live_vm_ids).values_list(
+            "launch_digest_hex", flat=True
+        )
+        for digest in rows:
+            measurement = _normalise_measurement(digest)
+            if measurement is not None:
+                tenant.add(measurement)
+
+        # Latest launch job per vm_id that actually carries a measurement
+        # (the ledger write is best-effort, so this is the belt to its
+        # braces). Ordered newest-first per vm_id; the first hit wins.
+        seen_vm_ids: set[str] = set()
+        job_rows = (
+            launch_model.objects.filter(vm_id__in=live_vm_ids)
+            .order_by("vm_id", "-started_at")
+            .values_list("vm_id", "result_json")
+        )
+        for vm_id, result_json in job_rows:
+            if vm_id in seen_vm_ids:
+                continue
+            emit = (result_json or {}).get("emit") or {}
+            measurement = _normalise_measurement(emit.get("measurement_hex"))
+            if measurement is None:
+                continue
+            seen_vm_ids.add(vm_id)
+            tenant.add(measurement)
+
+    # EVERY host-attestor release ever admitted, active or not. The
+    # ACTIVE ones are carried; the inactive ones still matter as a
+    # blocklist — a trimmed release's measurement must never come back
+    # as a TENANT entry (that is exactly the "auto-pinned from a miner
+    # report" bleed the class namespace exists to stop).
+    host_known: set[str] = set()
+    host_carried: set[str] = set()
+    for raw, is_active in release_model.objects.values_list(
+        "measurement", "is_active"
+    ):
+        measurement = _normalise_measurement(raw)
+        if measurement is None:
+            continue
+        host_known.add(measurement)
+        if is_active:
+            host_carried.add(measurement)
+
+    # A measurement can only be in ONE §22 trust class. An overlap means
+    # a host-attestor image is also attributed to a tenant VM — refuse
+    # rather than pick one (picking `tenant` is the security regression).
+    overlap = tenant & host_known
+    if overlap:
+        raise EffectError(
+            "allowlist carry-forward: measurement "
+            f"{sorted(overlap)[0][:16]}… is claimed by BOTH a live VM and a "
+            "host-attestor release — refusing to guess its §22 class"
+        )
+
+    carried: dict[str, str] = {m: ALLOWLIST_CLASS_TENANT for m in tenant}
+    carried.update({m: ALLOWLIST_CLASS_HOST_ATTESTOR for m in host_carried})
+
+    # Veto: the ledger records the class each pin actually USED. Any row —
+    # for any VM, live or not, including the `host-attestor-release`
+    # audit sentinel — that recorded a different class than the one we
+    # derived fails the pin. This is what stops a derivation drift from
+    # silently re-emitting a `host_attestor` measurement as `tenant`.
+    # (Blank on rows written before the column existed ⇒ no veto, the
+    # derivation stands.)
+    if carried:
+        recorded_rows = ledger_model.objects.filter(
+            launch_digest_hex__in=sorted(carried)
+        ).values_list("launch_digest_hex", "measurement_class")
+        for digest, cls in recorded_rows:
+            measurement = _normalise_measurement(digest)
+            recorded = str(cls or "").strip().lower()
+            if measurement is None or not recorded:
+                continue
+            derived = carried.get(measurement)
+            if derived is not None and recorded != derived:
+                raise EffectError(
+                    f"allowlist carry-forward: measurement {measurement[:16]}… "
+                    f"was pinned as {recorded!r} but resolves to {derived!r} — "
+                    "refusing to re-pin it under a different §22 class"
+                )
+
+    if len(carried) > _MAX_CARRY_FORWARD_ENTRIES:
+        raise EffectError(
+            f"allowlist carry-forward: {len(carried)} measurements exceeds the "
+            f"{_MAX_CARRY_FORWARD_ENTRIES} cap — refusing to sign"
+        )
+    return carried
+
+
+# ─── Public entry point ──────────────────────────────────────────────
+
+
+def pin_measurement(
+    *,
+    measurement_hex: str,
+    l1_kids_hex: Sequence[str] = (DEFAULT_L1_KID_HEX,),
+    kbs_response_kids_hex: Sequence[str] = (DEFAULT_KBS_RESPONSE_KID_HEX,),
+    measurement_class: str = ALLOWLIST_CLASS_TENANT,
+) -> PinResult:
+    """Rebuild the allowlist as `base ∪ carry-forward ∪ {measurement}`,
+    sign, upload, reload. Returns the new epoch + the sha256 of the
+    signed COSE bytes (the KBS init container compares against this
+    exact value).
+
+    CUMULATIVE by construction: the KBS REPLACES its active allowlist on
+    install, so the artifact must re-state every measurement that has to
+    stay releasable — the base manifest's entries (preserved verbatim)
+    plus `_carry_forward_classes()` (every live VM + every active
+    host-attestor release), deduped. Emitting `base + 1` instead evicts
+    every earlier auto-pin and strands those VMs' LUKS overlays at their
+    next boot.
+
+    `measurement_class` selects the §22 trust class of the pinned entry
+    (`tenant` default / `host_attestor`). A `host_attestor` pin is
+    class-namespaced so it can NEVER alias a tenant measurement — the
+    blackbox host-attestor release path (PR-9) passes it; every existing
+    tenant launch keeps the default and its byte-identical output."""
+    if measurement_class not in _VALID_CLASSES:
+        raise EffectError(
+            f"pin_measurement: unknown allowlist class {measurement_class!r}"
+        )
+
+    manifest_path = _required_setting("VALI_ALLOWLIST_MANIFEST_PATH")
+    s3_url = _required_setting("VALI_KBS_ALLOWLIST_S3_URL")
+    sign_bin = _required_setting("VALI_KBS_ALLOWLIST_TOOL_BIN")
+
+    # §22 signing seed (Vault in production; file in tests). Resolved once
+    # up front; materialized into a 0600 tmpfs file per attempt below.
+    seed_hex = _resolve_seed_hex()
+
+    if not os.path.isfile(manifest_path):
+        raise EffectUnavailable(
+            "VALI_ALLOWLIST_MANIFEST_PATH does not exist"
+        )
+    if not (os.path.isabs(sign_bin) and os.access(sign_bin, os.X_OK)):
+        raise EffectUnavailable(
+            "VALI_KBS_ALLOWLIST_TOOL_BIN must be an absolute path to "
+            "an executable file"
+        )
+
+    if not re.fullmatch(r"[0-9a-f]{96}", measurement_hex):
+        raise EffectError(
+            "pin_measurement: measurement_hex must be exactly 96 lower-case "
+            "hex chars (48 bytes)"
+        )
+
+    with open(manifest_path, encoding="utf-8") as fh:
+        original = fh.read()
+
+    # Build the FULL entry set this artifact must carry. `install`
+    # replaces the active allowlist wholesale, so every measurement that
+    # must remain releasable has to be in these bytes — see
+    # `_carry_forward_classes` (fail-closed: it raises rather than let a
+    # DB hiccup degrade back to "base + 1", which is the eviction bug).
+    base_classes = _manifest_entry_classes(original)
+    to_pin = dict(_carry_forward_classes())
+    carried_count = len(to_pin)
+    prior_class = to_pin.get(measurement_hex)
+    if prior_class is not None and prior_class != measurement_class:
+        raise EffectError(
+            f"pin_measurement: {measurement_hex[:16]}… is already carried as "
+            f"{prior_class!r}; refusing to re-pin it as {measurement_class!r}"
+        )
+    to_pin[measurement_hex] = measurement_class
+
+    # Dedup against the base manifest, whose entries survive the rewrite
+    # verbatim. `hippius-kbs-allowlist-tool` ABORTS on a duplicate
+    # measurement (and `into_indexed` demands strictly-ascending unique
+    # entries), so an un-deduped rebuild would fail the pin outright.
+    appended: list[tuple[str, str]] = []
+    for measurement in sorted(to_pin):
+        entry_class = to_pin[measurement]
+        base_class = base_classes.get(measurement)
+        if base_class is not None:
+            if base_class != entry_class:
+                raise EffectError(
+                    f"pin_measurement: {measurement[:16]}… is in the base "
+                    f"manifest as {base_class!r} but resolves to "
+                    f"{entry_class!r} — refusing to sign a class-ambiguous "
+                    "allowlist"
+                )
+            continue
+        appended.append((measurement, entry_class))
+    log.info(
+        "allowlist pin: base=%d carried=%d appended=%d (new=%s… class=%s)",
+        len(base_classes),
+        carried_count,
+        len(appended),
+        measurement_hex[:16],
+        measurement_class,
+    )
+
+    # Epoch-retry loop. The static manifest ConfigMap's `epoch = N`
+    # only ever advances in the SIGNED artifact, never on disk, so a
+    # fresh pin starts at `manifest_epoch + 1` even after several
+    # successful pins already pushed the KBS's installed HWM higher.
+    # On a 409 (install-rejected, almost always the HWM CAS) we re-bump
+    # the epoch one past the last attempt and retry the whole
+    # build+sign+upload+reload. A genuine signature/schema 409 exhausts
+    # the bounded retries and surfaces the same error.
+    #
+    # Seed the floor from the highest epoch vali has already installed
+    # (`MeasurementLedger`) so a manifest whose frozen `epoch = N` has
+    # drifted many pins behind the live HWM still lands its FIRST attempt
+    # above the HWM instead of burning all `_MAX_EPOCH_RETRIES` at or
+    # below it — see `_installed_epoch_floor`.
+    floor: int | None = _installed_epoch_floor()
+    last_conflict: AllowlistEpochConflict | None = None
+    for _attempt in range(_MAX_EPOCH_RETRIES):
+        # 1+2: read, bump epoch, append entry. Write to a tmpfs
+        # intermediary so we can sign without mutating the operator's
+        # source TOML on disk (the dev manifest may be a git checkout).
+        bumped, new_epoch = _bump_epoch_text(original, floor=floor)
+        new_manifest = bumped
+        for entry_measurement, entry_class in appended:
+            # Carried entries re-use the module DEFAULT kids: every pin
+            # this control plane has ever emitted (tenant launches and
+            # host-attestor releases alike) used them, so re-emitting the
+            # defaults reproduces what was installed. Explicit kids only
+            # ever apply to the measurement being pinned NOW.
+            is_new = entry_measurement == measurement_hex
+            new_manifest = _append_entry(
+                new_manifest,
+                measurement_hex=entry_measurement,
+                l1_kids=l1_kids_hex if is_new else (DEFAULT_L1_KID_HEX,),
+                kbs_kids=(
+                    kbs_response_kids_hex
+                    if is_new
+                    else (DEFAULT_KBS_RESPONSE_KID_HEX,)
+                ),
+                measurement_class=entry_class,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="hippius-allowlist-") as workdir:
+            manifest_out = os.path.join(workdir, "manifest.toml")
+            cose_out = os.path.join(workdir, "dev.cose")
+            seed_out = os.path.join(workdir, "seed.hex")
+            with open(manifest_out, "w", encoding="utf-8") as fh:
+                fh.write(new_manifest)
+            # Materialize the seed 0600 inside the (tmpfs) workdir; removed
+            # with the TemporaryDirectory. §20: never logged, never on a
+            # persistent volume.
+            seed_fd = os.open(seed_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(seed_fd, "w", encoding="utf-8") as fh:
+                fh.write(seed_hex)
+
+            # 3: sign.
+            sign_proc = _run(
+                [sign_bin, "--manifest", manifest_out, "--seed", seed_out, "--out", cose_out],
+                label="kbs-allowlist-tool",
+                timeout_s=DEFAULT_SIGN_TIMEOUT_S,
+            )
+            if sign_proc.returncode != 0:
+                stderr_tail = sign_proc.stderr.decode("utf-8", errors="replace").strip()
+                raise EffectError(
+                    f"kbs-allowlist-tool: exit={sign_proc.returncode} stderr={stderr_tail!r}"
+                )
+            with open(cose_out, "rb") as fh:
+                cose_bytes = fh.read()
+            if not cose_bytes:
+                raise EffectError("kbs-allowlist-tool: empty COSE output")
+            new_sha = hashlib.sha256(cose_bytes).hexdigest()
+
+            # 4: upload to S3 so the KBS init container's startup-replay
+            #    path picks up the same bytes on the next pod restart.
+            #    The runtime swap below does not require this — kbs-admin's
+            #    `/v1/admin/allowlist/reload` accepts the bytes from the
+            #    request body directly — but the S3 mirror keeps the
+            #    startup path + the helm chart's `allowlist.url` reference
+            #    in sync with what the live KBS is serving.
+            _s3_upload(cose_out, s3_url)
+
+            # 5: in-memory swap via kbs-admin. The handler runs the SAME
+            #    `InstalledAllowlist::install` the file-fed startup path
+            #    uses — signature verify + epoch-HWM CAS + atomic active
+            #    swap. No kubectl, no RBAC concentration in vali, no pod
+            #    restart.
+            try:
+                _reload_kbs_allowlist(cose_bytes)
+            except AllowlistEpochConflict as conflict:
+                # The installed HWM is ≥ new_epoch. Re-bump one past
+                # this attempt and retry. The S3 object we just wrote
+                # is harmlessly overwritten on the next iteration.
+                last_conflict = conflict
+                floor = new_epoch + 1
+                continue
+
+        return PinResult(
+            new_epoch=new_epoch,
+            new_cose_sha256_hex=new_sha,
+            s3_url=s3_url,
+        )
+
+    # Retries exhausted — surface the last 409. Either the installed
+    # HWM raced ahead faster than we could climb (operationally
+    # implausible) or the 409 was never about the epoch (signature /
+    # schema), in which case re-bumping could never have helped.
+    raise last_conflict or EffectError(
+        "kbs-admin-reload: epoch retries exhausted with no recorded conflict"
+    )
+
+
+def _s3_upload(local_path: str, s3_url: str) -> None:
+    """Subprocess `aws s3 cp <local> s3://<bucket>/<key>`. The chart's
+    `VALI_KBS_ALLOWLIST_S3_URL` is the HTTPS URL the KBS init container
+    `curl`s; `aws s3 cp` requires the `s3://bucket/key` form, so we
+    translate by stripping the endpoint scheme + host. The operator's
+    AWS_* env (access key, secret, region) MUST be set before invoking
+    `vali_create_vm`; we propagate the env verbatim."""
+    aws_bin = str(getattr(settings, "VALI_AWS_CLI_BIN", "") or "").strip() or "aws"
+    endpoint = str(getattr(settings, "VALI_S3_ENDPOINT_URL", "") or "").strip()
+    s3_uri = _https_to_s3_uri(s3_url, endpoint)
+    argv: list[str] = [aws_bin]
+    if endpoint:
+        argv.extend(["--endpoint-url", endpoint])
+    argv.extend(["s3", "cp", local_path, s3_uri])
+    proc = _run(
+        argv,
+        label="aws-s3-cp",
+        timeout_s=DEFAULT_S3_TIMEOUT_S,
+        env=os.environ.copy(),
+    )
+    if proc.returncode != 0:
+        stderr_tail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise EffectError(
+            f"aws-s3-cp: exit={proc.returncode} stderr={stderr_tail!r}"
+        )
+
+
+def _https_to_s3_uri(https_url: str, endpoint: str) -> str:
+    """Translate `https://<endpoint-host>/<bucket>/<key>` (the form the
+    KBS init-container fetches) → `s3://<bucket>/<key>` (the form
+    `aws s3 cp` requires). Already-`s3://` URLs pass through. A URL
+    whose host doesn't match the endpoint host fails-closed — the
+    operator likely pointed at the wrong bucket.
+    """
+    if https_url.startswith("s3://"):
+        return https_url
+    if not https_url.startswith(("https://", "http://")):
+        raise EffectError(
+            f"aws-s3-cp: VALI_KBS_ALLOWLIST_S3_URL must be https:// or s3://, "
+            f"got {https_url[:20]!r}"
+        )
+    # Strip scheme + netloc; what's left is `/<bucket>/<key>`.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(https_url)
+    if endpoint:
+        ep_host = urlparse(endpoint).netloc
+        if parsed.netloc != ep_host:
+            raise EffectError(
+                f"aws-s3-cp: VALI_KBS_ALLOWLIST_S3_URL host {parsed.netloc!r} "
+                f"does not match VALI_S3_ENDPOINT_URL host {ep_host!r}"
+            )
+    path = parsed.path.lstrip("/")
+    if "/" not in path:
+        raise EffectError(
+            f"aws-s3-cp: VALI_KBS_ALLOWLIST_S3_URL path {path!r} lacks <bucket>/<key>"
+        )
+    return f"s3://{path}"
+
+
+def _reload_kbs_allowlist(cose_bytes: bytes) -> None:
+    """POST the freshly-signed COSE artifact to
+    `VALI_KBS_ADMIN_URL/v1/admin/allowlist/reload` so the live KBS
+    runs the same `InstalledAllowlist::install` it ran at startup —
+    signature verify + epoch HWM CAS + atomic active-body swap, all
+    without a pod restart.
+
+    Fails closed:
+    - `EffectUnavailable` on transport failure, and on ANY admin-TLS
+      misconfiguration — `kbs_admin_tls.admin_transport` refuses to
+      hand back a downgraded transport, so a broken client identity
+      stops the pin instead of pinning over an unauthenticated hop.
+    - `EffectError` on any non-200 response. The kbs-admin handler
+      classifies via the `reason` field of `AdminErrorResponse`; we
+      surface the HTTP status + the static reason without leaking the
+      URL or body bytes.
+    """
+    import urllib.error
+    import urllib.request
+
+    # Local import: `kbs_admin_tls` imports `settings`, and importing it
+    # at module load would tighten this module's import graph for a
+    # dependency only this function needs.
+    from apps.orchestration.services.kbs_admin_tls import (
+        KbsAdminTlsMisconfigured,
+        admin_transport,
+    )
+
+    try:
+        transport = admin_transport()
+    except KbsAdminTlsMisconfigured as exc:
+        raise EffectUnavailable(str(exc)) from exc
+    url = transport.url("/v1/admin/allowlist/reload")
+    context = transport.context
+
+    request = urllib.request.Request(
+        url,
+        data=cose_bytes,
+        headers={"Content-Type": "application/cbor"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=DEFAULT_KBS_RELOAD_TIMEOUT_S,
+            context=context,
+        ) as resp:  # noqa: S310 — vali-internal, mTLS-pinned ClusterIP service
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        # kbs-admin returned a 4xx/5xx — surface the HTTP status. The
+        # `reason` field lives in the CBOR response body; we don't
+        # parse CBOR in Python (no stdlib + no project dep), but
+        # status-only is enough to triage:
+        #   409 → install-rejected (signature, schema, or HWM)
+        #   415 → wrong-content-type
+        #   429 → rate-limited
+        #   413 → body-too-large
+        # The kbs-admin pod logs carry the verbose classifier.
+        if exc.code == 409:
+            # Retriable at a higher epoch (HWM CAS) — see
+            # `AllowlistEpochConflict` + the pin_measurement loop.
+            raise AllowlistEpochConflict(
+                "kbs-admin-reload: kbs returned status=409 (install-rejected)"
+            ) from exc
+        raise EffectError(
+            f"kbs-admin-reload: kbs returned status={exc.code}"
+        ) from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise EffectUnavailable("kbs-admin-reload: peer unreachable") from exc
+    if not 200 <= status < 300:
+        raise EffectError(f"kbs-admin-reload: unexpected status={status}")

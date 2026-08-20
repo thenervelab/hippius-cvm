@@ -1,0 +1,191 @@
+[package]
+name = "hippius-miner-agent"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PR-MA-1/2/3: Hippius miner-agent — runs on an UNTRUSTED bare-metal miner host. It self-generates the miner's persistent Ed25519 identity (never Vault-issued, never leaves the host), fetches + §22-verifies UKI images via the miner-uki-fetch library, and launches tenant SEV-SNP confidential VMs locally via libvirt+qemu (MA-3: a fail-closed CVM lifecycle state machine, a pre-flight launch digest computed with the `sev` crate that must match the §F allowlist measurement, and a virsh-shell-out libvirt driver behind a mockable trait). The Edge mTLS client stays a skeleton until a later MA-* PR. The miner never authenticates to the hippius-compute Vault and never speaks to the KBS — only the guest VMs do."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-miner-agent"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_miner_agent"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Real AMD SEV-SNP pre-flight launch digest (PR-MA-3). Mirrors
+# `binaries/uki-measure`'s `snp` feature exactly: `sev::measurement` is
+# Linux-only and needs `openssl`, so the `sev` dependency is optional,
+# non-default and target-gated. This keeps `cargo test --workspace`
+# cross-platform green on macOS dev; the digest known-answer test runs
+# on the Linux `cargo test -p hippius-miner-agent --features snp` CI
+# lane, alongside uki-measure's. Without the feature `compute_launch_
+# digest` fails closed (`cvm-launch-digest/feature-disabled`).
+snp = ["dep:sev"]
+# `prod-root` (RA-N6) — forward to the UKI-fetch library's prod-root gate:
+# a production miner-agent image built with this feature MUST supply the
+# real §22 root pubkey via `HIPPIUS_PROVENANCE_ROOT_PUBKEY` or the build
+# fails closed (no dev-placeholder fallback). Off by default; the operator
+# turns it on once the §22 signing ceremony + #80 image-store wiring land.
+prod-root = ["hippius-miner-uki-fetch/prod-root"]
+
+[dependencies]
+# The canonical §K heartbeat wire format (PR-MA-6) — `MinerHeartbeat`,
+# `SignedMinerHeartbeat`, the canonical-CBOR encoder. Crypto-free; the
+# Ed25519 signing is the miner-agent's own `MinerIdentity`.
+hippius-types = { path = "../../hippius-types" }
+# The miner-side UKI fetch + §22-verify pipeline — consumed as a
+# library. `fetch` already does cached fetch, always-verify (even on a
+# cache hit), hash-gating, and crash-safe atomic install.
+hippius-miner-uki-fetch = { path = "../miner-uki-fetch" }
+# The `ImageStore` abstraction + its backends (`MemoryImageStore`,
+# the `HippiusS3ImageStore` stub) + `ImageStoreError`.
+hippius-image-provenance = { path = "../image-provenance" }
+# Ed25519 identity. `zeroize` feature ⇒ `SigningKey` wipes its seed on
+# drop; `from_bytes` (not `generate`) so the `rand_core` feature is not
+# needed here — the seed is drawn from `OsRng` explicitly, the same
+# pattern as `agent-tenant-telemetry`.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+# `OsRng` — the kernel CSPRNG (`getrandom`) the identity seed is drawn from.
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+# Secret-wiping: `Zeroizing` for the seed buffer + the on-disk hex.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# Operator config (TOML). Parser only — no date / sptr features.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+# Atomic identity-file writes: `NamedTempFile` is an `O_EXCL`-created
+# temp in the target dir — the safe primitive for write → fsync →
+# rename. MA-3 also stages the libvirt domain XML through it.
+tempfile = "3"
+# Async runtime for the CVM lifecycle + the MA-4/5 serve loop.
+# `tokio::process` drives the `virsh` shell-out in `VirshDriver`;
+# `tokio::time` bounds the domain-state poll; MA-4/5 add `net` (the
+# AF_VSOCK + orders-HTTP listeners), `signal` (the SIGTERM serve
+# wait) and `io-util` (the length-prefixed vsock framing). A
+# current-thread runtime is enough — the agent hosts a few small
+# listeners, never a high-RPS server.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "process",
+    "time",
+    "net",
+    "signal",
+    "io-util",
+    "fs",
+] }
+# `#[async_trait]` makes the `LibvirtDriver` trait object-safe so the
+# production `VirshDriver` and the test `MockLibvirtDriver` share one
+# `Arc<dyn LibvirtDriver>` behind the lifecycle state machine.
+async-trait = "0.1"
+# MA-5 orders HTTP server. Same axum version + slim feature set the
+# `kbs-server` binary pins (`http1` + `tokio`, default-features off) —
+# axum is already a workspace dependency, no new lockfile tree.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+# MA-4/5 CBOR wire codec — the length-prefixed vsock guest frames and
+# the signed lifecycle-order envelopes. Same `ciborium` / `serde_bytes`
+# pinning as the edge-gateway crate.
+ciborium = "0.2"
+# #312 — COSE_Sign1 envelope decode for the OrderTicket. The
+# miner-agent does NOT verify the L1 Ed25519 signature (that's KBS's
+# job); it only PEEKS at the ticket payload to extract `flavor` so
+# the launch path can refuse a mismatched `cpu_count` BEFORE QEMU
+# starts. Defense-in-depth: the §22 allowlist + SNP measurement chain
+# also catches mismatches at KBS release time, but earlier rejection
+# saves a guest boot + audit-log entry.
+coset = { version = "0.3", default-features = false, features = ["std"] }
+# JSON encoder for the `tenant-preflight` HTTP response body. CBOR is
+# the wire shape for every other signed in/out path; the preflight
+# reply is operator-facing diagnostics that vali parses with stdlib
+# `json` (keeps the vali side dep-free). One direction only — we never
+# deserialize JSON in the miner-agent.
+serde_json = "1"
+serde_bytes = "0.11"
+# MA-4/5 graceful-shutdown plumbing — `CancellationToken` fans one
+# shutdown signal out to the vsock listener, the orders server and the
+# heartbeat task; `TaskTracker` (the `rt` feature) tracks the detached
+# order-dispatch tasks so the serve loop can drain them at shutdown.
+# `rt` (TaskTracker) + `io` — the latter gives `ReaderStream`, which
+# adapts a `tokio::fs::File` into a `Stream` so the §25 M1 snapshot
+# uploader can stream the multi-GB LUKS volume to S3 without buffering
+# it in RAM (`reqwest::Body::wrap_stream`).
+tokio-util = { version = "0.7", default-features = false, features = ["rt", "io"] }
+# PR-MA-6 heartbeat pusher — the mTLS client to the Edge gateway.
+# `rustls-tls` (NO native-tls — same posture as `agent-initramfs` /
+# the edge-gateway forward client); `rustls-tls` ⇒ TLS 1.3 floor is
+# enforced via `min_tls_version`. `http2` is REQUIRED — the Edge
+# miner listener is LOCKED to HTTP/2 (`miner_listener.rs` ALPN gate
+# rejects anything else). The pusher pairs this feature with
+# `.http2_prior_knowledge()` on the client builder so the connection
+# uses h2 framing from the first byte, instead of attempting an
+# HTTP/1.1 request that the Edge silently RSTs. `json` is OFF — the
+# heartbeat body is opaque canonical-CBOR posted verbatim, never JSON.
+# `stream` is added for the §25 M1 snapshot uploader: it enables
+# `reqwest::Body::wrap_stream`, so the encrypted LUKS volume is streamed
+# to the presigned S3 PUT URL chunk-by-chunk (never buffered whole).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+# Self-signed mTLS client cert minted from the Ed25519 identity key
+# (permissionless Edge auth — docs/design/permissionless-miner-auth.md).
+# No operator CA: the cert's key IS the node identity, so presenting it
+# proves possession of the on-chain-registered identity.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls-pki-types = "1"
+# SHA-256 — the heartbeat `body_hash` logged in place of the body
+# bytes (§K logging discipline). Same pinning as the edge-gateway.
+sha2 = "0.10"
+# Safe CPUID wrapper used by `snp_config::SnpCpuConfig::probe` to read
+# `CPUID 0x8000001f EBX` (the SEV C-bit position + physical-address
+# reduction) and `CPUID 0` (vendor string) directly off the miner
+# host's CPU. The workspace forbids `unsafe_code`; `raw-cpuid` keeps
+# the `unsafe` asm intrinsics inside the crate so our call site stays
+# safe. Cross-platform: the crate compiles a `cfg(target_arch =
+# "x86_64")` body on x86_64 and a `panic!`-on-call stub elsewhere —
+# matches our `snp_config::SnpCpuConfig::probe` cfg-gate (issue #116).
+raw-cpuid = "11"
+# `statvfs` for the data-disk free-space pre-check — convert the in-guest
+# mid-format ENOSPC into a clean pre-create reject (and catch a miner
+# that over-declares its disk budget). `fs` feature only.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+[dev-dependencies]
+# Integration tests verify the on-disk identity round-trip + drive the
+# image cache against the committed `test_vectors/provenance/`, and the
+# PR-MA-6 heartbeat KAT decodes the heartbeat wire format.
+tempfile = "3"
+# Conformance oracle for the §23 `register_child` node-authorisation
+# message (`sign-registration`): re-encode the same tuple via
+# parity-scale-codec — the exact codec `pallet-compute-scoring` uses —
+# and assert it byte-matches `MinerIdentity::registration_message`'s
+# hand-rolled concatenation, so the two can never silently drift.
+# Dev-only: the production signing path needs no SCALE codec.
+codec = { workspace = true, features = ["std"] }
+
+# `sev` supplies `snp_calc_launch_digest` for the PR-MA-3 pre-flight
+# launch digest. Target-gated to Linux (the `measurement` module is
+# `cfg(target_os = "linux")`) and optional — only the `snp` feature
+# pulls it. `default-features = false` + `snp`/`openssl` is the minimum
+# `sev::measurement` compiles with; `openssl` resolves to the system
+# libssl. Identical pinning to `binaries/uki-measure` so both crates'
+# digests come from the same `sev` version.
+#
+# `tokio-vsock` (MA-4) is the host side of the guest-CVM ↔ miner-agent
+# AF_VSOCK relay. AF_VSOCK is a Linux kernel facility, so the crate is
+# Linux-only and target-gated — the framing logic in `vsock::frame` is
+# generic over `AsyncRead`/`AsyncWrite` and stays cross-platform, so
+# `cargo test --workspace` is still green on a macOS dev host; only the
+# real `VsockListener` bind is behind `cfg(target_os = "linux")`.
+[target.'cfg(target_os = "linux")'.dependencies]
+sev = { version = "7.1", default-features = false, features = [
+    "snp",
+    "openssl",
+], optional = true }
+tokio-vsock = "0.7"

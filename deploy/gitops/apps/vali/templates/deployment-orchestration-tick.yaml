@@ -1,0 +1,182 @@
+{{- if .Values.orchestrationTick.enabled }}
+---
+# §24/§25 orchestration tick worker.
+#
+# Drives `orchestration.service.tick_once()` on a fixed interval
+# (`VALI_ORCHESTRATION_TICK_INTERVAL_S`, default 10s). Each cycle:
+#   1. enrols a warm §25 MigrationJob for every Active VM still bound to
+#      a miner that went Quarantined/Decommissioned on-chain (graceful
+#      exit — so its VMs vacate WARM, off the departing miner, before the
+#      stake unbonds), then
+#   2. advances every in-flight MigrationJob / DecommissionJob by one
+#      bounded, CAS-guarded step (snapshot poll, ack waits, the §25
+#      generation fence, crypto-erase, NetBird revoke).
+#
+# Without this worker, MigrationJobs are created (by the API / price-watch
+# / the new graceful-exit enroller) but never advanced, so a departing
+# miner's VMs would never actually move. Deploy as a SINGLE instance —
+# the §14 idempotency + the (id, version, state) CAS make a crash-restart
+# safe, but two concurrent tick loops are not a supported topology (same
+# single-writer posture as vali-scheduler-reeval).
+#
+# Same image + env as the vali web pod (shares the Django app, Postgres,
+# Vault creds for S3 + NetBird, and `VALI_THEBRAIN_RPC_URL` via envFrom
+# vali-config). Worker posture: no HTTP port/probes, replicas 1 +
+# Recreate, no k8s API token, readOnlyRootFilesystem. Sync wave 3.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-orchestration-tick
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestration-tick
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: orchestration-tick
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: orchestration-tick
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every tick times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestration-tick
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "vali_orchestration_tick"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
+            {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            - name: VALI_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: vali-vault
+                  key: address
+            # §25 migration presigns: the tick driver advances
+            # SNAPSHOTTING/UPLOADING/DEST_ACTIVATING, each of which mints a
+            # presigned S3 URL (boto S3 client — see configmap
+            # VALI_S3_CLIENT_FACTORY). SigV4 signing needs these creds from
+            # the operator-provisioned `vali-s3` Secret.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.config.s3RegionName | quote }}
+            {{- if .Values.orchestrationTick.rebootRecovery.enabled }}
+            # Reboot-recovery (service.reboot_recovery_once): relaunch an
+            # Active VM that a host reboot powered off, on its SAME alive
+            # miner, reusing the existing encrypted overlay. Gated to VMs
+            # previously observed running (seen_running) so it never mass-
+            # resurrects stale Active-but-down rows. See values orchestrationTick.
+            - name: VALI_REBOOT_RECOVERY_ENABLED
+              value: "true"
+            - name: VALI_REBOOT_RECOVERY_DEBOUNCE_POLLS
+              value: {{ .Values.orchestrationTick.rebootRecovery.debouncePolls | quote }}
+            - name: VALI_REBOOT_RECOVERY_MAX_ATTEMPTS
+              value: {{ .Values.orchestrationTick.rebootRecovery.maxAttempts | quote }}
+            - name: VALI_REBOOT_RECOVERY_BACKOFF_BASE_S
+              value: {{ .Values.orchestrationTick.rebootRecovery.backoffBaseS | quote }}
+            {{- if .Values.netbird.enabled }}
+            # Reboot-recovery calls `launch_on_miner`, which — for a
+            # netbird-on VM (every real tenant) — mints a NetBird setup-key.
+            # This tick historically ran ONLY migration/decommission (no key
+            # mint) so it lacked these creds; reboot-recovery adds a LAUNCH
+            # here, so it now needs the SAME NetBird BASE + TOKEN the
+            # launch-tick has, or every recovery of a netbird-on VM fails
+            # `terminal` at `netbird:list-groups` and burns the attempt cap.
+            - name: VALI_NETBIRD_API_BASE
+              value: {{ .Values.netbird.apiBase | quote }}
+            - name: VALI_NETBIRD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vali-netbird-token
+                  key: VALI_NETBIRD_API_TOKEN
+            {{- end }}
+            {{- end }}
+          resources:
+            {{- .Values.orchestrationTick.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- include "vali.vaultTokenVolumeMount" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 12 }}
+            - name: tmp
+              mountPath: /tmp
+            - name: vault-ca
+              mountPath: /etc/hippius/vault-ca
+              readOnly: true
+            {{- if .Values.createVm.enabled }}
+            # §25 dest-activation re-mints the destination OrderTicket at
+            # new_gen (migration_ticket.remint_dest_ticket) + may re-pin
+            # the §22 allowlist — both sign with the PROD seed fetched
+            # from Vault (#587 Phase 1A; no committed dev seed file). Only
+            # the live allowlist manifest (non-secret) is mounted.
+            - name: allowlist-manifest
+              mountPath: /etc/hippius/allowlist
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "vali.vaultTokenVolume" . | nindent 8 }}
+        {{- include "vali.kbsAdminTlsVolume" . | nindent 8 }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: vault-ca
+          configMap:
+            name: vault-ca
+        {{- if .Values.createVm.enabled }}
+        - name: allowlist-manifest
+          configMap:
+            name: vali-allowlist-manifest
+        {{- end }}
+{{- end }}

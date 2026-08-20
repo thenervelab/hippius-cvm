@@ -1,0 +1,62 @@
+[package]
+name = "hippius-agent-tenant-telemetry"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PR-E2.1: tenant telemetry agent — establishes the §23 per-VM telemetry-signer key inside the measured SEV-SNP guest. Runs as a systemd service after switch_root (separate from the initramfs agent). Generates an Ed25519 signer keypair in RAM, attests it via /dev/sev-guest with the §23 tenant_telemetry REPORT_DATA layout, obtains + verifies a KBS-signed telemetry certificate, and holds the key behind a TelemetrySigner trait for PR-E2.2's receipt signing. The key never touches disk and is zeroized on shutdown."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-agent-tenant-telemetry"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_agent_tenant_telemetry"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+hippius-guest = { path = "../../hippius-guest" }
+# Ed25519 telemetry signer key. `zeroize` so `SigningKey` is
+# `ZeroizeOnDrop` — the seed wipes when the `TelemetrySigner` drops.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+# `OsRng` (kernel CSPRNG via getrandom) for the signer keygen — same
+# RNG source the initramfs agent's X25519 keygen uses.
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# KBS HTTP client — `reqwest` blocking + `rustls-tls` (no system
+# OpenSSL dependency), mirroring the initramfs agent's KBS client.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Encode the canonical-CBOR cert request + decode the nonce / signed
+# telemetry-certificate responses.
+ciborium = "0.2"
+hex = "0.4"
+thiserror = "2"
+# Graceful shutdown: convert SIGTERM/SIGINT into a normal return so
+# the `TelemetrySigner` `Drop` (and its `Zeroize`) runs before exit.
+signal-hook = "0.3"
+
+# `sev` provides the SNP guest attestation ioctl. Target-gated so
+# non-Linux dev hosts still `cargo check`/`cargo test` (against the
+# mock provider) — `/dev/sev-guest` only exists on a Linux/x86_64
+# SEV-SNP guest. `default-features = false` drops the host-side API.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+sev = { version = "7.1", default-features = false, features = ["snp"] }
+
+# PR-E2.3 — the synchronous `AF_VSOCK` client the telemetry agent uses
+# to push buffered receipts to the host miner-agent. `AF_VSOCK` is a
+# Linux-only socket family, so the crate is target-gated (like `sev`):
+# a non-Linux dev host still builds + tests the pusher's encoding /
+# batching / back-off logic — that path is generic over `std::io::Write`
+# and exercised over TCP loopback — only the vsock dial itself is Linux.
+#
+# `vsock` is a thin synchronous socket wrapper — PR-E2.3 adds NO async
+# runtime; the §E agent stays single-threaded-and-synchronous
+# (`std::thread`), keeping the measured guest TCB minimal. (The crate's
+# pre-existing `reqwest` KBS client, PR-E2.1, does pull `tokio`
+# transitively — that footprint is unchanged here and out of scope.)
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"

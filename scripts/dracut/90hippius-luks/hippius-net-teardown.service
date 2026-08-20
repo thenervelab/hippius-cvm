@@ -1,0 +1,26 @@
+# `hippius-net-teardown.service` — initrd unit (dracut module
+# 90hippius-luks) that flushes the runner's static network config and
+# shreds the unlock secrets (/run/hippius/{kek,luks.header}) just
+# before switch-root.
+#
+# Ordering: units WantedBy=initrd-switch-root.target are started by
+# the isolate that precedes the pivot; Before=initrd-switch-root.service
+# guarantees we run before the actual switch. After=cryptsetup.target
+# guarantees systemd-cryptsetup has already consumed the keyfile +
+# verified header.
+
+[Unit]
+Description=Hippius initrd net teardown + unlock-secret wipe before switch-root
+DefaultDependencies=no
+After=cryptsetup.target
+Before=initrd-switch-root.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/hippius-net-teardown
+StandardOutput=kmsg+console
+StandardError=kmsg+console
+
+[Install]
+WantedBy=initrd-switch-root.target

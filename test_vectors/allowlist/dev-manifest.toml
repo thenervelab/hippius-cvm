@@ -1,0 +1,306 @@
+# `test_vectors/allowlist/dev-manifest.toml` — dev §22 allowlist input.
+#
+# `hippius-kbs-allowlist-tool --manifest <this file>` ingests this TOML
+# and emits `dev.cose` — the byte-identical artifact the dev KBS pulls
+# at boot via `[allowlist].signed_path`. The dev seed lives at
+# `packer/kbs-uki/keys/dev/provenance-root.dev.ed25519` (the same key
+# the §F UKI provenance signer uses); the matching pubkey is
+# `e6fec6b20e2a6848537e70c195e99dce63a09f6d17551845e6eda126be53adab`.
+#
+# Drift control: `test_vectors/allowlist/dev.cose` is committed and CI
+# re-mints it from this manifest + the dev seed and `diff -q`s the
+# result; canonical-CBOR + EdDSA being deterministic, any drift surfaces
+# loudly. Bumping `epoch` here without re-running the tool fails CI.
+
+# Monotonic anti-rollback counter (§22 HWM). Bump in lockstep with any
+# measurement-affecting change to the UKI build OR any change to this
+# manifest (entry add/remove, kid swap).
+#
+# Epoch history:
+#   1 — initial KBS-UKI-only allowlist (PR #145).
+#   2 — add tenant UKI measurement entry + bind dev L1 kid
+#       `l1-order-ticket-dev-v1` for tenant launches.
+#   3 — re-pin tenant UKI measurement to post-PR #171
+#       (`fix(agent-initramfs): mount procfs/sysfs/devtmpfs when running
+#       as PID 1`). Only the initrd portion of the UKI changed; kernel,
+#       cmdline, ovmf, rootfs verity root all preserved bit-for-bit.
+#   4 — re-pin tenant UKI measurement for §E1 wire-up 1/3 — adds
+#       `hippius.luks_device=/dev/vda` to the tenant UKI cmdline so
+#       agent-initramfs `resolve_luks_device_from` resolves the LUKS
+#       backing device at PID 1 instead of failing closed with
+#       `luks-failed`. Cmdline bytes change → cmdline_sha256,
+#       initrd_sha256, rootfs verity root, measurement_hex all roll
+#       in lockstep with the new SOURCE_DATE_EPOCH.
+#   5 — re-pin tenant UKI measurement to post-PR #181+#182+#183 (KBS
+#       response trust anchor pin + `hippius.luks_device=` cmdline +
+#       vsock ticket delivery from miner to guest).
+#   6 — re-pin tenant UKI measurement for the vsock kernel-module
+#       bundle: Debian Trixie 6.12 ships `CONFIG_VSOCKETS=m`, so the
+#       initramfs now stages `vsock.ko` +
+#       `vmw_vsock_virtio_transport_common.ko` +
+#       `vmw_vsock_virtio_transport.ko` under
+#       `/lib/modules/<kver>/kernel/net/vmw_vsock/` (decompressed at
+#       build time from the kernel `.deb`), and the agent
+#       `init_module(2)`s them at PID 1 so `/dev/vsock` exists before
+#       `VsockListener::bind` inside `recv_ticket`. Initrd +
+#       cmdline_sha256 + rootfs_verity_root + measurement_hex all
+#       roll in lockstep with the new path-scoped SOURCE_DATE_EPOCH.
+#   7 — re-pin BOTH UKI measurements for the in-initramfs network
+#       bring-up (PR #194). Tenant UKI now also stages
+#       `failover.ko` + `net_failover.ko` + `virtio_net.ko` (Trixie
+#       ships `virtio_net=m`); the agent `init_module(2)`s them at
+#       PID 1 then runs a hand-rolled DHCP handshake against the
+#       libvirt-NAT dnsmasq + applies the lease via RTNETLINK +
+#       writes `/etc/resolv.conf` BEFORE the first KBS HTTPS call.
+#       Without it `ReqwestHttpClient::post_cbor` failed closed at
+#       `kbs-connect` ~0.9 s after `/init` (live 2026-05-25). The
+#       KBS-UKI also re-pins because the agent-initramfs binary
+#       bytes changed (the network bring-up code is a no-op skip on
+#       a UKI that bundles no virtio_net modules, but the call sites
+#       and the new `AgentError::Network` variant are in the linked
+#       binary either way).
+#   8 — re-pin BOTH UKI measurements for the wait_for_interface
+#       kernel-async race fix (PR #200). Post-#197 live boot
+#       2026-05-26 fail-closed at ~22 ms after `PF_VSOCK registered`
+#       with `network-failed`: `init_module(virtio_net)` returns Ok
+#       the moment the kernel accepts the module bytes, but device
+#       registration runs async — `/sys/class/net/eth0/address` is
+#       populated and the ifindex is registered some tens of ms
+#       later. The agent's first `find_first_ethernet()` poll landed
+#       inside that window, `read_mac` returned `Err("mac-read")`,
+#       and the `?` propagated. The fix narrows the retry to those
+#       two transient sub-classes (`mac-read` / `iface-nametoindex`)
+#       so the agent waits the kernel out within the existing
+#       5 s `IFACE_WAIT` budget instead of fail-closing on the
+#       first poll. Structural errors (sysfs unreadable, NUL byte
+#       in name, etc.) still propagate immediately. Pure
+#       binary-bytes change — no cmdline / module-set delta — but
+#       initrd + measurement_hex shift on BOTH UKIs in lockstep
+#       (the kbs UKI links the same agent binary; its `bring_up_dhcp`
+#       no-op skip path is unaffected at runtime but its bytes shift).
+#   9 — re-pin BOTH UKI measurements for the second phase of the
+#       virtio_net registration race coverage (PR #202). Post-#201
+#       boot still fail-closed at ~30 ms after `PF_VSOCK registered`;
+#       a one-off debug initramfs printed the raw `AgentError::Network`
+#       payload and exposed two new race steps NOT covered by #201:
+#         step 2 — `/sys/class/net/eth0/address` exists but body is
+#                  still `"\n"` ⇒ `parse_mac` returns `mac-parse`;
+#         step 5 — `netlink_set_link_up` SET hits the kernel before
+#                  the netdev finishes registration ⇒
+#                  `netlink-ack-error` / `netlink-unexpected-reply`
+#                  bubbling out of `netlink_send_recv_ack`.
+#       PR #202 extends `wait_for_interface_with`'s transient set
+#       with `mac-parse` AND adds a short retry wrapper
+#       (`netlink_set_link_up_retry` — 3 × 50 ms = 150 ms budget)
+#       around `netlink_set_link_up`. The pre-#202 generic
+#       `.map_err` squash on `netlink_set_link_up` is removed so the
+#       wrapper can discriminate retry-worthy from structural
+#       netlink errors. Same pure binary-bytes shape as epoch 8.
+#  10 — re-pin BOTH UKI measurements for the structural network-race
+#       refactor + sev-guest module chain (PR #206 + #207). Three
+#       buckets of changes:
+#         a) network.rs retry policy inverted from whitelist to
+#            blacklist — anything not in `STRUCTURAL_INTERFACE_PROBE_ERRORS`
+#            (sys-class-net-read, iface-name-nul) or
+#            `STRUCTURAL_NETLINK_ERRORS` (netlink-socket, -bind, -send)
+#            is retried inside the wait_for_interface budget.
+#            Closes the iterative one-sub-class-at-a-time fix loop
+#            that #200 / #202 walked: any future race-window sub-class
+#            (the live debug found `netlink-deserialize` post-#203)
+#            self-resolves under the same retry policy.
+#         b) `netlink_set_link_up` and `netlink_apply_lease` switched
+#            to send-without-ACK (the SEV-SNP guest's netlink_sys recv
+#            returns 36 bytes of zeros instead of NLMSGERR(0) for the
+#            ACK — observed live). IFF_UP confirmation now polls
+#            /sys/class/net/<name>/flags. DHCP recv-loop drains stale
+#            packets to handle the OFFER-from-previous-attempt-arrives-
+#            late case.
+#         c) SEV-SNP attestation modules bundled in the initramfs +
+#            loaded by the agent before `/dev/sev-guest` access:
+#            crypto_null, gf128mul (lib/crypto), ghash-generic, gcm
+#            (for the gcm(aes) AEAD sev-guest probe allocates),
+#            configfs (CoCo TSM report interface), tsm (depends on
+#            configfs), sev-guest (depends on tsm). Without these
+#            the sev-guest probe returned -EIO and /dev/sev-guest
+#            never appeared.
+#         d) `/etc/` mkdir added before write_resolv_conf since the
+#            minimal initramfs cpio ships only /init /lib /lib64 /sbin.
+#         e) `AgentError::sub_class()` + `log_fatal_err` surface the
+#            inner sub-classifier on serial so the family-name collapse
+#            (`network-failed`) no longer hides which step inside the
+#            family fired.
+#       Live debug-initrd validation 2026-05-26 reached hop 16
+#       (KBS attestation, `kbs-denial` from the still-unsigned debug
+#       initrd) — same chain a real allowlist entry unblocks for
+#       Phase A close. initrd_sha256 + cmdline_sha256 + rootfs_verity_root
+#       + measurement_hex all roll on BOTH UKIs.
+#   12 — re-pin BOTH UKI measurements for the vendored `sev` crate's
+#       EpycGenoa stepping=1 fix (see `vendor/sev/HIPPIUS_PATCH.md`).
+#       Upstream sev 7.1.0 hardcodes `cpu_sig(25, 17, 0)` for
+#       EpycGenoa, real Genoa silicon (EPYC 9254) reports
+#       stepping=1 (CPUID 0x00A10F11). QEMU `-cpu host` writes the
+#       actual silicon CPUID into the BSP VMSA's rdx, so AMD-SP's
+#       launch_digest is computed over different VMSA bytes than
+#       `snp_calc_launch_digest` predicted upstream — every prior
+#       epoch's measurement_hex was 8 bytes off in exactly the RDX
+#       low nibble, which is why every Phase A KBS release attempt
+#       since #211 fail-closed `attestation: measurement not in
+#       ticket's allowed set`. Proven 2026-05-26 by capturing the
+#       AMD-SP-reported measurement field from a debug initrd's SNP
+#       report (`offset 144..192`) and re-running uki-measure with
+#       the patched sev — prediction matched byte-for-byte. Plus,
+#       the agent-initramfs + tenant-telemetry binaries' bytes change
+#       because they re-link against the vendored crate, so
+#       initrd_sha256 + rootfs_verity_root + cmdline_sha256 (the
+#       cmdline embeds rootfs_verity_root) all roll in lockstep.
+#   13 — re-pin BOTH UKI measurements post-#221+#222 (KBS admin
+#       endpoints `/v1/admin/vm/{vm_id}/register-vm` + vali
+#       `kbs-admin-client` baked into the image). The agent-
+#       initramfs binary does not USE the new admin code path, but
+#       it links `hippius-types` and the workspace lockfile grew
+#       a new top-level crate (`hippius-kbs-admin-client`) plus a
+#       new `admin` module inside `hippius-types` and `kbs-core`.
+#       The compiled `hippius-types` rlib bytes shift accordingly,
+#       which ripples into agent-initramfs's binary → initrd_sha256
+#       (both UKIs) + agent-tenant-telemetry's binary → rootfs
+#       squashfs → verity root → cmdline.effective bytes (tenant
+#       UKI only — the KBS UKI has no rootfs binary).
+#       `tenant-uki-build` + `uki-build` on `main` have been
+#       failing the KAT diff step since #221 landed on 2026-05-27
+#       04:44 UTC; first failure: run 26491293179. This re-pin
+#       catches the KAT up to the post-#221+#222 build output.
+#       Verified host-deterministic: dev-VM `sg docker make uki`
+#       produced byte-identical measurement.json to the GHA
+#       `tenant-uki-build` and `uki-build` runners.
+#   14 — re-pin BOTH UKI measurements + revert the temporary debug
+#       allowlist (#233). Closes Phase A. Captured live 2026-05-27
+#       ~13:35 UTC via a debug-eprintln tenant UKI: the agent
+#       rejected the KBS-released SignedResponse with
+#       `Signature("KBS response: crypto: response sig invalid")`.
+#       Root cause: the Vault-stored response-signing seed
+#       (`49d6154b…5b15`) had been rotated out-of-band between
+#       PR #181 (which baked `PINNED_KBS_RESPONSE_VK` =
+#       `a2b99f54…060c`) and now, so KBS was signing with
+#       pubkey `24e6a730…c803` while the agent + chart still
+#       pinned `a2b99f54…060c`. This PR realigns the agent's
+#       compile-time const + the chart's `authPubkeyHex` to the
+#       actual Vault key (`24e6a730…c803`). The pubkey lives in
+#       the rootfs of the tenant UKI (and indirectly the kbs
+#       UKI via the shared agent-initramfs binary), so the
+#       measurement_hex shifts on BOTH. The temporary 3rd
+#       allowlist entry from #233 (debug-eprintln tenant UKI)
+#       is dropped — the agent's debug eprintln was reverted
+#       before this rebuild, so the only two entries are the
+#       fresh kbs + tenant measurements below.
+#   15 — re-pin BOTH UKI measurements for the virtio_blk module
+#       bundle (this PR). Live evidence 2026-05-27 ~16:14 UTC
+#       captured via a debug-eprintln initramfs that surfaced the
+#       LUKS init error from libcryptsetup:
+#         `IOError(Os { code: 15, kind: Uncategorized,
+#          message: "Block device required" })`
+#       i.e. `crypt_init` opens `/dev/vda` and gets ENOTBLK
+#       because virtio_blk (Debian Trixie ships it `=m`) was
+#       never loaded — the kernel sees the virtio-blk device on
+#       the PCI bus (virtio_pci is built-in) but does not expose
+#       it as a block device node until the driver attaches.
+#       Bundle `drivers/block/virtio_blk.ko` in the tenant UKI
+#       cpio and add it to `load_kernel_modules` (4th family,
+#       after vsock + virtio_net, before sev-guest). The KBS UKI
+#       also re-pins because its agent-initramfs binary links
+#       the same `load_kernel_modules` (which now has the
+#       virtio_blk slot in the source even though the KBS UKI
+#       does not stage the .ko — the per-family skip semantics
+#       hide it at runtime, but the binary bytes shift).
+#       Allowlist remains 2-entry (KBS + tenant); the temporary
+#       LUKS-debug entries from #237 + the local working-tree
+#       eprintln are dropped.
+#   16 — KAT-only re-pin. Epoch 15 (PR #238) committed locally-
+#       built measurements that were produced with SDE=1779899645
+#       (the pre-rebase commit timestamp). Post-rebase + admin-
+#       merge the canonical SDE for `packer/tenant-uki/` and
+#       `packer/kbs-uki/` shifted to 1779900497 (the squash-merge
+#       commit timestamp), so the CI runners on `main` produced
+#       different bytes than the locally-pinned KAT. The fix is
+#       pure KAT re-pin to the canonical CI output (reproduced
+#       byte-for-byte by a clean local build at HEAD=7349682 with
+#       the correct SDE). No source code under `binaries/` or
+#       `packer/` changes. Lesson: re-run the UKI build AFTER
+#       any rebase before re-committing the KAT.
+#   17 — re-pin BOTH UKI measurements for the LUKS block-device
+#       wait + sub-class surfacing. PR #238 (virtio_blk bundle)
+#       unblocked module load but exposed an asynchronous probe
+#       race: `init_module(virtio_blk)` returns the moment the
+#       kernel accepts the module bytes, but `/dev/vda` does not
+#       materialise until the workqueue-driven PCI / device-mapper
+#       probe finishes (~tens of ms on the measured Trixie 6.12
+#       kernel, longer under host CPU pressure). Hitting that
+#       window made `crypt_init` fail-closed with ENOTBLK and
+#       collapsed the boot at `luks-failed:crypt-init`.
+#       The fix adds `wait_for_luks_block_device` (3 s budget ×
+#       50 ms poll) after `load_kernel_modules` and BEFORE the
+#       §21 pipeline starts, mirroring `wait_for_interface`
+#       (#200 / #202) which closed the equivalent virtio_net
+#       registration race. Same commit also routes the boot
+#       error arm through `fail_closed_err` so serial shows
+#       `class:sub_class` — operator-visible diagnostics for any
+#       future LUKS / network / KBS sub-class without changing
+#       the §20 plaintext-free invariant (every emitted string is
+#       a compile-time `&'static str`). Pure binary-bytes shift
+#       in agent-initramfs → both UKI measurements re-pin; the
+#       packer/ trees are unchanged so SDE stays stable.
+#  27 — re-pin BOTH UKI measurements for PR #258 (#257 Phase B PR 1):
+#       `hippius.handoff=tenant-luks` mode + `PivotConfig` refactor
+#       in agent-initramfs. The §21 pipeline now branches on
+#       `HandoffMode` and `RootfsPivot::pivot_into_rootfs` takes a
+#       `&PivotConfig` instead of `&str`. Pure binary-bytes shift —
+#       no cmdline / module-set delta — but the agent-initramfs
+#       binary IS linked by both UKIs, so both initrd_sha256 +
+#       measurement_hex roll. packer/ trees unchanged so SDE stays
+#       stable.
+#  28 — re-pin BOTH UKI measurements for PR #261 (#257 Phase B
+#       ext4.ko bundle): Debian Trixie 6.12 ships
+#       `CONFIG_EXT4_FS=m`, so the first BYO base-OS live attempt
+#       fail-closed at `switch-root-failed:mount-rootfs` because
+#       every fstype in `TENANT_LUKS_FSTYPES` returned ENODEV. PR
+#       #261 stages ext4 + jbd2 + crc16 + mbcache in
+#       `build-initramfs.sh` and adds the matching `tenant_luks_fs`
+#       family to `agent-initramfs::load_kernel_modules`. The
+#       tenant UKI's initrd_sha256 + measurement_hex shift in
+#       lockstep with the .ko bundle; the kbs UKI doesn't bundle
+#       these .ko files but still relinks the agent binary, so its
+#       measurement_hex shifts on the agent-side load_module_family
+#       table change (per-family skip semantics skip the family at
+#       runtime on the kbs UKI).
+epoch = 28
+
+# §F KBS-UKI launch measurement. Pinned in `test_vectors/uki/
+# measurement.json` (regenerated only on intentional input changes —
+# see `test_vectors/uki/REGENERATE.md`).
+[[entries]]
+measurement_hex = "c2b2dcb8e70db2b8b13f06902ab9c69a5d6315b9cdd23920062325086d85aece13d507c373849a81c253309941a6cb52"
+# Placeholder L1 OrderTicket-signing kid. The KBS-UKI measurement is
+# the KBS pod's OWN launch identity (not a tenant launch target), so no
+# real OrderTicket carries this measurement — the kid here is inert.
+# Kept non-empty because `kbs-allowlist-tool` enforces ≥1 entry per
+# field.
+accepted_l1_kids_hex = ["686970706975732d6c312d7469636b65742d7631"]
+# KBS response-signing kid — hex of "kbs-cc-1-response-v1", matching
+# `deploy/gitops/apps/kbs/values.yaml::config.kidHex`.
+accepted_kbs_response_kids_hex = ["6b62732d63632d312d726573706f6e73652d7631"]
+
+# §F tenant UKI launch measurement (PR #146). Pinned in
+# `test_vectors/uki/tenant-measurement.json` (regenerated only on
+# intentional tenant-UKI input changes).
+[[entries]]
+measurement_hex = "8e7b31cd7a20f6d3e9c1fa317c3a818afde4f9647bc85aa76a8d6a47a97f3edb983af09799c146ec679632cdd929fa89"
+# Dev L1 OrderTicket-signing kid — hex of "l1-order-ticket-dev-v1",
+# whose Ed25519 pubkey lives in `packer/keys/dev/
+# l1-order-ticket.dev.ed25519.pub` and is rendered into the KBS
+# `[[l1_keys]]` config by the helm chart. DEV-ONLY (see
+# `packer/keys/dev/README.md` "Three-belt defense"). Production
+# tenant launches accept a prod L1 kid here in lockstep with the
+# offline §22 ceremony rotation.
+accepted_l1_kids_hex = ["6c312d6f726465722d7469636b65742d6465762d7631"]
+# Same response-signing kid as the KBS-UKI entry — one KBS pod, one
+# response key (`kbs-cc-1-response-v1`).
+accepted_kbs_response_kids_hex = ["6b62732d63632d312d726573706f6e73652d7631"]

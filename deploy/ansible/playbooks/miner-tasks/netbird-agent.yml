@@ -1,0 +1,116 @@
+---
+# NetBird agent — install + join the `miner` mesh group. Tasks file
+# imported by 06-miner-bootstrap.yml play "04".
+#
+# The miner joins the NetBird mesh in the group named by
+# `network.netbird_group` (group_vars/miner_nodes.yml). Group
+# membership is carried by the SETUP KEY the operator creates in their
+# NetBird dashboard bound to that group — the agent inherits it on
+# join. The setup key is read from the operator workstation at run
+# time and NEVER written to the repo or logged.
+
+# `deb822_repository` imports `python3-debian` on the MANAGED node and
+# cannot install it itself — unlike `ansible.builtin.apt`, which
+# auto-installs `python3-apt` when it is missing. So the module fails
+# with "Failed to import the required Python library (python3-debian)"
+# on any image that does not already carry it.
+#
+# Whether an image carries it is a property of the image, not of Ubuntu:
+# measured on 24.04, `ubuntu-minimal` + `ubuntu-standard` do NOT pull it
+# in, while the `ubuntu-server` metapackage does. Our own hosts happened
+# to be built from an image that had it, which is exactly why this was
+# invisible until the playbook was run somewhere else. A third party on a
+# minimised cloud image stops here.
+- name: Ensure the deb822_repository module's host dependency is present
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+    update_cache: true
+
+# The conflicting legacy `netbird.list` is removed in the PREFLIGHT play,
+# not here — see `06-miner-bootstrap.yml`. It has to be gone before the
+# first apt task of the whole run, and that is play 02, well before this
+# file is reached.
+- name: Add the NetBird apt repository
+  ansible.builtin.deb822_repository:
+    name: netbird
+    types: [deb]
+    uris: "https://pkgs.netbird.io/debian"
+    suites: [stable]
+    components: [main]
+    signed_by: "https://pkgs.netbird.io/debian/public.key"
+    enabled: true
+
+- name: Install the NetBird agent (pinned)
+  ansible.builtin.apt:
+    name: "netbird={{ versions.netbird }}"
+    state: present
+    update_cache: true
+    # The repo only carries `netbird`; keep an exact version pinned
+    # rather than letting a future release drift in unreviewed.
+    allow_downgrade: true
+
+- name: Enable the NetBird service
+  ansible.builtin.systemd:
+    name: netbird
+    enabled: true
+    state: started
+
+- name: Read the operator-local NetBird setup key
+  ansible.builtin.set_fact:
+    miner_netbird_setup_key: >-
+      {{ lookup('file', operator_secret_dir ~ '/' ~ netbird_setup_key_file) | trim }}
+  no_log: true
+
+- name: Query the current NetBird connection state
+  ansible.builtin.command:
+    cmd: netbird status
+  register: miner_netbird_status
+  changed_when: false
+  failed_when: false
+
+- name: Join the NetBird mesh (miner group) via the setup key
+  # `netbird up` registers this peer. Skipped when the agent is
+  # already connected — a second run is then a no-op. `no_log` keeps
+  # the setup key out of the Ansible output.
+  ansible.builtin.command:
+    cmd: >-
+      netbird up
+      --setup-key {{ miner_netbird_setup_key }}
+      {% if netbird_management_url is defined %}--management-url {{ netbird_management_url }}{% endif %}
+  no_log: true
+  register: miner_netbird_up
+  changed_when: miner_netbird_up.rc == 0
+  when: "'Management: Connected' not in miner_netbird_status.stdout"
+
+- name: Report the NetBird peer state (no secrets)
+  ansible.builtin.command:
+    cmd: netbird status
+  register: miner_netbird_final
+  changed_when: false
+  failed_when: false
+
+# The miner's own NetBird mesh address — assigned by NetBird at join,
+# so it is PER-HOST and only known after the join. The orders HTTP
+# server (MA-5) binds it (and ONLY it; the agent rejects any non-mesh
+# bind). Captured here as a fact so the config template uses the REAL
+# address instead of the `orders_bind_ip` placeholder — no manual
+# host_vars edit per miner.
+- name: Capture this miner's NetBird mesh IP (for orders.bind_addr)
+  ansible.builtin.set_fact:
+    miner_netbird_ip: >-
+      {{ miner_netbird_final.stdout
+         | regex_findall('NetBird IP:\s+([0-9.]+)')
+         | first | default(orders_bind_ip) }}
+
+- name: Assert a NetBird mesh IP was obtained (fail closed)
+  ansible.builtin.assert:
+    that: "miner_netbird_ip is match('100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.')"
+    fail_msg: >-
+      Could not determine this miner's NetBird CGNAT IP (100.64.0.0/10)
+      from `netbird status`. The mesh join likely failed — the orders
+      server cannot bind. Re-check the NetBird setup key + management URL.
+
+- name: Show the NetBird peer state + bind IP
+  ansible.builtin.debug:
+    msg: "{{ miner_netbird_final.stdout_lines }} | bind_ip={{ miner_netbird_ip }}"

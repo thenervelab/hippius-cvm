@@ -1,0 +1,104 @@
+# publishability — nothing in the tracked tree may disclose our
+# infrastructure.
+#
+# WHY THIS WORKFLOW EXISTS: the gate was written, reviewed and merged, and
+# then ran nowhere. It was invoked by hand, which means it certified the
+# tree at the moment someone remembered to type it and said nothing about
+# every commit afterwards. A gate nobody runs is decoration.
+#
+# WHY THE DENYLIST COMES FROM A SECRET: the patterns ARE the estate — the
+# IPs, the hostnames, the chip ids. Committing them would publish exactly
+# what the gate exists to keep out, so they live in a secret store and are
+# written to a file the job deletes. The script itself carries none of them
+# and is safe to publish.
+name: publishability
+
+# DELIBERATELY NOT `main`. `main` is the branch production is deployed from,
+# and it is deliberately NOT publishable: the ArgoCD chart values carry the
+# real Vault address, the real cluster CIDRs and the real hostnames, because
+# five apps selfHeal from it. Gating `main` on this check would leave a
+# choice between scrubbing the values that production needs and living with
+# a permanently red pipeline, and a red pipeline that everyone learns to
+# ignore is worse than no check.
+#
+# So the gate guards the branch that gets PUBLISHED. `release/**` is cut
+# from `main`, so anything that lands on `main` is caught the moment it is
+# merged forward — before it can reach a public repo, which is the only
+# moment that matters.
+on:
+  push:
+    branches: ["release/**"]
+  pull_request:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publishability:
+    name: publishability
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history. The divergence check below compares
+          # `origin/main...HEAD`, and a three-dot diff needs a MERGE BASE:
+          # in a shallow clone git cannot find one and returns nothing,
+          # which reads exactly like "the branches agree". The check
+          # shipped that way and reported "no divergence" over 66 changed
+          # files on its first CI run.
+          fetch-depth: 0
+
+      # A pull_request from a FORK gets no secrets, so the gate cannot run
+      # there. That is stated out loud rather than silently passing: the
+      # branches that actually get published (main, release/**) are gated on
+      # push, which is the run that matters.
+      - name: Determine whether the denylist is available
+        id: avail
+        env:
+          DENYLIST: ${{ secrets.PUBLISH_DENYLIST }}
+        run: |
+          if [ -z "${DENYLIST}" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PUBLISH_DENYLIST is not available to this run (fork PR, or the secret is unset)."
+            echo "::notice::This job CANNOT verify the tree here. The gating run is the push to main / release/**."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail loudly if the secret is missing on a branch we DO publish from.
+      # Otherwise deleting the secret would turn the gate off silently, which
+      # is the same defect as never wiring it up.
+      - name: A publishable branch MUST be able to run the gate
+        if: steps.avail.outputs.available != 'true' && github.event_name == 'push'
+        run: |
+          echo "::error::PUBLISH_DENYLIST is unset, so the publishability gate cannot run on a branch we publish from."
+          echo "::error::This fails rather than skips: an absent denylist means the tree was verified against nothing."
+          exit 1
+
+      # The gate above proves the published tree DISCLOSES nothing. This
+      # proves something different and just as load-bearing: that it
+      # BEHAVES like the tree CI tests. A scrub that edits a `.rs` on the
+      # release branch alone would make the binary a miner builds from the
+      # public repo stop being the binary our suite ever ran, and nothing
+      # else here would notice.
+      - name: The release branch may differ from main in config only
+        run: |
+          git fetch --no-tags --depth=0 origin main 2>/dev/null || git fetch --no-tags origin main
+          bash scripts/dev/release-diverges-only-in-config.sh
+
+      - name: Run the gate
+        if: steps.avail.outputs.available == 'true'
+        env:
+          DENYLIST: ${{ secrets.PUBLISH_DENYLIST }}
+        run: |
+          set -euo pipefail
+          # `printenv` rather than an echo of the value: no interpolation,
+          # and the value never appears in a command line visible to `ps`.
+          printenv DENYLIST > "${RUNNER_TEMP}/denylist"
+          chmod 0600 "${RUNNER_TEMP}/denylist"
+          trap 'rm -f "${RUNNER_TEMP}/denylist"' EXIT
+          PUBLISH_DENYLIST="${RUNNER_TEMP}/denylist" \
+            bash scripts/dev/publishability-test.sh

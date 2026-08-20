@@ -1,0 +1,72 @@
+# Denylist for scripts/dev/publishability-test.sh — COPY to .publish-denylist
+# and fill in the REAL values. The real file is gitignored on purpose: it
+# describes the estate, so committing it would publish exactly what the gate
+# exists to keep out. See the script header.
+#
+# Format: <class-name><TAB><extended-regex>
+#
+# host-ips	203\.0\.113\.(7|8|9)
+# control-plane-ip	198\.51\.100\.4
+# secret-store-ip	192\.0\.2\.55
+# internal-domain	[a-z0-9-]+\.internal\.example
+# host-names	myorg-node-[0-9]+
+# overlay-net	100\.64\.[0-9]+\.
+# provider	(acme ?cloud|somedatacentre)
+#
+# Certificate-borne identifiers are scanned as DECODED HEX, so write them
+# in hex (uppercase, no separators). An AMD VCEK carries the 64-byte
+# CHIP_ID of a physical host in an X.509 extension: a text search over the
+# PEM returns nothing, because the bytes are base64 inside DER. That is not
+# hypothetical — it is how a real chip id survived a scrub that renamed the
+# file it lived in.
+#
+# chip-ids	DEADBEEF0123456789ABCDEF0123456789ABCDEF
+#
+# The class NAMES are pinned in scripts/dev/publishability-test.sh
+# (`EXPECTED_CLASSES`). A list missing one of them is a hard failure, not a
+# shorter scan — because the list lives outside the repo, in two copies (a
+# local file and a CI secret), and two copies drift. Retiring a class is
+# allowed; doing it silently is not.
+#
+# On-chain identity is a fingerprint even though it is not a secret. An SS58
+# address is public by construction, but naming YOUR administrative authority
+# account in a published repo tells a reader which key to target without them
+# having to know where to look.
+#
+# chain-accounts	5FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake
+#
+# Your organisation's role addresses. Not secrets, but identities: an ACME
+# contact hardcoded in a chart means whoever deploys it registers a
+# certificate account under YOUR address and receives YOUR expiry mail.
+#
+# org-emails	(ops|admin|security)@example\.invalid
+#
+# Cover the name a machine gives ITSELF, not only the name your inventory
+# gives it. Ours differ: ansible and k8s say `hippius-cc-miner-3`, the box's
+# own hostname is `confidential-compute-miner-3`. The second is what lands in
+# kernel logs, serial captures and pasted terminal output — the things that
+# actually get committed by accident — and a class written from the inventory
+# alone is blind to all of it.
+#
+# host-names	(inventory-name-[0-9]+|actual-hostname-[0-9]+)
+#
+# Do NOT put people's home addresses in here.
+#
+# Auditing our own mesh turned up three public IPs the host-ips class did not
+# know: one was a server nobody had told the list about (added), and two were
+# the ISP addresses of colleagues' laptops. Those are personal data and they
+# change with a DHCP lease, so encoding them by value would mean storing
+# personal data on disk and in a CI secret in order to avoid storing it —
+# and the entry would be stale within weeks.
+#
+# What actually covers that risk is shape, not value: the likeliest way a
+# personal address reaches the tree is a pasted terminal capture, and the
+# root-level `/*.log` ignore blocks the usual vector. Sweep for bare public
+# IPv4 periodically instead, and triage what it finds by hand — most hits
+# will be legitimate third-party addresses (distro mirrors, RFC examples).
+#
+# The three classes below have no illustrative line above; every class the
+# gate expects needs one, so they are here for completeness.
+#
+# cluster-net	10\.0\.0\.[0-9]+
+# node-ids	(deadbeef0123|feedface4567)

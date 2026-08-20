@@ -1,0 +1,340 @@
+{{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
+---
+# Synthetic-monitor alerts (apps.synthetic). Prometheus discovers this via
+# `ruleSelector: {}` (all namespaces). The alerts carry a `severity` label
+# and NO custom receiver, so they fall through the Alertmanager default
+# route to the `slack-operators` receiver (#hippius-alerts) — the same path
+# the cluster's other critical alerts use.
+#
+# NOTE: the deployed Alertmanager Slack `api_url` is still a placeholder
+# (secret `alertmanager-config`, ESO key
+# `hippius-compute/observability/alertmanager`). These alerts route
+# correctly the moment a real Slack webhook is `vault kv put` there.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-synthetic-monitor
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-synthetic-monitor
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-synthetic-e2e
+      interval: 30s
+      rules:
+        - alert: SyntheticE2EFailing
+          # The real launch→boot→decommission→erase cycle failed for a
+          # distro. `success` persists in the Pushgateway per {tier,distro},
+          # so this pins the exact distro that regressed.
+          expr: hippius_synthetic_e2e_success == 0
+          for: 10m
+          labels:
+            severity: critical
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic e2e FAILING (distro {{`{{ $labels.distro }}`}})"
+            description: |
+              The full synthetic launch→decommission probe for distro
+              {{`{{ $labels.distro }}`}} has reported success=0 for 10m. A
+              real tenant launch path is broken — inspect the
+              synthetic-monitor-full Job logs + the LaunchJob/DecommissionJob.
+        - alert: SyntheticE2EStale
+          # last_success_timestamp only advances on a PASS. Each distro is
+          # re-proven ~once/day (4 distros rotating every 6h), so >36h
+          # without a pass means missed cycles or a broken CronJob.
+          expr: time() - hippius_synthetic_last_success_timestamp{tier="full"} > 129600
+          for: 10m
+          labels:
+            severity: critical
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic e2e STALE (distro {{`{{ $labels.distro }}`}})"
+            description: |
+              No successful full e2e for distro {{`{{ $labels.distro }}`}} in
+              >36h. The 6h CronJob may be broken, the Pushgateway down, or
+              every recent run failing.
+        - alert: SyntheticE2ETeardownForced
+          # The self-cleaning safety net had to FORCE-destroy a synthetic VM
+          # because the §24 API could not finish — the decommission path is
+          # degraded (and real tenants may be affected). Page.
+          expr: hippius_synthetic_teardown_forced == 1
+          for: 0m
+          labels:
+            severity: critical
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic e2e forced-teardown fallback fired"
+            description: |
+              The synthetic monitor could not decommission its throwaway VM
+              via the §24 API and fell back to in-process force-erase +
+              destroy. The decommission path is degraded — investigate before
+              a real tenant decommission is attempted.
+    - name: hippius-synthetic-light
+      interval: 30s
+      rules:
+        - alert: SyntheticLightFailing
+          # Read-only fleet-health tripwire (dispatchable/attestor/capacity/
+          # stuck-jobs/epoch/migrations). Runs every ~15m.
+          #
+          # `light_success` now excludes checks with a VALID acknowledgement
+          # (`VALI_SYNTHETIC_ACK`, see apps/synthetic/ack.py). Without that,
+          # one standing accepted failure pins this alert at firing forever
+          # and a NEW light-tier failure is indistinguishable from it — which
+          # is what happened from 2026-08-10 (the fossil `epoch_close`; ~2
+          # days continuously firing). An acknowledgement is named, reasoned
+          # and expires within 30 days, and the acknowledged check still
+          # publishes `light_check_success{check=...} == 0` — so nothing is
+          # hidden, it just no longer drowns the tier.
+          expr: hippius_synthetic_light_success == 0
+          for: 20m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic light health-check failing"
+            description: |
+              A light-tier check has failed for 20m WITHOUT a valid
+              acknowledgement. The failing check is the one reporting
+              hippius_synthetic_light_check_success == 0 with
+              hippius_synthetic_light_check_acknowledged == 0; see the
+              synthetic-monitor-light Job logs for its detail line.
+        - alert: SyntheticLightStale
+          expr: time() - hippius_synthetic_last_success_timestamp{tier="light"} > 3600
+          for: 10m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic light health-check STALE"
+            description: |
+              No successful light health-check in >1h (~4 missed cycles) —
+              the CronJob or the Pushgateway may be down.
+        - alert: SyntheticLeak
+          # The light-tier reaper force-tore-down a leaked synthetic VM /
+          # pending launch. A reaped resource means a PRIOR full-e2e run's
+          # in-process `finally` teardown could not run (SIGKILL/OOM/
+          # eviction) — a bug worth knowing: the self-cleaning guarantee
+          # depended on the backstop. Never silently hidden.
+          expr: hippius_synthetic_reaped_total > 0
+          for: 0m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "synthetic monitor reaped a leaked VM/launch"
+            description: |
+              The light-tier reaper force-tore-down a leaked
+              synthetic-monitor resource (VM or pending LaunchJob). A prior
+              full-e2e run leaked it — its finally teardown could not run.
+              Inspect the synthetic-monitor-full Job history for a
+              killed/evicted run.
+    # ── uptime billing: money stops, and it must not be quiet ─────────
+    # `light_success` already flips on this check, but that roll-up is a
+    # `warning` shared with six other conditions and is muteable by an
+    # acknowledgement. A tenant VM that runs and earns nothing is a direct
+    # revenue loss, so it also gets its own CRITICAL alert on the gauge —
+    # which an ack cannot silence and which names the count directly.
+    - name: hippius-uptime-billing
+      interval: 30s
+      rules:
+        - alert: UptimeAttestationStalled
+          # A VM that HAS produced SNP live attestations has stopped, while
+          # still bound + billable. That is "running and earning nothing".
+          #
+          # This is the signal the 2026-08-13 gateproof-a incident did not
+          # have: a KBS restart reseeded the per-VM attestation sequence,
+          # vali mistook every post-restart attestation for a replay of the
+          # old sequence, and dropped 3.7h of a live tenant's uptime while
+          # the miner logged ok and vali logged INFO. The cause is fixed
+          # (vm_liveness._resolve_chain); this alert is what makes the next
+          # cause of the same symptom loud instead of silent.
+          #
+          # VMs that have NEVER attested are deliberately NOT counted — a
+          # pre-keepalive image legitimately emits nothing, and a
+          # permanently-firing alert is a disabled alert.
+          expr: hippius_synthetic_uptime_stalled_vms > 0
+          for: 30m
+          labels:
+            severity: critical
+            component: uptime-billing
+          annotations:
+            summary: "{{`{{ $value }}`}} VM(s) running and earning NOTHING"
+            description: |
+              One or more tenant VMs are bound + billable and previously
+              produced SNP live attestations, but have produced none within
+              VALI_UPTIME_LIVENESS_STALL_S. With
+              VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION armed
+              (hippius_synthetic_uptime_liveness_armed == 1) their uptime is
+              accruing ZERO right now. Check the vali logs for
+              `live-attestation chain RESET/FORK` and `chain conflict`, the
+              miner-agent vsock relay, and the KBS keepalive path.
+    # ── the KBS ConfigMap is not the KBS config ───────────────────────
+    # `Config::load` runs ONCE at kbs-server start and the KBS Deployment
+    # carries no `checksum/config` annotation — correctly, since rolling
+    # that pod wipes its state/audit/evidence emptyDirs inside a Kata CVM.
+    # The cost is that an edited ConfigMap can sit next to a process that
+    # never read it, indefinitely, while ArgoCD reports Synced + Healthy.
+    # On 2026-08-13 the suppressed-confirm anti-rollback gate was armed
+    # (0 → 3), merged and synced, and the 152-minute-old process was still
+    # running with the gate DISABLED. `check_kbs_config_drift` asks the
+    # RUNNING process every ~15 min; these two rules split its answer.
+    - name: hippius-kbs-config-drift
+      interval: 30s
+      rules:
+        - alert: KbsRunningConfigDrift
+          # A key the deployed chart declares does NOT match what the
+          # running kbs-server reports. CRITICAL, and deliberately not
+          # left to the light-tier roll-up: that roll-up is a `warning`
+          # shared with eight other conditions AND is muteable by an
+          # acknowledgement, while this condition means a security control
+          # is recorded as applied and is not. The 2026-08-13 instance was
+          # an anti-rollback gate; the same mechanism silently governs
+          # `require_wrapped_kek` (plaintext KEKs at rest) and the admin
+          # listener mode (whether the lifecycle API authenticates at all).
+          #
+          # 15m, not 0m: the CronJob runs every ~15 min, so `for: 15m`
+          # requires the condition to survive one full cycle and cannot
+          # fire on a single scrape of a stale Pushgateway sample.
+          expr: hippius_synthetic_kbs_config_drift > 0
+          for: 15m
+          labels:
+            severity: critical
+            component: kbs-config
+          annotations:
+            summary: "KBS running config DIVERGES from the deployed ConfigMap"
+            description: |
+              {{`{{ $value }}`}} declared posture key(s) do not match what the
+              running kbs-server reports. The KBS has not re-read its config
+              since that change: it is INERT while gitops reports Synced, and
+              any record of it being applied is false. The
+              synthetic-monitor-light Job log names each key with BOTH values.
+              Fix by restarting the KBS deliberately — that wipes the
+              state/audit/evidence emptyDirs, see the restart-cost table in
+              deploy/gitops/apps/kbs/README.md — or by reverting the change.
+        - alert: KbsRunningConfigUnverified
+          # The other half, and the reason drift is not the only failure
+          # mode worth alarming: a check that could not look at anything is
+          # not a passing check. Deliberately WARNING and slow (2h): the
+          # admin API being briefly unreachable is already carried by
+          # SyntheticLightFailing via `check_kbs`, and paging twice for one
+          # outage trains people to ignore both.
+          #
+          # NOT alerted: `hippius_synthetic_kbs_posture_endpoint == 0`.
+          # `GET /v1/admin/config` 404s on every KBS built before it
+          # existed, and the fix is a restart nobody should take for a
+          # monitoring endpoint — so it is a KNOWN, INTENDED, possibly
+          # weeks-long window. An alert that fires for a state we chose
+          # is an alert that gets muted. It stays a gauge (visible on the
+          # dashboard, greppable in the Job log) and the coverage it
+          # represents is alarmed HERE, by `keys_compared == 0`, which is
+          # the condition that actually matters: not "the new endpoint is
+          # missing" but "nothing at all was verified".
+          expr: hippius_synthetic_kbs_config_keys_compared == 0
+          for: 2h
+          labels:
+            severity: warning
+            component: kbs-config
+          annotations:
+            summary: "KBS running config could not be verified at all"
+            description: |
+              The synthetic monitor could not read a single posture key back
+              from the running kbs-server for 2h — the admin API is
+              unreachable, refusing vali's client identity, or
+              VALI_KBS_EXPECTED_POSTURE is unset/unparseable. This is NOT
+              "no drift": it is no coverage, so a KBS config change that
+              never reached the running process would currently be invisible
+              again.
+    # ── the acknowledged conditions keep their OWN alerts ─────────────
+    # An acknowledgement changes WHICH alert carries a condition, never
+    # whether it is carried. Two properties are alerted here:
+    #   1. the acknowledged condition itself (the chain fossil), on its own
+    #      dedicated, definitive signal — so muting the tier roll-up cannot
+    #      also mute the thing that was accepted;
+    #   2. the acknowledgement MECHANISM, so a mute cannot rot in silence
+    #      (expiring / stale / refused).
+    # REJECTED for (1): relying on `light_check_success{check="epoch_close"}`
+    # — that gauge is 0 for ANY epoch_close failure (chain RPC unreachable,
+    # epoch 0), so it could not distinguish the accepted fossil from a new,
+    # different fault while the check is acknowledged.
+    - name: hippius-synthetic-ack
+      interval: 30s
+      rules:
+        - alert: ChainScoringPalletFossil
+          # The configured scoring pallet is ABSENT from the runtime
+          # metadata while its orphaned storage prefix still answers — every
+          # chain value vali reads is frozen and no epoch can ever close.
+          # This DISARMS the §23 stale-epoch gate (placement.py compares
+          # current_epoch - data_epoch; both operands stop moving together),
+          # so no miner can be excluded as stale. Known + accepted since
+          # 2026-08-10 (upstream runtime work, no date) and therefore
+          # acknowledged out of the light-tier roll-up — but it keeps this
+          # dedicated alert so the condition itself is never un-alarmed.
+          # 0 == fossil (see checks.check_epoch_close_advancing).
+          expr: hippius_synthetic_chain_pallet_live == 0
+          for: 15m
+          labels:
+            severity: warning
+            component: chain
+          annotations:
+            summary: "scoring pallet is a FOSSIL — no epoch can close"
+            description: |
+              The pallet vali reads is no longer in the runtime metadata; its
+              storage prefix still answers, so hippius_synthetic_current_epoch
+              is frozen and the §23 stale-epoch gate is disarmed. Resolves
+              only when the runtime carries the pallet again — this alert is
+              the standing record of that gap.
+        - alert: SyntheticAckStale
+          # An acknowledged check now PASSES: the condition resolved and the
+          # acknowledgement is dead config. Left in place it sits pre-armed
+          # over the NEXT, different failure of that same check for the rest
+          # of its window — exactly the blind spot the design forbids.
+          expr: hippius_synthetic_ack_stale == 1
+          for: 30m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "stale acknowledgement for check {{`{{ $labels.check }}`}}"
+            description: |
+              Check {{`{{ $labels.check }}`}} is acknowledged in
+              VALI_SYNTHETIC_ACK but is now PASSING. Remove the entry — until
+              you do, that check's next failure will be silently absorbed.
+        - alert: SyntheticAckExpiring
+          # Forces the re-decision BEFORE the lapse reddens the tier. Fires
+          # from 3 days out and keeps firing once negative (an expired entry
+          # left in config). Chosen over "alert only once expired" so the
+          # operator gets a window to re-state or fix, instead of being
+          # surprised by SyntheticLightFailing.
+          expr: hippius_synthetic_ack_expires_timestamp - time() < 259200
+          for: 1h
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "acknowledgement for {{`{{ $labels.check }}`}} expires in <3d"
+            description: |
+              The acknowledgement for check {{`{{ $labels.check }}`}} lapses
+              within 3 days (negative ⇒ already lapsed). When it does, the
+              check re-enters the light-tier roll-up and SyntheticLightFailing
+              fires. Re-decide: fix the condition, or re-state the ack with a
+              fresh expiry and a current reason.
+        - alert: SyntheticAckInvalid
+          # A refused entry acknowledges NOTHING (the safe direction), but an
+          # operator who thinks they filed one must be told they did not.
+          expr: hippius_synthetic_ack_invalid > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "VALI_SYNTHETIC_ACK has refused entries"
+            description: |
+              {{`{{ $value }}`}} acknowledgement entry/entries were REFUSED
+              (bad or over-horizon expiry, missing reason, wildcard, unknown
+              check name, or the hard cap of 3 exceeded — which voids the
+              WHOLE spec). Nothing is acknowledged by a refused entry. The
+              synthetic-monitor-light Job log names each refusal.
+{{- end }}

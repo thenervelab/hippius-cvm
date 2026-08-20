@@ -1,0 +1,17 @@
+# Exclude build artefacts + scratch dirs from the Docker build
+# context. The `agent-builder` stage `COPY . /src` would otherwise
+# transfer the entire workspace including caches.
+target/
+.git/
+vali/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+node_modules/
+
+# Packer / UKI scratch.
+packer/kbs-uki/uki/output/
+packer/kbs-uki/uki/output-run-*/
+packer/kbs-uki/uki/fetched/
+packer/kbs-uki/uki/build/
+packer/kbs-uki/packer_cache/

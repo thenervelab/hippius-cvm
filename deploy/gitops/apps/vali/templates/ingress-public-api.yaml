@@ -1,0 +1,64 @@
+---
+# PUBLIC VM-control API — `api.hippius.network`, fronted by the
+# Cloudflare Tunnel connector (see `apps/cloudflared`).
+#
+# ⚠️ THIS INGRESS IS AN ALLOW-LIST, AND THAT IS THE WHOLE POINT.
+#
+# vali serves 45 routes. **14 of them carry no DRF authentication** —
+# `/v1/telemetry/*`, `/v1/miner/*`, `/v1/edge/registry`,
+# `/v1/lifecycle/stopped`, `/v1/admin/epoch-weights`, and the schema/docs
+# views. Those are not an oversight: the miner-plane endpoints are
+# authenticated by a SIGNATURE IN THE BODY because the caller is an
+# untrusted miner that holds no bearer token, and they are reachable
+# only over the Edge + NetBird mesh. Publishing them would hand the
+# internet an unauthenticated write surface that was never designed for
+# it.
+#
+# So the tunnel MUST NOT point at `vali:8000` directly. It points at the
+# nginx controller, and only the prefixes listed below exist publicly.
+# nginx answers 404 for everything else — there is no default backend to
+# vali on this host.
+#
+# Every path here is authenticated by vali itself
+# (`MtlsAuthentication` | `ServiceTokenAuthentication`), and the four
+# mutating ones additionally require `IsOrchestrationRoot`:
+#
+#   POST /v1/vm/launch                    IsAuthenticated + IsOrchestrationRoot
+#   POST /v1/vm/{id}/decommission         IsAuthenticated + IsOrchestrationRoot
+#   POST /v1/vm/{id}/migrate              IsAuthenticated + IsOrchestrationRoot
+#   POST /v1/vm/{id}/transition           IsAuthenticated + IsOrchestrationRoot
+#   GET  /v1/vm, /state, /attestation, jobs   IsAuthenticated
+#
+# `/v1/vm` as a Prefix covers the whole VM surface (launch, jobs, state,
+# attestation, migrate, decommission) and nothing outside it. Adding a
+# route here is a security decision — check its `permission_classes`
+# first, and do not add a prefix that would sweep in a sibling.
+{{- if .Values.publicApiIngress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vali-public-api
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # Cloudflare terminates TLS at its edge and the connector reaches us
+    # over the cluster network, so nginx must not bounce plain HTTP.
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # A launch body carries userdata; keep a bound so a public endpoint
+    # cannot be used to push arbitrarily large payloads at vali.
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.publicApiIngress.maxBodySize | quote }}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.publicApiIngress.host | quote }}
+      http:
+        paths:
+          {{- range .Values.publicApiIngress.allowedPaths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: vali
+                port:
+                  number: 8000
+          {{- end }}
+{{- end }}

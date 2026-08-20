@@ -1,0 +1,45 @@
+[package]
+name = "hippius-onchain-registry"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Single-source reader for `pallet-compute-scoring` (§23) state over Substrate JSON-RPC: the twox-128/blake2-128 storage-key hashing + SCALE decode + a minimal blocking RPC client. Shared by the `read-miner-status` vali shell-out AND the Edge gateway's on-chain miner-auth registry poller, so the storage-key derivation has exactly one definition (no drift). Lean by design — no rustls (keeps the Edge's TLS-1.3-only graph + ticket-validator's no-rustls posture intact) and no KBS stack."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Opt-in TLS for the JSON-RPC client (ureq's rustls backend). vali
+# enables it so `read-miner-status` can reach the public Cloudflare-
+# fronted testnet RPC over HTTPS (vali has `world:443` egress);
+# validated to pass Cloudflare where a plain-urllib client is 403'd.
+# OFF by default so the lean HTTP-only posture is preserved for the
+# in-cluster HTTP path (the Edge polls vali's feed over plain HTTP and
+# never needs TLS).
+tls = ["ureq/tls"]
+
+[dependencies]
+# SCALE codec — mirrors the `pallet-compute-scoring` wire layout for
+# the u64 / u128 storage values. `twox-hash` / `blake2` reproduce
+# Substrate's `twox_128` / `blake2_128` storage-key hashers so this
+# crate stays decoupled from the heavy polkadot-sdk build graph.
+codec = { workspace = true, features = ["std"] }
+twox-hash = "1.6"
+blake2 = "0.10"
+hex = "0.4"
+serde_json = "1"
+thiserror = "2"
+# Verify the vali registry feed's Ed25519 signature (audit
+# M-registry-mTLS). `default-features = false` keeps `rand`/`getrandom`
+# off — verification only, no key generation.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+# `ureq` is pinned HTTP-only (`default-features = false` ⇒ no `tls`
+# feature). The thebrain JSON-RPC endpoint is an internal control-
+# plane service; plain HTTP is the v1 posture. Critically, this keeps
+# `rustls` off this crate's dependency graph — pulling `rustls` would
+# unify its `tls12` feature back ON across the workspace and silently
+# undo the Edge gateway's TLS-1.3-only guarantee, and would break
+# ticket-validator's deliberate no-rustls build.
+ureq = { version = "2", default-features = false, features = ["json"] }

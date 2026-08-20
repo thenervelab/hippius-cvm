@@ -1,0 +1,108 @@
+---
+# Patches /etc/default/grub to ensure SEV-SNP kernel parameters are
+# present and conflicting tokens (iommu=pt) are absent. Reboots only
+# if a change actually happened.
+#
+# Required tokens (group_vars/all.yml -> grub_cmdline_required):
+#   kvm_amd.sev=1 kvm_amd.sev_es=1 kvm_amd.sev_snp=1 mem_encrypt=on
+# Forbidden tokens:
+#   iommu=pt (breaks SEV-SNP — IOMMU must NOT be in passthrough mode)
+#
+# Idempotency: a second run produces zero diff. The reboot is gated
+# on the actual modification of the grub file via a handler.
+
+- name: SEV-SNP kernel cmdline prep
+  hosts: cc_nodes
+  gather_facts: true
+  become: true
+  vars:
+    grub_file: /etc/default/grub
+  tasks:
+    - name: Read current GRUB_CMDLINE_LINUX
+      ansible.builtin.shell:
+        cmd: grep -E '^GRUB_CMDLINE_LINUX=' {{ grub_file }} | head -1
+      register: grub_line_raw
+      changed_when: false
+
+    - name: Parse current cmdline tokens
+      ansible.builtin.set_fact:
+        current_cmdline_tokens: >-
+          {{
+            grub_line_raw.stdout
+            | regex_replace('^GRUB_CMDLINE_LINUX="(.*)"$', '\1')
+            | split(' ')
+            | reject('equalto', '')
+            | list
+          }}
+
+    - name: Compute desired cmdline tokens
+      ansible.builtin.set_fact:
+        desired_cmdline_tokens: >-
+          {{
+            (current_cmdline_tokens
+              | reject('in', grub_cmdline_forbidden)
+              | list
+            )
+            + (grub_cmdline_required
+              | reject('in', current_cmdline_tokens)
+              | list
+            )
+          }}
+
+    - name: Compute desired GRUB_CMDLINE_LINUX value
+      ansible.builtin.set_fact:
+        desired_cmdline_string: "{{ desired_cmdline_tokens | join(' ') }}"
+
+    - name: Show planned cmdline diff
+      ansible.builtin.debug:
+        msg: |
+          current : {{ current_cmdline_tokens | join(' ') }}
+          desired : {{ desired_cmdline_string }}
+
+    - name: Backup grub file before edit (one per change)
+      ansible.builtin.copy:
+        src: "{{ grub_file }}"
+        dest: "{{ grub_file }}.bak.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        force: false
+      when: current_cmdline_tokens | symmetric_difference(desired_cmdline_tokens) | length > 0
+
+    - name: Replace GRUB_CMDLINE_LINUX
+      ansible.builtin.lineinfile:
+        path: "{{ grub_file }}"
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: 'GRUB_CMDLINE_LINUX="{{ desired_cmdline_string }}"'
+        backrefs: false
+      notify:
+        - run update-grub
+        - reboot for SEV-SNP cmdline
+
+    - name: Wait for SEV-SNP confirmation post-reboot (only if rebooted)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Post-state — read sev_snp parameter
+      ansible.builtin.slurp:
+        src: /sys/module/kvm_amd/parameters/sev_snp
+      register: sev_snp_post
+
+    - name: Confirm SEV-SNP is enabled
+      ansible.builtin.assert:
+        that:
+          - (sev_snp_post.content | b64decode | trim) == "Y"
+        fail_msg: |
+          Post-reboot kvm_amd.sev_snp != Y. Check:
+            - BIOS: SEV Control + SNP Memory (RMP Table) Coverage are Enabled
+            - dmesg: 'kvm_amd: SEV-SNP enabled' + 'AMD-Vi: IOMMU SNP support enabled'
+            - /proc/cmdline contains kvm_amd.sev_snp=1 and does NOT contain iommu=pt
+
+  handlers:
+    - name: run update-grub
+      ansible.builtin.command:
+        cmd: update-grub
+      changed_when: true
+
+    - name: reboot for SEV-SNP cmdline
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 15
+        msg: "Rebooting to apply SEV-SNP GRUB cmdline"

@@ -1,0 +1,132 @@
+# ── Vault binding — OPERATOR-SET ────────────────────────────────────
+# Where the `hippius-vault` ClusterSecretStore points. Every
+# ExternalSecret in the fleet resolves through this store, so nothing
+# syncs until these are filled in with YOUR Vault.
+vault:
+  # Vault API endpoint. The placeholder below uses the RFC 2606
+  # `.invalid` TLD: it cannot resolve, so a forgotten value fails loudly
+  # instead of silently pointing somewhere real.
+  address: "https://vault.example.invalid:8200"
+  # KV v2 mount + version the secrets live under.
+  path: "secret"
+  version: "v2"
+  # PEM of the CA that signed the Vault server's TLS certificate.
+  #
+  # Set this when Vault presents a PRIVATE / self-signed cert (the usual
+  # case for a self-hosted Vault reached by IP): the value is rendered
+  # into the `vault-ca` ConfigMap and the ClusterSecretStore's
+  # `caProvider` pins verification to it.
+  #
+  # Leave EMPTY when Vault presents a publicly-trusted certificate — the
+  # ConfigMap and the `caProvider` block are then both omitted and ESO
+  # verifies against the system trust store. TLS verification is a
+  # locked invariant either way: there is deliberately no
+  # `tls-skip-verify` knob.
+  #
+  # A CA certificate is PUBLIC, not a secret. It is absent here only
+  # because it is infrastructure identity, not because it is sensitive.
+  # Paste yours as a literal block:
+  #
+  #   caCert: |
+  #     -----BEGIN CERTIFICATE-----
+  #     ...
+  #     -----END CERTIFICATE-----
+  #
+  # ⚠️  A CA has an expiry. ESO fails closed on an expired one — check it
+  # (`openssl x509 -noout -dates`) and rotate this value before then.
+  caCert: ""
+  # Vault JWT auth mount + role the ESO ServiceAccount logs in with.
+  # Operator-configured on the Vault side; see README.md.
+  authPath: "jwt"
+  authRole: "eso"
+
+# Values for the `external-secrets` dependency (see Chart.yaml). Nested
+# under the `external-secrets:` key — the dependency's name.
+external-secrets:
+  # Fleet labels on every ESO-rendered resource.
+  commonLabels:
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+
+  # ── Images — digest-pinned ──────────────────────────────────────────
+  # The upstream chart renders `repository:tag` (`external-secrets.image`
+  # helper) with no digest field, so the digest is carried INSIDE `tag`
+  # (`<tag>@sha256:…`) — the same trick the local-path-provisioner addon
+  # uses. All three ESO workloads run the SAME image, so all three take
+  # the same pin.
+  #
+  # This matters more than a typical operator: ESO is the component that
+  # reads Vault and materialises cluster Secrets. A substituted ESO image
+  # is a direct read of every secret this cluster syncs.
+  #
+  # Digest is the multi-arch INDEX digest of what the cluster is already
+  # running, read back from the node (`k3s crictl inspecti <ref>` →
+  # `repoDigests`), so applying this changes no bytes. `flavour` stays
+  # empty — a non-empty flavour would append `-<flavour>` AFTER the
+  # digest and produce an invalid reference.
+  image:
+    tag: "v2.5.0@sha256:45e7bee4e743331288df01efce0e35b41738cffdc89c86a235359a5153257489"
+
+  # ── RBAC scope ──────────────────────────────────────────────────────
+  # Do NOT aggregate ESO's ExternalSecret / SecretStore verbs into the
+  # built-in `edit` / `view` ClusterRoles (the chart default aggregates
+  # both). With aggregation ON, any principal holding namespace `edit`
+  # could create an `ExternalSecret` pointing at the cluster-wide
+  # `hippius-vault` store and pull any of the ESO-synced
+  # `hippius-compute/…` leaves (RA-N1-scoped, not the whole subtree —
+  # but still incl. every tenant KEK) into its own namespace — a
+  # cross-namespace secret-exfiltration path.
+  # ExternalSecrets in this fleet are created by Argo CD from Git only;
+  # no namespace editor needs the create verb. (The store is
+  # additionally gated by `spec.conditions` — see clustersecretstore.yaml.)
+  rbac:
+    aggregateToView: false
+    aggregateToEdit: false
+
+  # ── PodDisruptionBudgets ────────────────────────────────────────────
+  # ESO has three single-replica Deployments — the controller, the
+  # webhook, and the cert-controller. The locked "no replicas: 1
+  # without a PDB" rule (#1) requires an explicit PDB for each.
+  # `maxUnavailable: 1` (with the chart-default `minAvailable` cleared)
+  # allows the singleton to be drained — correct for a single-node
+  # cluster, where a `minAvailable` budget would wedge `kubectl drain`.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: null
+    maxUnavailable: 1
+  webhook:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: null
+      maxUnavailable: 1
+    # Digest pin — see the "Images" section at the top of this file. It
+    # lives here rather than in that section because this chart's values
+    # already carry a `webhook:` key, and a second top-level key of the
+    # same name would silently shadow it in YAML.
+    image:
+      tag: "v2.5.0@sha256:45e7bee4e743331288df01efce0e35b41738cffdc89c86a235359a5153257489"
+  certController:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: null
+      maxUnavailable: 1
+    # Digest pin — see the "Images" section at the top of this file.
+    image:
+      tag: "v2.5.0@sha256:45e7bee4e743331288df01efce0e35b41738cffdc89c86a235359a5153257489"
+
+# ── Vault token self-renewal — REMOVED 2026-08-13 ───────────────────────
+# The `tokenRenew` CronJob renewed the static Vault token the
+# `hippius-vault` ClusterSecretStore used to authenticate with. That
+# store no longer uses a static token: it authenticates with a projected
+# ServiceAccount JWT (verified live —
+# `.spec.provider.vault.auth.jwt.kubernetesServiceAccountToken`,
+# role `eso`, path `jwt`), so there is nothing left to renew and the
+# `Secret/external-secrets/vault-token` it mounted no longer exists.
+#
+# The template was still rendering, so an ArgoCD sync would have
+# recreated a CronJob whose only job is to renew a credential that was
+# deliberately retired. Deleted rather than disabled: a value that is
+# only ever `false` is a trap for the next reader.
+#
+# The sibling `tokenRenew` blocks in apps/kbs and apps/vali are SEPARATE
+# and still live — do not delete those by pattern-match.

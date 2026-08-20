@@ -1,0 +1,21 @@
+---
+# KBS PodDisruptionBudget. PR-K6, §K (#54).
+#
+# `maxUnavailable: 1` — the KBS is single-replica (the audit-log lock
+# and allowlist high-water-mark are single-process, §D #101), so it
+# cannot offer real availability across a disruption. The PDB exists to
+# satisfy #1 anti-pattern 6 ("no replicas:1 without a PDB") and to keep
+# `kubectl drain` able to proceed on the single-node MVP — a
+# `minAvailable: 1` would instead wedge the drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kbs-server
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "kbs.selectorLabels" . | nindent 6 }}

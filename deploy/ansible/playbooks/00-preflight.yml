@@ -1,0 +1,150 @@
+---
+# Read-only sanity checks. Fails loudly if the host is missing a
+# prerequisite (wrong CPU, no kernel SEV-SNP support, missing data
+# disks, etc.) — better to abort here than to wreck a half-bootstrapped
+# host downstream.
+
+- name: Preflight sanity checks
+  hosts: cc_nodes
+  gather_facts: true
+  # become=true because wipefs/blkid require CAP_SYS_RAWIO to probe block
+  # devices; all tasks here are read-only.
+  become: true
+  tasks:
+    - name: Assert host is Ubuntu 24.04 (Noble)
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version == "24.04"
+        fail_msg: |
+          These playbooks are Ubuntu 24.04 (Noble) specific. Detected:
+            distribution = {{ ansible_distribution }}
+            version      = {{ ansible_distribution_version }}
+          The netplan/apt/k3s-install paths assume Ubuntu 24.04. If you
+          need to support a different OS, fork host_vars + adjust the
+          relevant playbooks rather than letting them silently break.
+
+    - name: Assert host is AMD x86_64
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture == "x86_64"
+          - "'AMD' in ansible_processor[1] or 'AMD' in ansible_processor[2]"
+        fail_msg: |
+          Host CPU is not AMD x86_64. SEV-SNP requires AMD EPYC.
+          Detected: arch={{ ansible_architecture }} processor={{ ansible_processor }}
+
+    - name: Assert kernel is >= 6.11 (SEV-SNP host support)
+      ansible.builtin.assert:
+        that:
+          - ansible_kernel is version('6.11', '>=')
+        fail_msg: |
+          Kernel {{ ansible_kernel }} is too old for SEV-SNP host support.
+          Install linux-generic-hwe-24.04 and reboot before continuing:
+            sudo apt install --install-recommends linux-generic-hwe-24.04
+            sudo apt full-upgrade
+            sudo reboot
+
+    - name: Check sev_snp module parameter exists
+      ansible.builtin.stat:
+        path: /sys/module/kvm_amd/parameters/sev_snp
+      register: sev_snp_param
+
+    - name: Assert kvm_amd module exposes sev_snp param
+      ansible.builtin.assert:
+        that:
+          - sev_snp_param.stat.exists
+        fail_msg: |
+          /sys/module/kvm_amd/parameters/sev_snp does not exist.
+          This means the running kernel's kvm_amd module was not
+          compiled with SEV-SNP support. Install the HWE kernel
+          and reboot (see message above).
+
+    - name: Read sev_snp parameter
+      ansible.builtin.slurp:
+        src: /sys/module/kvm_amd/parameters/sev_snp
+      register: sev_snp_value
+      when: sev_snp_param.stat.exists
+
+    - name: Show SEV-SNP runtime status
+      ansible.builtin.debug:
+        msg: |
+          kvm_amd.sev_snp = {{ (sev_snp_value.content | b64decode | trim) }}
+          (If 'N', 02-snp-kernel-prep.yml will fix it.)
+      when: sev_snp_param.stat.exists
+
+    - name: Verify data RAID candidate disks exist, are unused, and have no partition table
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for dev in {{ data_raid_devices | join(' ') }}; do
+            # Must be a block device.
+            if [ ! -b "$dev" ]; then
+              echo "MISSING: $dev"; exit 1
+            fi
+            # Must have NO partition table (we operate on whole-disk RAID
+            # members only — partitioned disks are almost always system).
+            if blkid -p "$dev" 2>/dev/null | grep -q "PTTYPE="; then
+              echo "BUSY: $dev has a partition table — refusing to touch:"
+              parted "$dev" print 2>&1 | head -10
+              exit 1
+            fi
+            # Must have no filesystem signature OR be a clean linux_raid_member
+            # from a previous run (idempotency — full member-name validation
+            # happens in 04-data-raid.yml).
+            sig=$(wipefs --noheadings --output TYPE "$dev" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+            case "$sig" in
+              "")
+                # Truly empty disk — must also have no mountpoint anywhere.
+                if lsblk -no MOUNTPOINT "$dev" | awk 'NF>0' | grep -q .; then
+                  echo "BUSY: $dev (or a child partition) is mounted:"
+                  lsblk "$dev"
+                  exit 1
+                fi
+                ;;
+              "linux_raid_member")
+                # Already a RAID member — the mdadm child is expected to be
+                # mounted (that's the whole point of idempotent rerun). The
+                # array-name match check happens in 04-data-raid.yml's
+                # detection step, not here.
+                ;;
+              *)
+                echo "BUSY: $dev has unexpected signatures: [$sig]"
+                wipefs "$dev"
+                exit 1
+                ;;
+            esac
+          done
+          echo OK
+      register: disk_check
+      changed_when: false
+      failed_when: "'OK' not in disk_check.stdout"
+
+    - name: Build the list of expected permanent MACs (lowercase)
+      ansible.builtin.set_fact:
+        expected_perm_macs: "{{ privnet_bond_macs | map('lower') | list }}"
+
+    - name: Enumerate permanent MACs of all non-virtual interfaces
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for iface in $(ls /sys/class/net | grep -v -E '^(lo|wt|bond|docker|cni|veth|flannel|kube|cilium)'); do
+            perm=$(ethtool -P "$iface" 2>/dev/null | awk '{print tolower($NF)}')
+            [ -n "$perm" ] && echo "$perm"
+          done
+        executable: /bin/bash
+      register: enumerated_perm_macs
+      changed_when: false
+
+    - name: Verify all expected bond-member MACs are present on the host
+      ansible.builtin.assert:
+        that:
+          - (expected_perm_macs | difference(enumerated_perm_macs.stdout_lines)) | length == 0
+        fail_msg: |
+          One or more permanent MACs from host_vars.privnet_bond_macs are
+          missing on this host.
+            Expected: {{ expected_perm_macs }}
+            Present : {{ enumerated_perm_macs.stdout_lines }}
+            Missing : {{ expected_perm_macs | difference(enumerated_perm_macs.stdout_lines) }}
+          Note: `ip link show` reports the CURRENT MAC. After a slave
+          joins a Linux bond its current MAC mirrors the bond's; the
+          permanent burned-in address (ethtool -P) is the stable identity.

@@ -1,0 +1,109 @@
+{{- if .Values.tenantBake.enabled }}
+---
+# tenant-bake Job spawner (RA-N9 — privilege isolation).
+#
+# Creating a tenant-bake k8s Job means creating a PRIVILEGED pod
+# (`privileged:true` + hostPath /dev/kvm, /dev/loop-control — the baker
+# needs losetup + cryptsetup), which is a path to node root → the k3s
+# datastore → every secret. Previously the large vali web/Django pod
+# held the `vali-tenant-bake-spawner` SA token and spawned the Job inline
+# in `TenantBakeCreateView`, so a web-tier RCE could create an arbitrary
+# privileged Job and escalate.
+#
+# This tiny worker is now the ONLY workload that mounts that SA token.
+# `TenantBakeCreateView` only creates the `Queued` row; the
+# `vali_bake_spawn` loop (default `VALI_BAKE_SPAWN_INTERVAL_S`=15s) polls
+# Queued bakes and calls the idempotent `spawn_bake_job`. The vali web
+# pod now mounts NO ServiceAccount token (see deployment-vali.yaml), so a
+# web RCE cannot create Jobs at all. Attack surface holding the
+# create-jobs capability: a headless poll loop with no HTTP, no user
+# input beyond already-validated DB rows.
+#
+# Same image + env as the vali web pod via envFrom: vali-config. A
+# worker — no HTTP port, no probes; the loop IS the process, a crash
+# exits + the kubelet restarts it. `replicas: 1` + `Recreate` (the spawn
+# is idempotent; two spawners would just race harmlessly, but one is
+# cleanest).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + migrations).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-bake-spawner
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bake-spawner
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: bake-spawner
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: bake-spawner
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every cycle times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The SOLE holder of the bake-Job `create` right (RA-N9). The Role
+      # bound by `rbac-tenant-bake.yaml` narrows it to "jobs in own
+      # namespace only".
+      serviceAccountName: {{ .Values.tenantBake.spawnerServiceAccount.name }}
+      automountServiceAccountToken: true
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bake-spawner
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the spawn loop.
+          command: ["python", "manage.py", "vali_bake_spawn"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+          resources:
+            {{- .Values.bakeSpawner.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+{{- end }}

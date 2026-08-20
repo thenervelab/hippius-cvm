@@ -1,0 +1,150 @@
+---
+# KBS network policy — default-deny + explicit. PR-K6, §K (#54).
+#
+# A CiliumNetworkPolicy (Cilium is the CNI). Selecting the KBS pod
+# makes it default-deny for ingress AND egress; only the rules below
+# are permitted.
+#
+# Security model: the access control on the KBS release path is the
+# SNP attestation chain + §22 signed allowlist + L1 ticket signature
+# verification — NOT the NetworkPolicy. The NetworkPolicy is
+# defence-in-depth: it scopes the set of pods that may even SEND a
+# request, but a leaked NetworkPolicy entry does NOT release secrets
+# (attestation fails closed). The ingress allowlist below therefore
+# enumerates the in-cluster relay endpoints that need to reach the
+# KBS HTTP port, NOT the trust boundary.
+#
+# Two relays are allowed today:
+#   1. The Edge gateway — relays the SIGNED release path from miner-
+#      hosted tenant guests (the original opaque relay, PR-K6).
+#   2. `ingress-nginx` — terminates TLS for the public DNS name
+#      `kbs.hippius.network` and forwards plain HTTP to the KBS.
+#      Tenant guests in their initramfs (pre-NetBird) need a public
+#      DNS to reach the release endpoint; the cmdline-baked
+#      `hippius.kbs_url=https://kbs.hippius.network` is what gets us
+#      there. The TLS cert is operator-provisioned by cert-manager
+#      via the `letsencrypt-prod-cloudflare` ClusterIssuer (DNS-01).
+#
+# Egress DOES use `world` (the kata guest-pull of the image + AMD KDS
+# over HTTPS) — see the egress comments.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: kbs-server
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "kbs.selectorLabels" . | nindent 6 }}
+  ingress:
+    # kubelet liveness / readiness probes (host → pod). Scoped to the
+    # HTTP port only.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    # Relay 1 — the Edge gateway forwards signed release requests
+    # from miner-hosted tenant guests. Scoped to the edge-gateway pods
+    # (name + namespace), not the whole namespace.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: edge-gateway
+            k8s:app.kubernetes.io/name: hippius-edge-gateway
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    # Relay 2 — ingress-nginx terminates TLS for the public DNS name
+    # `kbs.hippius.network` and forwards plain HTTP. Tenant guests in
+    # initramfs (pre-NetBird) need a public DNS to reach the release
+    # path. The cluster has a single ingress-nginx controller; scoped
+    # to its namespace (the controller pod label can vary across
+    # helm releases).
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: ingress-nginx
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- if .Values.admin.enabled }}
+    # Admin endpoint (§24/§25). ONLY vali may reach the
+    # `:8001` listener — it pre-registers `VmState::Active` before
+    # dispatching a launch. The L1-signed OrderTicket in the request
+    # body is the cryptographic auth anchor; this rule is the network
+    # belt #2. The kbs-server-admin ClusterIP Service exposes the
+    # port; this CNP gates which pods may even open a TCP connection
+    # to it.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+      toPorts:
+        - ports:
+            - port: "{{ .Values.admin.listenPort }}"
+              protocol: TCP
+    {{- end }}
+  egress:
+    # Public DNS. `dnsPolicy: None` points the pod at public resolvers
+    # (1.1.1.1 / 8.8.8.8) — a kata SEV-SNP guest cannot reach the
+    # CoreDNS ClusterIP (PR-K5). The kata guest-pull resolves `ghcr.io`
+    # through this.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # HTTPS to the public internet — two consumers:
+    #  - the kata-qemu-snp GUEST-PULL of the PUBLIC KBS image from
+    #    `ghcr.io` + GitHub's blob CDN, at pod-create time;
+    #  - AMD KDS (`kdsintf.amd.com`) for the SEV-SNP cert chain — used
+    #    once the real attestation verifier replaces the §D deny-closed
+    #    stub (#102).
+    # Deliberately broad (`world:443`): an external-registry guest-pull
+    # cannot be served reliably by a tight `toFQDNs` set, and the §D
+    # binary itself makes no outbound HTTPS (the release path is
+    # fail-closed). TODO(§K networking follow-up): mirror the image to
+    # an in-cluster registry the kata guest reaches by pod IP, then drop
+    # the public-registry egress.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    {{- if .Values.vault.egressCidr }}
+    # Vault (§8) — the KBS reads release secrets from Vault KV.
+    #
+    # OPERATOR-SET: `vault.egressCidr` must cover the address behind
+    # `vault.address`. Empty ⇒ no explicit egress rule is rendered,
+    # which is correct ONLY when Vault is already reachable through the
+    # `world:443` rule above. A Vault on any other port, or on an
+    # RFC 1918 address, needs this pin — without it every release fails
+    # closed at the Vault step.
+    - toCIDR:
+        - {{ .Values.vault.egressCidr }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.vault.egressPort | quote }}
+              protocol: TCP
+    {{- end }}
+    {{- if .Values.vault.brokerUrl }}
+    # §8 / #102 — the SNP-attestation-bound Vault broker, reached via
+    # the host-network socat relay on the node's cilium_host IP (kata
+    # pods cannot reach VIPs — see the broker chart's relay.yaml).
+    # A host-netns listener is the `host` entity to Cilium.
+    - toEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8100"
+              protocol: TCP
+    {{- end }}

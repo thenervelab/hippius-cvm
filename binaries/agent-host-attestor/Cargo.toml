@@ -1,0 +1,80 @@
+[package]
+name = "hippius-agent-host-attestor"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Blackbox host-attestor chantier PR-4: the bare-metal SEV-SNP host attestor agent. A measured guest binary (PID1, synchronous — no tokio) that, once per boot, fetches a measurement-bound SNP derived key, HKDF-derives a per-boot Ed25519 signer, enrols the pubkey with the KBS (host-enroll vsock frame binding a host-attestor REPORT_DATA), then emits periodic cheap Ed25519-signed liveness beacons (host-beacon frames) — the SNP report is minted once at enrollment. The two /dev/sev-guest interactions (derived-key + report) are strictly sequenced on the main thread so the serialized channel is never raced. Ships INERT: functional but not yet launched (PR-7) or consumed by vali (PR-8); off Linux/x86_64 the binary refuses to run. The nonce is a PR-10 placeholder (local CSPRNG, not yet vali-fresh). The signer key lives only in RAM and is zeroized on drop."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-agent-host-attestor"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_agent_host_attestor"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+# Ed25519 host-attestor signer key. `zeroize` so `SigningKey` is
+# `ZeroizeOnDrop` — the seed wipes when the signer drops.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+# HKDF-SHA256 to stretch the 32-byte SNP derived key into the Ed25519
+# signer seed under the frozen `HIPPIUS_HOST_ATTESTOR_KEY_V1` domain —
+# the same primitive `hippius_guest::telemetry_key` uses.
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+thiserror = "2"
+# `OsRng` (kernel CSPRNG via getrandom) for the PR-10-placeholder
+# freshness nonce — same RNG source the sibling agents' keygen uses.
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+# Encode the `{kind, body}` GuestFrame + length-prefix the enroll /
+# beacon vsock frames.
+ciborium = "0.2"
+# Decode the 64-hex chain-genesis / pallet-instance config digests.
+hex = "0.4"
+# Graceful shutdown: convert SIGTERM/SIGINT into a normal return so the
+# signer's `Drop` (and its `Zeroize`) runs before exit.
+signal-hook = "0.3"
+
+# `sev` provides the SNP guest `get_derived_key` + `get_report` ioctls.
+# Target-gated so non-Linux/x86_64 dev hosts still `cargo check`/`cargo
+# test` (against the mock providers) — `/dev/sev-guest` only exists on a
+# Linux/x86_64 SEV-SNP guest. `default-features = false` drops the
+# host-side API; `snp` enables the guest firmware API. Mirrors the
+# sibling agent-tenant-telemetry crate's dependency gating exactly.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+sev = { version = "7.1", default-features = false, features = ["snp"] }
+
+# The synchronous `AF_VSOCK` client the attestor uses to push its
+# enroll + beacon frames to the host miner-agent. `AF_VSOCK` is a
+# Linux-only socket family, so it is target-gated: a non-Linux dev host
+# still builds + tests the pusher's framing / batching / back-off (that
+# path is generic over `std::io::Write` and exercised over TCP loopback);
+# only the vsock dial itself is Linux. A thin sync wrapper — NO async
+# runtime, keeping the measured guest TCB minimal.
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
+# Mount `/proc`, `/sys`, `/dev` at PID 1 — the diskless attestor initrd
+# ships none pre-mounted (the kernel does not auto-mount them for
+# `/init`). `nix::mount` wraps `mount(2)` so the agent stays
+# `unsafe_code = "forbid"`; same crate + version the tenant
+# `agent-initramfs` uses for the identical PID-1 mount (#171).
+#
+# `kmod` (`init_module(2)`) + `feature` (`sys::utsname::uname`) load the
+# bundled `sev-guest` + `vsock` kernel modules at PID 1: the Debian stock
+# kernel ships them as `=m`, so `/dev/sev-guest` and the challenge/enroll
+# vsock only exist after the agent `init_module`s the `.ko` bytes the
+# initrd carries. Same crate + features the tenant `agent-initramfs` uses
+# for its `load_kernel_modules`, so the agent stays `unsafe_code = "forbid"`.
+nix = { version = "0.31", default-features = false, features = ["mount", "kmod", "feature"] }
+
+[dev-dependencies]
+# Known-answer-test hex assertions.
+hex = "0.4"
+# Ed25519 signature verification in the beacon tests.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }

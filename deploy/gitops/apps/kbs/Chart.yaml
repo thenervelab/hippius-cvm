@@ -1,0 +1,18 @@
+# `apps/kbs` — Hippius Tier-0 Key Broker Service. PR-K6, §K (#54).
+#
+# A plain (non-wrapper) Helm chart: the KBS is a first-party Rust
+# binary (`hippius-kbs-server`, §D #101), so there is no upstream chart
+# to depend on — every manifest lives in `templates/`. Argo CD renders
+# it directly.
+#
+# The KBS is a CONFIDENTIAL workload (#1 locked topology): its pods run
+# under the `kata-qemu-snp` RuntimeClass inside an AMD SEV-SNP CVM —
+# the first attested workload on the cluster.
+apiVersion: v2
+name: hippius-kbs
+description: Hippius Tier-0 Key Broker Service — kata-qemu-snp confidential pod.
+type: application
+# Chart version — bump on any change to this directory.
+version: 0.1.0
+# Tracks the `hippius-kbs-server` crate version.
+appVersion: "0.0.1"

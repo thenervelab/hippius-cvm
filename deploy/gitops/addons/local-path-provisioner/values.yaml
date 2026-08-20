@@ -1,0 +1,106 @@
+# Values for the vendored `local-path-provisioner` subchart (see
+# Chart.yaml + PROVENANCE.md). Nested under the `local-path-provisioner:`
+# key — the subchart's name.
+local-path-provisioner:
+  # Fleet labels stamped on every rendered resource (the subchart's
+  # label helper appends `commonLabels`).
+  commonLabels:
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+
+  # ── Images — digest-pinned ──────────────────────────────────────────
+  # The chart renders `repository:tag`; the digest is carried in `tag`
+  # (`<tag>@sha256:…`) so the kubelet pulls by digest — the tag is then
+  # only a human-readable hint. Digests captured at vendoring time; see
+  # PROVENANCE.md.
+  image:
+    repository: docker.io/rancher/local-path-provisioner
+    tag: "v0.0.36@sha256:1eba82e9c386038b4af6d69cca7519fac738c28c42735ed48ce70c882ad0d80f"
+    pullPolicy: IfNotPresent
+  helperImage:
+    # The ephemeral mkdir/rm pod. Upstream defaults this to
+    # `busybox:latest` — a MOVING tag — so it is pinned here to an exact
+    # version + digest.
+    repository: docker.io/library/busybox
+    tag: "1.37.0@sha256:1487d0af5f52b4ba31c7e465126ee2123fe3f2305d638e7827681e7cf6c83d5e"
+
+  # ── StorageClass — THE cluster default ──────────────────────────────
+  storageClass:
+    create: true
+    # The default StorageClass cluster-wide — a PVC with no explicit
+    # `storageClassName` binds here. The cluster has no other SC (the
+    # k3s built-in `local-storage` is disabled — PR-K2 Ansible).
+    defaultClass: true
+    name: local-path
+    # Retain — deleting a PVC leaves its directory on disk; data is
+    # never auto-wiped. Reclaiming freed space is a deliberate operator
+    # action.
+    reclaimPolicy: Retain
+    # Lazy bind — the PV is provisioned only once a Pod consuming the
+    # PVC is scheduled, so it lands on the node that will run the Pod.
+    volumeBindingMode: WaitForFirstConsumer
+    # Explicit, stable provisioner name — decoupled from the Helm
+    # release name (the chart would otherwise derive
+    # `cluster.local/<release-name>`). PVs record their provisioner, so
+    # this must not drift.
+    provisionerName: cluster.local/hippius-local-path
+
+  # ── Data path ───────────────────────────────────────────────────────
+  # PVs are backed by directories under this path. `/var/lib/hippius-data`
+  # is the RAID1 NVMe data volume (PR-K2 Ansible, `data_mount_path`); the
+  # `local-path-provisioner/` subdir keeps it from overlapping other
+  # consumers of the same mount (KBS state, audit hash-chain, …).
+  #
+  # `nodePathMap` is an explicit per-node ALLOW-LIST — deliberately not
+  # the chart's `DEFAULT_PATH_FOR_NON_LISTED_NODES` catch-all. Only nodes
+  # proven to carry the PR-K2 RAID1 data mount are listed. A PVC consumer
+  # scheduled onto an UNLISTED node makes the provisioner refuse — the
+  # PVC stays `Pending` (fail loud) — instead of silently `mkdir`-ing the
+  # path on that node's OS disk (no RAID, no capacity planning). On
+  # scale-out, add each new SEV-SNP node here once its data mount is
+  # confirmed; never a general worker that lacks `/var/lib/hippius-data`.
+  #
+  # ⚠️  OPERATOR-SET: the node names below must match YOUR Kubernetes
+  # node names (`kubectl get nodes`) — the same names you used in
+  # `deploy/ansible/inventory.yml` under `cc_nodes`. The placeholder
+  # matches no node, so every PVC stays Pending until you replace it.
+  nodePathMap:
+    - node: REPLACE_ME_CC_NODE_HOSTNAME
+      paths:
+        - /var/lib/hippius-data/local-path-provisioner
+
+  # ── Scheduling ──────────────────────────────────────────────────────
+  # The provisioner controller runs only on the confidential-compute
+  # node pool (the single-node MVP). Helper pods are unaffected — they
+  # run on whichever node a PVC is being provisioned for. When general
+  # worker nodes join (Phase 3), widen this if PVCs land there.
+  nodeSelector:
+    node-role.hippius.network/confidential-compute: "true"
+
+  # ── PodDisruptionBudget ─────────────────────────────────────────────
+  # Single-replica controller — the locked "no replicas: 1 without a
+  # PDB" rule (#6) requires one. `maxUnavailable: 1` lets the singleton
+  # be drained on the single-node cluster (a `minAvailable` budget would
+  # wedge `kubectl drain`).
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+
+  # ── Resources ───────────────────────────────────────────────────────
+  # The controller only watches PVCs and spawns helper pods — light.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  # The helper pod just runs `mkdir`/`rm` — tiny and short-lived.
+  helperPod:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi

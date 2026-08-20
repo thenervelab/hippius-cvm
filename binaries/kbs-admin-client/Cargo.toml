@@ -1,0 +1,43 @@
+[package]
+name = "hippius-kbs-admin-client"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Operator + vali subprocess that POSTs L1-signed OrderTicket COSE_Sign1 envelopes to the KBS admin endpoint (ARCHITECTURE.md §24/§25). Pre-registers `VmState::Active` before vali dispatches the launch; KBS derives all lifecycle fields from the verified ticket. Stand-alone — never imported from kbs-core/kbs-server."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-kbs-admin-client"
+path = "src/main.rs"
+
+# Lib target so `mtls` (the client half of the admin mTLS gate) can be
+# driven from an integration test that runs the REAL kbs-server admin
+# listener. Still stand-alone: nothing in kbs-core / kbs-server imports
+# it outside `[dev-dependencies]`.
+[lib]
+name = "hippius_kbs_admin_client"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+clap = { version = "4", features = ["derive", "env"] }
+# Blocking HTTP client. The subprocess pattern (Django spawns this,
+# waits for exit code) doesn't need async. `rustls-tls` rather than
+# `native-tls` so the binary doesn't link to system OpenSSL — same
+# discipline as the other Hippius Rust binaries.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# mTLS on the admin hop: our own `rustls::ClientConfig` (pinned server
+# CA + client identity), handed to ureq via `AgentBuilder::tls_config`.
+# Same pin/features as `binaries/kbs-server` + `binaries/edge-gateway`
+# so one rustls unifies across the workspace.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+ciborium = "0.2"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

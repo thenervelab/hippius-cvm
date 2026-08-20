@@ -1,0 +1,85 @@
+{{- if .Values.relay.enabled }}
+---
+# Host-network relay — the KBS's route to the broker. #102 PR C.
+#
+# Live finding (2026-06-10): kata-qemu-snp pods cannot reach ANY
+# kube-proxy/eBPF-translated VIP — ClusterIP, LoadBalancer IP and
+# hostPort all fail from a kata guest (service translation happens at
+# the host socket/tc hooks the guest's kernel never traverses), while
+# direct pod-IP and real host-netns listeners work. Pod IPs are
+# unstable across restarts, so the stable route is a REAL listener in
+# the host netns: this socat relay binds the node's `cilium_host` IP
+# (host-internal, in the pod CIDR, NOT publicly routed and NOT in the
+# NetBird-advertised LoadBalancer subnet route) and forwards to the
+# broker Service (ClusterIP works from the host netns — verified).
+#
+# Security: the relay listens ONLY on the cilium_host IP. Traffic
+# host→broker-pod is allowed by the broker CNP's `fromEntities: host`
+# rule (the same identity as kubelet probes). The token-confidentiality
+# story is unchanged from pod-to-pod plaintext HTTP (the host sees
+# either path); the §8 HPKE wrap to the KBS auth pubkey is the
+# follow-up that closes that residual on ANY route.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbs-vault-broker-relay
+  namespace: kbs
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-broker-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kbs-vault-broker-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kbs-vault-broker-relay
+        app.kubernetes.io/part-of: hippius-compute
+        app.kubernetes.io/managed-by: argocd
+        app.kubernetes.io/component: vault-broker-relay
+    spec:
+      # Host netns — that's the point (see header). runc (no kata): the
+      # relay carries already-host-visible traffic; confidentiality is
+      # the broker's + HPKE follow-up's job, not the relay's.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      nodeSelector:
+        node-role.hippius.network/confidential-compute: "true"
+      containers:
+        - name: socat
+          # docker.io/alpine/socat — digest-pinned (§F).
+          image: "alpine/socat@{{ .Values.relay.imageDigest }}"
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              IP=$(ip -4 addr show cilium_host | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+              if [ -z "${IP}" ]; then
+                echo "relay: cilium_host has no IPv4 — refusing to bind 0.0.0.0" >&2
+                exit 64
+              fi
+              echo "relay: ${IP}:{{ .Values.config.listenPort }} → kbs-vault-broker.kbs.svc:{{ .Values.config.listenPort }}"
+              exec socat TCP-LISTEN:{{ .Values.config.listenPort }},bind=${IP},fork,reuseaddr \
+                TCP:kbs-vault-broker.kbs.svc.cluster.local:{{ .Values.config.listenPort }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+{{- end }}

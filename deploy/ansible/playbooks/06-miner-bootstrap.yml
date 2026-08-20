@@ -1,0 +1,327 @@
+---
+# Orchestrator for the UNTRUSTED miner fleet (`miner_nodes` group).
+#
+# Run order:
+#   00 preflight         READ-ONLY, fail-closed sanity checks
+#   01 SEV-SNP cmdline   GRUB tokens — reboots ONLY if the line changed
+#   02 libvirt + qemu    tenant-CVM hypervisor stack
+#   03 networking        libvirt `default` NAT network for tenant VMs
+#   04 NetBird agent     join the NetBird `miner` group via setup key
+#   05 miner-agent       install the binary + systemd unit + identity
+#   06 mTLS mount point  create the dir; the operator pushes the certs
+#   07 host firewall     UFW default-deny INPUT + narrow public surface
+#
+# This playbook is a SEPARATE trust profile from the cc-node playbooks
+# (`site.yml` / 00-05): it is intentionally NOT wired into `site.yml`.
+# Run it explicitly, scoped to one host:
+#   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+#     --limit <miner-hostname>
+#
+# INVARIANTS (asserted at preflight, see the README "Miner node
+# bootstrap" section):
+#   - it NEVER touches the hippius-compute Vault — no lookup, no token.
+#     A task that pulls a credential from Vault is a BUG.
+#   - it NEVER installs k3s — a miner is not a cluster node.
+#   - the miner identity is self-generated on the box; nothing is
+#     imported.
+#   - the mTLS cert content is operator-provisioned out-of-band;
+#     Ansible only creates the mount-point directory.
+
+# ── 00 — Preflight (read-only, fail-closed) ─────────────────────────
+- name: "00 — Miner preflight"
+  hosts: miner_nodes
+  gather_facts: true
+  become: true
+  tasks:
+    - name: Assert host is a supported Ubuntu (24.04 or 25.10)
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version in miner_supported_ubuntu_versions
+        fail_msg: >-
+          Miner bootstrap supports Ubuntu {{ miner_supported_ubuntu_versions | join(' / ') }}
+          — detected {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          Both 24.04 and 25.10 are validated. The NetBird apt repo
+          (pkgs.netbird.io/debian) and the agent source-build are
+          codename-independent. Add the version to
+          `miner_supported_ubuntu_versions` (group_vars) if validated.
+
+    - name: Assert host CPU is AMD x86_64 (SEV-SNP needs AMD EPYC)
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture == "x86_64"
+          - "'AMD' in ansible_processor[1] or 'AMD' in ansible_processor[2]"
+        fail_msg: >-
+          Host CPU is not AMD x86_64 — SEV-SNP requires AMD EPYC.
+          Detected arch={{ ansible_architecture }} processor={{ ansible_processor }}.
+
+    - name: Show detected CPU + RAM vs the host_vars expectation
+      ansible.builtin.debug:
+        msg: |
+          CPU detected : {{ ansible_processor[2] | default(ansible_processor | join(' ')) }}
+          CPU expected : {{ cpu_model_expected | default('(not set)') }}
+          RAM detected : {{ (ansible_memtotal_mb / 1024) | round(1) }} GiB
+          RAM expected : {{ ram_gb_expected | default('(not set)') }} GiB
+
+    - name: Assert the detected CPU matches the host_vars expectation
+      ansible.builtin.assert:
+        that:
+          - cpu_model_expected in (ansible_processor | join(' '))
+        fail_msg: >-
+          CPU mismatch — host_vars expects "{{ cpu_model_expected }}"
+          but this host reports "{{ ansible_processor | join(' ') }}".
+          Fix host_vars, or confirm this is the right box.
+      when: cpu_model_expected is defined
+
+    - name: Assert the detected RAM is at least the host_vars expectation
+      ansible.builtin.assert:
+        that:
+          # 90% floor — firmware reserves a few percent of installed RAM.
+          - ansible_memtotal_mb >= (ram_gb_expected | int) * 1024 * 0.9
+        fail_msg: >-
+          RAM mismatch — host_vars expects ~{{ ram_gb_expected }} GiB
+          but this host reports {{ (ansible_memtotal_mb / 1024) | round(1) }} GiB.
+      when: ram_gb_expected is defined
+
+    - name: Assert kernel is >= 6.11 (HWE — SEV-SNP host support)
+      ansible.builtin.assert:
+        that:
+          - ansible_kernel is version('6.11', '>=')
+        fail_msg: >-
+          Kernel {{ ansible_kernel }} is too old for SEV-SNP host
+          support. Install linux-generic-hwe-24.04 and reboot.
+
+    - name: Check the kvm_amd module exposes the sev_snp parameter
+      ansible.builtin.stat:
+        path: /sys/module/kvm_amd/parameters/sev_snp
+      register: miner_sev_snp_param
+
+    - name: Assert the running kernel's kvm_amd has SEV-SNP support
+      ansible.builtin.assert:
+        that:
+          - miner_sev_snp_param.stat.exists
+        fail_msg: >-
+          /sys/module/kvm_amd/parameters/sev_snp is absent — the
+          running kernel's kvm_amd was built without SEV-SNP support.
+          Install the HWE kernel and reboot.
+
+    - name: Assert system + data NVMe devices from host_vars are block devices
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ (nvme_system_devices | default([])) + (nvme_data_devices | default([])) }}"
+      register: miner_nvme_stat
+
+    - name: Fail closed if any declared NVMe device is missing or not a block device
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isblk | default(false)
+        fail_msg: >-
+          {{ item.item }} is not a block device on this host — the
+          host_vars NVMe layout is wrong. Re-check `lsblk` BEFORE
+          running anything (the §K2 near-miss lesson).
+      loop: "{{ miner_nvme_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Verify the data NVMe devices carry no system / unexpected signature
+      # Read-only safety assertion — this bootstrap does NOT format the
+      # data disks (tenant LUKS volumes are MA-3+). It fails closed on:
+      #   - a partition table — a partitioned "data" device is almost
+      #     always a mis-targeted system disk (/, /boot, swap); the
+      #     §K2 near-miss lesson;
+      #   - any whole-disk filesystem / RAID signature OTHER than
+      #     crypto_LUKS or a data-only `linux_raid_member`.
+      # An empty (raw, fresh box) device passes; so does crypto_LUKS —
+      # a tenant volume a later MA-3+ stage initialised — so re-running
+      # this bootstrap to update the agent stays idempotent after the
+      # disks are in use.
+      #
+      # `linux_raid_member` is accepted ONLY when the array the device
+      # belongs to is mounted, and mounted nowhere system-critical.
+      # Play 04 (`04-data-raid.yml`) is what PUTS that signature there,
+      # so refusing it outright broke the idempotence this comment
+      # promises: on any host where play 04 had run, re-running this
+      # bootstrap failed closed forever. The safety property is
+      # unchanged — a member of an array carrying /, /boot, /boot/efi
+      # or swap is still refused, which is the §K2 cc-1 near-miss this
+      # assertion exists for. An UNMOUNTED raid member is refused too:
+      # an unassembled array is unidentifiable, so it fails closed.
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for dev in {{ nvme_data_devices | default([]) | join(' ') }}; do
+            if blkid -p "$dev" 2>/dev/null | grep -q "PTTYPE="; then
+              echo "BUSY: $dev has a partition table — refusing (likely a system disk):"
+              lsblk "$dev"
+              exit 1
+            fi
+            sig=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)
+            case "$sig" in
+              ""|crypto_LUKS) ;;
+              linux_raid_member)
+                mnts=$(lsblk -nro MOUNTPOINTS "$dev" 2>/dev/null | grep -v '^$' || true)
+                if [ -z "$mnts" ]; then
+                  echo "BUSY: $dev is an UNASSEMBLED raid member — refusing (cannot identify the array):"
+                  lsblk "$dev"
+                  exit 1
+                fi
+                while IFS= read -r m; do
+                  case "$m" in
+                    /|/boot|/boot/efi|"[SWAP]")
+                      echo "BUSY: $dev backs a SYSTEM mount [$m] — refusing:"
+                      lsblk "$dev"
+                      exit 1
+                      ;;
+                  esac
+                done <<< "$mnts"
+                ;;
+              *)
+                echo "BUSY: $dev has an unexpected signature [$sig] — refusing:"
+                lsblk "$dev"
+                exit 1
+                ;;
+            esac
+          done
+          echo OK
+        executable: /bin/bash
+      register: miner_disk_check
+      changed_when: false
+      failed_when: "'OK' not in miner_disk_check.stdout"
+
+    # NetBird's OWN install script writes a legacy one-line source at
+    # `/etc/apt/sources.list.d/netbird.list` pinned to
+    # `/usr/share/keyrings/netbird-archive-keyring.gpg`. Play 04 declares
+    # the SAME repo as a deb822 source with a different keyring, and apt
+    # refuses to read its ENTIRE source list when one repo carries two
+    # `Signed-By` values:
+    #
+    #   E: Conflicting values set for option Signed-By regarding source
+    #      https://pkgs.netbird.io/debian/ stable:
+    #      /usr/share/keyrings/netbird-archive-keyring.gpg
+    #      != /etc/apt/keyrings/netbird.asc
+    #
+    # So it does not merely break NetBird — it breaks the FIRST apt task
+    # of the run, which is the libvirt install in play 02, long before
+    # play 04 could clean up after itself. Hence the removal lives here in
+    # preflight rather than next to the repo it belongs to.
+    #
+    # This bites any host where netbird was installed by the vendor's
+    # script — a third party who followed NetBird's own documentation
+    # before running this playbook, or any re-run on a host bootstrapped
+    # by an older revision of it.
+    - name: Remove the legacy one-line NetBird apt source (conflicting Signed-By)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/netbird.list
+        state: absent
+
+    - name: Stat the NetBird setup key on the operator workstation
+      ansible.builtin.stat:
+        path: "{{ operator_secret_dir }}/{{ netbird_setup_key_file }}"
+      delegate_to: localhost
+      become: false
+      register: miner_nb_key
+
+    - name: Assert the NetBird setup key is present locally
+      ansible.builtin.assert:
+        that:
+          - miner_nb_key.stat.exists
+        fail_msg: >-
+          NetBird setup key missing. Create a single-use key in the
+          NetBird dashboard bound to the `miner` group, then save it to
+          {{ operator_secret_dir }}/{{ netbird_setup_key_file }}.
+
+    - name: "INVARIANT — assert NO Vault credentials are configured for miners"
+      # Miners are untrusted — they must NEVER reach the hippius-compute
+      # Vault. This fails the run if a Vault var was inherited or set.
+      ansible.builtin.assert:
+        that:
+          - vault_addr is not defined
+          - vault_token is not defined
+        fail_msg: >-
+          INVARIANT VIOLATION — a Vault credential is defined for a
+          miner node. Miners never authenticate to the hippius-compute
+          Vault. Remove vault_addr / vault_token from the miner vars.
+
+    - name: Check whether k3s is installed on this host
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: miner_k3s_bin
+
+    - name: "INVARIANT — assert this miner host is not a k3s node"
+      # A miner is not a cluster node. `k3s_install_args` exists in
+      # group_vars/all.yml for the cc-nodes — this playbook never acts
+      # on it — and the box itself must carry no k3s install.
+      ansible.builtin.assert:
+        that:
+          - not miner_k3s_bin.stat.exists
+        fail_msg: >-
+          INVARIANT VIOLATION — /usr/local/bin/k3s exists on this host.
+          Miners are never cluster nodes and never run k3s; this box is
+          mis-targeted for the miner bootstrap.
+
+# ── 01 — SEV-SNP kernel cmdline ─────────────────────────────────────
+- name: "01 — SEV-SNP kernel cmdline"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Apply the SEV-SNP GRUB cmdline
+      ansible.builtin.import_tasks: miner-tasks/snp-kernel.yml
+  handlers:
+    - name: run update-grub
+      ansible.builtin.command:
+        cmd: update-grub
+      changed_when: true
+    - name: reboot for SEV-SNP cmdline
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 15
+        msg: "Rebooting to apply the SEV-SNP GRUB cmdline"
+
+# ── 02 — libvirt + qemu ─────────────────────────────────────────────
+- name: "02 — libvirt + qemu install"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Install the tenant-CVM hypervisor stack
+      ansible.builtin.import_tasks: miner-tasks/libvirt-install.yml
+
+# ── 03 — Tenant CVM networking ──────────────────────────────────────
+- name: "03 — Tenant CVM networking bridge"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Enable the libvirt default network
+      ansible.builtin.import_tasks: miner-tasks/networking-bridge.yml
+
+# ── 04 — NetBird agent ──────────────────────────────────────────────
+- name: "04 — NetBird agent + join the miner group"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Install + join NetBird
+      ansible.builtin.import_tasks: miner-tasks/netbird-agent.yml
+
+# ── 05 — miner-agent ────────────────────────────────────────────────
+- name: "05 — miner-agent install + identity self-gen"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Install the miner-agent
+      ansible.builtin.import_tasks: miner-tasks/miner-agent-install.yml
+
+# ── 06 — mTLS cert mount point ──────────────────────────────────────
+- name: "06 — mTLS cert mount point (operator pushes the content)"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Prepare the mTLS cert directory
+      ansible.builtin.import_tasks: miner-tasks/mtls-cert-mount.yml
+
+# ── 07 — Host firewall (UFW) ────────────────────────────────────────
+- name: "07 — Host firewall (UFW default-deny INPUT)"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Apply the UFW host firewall
+      ansible.builtin.import_tasks: miner-tasks/host-firewall.yml

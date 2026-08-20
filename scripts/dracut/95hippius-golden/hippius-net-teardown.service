@@ -1,0 +1,25 @@
+# `hippius-net-teardown.service` — initrd unit (dracut module
+# 95hippius-golden) that flushes the release core's static network config
+# and shreds any KEK residue just before switch-root.
+#
+# Ordering: units WantedBy=initrd-switch-root.target are started by the
+# isolate that precedes the pivot; Before=initrd-switch-root.service
+# guarantees we run before the actual switch. After=initrd-root-fs.target
+# guarantees the golden overlay assembly (hippius-golden-mount.service)
+# has already released + consumed the KEK.
+
+[Unit]
+Description=Hippius golden initrd net teardown + KEK-residue wipe before switch-root
+DefaultDependencies=no
+After=initrd-root-fs.target
+Before=initrd-switch-root.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/hippius-net-teardown
+StandardOutput=kmsg+console
+StandardError=kmsg+console
+
+[Install]
+WantedBy=initrd-switch-root.target

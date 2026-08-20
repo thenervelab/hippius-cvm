@@ -1,0 +1,18 @@
+# `apps/edge-gateway` — Hippius Edge gateway. PR-K8, §K (#54).
+#
+# A plain (non-wrapper) Helm chart: the Edge is a first-party Rust
+# binary, so there is no upstream chart to depend on — every manifest
+# lives in `templates/`. Argo CD renders it directly.
+#
+# The Edge is the opaque relay between the untrusted miner NetBird
+# mesh and the internal control plane. It is NOT a confidential
+# workload (#1 locked topology) — runc pods, no Kata, no
+# kata-qemu-snp RuntimeClass.
+apiVersion: v2
+name: hippius-edge-gateway
+description: Hippius Edge gateway — opaque relay, HA pair of runc pods.
+type: application
+# Chart version — bump on any change to this directory.
+version: 0.1.0
+# Tracks the `hippius-edge-gateway` crate version.
+appVersion: "0.0.1"

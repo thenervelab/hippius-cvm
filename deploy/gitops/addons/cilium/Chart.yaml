@@ -1,0 +1,21 @@
+# `addons/cilium` — wrapper chart for the Cilium CNI.
+#
+# This is a thin "umbrella" chart: it carries no templates of its own,
+# it only pins the upstream `cilium` chart as a dependency and supplies
+# `values.yaml`. Argo CD renders it (running `helm dependency build`
+# from `Chart.lock`) and reconciles the result. Keeping the upstream
+# chart a pinned DEPENDENCY — rather than a loose `targetRevision` on
+# the Application — means `Chart.lock` records the exact resolved
+# version + digest, and `helm lint` / `helm template` work offline.
+apiVersion: v2
+name: hippius-cilium
+description: Cilium eBPF CNI for hippius-compute (kube-proxy replacement, k3s).
+type: application
+# Wrapper version — bump on any change to this directory.
+# 0.1.1: pin cilium-operator to 1 replica (single-node).
+version: 0.1.1
+dependencies:
+  - name: cilium
+    # Pinned EXACTLY (no `^`, no `~`, no `*`). Bump deliberately.
+    version: 1.19.4
+    repository: https://helm.cilium.io

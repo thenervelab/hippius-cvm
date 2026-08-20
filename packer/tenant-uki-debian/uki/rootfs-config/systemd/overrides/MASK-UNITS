@@ -1,0 +1,54 @@
+# Units this rootfs MASKS — `build-rootfs.sh` symlinks each to
+# /dev/null under /etc/systemd/system/, which is what
+# `systemctl mask` does at runtime but applied at build time so the
+# squashfs is the source of truth.
+#
+# A "mask" is stronger than "disable": a masked unit cannot be
+# re-enabled mid-boot, even by a sloppy first-boot cloud-init runcmd.
+#
+# Rationale per unit:
+#   rsyslog.service        — duplicates journald; journald keeps logs
+#                            in /run/log/journal (tmpfs) so they don't
+#                            persist past poweroff (§20 logging
+#                            discipline). rsyslog would re-stream to
+#                            /var/log/* which adds disk pressure on
+#                            the small data volume + non-deterministic
+#                            file mtimes.
+#   cron.service           — no scheduled jobs in a serverless tenant
+#                            baseline; mask avoids the daily
+#                            `cron.daily` runs touching state.
+#   getty@*.service        — no TTY in a serverless CVM. The QEMU
+#                            serial console is reserved for kernel
+#                            diagnostics; an interactive login on it
+#                            would defeat the no-shell §20 posture.
+#   apt-daily.service +
+#   apt-daily-upgrade.service — the rootfs is dm-verity (read-only at
+#                              runtime). Apt updates would either
+#                              fail noisily (writing to a read-only
+#                              FS) OR succeed quietly on an overlay
+#                              and drift away from the measured
+#                              image. Mask both.
+#   systemd-timesyncd      — an NTP query before NetBird is up would
+#                            block, AND the host's SEV-SNP attestable
+#                            RTC is already the trust anchor for time
+#                            inside the CVM. Skip.
+#   serial-getty@*.service — same posture as getty@*; the ttyS0
+#                            console is for diagnostics only.
+#
+# This file is consumed by `build-rootfs.sh::mask_units`. Format:
+# one unit per line, blank lines + `#` comments ignored.
+
+rsyslog.service
+cron.service
+getty@tty1.service
+getty@tty2.service
+getty@tty3.service
+getty@tty4.service
+getty@tty5.service
+getty@tty6.service
+serial-getty@ttyS0.service
+apt-daily.service
+apt-daily-upgrade.service
+apt-daily.timer
+apt-daily-upgrade.timer
+systemd-timesyncd.service

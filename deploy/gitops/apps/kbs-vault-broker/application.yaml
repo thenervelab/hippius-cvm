@@ -1,0 +1,72 @@
+---
+# Argo CD Application — SNP-attestation-bound Vault broker (#102).
+#
+# Sync wave 9: after every addon (waves 1-5) and BEFORE the KBS app
+# (wave 10) — when the KBS flips to `vault.broker_url` (#102 PR C
+# final), the broker must be serving before the KBS starts releasing.
+# The broker depends on external-secrets (its Vault token + VEK
+# ExternalSecrets) and on Kata (the `kata-qemu-snp` RuntimeClass).
+#
+# Deployed into the `kbs` namespace: the broker is part of the KBS
+# trust domain, shares the same ClusterSecretStore namespace label, and
+# the KBS→broker CiliumNetworkPolicy stays within one namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-kbs-vault-broker
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-kbs-vault-broker
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: vault-broker
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # External Secrets Operator mutates these defaulted fields on every
+  # ExternalSecret it reconciles; without this Argo CD would report the
+  # app perpetually OutOfSync. Mirrors the kbs app.
+  ignoreDifferences:
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
+        - .spec.data[].remoteRef.nullBytePolicy
+        - .spec.target.deletionPolicy
+        - .spec.target.template.engineVersion
+        - .spec.target.template.mergePolicy
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/apps/kbs-vault-broker
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kbs
+  syncPolicy:
+    # The `kbs` namespace is created (and its ClusterSecretStore label
+    # managed) by the kbs app; this app only adds resources to it. The
+    # label is repeated here so the broker app stands alone if the kbs
+    # app is ever pruned — both apps assert the identical value, so
+    # ServerSideApply never fights.
+    managedNamespaceMetadata:
+      labels:
+        hippius.network/vault-secrets: enabled
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

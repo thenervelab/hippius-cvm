@@ -1,0 +1,73 @@
+---
+# Host firewall (UFW) — default-deny INPUT with a narrow public surface.
+# Tasks file imported by 06-miner-bootstrap.yml play "07".
+#
+# The miner is on a public IP (bare metal, no provider firewall in
+# front of it by default). Without this, every
+# port the host process binds on 0.0.0.0 is exposed — and the journal
+# already shows continuous SSH bruteforce from the open Internet.
+#
+# Public surface kept open (the strict minimum to keep the box
+# operable and on the NetBird mesh):
+#   - 22/tcp        — SSH (operator + automation; key-only auth, no
+#                     IP allowlist by design — operators come from
+#                     several roaming IPs).
+#   - 51820/udp     — NetBird WireGuard encrypted tunnel. Without it
+#                     the mesh cannot form and the miner-agent (which
+#                     binds the NetBird IP) becomes unreachable from
+#                     vali / Edge.
+#
+# Everything else received from `wt0` (the NetBird mesh interface) is
+# allowed — that traffic has already passed NetBird's policy engine
+# (validator-miner-ctrl etc.) which is the authoritative ACL for
+# mesh-internal services (miner-agent :9700, internal DNS :53).
+#
+# Outbound is left fully open — the miner needs to reach the NetBird
+# signal/relay, libvirt's apt mirrors, and the control-plane vali/Edge over the
+# mesh. None of those benefit from egress filtering on a single-tenant
+# bare-metal host.
+#
+# libvirt's own iptables chain (`LIBVIRT_INP`) is unaffected — UFW
+# inserts its rules ahead of libvirt's chain in the INPUT path; tenant
+# CVM traffic on virbr0 stays handled by libvirt as before.
+
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+
+- name: Set UFW default policies (deny in, allow out, deny forward)
+  community.general.ufw:
+    direction: "{{ item.direction }}"
+    policy: "{{ item.policy }}"
+  loop:
+    - { direction: incoming, policy: deny }
+    - { direction: outgoing, policy: allow }
+    - { direction: routed,   policy: deny }
+
+- name: Allow SSH on the public interface (key-only auth assumed)
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+    comment: "ssh — operator + automation"
+
+- name: Allow NetBird WireGuard tunnel (public UDP listener)
+  community.general.ufw:
+    rule: allow
+    port: "51820"
+    proto: udp
+    comment: "netbird wireguard tunnel"
+
+- name: Allow all traffic received on the NetBird mesh interface (wt0)
+  community.general.ufw:
+    rule: allow
+    interface: wt0
+    direction: in
+    comment: "netbird mesh — ACLs enforced by netbird policy engine"
+
+- name: Enable UFW with logging
+  community.general.ufw:
+    state: enabled
+    logging: low

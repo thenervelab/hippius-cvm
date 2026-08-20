@@ -1,0 +1,18 @@
+# `addons/ingress-nginx` — wrapper chart for ingress-nginx.
+#
+# Umbrella chart: pins the upstream `ingress-nginx` chart as a
+# dependency and adds a PodDisruptionBudget for the single-replica
+# controller as a local template. Argo CD renders it (`helm dependency
+# build` from Chart.lock) and reconciles it.
+apiVersion: v2
+name: hippius-ingress-nginx
+description: ingress-nginx HTTP(S) ingress controller for hippius-compute.
+type: application
+# Wrapper version — bump on any change to this directory.
+# 0.1.1: disable LoadBalancer NodePort allocation.
+version: 0.1.1
+dependencies:
+  - name: ingress-nginx
+    # Pinned EXACTLY. Bump deliberately.
+    version: 4.15.1
+    repository: https://kubernetes.github.io/ingress-nginx

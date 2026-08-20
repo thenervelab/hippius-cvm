@@ -1,0 +1,69 @@
+# ── LoadBalancer address pool — OPERATOR-SET ────────────────────────
+# The range MetalLB hands out to `type: LoadBalancer` Services, rendered
+# into the `hippius-lb-pool` IPAddressPool by templates/l2-pool.yaml.
+#
+# ⚠️  The default below is the RFC 5737 TEST-NET-1 documentation range.
+# It routes nowhere and is NOT a working value — replace it with a range
+# on the L2 segment your nodes share. See templates/l2-pool.yaml for the
+# constraints (no overlap with the k3s pod / service CIDRs; must contain
+# every service that pins an address out of it).
+#
+# Downstream consumers that must stay inside this range:
+#   - `deploy/gitops/apps/edge-gateway/values.yaml::service.loadBalancerIP`
+#   - the ingress-nginx controller's LoadBalancer address
+#   - `deploy/ansible/group_vars/miner_nodes.yml::miner_vali_lifecycle_url`
+lbPool:
+  addresses:
+    - 192.0.2.0/24
+
+# Values for the `metallb` dependency (see Chart.yaml). Nested under
+# the `metallb:` key — the dependency's name.
+#
+# The L2 address pool itself (IPAddressPool + L2Advertisement) is NOT
+# configured in the block below — MetalLB takes that as CRs, rendered
+# from this wrapper chart's own templates/ (see templates/l2-pool.yaml
+# and `lbPool` above).
+#
+# Label note: MetalLB's chart has no global `commonLabels`. The fleet
+# labels are applied to the controller + speaker workloads via the
+# per-component `labels` below, to every resource this wrapper owns
+# (templates/), and to the Argo CD Application. MetalLB's own
+# ServiceAccount / RBAC / webhook objects therefore carry only Argo
+# CD's `app.kubernetes.io/instance` tracking label — an upstream-chart
+# limitation, not a policy exception.
+metallb:
+  # ── L2 mode only ────────────────────────────────────────────────────
+  # Single-node MVP: pure ARP-based L2 advertisement. The FRR / frr-k8s
+  # BGP datapath is explicitly disabled — BGP is a later change, once
+  # there is a router to peer with (issue #54).
+  frrk8s:
+    enabled: false
+
+  # ── Images — digest-pinned ──────────────────────────────────────────
+  # The upstream chart renders `repository:tag` with no digest support,
+  # so the digest is carried INSIDE `tag` (`<tag>@sha256:…`) — the same
+  # trick the local-path-provisioner addon uses. The rendered reference
+  # is `quay.io/metallb/<c>:v0.16.0@sha256:…`; the kubelet pulls by
+  # digest and the tag is only a human-readable hint.
+  #
+  # Digests are the multi-arch INDEX digests of what the cluster is
+  # already running, read back from the node (`k3s crictl inspecti <ref>`
+  # → `repoDigests`), so applying this changes no bytes. MetalLB's
+  # `app.kubernetes.io/version` label comes from `.Chart.AppVersion`, not
+  # from this `tag`, so the `@` is not carried into any label value.
+  controller:
+    image:
+      tag: "v0.16.0@sha256:615b454c45e424e61d1f82c916ad7ab8c11ef2ba09d3ec4b0b64458e4058ff2b"
+    labels:
+      app.kubernetes.io/part-of: hippius-compute
+      app.kubernetes.io/managed-by: argocd
+
+  speaker:
+    image:
+      tag: "v0.16.0@sha256:70e7f83255af2e96acfd574ac9f049745639deb2746d35e988008afcc0b80dbd"
+    # The deprecated in-speaker FRR mode — off (L2 only).
+    frr:
+      enabled: false
+    labels:
+      app.kubernetes.io/part-of: hippius-compute
+      app.kubernetes.io/managed-by: argocd

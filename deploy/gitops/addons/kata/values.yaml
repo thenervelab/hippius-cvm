@@ -1,0 +1,150 @@
+# Helm values for `addons/kata` — passed to the `kata-deploy` subchart
+# under its release key. PR-K5, §K (#54).
+kata-deploy:
+  # The cluster runs **k3s** (verified live:
+  # `k3s.service` active, containerd config at
+  # `/var/lib/rancher/k3s/agent/etc/containerd/config.toml`; the
+  # default RuntimeClasses `crun` / `wasmtime` / `spin` / … are the
+  # k3s-shipped set). kata-deploy MUST target k3s's containerd config
+  # path — the vanilla-k8s default (`/etc/containerd/`) or the RKE2
+  # path is wrong, and a wrong distro ⇒ the kata runtime handlers are
+  # never registered with containerd and every kata pod fails to start.
+  #
+  # NOTE: the locked-topology notes say "RKE2"; the live cluster is in
+  # fact k3s. Flagged in the PR description (memory is read-only).
+  k8sDistribution: k3s
+
+  # ── kata-deploy image — digest-pinned ───────────────────────────────
+  # ⚠️ APPLYING A CHANGE TO THIS VALUE ROLLS THE kata-deploy DaemonSet.
+  #    That is not a routine image pin — read the whole comment.
+  #
+  # WHY IT MATTERS. This is the single most load-bearing image in the
+  # fleet's supply chain. kata-deploy is a node-level INSTALLER: the
+  # DaemonSet writes the Kata shim, its QEMU, its OVMF firmware and its
+  # guest kernel onto the confidential-compute node and rewrites
+  # containerd's config to register the `kata-qemu-snp` handler. Every
+  # confidential VM — including the KBS, which holds every tenant KEK —
+  # boots on the bytes this image drops. Substituting it substitutes the
+  # measured guest stack itself.
+  #
+  # The chart default is the tag `3.31.0`, and the rendered DaemonSet
+  # carries `imagePullPolicy: Always`. Tag + Always is the worst pairing
+  # available: a registry-side re-tag of `3.31.0` needs no cluster access
+  # at all — it lands on the node the next time the DaemonSet pod
+  # restarts, which host reboot-recovery does on its own. No signature,
+  # no pin, no operator in the loop. The digest below closes that.
+  #
+  # The digest is the multi-arch INDEX digest of what the node is running
+  # RIGHT NOW, read back with `k3s crictl inspecti` -> `repoDigests` and
+  # cross-checked against quay.io with `docker buildx imagetools inspect`
+  # (both report sha256:6434710675…). No version bump: the same bytes
+  # that are on the node today, now named unambiguously.
+  #
+  # WHY IT IS STILL A RESTART. Kubernetes compares the image STRING, not
+  # the resolved digest, so appending `@sha256:…` changes the pod-template
+  # hash and triggers a RollingUpdate even though the content is
+  # identical. Terminating the kata-deploy pod runs its cleanup path,
+  # which removes the kata runtime config from containerd and reloads it
+  # before the replacement pod reinstalls it (see README.md, "Privileged
+  # + hostPath"; `terminationGracePeriodSeconds` is 600 for exactly this
+  # reason). For the duration of that window the node has no
+  # `kata-qemu-snp` handler.
+  #
+  # HOW TO APPLY. Deliberately, by an operator, not by an unattended
+  # sync: confirm no tenant CVM is live, apply, wait for the DaemonSet to
+  # report Ready, then verify the KBS pod is Running and serving before
+  # calling it done. The kata Application currently has `automated` sync
+  # OFF, so committing this does not by itself move the cluster — but if
+  # auto-sync is ever re-armed while this commit is unapplied, the
+  # rollout happens on its own. That is the one thing in this PR that
+  # should not be left to chance.
+  image:
+    tag: "3.31.0@sha256:643471067559cbde3258a62eb60840ce435383d9a6dae7a803bd9418eb81be8b"
+
+  # Install the kata-deploy DaemonSet only on confidential-compute
+  # nodes (locked topology / §23 — the KBS + Audit-VM confidential pods
+  # run there; ordinary `general-workloads` nodes do not need the kata
+  # runtime installed). On the single-node MVP this is the only node;
+  # the selector keeps it correct as the cluster scales.
+  nodeSelector:
+    node-role.hippius.network/confidential-compute: "true"
+
+  # Only two shims. `qemu-snp` is the AMD SEV-SNP confidential runtime
+  # (handler `kata-qemu-snp`). `qemu` is a plain, non-confidential kata
+  # sibling kept for debug/triage — it isolates "a kata pod won't start
+  # at all" from "SNP attestation is broken". `disableAll: true` then
+  # opt-in keeps the node free of the ~20 other shims the chart enables
+  # by default (clh, firecracker, dragonball, tdx, se, every nvidia
+  # variant) — none of which this fleet uses.
+  #
+  # IMAGE PULL — `qemu-snp` is a TEE shim, so kata-deploy wires it to
+  # the `nydus-for-kata-tee` snapshotter and **guest-pull**: the
+  # container image is pulled *inside* the SEV-SNP guest, never staged
+  # decrypted on the host. This is the correct confidential-containers
+  # posture and is NOT a chart toggle — kata-deploy hardwires it for
+  # the snp/tdx/se shims (verified live: the qemu-snp containerd
+  # handler gets `snapshotter = nydus-for-kata-tee` regardless of the
+  # `containerd`/`crio` shim values). `qemu` (non-TEE) keeps the normal
+  # host-pull / overlayfs path.
+  #
+  # Operational implication: the guest resolves the registry over the
+  # pod network. A kata SEV-SNP guest reaches pod IPs and the public
+  # internet but NOT k8s ClusterIP VIPs — so a guest-pull pod must be
+  # given a DNS resolver it can actually reach (a public resolver via
+  # `spec.dnsConfig`, not the CoreDNS ClusterIP). See README.md
+  # "Guest-pull + DNS".
+  shims:
+    disableAll: true
+    qemu:
+      enabled: true
+    qemu-snp:
+      enabled: true
+
+  # The hippius-owned RuntimeClasses live in `templates/runtimeclass.yaml`
+  # — they carry the fleet labels (`part-of` / `managed-by: argocd`) and
+  # the confidential-compute `scheduling.nodeSelector`. The chart's own
+  # RuntimeClass objects are therefore turned OFF to avoid a same-name
+  # collision. This does NOT affect functionality: `runtimeClasses.enabled`
+  # only governs the k8s `RuntimeClass` API objects — kata-deploy still
+  # registers the containerd runtime *handlers* (`kata-qemu-snp`,
+  # `kata-qemu`) that those RuntimeClasses point at.
+  runtimeClasses:
+    enabled: false
+
+  # Pin the kubectl image used by the chart's RBAC-cleanup hook Job.
+  # The chart default tag is `latest` — unacceptable for a Job that
+  # holds cluster RBAC to delete ClusterRole/ClusterRoleBinding objects,
+  # and a GitOps anti-pattern. `v1.36.1` is the current published tag.
+  #
+  # `v1.36.1` on its own is still a MUTABLE tag: a quay.io re-tag would
+  # silently change what that RBAC-holding Job runs. The digest below
+  # closes that. The chart helper renders `reference:tag`, and it only
+  # treats a reference as digest-pinned when the `@` is in `reference` —
+  # so carrying the digest in `tag` yields the readable
+  # `quay.io/kata-containers/kubectl:v1.36.1@sha256:…` form.
+  #
+  # This image is NOT resident on the node: it renders only into the
+  # `post-delete` hook Job (`kata-cleanup-rbac-job.yaml`) and the
+  # `verification-job.yaml`, which is gated on `verification.pod` and so
+  # is not rendered at all. The digest is therefore the multi-arch INDEX
+  # digest resolved from quay.io, not read back from the cluster.
+  #
+  # Because it renders no live workload, this pin changes NOTHING that is
+  # currently running — it cannot restart the kata DaemonSet or the KBS.
+  kubectlImage:
+    tag: "v1.36.1@sha256:aad949a6dc0c46370ff24dfbb7317ad391925e32936c016aafc59a5f97ee577e"
+
+  # `snapshotter.setup` is intentionally NOT overridden — the chart
+  # default (`["nydus"]`) is kept. The `qemu-snp` shim defaults to
+  # `containerd.snapshotter: nydus`, so the rendered DaemonSet maps
+  # `qemu-snp` to a nydus snapshotter; `snapshotter.setup` is what
+  # makes kata-deploy actually install one. Keeping both at the
+  # upstream default is the supported, CI-tested TEE path — overriding
+  # `setup` to `[]` leaves the `qemu-snp` handler pointing at a
+  # snapshotter that may never be installed.
+  #
+  # Hardware-feature detection is via our explicit
+  # `node-role.hippius.network/confidential-compute` label (set by the
+  # PR-K2 node bootstrap), not NFD — keep the bundled NFD subchart off.
+  node-feature-discovery:
+    enabled: false

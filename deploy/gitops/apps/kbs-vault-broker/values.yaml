@@ -1,0 +1,209 @@
+# Values for the `kbs-vault-broker` chart. #102 PR C.
+
+image:
+  repository: ghcr.io/thenervelab/hippius-kbs-vault-broker
+  # SHA-256 digest — NOT a tag (§F supply-chain discipline: the
+  # deployed image is content-addressed). Produced by the
+  # `broker-image.yml` workflow.
+  # 83d32f0 (`sha-83d32f0d6811`, 2026-07-08) — what the cluster ACTUALLY
+  # runs. The pin had drifted behind an out-of-band deploy, and the stale
+  # value (f54902e, 2026-07-06) predates the KEK-HSM series: it is missing
+  # #777 (KBS transit-decrypts a WRAPPED KEK) and #779 (Phase 3 fixed
+  # templated cap policy, RA-KBS-M2).
+  #
+  # Reverting it would therefore break every release. The KBS (not the broker)
+  # performs the `transit/decrypt`; the broker mints the SCOPED capability
+  # token that must grant it. A pre-#777 broker mints a token with no
+  # `transit/decrypt` grant, so the KBS's unwrap of the `vault:v1:` KEK is
+  # denied by Vault and the release fails — and since the kbs chart renders
+  # `require_wrapped_kek = true`, every KEK at rest is such a blob, so NO
+  # release succeeds. Nothing alerts on it; it surfaces as guests failing to
+  # unlock.
+  #
+  # #779 (RA-KBS-M2) also deleted the broker's ACL-writing code path in favour
+  # of a fixed templated cap policy. What a revert does there depends on Vault
+  # state the chart does not control: dropping the broker's `sys/policies/acl`
+  # grant was a STAGED MANUAL step in that commit. If it was completed, a
+  # rolled-back broker simply cannot write ACLs and fails closed — a
+  # functional break. If it was skipped, the revert re-arms a
+  # forge-any-policy grant, which is a security regression. Verify the Vault
+  # policy before ever rolling this back. Keep this pin honest: it is the
+  # contract.
+  digest: "sha256:5b97c6400074f049cf33adb68950dc403c2be97fafabf6536f941691196d981a"
+  # ── Build provenance of the digest above (P3) ───────────────────────
+  # MACHINE-CHECKED against the digest's Sigstore signature — see the
+  # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
+  # `.github/scripts/verify_image_provenance.py`. The broker is
+  # trust-critical for the same reason the KBS is: it mints the scoped
+  # Vault capability the KBS uses to unwrap every tenant KEK, and its own
+  # CVM measurement covers the VM shape, not this image.
+  #
+  # Unlike the KBS pin, this one IS a merged-source build and the comment
+  # above it is accurate.
+  provenance:
+    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/broker-image.yml@refs/heads/main"
+    commitSha: "83d32f0d68110481d3c0e15d00ff035a026c13ca"
+    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/28907887726/attempts/1"
+    mergedSource: true
+  # The image is PUBLIC: the kata-qemu-snp guest pulls it itself
+  # IN-GUEST via the CDH (nydus-for-kata-tee) and pull secrets do NOT
+  # reach that path — verified live 2026-06-10: the kubelet host pull
+  # honoured the regcred, the in-guest CDH blob fetch got 401. The
+  # image carries no secrets — the privileged Vault token arrives via
+  # the BROKER_VAULT_TOKEN env (ExternalSecret), config via ConfigMap.
+  pullSecret:
+    # Dormant: pull secrets only apply to the HOST-side resolution for
+    # kata-qemu-snp pods (see above). Kept for non-CVM reuse.
+    enabled: false
+    name: harbor-regcred
+    # Vault KV-v2 path holding `dockerconfigjson` (operator-staged).
+    vaultPath: hippius-compute/registry/harbor
+
+# Single replica: the challenge store is in-memory + single-use — a
+# nonce issued by replica A cannot be redeemed against replica B. One
+# broker pod serves one KBS pod; neither scales horizontally today.
+replicaCount: 1
+
+# Host-network socat relay — the KBS's stable route to the broker
+# (kata pods cannot reach VIPs; see templates/relay.yaml header). The
+# KBS's `vault.brokerUrl` points at the node's cilium_host IP on
+# `config.listenPort`.
+relay:
+  enabled: true
+  # docker.io/alpine/socat:1.8.x (manifest list, linux/amd64 included).
+  imageDigest: "sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e"
+
+# The broker is lightweight: one SNP chain verify + two small Vault
+# HTTP calls per release.
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# RA-KBS-M1 — server-TLS on the broker↔KBS hop. ON: the broker binds
+# TLS (ring provider) and the KBS pins the exact leaf. The cert + key
+# are operator-staged in Vault at `tls.vaultPath` and materialised by
+# external-secret-tls.yaml into the `broker-tls` Secret; the kbs chart
+# reads the same cert into its `broker-ca` pin (single source, no
+# drift). OFF ⇒ plaintext HTTP (the pre-RA-KBS-M1 posture).
+tls:
+  enabled: true
+  # KV-v2 path holding `tls.crt` + `tls.key` (operator-provisioned).
+  vaultPath: hippius-compute/kbs-vault-broker/tls
+
+config:
+  # Canonical-CBOR challenge/redeem transport + /healthz.
+  listenPort: 8100
+  # Challenge nonce TTL (seconds) — the KBS redeems within one release
+  # round-trip; 120 s absorbs a slow SNP self-report ioctl + retry.
+  challengeTtlSecs: 120
+  # SNP launch-policy floor applied to the KBS's OWN report. Same dev
+  # profile as the KBS chart's `config.launchPolicy` (see that file for
+  # the bit-level rationale + the string-quoting pitfalls): require
+  # only ABI-1.55 reserved-must-be-1, allow everything else.
+  # Production tightens in lockstep with the KBS-measurement pin.
+  launchPolicy:
+    minTcb: 0
+    requiredBits: "131072"
+    # 2026-08-13: was "9223372036854775807" — ALL 63 bits — while the
+    # live ConfigMap carries 65536 (bit 16 only). `redeem.rs:154` rejects
+    # on `verified.policy & !(required_bits | allowed_mask) != 0`, so a
+    # LARGER mask is MORE permissive: git's value would have admitted an
+    # SNP guest policy carrying DEBUG. Syncing this app would have
+    # LOOSENED an attestation gate. Corrected to match production.
+    allowedMask: "65536"
+
+# Accepted KBS launch measurements (lower-case 96-hex). EMPTY ⇒ the
+# broker starts but mints NOTHING (fail-closed) — every redeem is
+# denied until the live KBS launch measurement is pinned here (#102
+# PR C final, in lockstep with flipping the KBS's
+# `dev_allow_any_kbs_measurement` off).
+kbsMeasurementAllowlist:
+  # The live KBS pod launch measurement (captured 2026-06-11 from the
+  # broker pin-candidate log, after KDS-verified self-report). Re-pin
+  # this for YOUR cluster: it is the measurement of the KBS CVM this
+  # broker will hand a privileged Vault token to.
+  # Re-pin in lockstep with any KBS image / kata-snp launch-shape change.
+  - "1908936d4ef69fd118d0dac1d3d698590e42037ab1a351969309cb345a959683e62fee99ba5da4cdf9feffea4065b2fa"
+
+vault:
+  # ⚠️  OPERATOR-SET. The Vault this broker mints scoped tokens
+  # against. The broker is the ONLY holder of a privileged token;
+  # everything downstream gets per-VM-scoped short-TTL child tokens.
+  #
+  # The placeholder uses the RFC 2606 `.invalid` TLD so it cannot
+  # resolve — an unfilled value fails loudly. Note the prod-marker
+  # guard below keys off this string.
+  address: "https://vault.example.invalid:8200"
+  # ⚠️  OPERATOR-SET. CIDR + port the CiliumNetworkPolicy opens toward
+  # Vault (templates/networkpolicy.yaml). Must cover whatever
+  # `vault.address` resolves to. Empty ⇒ no explicit egress rule, which
+  # only works if Vault is reachable through the policy's `world:443`
+  # rule. The placeholder is RFC 5737 TEST-NET-1 and routes nowhere.
+  egressCidr: "192.0.2.0/32"
+  egressPort: "8200"
+  kvMount: secret
+  # KV-v2 path holding the broker's privileged `vault-token`.
+  # Operator-provisioned — see README.md.
+  brokerSecretPath: hippius-compute/kbs-vault-broker
+  refreshInterval: 1h
+  # TTL (seconds) of the minted scoped child token. Short — the KBS
+  # uses it for two reads (luks + userdata) immediately.
+  childTokenTtlSecs: 120
+  # Vault token ROLE the child token is created against
+  # (`auth/token/create/<role>`). Operator-provisioned next to the
+  # broker policy; its `allowed_policies_glob: ["kbs-cap-*"]` is what
+  # authorises the broker to attach a policy outside its own set
+  # (Vault's child-policy-subset rule). See README "Operator setup".
+  tokenRole: kbs-vault-broker-cap
+  # ⚠️  DEV-ONLY: skip TLS server-cert verification toward a Vault
+  # with a private / self-signed certificate. Same prod-marker guard
+  # as the KBS (`tier0` / `prod` / `hippius.network` in vault.address
+  # refuses startup). Production mounts the Vault CA instead.
+  devSkipTlsVerify: false
+  # PROD Vault TLS: pin verification to this CA instead of the dev
+  # skip. Mutually exclusive with devSkipTlsVerify (now off).
+  #
+  # ⚠️  OPERATOR-SET. Paste the PEM of the CA that signed YOUR Vault
+  # server certificate as a literal block:
+  #
+  #   caCert: |
+  #     -----BEGIN CERTIFICATE-----
+  #     ...
+  #     -----END CERTIFICATE-----
+  #
+  # Rendered into the `kbs-vault-broker-vault-ca` ConfigMap and
+  # mounted at `caCertPath`. Empty ⇒ no ConfigMap, system trust store
+  # — correct only for a publicly-trusted Vault certificate. A CA
+  # certificate is PUBLIC, not a secret; it is absent here because it
+  # is infrastructure identity. Rotate it before its notAfter date.
+  caCertPath: "/etc/vault-ca/ca.pem"
+  caCert: ""
+
+# AMD SEV-SNP verifier wiring for the KBS's self-report. The broker
+# anchors the built-in AMD ARK/ASK for `generation` and takes the VEK
+# leaf from the self-report itself (the host PSP extended-report cert
+# table) — TCB-rotation-proof, no static staging (#400). An
+# operator-mounted VEK is only a dev fallback (`mountedVekFallback`).
+snp:
+  # `turin` matches the confidential k8s node (EPYC 9255 Turin) where
+  # the KBS POD runs — its self-report is what the broker verifies.
+  # (NOT the tenant host miner-1, which is Genoa.)
+  generation: "turin"
+  # Mounted-VEK fallback. OFF: the broker uses ONLY the report-carried
+  # VEK. The previously-staged VEK was miner-1's Genoa VEK — wrong host
+  # + generation for the k8s node's Turin self-report — so it must stay
+  # off here. Set true only with a correct Turin VEK for THAT node at
+  # vekVaultPath.
+  mountedVekFallback: false
+  # AMD KDS base URL. When the host doesn't inject certs into the
+  # extended report (this node's case), the broker derives the per-chip
+  # VCEK URL from each report and fetches it here, caching by
+  # (chip_id, TCB). Empty disables the KDS fallback.
+  kdsUrl: "https://kdsintf.amd.com"
+  # Used only when mountedVekFallback is true:
+  vekSecretName: "kbs-vault-broker-vek"
+  vekVaultPath: hippius-compute/kbs/vek

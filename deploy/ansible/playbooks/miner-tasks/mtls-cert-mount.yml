@@ -1,0 +1,178 @@
+---
+# mTLS cert mount point. Tasks file imported by 06-miner-bootstrap.yml
+# play "06".
+#
+# The miner's Edge mTLS material is OPERATOR-PROVISIONED OUT-OF-BAND —
+# the operator's CA signs the miner cert and the operator `scp`s it
+# onto the box. This task does exactly three things: create the mount
+# directory, REPORT which expected files are present, and (§17.7
+# belt-and-suspenders) READ-ONLY verify `client.crt`'s SAN URI matches
+# this host. It NEVER generates a key, NEVER copies a certificate, and
+# NEVER touches the content OR metadata of an operator-provisioned
+# file — the SAN check uses `openssl x509 -noout`, which only reads
+# the cert. Those files belong entirely to the operator (the expected
+# modes are documented in `mtls.expected_files`).
+
+- name: Create the mTLS cert directory
+  ansible.builtin.file:
+    path: "{{ mtls.cert_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# ─── PERMISSIONLESS on-chain mode (default) ──────────────────────────
+# No operator client cert: the agent self-signs from its identity key
+# and the Edge admits it on the on-chain registry. The ONLY mTLS file
+# the miner needs is the Edge's PUBLIC server CA (so the agent can
+# verify the Edge it connects to) — the playbook provisions it from
+# `files/edge-ca.crt`. Onboarding is then: register the node_id
+# on-chain (`deploy/register-miner/`) + start the agent. No `scp`.
+- name: "[onchain] Install the Edge server CA cert (public — not a secret)"
+  when: miner_edge_auth | default('onchain') != 'ca'
+  ansible.builtin.copy:
+    src: edge-ca.crt
+    dest: "{{ mtls.cert_dir }}/ca.crt"
+    owner: root
+    group: root
+    mode: "0444"
+
+- name: "[onchain] Confirm the self-sign mTLS posture"
+  when: miner_edge_auth | default('onchain') != 'ca'
+  ansible.builtin.debug:
+    msg: >-
+      Permissionless on-chain auth: ca.crt installed; the agent
+      self-signs its client cert from identity.key (no operator cert).
+      Register this miner's node_id on-chain with deploy/register-miner/,
+      then the Edge (EDGE_MINER_AUTH=onchain) admits it.
+
+# ─── LEGACY operator-CA mode (`miner_edge_auth: ca`) ─────────────────
+# The operator's CA signs the miner cert + the operator `scp`s it onto
+# the box. Ansible only REPORTS presence + (§17.7) read-only verifies
+# the client.crt SAN — it never generates / copies / touches the
+# operator's cert content. Everything below is gated on `ca` mode.
+- name: "[ca] Check which expected mTLS files the operator has provisioned"
+  when: miner_edge_auth | default('onchain') == 'ca'
+  ansible.builtin.stat:
+    path: "{{ mtls.cert_dir }}/{{ item.name }}"
+  loop: "{{ mtls.expected_files }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: miner_mtls_stat
+
+- name: "[ca] Report the mTLS cert provisioning state"
+  when: miner_edge_auth | default('onchain') == 'ca'
+  ansible.builtin.debug:
+    msg: |
+      mTLS cert directory: {{ mtls.cert_dir }} (0700)
+      {% for r in miner_mtls_stat.results %}
+      - {{ r.item.name }} (mode {{ r.item.mode }}): {{ 'present' if r.stat.exists else 'MISSING' }}
+      {% endfor %}
+      The operator pushes the cert content out-of-band (with the modes
+      above), then starts the agent:
+        systemctl start {{ miner_agent.systemd_unit_name }}
+
+# ─── §17.7 SAN URI verification — belt-and-suspenders ────────────────
+# The Edge gateway's mTLS acceptor pins each miner's identity to the
+# SAN URI carried in its `client.crt`. A cert without — or with a
+# wrong — SAN URI silently fails every handshake at the Edge, which is
+# a painful failure mode to debug in production. So this play
+# fail-LOUDS at apply time: if `client.crt` is present but its SAN URI
+# does not match `hippius-miner:<inventory_hostname>` exactly, the
+# play aborts BEFORE the agent ever tries to handshake.
+#
+# Read-only by construction: `openssl x509 -noout` does not modify the
+# cert file. The "operator-provisioned content, Ansible never touches"
+# discipline is preserved — Ansible only INSPECTS.
+
+- name: "[ca] Verify the client.crt SAN URI (§17.7 — only if the cert exists)"
+  # Skip the check when the cert isn't on the box yet — the report
+  # above already flagged it as MISSING. Once the operator `scp`s it
+  # the next play run will pick it up.
+  when:
+    - miner_edge_auth | default('onchain') == 'ca'
+    - (miner_mtls_stat.results | selectattr('item.name', 'equalto', 'client.crt') | map(attribute='stat.exists') | first | default(false)) | bool
+  ansible.builtin.command:
+    cmd: "openssl x509 -in {{ mtls.cert_dir }}/client.crt -noout -ext subjectAltName"
+  register: miner_mtls_san
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "[ca] Assert client.crt carries SAN URI:hippius-miner:{{ inventory_hostname }}"
+  # The previous task is `when:`-skipped if client.crt is absent;
+  # `miner_mtls_san is not skipped` keeps this assertion off the
+  # not-yet-provisioned path too. Don't fail the play just because
+  # the operator hasn't `scp`ed the cert yet.
+  when:
+    - miner_edge_auth | default('onchain') == 'ca'
+    - miner_mtls_san is defined
+    - miner_mtls_san is not skipped
+  vars:
+    expected_san: "URI:hippius-miner:{{ inventory_hostname }}"
+    # Strict match: anchored on BOTH sides — `URI:hippius-miner:<host>`
+    # must be preceded by a SAN delimiter (start-of-string, whitespace,
+    # or comma) AND followed by one. Prevents `miner-1` from satisfying
+    # a `miner-12` host (right anchor) and a hypothetical future
+    # openssl format that nested the URI mid-token (left anchor).
+    san_regex: "(?:^|[\\s,])URI:hippius-miner:{{ inventory_hostname | regex_escape }}(?:[\\s,]|$)"
+  ansible.builtin.assert:
+    that:
+      # openssl actually parsed the cert — `rc != 0` means a malformed
+      # cert; surface that distinctly from a missing SAN.
+      - miner_mtls_san.rc == 0
+      # `is search(pattern)` returns a real bool — robust across
+      # Ansible versions that differ on `regex_search`'s no-match
+      # return value (`None` vs `""`).
+      - miner_mtls_san.stdout is search(san_regex)
+    fail_msg: |
+      client.crt at {{ mtls.cert_dir }}/client.crt FAILED the §17.7
+      SAN check.
+
+      Expected SAN URI : {{ expected_san }}
+      openssl rc       : {{ miner_mtls_san.rc }}
+      openssl stdout   : {{ miner_mtls_san.stdout | default('<empty>') }}
+      openssl stderr   : {{ miner_mtls_san.stderr | default('<empty>') }}
+
+      The Edge gateway pins this exact SAN URI; a cert without it
+      silently fails every handshake. Re-mint the cert with the §17.7
+      openssl recipe and re-`scp` it onto the host.
+    success_msg: "client.crt SAN OK: {{ expected_san }}"
+
+# ── KBS serving CA ───────────────────────────────────────────────────
+#
+# Distinct from the Edge CA above, and easy to conflate: this one is what
+# the agent trusts when it dials the KBS to relay a guest's §21 release.
+# The KBS is an internal service on the mesh, so it serves a private
+# certificate by default.
+#
+# Skipped when `miner_kbs_ca_cert_file` is empty — the case where your KBS
+# has a publicly-trusted certificate. Skipped is a real answer here, not a
+# silent hole: the template omits `[kbs].ca_cert` too, so the agent falls
+# back to the webpki roots, which is exactly right for a public cert.
+
+- name: Copy the KBS serving CA onto the miner
+  ansible.builtin.copy:
+    src: "{{ miner_kbs_ca_cert_src | expanduser }}"
+    dest: "{{ miner_kbs_ca_cert_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: miner_kbs_ca_cert_file | default('') | length > 0
+
+- name: Refuse a KBS CA that is not a certificate
+  ansible.builtin.command:
+    cmd: "openssl x509 -in {{ miner_kbs_ca_cert_file }} -noout -subject"
+  register: miner_kbs_ca_subject
+  changed_when: false
+  failed_when: miner_kbs_ca_subject.rc != 0
+  when: miner_kbs_ca_cert_file | default('') | length > 0
+
+# Why this assert exists: a wrong or truncated CA does not fail here, it
+# fails hours later as `refused kbs-transport` on the vsock relay, with a
+# guest that boots, burns a core and never unlocks. Nothing in that symptom
+# points at a certificate, so the check belongs where the file is placed.
+- name: Report the KBS CA the agent will trust
+  ansible.builtin.debug:
+    msg: "KBS CA installed: {{ miner_kbs_ca_subject.stdout | default('(skipped — public cert)') }}"
+  when: miner_kbs_ca_cert_file | default('') | length > 0

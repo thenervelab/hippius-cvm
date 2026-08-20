@@ -1,0 +1,16 @@
+# `addons/cert-manager` — wrapper chart for cert-manager.
+#
+# Umbrella chart: pins the upstream `cert-manager` chart as a dependency
+# and adds this cluster's ACME issuer (Let's Encrypt STAGING) as a local
+# template. Argo CD renders it (`helm dependency build` from Chart.lock)
+# and reconciles it.
+apiVersion: v2
+name: hippius-cert-manager
+description: cert-manager (ACME / Let's Encrypt) for hippius-compute.
+type: application
+version: 0.1.0
+dependencies:
+  - name: cert-manager
+    # Pinned EXACTLY. Bump deliberately.
+    version: v1.20.2
+    repository: https://charts.jetstack.io

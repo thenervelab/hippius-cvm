@@ -1,0 +1,659 @@
+# Values for the `kbs` chart. PR-K6, §K (#54).
+
+image:
+  repository: ghcr.io/thenervelab/hippius-kbs-server
+  # SHA-256 digest — NOT a tag (§F supply-chain discipline: the
+  # deployed image is content-addressed). Produced by the
+  # `kbs-image.yml` workflow; see README.md "Image".
+  #
+  # Bumped to the f8c570c main build (#581): the §7 TCB anti-rollback
+  # check now keys off the ACTUAL RUNNING tcb (current_tcb >= launch_tcb
+  # AND committed_tcb >= launch_tcb), NOT the host-settable reported_tcb.
+  # miner-3's Turin firmware (API 1.55) reports reported_tcb.microcode=0
+  # while current_tcb == launch_tcb == 0x47 (a NON-rolled-back platform),
+  # so the prior build false-denied it "policy: TCB rollback". This is
+  # the 4th and final Turin attestation gate — completes the §25
+  # dest-activation KEK release on miner-3. VERIFIER-ONLY change.
+  # Carries #579 (VCEK keyed by whichever TCB signs), #573 (report-sig
+  # over RAW WIRE BYTES), #571 (v3/v4 version gate), Flavor xlarge+,
+  # two-phase boot counter, MultiGenChainVerifier #541.
+  # f54902e (RA-L-NEW-2 shared admin boot-counter handle + RA-KBS-VL4
+  # classifier drops `.internal`). Carries df39f22 (RA-KBS-M1) broker
+  # TLS + CA-pin, #581 anti-rollback, #579 VCEK, #573 raw-wire sig,
+  # #571 v3/v4 gate, two-phase boot counter, xlarge+, MultiGenChainVerifier.
+  # ⚠️  SUPERSEDED / INACCURATE — the next line's attribution is wrong. The
+  # digest below was signed 2026-08-10 by a `refs/pull/897/merge` build, not
+  # by b62d6db. Trust `provenance:` below it, which is machine-checked
+  # against the digest's Sigstore signature; this narrative block is kept
+  # only for the deployment-hazard history it records.
+  # b62d6db (2026-07-16) — what the cluster ACTUALLY runs. The pin had
+  # drifted 3 weeks behind an out-of-band deploy, and that stale binary
+  # (f54902e) predates the KEK-HSM series: it has no `require_wrapped_kek`
+  # field, and `Config` is `deny_unknown_fields`, so a sync that reverted
+  # the image while rendering that key would have failed config parse and
+  # crashlooped the KBS — with `strategy: Recreate` deleting the old pod
+  # first, i.e. a hard outage of the component that releases every tenant
+  # disk key. Keep this pin honest: it is the contract, not a comment.
+  digest: "sha256:3304358b335f157630c48a132742892cf53433a61a34215e38d1e42cc65e4f9d"
+  # ── Build provenance of the digest above (P3) ───────────────────────
+  # MACHINE-CHECKED, not a comment. `.github/scripts/verify_image_
+  # provenance.py` runs `cosign verify` with these exact values as
+  # `--certificate-identity` / `--certificate-github-workflow-sha`
+  # constraints, so a declaration that does not match the digest's
+  # Sigstore signature fails CI, and a digest bump without a matching
+  # declaration fails CI. The offline half of the policy runs in the
+  # required `rust` job (scripts/dev/image-provenance-test.sh).
+  #
+  # This exists because the free-text pin comments above were WRONG: they
+  # named `b62d6db (2026-07-16)` while the digest was in fact signed on
+  # 2026-08-10 by a pre-merge PR build. The SNP measurement cannot tell
+  # you which binary is in the CVM (see README.md "What the KBS
+  # measurement does not cover"); this at least makes the claim about it
+  # checkable.
+  #
+  # Purely declarative: no template reads `image.provenance`, so it
+  # cannot change what the pod renders to.
+  provenance:
+    # Fulcio SAN on the signature — workflow AND the git ref it ran on.
+    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/kbs-image.yml@refs/heads/main"
+    # `githubWorkflowSha` on the signing cert — the exact source commit.
+    commitSha: "d15b850aae931ff21e7ac696e6af286e3d7c46c1"
+    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/31686939409/attempts/1"
+    # false ⇒ built from a ref other than refs/heads/main, i.e. from a
+    # tree that is NOT in this repo's history.
+    mergedSource: true
+  # The image is PUBLIC: the kata-qemu-snp guest pulls it itself (CoCo
+  # guest-pull) and cannot use an imagePullSecret. The image carries no
+  # secrets — see README.md "Image". No pull secret.
+
+# The KBS is single-replica: `kbs-core`'s `FileAuditSink` holds an
+# exclusive lock and the allowlist high-water-mark assumes one process
+# (§D #101). A PodDisruptionBudget still accompanies it (#1
+# anti-pattern 6).
+replicaCount: 1
+
+# Public Ingress exposing `kbs.hippius.network` for tenant guests in
+# initramfs (pre-NetBird). Off ⇒ the chart renders no Ingress and the
+# CiliumNetworkPolicy ingress allowlist still permits the
+# ingress-nginx ns, just unused. See templates/ingress.yaml header for
+# the architecture rationale (security control = SNP attestation +
+# §22 + L1 sig, NOT the network ACL).
+publicIngress:
+  enabled: true
+  ingressClassName: nginx
+  hostname: kbs.hippius.network
+  # ClusterIssuer name used for the TLS cert. Provisioned out-of-band
+  # against the operator's Cloudflare account; see runbook for the
+  # bootstrap (DNS-01 + Cloudflare API token Secret in cert-manager
+  # namespace).
+  clusterIssuer: letsencrypt-prod-cloudflare
+
+# Generous head-room for the SNP attestation + HPKE work on the
+# release path; the kata-qemu-snp RuntimeClass adds its own pod
+# overhead on top (PR-K5).
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+vault:
+  # ⚠️  OPERATOR-SET. The Vault this KBS reads release secrets from,
+  # consumed by the binary's `[vault]` config (KV reads on the release
+  # path) — see README "MVP scope".
+  #
+  # The placeholder below uses the RFC 2606 `.invalid` TLD so it cannot
+  # resolve: an unfilled value fails loudly instead of pointing at
+  # something real. NOTE the prod-marker guard described under
+  # `devAllowAnyKbsMeasurement`: the binary refuses to start with a dev
+  # bypass enabled when this address contains `tier0` / `prod` /
+  # `hippius.network`.
+  address: "https://vault.example.invalid:8200"
+  # ⚠️  OPERATOR-SET. CIDR + port the CiliumNetworkPolicy opens toward
+  # Vault (templates/networkpolicy.yaml). Must cover whatever
+  # `vault.address` resolves to. Empty ⇒ no explicit egress rule, which
+  # only works if Vault is reachable through the policy's `world:443`
+  # rule. The placeholder is RFC 5737 TEST-NET-1 and routes nowhere.
+  egressCidr: "192.0.2.0/32"
+  egressPort: "8200"
+  kvMount: secret
+  # KV-v2 path holding the KBS `vault-token` + `signing-key`.
+  # Operator-provisioned — see README.md.
+  kbsSecretPath: hippius-compute/kbs
+  refreshInterval: 1h
+  # ⚠️  DEV-ONLY: bypass the KBS-side measurement/TCB/launch-policy
+  # gates in the Vault auth seam so the placeholder all-zero
+  # `VerifiedReport` from `attest::placeholder_verified_report()`
+  # passes. Lets dev work (#138 attestation persistence wire-up,
+  # cloud-init validation, NetBird mesh smoke) exercise the full
+  # release chain while EPIC #102 (production SNP-attestation-bound
+  # Vault broker) is being built.
+  #
+  # Default `false` — must stay `false` in any production-marked
+  # environment. The binary refuses to start with this flag set if
+  # `vault.address` contains a prod marker substring (`tier0`,
+  # `prod`, `hippius.network`) — see binaries/kbs-server/src/config.rs.
+  #
+  # Boot log: when enabled, kbs-server emits a loud
+  # `⚠️  DEV-MODE: vault.dev_allow_any_kbs_measurement=true` line to
+  # stderr (captured by `kubectl logs`).
+  #
+  # OFF since the #102 flip — `brokerUrl` below is the measurement
+  # gate now, and the binary refuses the combination anyway.
+  devAllowAnyKbsMeasurement: false
+  # ⚠️  DEV-ONLY: skip TLS server-cert verification on the static-token
+  # Vault KV client. Lets the binary talk to a Vault presenting a
+  # private / self-signed server certificate without baking its CA
+  # bundle into the image. Same prod-marker
+  # guard as `devAllowAnyKbsMeasurement` — refused at startup if
+  # `vault.address` contains `tier0` / `prod` / `hippius.network`.
+  # Boot stderr: `⚠️  DEV-MODE: vault.dev_skip_tls_verify=true`.
+  #
+  # Default `false`. The production replacement is a Vault CA bundle
+  # mounted into the pod + rustls RootCertStore extension; the
+  # SNP-attestation-bound broker (#102) supersedes the static-token
+  # path entirely.
+  devSkipTlsVerify: false
+  # PROD Vault TLS: pin the Vault server cert to this CA instead of the
+  # dev skip. Mutually exclusive with devSkipTlsVerify (which is off).
+  #
+  # ⚠️  OPERATOR-SET. Paste the PEM of the CA that signed YOUR Vault
+  # server certificate as a literal block:
+  #
+  #   caCert: |
+  #     -----BEGIN CERTIFICATE-----
+  #     ...
+  #     -----END CERTIFICATE-----
+  #
+  # It is rendered into the `kbs-vault-ca` ConfigMap and mounted at
+  # `caCertPath`. Empty ⇒ no ConfigMap is rendered and the binary falls
+  # back to the system trust store — correct only if your Vault presents
+  # a publicly-trusted certificate. A CA certificate is PUBLIC, not a
+  # secret; it is absent here because it is infrastructure identity.
+  # Certificates expire: re-check and rotate this value before the
+  # notAfter date, or every release fails closed.
+  caCertPath: "/etc/vault-ca/ca.pem"
+  caCert: ""
+  # §8 / #102 — base URL of the SNP-attestation-bound Vault broker.
+  # Empty = the dev static seam stays wired (ChallengeVaultAuth +
+  # devAllowAnyKbsMeasurement above). When non-empty the KBS
+  # authenticates to the broker for EVERY release — fresh
+  # `/dev/sev-guest` self-report binding `challenge_nonce ‖
+  # auth_pubkey` — and the binary REFUSES to start with
+  # `devAllowAnyKbsMeasurement: true` (the broker IS the measurement
+  # gate; see binaries/kbs-server/src/config.rs).
+  #
+  # NOT a `.svc` name: kata pods resolve only public DNS and cannot
+  # reach VIPs (ClusterIP/LB/hostPort all fail from the guest —
+  # verified live 2026-06-10). The address is the node's `cilium_host`
+  # IP, served by the broker chart's host-network socat relay
+  # (deploy/gitops/apps/kbs-vault-broker/templates/relay.yaml). The
+  # CNP egress rule for it is `toEntities: host` on this port.
+  #
+  # RA-KBS-M1: https — the broker serves TLS and the KBS pins its exact
+  # leaf (brokerCaPath below). The relay is a raw TCP passthrough, so
+  # the TLS handshake rides through it end-to-end KBS↔broker-pod; the
+  # exact-leaf match ignores the IP-vs-SAN mismatch by design.
+  # REPLACE. This is YOUR cluster's `cilium_host` IP on the node the
+  # broker relay runs on — read it from that node rather than guessing.
+  # The KBS reaches the broker over the cluster host network, so the
+  # address is deployment-specific and there is no sensible default.
+  brokerUrl: "https://<BROKER_RELAY_HOST_IP>:8100"
+  # RA-KBS-M1 — pin the broker's server cert (byte-exact leaf match).
+  # Mounted from the `broker-ca` Secret (external-secret-broker-ca.yaml),
+  # sourced from the same Vault path as the broker's own cert. Unset ⇒
+  # the KBS dials the broker over plaintext HTTP (pre-RA-KBS-M1).
+  brokerCaPath: "/etc/kbs-server/broker-ca/ca.crt"
+  # Vault KV-v2 path the broker-ca ExternalSecret reads `tls.crt` from
+  # (single source shared with the broker chart; keep in lockstep).
+  brokerTlsVaultPath: hippius-compute/kbs-vault-broker/tls
+
+# `hippius-kbs-server` config (rendered into the kbs-config ConfigMap).
+config:
+  # HTTP transport bind port (/healthz, /readyz, /v1/kbs/*).
+  listenPort: 8000
+  # KBS-nonce time-to-live, seconds.
+  nonceTtlSecs: 300
+  # §22 allowlist-root Ed25519 public key, 32-byte hex. The KBS accepts
+  # an allowlist artifact COSE_Sign1-signed by this key (the §22 signing
+  # authority). The matching seed is held by vali (the trusted control
+  # plane) in Vault at `secret/hippius-compute/vali/allowlist-root` and
+  # used by the auto-pin — NOT committed.
+  #
+  # PRODUCTION root (rotation COMPLETE 2026-06-30, #587 Phase 1A): the dev
+  # root `e6fec6b2…` was rotated out via the kbs-core multi-root primitive
+  # (#589) — the live allowlist (epoch 2600000003+) is signed by THIS prod
+  # key, cryptographically verified, and granted a real KEK release live.
+  allowlistRootPubkeyHex: "2aa26ac4c71b04a2b73162e4a7a2bb2d01ddd5037d38465255929d5a4c9058b0"
+  # OPTIONAL second accepted allowlist-root pubkey — the §22 KEY-ROTATION
+  # knob (kbs-core multi-root). Set to the INCOMING root during a rotation
+  # so the KBS accepts an artifact signed by the primary above OR this one
+  # (no atomic flag-day). Empty ⇒ single-root steady state (current).
+  allowlistRootPubkeyHexNext: ""
+  # KBS response-signing `kid` — the ASCII bytes of
+  # "kbs-cc-1-response-v1", hex-encoded.
+  #
+  # ⚠️  DO NOT edit this value here alone. It is PINNED in three other
+  # places that must change atomically with it:
+  #   - `binaries/agent-initramfs/src/trust_anchors.rs`
+  #     (`PINNED_KBS_RESPONSE_KID` / `EXPECTED_KID_HEX`) — compiled into
+  #     every tenant guest initramfs, so a change here without a re-bake
+  #     makes every already-booted guest reject the KBS's responses;
+  #   - `test_vectors/allowlist/dev-manifest.toml`
+  #     (`accepted_kbs_response_kids_hex`);
+  #   - `test_vectors/allowlist/REGENERATE.md`.
+  #
+  # The string still carries a legacy node nickname. Neutralising it is a
+  # cross-component rename + guest re-bake, not a values-file edit; it is
+  # deliberately NOT done as part of the deploy/ scrub.
+  kidHex: "6b62732d63632d312d726573706f6e73652d7631"
+  # KBS channel / TLS-exporter public key, 32-byte hex.
+  # TODO: replace with the real channel key when the SNP-attested
+  # Vault broker (#102) wires the release path; inert until then.
+  authPubkeyHex: "24e6a730dc24e1bfba1e6d21d943924d3ab6f311ea0f2e0b3e585458393bc803"
+  # SNP launch-policy floor. The KBS checks the SNP report's `policy`
+  # field two ways:
+  #   1. `report.policy & required_bits == required_bits`  → required set
+  #   2. `report.policy & ~(required | allowed_mask) == 0` → no extras
+  # See `kbs-core/src/snp.rs::check_attestation`.
+  #
+  # Per the AMD SEV-SNP ABI 1.55 §4.3 (GuestPolicy structure):
+  #   - bit 17 is RESERVED-MUST-BE-1 on every SNP launch
+  #   - bit 16 = SMT_ALLOWED (QEMU sets it for SNP guests by default)
+  #   - bits 0..15 = ABI_MINOR / ABI_MAJOR floor the firmware enforces
+  #   - bit 18 = MigrateMA, bit 19 = Debug, bit 20 = SingleSocket
+  # QEMU 10.1 on miner-1 emits `policy = 0x30000` (bits 16 + 17 set,
+  # i.e. SMT_ALLOWED + reserved-must-be-1, ABI bits zero) — observed
+  # live 2026-05-26 via the debug-initrd KBS-denial body capture.
+  #
+  # SECURITY PROFILE (untrusted-miner threat model): the guest POLICY is
+  # set at launch by the (100% untrusted) miner/host and is NOT part of
+  # the measurement, so the KBS launch-policy gate is the ONLY thing that
+  # stops a malicious miner from launching the tenant CVM with dangerous
+  # policy bits and then reading guest RAM. We therefore FORBID:
+  #   - bit 19 = Debug: if set, the hypervisor may SNP_DBG_DECRYPT the
+  #     guest's encrypted RAM (incl. the released LUKS KEK + all tenant
+  #     plaintext). MUST be off — this is the core RAM-confidentiality
+  #     guarantee. A debug-enabled guest is DENIED the KEK.
+  #   - bit 18 = MigrateMA: associates a migration agent that could
+  #     extract guest state. Hippius §25 migration is COLD (encrypted-disk
+  #     move + reboot, no live MA), so MigrateMA is never legitimately set
+  #     and is forbidden.
+  # §22 CEREMONY (2026-06-30) — tightened from "forbid Debug+MigrateMA" to a
+  # full POSITIVE allowlist. The miner-agent launcher hard-codes ONE guest
+  # policy for EVERY CVM on EVERY generation:
+  #   `binaries/miner-agent/src/lifecycle/qemu_config.rs:43`
+  #   `const SEV_SNP_POLICY: &str = "0x30000"`  (bit 16 SMT_ALLOWED +
+  #   bit 17 reserved-must-be-1), passed verbatim into the libvirt
+  #   <policy> → SNP_LAUNCH_START, so report.policy == 0x30000 exactly on
+  #   both Turin and Genoa (live-observed 0x30000 on miner-1 Genoa
+  #   2026-05-26 + miner-3 Turin / miner-1 Genoa grants 2026-06-30).
+  # So the ONLY non-required bit a legitimate guest sets is bit 16 (SMT).
+  # We therefore allow EXACTLY bit 16 and require bit 17 → required|allowed
+  # = 0x30000 = the launcher policy. ANY other bit — Debug(19),
+  # MigrateMA(18), SingleSocket(20), the ABI-version bits, AND every
+  # currently-undefined bit 21..63 — now fails `report.policy &
+  # ~(required|allowed) != 0 → deny`. Re-verified granted=true on BOTH
+  # Turin (miner-3) and Genoa (miner-1) after this tightening.
+  #
+  # SMT is ALLOWED (not required) so a future SMT-off transition (clearing
+  # bit 16 in the launcher to kill cross-thread side-channels — an infra
+  # change: the miner hosts must disable SMT, else the firmware refuses to
+  # launch) needs no change to THIS gate: a 0x20000 (SMT-off) guest also
+  # clears `& ~0x30000 == 0`.
+  launchPolicy:
+    # min_tcb stays 0: `report.tcb` packs the HOST-SETTABLE `reported_tcb`
+    # (snp_real.rs:387), which Turin firmware reports with microcode=0, so
+    # a non-zero floor would false-deny Turin (same anti-pattern #581 fixed
+    # for rollback). A meaningful absolute floor would need a code change to
+    # key off `current_tcb`, but Turin's current_tcb is bl=0/tee=0 (packs
+    # ~0x147) so even that floor is near-zero — and #581's anti-rollback
+    # (current_tcb/committed_tcb >= launch_tcb) already covers the real
+    # downgrade threat. Left 0 deliberately.
+    minTcb: 0
+    # 0x20000 = bit 17 (SEV-SNP ABI 1.55 §4.3 reserved-must-be-1) — required.
+    requiredBits: "131072"
+    # 0x10000 = bit 16 (SMT_ALLOWED) — the ONLY non-required bit the
+    # launcher's 0x30000 policy sets. = 65536. Positive allowlist: with
+    # required_bits 0x20000, required|allowed = 0x30000 exactly; every
+    # other policy bit (incl. Debug 19 / MigrateMA 18 / SingleSocket 20 /
+    # all undefined 21..63) fails closed. Both values quoted-string so the
+    # YAML→Helm→TOML pipeline preserves the exact integer (Helm's float64
+    # round-trip would otherwise mangle them).
+    #
+    # ⚠️ Do NOT widen this without a security review + a re-verify on both
+    # generations — adding bit 18/19 re-opens the untrusted-miner RAM-read
+    # hole; adding undefined bits weakens the positive allowlist.
+    allowedMask: "65536"
+
+  # §322 Phase B — on-chain bindings for the live-attestation flow.
+  # Pin the compute-pallet identity the KBS copies into every signed
+  # body. Both values are 32-byte hex strings. The pallet enforces
+  # `view.chain_genesis == T::ComputeChainGenesis::get()` and
+  # `view.pallet_instance == T::ComputePalletInstance::get()`; a wrong
+  # value silently produces attestations the pallet rejects on
+  # submit_live_attestation. Bumped in lockstep with the substrate
+  # runtime's pinned constants — never edit blindly.
+  liveAttestation:
+    # Pre-mainnet placeholder — matches the mock-runtime sentinel in
+    # `pallets/compute-scoring/src/mock.rs::ComputeChainGenesis`.
+    computeChainGenesisHex: "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    # Pre-mainnet placeholder — matches the mock-runtime sentinel in
+    # `pallets/compute-scoring/src/mock.rs::ComputePalletInstance`.
+    computePalletInstanceHex: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+    # §322 PR 3b.1 — directory the KBS writes per-keepalive signed
+    # bodies into so the vali batcher (#327) can pick them up + ship
+    # on chain. EMPTY = the sink is disabled (NullLiveAttestationSink
+    # wired) — keepalive responses still flow to the caller but
+    # nothing is archived for vali. PVC required if you set this;
+    # operators bootstrap a sibling volume (alongside audit /
+    # evidence) before flipping the switch.
+    sinkDir: ""
+
+  # §KEK-HSM — refuse to release a KEK that is not Vault-Transit wrapped
+  # (`vault:v1:…`). The Rust field is `#[serde(default)]` = FALSE, so this
+  # MUST be rendered explicitly: the cluster previously carried a
+  # hand-edited `true` that any helm upgrade / argocd re-sync would have
+  # silently dropped, re-opening plaintext KEKs at rest.
+  requireWrappedKek: true
+
+  # ⚠️  DEPLOYMENT-SAFETY FUSE — suppressed-confirm anti-rollback bound
+  # (`kbs_core::volume_stamp::MAX_UNCONFIRMED_RELEASES`). The Rust field
+  # is `#[serde(default)]` = absent ⇒ the binary's compiled default is
+  # `3` and ARMED — the SAME fail-closed-by-default precedent as
+  # `admin.requireMtls` below. That default is UNSAFE to ship against
+  # THIS fleet right now: the gate is unconditional per VM, and a
+  # LEGACY VM — any guest whose initramfs predates the
+  # `/v1/kbs/volume-stamp/confirm` route — can NEVER confirm. Arming
+  # the gate before every golden image has been re-baked to send
+  # confirms would refuse each legacy VM (incl. `realtenant-ubuntu-1`
+  # on miner-3) after `bound` releases — a boot, a §25 migration, and a
+  # reboot-recovery relaunch each count as one. The admin reset buys
+  # exactly `bound` more releases before it trips again; it is not a
+  # fix.
+  #
+  # `0` is the ONE way to DISABLE the gate entirely (no VM is EVER
+  # refused for unconfirmed releases) — rendered EXPLICITLY here, same
+  # discipline as `requireWrappedKek` above: a config that says nothing
+  # would arm at the compiled default, and an omitted key is exactly
+  # the failure mode a re-sync could silently reintroduce.
+  #
+  # CUTOVER (do these in order, they are not independent):
+  #   1. deploy this KBS build with maxUnconfirmedReleases: 0 (here);
+  #   2. re-bake + re-bless every golden image against it — the guest
+  #      side of the confirm landed in #897 (2026-08-10), so a golden
+  #      base baked before that has no `hippius_golden_confirm_stamp`
+  #      at all and can never advance its expectation. The confirm is
+  #      deliberately non-fatal, so such an image boots fine and fails
+  #      SILENT: step 3 is the only thing that sees it;
+  #   3. issue the admin PKI (`admin.requireMtls: true` below — the
+  #      read route in step 3b refuses on a plaintext listener), then
+  #      verify confirms are arriving fleet-wide:
+  #
+  #        curl --cert operator.crt --key operator.key --cacert ca.crt \
+  #             "https://<kbs-admin>:8001/v1/admin/volume-stamp?bound=3"
+  #
+  #      Arm only when `ready_to_arm: true`. The two ways it is false
+  #      are DIFFERENT problems: `never_confirmed > 0` = those VMs'
+  #      guests have never once landed a confirm (usually a pre-#897
+  #      golden base — go back to step 2); `would_refuse_now > 0` =
+  #      arming refuses those VMs' very NEXT release, i.e. an immediate
+  #      self-inflicted outage. `?bound=` is the value you intend to
+  #      arm at, NOT the live one — while the gate is disabled there is
+  #      no live bound and the answer would be unconditionally green.
+  #      The route is READ-ONLY (it cannot clear a suppression streak;
+  #      that stays the audited reset-volume-stamp-suppression write);
+  #   4. THEN raise this value (or remove the key) to arm the gate.
+  #      Removing the key arms at the compiled default 3, which is what
+  #      `?bound=3` above models.
+  # Until step 4, the anti-rollback gate this whole KEK-guest-keyed-
+  # overlay design exists for is bypassable by confirm suppression —
+  # accepted, documented, and NOT a silent gap.
+  #
+  # NOTE the store this reports on is the `state` emptyDir: a KBS
+  # restart (survivable since #889/#890, proven live 2026-08-13) wipes
+  # every row, so a post-restart report reads an empty fleet and is
+  # vacuously `ready_to_arm: true` with `vms: 0`. Check `vms` against
+  # the number of live VMs before believing a green verdict.
+  # ARMED 2026-08-13 at the compiled default bound. Every step of the
+  # cutover above was completed and evidenced first:
+  #   1. this KBS build deployed;
+  #   2. ALL FOUR blessed golden images re-baked post-#897 and re-blessed
+  #      (ubuntu / debian / cs10 / fedora);
+  #   3. the admin PKI issued and the read route queried with a real
+  #      client identity — `?bound=3` returned, non-vacuously:
+  #        vms=4  never_confirmed=0  would_refuse_now=0  ready_to_arm=true
+  #      with all four distros showing confirmed=1, has_ever_confirmed=true.
+  #      `vms` was checked against the live VM count, because a
+  #      post-restart read is vacuously green with vms=0.
+  #
+  # Reversible: set back to 0 and restart to disable the gate entirely.
+  maxUnconfirmedReleases: 3
+
+  # §280 evidence sink — where the KBS archives one signed evidence bundle
+  # per GRANTED release (attested measurement + SNP report + VCEK chain +
+  # boot counter). Empty ⇒ NullEvidenceSink: every bundle is discarded, the
+  # admin evidence endpoint 404s for every VM, and vali's attestation
+  # endpoint can only answer "unknown" — which is what shipped, so tenants
+  # had no way to obtain proof their VM was attested.
+  #
+  # NOTE this is an emptyDir (pod lifetime), matching state/audit: bundles
+  # do NOT survive a KBS restart, so a VM that attested before the last
+  # restart still reads as unknown until it releases again. Point it at a
+  # PVC for durable proof.
+  evidenceDir: "/var/lib/kbs/evidence"
+
+# §22 signed allowlist artifact — fetched by an init container at pod
+# start. Trust is established ENTIRELY by the KBS binary's COSE_Sign1
+# EdDSA verify against `config.allowlistRootPubkeyHex` + the durable
+# monotonic-epoch HWM (rejects rollback) — enforced identically at
+# startup and at the admin reload. There is intentionally NO `sha256`
+# pin here: it was redundant with the signature + epoch and forced a
+# manual gitops bump after every §22 auto-pin (or the pod crashlooped).
+# The auto-pin may now rewrite the S3 object freely; any restart
+# re-fetches the latest signed, higher-epoch artifact. (#587 Phase 1A.)
+# Set `url: ""` to disable the init container and fall back to the
+# binary's deny-closed "no allowlist installed" path.
+allowlist:
+  # HTTPS URL the init container `curl`s the artifact from. Public; the
+  # COSE_Sign1 signature against `config.allowlistRootPubkeyHex` is what
+  # establishes trust, not the URL.
+  url: "https://s3.hippius.com/hippius-compute-images/allowlist/v1/dev.cose"
+  # `curlimages/curl` init-container image (the only image OTHER than
+  # the KBS binary in this chart). Pinned by digest, NOT by tag — the
+  # KBS image is digest-pinned for §F supply-chain discipline, and so
+  # is this. Resolved against the operator's mirror in production.
+  fetcherImage:
+    repository: "curlimages/curl"
+    # docker.io/curlimages/curl:8.10.1 (linux/amd64) — looked up
+    # against the Docker Hub manifest list.
+    digest: "sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b"
+
+# L1 OrderTicket-signing keyring — rendered into the KBS binary's
+# `[[l1_keys]]` config table by `templates/configmap-kbs.yaml`. An
+# empty list is permitted: with no keys, every OrderTicket fails
+# Ed25519 signature verification on the release path (fail-closed).
+#
+# The pubkey listed here MUST match a `kid` referenced under
+# `accepted_l1_kids_hex` in the §22 allowlist artifact this KBS pulls
+# (`allowlist.url` above) — the allowlist gates kid → measurement
+# acceptance, the keyring gates kid → pubkey resolution. Both gates
+# must clear for a release.
+#
+# The keyring is a LIST so dev + prod kids could be accepted concurrently
+# during the zero-downtime cutover. #587 Phase 1A rotated the L1 signing
+# key from the committed dev seed to a PRODUCTION Ed25519 seed held in
+# Vault (`secret/hippius-compute/vali/l1-order-ticket`). The cutover is
+# COMPLETE + live-verified (a prod-kid ticket minted from the Vault seed
+# granted=true), so the committed dev kid is now removed — only the prod
+# kid `l1-order-ticket-v1` is trusted. Every new ticket is signed under
+# it; the auto-pin pins it in each measurement's `accepted_l1_kids`.
+l1Keys:
+  - kidHex: "6c312d6f726465722d7469636b65742d7631"  # "l1-order-ticket-v1" (PROD)
+    pubkeyHex: "4f8a1eb8a7d193dd6d4d49a21f27404934baa935d07603c272fef98ec45438b9"
+
+# AMD SEV-SNP attestation chain wiring. Absent ⇒ the binary wires the
+# deny-closed `UnconfiguredChainVerifier`; present + a readable VEK file
+# at `vekPemPath` ⇒ the binary anchors `SevChainVerifier` against the
+# built-in AMD ARK matching `snp.generation`. The per-CHIP_ID VEK fetch
+# from AMD KDS is the §17 follow-up — until then the operator stages
+# the VEK PEM in Vault (under `vault.kbsSecretPath/vek`, property
+# `pem`) and ESO materialises the `kbs-server-vek` Secret via the
+# `external-secret-vek.yaml` template the chart renders iff `enabled`.
+snp:
+  # Enabled — the KBS's release path now performs real AMD SEV-SNP
+  # chain verification against the operator-staged VEK below. The
+  # static-token Vault MVP downstream still fails the release closed
+  # (broker = #102), but the SNP gate itself is now production-shape.
+  enabled: true
+  # `generation` is the STATIC-VEK fallback anchor (a report carrying no
+  # VCEK in its cert table — the Genoa miner-1 path with the operator-
+  # mounted vek.pem). `genoa` matches miner-1 (EPYC 9254); `milan` for
+  # 3rd-gen EPYC. Multi-generation (Milan/Genoa/TURIN) is now handled
+  # PER-REPORT by the MultiGenChainVerifier (#541): it identifies each
+  # report's generation from its CPUID/chip_id, anchors to the matching
+  # built-in AMD ARK, and resolves the VCEK from AMD KDS (kdsUrl below).
+  # So Turin miners (EPYC 9255, miner-2/3) attest without changing this.
+  generation: "genoa"
+  # AMD KDS base URL for per-CHIP_ID VCEK fetch — REQUIRED for Turin
+  # (Turin guest reports do NOT embed their cert chain). The KBS already
+  # has world:443 egress (networkpolicy.yaml). Empty ⇒ KDS fetch off
+  # (only the static-VEK Genoa/Milan path works).
+  kdsUrl: "https://kdsintf.amd.com"
+  # Secret name ESO materialises from Vault. The Helm template's
+  # `required` guard fails the render if `enabled: true` while this is
+  # empty. Mounted into the pod at `/etc/kbs-vek/vek.pem`.
+  vekSecretName: "kbs-server-vek"
+  # Optional Vault KV-v2 path override. Default is
+  # `${vault.kbsSecretPath}/vek`. The property MUST be named `pem` and
+  # hold the AMD-signed VEK PEM bytes. Operator-provisioned — see
+  # README.md "Operator setup".
+  # vekVaultPath: hippius-compute/kbs/vek
+
+# Admin endpoint — `POST /v1/admin/vm/{vm_id}/register-vm`. Closes
+# the §24 lifecycle pre-registration gap: vali submits the signed
+# OrderTicket here BEFORE dispatching to the miner-agent, so the
+# downstream release path's `vm_states.get` check has a `VmState::
+# Active` to match. The KBS derives ALL lifecycle fields from the
+# verified ticket (not from anything vali sends in the URL or body
+# wrapper), so a compromised vali pod without a valid L1-signed
+# ticket cannot poison the store.
+#
+# Listener: a SEPARATE port from the public release transport — the
+# public Ingress on `:8000` never forwards admin traffic. Access is
+# gated by a CiliumNetworkPolicy rule (vali pod only); a dedicated
+# `kbs-server-admin` ClusterIP Service exposes the port. On top of
+# that the listener authenticates its callers with mTLS against a
+# PINNED client CA (`mtls` below) — two independent controls, one of
+# them cryptographic. A network policy alone is a single label match:
+# any in-cluster compromise, or a pod that spoofs the vali label, would
+# otherwise reach an API with no authentication whatsoever.
+#
+# `enabled: false` ⇒ no admin port bound, no Service rendered, no
+# CNP rule rendered. Every release will then fail closed at the
+# vm-states gate. Leave `enabled: true` once vali integration lands.
+admin:
+  enabled: true
+  # Container port the kbs-server binary binds for the admin
+  # listener. The Service and CNP use the same value.
+  listenPort: 8001
+  # Idempotency-store TTL, seconds. A successful register stays
+  # cached for this long; a retry within the window with the same
+  # ticket bytes returns the cached 200, a retry with a DIFFERENT
+  # body for the same ticket_id returns 409 (state drift). 24 h is
+  # plenty for the vali launch retry window.
+  idempotencyTtlSecs: 86400
+  # Per-process rate limit. Admin runs at vali-launch QPS — very
+  # low. Defaults are a safety floor, not a throttle.
+  ratePerSec: 10
+  burst: 20
+
+  # ── mTLS on the admin listener ─────────────────────────────────────
+  # The binary's own default is `require_mtls = true` (fail closed): a
+  # config that says nothing about TLS gets NO admin listener at all.
+  #
+  # ⚠️ STILL `false` HERE — the admin PKI has not been issued for the
+  # live fleet. Serving the listener in plaintext is a KNOWN, LOGGED
+  # weakness, not an accident: the process prints an "UNAUTHENTICATED"
+  # warning at every start naming the listen address.
+  #
+  # ⚠️ READ THIS BEFORE TOUCHING EITHER KEY BELOW. `requireMtls` is NOT
+  # the enforcement switch, and treating it as one is how this gets
+  # deployed wrong. `AdminListenerMode::decide` (admin_tls.rs) is:
+  #
+  #   material present  ⇒ mTLS ENFORCED  (whatever requireMtls says)
+  #   absent + true     ⇒ listener NOT BOUND at all
+  #   absent + false    ⇒ plaintext + warning   ← where we are now
+  #
+  # So enforcement begins the moment `mtls.secretName` is set and the
+  # ConfigMap re-renders the three paths — there is deliberately no
+  # "certs mounted but still plaintext" state to rehearse in. Setting
+  # `requireMtls: true` afterwards changes no behaviour while the
+  # material is present; its job is to make the fallback IMPOSSIBLE, so
+  # that if the Secret ever fails to mount the listener refuses to bind
+  # instead of quietly reverting to an unauthenticated API.
+  #
+  # CUTOVER — the ordering is a correctness requirement, and the full
+  # procedure with the check between every step is in
+  # `docs/operator/kbs-admin-mtls-cutover-runbook.md`. In outline:
+  #   1. mint the admin CA OFFLINE; put the listener leaf + the CA cert
+  #      in Vault at `mtls.vaultPath`, and vali's client leaf at the
+  #      vali chart's `kbsAdminMtls.vaultPath`;
+  #   2. deploy vali with the material MOUNTED but its URL still
+  #      `http://` — vali logs "staged and VALID", proving the client
+  #      half works before anything starts demanding it;
+  #   3. set `mtls.secretName` here + restart the KBS (this is the
+  #      enforcing step) and, in the same window, flip vali's
+  #      `kbsAdminUrl` to `https://`;
+  #   4. verify with `hippius-kbs-admin-client probe`, THEN set
+  #      `requireMtls: true` to remove the plaintext fallback.
+  # TRUE since 2026-08-13 — the last action of the cutover, taken only
+  # after a real mTLS call was verified live (200 with the vali client
+  # identity; TLSV13_ALERT_CERTIFICATE_REQUIRED without it).
+  #
+  # This changes NOTHING while the material mounts: `AdminListenerMode::decide`
+  # already enforces on material present. Its whole job is the failure
+  # case — if the Secret ever fails to mount, the listener REFUSES TO
+  # BIND instead of quietly falling back to an unauthenticated API on
+  # the routes that decide which host may unlock a VM. Loud outage over
+  # silent exposure.
+  #
+  # Consequence to know before editing `mtls.secretName`: emptying it
+  # while this is true makes the chart FAIL TO RENDER (by design), and
+  # if it somehow got past that, the listener would not bind at all.
+  requireMtls: true
+  mtls:
+    # Name of the Secret holding `tls.crt` + `tls.key` + `ca.crt`.
+    # Empty ⇒ no ExternalSecret is rendered, no material is mounted, no
+    # paths reach `config.toml`, and the listener stays on the
+    # `requireMtls` arm above. NON-EMPTY ⇒ mTLS is ENFORCED.
+    secretName: "kbs-admin-tls"
+    # Vault KV-v2 path the ExternalSecret reads `cert` / `key` / `ca`
+    # from (operator-provisioned; the CA's private key never enters the
+    # cluster — see external-secret-admin-tls.yaml for why not
+    # cert-manager). Empty ⇒ no ExternalSecret, so an operator who sets
+    # only `secretName` gets a pod stuck on a missing Secret rather than
+    # a silently unauthenticated API.
+    vaultPath: "hippius-compute/kbs/admin-mtls"
+    refreshInterval: 1h
+    # Where that Secret is mounted in the kbs-server container. The
+    # rendered `config.toml` paths are derived from it.
+    mountPath: /etc/kbs-admin-tls
+
+# ── Vault token self-renewal (audit H4) ─────────────────────────────────
+# Weekly CronJob that self-renews the periodic Vault tokens in this
+# namespace (`kbs-vault-creds`, `kbs-vault-broker-token`) so they never
+# silently expire (the KBS token expiry caused the 2026-06-25 boot loop;
+# the broker token was ~6d from expiry). See the cronjob template.
+tokenRenew:
+  enabled: true
+  # Weekly, Tuesday 03:23 local — off the :00/:30 marks and staggered from
+  # the ESO renewer (Mon 03:17); period is 32d so weekly has ~4x margin.
+  schedule: "23 3 * * 2"
+  # ⚠️  OPERATOR-SET — must match the Vault this namespace reads from.
+  # RFC 2606 `.invalid` placeholder: it cannot resolve, so an
+  # unfilled value fails loudly rather than pointing somewhere real.
+  vaultAddr: "https://vault.example.invalid:8200"
+  image: "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"

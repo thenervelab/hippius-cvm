@@ -1,0 +1,49 @@
+---
+# Let's Encrypt STAGING ClusterIssuer — PR-K3, §K (#54).
+#
+# Staging ONLY. Staging has generous rate limits and issues certs from
+# an untrusted root, so it is safe to (re)issue freely during cluster
+# bring-up and app rollout. A PRODUCTION ClusterIssuer is deliberately
+# NOT shipped here: auto-deploying it would risk burning Let's Encrypt's
+# strict production rate limits on a misconfigured Ingress. Production
+# is switched on by a deliberate, reviewed follow-up once an Ingress has
+# been validated end-to-end against staging.
+#
+# `sync-wave: "1"` is an INTRA-Application wave — it places this CR
+# after the cert-manager chart (CRDs + webhook, wave 0) so the
+# `ClusterIssuer` CRD exists and the cert-manager webhook is up.
+#
+# The HTTP-01 solver routes ACME challenges through ingress-nginx (the
+# `nginx` IngressClass, deployed by the sibling ingress-nginx addon in
+# the same sync wave). The ClusterIssuer is inert until a Certificate
+# references it, so the two addons converging together is fine.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+  labels:
+    app.kubernetes.io/name: letsencrypt-staging
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: cert-issuer
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  acme:
+    # Let's Encrypt STAGING ACME endpoint.
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    # Account contact for YOUR organisation — a role address, not a
+    # personal one. Not a secret (an ACME account is identified by the
+    # key below, not by this address), but it IS an identity: whoever
+    # deploys this chart registers a Let's Encrypt account under
+    # whatever is written here, and Let's Encrypt mails expiry warnings
+    # to it. It must not be somebody else's address.
+    email: <YOUR_ACME_CONTACT_EMAIL>
+    # cert-manager creates + manages this Secret (the ACME account
+    # private key). It is generated in-cluster, never committed.
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx

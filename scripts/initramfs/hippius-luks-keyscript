@@ -1,0 +1,66 @@
+#!/bin/sh
+# `hippius-luks-keyscript` — Debian-family wrapper around the SHARED
+# §21 release sequence in `hippius-release-core.sh`. Runs inside the
+# tenant cloud-image's initramfs (initramfs-tools +
+# cryptsetup-initramfs, fed via /etc/crypttab's `keyscript=` field).
+#
+# Contract (cryptsetup-initramfs):
+#   - stdout receives the LUKS passphrase BYTE-EXACT (no trailing \n)
+#   - stderr is forwarded to /dev/kmsg + the kernel console
+#   - exit 0 on success; non-zero ⇒ cryptroot retries / falls through
+#
+# ALL security-relevant logic lives in the core
+# (`/lib/hippius/hippius-release-core.sh`, staged by
+# `hippius-luks-hook`; source: `scripts/initramfs/hippius-release-core.sh`)
+# so the Debian keyscript path and the RHEL dracut runner path
+# (`scripts/dracut/90hippius-luks/hippius-release-runner.sh`) can never
+# drift. The full sequence + the §296/§20 rationale is documented IN
+# the core; this wrapper only owns:
+#   - the fd 3 passphrase-channel dance,
+#   - the tmpfs KEK buffer + atomic `cat` into fd 3 (EPIPE-race-safe),
+#   - shredding the buffer.
+#
+# Retry model: cryptroot re-invokes this whole script on failure, so
+# the wrapper makes a SINGLE attempt (HIPPIUS_NET_RETRIES has no
+# meaning here; the dracut runner owns its own bounded retry).
+
+set -eu
+
+# cryptroot invokes us with a stripped PATH (`/bin:/sbin`), hiding the
+# /usr/sbin binaries the hook staged. Pin a permissive PATH.
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+HIPPIUS_LOG_TAG="hippius-luks-keyscript"
+
+# fd 3 = the keyscript stdout channel cryptsetup-initramfs reads as
+# the LUKS passphrase. Redirect script stdout → stderr so any stray
+# `echo` from the sourced core can't corrupt the passphrase.
+exec 3>&1
+exec 1>&2
+
+CORE=""
+for c in /lib/hippius/hippius-release-core.sh /etc/hippius/hippius-release-core.sh; do
+    [ -r "$c" ] && { CORE="$c"; break; }
+done
+if [ -z "$CORE" ]; then
+    printf 'hippius-luks-keyscript: FATAL: hippius-release-core.sh not staged (hook bug); rebake the image\n' >&2
+    exit 1
+fi
+# shellcheck source=scripts/initramfs/hippius-release-core.sh
+. "$CORE"
+
+# Buffer the KEK through tmpfs (0600), then atomically `cat` into fd 3.
+# Writing the release binary's stdout straight to fd 3 races
+# cryptsetup's pipe reader (EPIPE on the tail flush) — see the core's
+# hippius_run_release doc.
+KEK_TMP=$(mktemp -p /run hippius-kek.XXXXXX)
+chmod 0600 "$KEK_TMP"
+
+hippius_release_run "$KEK_TMP"
+
+cat "$KEK_TMP" >&3
+shred -u "$KEK_TMP" 2>/dev/null || rm -f "$KEK_TMP"
+
+hippius_log "KEK released; cryptsetup will now attempt activation"
+exit 0

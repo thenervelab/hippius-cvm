@@ -1,0 +1,88 @@
+---
+# Cluster-wide critical alert rules. PR-K14, §K (#54), issue #128
+# Phase 1 slice 1.
+#
+# These are the alerts we can fire today, without per-component
+# `/metrics` endpoints in place. The kube-prometheus-stack chart's
+# `defaultRules` already ships a curated set of upstream rules
+# (`KubePodCrashLooping`, `KubePodNotReady`, `KubeletDown`, …) — this
+# file adds Hippius-specific alerts on top:
+#
+#   * `IngressNginxHigh5xxRate`     — gates on the new ingress-nginx
+#                                     ServiceMonitor (this PR enables
+#                                     it in addons/ingress-nginx/values).
+#   * `HippiusObservabilityWatchdog`— heartbeat alert (always firing).
+#                                     Routed by the Alertmanager
+#                                     config to the `slack-deadmans`
+#                                     channel; silence = problem.
+#
+# Edge-gateway service-level alerts (`EdgeHaPeerDown`, shed-spike, …)
+# are deferred to PR-K14a: the binary's `/metrics` listener is gated on
+# `EDGE_PEER_ENDPOINT` being set (HA peer link mode — see
+# `binaries/edge-gateway/src/ha/mod.rs:34-36`) and the current
+# deployment runs in single-instance mode (`templates/deployment.yaml`
+# header in the edge-gateway chart). PR-K14a either wires the HA peer
+# link in-cluster (StatefulSet + headless Service) or adds a
+# metrics-only listener that binds unconditionally, then this rule
+# group gains its first edge-level alert.
+#
+# Component-specific alerts for KBS / vali / miner-agent / sentinel
+# ride into their respective follow-up PRs (PR-K14b..PR-K14f) once the
+# `/metrics` endpoints they reference exist.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-critical
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hippius-critical
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: alerts
+    # The kube-prometheus-stack Prometheus picks PrometheusRule
+    # resources up via `ruleSelectorNilUsesHelmValues: false`
+    # (../values.yaml), so this label is informational, not load-bearing.
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-ingress
+      interval: 30s
+      rules:
+        - alert: IngressNginxHigh5xxRate
+          # 5xx rate as a fraction of total ingress traffic, over a 5m
+          # window. >5% is unusual enough to page; tune as we get a
+          # real baseline.
+          expr: |
+            sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+              /
+            clamp_min(sum(rate(nginx_ingress_controller_requests[5m])), 1)
+              > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            component: ingress-nginx
+          annotations:
+            summary: ingress-nginx 5xx rate above 5%
+            description: |
+              ingress-nginx has been returning >5% 5xx for 5 minutes.
+              Check the upstream Service(s) and pod health.
+
+    - name: hippius-watchdog
+      interval: 30s
+      rules:
+        - alert: HippiusObservabilityWatchdog
+          # Always-firing heartbeat. The Alertmanager route ../external-
+          # secret-alertmanager.yaml example sends this to a dedicated
+          # `slack-deadmans` channel; if it stops arriving, *something*
+          # in {Prometheus, Alertmanager, the receiver} is broken even
+          # if no real alert has been raised.
+          expr: vector(1)
+          labels:
+            severity: none
+          annotations:
+            summary: Hippius observability heartbeat
+            description: |
+              Constantly-firing alert routed to the still-alive channel.
+              Silence here means Prometheus or Alertmanager (or the
+              Slack receiver) is broken — investigate.

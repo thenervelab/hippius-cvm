@@ -1,0 +1,407 @@
+# `.github/workflows/tenant-uki-build.yml` — tenant UKI build pipeline.
+#
+# Mirror of `uki-build.yml` (which builds `packer/kbs-uki/`); this
+# workflow builds `packer/tenant-uki/` — the SEV-SNP measured UKI a
+# Hippius tenant CVM boots. On every push to `main` and every `v*`
+# tag it:
+#
+#   - runs the SEV-SNP launch-digest known-answer test (PR-F3 KAT —
+#     same `hippius-uki-measure` binary the kbs flow uses),
+#   - builds the tenant UKI end-to-end (`make uki`), compares the
+#     measurement against the pinned `test_vectors/uki/
+#     tenant-measurement.json`, double-builds it
+#     (`make uki-reproducible-check`), and publishes the artefact.
+#
+# ## Guard — why the heavy build can self-skip
+#
+# `make uki` consumes pins in `packer/tenant-uki/uki/inputs.lock`,
+# the SHARED `packer/kbs-uki/ovmf/ovmf.lock`, and the tenant UKI
+# `Dockerfile`. While any of those carries a placeholder zero / a
+# `<…>` sentinel, the `Detect …` step sets `pins_resolved=false` and
+# the build self-skips with a loud notice instead of failing red. The
+# moment every pin resolves the full pipeline activates with NO
+# change to this workflow.
+#
+# Supply-chain discipline (§F): every GitHub Action is pinned by SHA.
+
+name: tenant-uki-build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # Manual dispatch — lets an operator (or a pre-merge PR) trigger
+  # the full build on any branch without touching `main`. Mirrors
+  # `uki-build.yml` (added in PR #172); same rationale: capture a
+  # measurement on a PR branch before opening a KAT re-pin commit,
+  # without rolling main first.
+  workflow_dispatch:
+
+# Minimal: read the repo, build, upload a workflow artifact. No job
+# here writes to the repo or needs an OIDC token.
+permissions:
+  contents: read
+
+jobs:
+  tenant-uki-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # `fetch-depth: 0` (full history) is REQUIRED because the
+        # `packer/tenant-uki/uki/Makefile`'s SOURCE_DATE_EPOCH is
+        # path-scoped:
+        #   git log -1 --format=%ct -- packer/tenant-uki
+        # On a shallow clone (default `fetch-depth: 1`) that returns
+        # an empty string whenever the head commit doesn't touch
+        # `packer/tenant-uki/` (e.g. a KAT-only commit at
+        # `test_vectors/uki/tenant-measurement.json`). The Makefile
+        # then falls back to `echo 0` → cpio/squashfs mtimes collapse
+        # to 1970-01-01 → the initramfs + rootfs bytes shift → the
+        # launch_digest diverges from the pinned KAT and the workflow
+        # fails closed on `main`.
+        #
+        # PR #149 post-mortem: the squash-merge of #149 (a
+        # `test_vectors/`-only commit) surfaced this on `main`. The
+        # path-scoped SDE design (added in PR #146 round 1) is correct
+        # — it lets KAT-only commits ship without re-attesting the §22
+        # allowlist — and the right adapter is full git history here.
+        # The provenance `--built-at` step below also derives from
+        # `git log -- packer/tenant-uki` and benefits from this.
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+
+      - name: Dependencies for the SNP launch-digest KAT
+        # `hippius-uki-measure --features snp` links the `sev`
+        # measurement crate, which needs OpenSSL — same prerequisite as
+        # the `packer-f3` job in `ci.yml`.
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Detect unresolved §F measured pins
+        id: guard
+        run: |
+          set -euo pipefail
+          # The OVMF lockfile is SHARED with kbs-uki — same scrutiny.
+          # Tenant-specific files: inputs.lock (kernel + stub + NetBird)
+          # and the tenant Dockerfile (Debian base + Rust builder).
+          unresolved=""
+          for f in packer/tenant-uki/uki/inputs.lock \
+                   packer/kbs-uki/ovmf/ovmf.lock \
+                   packer/tenant-uki/uki/Dockerfile; do
+            if grep -vE '^[[:space:]]*#' "$f" \
+               | grep -Eq 'PLACEHOLDER-PIN-VIA-MAKE-PIN-APT|0{64}|<TIMESTAMP>|<VERSION>|<ARCH>|<PINNED-CONTENT-ADDRESSED-HOST>'; then
+              unresolved="${unresolved} ${f}"
+            fi
+          done
+          if [ -n "$unresolved" ]; then
+            echo "Measured-boot pins still placeholder in:${unresolved} — see issue #84."
+            echo "pins_resolved=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All measured-boot pins resolved — running the full tenant UKI build."
+            echo "pins_resolved=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SEV-SNP launch-digest known-answer test
+        # Always runs — independent of the pins. `--locked` is omitted
+        # for the same reason as the `packer-f3` job: enabling a feature
+        # forces a re-resolve the strict-cargo `thebrain` vendored
+        # manifest rejects under `--locked`.
+        run: cargo test -p hippius-uki-measure --features snp
+
+      - name: NOTICE — tenant UKI build skipped (pins unresolved)
+        if: steps.guard.outputs.pins_resolved != 'true'
+        run: |
+          echo "::warning title=Tenant UKI build skipped::§F measured-boot pins are placeholders — resolve them to activate the full build."
+          cat <<'EOF'
+          ============================================================
+            tenant-uki-build: SKIPPED `make uki` + `make uki-reproducible-check`
+
+            The measured-boot pins (kernel, systemd-stub, NetBird, OVMF,
+            Docker base digests, apt versions) in
+            packer/tenant-uki/uki/inputs.lock /
+            packer/kbs-uki/ovmf/ovmf.lock /
+            the tenant UKI Dockerfile are still PLACEHOLDERS.
+            Resolving them is measurement-affecting and couples to a
+            §22 allowlist epoch — an operator ceremony tracked in:
+
+              https://github.com/thenervelab/hippius-compute/issues/84
+
+            The SNP launch-digest KAT above still ran and gated this push.
+          ============================================================
+          EOF
+
+      - name: Install UKI build dependencies
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # `make uki` itself runs the build inside Docker (the UKI
+        # Dockerfile carries veritysetup / mksquashfs); these host
+        # packages cover `make test-rootfs` + the documented build
+        # prerequisites.
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools cryptsetup-bin
+
+      - name: Build the tenant UKI end-to-end
+        if: steps.guard.outputs.pins_resolved == 'true'
+        run: make -C packer/tenant-uki/uki uki
+
+      - name: Chown build outputs back to the runner user
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # The docker container writes `rootfs.verity` (the dm-verity
+        # hash tree) as root mode 0600 onto the bind-mounted host path
+        # — veritysetup's default — and the non-root runner user then
+        # cannot read it for subsequent steps:
+        #   - the artifact upload zips the whole `output/` tree (fails
+        #     with EACCES on rootfs.verity);
+        #   - the provenance sign + S3 publish steps also need to
+        #     read the output dir.
+        # (Local macOS Docker Desktop translates container-root to the
+        # host user, masking this; native Linux docker does not.)
+        # Chowning at the workflow level keeps the path-scoped SDE
+        # basis stable — touching `packer/tenant-uki/uki/Makefile`
+        # would shift SDE and invalidate the pinned KAT.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            packer/tenant-uki/uki/output \
+            packer/tenant-uki/uki/build \
+            packer/tenant-uki/uki/fetched
+
+      - name: Compare the measurement against test_vectors/uki/
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # Fail loud with a visible diff on any drift. `tenant-measurement.json`
+        # is the tenant-specific KAT — the first publish records it from
+        # an actual build (same procedure as kbs's `measurement.json`).
+        run: |
+          set -euo pipefail
+          expected=test_vectors/uki/tenant-measurement.json
+          if [ ! -f "$expected" ]; then
+            echo "::error::${expected} is missing — populate it from the first reproducible build's output."
+            exit 1
+          fi
+          diff -u "$expected" packer/tenant-uki/uki/output/measurement.json
+
+      - name: Reproducibility check (double build, byte-identical)
+        if: steps.guard.outputs.pins_resolved == 'true'
+        # The Makefile target `uki-reproducible-check` builds twice
+        # into isolated dirs and runs `diff -r`. The docker container
+        # writes `rootfs.verity` as root mode 0600 onto the bind-
+        # mounted host path; on the ubuntu-latest runner the non-root
+        # job user then cannot read it back and the diff fails with
+        # `Permission denied` — masking whether the bytes actually
+        # diverged. (My local macOS build passed because Docker
+        # Desktop uid-translates container-root to the host user;
+        # native Linux docker does not.)
+        #
+        # Inline equivalent of the make target that `sudo chown`s the
+        # output dirs back to the runner user before the diff. The
+        # `make uki` invocations still run as the runner user; only
+        # the chown + diff need elevated read access. Doing this in
+        # the workflow (not in the Makefile) keeps the path-scoped
+        # `SOURCE_DATE_EPOCH` basis stable — touching
+        # `packer/tenant-uki/uki/Makefile` would shift the SDE and
+        # invalidate the pinned KAT.
+        run: |
+          set -euo pipefail
+          cd packer/tenant-uki/uki
+          rm -rf output-run-a output-run-b \
+                 fetched-run-a fetched-run-b \
+                 build-run-a build-run-b
+          make uki \
+            OUTPUT_DIR="$(pwd)/output-run-a" \
+            FETCHED_DIR="$(pwd)/fetched-run-a" \
+            BUILD_DIR="$(pwd)/build-run-a" >/dev/null
+          make uki \
+            OUTPUT_DIR="$(pwd)/output-run-b" \
+            FETCHED_DIR="$(pwd)/fetched-run-b" \
+            BUILD_DIR="$(pwd)/build-run-b" >/dev/null
+          sudo chown -R "$(id -u):$(id -g)" \
+            output-run-a output-run-b \
+            fetched-run-a fetched-run-b \
+            build-run-a build-run-b
+          if diff -r --exclude='*.uki.signed' \
+                  output-run-a output-run-b; then
+            echo "uki-reproducible-check: PASS — outputs are byte-identical."
+            echo "  (*.uki.signed excluded — sbsign 0.9.4 embeds a"
+            echo "   wall-clock timestamp with no --no-timestamp flag;"
+            echo "   the launch_digest measures the UNSIGNED UKI bytes"
+            echo "   so the §22 measurement IS reproducible.)"
+          else
+            echo "::error::uki-reproducible-check: FAIL — outputs diverged"
+            exit 1
+          fi
+
+      - name: Upload the tenant UKI as a workflow artifact
+        if: steps.guard.outputs.pins_resolved == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # `github.ref_name` carries the branch name verbatim, which
+          # on a `feat/…` workflow_dispatch contains a `/` —
+          # actions/upload-artifact rejects forward-slashes in the
+          # artifact name (NTFS portability). Use the commit SHA: it
+          # is unique per push, fits the path constraint, and gives
+          # the operator something they can correlate against
+          # `git log`. Mirrors `uki-build.yml` (PR #172).
+          name: tenant-uki-${{ github.sha }}
+          path: packer/tenant-uki/uki/output/
+          if-no-files-found: error
+
+      - name: Sign the provenance map (shared dev §22 root key)
+        # `hippius-image-provenance sign` is offline: it reads the
+        # measurement envelope + the artifact + the §22 root signing
+        # key and writes a canonical-CBOR `provenance.cbor` Ed25519-
+        # signed by that root. The dev key under `packer/kbs-uki/keys/dev/`
+        # is the SHARED §22 root for the whole fleet —
+        # `DO-NOT-TRUST-IN-PROD` until rotated.
+        if: steps.guard.outputs.pins_resolved == 'true'
+        run: |
+          set -euo pipefail
+          # `--built-at` MUST track the Makefile's SOURCE_DATE_EPOCH
+          # (anchored at `packer/tenant-uki/`'s last commit, NOT repo
+          # HEAD). The UKI bytes are reproducible across unrelated
+          # commits, so a `--built-at` driven by repo HEAD would produce
+          # a fresh `provenance.cbor` every push, collide on the
+          # content-addressed `images/<uki-sha>/provenance.cbor` key,
+          # and trip `publish_idempotent`'s fail-loud "DIFFERENT bytes"
+          # branch. Pinning here mirrors the Makefile so re-publish is
+          # a true no-op when nothing under `packer/tenant-uki/` moved.
+          SDE=$(git log -1 --format=%ct -- packer/tenant-uki)
+          UKI=$(ls -1 packer/tenant-uki/uki/output/tenant-*.uki.signed | head -1)
+          cargo run -p hippius-image-provenance --release -- sign \
+              --measurement packer/tenant-uki/uki/output/measurement.json \
+              --artifact "$UKI" \
+              --signing-key packer/kbs-uki/keys/dev/provenance-root.dev.ed25519 \
+              --built-at "$SDE" \
+              --out packer/tenant-uki/uki/output/provenance.cbor
+
+      - name: Publish tenant UKI + provenance to s3.hippius.com (idempotent)
+        # Content-addressed `images/<artifact-sha256>/...` keys —
+        # SAME bucket layout as kbs-uki (the bucket holds every fleet
+        # image keyed by its sha; an artefact's flavour is in its
+        # basename, not the key prefix). Only runs on a real push to
+        # `main` (skipped on PR runs / tags so a re-trigger cannot
+        # re-publish at a non-canonical commit).
+        #
+        # Idempotency: for each object, HEAD first. If absent → upload.
+        # If present → GET and byte-compare to the local file. Identical
+        # bytes → no-op (the typed `ImageStore::put` contract); DIFFERENT
+        # bytes → FAIL LOUD (the artifact is content-addressed by sha so
+        # this should be impossible, and the provenance is deterministic
+        # under the pinned `--built-at` + signing-key; a divergence means
+        # someone re-signed under different metadata and we must NOT
+        # silently overwrite the audit trail).
+        if: steps.guard.outputs.pins_resolved == 'true' && github.ref == 'refs/heads/main'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.HIPPIUS_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.HIPPIUS_S3_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # A published copy of this repository has no operator S3
+          # credentials, and should not have any: these uploads target
+          # THIS project's object store. Unguarded, the first push to
+          # `main` of a public copy fires this step and dies on a
+          # credentials error — which reads as "the project is broken"
+          # rather than "this step is not yours to run".
+          #
+          # So absent credentials are a clean skip WITH a reason. Except
+          # here, where their absence means we broke our own publishing
+          # and need to hear about it rather than ship nothing quietly.
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            if [ "${GITHUB_REPOSITORY}" = "thenervelab/hippius-compute-internal" ]; then
+              echo "::error::HIPPIUS_S3_* are unset on the canonical repository. The"
+              echo "::error::artifact was BUILT but not published — publishing is broken."
+              exit 1
+            fi
+            echo "::notice::No object-store credentials — skipping publish. The artifact"
+            echo "::notice::is still attached to this run; point the upload at a store you"
+            echo "::notice::own to publish it yourself."
+            exit 0
+          fi
+          UKI=$(ls -1 packer/tenant-uki/uki/output/tenant-*.uki.signed | head -1)
+          UKI_SHA=$(sha256sum "$UKI" | awk '{print $1}')
+          UKI_BASE=$(basename "$UKI")
+          ENDPOINT=https://s3.hippius.com
+          BUCKET=hippius-compute-images
+
+          # publish_idempotent <local-file> <object-key> <content-type>
+          # Strict 3-way head-object semantics — any "ambiguous" outcome
+          # fails closed (see uki-build.yml for the full rationale).
+          publish_idempotent() {
+            local local_file="$1"
+            local key="$2"
+            local ctype="$3"
+            local s3uri="s3://${BUCKET}/${key}"
+
+            local head_out head_rc
+            head_out=$(aws s3api head-object \
+                          --bucket "$BUCKET" --key "$key" \
+                          --endpoint-url "$ENDPOINT" 2>&1) && head_rc=0 || head_rc=$?
+
+            if [ "$head_rc" = 0 ]; then
+              local existing got_sha exp_sha
+              existing=$(mktemp)
+              aws s3 cp "$s3uri" "$existing" --endpoint-url "$ENDPOINT" >/dev/null
+              got_sha=$(sha256sum "$existing" | awk '{print $1}')
+              exp_sha=$(sha256sum "$local_file" | awk '{print $1}')
+              shred -u "$existing" 2>/dev/null || true
+              if [ "$got_sha" != "$exp_sha" ]; then
+                echo "::error::Object ${key} exists with DIFFERENT bytes (existing ${got_sha} vs local ${exp_sha}) — refusing silent overwrite"
+                exit 1
+              fi
+              echo "publish: ${key} already at ${exp_sha} — no-op (will re-assert public-read ACL)"
+            elif echo "$head_out" | grep -qE '(Not Found|404|NoSuchKey)'; then
+              aws s3 cp "$local_file" "$s3uri" \
+                  --endpoint-url "$ENDPOINT" \
+                  --content-type "$ctype" \
+                  --acl public-read
+            else
+              echo "::error::head-object on ${key} failed with rc=${head_rc} (no Not-Found marker in stderr) — refusing to upload blind"
+              echo "$head_out" >&2
+              exit 1
+            fi
+
+            # Re-assert public-read on every run. The bucket is content-
+            # addressed and the .uki.signed/provenance.cbor pair is public
+            # by design (verified by signature, not gatekept by ACL); the
+            # `aws s3 cp --acl` on the upload path only fires for fresh
+            # objects, so an object whose ACL drifted (manual upload, S3
+            # backend quirk, pre-`--acl` workflow run) would otherwise
+            # stay 403 forever and force consumers like
+            # `tenant-uki-stage-miner.sh` to auth needlessly.
+            aws s3api put-object-acl \
+                --bucket "$BUCKET" --key "$key" \
+                --endpoint-url "$ENDPOINT" \
+                --acl public-read >/dev/null
+          }
+
+          publish_idempotent "$UKI" \
+              "images/${UKI_SHA}/${UKI_BASE}" \
+              application/octet-stream
+          publish_idempotent packer/tenant-uki/uki/output/provenance.cbor \
+              "images/${UKI_SHA}/provenance.cbor" \
+              application/cbor
+          # Publish the dm-verity rootfs artifacts alongside the UKI
+          # under the SAME content-addressed prefix. The launch digest
+          # (= UKI_SHA's directory key) covers the cmdline-embedded
+          # `dm-verity.root=` hash, which in turn binds these bytes
+          # cryptographically — so an operator fetching them by the
+          # UKI's sha is fetching the §22-allowlisted artifacts. The
+          # files are content-addressed too: the rootfs.img bytes are
+          # deterministic across runs (build-rootfs.sh reproducibility
+          # discipline), and rootfs.verity is the hash tree over them.
+          publish_idempotent packer/tenant-uki/uki/output/rootfs.img \
+              "images/${UKI_SHA}/rootfs.img" \
+              application/octet-stream
+          publish_idempotent packer/tenant-uki/uki/output/rootfs.verity \
+              "images/${UKI_SHA}/rootfs.verity" \
+              application/octet-stream
+
+          {
+            echo "## Tenant UKI published to s3.hippius.com"
+            echo
+            echo "- UKI sha256: \`${UKI_SHA}\`"
+            echo "- UKI url: <${ENDPOINT}/${BUCKET}/images/${UKI_SHA}/${UKI_BASE}>"
+            echo "- Provenance url: <${ENDPOINT}/${BUCKET}/images/${UKI_SHA}/provenance.cbor>"
+            echo "- Rootfs.img url: <${ENDPOINT}/${BUCKET}/images/${UKI_SHA}/rootfs.img>"
+            echo "- Rootfs.verity url: <${ENDPOINT}/${BUCKET}/images/${UKI_SHA}/rootfs.verity>"
+            echo "- Launch digest: \`$(jq -r .measurement_hex packer/tenant-uki/uki/output/measurement.json)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

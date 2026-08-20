@@ -1,0 +1,343 @@
+---
+# miner-agent install + identity self-gen. Tasks file imported by
+# 06-miner-bootstrap.yml play "05".
+#
+# Installs the `hippius-miner-agent` binary, renders its config,
+# self-generates the miner identity on first run (printing the public
+# key for the operator to register out-of-band with vali), and writes
+# a hardened systemd unit. The unit is ENABLED but NOT STARTED — the
+# operator starts it manually once the mTLS cert is in place (play 06
+# only creates the mount point; the operator pushes the content).
+#
+# This task file does NOT touch Vault and does NOT install k3s.
+
+- name: Ensure the miner-agent state directory exists
+  ansible.builtin.file:
+    path: "{{ miner_agent.state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure the miner-agent config directory exists
+  ansible.builtin.file:
+    path: /etc/hippius-miner
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check the installed miner-agent version
+  ansible.builtin.command:
+    argv:
+      - "{{ miner_agent.install_path }}"
+      - "--version"
+  register: miner_agent_version_check
+  failed_when: false
+  changed_when: false
+
+- name: Set whether the miner-agent binary needs (re)building
+  ansible.builtin.set_fact:
+    miner_agent_build_needed: >-
+      {{ miner_agent_version_check.rc != 0
+         or versions.miner_agent not in (miner_agent_version_check.stdout | default('')) }}
+
+# ── Binary install ──────────────────────────────────────────────────
+# MVP: build from source on the host. This is TEMPORARY — once a
+# signed GitHub Release / GHCR artifact for `hippius-miner-agent`
+# exists, replace this block with a `get_url` of the pinned digest.
+# Tracked alongside the §MA phase-2 roadmap.
+# Building from source needs a build environment, and the playbook used
+# to install only the Rust half of it. Each of these was found by running
+# the play on a host that did not already have it, and each stopped the
+# build dead:
+#
+#   git              the `ansible.builtin.git` clone below: "Failed to
+#                    find required executable git"
+#   build-essential  `error: linker 'cc' not found` — cargo cannot link
+#                    even a build script without a C toolchain
+#   pkg-config       }  `openssl-sys` build script: the `sev` crate that
+#   libssl-dev       }  `--features snp` pulls in links against OpenSSL
+#
+# None of this is exotic; it was simply already present on the machines
+# we provisioned, so the omission never showed. It is the same failure
+# mode as the `python3-debian` one in play 04.
+- name: Install the source-build prerequisites (TEMPORARY — with the source build)
+  ansible.builtin.apt:
+    name:
+      - git
+      - build-essential
+      - pkg-config
+      - libssl-dev
+    state: present
+    update_cache: true
+  when: miner_agent_build_needed | bool
+
+# A published tree cannot ship a default that only WE can clone, and the
+# placeholder must fail loudly rather than produce a confusing git error
+# several tasks later. `<...>` is the repository's placeholder convention.
+- name: Assert the miner-agent source repository has been configured
+  ansible.builtin.assert:
+    that:
+      - "'<' not in miner_agent_source_repo_resolved"
+    fail_msg: >-
+      `miner_agent_source_repo` is still the unfilled placeholder
+      ({{ miner_agent_source_repo_resolved }}). Play 05 builds the
+      miner-agent from source, so it needs a git URL it can actually
+      clone. Set `miner_agent_source_repo` in group_vars/miner_nodes.yml
+      to the repository you build the agent from, or skip this play and
+      place a binary at /usr/local/bin/hippius-miner-agent yourself.
+  vars:
+    miner_agent_source_repo_resolved: "{{ miner_agent_source_repo | default('') }}"
+  when: miner_agent_build_needed | bool
+
+- name: Install the Rust toolchain (TEMPORARY — until a binary release)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal
+    executable: /bin/bash
+    creates: /root/.cargo/bin/cargo
+  when: miner_agent_build_needed | bool
+
+- name: Clone the hippius-compute repo (TEMPORARY — source build)
+  ansible.builtin.git:
+    # Spelled out, and overridable, because this step CLONES AND BUILDS the
+    # binary that runs on a confidential host — it is a code-delivery path,
+    # not a documentation link.
+    #
+    # It used to name the repo as it was called before the rename, and that
+    # only kept working because GitHub redirects the old name. A redirect is
+    # not a pin: it lives exactly as long as nobody else takes the name, and
+    # the moment some other repo claims it this task would silently clone
+    # THAT one and build a miner-agent from it.
+    # The value lives in `group_vars/miner_nodes.yml`, with NO inline
+    # default here on purpose. A default would silently win whenever the
+    # group_vars entry is missing or renamed, which is precisely how a
+    # published tree would keep pointing at a repository only we can
+    # clone. Undefined is a loud failure; a wrong default is a quiet one.
+    repo: "{{ miner_agent_source_repo }}"
+    dest: /opt/hippius-compute
+    # Defaults to `main`; override `miner_agent_source_ref` in host_vars
+    # to test an agent-side branch.
+    version: "{{ miner_agent_source_ref | default('main') }}"
+    depth: 1
+    force: true
+  when: miner_agent_build_needed | bool
+
+- name: Build the miner-agent binary (TEMPORARY — source build)
+  # No `creates:` guard — the `when` already gates this. A `creates:`
+  # on the build output would skip rebuilding a STALE binary after a
+  # `git` pull bumped the source, so the install step would keep
+  # copying the old version forever.
+  #
+  # `--features snp` is LOAD-BEARING for a production miner: it pulls
+  # in the `sev` crate so `compute_launch_digest` can actually
+  # compute the SEV-SNP launch digest pre-flight. WITHOUT the flag,
+  # any launch order fail-closes at the validate step with
+  # `cvm-launch-digest/feature-disabled` (observed live 2026-05-28:
+  # a `cargo build` without `--features snp` produced a binary that
+  # rejected every order with HTTP 422 `launch-input`). The default
+  # feature set is empty by design — it keeps `cargo test
+  # --workspace` cross-platform green on macOS dev, where the `sev`
+  # crate's OpenSSL + Linux-only headers cannot link. Production
+  # always opts in here.
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      source "$HOME/.cargo/env"
+      cd /opt/hippius-compute
+      cargo build --release --locked -p hippius-miner-agent --features snp
+    executable: /bin/bash
+  when: miner_agent_build_needed | bool
+
+- name: Install the miner-agent binary
+  ansible.builtin.copy:
+    src: /opt/hippius-compute/target/release/hippius-miner-agent
+    dest: "{{ miner_agent.install_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: miner_agent_build_needed | bool
+
+# ── Config ──────────────────────────────────────────────────────────
+- name: Render the miner-agent config
+  ansible.builtin.template:
+    # Explicit playbook-relative path — unambiguous regardless of the
+    # template search-path heuristics for an imported task file.
+    src: "{{ playbook_dir }}/miner-tasks/templates/miner-agent-config.toml.j2"
+    dest: "{{ miner_agent.config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# ── Identity self-gen (first run only) ──────────────────────────────
+- name: Check whether the miner identity already exists
+  ansible.builtin.stat:
+    path: "{{ miner_agent.state_dir }}/identity.key"
+  register: miner_identity_check
+
+- name: Self-generate the miner identity + print the public key
+  # Run UNCONDITIONALLY — `init-identity` is itself idempotent (it
+  # refuses to overwrite an existing key) and `--print-pubkey` re-emits
+  # the existing public key on a no-op run. Running it every time means
+  # the operator can re-capture the pubkey from any playbook run, not
+  # only the first. `changed_when` keys on the binary's stderr so a
+  # no-op re-run still reports changed=0.
+  ansible.builtin.command:
+    argv:
+      - "{{ miner_agent.install_path }}"
+      - "init-identity"
+      - "--key-output"
+      - "{{ miner_agent.state_dir }}/identity.key"
+      - "--pub-output"
+      - "{{ miner_agent.state_dir }}/identity.pub"
+      - "--print-pubkey"
+  register: miner_identity_init
+  changed_when: "'already present' not in miner_identity_init.stderr"
+
+- name: Read this host's real SEV-SNP CHIP_ID (the launch/attestation platform_id)
+  # The `platform_id` vali stores in `MinerIdentity` MUST be the real
+  # 64-byte AMD CHIP_ID — the launch ticket pins it to bind the miner's
+  # VCEK for §21 attestation, and vali's scheduler dispatchability gate
+  # (#510) rejects a miner whose platform_id is not real 128-hex.
+  # Reading it from hardware (host /dev/sev GET_ID) instead of letting
+  # the operator hand-type a label removes the placeholder-CHIP_ID bug
+  # that left cc-miner-2/3 un-schedulable.
+  ansible.builtin.command:
+    argv:
+      - "{{ miner_agent.install_path }}"
+      - "platform-id"
+  register: miner_platform_id
+  changed_when: false
+
+- name: "OPERATOR ACTION — register this miner with vali"
+  # `--print-pubkey` prints ONLY the 64-hex public key to stdout (the
+  # agent's info lines go to stderr). The private key is never printed.
+  # `platform-id` (above) prints the real CHIP_ID — NO placeholder to
+  # hand-fill. node_id == the identity pubkey (the on-chain register_child
+  # node_id), so chain_node_id is the same value.
+  ansible.builtin.debug:
+    msg: |
+      ============================================================
+      MINER REGISTRATION — record with vali's admin API
+      (POST /v1/admin/miner/register), all fields REAL (no placeholders):
+
+        miner_id:      "{{ inventory_hostname }}"
+        pubkey:        "{{ miner_identity_init.stdout }}"
+        chain_node_id: "{{ miner_identity_init.stdout }}"
+        platform_id:   "{{ miner_platform_id.stdout }}"   # real CHIP_ID
+        netbird_ip:    "{{ miner_netbird_ip | default('<run netbird-agent first>') }}"
+
+      Also register the node_id on-chain via deploy/register-miner/
+      (register_child + the agent's sign-registration node_sig).
+
+      Until the identity is registered, vali rejects this miner's
+      telemetry as an unknown source, and the scheduler will not place
+      VMs on it (the dispatchability gate requires a complete identity).
+      ============================================================
+
+# ── systemd unit ────────────────────────────────────────────────────
+- name: Install the miner-agent systemd unit
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ miner_agent.systemd_unit_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hippius miner-agent
+      After=network-online.target libvirtd.service netbird.service
+      Wants=network-online.target
+      Requires=libvirtd.service netbird.service
+
+      [Service]
+      Type=simple
+      ExecStart={{ miner_agent.install_path }} serve --config {{ miner_agent.config_path }}
+      Restart=on-failure
+      RestartSec=10
+      User=root
+      Group=root
+
+      # Hardening — a root service kept on a tight leash. The agent
+      # reaches libvirt over its UNIX socket and Hippius S3 over the
+      # network; it needs no raw devices and no kernel tunables.
+      ProtectSystem=strict
+      ProtectHome=true
+      ReadWritePaths={{ miner_agent.state_dir }}
+      NoNewPrivileges=true
+      PrivateTmp=true
+      PrivateDevices=true
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable the miner-agent unit — but DO NOT start it
+  # Intentionally no `state:` — the operator starts the service
+  # manually after provisioning the mTLS cert (play 06 + the README
+  # post-delivery checklist). `daemon_reload` picks up the unit above.
+  ansible.builtin.systemd:
+    name: "{{ miner_agent.systemd_unit_name }}"
+    enabled: true
+    daemon_reload: true
+
+- name: "OPERATOR ACTION — restart the agent if it was already running"
+  # The miner-agent lifecycle is operator-controlled (the service is
+  # enabled, not started). If this run REPLACED the binary and the
+  # operator had already started the service, it keeps running the old
+  # binary until restarted — surface that rather than auto-restarting.
+  ansible.builtin.debug:
+    msg: >-
+      The miner-agent binary was (re)installed. If the service is
+      already running on this host, restart it to pick up the new
+      binary: systemctl restart {{ miner_agent.systemd_unit_name }}
+  when: miner_agent_build_needed | bool
+
+# ── Auto-update (S3 channel) ────────────────────────────────────────
+# A systemd timer pulls the latest published miner-agent build from
+# Hippius S3 every ~15 min, sha256-verifies it, atomically installs it,
+# and rolls back on an unhealthy restart. ADDITIVE + INERT until the
+# operator publishes the first manifest (deploy/scripts/publish-miner-
+# agent.sh writes ${S3_BASE}/latest.json). Change-detection is sha256,
+# NOT --version (the agent's --version is a static 0.0.1 that is never
+# bumped). See miner-tasks/AUTO_UPDATE.md.
+- name: Install the miner-agent auto-update script
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/miner-tasks/files/hippius-miner-update.sh"
+    dest: /usr/local/bin/hippius-miner-update
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the auto-update env file
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/miner-tasks/templates/auto-update.env.j2"
+    dest: /etc/hippius-miner/auto-update.env
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render the auto-update systemd service + timer units
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/miner-tasks/templates/{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - hippius-miner-update.service
+    - hippius-miner-update.timer
+
+- name: Enable + start the auto-update timer (gated on miner_auto_update_enabled)
+  # `daemon_reload` picks up the rendered units. The timer is only
+  # enabled when auto-update is on; when disabled we stop+disable it so a
+  # previously-enabled miner is cleanly frozen.
+  ansible.builtin.systemd:
+    name: hippius-miner-update.timer
+    enabled: "{{ miner_auto_update_enabled | default(true) | bool }}"
+    state: "{{ 'started' if (miner_auto_update_enabled | default(true) | bool) else 'stopped' }}"
+    daemon_reload: true

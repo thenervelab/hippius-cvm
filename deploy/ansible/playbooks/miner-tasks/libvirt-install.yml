@@ -1,0 +1,101 @@
+---
+# libvirt + QEMU — the tenant-CVM hypervisor stack. Tasks file
+# imported by 06-miner-bootstrap.yml play "02".
+#
+# Distro packages from Ubuntu 24.04 (libvirt 10.0.x / qemu 8.2.x — see
+# `versions` in group_vars/miner_nodes.yml). They are NOT apt-version-
+# pinned: pinning a distro's own default blocks its security point
+# releases. `apt` with `state: present` is idempotent — a second run
+# is a zero-diff no-op.
+
+- name: Install the libvirt + QEMU hypervisor packages
+  ansible.builtin.apt:
+    name:
+      - libvirt-daemon-system   # the libvirt daemon + system config
+      - libvirt-clients         # virsh
+      - qemu-system-x86         # the x86 system emulator
+      - qemu-utils              # qemu-img and friends
+      - ovmf                    # UEFI firmware — required for CVMs
+      - virtinst                # virt-install / domain provisioning
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable + start the libvirt daemon
+  ansible.builtin.systemd:
+    name: libvirtd
+    enabled: true
+    state: started
+
+- name: Add the login user to the libvirt group (non-sudo virsh)
+  ansible.builtin.user:
+    name: "{{ libvirt.access_user }}"
+    groups: libvirt
+    append: true
+  when: libvirt.user_can_access | default(false)
+
+- name: Report the installed hypervisor versions
+  ansible.builtin.command:
+    cmd: "{{ item }}"
+  loop:
+    - "virsh --version"
+    - "qemu-system-x86_64 --version"
+  register: miner_hv_versions
+  changed_when: false
+
+- name: Show the installed hypervisor versions
+  ansible.builtin.debug:
+    msg: >-
+      {{ miner_hv_versions.results | map(attribute='stdout') | list }}
+
+# ── Tenant OVMF ──────────────────────────────────────────────────────
+#
+# The `ovmf` package above is for libvirt's own use. Tenant CVMs boot a
+# SPECIFIC firmware image whose bytes are folded into the SNP launch
+# measurement, and the validator recomputes that measurement from the copy
+# it pins. A different build measures differently, the KBS refuses the
+# release, and the guest never unlocks — so this is fetched by URL and
+# verified by digest, never taken from the distro.
+#
+# Without it every launch fails preflight with
+# `tenant-preflight/ovmf-missing`, which names the file but not the fact
+# that nothing was ever supposed to create it.
+
+- name: Ensure the miner state directory exists
+  ansible.builtin.file:
+    path: "{{ miner_tenant_ovmf_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stage the tenant OVMF, verified by digest
+  ansible.builtin.get_url:
+    url: "{{ miner_tenant_ovmf_url }}"
+    dest: "{{ miner_tenant_ovmf_path }}"
+    checksum: "sha256:{{ miner_tenant_ovmf_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: miner_tenant_ovmf
+
+# get_url verifies before installing, so a mismatch never lands. Re-read the
+# file that is ACTUALLY on disk: this asserts the end state, not the action.
+- name: Re-verify the staged tenant OVMF on disk
+  ansible.builtin.stat:
+    path: "{{ miner_tenant_ovmf_path }}"
+    checksum_algorithm: sha256
+  register: miner_tenant_ovmf_stat
+
+- name: Refuse to continue on an OVMF that is not the pinned one
+  ansible.builtin.assert:
+    that:
+      - miner_tenant_ovmf_stat.stat.exists
+      - miner_tenant_ovmf_stat.stat.checksum == miner_tenant_ovmf_sha256
+    fail_msg: >-
+      {{ miner_tenant_ovmf_path }} does not match
+      miner_tenant_ovmf_sha256. This firmware is measured into every tenant
+      guest's SNP launch digest, so a mismatch means the KBS will refuse to
+      release any disk key on this host. Fix the pin or the artefact — do
+      not proceed.
+    success_msg: "tenant OVMF staged and digest-verified"

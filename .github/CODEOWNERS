@@ -1,0 +1,27 @@
+# CODEOWNERS — required review for the security-critical surface
+# (M-cosign-admission governance). With branch protection's
+# `require_code_owner_reviews`, a change under these paths needs an
+# approval from an owner below before it can merge to `main`.
+#
+# @masterdubs is the repo owner. Add more owners / a team as the trust
+# set grows.
+
+# gitops deploy manifests — a digest/values edit is (with ArgoCD
+# selfHeal) a production deploy; must be owner-reviewed + pass the
+# verify-gitops-signatures cosign gate.
+/deploy/gitops/                      @masterdubs
+# Vault ACL policies (least-privilege scoping — RA-N1 / C1).
+/deploy/terraform/policies/          @masterdubs
+# CI / supply-chain: workflows, the signature-verify gate + its extractor.
+/.github/                            @masterdubs
+# Committed signing keys (dev placeholders defended by the three belts).
+/packer/kbs-uki/keys/                @masterdubs
+
+# KEK-release + attestation trust core (the crown jewels).
+/kbs-core/                           @masterdubs
+/binaries/kbs-server/                @masterdubs
+/binaries/kbs-vault-broker/          @masterdubs
+/hippius-types/src/vault_broker.rs   @masterdubs
+/hippius-types/src/release.rs        @masterdubs
+# The miner-side §22 provenance verifier + its build-overridable root.
+/binaries/miner-uki-fetch/           @masterdubs

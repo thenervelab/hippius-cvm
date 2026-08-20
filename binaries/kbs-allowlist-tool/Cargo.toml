@@ -1,0 +1,38 @@
+[package]
+name = "hippius-kbs-allowlist-tool"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Offline §22 allowlist minter — builds a canonical-CBOR `AllowlistBody` and signs it as a COSE_Sign1 EdDSA artifact the KBS will accept. Inputs: an Ed25519 seed file (the §22 root, NEVER inline) + a TOML manifest listing measurements + per-measurement L1 / KBS kids + epoch. Output: the bytes a KBS `[allowlist].signed_path` ingests. Fail-closed on every malformed input — the tool refuses to emit an artifact the runtime would reject."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-kbs-allowlist-tool"
+path = "src/main.rs"
+
+[dependencies]
+# We reuse the same canonical-CBOR + AllowlistBody types the KBS runtime
+# verifies against — guarantees the minter and the runtime can never
+# disagree on what "valid" means.
+kbs-core = { path = "../../kbs-core" }
+hippius-types = { path = "../../hippius-types" }
+# COSE_Sign1 envelope (matches kbs-core's `parse_and_verify` consumer).
+coset = "0.3"
+ciborium = "0.2"
+# EdDSA over the canonical-CBOR payload.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+# TOML input manifest — matches the operator-config convention used by
+# `binaries/kbs-server`.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+thiserror = "2"
+zeroize = "1.8"
+
+[dev-dependencies]
+tempfile = "3"

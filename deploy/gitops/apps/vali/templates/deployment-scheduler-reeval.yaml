@@ -1,0 +1,125 @@
+{{- if .Values.schedulerReeval.enabled }}
+---
+# §23 scheduler reeval worker.
+#
+# The vali web Deployment serves the placement API on-demand, but
+# nothing periodically drives `service.reeval_once` — so the
+# `MinerCapacity` mirror goes stale and `Bound` placements whose miner
+# left the chain are never §13-drained until the next API hit. This
+# Deployment runs the existing `vali_scheduler_reeval` management
+# command (a long-running loop, `VALI_SCHEDULER_REEVAL_INTERVAL_S`,
+# default 30s) so scheduling is CONTINUOUSLY autonomous: each cycle
+# reads a fresh on-chain snapshot, refreshes `MinerCapacity`, and drains
+# placements off departed/quarantined miners.
+#
+# Same image + env as the vali web pod (it shares the Django app, the
+# Postgres DB, the Vault creds, and the `VALI_THEBRAIN_RPC_URL` chain
+# read via `envFrom: vali-config`). A worker — no HTTP port, no probes;
+# the loop IS the process, a crash exits the container and the kubelet
+# restarts it. `replicas: 1` + `Recreate` so two reeval loops never run
+# concurrently (reeval_once is CAS-safe, but one writer is cleanest).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + the
+# migrations hook).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-scheduler-reeval
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler-reeval
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: scheduler-reeval
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: scheduler-reeval
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every tick times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        # Roll the worker whenever the rendered config changes (it reads
+        # vali-config via envFrom, snapshotted at container start) — same
+        # rationale as the web Deployment.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The reeval loop does not call the Kubernetes API.
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scheduler-reeval
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the reeval loop.
+          command: ["python", "manage.py", "vali_scheduler_reeval"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            # The §13 drain path dispatches lifecycle orders + reads the
+            # chain; carry the same Vault creds as the web pod so the
+            # shared code paths behave identically.
+            {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
+            {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            - name: VALI_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: vali-vault
+                  key: address
+          resources:
+            {{- .Values.schedulerReeval.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- include "vali.vaultTokenVolumeMount" . | nindent 12 }}
+            # `read-miner-status` (the chain-read subprocess) + Python
+            # tempfiles need a writable /tmp under readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+            - name: vault-ca
+              mountPath: /etc/hippius/vault-ca
+              readOnly: true
+      volumes:
+        {{- include "vali.vaultTokenVolume" . | nindent 8 }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: vault-ca
+          configMap:
+            name: vault-ca
+{{- end }}

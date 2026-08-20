@@ -1,0 +1,95 @@
+{{- if .Values.epochClose.enabled }}
+---
+# §23 periodic epoch-close — advances pallet-compute-scoring's CurrentEpoch
+# so vali's scheduler reads fresh per-miner reward weights (without it every
+# miner scores quality=0 and the scheduler stale-gates). Runs the
+# `hippius-epoch-closer` (node + @polkadot/api) which submits
+# `Sudo.sudo(ComputeScoring.valiSubmitEpochClose(epoch, updates))` signed by
+# the authority/sudo key (the `epoch-close-key` Secret — provisioned out of
+# git; should be an ExternalSecret from Vault). Weight is currently flat
+# (`epochClose.weight`); real placement-based merit is a vali-fed follow-up.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: epoch-close
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: epoch-close
+spec:
+  schedule: {{ .Values.epochClose.schedule | quote }}
+  # ⛔ SAFETY INTERLOCK — see `epochClose.suspend` in values.yaml. Closing an
+  # epoch submits an on-chain extrinsic that becomes the AUTHORITATIVE reward
+  # weight. While `VALI_EPOCH_WEIGHT_SOURCE=usage` is live and the accrued
+  # figures are known-wrong, resuming would submit them. Declared here so a
+  # chart redeploy cannot silently undo a suspension applied by hand.
+  suspend: {{ .Values.epochClose.suspend }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            # NOTE: deliberately NOT `vali.valiSelector` (name=vali) — that
+            # would subject this pod to the vali CNP's default-deny EGRESS
+            # (which allows neither vali:8000 nor the external chain RPC).
+            # The CNP ingress rule admits it by component instead.
+            app.kubernetes.io/component: epoch-close
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: epoch-close
+              # Digest-only, never `repo:tag@digest`: the tag was decoration
+              # (a pull honours the digest) and its only real effect was to
+              # make a stale pin look current at a glance. See the P3
+              # `provenance:` block beside the digest in values.yaml.
+              image: "{{ .Values.epochClose.image.repository }}@{{ .Values.epochClose.image.digest }}"
+              env:
+                - name: THEBRAIN_RPC_URL
+                  value: {{ .Values.epochClose.rpcUrl | quote }}
+                - name: EPOCH_CLOSE_KEY_FILE
+                  value: /etc/epoch/mnemonic
+                - name: EPOCH_DEFAULT_WEIGHT
+                  value: {{ .Values.epochClose.weight | quote }}
+                {{- if .Values.epochClose.weightsUrl }}
+                # Pull REAL §23 merit weights from vali (falls back to the
+                # flat weight above if unreachable). The endpoint is AllowAny,
+                # CNP-gated — no token needed.
+                - name: VALI_EPOCH_WEIGHTS_URL
+                  value: {{ .Values.epochClose.weightsUrl | quote }}
+                {{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              volumeMounts:
+                - name: key
+                  mountPath: /etc/epoch
+                  readOnly: true
+          volumes:
+            - name: key
+              secret:
+                secretName: {{ .Values.epochClose.keySecretName | quote }}
+{{- end }}

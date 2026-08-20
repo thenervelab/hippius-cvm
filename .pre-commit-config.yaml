@@ -1,0 +1,23 @@
+---
+# Pre-commit secret-hygiene hooks. Added by PR-K0, §K (#54).
+#
+# Opt-in per clone: `pip install pre-commit && pre-commit install`.
+# Once installed, `git commit` runs these against the staged files and
+# refuses the commit if a secret pattern is found. This is the active
+# backstop that complements the passive `deploy/.gitignore`.
+#
+# Deliberately minimal — only secret-detection hooks. No formatting /
+# linting hooks: they would fight the Helm-templated YAML that PR-K3+
+# add under deploy/gitops/.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      # Scans staged content for API keys, tokens, private keys, etc.
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Hard block on a committed private key (PEM/OpenSSH/PuTTY).
+      - id: detect-private-key

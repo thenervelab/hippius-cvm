@@ -1,0 +1,95 @@
+{{- if .Values.usageGc.enabled }}
+---
+# UsageAccrual garbage-collector (audit M-GC — state bloat).
+#
+# The (epoch, miner, vm) UsageAccrual ledger grows one row per VM per
+# epoch forever, but scoring.py only ever reads the LATEST epoch for the
+# uptime-integrated epoch weights + the `owed` readout. This Deployment
+# runs the `vali_usage_gc` management command (a long-running loop,
+# `VALI_USAGE_GC_INTERVAL_S`, default 3600s): each cycle reaps accruals
+# for epochs older than the last `VALI_USAGE_GC_KEEP_EPOCHS` (default 8 —
+# a generous audit/dispute window), always retaining the latest epoch.
+#
+# Same image + env as the vali web pod (Django app, Postgres DB) via
+# envFrom: vali-config. A worker — no HTTP port, no probes. `replicas: 1`
+# + `Recreate` (the delete is idempotent; one deleter is cleanest).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + migrations).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-usage-gc
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: usage-gc
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: usage-gc
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: usage-gc
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every cycle times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The GC loop does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usage-gc
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the GC loop.
+          command: ["python", "manage.py", "vali_usage_gc"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+          resources:
+            {{- .Values.usageGc.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+{{- end }}

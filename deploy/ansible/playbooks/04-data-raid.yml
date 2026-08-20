@@ -1,0 +1,235 @@
+---
+# Creates a RAID1 mdadm array from two raw NVMe block devices, formats
+# ext4, mounts at /var/lib/hippius-data, and persists in fstab.
+#
+# This volume holds:
+#   - Postgres (vali)
+#   - audit hash-chain log (KBS FileAuditSink)
+#   - KBS Sled stores (ReleaseStore / VmStateStore / KbsNonceStore)
+#   - sentinel state
+#   - local-path-provisioner PVs (PR-K4)
+#
+# Idempotency: detection uses wipefs to identify a prior linux_raid_member
+# signature with our exact array name, NOT mdadm --examine on the whole
+# device (which returns true for any disk with an MBR/GPT, including the
+# system disk). The playbook fails closed if it cannot prove a candidate
+# device is either truly empty or already a member of OUR array.
+
+- name: Data RAID1 + ext4 + mount
+  hosts: cc_nodes
+  gather_facts: true
+  become: true
+  vars:
+    md_device: "/dev/md/{{ data_raid_name }}"
+  tasks:
+    - name: Install mdadm
+      ansible.builtin.apt:
+        name: mdadm
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Check current signatures on candidate devices
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for dev in {{ data_raid_devices | join(' ') }}; do
+            sig=$(wipefs --noheadings --output TYPE "$dev" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+            ptt=$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)
+            printf '%s|%s|%s\n' "$dev" "$sig" "$ptt"
+          done
+      register: candidate_signatures
+      changed_when: false
+
+    - name: Fail closed if any candidate has a partition table
+      ansible.builtin.assert:
+        that:
+          - candidate_signatures.stdout_lines | select('search', '\\|[^|]*\\|[a-z]') | list | length == 0
+        fail_msg: |
+          Refusing to operate on a partitioned candidate device. This usually
+          means data_raid_devices points at a system disk by mistake.
+
+          Candidate signatures:
+          {% for line in candidate_signatures.stdout_lines %}
+            {{ line }}
+          {% endfor %}
+
+    - name: Determine if our array already exists on candidates
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          # Look for an existing array on candidate devices whose Name matches
+          # the configured name. Any other md superblock is a hard error.
+          # NB: mdadm prints "Name : <homehost>:<arrayname>" so the value itself
+          # can contain a colon — use sed to take everything after the first
+          # `:` rather than awk -F:.
+          target_name="{{ data_raid_name }}"
+          for dev in {{ data_raid_devices | join(' ') }}; do
+            if ! mdadm --examine "$dev" >/dev/null 2>&1; then
+              continue
+            fi
+            full_name=$(mdadm --examine "$dev" 2>/dev/null \
+              | sed -nE 's/^[[:space:]]*Name[[:space:]]*:[[:space:]]*(.+[^[:space:]])[[:space:]]*$/\1/p' \
+              | head -1 \
+              | awk '{print $1}')
+            if [ -z "$full_name" ]; then
+              continue   # MBR/GPT-only disk, no md superblock — that's fine
+            fi
+            # Strip "homehost:" prefix if present (--homehost=any → "any:")
+            short_name="${full_name##*:}"
+            if [ "$short_name" != "$target_name" ]; then
+              echo "FOREIGN_ARRAY:$dev:$full_name"
+              exit 1
+            fi
+            echo "OUR_ARRAY:$dev"
+          done
+        executable: /bin/bash
+      register: array_detect
+      changed_when: false
+
+    - name: Decide whether to create the array
+      ansible.builtin.set_fact:
+        # TODO(PR-K-followup): degraded-array recovery. Currently
+        # array_exists=true as soon as ONE candidate carries OUR_ARRAY.
+        # If a disk is replaced (one new empty + one existing member),
+        # creation is skipped and the new disk is never re-added. Health
+        # path should be: detect missing-member case, fail closed OR run
+        # `mdadm --add`. Out of scope for bootstrap PR.
+        array_exists: "{{ 'OUR_ARRAY:' in (array_detect.stdout | default('')) }}"
+
+    - name: Show detected state
+      ansible.builtin.debug:
+        msg: "data RAID1 (name={{ data_raid_name }}) already present on candidates: {{ array_exists }}"
+
+    - name: Create RAID{{ data_raid_level }} array
+      ansible.builtin.command:
+        cmd: >-
+          mdadm --create {{ md_device }}
+          --level={{ data_raid_level }}
+          --raid-devices={{ data_raid_devices | length }}
+          --metadata=1.2
+          --name={{ data_raid_name }}
+          --homehost=any
+          --run
+          {{ data_raid_devices | join(' ') }}
+      when: not array_exists
+      register: mdadm_create
+      changed_when: mdadm_create.rc == 0
+
+    - name: Wait for the by-name device node to appear
+      ansible.builtin.stat:
+        path: "{{ md_device }}"
+      register: md_dev_stat
+      retries: 30
+      delay: 2
+      until: md_dev_stat.stat.exists
+      # In --check mode the mdadm --create above is a no-op, so we'd wait
+      # 60 s for a device that will never appear. Skip the wait when the
+      # array doesn't already exist AND we're in check mode.
+      when: array_exists or not ansible_check_mode
+
+    - name: Wait for resync to finish (or report unchanged if already clean)
+      ansible.builtin.command:
+        cmd: mdadm --wait-clean {{ md_device }}
+      when: mdadm_create is defined and mdadm_create.changed
+      changed_when: false
+      failed_when: false   # --wait-clean can return non-zero during resync
+
+    - name: Compute the desired mdadm.conf ARRAY line for our array
+      ansible.builtin.shell:
+        cmd: |
+          mdadm --detail --scan | awk -v n="{{ data_raid_name }}" '$0 ~ ("name=([^ ]+:)?" n "( |$)") {print; exit}'
+        executable: /bin/bash
+      register: desired_array_line
+      changed_when: false
+
+    - name: Ensure /etc/mdadm/mdadm.conf exists
+      ansible.builtin.file:
+        path: /etc/mdadm/mdadm.conf
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Read current mdadm.conf
+      ansible.builtin.slurp:
+        src: /etc/mdadm/mdadm.conf
+      register: current_mdadm_conf
+
+    - name: Count ARRAY lines for our array currently in mdadm.conf
+      ansible.builtin.shell:
+        cmd: |
+          grep -cE "^ARRAY .* name=([^ ]+:)?{{ data_raid_name }}( |$)" /etc/mdadm/mdadm.conf || true
+        executable: /bin/bash
+      register: existing_array_line_count
+      changed_when: false
+
+    - name: Decide whether mdadm.conf needs to be updated
+      ansible.builtin.set_fact:
+        # We need to (re)write if EITHER:
+        #   - the desired line is non-empty and not yet present, OR
+        #   - there are zero or more-than-one ARRAY lines for our array
+        #     (catches the "stale duplicate left behind" case codex round 2
+        #     flagged where the desired line is present but a stale line
+        #     for the same array name also remains).
+        mdadm_conf_needs_update: >-
+          {{
+            (desired_array_line.stdout | trim) != ''
+            and (
+              (desired_array_line.stdout | trim) not in
+                (current_mdadm_conf.content | b64decode)
+              or (existing_array_line_count.stdout | trim | int) != 1
+            )
+          }}
+
+    - name: Persist mdadm config to /etc/mdadm/mdadm.conf (only when content drifts)
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          # Remove every prior ARRAY entry for our array name (including
+          # duplicates from past partial runs), then append the freshly-
+          # detected canonical ARRAY line.
+          sed -i -E "/^ARRAY .* name=([^ ]+:)?{{ data_raid_name }}( |$)/d" /etc/mdadm/mdadm.conf
+          printf '%s\n' "{{ desired_array_line.stdout | trim }}" >> /etc/mdadm/mdadm.conf
+        executable: /bin/bash
+      register: mdadm_conf_write
+      changed_when: mdadm_conf_needs_update
+      when: mdadm_conf_needs_update
+
+    - name: Update initramfs (only when mdadm.conf actually changed)
+      ansible.builtin.command:
+        cmd: update-initramfs -u
+      when: (mdadm_create is defined and mdadm_create.changed) or mdadm_conf_needs_update
+      changed_when: true
+
+    - name: Check current filesystem on the array
+      ansible.builtin.command:
+        cmd: blkid -s TYPE -o value {{ md_device }}
+      register: array_fstype
+      changed_when: false
+      failed_when: false
+
+    - name: Format array with {{ data_raid_filesystem }} (only when unformatted)
+      community.general.filesystem:
+        fstype: "{{ data_raid_filesystem }}"
+        dev: "{{ md_device }}"
+        force: false
+      when: (array_fstype.stdout | default('') | trim) == ""
+
+    - name: Ensure data mount point exists
+      ansible.builtin.file:
+        path: "{{ data_mount_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Mount the data volume + fstab entry
+      ansible.posix.mount:
+        path: "{{ data_mount_path }}"
+        src: "{{ md_device }}"
+        fstype: "{{ data_raid_filesystem }}"
+        opts: "defaults,noatime,nodiratime"
+        state: mounted

@@ -1,0 +1,22 @@
+---
+# Orchestrator playbook. Runs every step in order. Use this for full
+# bootstrap of a fresh SEV-SNP host. Each sub-playbook is idempotent
+# and may be run independently (handy for partial re-runs / debugging).
+#
+# Reboot semantics: 02-snp-kernel-prep.yml may reboot the host if
+# GRUB_CMDLINE_LINUX changed. Subsequent runs are no-op.
+
+- name: 00 — Preflight
+  ansible.builtin.import_playbook: 00-preflight.yml
+
+- name: 02 — SEV-SNP kernel prep
+  ansible.builtin.import_playbook: 02-snp-kernel-prep.yml
+
+- name: 03 — private network LACP bond + static IP
+  ansible.builtin.import_playbook: 03-private-network.yml
+
+- name: 04 — Data RAID1 + mount
+  ansible.builtin.import_playbook: 04-data-raid.yml
+
+- name: 05 — k3s install
+  ansible.builtin.import_playbook: 05-k3s-install.yml

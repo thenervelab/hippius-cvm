@@ -1,0 +1,29 @@
+# `tenant-uki.auto.pkrvars.hcl` — operator-supplied build inputs.
+#
+# Copy this file to `tenant-uki.auto.pkrvars.hcl` (gitignored) and fill
+# in the actual values. Packer auto-loads any `*.auto.pkrvars.hcl`
+# in the working directory.
+#
+# DO NOT commit the filled-in copy — the SHA-256 below is non-secret
+# but the file is the operator's "I verified this against debian.org
+# SHA256SUMS.sign" attestation; it should live in the build host's
+# secrets store (Vault / sealed-secret in k8s), not the repo.
+
+# Debian Bookworm 12.x netinst — set to the exact point release you
+# verified.
+debian_iso_release = "12.8.0"
+debian_iso_url     = "https://cdimage.debian.org/debian-cd/12.8.0/amd64/iso-cd/debian-12.8.0-amd64-netinst.iso"
+
+# SHA-256 from `debian-cd/12.X.0/amd64/iso-cd/SHA256SUMS`. Verify
+# `SHA256SUMS.sign` against a trusted Debian release key (e.g.
+# `gpg --verify SHA256SUMS.sign SHA256SUMS` with keyring populated
+# from a *signed* Debian source — NOT the same TLS connection that
+# served the ISO).
+debian_iso_sha256 = "sha256:<paste the verified hex digest here>"
+
+# Build identity. PR-F4 reads this into the signed provenance map.
+image_version = "0.0.1-pr-f1-skeleton"
+
+# qemu accelerator override for the build host (linux → kvm,
+# darwin → hvf, anywhere → tcg).
+qemu_accelerator = "kvm"

@@ -1,0 +1,56 @@
+---
+# Argo CD Application — Cilium CNI. PR-K3, §K (#54).
+#
+# Sync wave 1: the very first addon. Cilium provides pod networking, so
+# the node only reports `Ready` once this is converged — every other
+# addon and app waits behind it.
+#
+# Bootstrap note: the cluster has no CNI until Cilium is installed, and
+# Argo CD's own pods need pod networking to run. Cilium is therefore
+# also `helm install`-ed imperatively ONCE at cluster bootstrap (before
+# Argo CD); this Application then adopts and reconciles that release.
+# See deploy/gitops/README.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-cilium
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-cilium
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: cni
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  # Cascade-delete the addon's resources if this Application is deleted.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    # The wrapper chart — Argo CD runs `helm dependency build` from
+    # Chart.lock and renders it with the sibling values.yaml.
+    path: deploy/gitops/addons/cilium
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    # Fully automated GitOps — non-negotiable, fleet-wide.
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      # Cilium ships large CRDs — server-side apply avoids the
+      # client-side `last-applied-configuration` annotation size limit.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

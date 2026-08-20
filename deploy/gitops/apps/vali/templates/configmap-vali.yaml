@@ -1,0 +1,327 @@
+---
+# vali Django config — non-secret env. PR-K7, §K (#54).
+#
+# Keys are the literal env-var names; the Deployment pulls them with
+# `envFrom`. Secrets (DATABASE_URL, DJANGO_SECRET_KEY) are NOT here —
+# they come from ExternalSecrets. vali's settings.py gives every other
+# `VALI_*` knob a safe default, so only these four need setting for the
+# OrderTicket-intake deployment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vali-config
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: vali
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  # Production: DEBUG off (settings.py then REFUSES the placeholder
+  # SECRET_KEY — the real key arrives via the vali-django Secret).
+  DJANGO_DEBUG: "false"
+  DJANGO_ALLOWED_HOSTS: {{ .Values.config.allowedHosts | quote }}
+  {{- if .Values.publicApiIngress.enabled }}
+  # The PUBLIC OpenAPI document's path filter, rendered from the SAME list
+  # that builds the Ingress rules — so `/v1/public/docs` describes exactly
+  # the routes `api.hippius.network` serves, and adding or removing a
+  # public path updates both at once. Never hand-maintain a second list.
+  # The docs routes themselves are excluded: they are documentation, not
+  # API surface, and listing them would document the documentation.
+  VALI_PUBLIC_API_PATHS: {{ without .Values.publicApiIngress.allowedPaths "/v1/public/docs" "/v1/public/schema" | join "," | quote }}
+  {{- end }}
+  # Hard cap on an inbound OrderTicket body — and Django's matching
+  # pre-body-read limit, kept in lockstep so a body vali would accept is
+  # never rejected first by `RequestDataTooBig` (settings.py mirrors
+  # these two).
+  VALI_TICKET_MAX_BYTES: {{ .Values.config.ticketMaxBytes | quote }}
+  DJANGO_DATA_UPLOAD_MAX_MEMORY_SIZE: {{ .Values.config.ticketMaxBytes | quote }}
+  # The OrderTicket intake view shells out to this Rust binary for
+  # COSE_Sign1 parsing — bundled in the image at this path.
+  VALI_TICKET_VALIDATOR_BIN: "/usr/local/bin/hippius-ticket-validator"
+  # thebrain JSON-RPC endpoint for the §23 chain read (scheduler) + the
+  # Edge registry feed (GET /v1/edge/registry). The image's
+  # `read-miner-status` is built `--features tls` so it reaches this
+  # HTTPS testnet over vali's `world:443` egress. Empty ⇒ fail-closed.
+  VALI_THEBRAIN_RPC_URL: {{ .Values.config.thebrainRpcUrl | quote }}
+  # The single `ServiceClient.name` that `IsMinerAdmin` accepts on the
+  # miner-register / quarantine endpoints. Seeded by `manage.py
+  # vali_identity_seed_miner_admin` — see vali/apps/miners/README.md.
+  # Empty fails closed.
+  VALI_MINER_ADMIN_PRINCIPAL: {{ .Values.config.minerAdminPrincipal | quote }}
+  # Blackbox host-attestor admin-release (PR-9). The single
+  # `ServiceClient.name` that `IsHostAttestorAdmin` accepts on
+  # `POST /v1/admin/host-attestor/release` (a fleet-wide trust-root
+  # action). Empty fails closed.
+  VALI_HOST_ATTESTOR_ADMIN_PRINCIPAL: {{ .Values.config.hostAttestorAdminPrincipal | default "" | quote }}
+  # Keyless cosign verification of the release artifact — the PINNED CI
+  # signing identity (SAN) + OIDC issuer of `blackbox-uki-build.yml`. NOT
+  # secrets (public CI identity). Empty identity fails closed (vali refuses
+  # to verify an unpinned identity).
+  VALI_HOST_ATTESTOR_COSIGN_IDENTITY: {{ .Values.config.hostAttestorCosignIdentity | default "" | quote }}
+  VALI_HOST_ATTESTOR_COSIGN_ISSUER: {{ .Values.config.hostAttestorCosignIssuer | default "https://token.actions.githubusercontent.com" | quote }}
+  VALI_COSIGN_BIN: {{ .Values.config.cosignBin | default "cosign" | quote }}
+  # Reconcile liveness window (seconds) — how recently an `attested`
+  # host-attestor must have been seen to count as covered. WARN-ONLY.
+  VALI_HOST_ATTESTOR_LIVENESS_WINDOW_S: {{ .Values.config.hostAttestorLivenessWindowS | default 600 | quote }}
+  # The KBS L0 Ed25519 PUBLIC verifying key (64 hex) a `SignedHostAttestor
+  # Cert` / `LiveAttestation` signature is checked against. A PUBLIC key —
+  # never a secret. Read by the ingest (web), the §23 dispatchability gate
+  # and the liveness meter, so it lives in the ConfigMap every workload
+  # gets via `envFrom` rather than on one Deployment. Empty ⇒ every
+  # ingested cert stays `pending` FOREVER and the gate below has nothing
+  # to consume. Empty is a LEGITIMATE pre-arming state, so this is not
+  # blanket-`required` — instead the real invariant is enforced: an ARMED
+  # gate with no verifying key is refused at render time, because that
+  # combination makes the WHOLE FLEET undispatchable.
+  {{- if and .Values.hostAttestor.gateEnforce (not .Values.hostAttestor.kbsL0VerifyingKey) }}
+  {{- fail "hostAttestor.gateEnforce is true but hostAttestor.kbsL0VerifyingKey is empty — every attestor cert would stay `pending`, which the ENFORCE gate never accepts, so NO miner would be dispatchable. Wire the key or disarm the gate." }}
+  {{- end }}
+  VALI_KBS_L0_VERIFYING_KEY: {{ .Values.hostAttestor.kbsL0VerifyingKey | quote }}
+  # §23 dispatchability gate (blackbox host-attestor PR-11). TRUE ⇒ a
+  # miner is dispatchable only if it ALSO carries an `attested` (never
+  # `pending`) host-attestor row inside the liveness window on a desired
+  # release measurement. Fail-closed. `required` (NOT `| default`) on
+  # purpose: settings.py defaults this to FALSE, so an absent key here
+  # SILENTLY DISARMS the gate — the chart must SAY which regime is live.
+  # Armed 2026-07-20; see values.yaml before flipping.
+  VALI_HOST_ATTESTOR_GATE_ENFORCE: {{ required "hostAttestor.gateEnforce must be set explicitly — absent silently disarms the §23 host-attestor dispatchability gate" .Values.hostAttestor.gateEnforce | quote }}
+  # §23 reward multiplier (same PR-11 pair). TRUE ⇒ a miner's epoch weight
+  # is MULTIPLIED by its attestor liveness ratio. Same `required`
+  # rationale: this decides who gets paid.
+  VALI_REWARD_REQUIRE_ATTESTOR: {{ required "hostAttestor.rewardRequireAttestor must be set explicitly — absent silently disarms the §23 attestor reward multiplier" .Values.hostAttestor.rewardRequireAttestor | quote }}
+  # The single `ServiceClient.name` that `IsOrchestrationRoot` accepts on
+  # the root-only orchestration endpoints: `POST /v1/vm/launch` (#587
+  # Phase 1), `POST /v1/vm/<id>/migrate`, `POST /v1/vm/<id>/decommission`.
+  # Empty fails closed (every call 403s) — set it to make the production
+  # API launch path callable. Seed the matching ServiceClient + a token.
+  VALI_ORCHESTRATION_ROOT_PRINCIPAL: {{ .Values.config.orchestrationRootPrincipal | quote }}
+  # Edge order-dispatch endpoint (§H phase-2, PR #153). `vali_dispatch_
+  # launch` POSTs the canonical-CBOR OrderBody here; the Edge inner
+  # listener signs it with its Ed25519 key (from #144) and forwards to
+  # the miner-agent. The Edge inner service is ClusterIP-only on port
+  # 8444, NetworkPolicy-gated to allow only the vali namespace +
+  # gated on `orderSigning.enabled` in the edge-gateway chart.
+  VALI_EDGE_ORDER_URL: {{ .Values.config.edgeOrderUrl | quote }}
+  # §24/§25 guest-ward relay base — the migration/decommission effects
+  # POST {url}/v1/relay/{vm}/{quiesce,snapshot,…} to the SAME Edge inner
+  # listener as order dispatch. Without it a MigrationJob stalls at quiescing.
+  VALI_EDGE_GATEWAY_URL: {{ .Values.config.edgeOrderUrl | quote }}
+  # Dir for §24/§25 effect idempotency markers (under the pod /tmp). Without
+  # it the _guarded effect wrapper fails closed and the migration stalls.
+  VALI_IDEMPOTENCY_DIR: "/tmp/vali-idempotency"
+  # KBS admin endpoint (§24/§25 lifecycle pre-registration). vali's
+  # `vali_dispatch_launch` POSTs the L1-signed OrderTicket here BEFORE
+  # the order-dispatch step so the downstream §7 release path has a
+  # `VmState::Active` for `vm_states.get` to match. Without this URL
+  # the dispatch fails closed with `kbs-admin-unavailable`.
+  VALI_KBS_ADMIN_URL: {{ .Values.config.kbsAdminUrl | quote }}
+  # Path to the `hippius-kbs-admin-client` Rust binary the subprocess
+  # spawns. Baked into the vali image at this path; the chart value
+  # here is just the override hook for non-default deployments.
+  VALI_KBS_ADMIN_CLIENT_BIN: "/usr/local/bin/hippius-kbs-admin-client"
+  # Subprocess timeout, seconds. The admin path is in-memory on the
+  # KBS side (ticket verify + CAS); 5 s is generous.
+  VALI_KBS_ADMIN_TIMEOUT_SECS: {{ .Values.config.kbsAdminTimeoutSecs | quote }}
+  # ── `vali_create_vm` operator-CLI kill-switch ────────────────────
+  #
+  # "true" DISABLES the `vali_create_vm` operator CLI on this cluster
+  # (launches then go through the `POST /v1/vm/launch` API only). The
+  # §22 auto-pin signs with the prod Vault root seed regardless — this
+  # gate is about the CLI surface, not the signing key.
+  VALI_ALLOW_PROD: {{ .Values.config.allowProd | quote }}
+  # Vault KV v2 endpoint vali writes tenant secrets to. Token comes
+  # from `VAULT_TOKEN` env at invocation time (NOT the pod env); the
+  # CA bundle path is settings-pinned so a tampered token cannot
+  # disable cert verification.
+  VALI_VAULT_ADDR: {{ .Values.config.vaultAddr | quote }}
+  VALI_VAULT_CACERT: {{ .Values.config.vaultCacert | quote }}
+  # KV mount + per-tenant path prefix. Both KBS-side release + vali-
+  # side write read these from the SAME settings, so they cannot drift.
+  VALI_VAULT_KV_MOUNT: {{ .Values.config.vaultKvMount | quote }}
+  VALI_VAULT_KV_PREFIX: {{ .Values.config.vaultKvPrefix | quote }}
+  # Cross-built `hippius-order-ticket-mint` binary. Baked into the
+  # vali image at this path; `services/ticket_mint.py` subprocesses it.
+  VALI_ORDER_TICKET_MINT_BIN: "/usr/local/bin/hippius-order-ticket-mint"
+  # L1 OrderTicket Ed25519 signing seed — PRODUCTION (and the SOLE
+  # source): a Vault KV v2 path (under VALI_VAULT_KV_MOUNT) holding the
+  # 32-byte seed as `seed=<hex>`. vali fetches it, materializes a 0600
+  # tmpfs file for the mint binary, and drops it. #587 Phase 1A. The
+  # `VALI_L1_SIGNING_KEY_PATH` file fallback remains a code-level test
+  # affordance only — deliberately UNSET here so production mints fail
+  # closed rather than read a stale committed dev seed.
+  VALI_L1_SIGNING_KEY_VAULT_PATH: {{ .Values.config.l1SigningKeyVaultPath | quote }}
+  # §22 allowlist root signing seed — PRODUCTION: a Vault KV v2 path
+  # (under VALI_VAULT_KV_MOUNT) holding the 32-byte seed as `seed=<hex>`.
+  # vali (the trusted control plane) signs every §22 artifact with this
+  # seed; the KBS pins the matching root pubkey. The committed-dev-seed
+  # FILE fallback (`VALI_KBS_ALLOWLIST_ROOT_SEED_PATH`) is a code-only
+  # test affordance — deliberately UNSET here so production fails closed
+  # rather than read a stale committed dev seed. #587 Phase 1A.
+  VALI_KBS_ALLOWLIST_ROOT_SEED_VAULT_PATH: {{ .Values.config.kbsAllowlistRootSeedVaultPath | quote }}
+  # Registry-feed signing seed (signs the Edge admission feed, audit
+  # M-registry-mTLS) — a Vault KV v2 path holding `seed=<hex>`. Unset ⇒
+  # the feed is served UNSIGNED (pre-pin window). The Edge pins the
+  # matching pubkey via EDGE_REGISTRY_FEED_PUBKEY.
+  VALI_EDGE_REGISTRY_FEED_SIGNING_SEED_VAULT_PATH: {{ .Values.config.edgeRegistryFeedSigningSeedVaultPath | default "" | quote }}
+  # C2: vali's independent SNP launch-digest recompute. The pinned OVMF
+  # (identical Genoa+Turin) staged in S3 + its SHA; the snp-featured
+  # recompute binary; ENFORCE gate. Empty OVMF pin ⇒ recompute disabled
+  # (fail-open). ENFORCE=false ⇒ WARN (compare+log, still pin miner value);
+  # true ⇒ refuse a mismatch + pin ONLY vali's recompute.
+  VALI_LAUNCH_DIGEST_BIN: "/usr/local/bin/hippius-launch-digest"
+  VALI_SNP_OVMF_S3_URI: {{ .Values.config.snpOvmfS3Uri | default "" | quote }}
+  VALI_SNP_OVMF_SHA256: {{ .Values.config.snpOvmfSha256 | default "" | quote }}
+  VALI_SNP_GUEST_FEATURES: {{ .Values.config.snpGuestFeatures | default "0x1" | quote }}
+  VALI_LAUNCH_DIGEST_ENFORCE: {{ .Values.config.launchDigestEnforce | default false | quote }}
+  VALI_KBS_ALLOWLIST_TOOL_BIN: "/usr/local/bin/hippius-kbs-allowlist-tool"
+  # In-cluster manifest TOML the auto-pin reads + bumps + signs. The
+  # operator mounts this via a ConfigMap so it can be edited in place;
+  # the auto-pin writes a temp copy + signs it (the source TOML is
+  # never mutated).
+  VALI_ALLOWLIST_MANIFEST_PATH: {{ .Values.config.allowlistManifestPath | quote }}
+  # S3 URL the KBS init container fetches — MUST equal the KBS chart's
+  # `allowlist.url`. Vali's auto-pin both uploads to this URL AND POSTs
+  # the bytes to `${VALI_KBS_ADMIN_URL}/v1/admin/allowlist/reload` so
+  # the in-memory state + the startup-replay state stay in sync.
+  VALI_KBS_ALLOWLIST_S3_URL: {{ .Values.config.kbsAllowlistS3Url | quote }}
+  VALI_S3_ENDPOINT_URL: {{ .Values.config.s3EndpointUrl | quote }}
+  # ── Real S3 client (§25 snapshot/restore presigns) ────────────────
+  # The §25 migration snapshot UPLOAD + dest RESTORE download ride
+  # presigned S3 URLs that vali (web + orchestration-tick) mints via
+  # `apps.storage.s3.get_s3_client()`. Default factory is the in-process
+  # MOCK (emits `mock-s3://…` — fine for tests, fatal for a live
+  # migration). Flip it to the boto factory + give it the endpoint so
+  # the presigned PUT/GET point at the real object store. Credentials
+  # for the PRESIGN (SigV4 signing) come from the `vali-s3` Secret via
+  # AWS_* env on the Deployments; the miner only needs the URL.
+  VALI_S3_CLIENT_FACTORY: "apps.storage.s3.boto_factory"
+  HIPPIUS_S3_ENDPOINT_URL: {{ .Values.config.s3EndpointUrl | quote }}
+  # MinIO requires a non-empty region for SigV4 presigning; the value
+  # is not validated by the store but must match between sign + verify.
+  HIPPIUS_S3_REGION_NAME: {{ .Values.config.s3RegionName | quote }}
+  # §25 snapshot bucket. The operator S3 creds (vali-s3) have full
+  # access to the images bucket but cannot create a separate
+  # `hippius-compute-migrations` bucket (AccessDenied), so the snapshot
+  # objects live UNDER the images bucket at the `migrations/<vm>/<job>.luks`
+  # key prefix the state machine already builds. Without this override the
+  # default points at a non-existent bucket → the miner's presigned PUT 404s.
+  VALI_ORCHESTRATION_SNAPSHOT_BUCKET: {{ .Values.config.snapshotBucket | quote }}
+  # ── the KBS admin hop's mTLS material ─────────────────────────────
+  # Required together once VALI_KBS_ADMIN_URL is https://; refused
+  # (fail-closed, no downgrade) if any is missing. The CA REPLACES the
+  # system trust store for this hop — see services/kbs_admin_tls.py.
+  # Always rendered, so "unauthenticated" is a visible empty value in
+  # the ConfigMap rather than an absent key nobody can see.
+  VALI_KBS_ADMIN_CACERT: {{ .Values.config.kbsAdminCacert | quote }}
+  VALI_KBS_ADMIN_CLIENT_CERT: {{ .Values.config.kbsAdminClientCert | quote }}
+  VALI_KBS_ADMIN_CLIENT_KEY: {{ .Values.config.kbsAdminClientKey | quote }}
+  # Light-tier acknowledgements — named, reasoned, ≤30-day declarations that
+  # a specific check's CURRENT failure is known and accepted, so it does not
+  # pin `hippius_synthetic_light_success` at 0 and drown every OTHER light
+  # check. The acknowledged check is still run, still logged WARNING, still
+  # publishes `light_check_success{check} == 0`, and (for the chain fossil)
+  # keeps its own `ChainScoringPalletFossil` alert. Deliberately NOT guarded
+  # by any `if`: the key must always be present, so "acknowledged nothing" is
+  # an explicit empty value rather than an absent key nobody can see. Read
+  # apps/synthetic/ack.py before adding an entry.
+  VALI_SYNTHETIC_ACK: {{ .Values.syntheticMonitor.light.acknowledgements | default "" | quote }}
+  # What the KBS process is SUPPOSED to be enforcing — diffed every ~15 min
+  # against what the RUNNING kbs-server reports (`check_kbs_config_drift`).
+  # The KBS reads its config ONCE at start and its Deployment carries no
+  # `checksum/config` annotation (correctly: rolling it wipes the
+  # state/audit/evidence emptyDirs inside its Kata CVM), so an edited KBS
+  # ConfigMap can sit next to a process that never read it while ArgoCD
+  # says Synced + Healthy. `required` — not defaulted — because an absent
+  # expectation means nothing is being checked, and that must fail the
+  # render rather than quietly disarm the check.
+  VALI_KBS_EXPECTED_POSTURE: {{ required "syntheticMonitor.light.kbsExpectedPosture must be set — it is what the running KBS is diffed against; CI pins it to the KBS chart's rendered config.toml" .Values.syntheticMonitor.light.kbsExpectedPosture | quote }}
+  {{- if .Values.tenantBake.enabled }}
+  # #334 Phase 2 — wire `apps.tenant_bake.k8s_jobs.spec_from_settings`
+  # to the helm-chosen values. The runtime defaults already match
+  # these (so a dev `runserver` works without env), but production
+  # overrides come from helm — never code-edit.
+  VALI_TENANT_BAKE_K8S_ENABLED: "true"
+  VALI_TENANT_BAKE_NAMESPACE: {{ .Release.Namespace | quote }}
+  VALI_TENANT_BAKE_IMAGE: "{{ .Values.tenantBake.image.repository }}@{{ .Values.tenantBake.image.digest }}"
+  VALI_TENANT_BAKE_IMAGE_PULL_SECRET: {{ .Values.image.pullSecret.name | quote }}
+  VALI_TENANT_BAKE_SERVICE_ACCOUNT: {{ .Values.tenantBake.bakerServiceAccount.name | quote }}
+  VALI_TENANT_BAKE_VALI_INTERNAL_URL: "http://vali.{{ .Release.Namespace }}.svc.cluster.local:8000"
+  VALI_TENANT_BAKE_WORKER_TOKEN_SECRET: {{ .Values.tenantBake.workerTokenSecret.name | quote }}
+  VALI_TENANT_BAKE_WORKER_TOKEN_KEY: {{ .Values.tenantBake.workerTokenSecret.key | quote }}
+  VALI_TENANT_BAKE_WORKER_PRINCIPAL: {{ .Values.tenantBake.workerPrincipal | quote }}
+  VALI_TENANT_BAKE_WORK_DIR_SIZE: {{ .Values.tenantBake.workDirSize | quote }}
+  VALI_TENANT_BAKE_BACKOFF_LIMIT: {{ .Values.tenantBake.backoffLimit | quote }}
+  # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The ROLE is the
+  # switch: settings.py defaults it to "" = fall back to the static
+  # `bake-vault-token` Secret — a Secret this namespace NO LONGER HAS
+  # (Phase 5 deleted it). The Job's `VAULT_TOKEN` ref is `optional`, so a
+  # chart missing these keys does not crash the pod; it produces a baker
+  # with NO Vault credential that dies later, at the transit-datakey call,
+  # looking like a Vault outage. Render all five.
+  VALI_TENANT_BAKE_VAULT_JWT_ROLE: {{ .Values.tenantBake.vault.jwtRole | quote }}
+  VALI_TENANT_BAKE_VAULT_JWT_AUTH_PATH: {{ .Values.tenantBake.vault.jwtAuthPath | quote }}
+  VALI_TENANT_BAKE_VAULT_JWT_AUDIENCE: {{ .Values.tenantBake.vault.jwtAudience | quote }}
+  VALI_TENANT_BAKE_VAULT_JWT_MOUNT_PATH: {{ .Values.tenantBake.vault.jwtMountPath | quote }}
+  # Name of the static-token Secret the (optional) transition fallback
+  # points at. Named here so the fallback target is visible in git rather
+  # than only in a Python default.
+  VALI_TENANT_BAKE_VAULT_TOKEN_SECRET: {{ .Values.tenantBake.vault.tokenSecret | quote }}
+  # §23 uptime billing — the source `compute_epoch_weights` ranks miners
+  # by: "snapshot" (the on-chain score snapshot, legacy) or "usage" (the
+  # attested per-VM served-receipt UsageAccrual ledger — pay only for UP
+  # VMs). Flipped to "usage" once the served-receipt pipeline was proven
+  # flowing end-to-end (2026-07-01). A miner with no attested VM usage in
+  # the current epoch gets zero weight — that is the intended fail-closed
+  # semantics of usage-based compute rewards.
+  VALI_EPOCH_WEIGHT_SOURCE: {{ .Values.epochWeightSource | default "snapshot" | quote }}
+  # §23 — VM owners (the launch spec's `user_id`, recorded as
+  # `Placement.owner`) whose usage earns NO reward weight and NO bill:
+  # OUR OWN infrastructure. Measured live 2026-08-11, operator VMs held
+  # 30.6 % of the reward pot. The synthetic monitor's own tenant
+  # (`VALI_SYNTHETIC_TENANT_ID`) is excluded by construction and does NOT
+  # need to be listed here — this is for the OTHER operator identities
+  # (rehearsals, proofs). Empty ⇒ only the synthetic tenant is excluded.
+  VALI_REWARD_EXCLUDED_OWNERS: {{ .Values.rewardExcludedOwners | join "," | quote }}
+  # §23 uptime-LIVENESS gate. `required` (NOT `| default`) on purpose:
+  # this value decides whether a killed VM can still be paid, so the
+  # chart must SAY which regime is live — never let it be inferred from
+  # an absent key. `false` = today's behaviour (a receipt alone accrues);
+  # `true` = credit only the part of a receipt window covered by a
+  # KBS-L0-signed, SNP-rooted live attestation, zero for the rest. Read
+  # the arming sequence in values.yaml BEFORE flipping this: arming it
+  # on a fleet whose guests do not yet answer keepalive challenges stops
+  # all reward accrual.
+  VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION: {{ required "uptimeLiveness.requireAttestation must be set explicitly — false keeps today's accrual, true credits only SNP-attested-alive time; see values.yaml for the arming sequence" .Values.uptimeLiveness.requireAttestation | quote }}
+  VALI_UPTIME_LIVENESS_COVERAGE_S: {{ .Values.uptimeLiveness.coverageSeconds | quote }}
+  VALI_UPTIME_LIVENESS_GRACE_S: {{ .Values.uptimeLiveness.graceSeconds | quote }}
+  # §23 placement concentration cap (soft): de-prioritise a miner already
+  # hosting ≥ this fraction of all active placements, so tenant VMs spread
+  # across the fleet instead of piling on the single cheapest miner. 1.0 =
+  # no cap. See scheduler.placement.decide_placement.
+  VALI_SCHEDULER_MAX_HOST_SHARE: {{ .Values.scheduler.maxHostShare | quote }}
+  # §23 fit gate + slot accounting (#668). Rendered EXPLICITLY — including
+  # the two that currently equal their settings.py default. Relying on a
+  # code default is exactly how `slotRefCpus` (live 2, default 4) and
+  # `hostReserveMemoryMb` (live 2048, default 4096) sat outside the chart
+  # unnoticed: a sync would have silently halved advertised slot counts
+  # and doubled the per-host memory reservation on every miner, evicting
+  # capacity the fleet is already running. If the code default changes,
+  # these four keys are what keeps the fleet where the operator put it.
+  VALI_SCHEDULER_HOST_RESERVE_CPUS: {{ .Values.scheduler.hostReserveCpus | quote }}
+  VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB: {{ .Values.scheduler.hostReserveMemoryMb | quote }}
+  VALI_SCHEDULER_SLOT_REF_CPUS: {{ .Values.scheduler.slotRefCpus | quote }}
+  VALI_SCHEDULER_SLOT_REF_MEMORY_MB: {{ .Values.scheduler.slotRefMemoryMb | quote }}
+  # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids
+  # (distro → Succeeded golden bake_id, JSON) + the Pushgateway URL result
+  # metrics are pushed to. Every other VALI_SYNTHETIC_* knob keeps its
+  # settings.py default.
+  VALI_SYNTHETIC_PUSHGATEWAY_URL: {{ .Values.config.syntheticPushgatewayUrl | quote }}
+  {{- if .Values.tenantBake.cache.enabled }}
+  # Stage-1 bake cache PVC (perf) — bake Jobs mount this at /cache
+  # and reuse the tenant-independent half of the bake across bakes.
+  # The PVC itself is provisioned by pvc-tenant-bake-cache.yaml.
+  VALI_TENANT_BAKE_CACHE_PVC: {{ .Values.tenantBake.cache.pvcName | quote }}
+  {{- end }}
+  {{- end }}

@@ -1,0 +1,80 @@
+{{- if .Values.tenantBake.enabled }}
+---
+# #334 Phase 2 — RBAC for vali to spawn `hippius-tenant-baker` Jobs
+# in its own namespace, and the baker pod's own SA (no RBAC; it
+# only needs Vault + S3 + the in-cluster Service URL).
+#
+# Threat model: vali's SA gains `create/get/list/delete jobs` in
+# its own namespace ONLY. It cannot reach other namespaces, cannot
+# touch pods/services/secrets, cannot create RBAC. The baker pod's
+# SA carries NO permissions at all — it auths to vali with the
+# worker token (a `ServiceClient` `ServiceToken`), to Vault with a
+# mounted token, to S3 with mounted creds. The k8s API is
+# unreachable from the baker pod.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.tenantBake.spawnerServiceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-bake-spawner
+---
+# Vali's reach: Jobs only, own namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vali-tenant-bake-spawner
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-bake-spawner
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    # `create`: the POST view's spawn step.
+    # `get`/`list`: the admin endpoint can echo current Job
+    # progression alongside the row state (PR-#334 phase 2.1).
+    # `delete`: the operator-triggered "abort a stuck bake" path
+    # (PR-#334 phase 2.1) — phase 2.0 does not exercise this but
+    # keeping it in the Role keeps the RBAC patch from re-opening
+    # every phase 2.x.
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vali-tenant-bake-spawner
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-bake-spawner
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.tenantBake.spawnerServiceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vali-tenant-bake-spawner
+---
+# Baker pod's SA — NO RBAC bound to it. The pod authenticates to
+# vali / Vault / S3 via tokens mounted from k8s secrets, not via
+# the SA token, so this SA carries no policy rules at all. Kept
+# distinct from `default` so a future ClusterRoleBinding doesn't
+# silently grant cluster-wide rights to "every pod that doesn't
+# specify an SA".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.tenantBake.bakerServiceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-baker
+# DO NOT add `automountServiceAccountToken: false` here — the pod
+# spec sets it. Setting it at the SA level too is belt+suspenders
+# but the pod-level flip is the authoritative one + matches the
+# rest of the chart's pattern.
+{{- end }}

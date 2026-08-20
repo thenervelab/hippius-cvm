@@ -1,0 +1,16 @@
+# `addons/metallb` — wrapper chart for MetalLB.
+#
+# Umbrella chart: pins the upstream `metallb` chart as a dependency and
+# adds this cluster's L2 configuration (IPAddressPool + L2Advertisement)
+# and a PodDisruptionBudget as local `templates/`. Argo CD renders it
+# (running `helm dependency build` from Chart.lock) and reconciles it.
+apiVersion: v2
+name: hippius-metallb
+description: MetalLB L2 LoadBalancer for hippius-compute bare-metal (single-node).
+type: application
+version: 0.1.0
+dependencies:
+  - name: metallb
+    # Pinned EXACTLY. Bump deliberately.
+    version: 0.16.0
+    repository: https://metallb.github.io/metallb

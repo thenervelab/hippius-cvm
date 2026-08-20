@@ -1,0 +1,340 @@
+---
+# vali network policy — default-deny + explicit. PR-K7, §K (#54).
+#
+# CiliumNetworkPolicy (Cilium is the CNI). Selecting the vali pod makes
+# it default-deny for ingress AND egress.
+#
+# Egress is intentionally MINIMAL — the deployed vali web service talks
+# only to Postgres (+ DNS). It does NOT call Vault (the External
+# Secrets Operator does that, separately), nor Hippius S3 (the S3
+# client factory is the in-process mock — settings.py
+# `VALI_S3_CLIENT_FACTORY`), nor thebrain RPC (the scheduler is a
+# separate management-command worker, not deployed here). Those egress
+# rules are added when §G3 (boto S3) / the scheduler land.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: vali
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.valiSelector" . | nindent 4 }}
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "vali.valiSelector" . | nindent 6 }}
+  ingress:
+    # kubelet liveness / readiness probes (host → pod).
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    # The Edge gateway relays OrderTickets to vali; the Sentinel reads
+    # telemetry from it. Scoped to those pods by name + namespace
+    # (least privilege), not the whole namespace. Cluster-internal only
+    # — no `world` ingress.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: edge-gateway
+            k8s:app.kubernetes.io/name: hippius-edge-gateway
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sentinel
+            k8s:app.kubernetes.io/name: hippius-sentinel
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- if .Values.tenantBake.enabled }}
+    # ── tenant-bake worker callback (#334 Phase 2) ──
+    #
+    # The `hippius-tenant-baker` Job pod POSTs its state transitions
+    # (claim → Running, finalize → Succeeded/Failed) to vali's
+    # /v1/tenant-bakes/<id>/finalize, authenticated by the worker
+    # bearer token. Without this rule the baker's very first claim
+    # POST times out and the Job dies at step-1/6 (observed live
+    # 2026-06-10: `curl: (28) Connection timed out` to
+    # vali.vali.svc:8000 — the companion gap to the kube-apiserver
+    # egress rule above; both halves of the bake plumbing were
+    # missing from this default-deny policy).
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            k8s:app.kubernetes.io/name: hippius-tenant-baker
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- end }}
+    {{- if and .Values.epochClose.enabled .Values.epochClose.weightsUrl }}
+    # ── §23 epoch-close CronJob → GET /v1/admin/epoch-weights ──
+    # The closer reads vali's real per-miner merit weights to submit them
+    # on-chain. Without this rule Cilium drops its in-cluster GET and the
+    # closer silently falls back to the flat weight.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            k8s:app.kubernetes.io/component: epoch-close
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- end }}
+    {{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
+    # ── synthetic-monitor (apps.synthetic) → vali public API ──
+    # The light tier GET /healthz-probes the vali API; the full tier POSTs
+    # the real /v1/vm/launch + §24 decommission. The synthetic Job pods
+    # carry the vali identity label (valiSelector) but are a DISTINCT
+    # component, so they need an explicit ingress entry on the listen port
+    # (Cilium default-deny drops them otherwise — the vali_api check times
+    # out, mirroring the tenant-baker gap above).
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            k8s:app.kubernetes.io/component: synthetic-monitor-light
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            k8s:app.kubernetes.io/component: synthetic-monitor-full
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- end }}
+    {{- if .Values.publicApiIngress.enabled }}
+
+    # ── ingress-nginx controller → the public VM API ──
+    # `ingress-public-api.yaml` publishes `publicApiIngress.host` through
+    # the in-cluster nginx controller, and the Cloudflare Tunnel connector
+    # terminates on that same controller. But an Ingress only writes an
+    # nginx routing rule — it grants NOTHING at the network layer, and
+    # this policy is default-deny. Without this entry the controller's
+    # connection to vali:8000 is DROPPED, which surfaces as a public
+    # 504 and, in the controller log, as
+    #
+    #   upstream timed out (110) while CONNECTING to upstream
+    #
+    # — a *connect* timeout, not a refusal and not a slow response, which
+    # is the signature of a policy drop rather than an application fault.
+    # (Observed live 2026-08-18: the tunnel registered four QUIC
+    # connections and the Ingress resolved, yet every public request
+    # 504'd, because the Ingress shipped without this companion rule.
+    # Same shape as the tenant-baker and synthetic-monitor gaps above:
+    # each time, half the plumbing landed and the policy half did not.)
+    #
+    # Gated on the SAME flag that creates the Ingress, so the hole cannot
+    # outlive the public route it exists to serve. Scoped to the
+    # controller pods by name + component in their own namespace — not
+    # the whole namespace, and never `world`: the tunnel is the only
+    # public path in, and it lands here.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Values.publicApiIngress.controllerNamespace }}
+            k8s:app.kubernetes.io/name: {{ .Values.publicApiIngress.controllerName }}
+            k8s:app.kubernetes.io/component: controller
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    {{- end }}
+  egress:
+    # Postgres, in-namespace.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            {{- include "vali.postgresSelector" . | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    # DNS — to resolve `postgres.vali.svc` + edge-gateway-inner.svc.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Edge inner listener — `vali_dispatch_launch` POSTs the canonical-
+    # CBOR OrderBody to :8444 on the edge-gateway-inner ClusterIP service.
+    # §H phase-2 (PR #153). The Edge side has the symmetric ingress
+    # entry under `app.kubernetes.io/name=hippius-edge-gateway` on the
+    # same port. Without this egress rule, vali's Cilium default-deny
+    # blocks the dispatch with `edge-unreachable`.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: edge-gateway
+            k8s:app.kubernetes.io/name: hippius-edge-gateway
+      toPorts:
+        - ports:
+            - port: "8444"
+              protocol: TCP
+    # KBS admin endpoint — §24/§25 lifecycle pre-registration. vali's
+    # `vali_dispatch_launch` POSTs the L1-signed OrderTicket to
+    # `kbs-server-admin.kbs.svc:8001` BEFORE the order-dispatch step.
+    # The KBS side has the symmetric ingress entry under
+    # `app.kubernetes.io/name=kbs-server` on the same port. Without
+    # this egress rule, vali's Cilium default-deny blocks the
+    # subprocess and `vali_dispatch_launch` exits with
+    # `kbs-admin-unavailable`.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kbs
+            k8s:app.kubernetes.io/name: kbs-server
+      toPorts:
+        - ports:
+            - port: "8001"
+              protocol: TCP
+    {{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
+    # ── synthetic-monitor (apps.synthetic) egress ──
+    # (1) the vali public API on the listen port — the light vali_api
+    #     /healthz probe + the full tier's real /v1/vm/launch + §24 calls;
+    # (2) the observability Pushgateway on :9091 — where BOTH tiers PUSH
+    #     their result gauges (Prometheus scrapes the gateway).
+    # Without these two rules Cilium default-deny drops the in-cluster
+    # ClusterIP connections and the vali_api check + the metrics push time
+    # out (observed live 2026-07-21 on the first light run).
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            {{- include "vali.valiSelector" . | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: "{{ .Values.config.listenPort }}"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: observability
+            k8s:app.kubernetes.io/name: prometheus-pushgateway
+      toPorts:
+        - ports:
+            - port: "9091"
+              protocol: TCP
+    {{- end }}
+    {{- if .Values.tenantBake.enabled }}
+    # ── tenant-bake Job spawn (#334 Phase 2) ──
+    #
+    # `apps.tenant_bake.k8s_jobs.spawn_bake_job` calls the Kubernetes
+    # API (create/get/list batch/v1 Jobs under the
+    # `vali-tenant-bake-spawner` Role). Without this egress rule the
+    # SDK call to 10.43.0.1:443 times out and every bake row sits in
+    # `queued` forever — the RBAC landed with the feature but this
+    # Cilium rule was missed (observed live 2026-06-10:
+    # `k8s spawn failed: ... ConnectTimeoutError ... 10.43.0.1`).
+    # `kube-apiserver` is the dedicated Cilium entity for the API
+    # server identity (covers the ClusterIP DNAT to the host:6443
+    # backend on k3s).
+    - toEntities:
+        - kube-apiserver
+    {{- end }}
+    {{- if .Values.createVm.enabled }}
+    # ── `vali_create_vm` operator-tier egress (DEV-MODE only) ──
+    #
+    # The mgmt command writes tenant secrets to Vault (KV v2 PUT) and
+    # uploads the freshly-signed §22 allowlist to Hippius S3. Both
+    # destinations are external IPs the in-cluster ClusterIP DNS
+    # cannot resolve, so we open `world:443` + `world:8200` here. Same
+    # broad-egress trade-off the backup CronJob makes; tightening to
+    # `toFQDNs` is a follow-up once Cilium's DNS proxy is configured.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"  # s3.hippius.com — presign + cp
+              protocol: TCP
+            - port: "8200" # vault.hippius.network — KV v2 PUT/GET
+              protocol: TCP
+    {{- end }}
+---
+# Postgres network policy — only vali (the Deployment + the migration
+# Job, both `name: vali`) and the backup CronJob may connect. PR-K7.
+#
+# Defence in depth on top of Postgres' own password auth. The liveness
+# / readiness probes are `exec` (`pg_isready` inside the container), so
+# no host ingress rule is needed. Postgres makes no outbound calls.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: postgres
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.postgresSelector" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "vali.postgresSelector" . | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            app.kubernetes.io/name: vali-postgres-backup
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+  # Postgres makes no outbound connections — deny all egress.
+  egress: []
+---
+# Postgres-backup network policy. PR-K7, §K (#54).
+#
+# The nightly backup pod egresses to Postgres (pg_dump), DNS, and the
+# public internet on 443 (the `aws s3 cp` to Hippius S3). Nothing
+# connects to it. `world:443` is broad — tightening to a precise
+# `toFQDNs` set is a follow-up.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: vali-postgres-backup
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: vali-postgres-backup
+    app.kubernetes.io/component: postgres-backup
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: vali-postgres-backup
+  # Nothing connects to the backup pod — deny all ingress.
+  ingress: []
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            {{- include "vali.postgresSelector" . | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Hippius S3 (the `aws s3 cp` upload).
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

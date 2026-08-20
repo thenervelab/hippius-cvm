@@ -1,0 +1,35 @@
+# Helm values for the `mon-runner-k8s` AutoscalingRunnerSet
+# (chart: actions-runner-controller/gha-runner-scale-set @ 0.14.2).
+#
+# Apply with:
+#   helm upgrade --install mon-runner-k8s \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+#     --version 0.14.2 \
+#     -n arc-runners --create-namespace \
+#     -f runner/values.yaml
+#
+# Image pin: `registry.hippius.com/hip-team-private/hippius-runner-k8s`
+# is built by `.github/workflows/runner-image.yml` (pushed to GHCR there);
+# we mirror to our private registry because GHCR packages default to
+# private and our k8s nodes don't have a GHCR pull secret. Pin by digest
+# so a `:latest` retag at the registry can't silently change the runner
+# the workflows execute on.
+#
+# Bumping the image: rebuild via `runner-image.yml`, mirror to
+# `registry.hippius.com`, then update `template.spec.containers[0].image`
+# below and re-apply.
+
+githubConfigUrl: https://github.com/thenervelab
+githubConfigSecret: mon-secret-github-app
+
+template:
+  spec:
+    imagePullSecrets:
+      # `regcred`-equivalent secret in `arc-runners`. Created out-of-band
+      # from the registry.hippius.com robot creds (see CLAUDE.md).
+      - name: registry
+    containers:
+      - name: runner
+        image: registry.hippius.com/hip-team-private/hippius-runner-k8s@sha256:87155f35648b240cf7d59a5c79cc252169144db474a51f10021d1a2c3e2c6bb2
+        command:
+          - /home/runner/run.sh

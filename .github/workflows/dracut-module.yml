@@ -1,0 +1,45 @@
+# Container gate for the RHEL-family dracut unlock module (multi-OS
+# series). Builds the initrd with `90hippius-luks` inside CentOS
+# Stream 10 + Fedora containers and asserts: units staged + enabled,
+# runner/core/binaries/crypttab present, and the SNP/vsock/integrity
+# kernel modules made it in (the "which kernel package carries
+# sev-guest" question answered in CI, not on a dead serial console).
+#
+# Path-filtered: runs only when the module / core / test change.
+# ~3-5 min per distro (dnf install of kernel packages dominates).
+name: dracut-module
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/dracut/**"
+      - "scripts/initramfs/hippius-release-core.sh"
+      - "scripts/initramfs/hippius-golden-overlay.sh"
+      - "scripts/dev/dracut-module-test.sh"
+      - "scripts/dev/golden-dracut-module-test.sh"
+      - ".github/workflows/dracut-module.yml"
+  pull_request:
+    paths:
+      - "scripts/dracut/**"
+      - "scripts/initramfs/hippius-release-core.sh"
+      - "scripts/initramfs/hippius-golden-overlay.sh"
+      - "scripts/dev/dracut-module-test.sh"
+      - "scripts/dev/golden-dracut-module-test.sh"
+      - ".github/workflows/dracut-module.yml"
+
+jobs:
+  lsinitrd-gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - quay.io/centos/centos:stream10
+          - fedora:latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: dracut build + lsinitrd asserts — legacy 90hippius-luks (${{ matrix.image }})
+        run: DRACUT_TEST_IMAGES="${{ matrix.image }}" bash scripts/dev/dracut-module-test.sh
+      - name: dracut build + lsinitrd asserts — golden 95hippius-golden (${{ matrix.image }})
+        run: DRACUT_TEST_IMAGES="${{ matrix.image }}" bash scripts/dev/golden-dracut-module-test.sh

@@ -1,0 +1,5 @@
+NAME="Hippius tenant"
+ID=hippius-tenant
+PRETTY_NAME="Hippius tenant SEV-SNP measured UKI"
+VERSION_ID=@IMAGE_VERSION@
+HOME_URL="https://github.com/thenervelab/hippius-compute"

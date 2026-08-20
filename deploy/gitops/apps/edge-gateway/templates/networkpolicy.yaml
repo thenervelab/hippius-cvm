@@ -1,0 +1,204 @@
+---
+# Edge gateway network policy — default-deny + explicit.
+# PR-K8 + PR-H7 + PR-H8.
+#
+# A CiliumNetworkPolicy (Cilium is the CNI). Selecting the Edge pods
+# makes them default-deny for ingress AND egress; only the rules below
+# are permitted.
+#
+# PR-H7 adds the miner-facing relay ingress on `:8443` (the container
+# port the `:443` LoadBalancer maps to). It is the pod-level enforcer
+# of which traffic may reach the relay — MetalLB L2 does no packet
+# filtering, so this rule, not `loadBalancerSourceRanges`, is the real
+# control. The relay is mTLS: an unauthenticated peer that reaches
+# `:8443` still fails the handshake and gets nothing.
+#
+# PR-H8 adds the forward egress: the Edge relays a validated miner
+# envelope to the in-cluster KBS (`kbs` ns, :8000) and vali (`vali`
+# ns, :8000). Those two egress rules are the who-calls-who control on
+# the forward leg — there is no mTLS on it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: edge-gateway
+  namespace: edge-gateway
+  labels:
+    {{- include "edge-gateway.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "edge-gateway.selectorLabels" . | nindent 6 }}
+  ingress:
+    # kubelet liveness / readiness probes (host → pod) and any future
+    # node-local traffic. Scoped to the API port only.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "9465"
+              protocol: TCP
+    # Read-only telemetry API consumers — the Sentinel and the
+    # Validator — plus same-namespace traffic (the replica peers, an
+    # operator's in-cluster probe). Cluster-internal ONLY.
+    - fromEndpoints:
+        - {}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sentinel
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+      toPorts:
+        - ports:
+            - port: "9465"
+              protocol: TCP
+    # Miner-facing mTLS relay (PR-H7) — container port :8443, behind the
+    # :443 LoadBalancer. Restricted to the NetBird CGNAT range: miners
+    # reach the Edge as NetBird mesh peers, NOT as arbitrary `world`
+    # traffic. This Cilium rule is the authoritative NetBird-only
+    # enforcer — MetalLB L2 does no packet filtering, so
+    # `loadBalancerSourceRanges` alone is not a control. The relay is
+    # additionally mTLS (client cert REQUIRED, hippius-compute-CA
+    # verified, CRL fail-closed).
+    - fromCIDR:
+        - "100.64.0.0/10"
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+    # Node-local reachability for :8443 — kubelet, an operator's
+    # on-node probe, and (multi-node future) a sibling node. `host` /
+    # `remote-node` are cluster-trust entities, not arbitrary `world`.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+    # §24/§25 guest stopped-ack relay listener (:8446) — the confidential
+    # guest's signed `stopped{}` ack reaches vali through here. Like the
+    # mTLS miner relay (:8443) it is published on the MetalLB LB and
+    # restricted to the NetBird CGNAT range: the miner host's vsock-proxy
+    # reqwest client dials `https://<service.loadBalancerIP>:8446` as a
+    # NetBird mesh peer. This hop is TLS server-cert-only (no client cert), so the
+    # control is THIS CGNAT rule + the fact that the listener serves one
+    # opaque relay route landing in vali's fail-closed `StoppedAckIngest`
+    # store (vali's verifier is the split-brain trust gate — a forged ack
+    # relayed here is inert).
+    - fromCIDR:
+        - "100.64.0.0/10"
+      toPorts:
+        - ports:
+            - port: "8446"
+              protocol: TCP
+    # Node-local reachability for :8446 — kubelet liveness probe + an
+    # operator's on-node probe. Same cluster-trust entities as :8443.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "8446"
+              protocol: TCP
+    {{- if .Values.orderSigning.enabled }}
+    # §H phase-2 inner-plane order-dispatch listener (:8444) — vali's
+    # entry point to the `vali → Edge sign → miner verify` chain. The
+    # AUTHORITATIVE access control: the Edge has no mTLS on this
+    # listener (vali does not own a client cert vs the Edge CA), so
+    # the CiliumNetworkPolicy gates ingress to ONLY the vali orchestration
+    # pod selector. The matching Service (`edge-gateway-inner`,
+    # service-inner.yaml) is `ClusterIP`-only — NOT on the public
+    # LoadBalancer — so the miner fleet cannot reach :8444 over the
+    # NetBird mesh either. The two controls (NetworkPolicy + Service
+    # type) are deliberately redundant.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: orchestration
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: orchestration-tick
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: scheduler-reeval
+        # #587 — the `vali_launch_tick` worker (deployment-launch-tick,
+        # PR #602) drives `launch_vm` → order-dispatch to this same :8444
+        # inner listener, exactly like orchestration-tick. Without this
+        # entry Cilium silently drops its connect → `edge-order: peer
+        # unreachable` at dispatch, stalling every API-driven launch.
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: launch-tick
+      toPorts:
+        - ports:
+            - port: "8444"
+              protocol: TCP
+    {{- end }}
+  egress:
+    # DNS — needed to resolve the in-cluster KBS / vali service names
+    # the PR-H8 forward client dials.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # PR-H8 forward path — the Edge relays a validated miner envelope
+    # to the KBS release endpoint. Scoped to namespace + pod label +
+    # port: only the `kbs-server` pods in the `kbs` namespace, :8000.
+    # The pod label matches the `kbs.selectorLabels` the KBS chart's
+    # own Service selects on.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kbs
+            k8s:app.kubernetes.io/name: kbs-server
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # PR-H8 forward path — the Edge relays `ServedReceipt` /
+    # `ServedAggregate` / `StoppedAck` telemetry envelopes to the vali
+    # §9 broker. Scoped to namespace + pod label + port: only the vali
+    # web pods in the `vali` namespace, :8000. `name: vali` +
+    # `component: orchestration` is the `vali.valiWebSelector` — it
+    # excludes the short-lived django-migrations Job pod (which is
+    # `component: migrations`), exactly as the vali chart's own
+    # Service selector does.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: orchestration
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    {{- if .Values.orderSigning.enabled }}
+    # §H phase-2 forward path — the Edge dials a miner's orders server
+    # on its NetBird `100.64.x.y:9700` address. Scoped to the NetBird
+    # CGNAT range (RFC 6598 100.64.0.0/10) + port :9700: the Edge can
+    # ONLY reach a miner's orders server, never an arbitrary external
+    # service over the mesh. The inner router additionally checks the
+    # target_addr is in this same range BEFORE the forwarder is invoked
+    # (defense-in-depth in `binaries/edge-gateway/src/listeners/inner_router.rs`).
+    #
+    # Note: this rule allows the egress at the NetworkPolicy layer; the
+    # cluster must independently have an L3 route to the NetBird CGNAT
+    # (typically: a host-network NetBird agent + a route into the pod
+    # network, OR the cluster is itself a NetBird peer). The chart does
+    # not configure that — it is a deployment-level concern.
+    - toCIDR:
+        - "100.64.0.0/10"
+      toPorts:
+        - ports:
+            - port: "9700"
+              protocol: TCP
+    {{- end }}

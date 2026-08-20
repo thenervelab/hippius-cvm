@@ -1,0 +1,70 @@
+---
+# Argo CD Application — Hippius Tier-0 KBS. PR-K6, §K (#54).
+#
+# Sync wave 10: after every addon (cilium / metallb / cert-manager /
+# ingress-nginx / external-secrets / kata — waves 1-5) and before the
+# Edge gateway app (wave 11, PR-K8). The KBS depends on the
+# external-secrets addon (its Vault ExternalSecrets) and on Kata (the
+# `kata-qemu-snp` RuntimeClass); the Edge is sequenced after it.
+#
+# The KBS is the first CONFIDENTIAL workload — `kata-qemu-snp` pods on
+# the SEV-SNP node (#1 locked topology).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-kbs
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-kbs
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: key-broker
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # External Secrets Operator mutates these defaulted fields on every
+  # ExternalSecret it reconciles; without this Argo CD would report the
+  # app perpetually OutOfSync. Mirrors the PR-K8 edge-gateway app.
+  ignoreDifferences:
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
+        - .spec.data[].remoteRef.nullBytePolicy
+        - .spec.target.deletionPolicy
+        - .spec.target.template.engineVersion
+        - .spec.target.template.mergePolicy
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/apps/kbs
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kbs
+  syncPolicy:
+    # Argo CD creates the `kbs` namespace (CreateNamespace=true)
+    # carrying this label, so the namespace-restricted `hippius-vault`
+    # ClusterSecretStore (PR-K11 — `namespaceSelector` on
+    # `hippius.network/vault-secrets`) admits this app's ExternalSecrets.
+    managedNamespaceMetadata:
+      labels:
+        hippius.network/vault-secrets: enabled
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

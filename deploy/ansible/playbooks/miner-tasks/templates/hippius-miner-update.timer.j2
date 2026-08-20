@@ -1,0 +1,16 @@
+# Managed by Ansible (miner-tasks/miner-agent-install.yml). Do not edit by hand.
+# Fires hippius-miner-update.service ~every 15 min, with a randomized delay so
+# the fleet does not stampede S3 (and a coordinated bad build does not roll to
+# every miner in the same instant).
+[Unit]
+Description=Hippius miner-agent auto-update timer
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=hippius-miner-update.service
+
+[Install]
+WantedBy=timers.target

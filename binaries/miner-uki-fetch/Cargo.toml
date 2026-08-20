@@ -1,0 +1,46 @@
+[package]
+name = "hippius-miner-uki-fetch"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PR-F5: miner-side UKI fetch tool. A miner operator runs it before booting a tenant VM — it pulls a UKI + its `provenance.cbor` from the Hippius S3 image bucket, verifies the §22 offline-allowlist-root Ed25519 signature on the provenance (root public key compiled in), recomputes the UKI's SHA-256 and fails closed on any mismatch, and atomically installs the verified image. Idempotent + content-addressed local cache."
+
+[lints]
+workspace = true
+
+[features]
+# `prod-root` (RA-N6) — a production build MUST supply the real
+# air-gapped §22 root public key via the `HIPPIUS_PROVENANCE_ROOT_PUBKEY`
+# build-time env var; with this feature on, the build fails closed if it
+# is unset (it will NOT silently fall back to the committed dev
+# placeholder key). Off (default) = dev/CI builds bake the reproducible
+# dev key. See `src/fetch.rs::ROOT_PUBKEY_HEX`.
+prod-root = []
+
+[lib]
+name = "hippius_miner_uki_fetch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "miner-uki-fetch"
+path = "src/main.rs"
+
+[dependencies]
+# The provenance wire format (canonical-CBOR `SignedProvenance` /
+# `ProvenanceMap`) — shared with the PR-F4 signer.
+hippius-types = { path = "../../hippius-types" }
+# Reused from PR-F4: the `ImageStore` abstraction + its backends, the
+# `verify_provenance` §22 verifier, and the content-addressed key
+# helpers. PR-F5 adds no new provenance crypto — it consumes F4's.
+hippius-image-provenance = { path = "../image-provenance" }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# Atomic install: `NamedTempFile` gives a unique, `O_EXCL`-created
+# temp file in the target directory (no predictable name, no symlink
+# follow, auto-removed on a dropped error path) — the safe primitive
+# for the write → fsync → rename sequence.
+tempfile = "3"

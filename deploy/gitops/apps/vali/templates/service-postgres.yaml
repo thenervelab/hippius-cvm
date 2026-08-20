@@ -1,0 +1,28 @@
+---
+# Postgres Service — headless. PR-K7, §K (#54).
+#
+# `clusterIP: None` — the StatefulSet's governing Service. Single
+# replica, so `postgres.vali.svc.cluster.local` resolves to the one
+# pod; vali (via DATABASE_URL), the migration Job, and the backup
+# CronJob all reach Postgres through this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.postgresSelector" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "vali.postgresSelector" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

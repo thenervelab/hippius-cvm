@@ -1,0 +1,51 @@
+---
+# EXAMPLE per-host config for a `cc_nodes` host (trusted control plane).
+#
+#   cp host_vars/cc-node.example.yml host_vars/<your-hostname>.yml
+#
+# `<your-hostname>` must match the name you put under `cc_nodes` in
+# `inventory.yml`. Real `host_vars/*.yml` files are git-ignored — see
+# `host_vars/README.md` for the full schema.
+#
+# Placeholders below use `<...>` and the RFC 5737 documentation range
+# `192.0.2.0/24`. Nothing here is a working value.
+
+# ── Connection ──────────────────────────────────────────────────────
+ansible_host: 192.0.2.10
+ansible_user: <SSH_USER>
+ansible_ssh_private_key_file: ~/.ssh/<YOUR_SSH_KEY>
+
+# ── Private L2 segment (03-private-network.yml) ─────────────────────
+# Static address this host takes on the cluster's private network. Must
+# sit inside `network.privnet_cidr` from `group_vars/all.yml`, and must
+# NOT overlap the k3s pod or service CIDRs declared there.
+privnet_static_ip: "<PRIVATE_IP>"
+privnet_static_prefix: 16
+privnet_static_cidr: "<PRIVATE_IP>/16"
+
+# PERMANENT MACs (`ethtool -P <iface>`, not `ip link`) of the NICs on
+# the private segment — one per physical card if you want card-failure
+# redundancy. The public-facing NIC must NOT be listed: the playbook
+# asserts the default-route interface is not among these and aborts if
+# it is, because enslaving it would drop your management access.
+privnet_bond_name: "bond-privnet"
+privnet_bond_macs:
+  - "<PERMANENT_MAC_1>"
+  - "<PERMANENT_MAC_2>"
+privnet_bond_mode: "802.3ad"           # LACP
+privnet_bond_lacp_rate: "fast"
+privnet_bond_xmit_hash_policy: "layer3+4"
+
+# ── Data RAID (04-data-raid.yml) ────────────────────────────────────
+# RAW block devices with NO existing partition table. The playbook
+# fails closed if they already carry data it does not recognise.
+#
+# ⚠️  These are NOT your system disks. Run `lsblk` on the box and read
+# the output before filling this in — this is the one mistake the
+# playbooks cannot undo for you.
+data_raid_devices:
+  - /dev/<DATA_NVME_1>
+  - /dev/<DATA_NVME_2>
+data_raid_name: "md-hippius-data"
+data_raid_level: 1
+data_raid_filesystem: "ext4"

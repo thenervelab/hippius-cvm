@@ -1,0 +1,69 @@
+---
+# Confidential runtime — AMD SEV-SNP. A pod with
+# `runtimeClassName: kata-qemu-snp` boots inside a Kata VM whose memory
+# is SEV-SNP-encrypted + attested; `/dev/sev-guest` is present in the
+# guest. This is the runtime the §23 KBS and Audit-VM confidential pods
+# (PR-K6+) use.
+#
+# `handler: kata-qemu-snp` matches the containerd runtime handler that
+# kata-deploy's `qemu-snp` shim registers (see `values.yaml`). The
+# RuntimeClass is defined here — not by the kata-deploy chart — so it
+# carries the fleet labels and the `scheduling.nodeSelector` below.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-snp
+  labels:
+    app.kubernetes.io/name: kata-qemu-snp
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: confidential-runtime
+handler: kata-qemu-snp
+# Pin every kata-qemu-snp pod to a confidential-compute node: that is
+# the only node SEV-SNP is enabled on AND the only node kata-deploy
+# installed the runtime on (the DaemonSet `nodeSelector` in values.yaml).
+# Without this a kata-qemu-snp pod could be scheduled onto a node with
+# no kata runtime and fail to start.
+scheduling:
+  nodeSelector:
+    node-role.hippius.network/confidential-compute: "true"
+# The Kata VM has its own memory/CPU footprint on top of the workload's
+# containers — the scheduler must reserve it or the node oversubscribes.
+# These match the kata-deploy chart's own built-in `qemu-snp` defaults:
+# a SEV-SNP guest carries the OVMF firmware, the guest kernel, and the
+# SEV bounce-buffer / RMP overhead, so it reserves substantially more
+# than a plain Kata VM. Revisit against the §F measured KBS/Audit-VM
+# image once it lands.
+overhead:
+  podFixed:
+    memory: "2048Mi"
+    cpu: "1.0"
+---
+# Non-confidential debug sibling. Same Kata VM isolation, plain QEMU —
+# NO SEV-SNP. Deliberately kept so an operator triaging a failed
+# confidential pod can run the identical workload under `kata-qemu` and
+# tell apart "the kata runtime / pod plumbing is broken" from "SNP
+# attestation specifically is broken". Not for production workloads.
+#
+# Still pinned to confidential-compute nodes: kata-deploy installs the
+# kata runtime only there, so the `kata-qemu` handler exists only there.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+  labels:
+    app.kubernetes.io/name: kata-qemu
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: confidential-runtime
+handler: kata-qemu
+scheduling:
+  nodeSelector:
+    node-role.hippius.network/confidential-compute: "true"
+# Plain Kata VM — no SEV-SNP firmware/overhead — so a much smaller
+# footprint than `kata-qemu-snp`. Matches the kata-deploy chart's
+# built-in `qemu` RuntimeClass default.
+overhead:
+  podFixed:
+    memory: "160Mi"
+    cpu: "250m"

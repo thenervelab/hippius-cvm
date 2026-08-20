@@ -1,0 +1,122 @@
+# `.github/workflows/ovmf-build.yml` — reproducible AmdSevX64 OVMF build.
+#
+# Why this is its own workflow (not part of `uki-build.yml`):
+#   The edk2 build is heavy (20–40 min on linux/amd64). It is also
+#   measurement-affecting: the resulting `OVMF.fd` is part of the
+#   SEV-SNP launch digest the §22 allowlist gates on, so it is only
+#   rebuilt when the operator deliberately bumps `packer/ovmf/inputs.lock`
+#   (the edk2 commit pin) — not on every `main` push. The `uki-build`
+#   workflow `curl`s the pre-built `OVMF.fd` from
+#   `s3://hippius-compute-images/firmware/ovmf/<sha>.fd` like every
+#   other pinned input — the heavy work runs once per epoch.
+#
+# Trigger model:
+#   - `workflow_dispatch` — the operator runs this manually to mint a
+#     new OVMF (e.g. to take a security fix in edk2).
+#   - `push` on `packer/ovmf/**` — automatic rebuild when the pin or
+#     the builder Dockerfile changes on `main`.
+#
+# Output:
+#   - GitHub artifact `ovmf-fd` (the `OVMF.fd` blob).
+#   - The reproducibility-check artifact `ovmf-reproducible-check.log`.
+#   - Uploaded to `s3://hippius-compute-images/firmware/ovmf/<sha>.fd`
+#     with `--acl public-read` (the writer-only ACL pattern — anyone
+#     with the URL can GET; writes need the operator creds).
+#   - The sha256 hex is printed in the workflow summary so the operator
+#     can paste it into `packer/kbs-uki/ovmf/ovmf.lock`.
+#
+# Supply-chain discipline (§F): every GitHub Action is pinned by SHA.
+
+name: ovmf-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "packer/ovmf/**"
+      - ".github/workflows/ovmf-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ovmf-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build the AmdSevX64 OVMF (reproducibility-checked)
+        # Runs `make ovmf` twice into ISOLATED output / work dirs and
+        # refuses to exit 0 unless the two `OVMF.fd` blobs are
+        # byte-identical. SOURCE_DATE_EPOCH is set from the HEAD commit.
+        run: make -C packer/ovmf ovmf-reproducible-check
+
+      - name: Compute sha256 + write the workflow summary
+        id: sha
+        run: |
+          set -euo pipefail
+          FD=packer/ovmf/output-run-a/OVMF.fd
+          SHA=$(sha256sum "$FD" | awk '{print $1}')
+          SIZE=$(stat -c %s "$FD")
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## AmdSevX64 OVMF built — ${SIZE} bytes"
+            echo
+            echo "- sha256: \`${SHA}\`"
+            echo "- s3 key: \`firmware/ovmf/${SHA}.fd\`"
+            echo
+            echo "Paste into \`packer/kbs-uki/ovmf/ovmf.lock\`:"
+            echo
+            echo "\`\`\`"
+            echo "OVMF_URL    = https://s3.hippius.com/hippius-compute-images/firmware/ovmf/${SHA}.fd"
+            echo "OVMF_SHA256 = ${SHA}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the OVMF to s3.hippius.com (writer-only ACL)
+        # Only runs on a real push / workflow_dispatch on main — the
+        # bucket is content-addressed by sha, so an idempotent re-upload
+        # of an identical blob is a no-op. Writes need the operator
+        # creds from Vault (mirrored into the GitHub repo secrets).
+        if: github.ref == 'refs/heads/main'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.HIPPIUS_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.HIPPIUS_S3_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # A published copy of this repository has no operator S3
+          # credentials, and should not have any: these uploads target
+          # THIS project's object store. Unguarded, the first push to
+          # `main` of a public copy fires this step and dies on a
+          # credentials error — which reads as "the project is broken"
+          # rather than "this step is not yours to run".
+          #
+          # So absent credentials are a clean skip WITH a reason. Except
+          # here, where their absence means we broke our own publishing
+          # and need to hear about it rather than ship nothing quietly.
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            if [ "${GITHUB_REPOSITORY}" = "thenervelab/hippius-compute-internal" ]; then
+              echo "::error::HIPPIUS_S3_* are unset on the canonical repository. The"
+              echo "::error::artifact was BUILT but not published — publishing is broken."
+              exit 1
+            fi
+            echo "::notice::No object-store credentials — skipping publish. The artifact"
+            echo "::notice::is still attached to this run; point the upload at a store you"
+            echo "::notice::own to publish it yourself."
+            exit 0
+          fi
+          FD=packer/ovmf/output-run-a/OVMF.fd
+          SHA=${{ steps.sha.outputs.sha256 }}
+          aws s3 cp "$FD" "s3://hippius-compute-images/firmware/ovmf/${SHA}.fd" \
+              --endpoint-url https://s3.hippius.com \
+              --content-type application/octet-stream \
+              --acl public-read
+
+      - name: Upload OVMF.fd as a workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ovmf-fd-${{ steps.sha.outputs.sha256 }}
+          path: packer/ovmf/output-run-a/OVMF.fd
+          if-no-files-found: error

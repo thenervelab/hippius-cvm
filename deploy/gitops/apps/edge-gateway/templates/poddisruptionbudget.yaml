@@ -1,0 +1,20 @@
+---
+# Edge gateway PodDisruptionBudget. PR-K8, §K (#54).
+#
+# `maxUnavailable: 1` — a node drain may take one Edge replica down
+# but never both, so the relay survives planned maintenance. On the
+# single-node MVP this also lets `kubectl drain` proceed (a
+# `minAvailable` would wedge it). Locked #1 anti-pattern 6: every
+# multi-replica workload carries a PDB.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: edge-gateway
+  namespace: edge-gateway
+  labels:
+    {{- include "edge-gateway.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "edge-gateway.selectorLabels" . | nindent 6 }}

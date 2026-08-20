@@ -1,0 +1,33 @@
+---
+# PodDisruptionBudget for the MetalLB controller — PR-K3, §K (#54).
+#
+# The MetalLB chart has no PDB option, and the controller is a single
+# replica on a single-node cluster — the locked "no replicas: 1 without
+# a PodDisruptionBudget" rule (#1) requires an explicit one. The
+# `speaker` is a DaemonSet (not a Deployment) and is out of scope of
+# that rule.
+#
+# `maxUnavailable: 1` consciously ALLOWS the singleton to be evicted —
+# a single-node cluster has no second node to fail over to, so a
+# drainable budget is correct; a `minAvailable` budget would wedge
+# `kubectl drain`. The selector matches the controller pods exactly,
+# including the release-name `instance` label (Argo CD renders this
+# wrapper with its own release name, so `{{ .Release.Name }}` resolves
+# to whatever the MetalLB subchart stamped on its pods).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: metallb-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: metallb-controller-pdb
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: loadbalancer
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metallb
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/instance: {{ .Release.Name }}

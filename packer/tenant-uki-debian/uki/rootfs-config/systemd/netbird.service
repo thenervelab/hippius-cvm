@@ -1,0 +1,63 @@
+# NetBird mesh client unit — runs INSIDE the booted Debian tenant
+# rootfs, not in the initramfs. The §F architectural decision: NetBird
+# joins the mesh POST-pivot, AFTER systemd-networkd has brought up
+# eth0 (the libvirt-NAT interface), AND BEFORE ssh.service so the
+# operator's SSH binds to the wt0 mesh interface that this unit
+# creates.
+#
+# §RUNTIME — environment variables
+#
+# NetBird is built with CGO_ENABLED=0; its `user.Current()` falls back
+# to $USER / $LOGNAME / /etc/passwd (`os/user/lookup_stubs.go::
+# currentUsername` in Go stdlib). Debian Trixie's default minimal
+# rootfs's systemd unit env DOES NOT seed those, so without these
+# `Environment=` lines the agent dies in <1 s with:
+#
+#   Error: get current user: user: Current requires cgo or
+#   $USER set in environment
+#
+# Documented in `thenervelab/hccs/hcc-image-builder/src/debian.rs:
+# 606-609`. Idempotent: a future netbird build with CGO_ENABLED=1
+# would ignore these.
+#
+# §RUNTIME — setup-key file
+#
+# `ExecStartPre` consumes a one-shot `--setup-key-file=` that
+# cloud-init wrote at `/var/lib/cloud/seed/nocloud/netbird-setup-key`
+# from the L1-minted OrderTicket's user-data (the operator's
+# tenant-secrets-staging flow injects it). After the one-shot, the
+# `ExecStart` `netbird up --foreground-mode` keeps the daemon
+# attached so systemd's Restart=on-failure can supervise it.
+
+[Unit]
+Description=NetBird mesh client
+Documentation=https://docs.netbird.io/
+After=systemd-networkd-online.target
+Wants=systemd-networkd-online.target
+Before=ssh.service
+
+[Service]
+Type=simple
+User=root
+Environment=USER=root
+Environment=HOME=/root
+Environment=LOGNAME=root
+# One-shot bootstrap with the per-tenant setup key. The key file is
+# written by cloud-init at first boot from the OrderTicket-released
+# user-data. If absent the unit fails closed (no `||true`); the
+# operator notices and re-issues the ticket.
+ExecStartPre=/usr/local/bin/netbird up \
+    --foreground-mode \
+    --setup-key-file=/var/lib/cloud/seed/nocloud/netbird-setup-key \
+    --management-url=https://vpn.hippius.network \
+    --no-browser
+# Steady-state daemon — Restart=on-failure supervises it.
+ExecStart=/usr/local/bin/netbird up \
+    --foreground-mode \
+    --management-url=https://vpn.hippius.network \
+    --no-browser
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# `addons/external-secrets` — wrapper chart for the External Secrets
+# Operator (PR-K11, §K #54).
+#
+# Umbrella chart: pins the upstream `external-secrets` chart as an
+# exact-version dependency and adds this cluster's Vault wiring (the
+# `hippius-vault` ClusterSecretStore + the Vault CA ConfigMap) as local
+# `templates/`. The ESO PodDisruptionBudgets are NOT local templates —
+# they are enabled directly on the upstream chart through values.yaml
+# (`<component>.podDisruptionBudget.enabled: true`). Argo CD renders
+# the umbrella (`helm dependency build` from Chart.lock) and
+# reconciles it. Same wrapper-chart convention as the PR-K3 addons —
+# see ../README.md.
+apiVersion: v2
+name: hippius-external-secrets
+description: External Secrets Operator + Vault ClusterSecretStore for hippius-compute.
+type: application
+# Wrapper version — bump on any change to this directory.
+version: 0.1.0
+dependencies:
+  - name: external-secrets
+    # Pinned EXACTLY (no `^`, `~`, `*`). Bump deliberately.
+    version: 2.5.0
+    repository: https://charts.external-secrets.io

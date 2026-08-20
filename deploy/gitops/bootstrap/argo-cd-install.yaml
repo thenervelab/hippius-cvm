@@ -1,0 +1,142 @@
+---
+# Argo CD bootstrap — Helm values overlay for the official `argo-cd`
+# chart. PR-K0, §K (#54).
+#
+# ── Chicken-and-egg ───────────────────────────────────────────────────
+# Argo CD is the GitOps engine, so it cannot install itself before it
+# exists. This file is the ONE component bootstrapped imperatively, by
+# Helm, exactly once. PR-K12 later hands Argo CD's own lifecycle BACK to
+# Argo CD (self-management) so future upgrades are GitOps too.
+#
+# ── This file is a Helm VALUES file, not a manifest ───────────────────
+# It is NOT `kubectl apply`-ed. It is passed to `helm install`. The
+# official chart renders, from these values:
+#   * the `argocd` namespace contents,
+#   * every ServiceAccount, Role/ClusterRole and RoleBinding Argo CD
+#     needs (the chart owns all RBAC — do not hand-write it),
+#   * the application-controller / server / repo-server / redis
+#     workloads,
+#   * the ingress-nginx Ingress for the web UI.
+#
+# ── Pinned versions ───────────────────────────────────────────────────
+# Chart + appVersion are pinned for reproducibility. Pinned 2026-05-21
+# to the then-current stable release; verify the latest stable and
+# re-pin in the same commit as the bootstrap. Chart repo:
+# https://argoproj.github.io/argo-helm
+#   chart:      argo-cd  9.5.15
+#   appVersion: v3.4.2
+#
+# ── Bootstrap command (run once, by an operator) ──────────────────────
+#   helm repo add argo https://argoproj.github.io/argo-helm
+#   helm repo update
+#   helm install argocd argo/argo-cd \
+#     --namespace argocd --create-namespace \
+#     --version 9.5.15 \
+#     -f deploy/gitops/bootstrap/argo-cd-install.yaml
+#
+# Then apply the app-of-apps root once (the second and last manual step):
+#   kubectl apply -f deploy/gitops/bootstrap/root-app.yaml
+#
+# After that, nothing is applied by hand — see deploy/gitops/README.md.
+
+# Argo CD is the ONE documented exception to the fleet-wide
+# `app.kubernetes.io/part-of: hippius-compute` + `managed-by: argocd`
+# labels — for two reasons, both load-bearing:
+#
+#  - `part-of`: Argo CD's argocd-server + application-controller run a
+#    configmap/secret informer that SELECTS on `part-of=argocd`.
+#    Overriding that label (e.g. with `global.additionalLabels:
+#    {app.kubernetes.io/part-of: hippius-compute}`) hides `argocd-cm`
+#    from the informer and crash-loops both components with
+#    `configmap "argocd-cm" not found`. PR-K3 hit exactly this on the
+#    live cluster — the chart's native `part-of: argocd` MUST stand.
+#  - `managed-by`: this single bootstrap component is Helm-managed
+#    until PR-K12 hands it to Argo CD self-management.
+#
+# So NO `global.additionalLabels` here. Every OTHER resource in this
+# repo carries the fleet labels.
+global:
+  # DNS only — no hard-coded IPs anywhere (locked invariant, #1).
+  domain: argocd.hippius.network
+
+# Single-node MVP ("MVP single-node = prod, scale by adding nodes").
+# HA Redis needs 3 replicas → off until the cluster has 3 nodes; flip
+# this on (and bump replicas below) once a second cc-node joins.
+redis-ha:
+  enabled: false
+
+configs:
+  params:
+    # nginx (and Cloudflare in front of it) terminates TLS. The Argo CD
+    # server therefore runs plain HTTP behind the Ingress — same posture
+    # as every other ingress in the fleet (CLAUDE.md: ssl-redirect off,
+    # Cloudflare handles edge SSL).
+    server.insecure: true
+  cm:
+    # Tighten later in PR-K12 (SSO + RBAC). Kept minimal at bootstrap.
+    application.instanceLabelKey: argocd.argoproj.io/instance
+
+# SSO / Dex is wired in PR-K12 (GitHub OAuth). Off at bootstrap.
+dex:
+  enabled: false
+
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+repoServer:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+applicationSet:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+server:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Web UI / API exposed via ingress-nginx. ClusterIP service + Ingress
+  # — never a NodePort (locked anti-pattern #2). Cloudflare fronts the
+  # public name and owns edge TLS; nginx does not redirect to HTTPS.
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostname: argocd.hippius.network
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    path: /
+    pathType: Prefix
+
+# Bundled Redis (non-HA) for the single-node MVP.
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi

@@ -1,0 +1,68 @@
+# Values for the `cilium` dependency (see Chart.yaml). Everything is
+# nested under the `cilium:` key — the dependency's name.
+#
+# Spec of record: issue #54 (PR-K3), `deploy/ansible/group_vars/all.yml`
+# (the k3s install flags these values must match).
+cilium:
+  # ── kube-proxy replacement ──────────────────────────────────────────
+  # k3s here runs WITHOUT flannel and WITHOUT network-policy
+  # (`--flannel-backend=none --disable-network-policy`, see
+  # group_vars/all.yml). Cilium is the CNI and its eBPF datapath fully
+  # replaces kube-proxy.
+  kubeProxyReplacement: true
+
+  # ── Reaching the API server ─────────────────────────────────────────
+  # Single-node cluster: the kube-apiserver is local. Cilium must talk
+  # to it by address — it cannot use the kube-proxy-backed
+  # `kubernetes` Service before its own datapath is up. 127.0.0.1:6443
+  # is the k3s apiserver on this node.
+  k8sServiceHost: "127.0.0.1"
+  k8sServicePort: "6443"
+
+  # ── IPAM ────────────────────────────────────────────────────────────
+  # Delegate pod-IP allocation to Kubernetes: Cilium uses the per-node
+  # PodCIDR carved from the k3s cluster-cidr. Cilium does NOT run its
+  # own IP pool — so pod IPs and the MetalLB LoadBalancer pool never
+  # collide, PROVIDED the two ranges are disjoint. Keep
+  # `network.k3s_cluster_cidr` (deploy/ansible/group_vars/all.yml) and
+  # `lbPool.addresses` (the metallb addon) non-overlapping.
+  ipam:
+    mode: kubernetes
+
+  # ── Datapath ────────────────────────────────────────────────────────
+  # eBPF-based masquerade for pod egress (no iptables masquerade rules).
+  bpf:
+    masquerade: true
+
+  # ── Observability ───────────────────────────────────────────────────
+  # Hubble embedded in the agent DaemonSet — per-node flow visibility
+  # for debugging the fleet. Relay + the web UI (extra Deployments) are
+  # intentionally left off for the single-node MVP; `hubble observe`
+  # against the node-local socket is enough.
+  hubble:
+    enabled: true
+
+  # ── Fleet labels ────────────────────────────────────────────────────
+  # Stamped onto every Cilium-rendered resource (the chart supports
+  # `commonLabels`), satisfying the fleet-wide label invariant.
+  commonLabels:
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+
+  # ── cilium-operator ─────────────────────────────────────────────────
+  # The operator chart-defaults to 2 replicas with node anti-affinity
+  # (HA). On the single-node MVP the 2nd replica is permanently
+  # unschedulable (no second node) and the Deployment never reaches
+  # Healthy — so pin to 1. Bump to 2 once more cc-nodes join (same
+  # "single-node now, scale by adding nodes" pattern as the Argo CD
+  # bootstrap's `redis-ha`).
+  #
+  # At 1 replica the operator is a single-replica Deployment — the
+  # explicit PodDisruptionBudget satisfies the locked "no replicas: 1
+  # without a PDB" rule (#1). The cilium agent is a DaemonSet — not a
+  # Deployment — so the rule does not apply to it.
+  operator:
+    replicas: 1
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1

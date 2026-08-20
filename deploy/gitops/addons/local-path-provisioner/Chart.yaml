@@ -1,0 +1,26 @@
+# `addons/local-path-provisioner` — wrapper chart. PR-K4, §K (#54).
+#
+# Unlike the other addons (which pin a REMOTE upstream chart via a
+# Chart.yaml dependency + Chart.lock), Rancher publishes no official Helm
+# repository for local-path-provisioner. Its chart is therefore VENDORED
+# in-tree, unpacked, at `charts/local-path-provisioner/` — content-pinned
+# via Git rather than version-pinned against a remote repo. See
+# PROVENANCE.md for the exact upstream commit + tag and the re-vendoring
+# procedure.
+#
+# The dependency below is declared with a `file://` repository pointing
+# at the vendored chart; a committed Chart.lock pins it. `helm dependency
+# build` (run by Argo CD's repo-server) repackages the vendored directory
+# into a git-ignored `charts/*.tgz` — the same render-time step as every
+# other addon, just from a local source instead of a remote repo.
+# `values.yaml` configures the subchart under the `local-path-provisioner:`
+# key — the subchart's name.
+apiVersion: v2
+name: hippius-local-path-provisioner
+description: local-path-provisioner — default StorageClass for hippius-compute.
+type: application
+version: 0.1.0
+dependencies:
+  - name: local-path-provisioner
+    version: 0.0.36
+    repository: "file://charts/local-path-provisioner"

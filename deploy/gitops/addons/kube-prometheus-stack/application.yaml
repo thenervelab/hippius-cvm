@@ -1,0 +1,90 @@
+---
+# Argo CD Application — kube-prometheus-stack (Prometheus + Alertmanager
+# + Grafana). PR-K14, §K (#54), issue #128 Phase 1 slice 1.
+#
+# Sync wave 8 — reserved in `../README.md`. After every other addon
+# (waves 1-7) so node-exporter / kube-state-metrics ScrapeConfigs
+# already have all their targets and so the `external-secrets`
+# ClusterSecretStore (wave 5) is live for the Grafana admin pw +
+# Alertmanager config ExternalSecrets.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-kube-prometheus-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-kube-prometheus-stack
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "8"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # The Prometheus Operator chart mutates a handful of server-side
+  # fields after we render them — these are normal operator behaviours
+  # that, without `ignoreDifferences`, keep the Application perpetually
+  # OutOfSync and self-heal-loop. Mirrors the vali/kbs ignore lists.
+  ignoreDifferences:
+    # ExternalSecrets — same fields the existing apps already ignore.
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
+        - .spec.data[].remoteRef.nullBytePolicy
+        - .spec.target.deletionPolicy
+        - .spec.target.template.engineVersion
+        - .spec.target.template.mergePolicy
+    # The chart-rendered Prometheus / Alertmanager `volumeClaimTemplates`
+    # are atomic lists the API server injects metadata into — same
+    # immutable-list pattern as vali's Postgres StatefulSet.
+    - group: monitoring.coreos.com
+      kind: Prometheus
+      jqPathExpressions:
+        - .spec.storage.volumeClaimTemplate.spec
+    - group: monitoring.coreos.com
+      kind: Alertmanager
+      jqPathExpressions:
+        - .spec.storage.volumeClaimTemplate.spec
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/addons/kube-prometheus-stack
+    helm:
+      # Pin a clean release name so the chart's `fullnameOverride`-aware
+      # helpers render predictable resource names (e.g.
+      # `kube-prometheus-stack-grafana` — referenced by
+      # `templates/ingress-grafana.yaml`).
+      releaseName: kube-prometheus-stack
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    # Stamps the `observability` namespace with the ESO ClusterSecretStore
+    # opt-in label so this addon's ExternalSecrets (Grafana admin pw,
+    # Alertmanager config) can resolve against the `hippius-vault`
+    # ClusterSecretStore. Same pattern as apps/vali/application.yaml.
+    managedNamespaceMetadata:
+      labels:
+        hippius.network/vault-secrets: enabled
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      # kube-prometheus-stack ships very large CRDs — server-side apply
+      # avoids the client-side last-applied-configuration annotation
+      # size limit (same reason as cert-manager / external-secrets).
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

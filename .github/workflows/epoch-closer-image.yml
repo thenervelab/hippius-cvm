@@ -1,0 +1,107 @@
+# `.github/workflows/epoch-closer-image.yml` — RA-N7.
+#
+# Builds the `hippius-epoch-closer` container image (the §23 periodic
+# epoch-close worker — node + @polkadot/api, deploy/epoch-closer/) and
+# pushes it to the GitHub Container Registry, cosign-signed. It runs as a
+# CronJob (deploy/gitops/apps/vali/), pinned by SHA-256 digest.
+#
+# Before this workflow the image was the ONE hippius image with no CI
+# build: the deployed `hippius-epoch-closer` digest was built + pushed
+# off-CI and UNSIGNED (every other hippius-* image is built + keyless-
+# cosign-signed by its `*-image.yml`). That is a supply-chain gap — an
+# unsigned, non-reproducible image in the prod deploy path. This closes
+# it by building epoch-closer the same way: reproducible CI build, base
+# layer digest-pinned in the Dockerfile, SHA-pinned Actions, and a
+# keyless (GitHub OIDC → Sigstore) cosign signature on the pushed digest.
+#
+# Trigger: push to main / v* tags, pull_request, workflow_dispatch — the
+# same shape as vali-image.yml.
+
+name: epoch-closer-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "deploy/epoch-closer/**"
+      - ".github/workflows/epoch-closer-image.yml"
+  pull_request:
+    paths:
+      - "deploy/epoch-closer/**"
+      - ".github/workflows/epoch-closer-image.yml"
+  workflow_dispatch:
+
+# Minimal: read the repo, write packages (push to GHCR), and an OIDC
+# token for cosign keyless signing. Nothing else.
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/thenervelab/hippius-epoch-closer
+
+jobs:
+  epoch-closer-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign (version pinned)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:sha-${GITHUB_SHA::12}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags="${tags},${IMAGE}:latest"
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tags="${tags},${IMAGE}:${GITHUB_REF_NAME}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          # The Dockerfile COPYs package.json + close-epoch.mjs, so the
+          # build context is the worker's own directory.
+          context: deploy/epoch-closer
+          file: deploy/epoch-closer/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Single-arch image, no provenance manifest — keeps the pushed
+          # digest a plain image digest the chart pins directly.
+          provenance: false
+
+      - name: Sign the image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Report the pushed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "### epoch-closer image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

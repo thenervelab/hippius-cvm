@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "hippius-types",
+    "hippius-onchain-registry",
+    "kbs-core",
+    "kbs-transport",
+    "hippius-guest",
+    "pallets/compute-scoring",
+    "binaries/agent-host-attestor",
+    "binaries/agent-initramfs",
+    "binaries/agent-keepalive",
+    "binaries/agent-tenant-init",
+    "binaries/agent-tenant-telemetry",
+    "binaries/edge-gateway",
+    "binaries/guest-release",
+    "binaries/image-provenance",
+    "binaries/kbs-admin-client",
+    "binaries/kbs-allowlist-tool",
+    "binaries/launch-digest",
+    "binaries/kbs-server",
+    "binaries/kbs-vault-broker",
+    "binaries/miner-agent",
+    "binaries/miner-uki-fetch",
+    "binaries/order-ticket-mint",
+    "binaries/ticket-validator",
+    "binaries/uki-measure",
+    "binaries/vsock-ticket",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Substrate / polkadot-sdk dependencies pinned to the same branch
+# `thenervelab/thebrain` uses, so the eventual vendoring of `pallet-arion`
+# (issue #40, PR-I2+) lands on byte-identical types. NOT applied to any
+# of the Rust-only crates (hippius-types / kbs-core / kbs-transport /
+# hippius-guest) — they don't depend on Substrate.
+[workspace.dependencies]
+codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
+scale-info = { version = "2", default-features = false, features = ["derive"] }
+frame-support = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+frame-benchmarking = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+frame-system = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+sp-runtime = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+sp-std = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+sp-core = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+sp-io = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2407", default-features = false }
+
+# Override `sev` crates.io pin to our in-tree vendor copy. Two patches in
+# vendor/sev/src/measurement/vcpu_types.rs unblock SEV-SNP launch_digest
+# prediction on real silicon: `EpycGenoa => cpu_sig(25, 17, 1)` (EPYC
+# 9254 Genoa, stepping=1) and the added `EpycTurin => cpu_sig(26, 2, 1)`
+# (EPYC 9255 Turin, CPUID 0x00B00F21) — see vendor/sev/HIPPIUS_PATCH.md
+# for the why + bump procedure.
+[patch.crates-io]
+sev = { path = "vendor/sev" }

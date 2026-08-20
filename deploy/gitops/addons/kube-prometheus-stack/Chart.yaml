@@ -1,0 +1,48 @@
+# `addons/kube-prometheus-stack` — wrapper chart for the Prometheus
+# Operator + Prometheus + Alertmanager + Grafana stack. PR-K14, §K (#54),
+# tracking issue #128 Phase 1.
+#
+# Umbrella chart: pins the upstream `kube-prometheus-stack` (community
+# chart) as an exact-version dependency and adds this cluster's local
+# overlays as `templates/`:
+#
+#   * `namespace-labels.yaml`        — opts the `observability` namespace
+#                                      into the ESO ClusterSecretStore
+#                                      (`hippius.network/vault-secrets`)
+#   * `external-secret-grafana.yaml` — Grafana admin password from Vault
+#   * `external-secret-alertmanager.yaml` — Alertmanager full config
+#                                      (with Slack webhook URL) from Vault
+#   * `ingress-grafana.yaml`         — `grafana.hippius.network` Ingress
+#                                      (NetBird CGNAT only, mirrors the
+#                                       Edge ingress source-range gate)
+#   * `prometheusrule-critical.yaml` — first-tier alert rules we can fire
+#                                      without per-component `/metrics`
+#                                      endpoints yet
+#   * `servicemonitor-edge.yaml`     — scrape `edge-gateway:9464` (the
+#                                      Prometheus text exposition is
+#                                      already live; see
+#                                      `binaries/edge-gateway/src/ha/mod.rs`
+#                                      `METRICS_PORT`)
+#   * `dashboard-stack-overview.yaml` — Grafana sidecar-loaded panoramic
+#                                      dashboard, ConfigMap-embedded
+#
+# Per-component `/metrics` endpoints for KBS, vali, miner-agent,
+# sentinel and Postgres land in follow-up PRs (PR-K14a..PR-K14e); each is
+# additive (ServiceMonitor in this addon's pattern) and shippable on its
+# own. Same wrapper-chart convention as the PR-K3 / PR-K11 addons — see
+# ../README.md.
+apiVersion: v2
+name: hippius-kube-prometheus-stack
+description: Prometheus Operator + Prometheus + Alertmanager + Grafana for hippius-compute.
+type: application
+# Wrapper version — bump on any change to this directory.
+version: 0.1.0
+dependencies:
+  - name: kube-prometheus-stack
+    # Pinned EXACTLY (no `^`, `~`, `*`). Bump deliberately. The same
+    # repo-version dependency caveat described in addons/README.md
+    # applies: pinning the version pins the entry, not the bytes; a
+    # follow-up could harden by re-downloading + SHA-pinning in CI or
+    # by moving to OCI digest pins.
+    version: 86.1.0
+    repository: https://prometheus-community.github.io/helm-charts

@@ -1,0 +1,166 @@
+[package]
+name = "hippius-edge-gateway"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hippius Edge / Miner Gateway — userspace opaque relay between the untrusted miner NetBird mesh and the internal vRack control plane (ARCHITECTURE.md §5 / §9 / §10). PR-H1/H2/H3/H4: pipeline (accept (mTLS) → per-source token-bucket rate limit → canonical-CBOR + typed-schema wire gate via hippius-types → bounded queue → forward TODO → log). The wire gate is typestate-locked (RawEnvelope → validate → ValidatedEnvelope → forward) AND each MessageKind decodes with deny_unknown_fields before forward; PR-H3 adds per-source rate limiting + bounded queue; PR-H4 adds rustls-based mTLS termination (TLS 1.3 only, CA-pinned client-cert verifier, CRL polled every 60s with fail-closed semantics) and switches rate-limit keying from IP to mTLS-derived PeerId; PR-H5/H6 fill HA + signed telemetry."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-edge-gateway"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_edge_gateway"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+# Permissionless on-chain miner auth (PR-2): the registry poller reads
+# `pallet-compute-scoring` (§23) over JSON-RPC through the SAME shared
+# reader the vali `read-miner-status` shell-out uses, so the Substrate
+# storage-key derivation has one definition. HTTP-only (no rustls), so
+# it does not perturb the Edge's TLS-1.3-only crypto graph.
+hippius-onchain-registry = { path = "../../hippius-onchain-registry" }
+# Tokio for the eventual real-network path. PR-H1 uses only the
+# runtime + sync primitives; no I/O syscalls are issued. PR-H3 adds
+# the `mpsc` channel under the `sync` feature for the bounded
+# validate→forward queue. PR-K8 adds `signal` for the SIGTERM/SIGINT
+# graceful-shutdown wait in `main` (the Edge is now a long-lived
+# service, not a boot-and-exit self-test).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+thiserror = "2"
+# PR-H2 typed-decode stack. `ciborium` runs `deny_unknown_fields`
+# deserialisation against the `hippius-types` SignedX shapes + the
+# local `stages/wire::KbsReleaseRequest` mirror. PR-H3 reuses
+# `serde::Deserialize` for the TOML config loader (`config.rs`).
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+# §25 migration M1 — the relay routes parse vali's small JSON relay
+# bodies (`{node_id, miner_addr, put_url}`). JSON-decode only (one
+# direction); the signed `OrderBody` it builds is canonical CBOR.
+serde_json = "1"
+# PR-H3 — operator-facing config (rate cfg + queue cap + idle
+# horizon). Loaded from a TOML file pointed at by the
+# `EDGE_GATEWAY_CONFIG` env var; absent ⇒ defaults baked into the
+# binary. `default-features = false` keeps the dep slim — we only
+# need the parser, not the date / sptr features.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+# PR-H4 — mTLS termination. `rustls` 0.23 gives us a pure-Rust
+# TLS 1.3 server (default-features disabled to pin the `ring`
+# crypto provider explicitly; `tls12` feature is OFF — Edge
+# refuses any TLS < 1.3 handshake, mooting reviewer concerns
+# about weak-cipher fallback). `tokio-rustls` is the async
+# adapter; `rustls-pemfile` parses the operator-supplied PEM
+# bundles (CA, server cert, server key, CRL). `x509-parser`
+# extracts SAN URI / SAN DNS / CommonName from the leaf
+# DER blob rustls hands us post-handshake — the source of
+# `PeerId` that the rate limiter keys on. `arc-swap` lets the
+# CRL poller atomically swap the live `ServerConfig` (and the
+# `crl_healthy` gate) without re-locking on every accept.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+arc-swap = "1.7"
+x509-parser = "0.16"
+# PR-H6 — signed telemetry envelopes + hash-chained audit log. The
+# Edge generates its OWN Ed25519 keypair at boot (never from Vault):
+# `ed25519-dalek` signs every telemetry envelope; the `zeroize`
+# feature makes `SigningKey` wipe on drop, `rand_core` enables
+# `SigningKey::generate`. `rand_core`'s `OsRng` is the CSPRNG the key
+# is drawn from (same dep shape `agent-initramfs` uses for keygen).
+# `sha2` builds the SHA-256 prev-hash chain over audit records — a
+# local re-implementation of the `kbs-core::audit::FileAuditSink`
+# pattern (Edge must NOT depend on `kbs-core`, which would pull the
+# whole KBS / hpke / sev stack across the diode). `hex` encodes the
+# audit-log lines + the published pubkey.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize", "rand_core"] }
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+sha2 = "0.10"
+hex = "0.4"
+# §H phase-2 — explicit zeroize for the transient `String` / `Vec<u8>`
+# / `[u8; 32]` buffers the order-signing loader handles the priv seed
+# through (`order_signing.rs`). `ed25519-dalek` already pulls `zeroize`
+# in via its `zeroize` feature for the `SigningKey`; naming it
+# directly here makes the dependency audit-visible at the call site.
+zeroize = { version = "1", default-features = false }
+# PR-H8 — miner-facing envelope protocol: HTTP/2 over the PR-H7 mTLS
+# listener. `axum` is the server-side router (4 ingress routes by
+# `MessageKind`); `hyper`'s HTTP/2-only server connection + `TokioIo`
+# serve the axum `Router` (as a `tower::Service`) over each already-
+# accepted `tokio_rustls` stream — `axum::serve` cannot be used here
+# because mTLS is terminated per-connection in `miner_listener.rs`,
+# not behind axum's own `TcpListener`. The wire is LOCKED to HTTP/2,
+# so only the `http2` feature is enabled on `hyper`/`hyper-util` (no
+# `http1` — an HTTP/1.1 client is refused at the ALPN layer). `tower`
+# supplies the `Service` trait; `tower-http`'s `TimeoutLayer` caps the
+# whole-request time (a slow-loris dripping a body cannot park a
+# stream). `http-body-util`'s `BodyExt::collect` reads a relayed
+# upstream body into bytes. `async-trait` lets `ForwardClient` be a
+# `dyn` trait with async methods. `reqwest` is the in-cluster forward
+# client to kbs + vali (`rustls-tls`, NO native-tls — same posture as
+# `agent-initramfs`).
+# `tokio` feature gates `axum::serve` — used by the inner-plane
+# listener (`listeners/inner_listener.rs`) which runs a plain-HTTP
+# `TcpListener` rather than the miner listener's per-connection
+# rustls-then-hyper stack.
+axum = { version = "0.7", default-features = false, features = ["http2", "tokio"] }
+hyper = { version = "1", default-features = false, features = ["http2", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "server-graceful", "http2", "tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["timeout"] }
+http-body-util = "0.1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+# Async test attribute. PR-H1 tests don't actually await anything
+# blocking, but the pipeline signature is async so the dev-dep is
+# unavoidable. PR-H4 integration tests drive a real loopback TLS
+# handshake → `net` + `io-util` are needed at test time too.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
+# §H phase-2 cross-crate compatibility test — `tests/inner_router_test.rs`
+# decodes a production-shaped envelope through the miner-agent's actual
+# `SignedOrder` type to pin the two definitions identical. ONLY a dev-dep:
+# the production binary deliberately does NOT depend on miner-agent
+# (opacity discipline — see `src/forward/miner_forward.rs` module docs).
+hippius-miner-agent = { path = "../miner-agent" }
+serde_bytes = "0.11"
+# PR-H4 — dynamic CA + valid + revoked client cert generation,
+# minted at test start so no test key material lives in git.
+# `crypto` enables the `ring`-backed signing; `pem` enables PEM
+# serialisation so we can feed the production loader (which only
+# accepts PEM paths).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# Test-side TLS client. Same crypto provider as the production
+# server side, so the handshake actually exercises shared code.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tempfile = "3"
+# rcgen's `CertificateRevocationListParams` requires `time::OffsetDateTime`
+# values for `this_update` / `next_update`. We re-use the same major
+# version rcgen pulls in transitively so there's no version skew.
+time = "0.3"
+# PR-H6 — the telemetry integration test reads the on-disk audit log
+# back, parsing the documented `<seq>:<hex_record>:<hex_hash>` line
+# format. `ciborium` + `hex` are already runtime deps; listing them as
+# dev-deps makes them visible to the (separate-crate) integration test.
+ciborium = "0.2"
+hex = "0.4"
+# PR-H8 — the miner-router integration test drives the production
+# axum router over a real loopback mTLS stream with an HTTP/2 client.
+# `hyper`'s client + `hyper-util`'s `TokioExecutor` build the H2
+# connection; `http-body-util` frames the request body and collects
+# the response; `http-body` lets the slow-loris test hand-roll a
+# never-completing request body. `bytes`/`http` are the shared HTTP
+# primitive crates. (`tower-http`'s `TimeoutLayer`, exercised by the
+# slow-loris test, is a normal dependency above.)
+hyper = { version = "1", default-features = false, features = ["client", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http2", "tokio"] }
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
+http = "1"

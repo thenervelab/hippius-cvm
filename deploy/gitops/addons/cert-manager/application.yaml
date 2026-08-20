@@ -1,0 +1,47 @@
+---
+# Argo CD Application — cert-manager. PR-K3, §K (#54).
+#
+# Sync wave 3: after Cilium (1) and MetalLB (2). cert-manager + the
+# sibling ingress-nginx addon share this wave — the HTTP-01 ACME solver
+# routes challenges through ingress-nginx, but the ClusterIssuer is
+# inert until a Certificate references it, so co-convergence is fine.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-cert-manager
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-cert-manager
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: cert-manager
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/addons/cert-manager
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      # cert-manager ships large CRDs — server-side apply avoids the
+      # client-side last-applied-configuration annotation size limit.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

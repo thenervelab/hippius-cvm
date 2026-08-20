@@ -1,0 +1,31 @@
+# §23 per-VM telemetry-signer service. The binary
+# `/usr/local/sbin/hippius-agent-tenant-telemetry` is bundled in the
+# verity-protected rootfs by `build-rootfs.sh` (copied from the
+# agent-builder Docker stage). It signs telemetry with a lifecycle
+# key the KBS releases at attestation time + pushes summaries to vali
+# over the NetBird mesh — so it ORDERS AFTER netbird.service.
+
+[Unit]
+Description=Hippius §23 tenant telemetry signer
+Documentation=internal:hippius-compute/ARCHITECTURE.md#section-23
+After=netbird.service
+Requires=netbird.service
+# Block ssh.service entry: tenant SSH is only meaningful once the
+# mesh + telemetry are up.
+Before=ssh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hippius-agent-tenant-telemetry
+Restart=on-failure
+RestartSec=5
+# §20 hardening — telemetry MUST NOT touch the verity rootfs read-
+# write. The unit has no need for arbitrary FS access; constrain
+# it to the bare minimum.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

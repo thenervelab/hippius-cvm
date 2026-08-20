@@ -1,0 +1,27 @@
+# `addons/kata` — wrapper chart for Kata Containers (confidential runtime).
+#
+# Thin "umbrella" chart, same pattern as the other addons: it pins the
+# upstream `kata-deploy` chart as an EXACT-version dependency, supplies
+# `values.yaml`, and carries the hippius-owned `kata-qemu-snp` /
+# `kata-qemu` RuntimeClasses in `templates/`. Argo CD's repo-server runs
+# `helm dependency build` from the committed `Chart.lock` to fetch the
+# pinned upstream chart, then renders the result.
+#
+# Unlike the network addons (Cilium etc., classic HTTP Helm repos), the
+# `kata-deploy` chart is distributed as an **OCI artifact** — Helm 3.8+
+# resolves an `oci://` dependency the same way.
+apiVersion: v2
+name: hippius-kata
+description: Kata Containers confidential runtime (kata-qemu-snp, AMD SEV-SNP) for hippius-compute.
+type: application
+# Wrapper version — bump on any change to this directory.
+version: 0.1.0
+dependencies:
+  - name: kata-deploy
+    # Pinned EXACTLY (no `^`, `~`, `*`). Kata 3.31.0 (released
+    # 2026-05-19) — the current stable release. The `qemu-snp` shim and
+    # its `kata-qemu-snp` handler have been AMD SEV-SNP-capable across
+    # the 3.2x/3.3x line; 3.31.0's CI gates `sev-snp` + `qemu-snp` as
+    # required. The kata-deploy chart version tracks the Kata version.
+    version: 3.31.0
+    repository: oci://ghcr.io/kata-containers/kata-deploy-charts

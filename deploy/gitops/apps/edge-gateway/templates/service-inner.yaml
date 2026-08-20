@@ -1,0 +1,47 @@
+{{- if .Values.orderSigning.enabled }}
+---
+# §H phase-2 — Edge inner-plane order-dispatch Service.
+#
+# Vali reaches the Edge's POST /v1/edge/order route over this Service
+# (cluster DNS name `edge-gateway-inner.edge-gateway.svc.cluster.local`);
+# the Edge then signs the body + forwards to the target miner-agent.
+#
+# Two reasons this is a SEPARATE Service from `edge-gateway` (the
+# LoadBalancer one):
+#
+#  1. The miner-facing `edge-gateway` Service is a MetalLB LoadBalancer
+#     with `loadBalancerSourceRanges: 100.64.0.0/10`. Adding the
+#     inner-listener port to it would expose `:8444` on the public LB
+#     IP too — even with the SourceRange limit, MetalLB L2 does NO
+#     packet filtering (see `service.yaml`), so the port would be
+#     reachable from any NetBird peer. The miner fleet must not be able
+#     to talk to vali's order channel.
+#
+#  2. The two Services have different access models: the miner-facing
+#     one is mTLS-on-LB (any NetBird peer with a valid client cert may
+#     connect); the inner one is plain HTTP, NetworkPolicy-gated to
+#     the vali pod selector. Splitting them keeps that asymmetry
+#     visible in the chart.
+#
+# `ClusterIP` (default) — the Service is reachable only from inside
+# the cluster. The CiliumNetworkPolicy
+# (`networkpolicy.yaml`) is the authoritative gate: only the vali pod
+# selector may ingress on `:8444` of the Edge pods. Other namespaces
+# cannot reach it even if they discover the Service's ClusterIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-gateway-inner
+  namespace: edge-gateway
+  labels:
+    {{- include "edge-gateway.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "edge-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: edge-order
+      port: 8444
+      targetPort: edge-order
+      protocol: TCP
+{{- end }}

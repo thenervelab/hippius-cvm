@@ -1,0 +1,91 @@
+# deploy/.gitignore — secret-hygiene safety net for the whole deploy/
+# tree (gitops manifests, terraform, runbooks). PR-K0, §K (#54).
+#
+# Nothing secret is EVER committed under deploy/. Application secrets
+# flow through the External Secrets Operator + Vault — see
+# deploy/gitops/secrets/README.md. This file is the belt-and-suspenders
+# backstop for an accidental `git add`; the gitleaks pre-commit hook
+# (.pre-commit-config.yaml at the repo root) is the other layer.
+
+# --- Private key / certificate material -------------------------------
+# Public certs (*.crt, CA bundles) are NOT ignored — cert-manager and
+# CA bundles are fine to track. Only private material is blocked here.
+*.pem
+*.key
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# --- SSH private keys (frequently extensionless, so name-matched) ------
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
+*.ppk
+deploy-key
+*-deploy-key
+
+# --- Raw Kubernetes Secret manifests ----------------------------------
+# Plaintext `kind: Secret` files must never exist (External Secrets
+# only). Both `.yaml` and `.yml` spellings are blocked. The `!` lines
+# keep *ExternalSecret* CRs trackable — those carry Vault key
+# *references*, never secret values. Name ExternalSecret files
+# `*-external-secret.yaml` (see deploy/gitops/secrets/README.md).
+*-secret.yaml
+*-secret.yml
+*.secret.yaml
+*.secret.yml
+secret.yaml
+secret.yml
+secrets.yaml
+secrets.yml
+# `!*external-secret.{yaml,yml}` already covers the hyphenated
+# `*-external-secret.*`; `!*externalsecret.{yaml,yml}` covers the
+# un-hyphenated spelling. These negations are sufficient.
+!*external-secret.yaml
+!*external-secret.yml
+!*externalsecret.yaml
+!*externalsecret.yml
+# Exception (PR-K4): `registry-secret.yaml` is a Helm *template* inside
+# the vendored local-path-provisioner chart, not a plaintext Secret — it
+# renders nothing unless a private registry is configured (it is not).
+# Keeping it tracked preserves the chart's byte-for-byte upstream
+# provenance (see addons/local-path-provisioner/PROVENANCE.md).
+!gitops/addons/local-path-provisioner/charts/local-path-provisioner/templates/registry-secret.yaml
+
+# --- Kubeconfigs / cluster credentials --------------------------------
+kubeconfig*
+*.kubeconfig
+*-kubeconfig
+
+# --- Environment files ------------------------------------------------
+.env
+.env.*
+*.env
+
+# --- Terraform state + vars (PR-K1) -----------------------------------
+# tfstate embeds resolved values (incl. secrets) in plaintext; never
+# commit it. `.terraform.lock.hcl` IS committed (provider version pins)
+# so it is deliberately absent below.
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+
+# --- Helm values deliberately holding secret values -------------------
+# Secret values must NOT go in a values file at all (External Secrets
+# only). These two explicit names are a backstop for a file created
+# under that deliberate naming — kept narrow on purpose: a broad
+# `*secret*` glob would also swallow a legitimate, non-secret values
+# file such as `external-secrets.values.yaml` (the ESO addon's values).
+secret-values.yaml
+secret-values.yml
+*-secret-values.yaml
+*-secret-values.yml

@@ -1,0 +1,49 @@
+---
+# vali PodDisruptionBudget. PR-K7, §K (#54).
+#
+# `maxUnavailable: 0` — vali is the OrderTicket-intake path; it must
+# not be lost to a routine voluntary eviction. The single replica makes
+# this absolute: a node drain cannot evict vali, so planned node
+# maintenance uses `kubectl drain --disable-eviction` (on the
+# single-node MVP a drain takes everything down regardless). Satisfies
+# #1 anti-pattern 6 ("no replicas:1 without a PDB").
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vali
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.valiSelector" . | nindent 4 }}
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  maxUnavailable: 0
+  # Web pods ONLY — `valiSelector` (`name: vali`) would also catch the
+  # django-migrations Job pod, and a PDB over a Job pod fails with
+  # `CalculateExpectedPodCountFailed` (no `scale` subresource).
+  selector:
+    matchLabels:
+      {{- include "vali.valiWebSelector" . | nindent 6 }}
+---
+# Postgres PodDisruptionBudget. PR-K7, §K (#54).
+#
+# `maxUnavailable: 0` — the database is not lost to a routine eviction.
+# Same drain caveat as vali above.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.postgresSelector" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "vali.postgresSelector" . | nindent 6 }}

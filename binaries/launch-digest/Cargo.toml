@@ -1,0 +1,35 @@
+[package]
+name = "hippius-launch-digest"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Independently recompute the AMD SEV-SNP launch digest (audit C2). vali runs this over its OWN launch inputs (pinned OVMF + the kernel/initrd/cmdline/vcpus/vcpu-type/guest-features it built into the LaunchOrder) and refuses any miner-asserted digest that does not match — so a miner booting a backdoored guest cannot get its measurement auto-pinned into the §22 allowlist. Byte-identical to `miner-agent`'s `launch_digest.rs` (both call `sev::measurement::snp::snp_calc_launch_digest`). Built `--features snp` (Linux-only sev dep)."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-launch-digest"
+path = "src/main.rs"
+
+[features]
+default = []
+# Real AMD SEV-SNP launch_digest. Linux-only + optional (mirrors
+# `hippius-uki-measure`) so `cargo test --workspace` stays cross-platform
+# and the `sev`/openssl graph is only pulled under this feature.
+snp = ["dep:sev"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+thiserror = "2"
+
+# `sev` provides `snp_calc_launch_digest`. Target-gated to Linux +
+# optional (pulled only by `snp`), `default-features = false` with the
+# minimum feature set the `measurement` module compiles with.
+[target.'cfg(target_os = "linux")'.dependencies]
+sev = { version = "7.1", default-features = false, features = [
+    "snp",
+    "openssl",
+], optional = true }

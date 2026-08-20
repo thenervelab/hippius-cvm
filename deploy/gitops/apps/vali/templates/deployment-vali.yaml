@@ -1,0 +1,217 @@
+---
+# vali Django orchestration service. PR-K7, §K (#54).
+#
+# A non-confidential runc Deployment behind gunicorn. Sync wave 3 —
+# after Postgres (wave 1) and the django-migrations hook (wave 2), so
+# the schema exists before vali serves. Single replica for the MVP;
+# stateless (all state is in Postgres), so a rolling update surges a
+# fresh pod with zero downtime.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.valiSelector" . | nindent 4 }}
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "vali.valiWebSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        {{- include "vali.valiSelector" . | nindent 8 }}
+        app.kubernetes.io/component: orchestration
+      annotations:
+        # Roll the pod whenever the rendered config changes. The pod
+        # reads vali-config via envFrom, which is snapshotted at
+        # container start — without this checksum a configmap-only
+        # sync (e.g. a tenant-baker digest bump) left the live pod
+        # serving STALE env and `spec_from_settings` spawned bake
+        # Jobs against the previous baker image (observed live
+        # 2026-06-10, bake take-5).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # RA-N9 — the vali web pod mounts NO ServiceAccount token. It no
+      # longer creates bake Jobs: `TenantBakeCreateView` only queues the
+      # row, and the dedicated `vali-bake-spawner` worker (the sole holder
+      # of the `vali-tenant-bake-spawner` SA) spawns the privileged bake
+      # Job. So a web-tier (large Django surface) RCE cannot create a
+      # privileged Job to escalate to the node.
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vali
+          # Content-addressed — digest, never a floating tag.
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # No command/args — the image ENTRYPOINT is gunicorn.
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            # Composed `postgres://…` URL — from the vali-db ExternalSecret.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            # Real Django SECRET_KEY — settings.py refuses to start in
+            # production with the placeholder dev key.
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            # Vault credential + address for the `vali_launch_tick` worker
+            # (the launch API stages/reads tenant secrets via vault_kv).
+            # The credential is the projected SA token (jwt auth, #94); the
+            # static `VAULT_TOKEN` renders only on the rollback path. The
+            # ADDRESS still comes from the operator-provisioned `vali-vault`
+            # Secret (out-of-band, same pattern as the L1 seed);
+            # `VALI_VAULT_ADDR` here OVERRIDES vali-config (env > envFrom) —
+            # the ConfigMap default points at the Cloudflare-proxied DNS
+            # whose :8200 is dead; the Secret carries the reachable IP.
+            {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
+            {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            - name: VALI_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: vali-vault
+                  key: address
+            # §25 migration presigns: vali signs the snapshot PUT + the
+            # dest RESTORE GET with these SigV4 creds (the boto S3 client
+            # — see configmap VALI_S3_CLIENT_FACTORY). The miner uses the
+            # resulting presigned URL and needs no creds of its own. From
+            # the operator-provisioned `vali-s3` Secret (Vault-fed via the
+            # vali-s3 ExternalSecret).
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.config.s3RegionName | quote }}
+            {{- if .Values.netbird.enabled }}
+            # §F NetBird tenant-VM overlay enrolment. BASE is the
+            # self-hosted management API (the settings default is the
+            # PUBLIC api.netbird.io — must override); TOKEN from the
+            # vali-netbird-token ExternalSecret (Vault-fed). The main pod
+            # needs both because the CLI `vali_create_vm` mints here.
+            - name: VALI_NETBIRD_API_BASE
+              value: {{ .Values.netbird.apiBase | quote }}
+            - name: VALI_NETBIRD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vali-netbird-token
+                  key: VALI_NETBIRD_API_TOKEN
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.listenPort }}
+              protocol: TCP
+          # `/healthz` is an unauthenticated static 200. The probes send
+          # `Host: localhost` (in DJANGO_ALLOWED_HOSTS) so Django's
+          # host check admits the kubelet's pod-IP-addressed request.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- .Values.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # gunicorn + Django write nothing to disk; the only writable
+            # path needed is /tmp (Python tempfiles + the validator
+            # subprocess).
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- include "vali.vaultTokenVolumeMount" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 12 }}
+            - name: tmp
+              mountPath: /tmp
+            # `vali_create_vm`'s ticket-mint subprocess writes the
+            # newly-signed COSE bytes into a tmpfs file before reading
+            # them back. /dev/shm is the canonical RAM-backed path on
+            # Linux; with `readOnlyRootFilesystem: true` we mount it
+            # as an emptyDir w/ medium=Memory so the file lives in
+            # RAM and never touches disk.
+            - name: shm
+              mountPath: /dev/shm
+            {{- if .Values.createVm.enabled }}
+            # ── `vali_create_vm` mounts ──
+            #
+            # The live allowlist manifest + the Vault CA. NEITHER signing
+            # seed is mounted: both the L1 ticket seed AND the §22
+            # allowlist-root seed are fetched from Vault at use (#587
+            # Phase 1A — no committed dev seed on the prod signing path).
+            - name: allowlist-manifest
+              mountPath: /etc/hippius/allowlist
+              readOnly: true
+            - name: vault-ca
+              mountPath: /etc/hippius/vault-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "vali.vaultTokenVolume" . | nindent 8 }}
+        {{- include "vali.kbsAdminTlsVolume" . | nindent 8 }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        {{- if .Values.createVm.enabled }}
+        - name: allowlist-manifest
+          configMap:
+            name: vali-allowlist-manifest
+        - name: vault-ca
+          configMap:
+            name: vault-ca
+        {{- end }}

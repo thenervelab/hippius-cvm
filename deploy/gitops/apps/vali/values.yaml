@@ -1,0 +1,1379 @@
+# Values for the `vali` chart. PR-K7, §K (#54).
+
+image:
+  repository: ghcr.io/thenervelab/hippius-vali
+  # SHA-256 digest — NOT a tag (§F supply-chain discipline). Produced by
+  # the `vali-image.yml` workflow; see README.md "Image".
+  #
+  # 6c898e5 (#761, RA-N4/RA-N5): anon ingress throttles key on the
+  # Edge-stamped x-hippius-peer-id (un-spoofable) via
+  # PeerIdScopedRateThrottle + NUM_PROXIES=0, and TelemetryIngestView is
+  # throttled (telemetry_ingest scope). Inherits the whole RA-remediation
+  # chain (RA-H1/M1-M4/L1-L2/N1, C2 enforce, allowlist-HWM pin). vali is
+  # CI-gated.
+  #
+  # PIN CORRECTED 2026-07-28 — was sha256:c0b26bee… (6c898e5, #761,
+  # 2026-07-06); the cluster runs sha-6520474a54fc = sha256:741804b7…,
+  # **109 commits** later.
+  #
+  # This is the easiest pin in the repo to wrongly clear: the DEPLOYMENT spec
+  # carries a TAG (CI sets it), so inspecting what RUNS says "current" — but
+  # every vali workload TEMPLATE renders this DIGEST (vali,
+  # orchestration-tick, launch-tick, scheduler-reeval, price-watch,
+  # bake-spawner, usage-meter, usage-gc, stopped-ack-gc, webhook-tick, the
+  # django-migrations Job, both synthetic-monitor cronjobs,
+  # host-attestor-reconcile). With `selfHeal: true` a sync reverts the WHOLE
+  # vali fleet 109 commits: golden-everywhere #850, reboot-recovery
+  # #851-#856, the §25 chain #862-#868, dynamic capacity #840/#841 and the
+  # attestation fix #873. The harm is code-vs-schema skew: Django migrations
+  # are forward-only, so the old image's `migrate` Job finds unknown rows in
+  # `django_migrations` and no-ops rather than unapplying anything — the DB
+  # keeps the new schema while the code expects the old one.
+  #
+  # Feature flags are no safety net: VALI_REBOOT_RECOVERY_ENABLED is
+  # chart-rendered, so a revert keeps setting it on an image that predates
+  # reboot-recovery entirely. Keep this pin honest: it is the contract.
+  #
+  # PIN CORRECTED AGAIN 2026-08-12 (P4) — was sha256:741804b7… =
+  # sha-6520474a54fc (#873, 2026-07-28); the cluster's `vali`, both
+  # synthetic-monitor cronjobs and the migrations Job run
+  # sha-542dc82e9733 = sha256:befb96f3… (#919), read off the running pods'
+  # `status.containerStatuses[].imageID`. The stale pin had gone stale a
+  # SECOND time in two weeks, and it sits directly in the deploy path of
+  # the P4 fix: applying this chart with the old digest would have rolled
+  # the whole vali fleet back ~46 commits while "fixing" the monitor.
+  # (`vali-launch-tick` / `vali-bake-spawner` run an older
+  # sha256:0ebebc1b… — the live fleet is already split; this pin UPGRADES
+  # them to what `vali` itself runs.)
+  #
+  # After merging the P4 branch, re-pin to the digest `vali-image.yml`
+  # builds for the merge commit: the LEGIBLE jwt-login error added in
+  # `vault_kv.py` only ships with that build. The chart-side half of the
+  # fix (the projected-token volumeMount on both cronjobs) works with the
+  # digest below as-is.
+  #
+  # PIN CORRECTED A THIRD TIME 2026-08-12 — was sha256:866615ea… , which
+  # is what the fleet ran BEFORE that day's four deploys. Applying the
+  # chart with it would have reverted, in one sync:
+  #   #932 §25 NetBird-loss detection      (ships lifecycle/0008)
+  #   #933 CUMULATIVE §22 allowlist pin    (ships orchestration/0009)
+  #   #934 guest-liveness watermark        (ships lifecycle/0009 + orchestration/0010)
+  #   #936 §25 source-artifact reclaim     (ships orchestration/0011)
+  # #933 is the P0: without it every launch EVICTS the rest of the fleet's
+  # measurements from the allowlist, so a tenant that reboots wedges in its
+  # initramfs while the control plane reports it healthy. Reverting it is
+  # not a rollback of a nicety — it re-opens a fleet-wide availability hole.
+  #
+  # And the schema does NOT come back with it: Django migrations are
+  # forward-only, so the four migrations above stay applied while the code
+  # expects the pre-#932 schema. That skew is the real damage, not the
+  # feature loss.
+  #
+  # ⚠️ This pin has now gone stale three times in three weeks, every time
+  # because a deploy set the image out of band. It is the single thing that
+  # must be refreshed before ArgoCD `selfHeal` is ever re-armed (P7).
+  #
+  # BUMPED 2026-08-12 (b6a487e) — FIRST deploy through gitops rather than
+  # `kubectl set image`. ArgoCD `selfHeal` is now armed on this app (P7), so
+  # an out-of-band image set would be reverted within minutes; this pin IS
+  # the deploy. Carries #938 (migration billing custody, ships
+  # `scheduler/0008` — ALREADY APPLIED before this bump) and #939 (the
+  # operator CLI can no longer create a VM with no `Vm` row; no migration).
+  #
+  # BUMPED 2026-08-12 (d6b16d6) — #941: a VM that REBOOTS stops being billed.
+  # The guest restarts `monotonic_seq` at 1 each boot while the watermark only
+  # advances, so every receipt after a reboot was dropped. Proven live: a
+  # rebooted probe sat 10 354 s with ZERO accruals while an un-rebooted tenant
+  # billed normally. Ships `scheduler/0009` — ALREADY APPLIED before this bump
+  # (the meter WRITES the new columns, so the new image on the old schema would
+  # error on the restart path).
+  #
+  # BUMPED 2026-08-12 (09c41464) — #942: the §23 Placement now follows the VM
+  # to its destination. Four consequences were confirmed, not assumed:
+  # `_snapshot_weights()` (the OTHER weight source) paid the SOURCE miner;
+  # §13 admission and the #668 fit gate both counted the VM against the
+  # source; and graceful-exit drain enrols by BOUND placement, so draining a
+  # miner MISSED every VM that had migrated to it. Ships `scheduler/0010` —
+  # ALREADY APPLIED — which also backfills VMs migrated before the fix.
+  #
+  # BUMPED 2026-08-12 (a19f788) — the VALI half of #944 + #946.
+  # #944 closes a LIVE data-loss vector: §25 staged to whatever path the order
+  # named, and `_launch_paths` resolved a golden VM's rootfs from the SPEC. That
+  # is how miner-3 acquired a real 709 MB `/var/lib/hippius-miner/rootfs.img`
+  # byte-identical to the tenant's per-VM copy. The same order aimed at miner-2,
+  # where that path is a SYMLINK to the shared legacy base, would have followed
+  # the link and replaced the base every legacy VM there boots — in place.
+  # #946 adds mTLS CAPABILITY to the kbs-admin client. Inert: the admin URL is
+  # still http:// and no cert material is mounted, so behaviour is unchanged.
+  # Ships `lifecycle/0010_vm_base_image` — ALREADY APPLIED.
+  #
+  # ⚠️ The MINER-AGENT half of #944 is deliberately NOT deployed. Restarting a
+  # miner-agent leaves its CVMs running (#669 `skip_shutdown_teardown`) but
+  # UNTRACKED — no startup re-adoption — which STOPS THE BILLING RELAY for them.
+  # On miner-3 that would silently stop billing `realtenant-ubuntu-1`, re-creating
+  # by another route the exact defect #941 just fixed. Gated on the re-adoption
+  # follow-up, or on the tenant being relaunched.
+  #
+  # BUMPED 2026-08-13 (36f24de) — #950: a migrated VM's relaunch budget no
+  # longer follows it from the host it left. `RebootRecovery` held HOST-scoped
+  # state (attempts / backoff / debounce) that no migration path reset, so a VM
+  # that burned its budget on a flaky source arrived at a healthy destination
+  # already capped and could never be reboot-recovered there.
+  # `seen_running` is deliberately PRESERVED, not cleared: it only re-arms when
+  # the destination domain is observed UP, i.e. exactly when recovery is not
+  # needed — clearing it would strand a VM whose destination never comes up.
+  # Ships `orchestration/0012_rebootrecovery_host`, which the chart runs on its
+  # own: the migrations Job is a Sync hook at wave 2, the Deployment at wave 3.
+  #
+  # BUMPED 2026-08-13 (243b589) — #952: a failed §25 no longer strands its VM in
+  # `migrating` with no domain anywhere. Detection is always on; automatic source
+  # restore fires ONLY where the KBS makes it safe (the migration never reached
+  # DestActivating, so VmState is still Active{source_gen, source}). Once
+  # `kbs_activate_dest` has moved VmState to Migrating{new_gen, dest},
+  # `check_releasable` (kbs-core/src/lifecycle.rs:59-79) will only ever release to
+  # the DEST chip at new_gen — so a source restore there is impossible, not merely
+  # unsafe, and that class gets a tested operator command instead.
+  # Ships `orchestration/0013`; the chart's wave-2 Sync hook applies it.
+  #
+  # BUMPED 2026-08-13 (a8221a0) — #955: "can this host START a CVM?" becomes an
+  # OBSERVED placement input. Proven necessary live: miner-3 failed four
+  # consecutive CVM starts (a §25 dest activation + three inside one launch,
+  # `sev_common_kvm_init ret=-16 EBUSY`), and the scheduler kept choosing it —
+  # because a host that starts nothing keeps its capacity pristine and therefore
+  # looks the EMPTIEST. It was not merely eligible, it was PREFERRED.
+  # DEGRADED on one failure (soft, with fallback), INCAPABLE only on three
+  # consecutive in-window failures with no success between — the class is
+  # intermittent fleet-wide (miner-2 recovered from 3 in 5 days), so a
+  # latch-on-first-failure would have pulled a healthy miner out repeatedly.
+  # Also fixes a real availability bug: the §25 dest retry was terminal in
+  # practice because the dispatch idempotency key was constant.
+  # Ships `scheduler/0011` (wave-2 Sync hook applies it).
+  #
+  # BUMPED 2026-08-13 (3249cca) — #958: a launch that fails AFTER the KBS
+  # register no longer leaves a phantom `active` VM with a LIVE KEK and no
+  # host. Hit FOUR times live today (p1final-1/2/3, p1reward-1), each needing
+  # a hand-erased Transit key. The failure path now stamps the row and a tick
+  # sweep opens a REAL DecommissionJob (§24 already erases, force-stops and
+  # tombstones AFTER the erase) — not an inline erase, because the evidence
+  # arrives after the failure returns.
+  # The safety question is answered, not assumed: the timed-out-but-actually-
+  # started window EXISTS (vali 45 s, Edge 30 s, and the miner's launch route
+  # AWAITS domain creation), so the reap gates on a live domain probe and a
+  # DARK MINER VETOES — unreachable means wait, never erase.
+  # Ships `lifecycle/0011_vm_launch_abandoned` (wave-2 Sync hook applies it).
+  digest: "sha256:673d3c64b8b1a7df437aa737be8d2f327bd5f0e43dd48416b1f6bdfe1d44e4e8"
+  # ── Build provenance of the digest above (P3) ───────────────────────
+  # MACHINE-CHECKED against the digest's Sigstore signature — see the
+  # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
+  # `.github/scripts/verify_image_provenance.py`. Purely declarative; no
+  # template reads it.
+  #
+  # ⚠️ It already contradicts the narrative above it, which is the point.
+  # That prose names 3249cca (#958); the SIGNATURE says this digest was
+  # built at 679c0397 (#976, "a KBS restart must not stop paying every
+  # running tenant") — EIGHTEEN commits later. #978 bumped the digest and
+  # left the paragraph above untouched, exactly the drift that made the
+  # KBS pin's comment wrong by three weeks and one branch. Prose is not
+  # checked and rots; this block is checked and cannot.
+  provenance:
+    workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
+    commitSha: "70aac5144c7899cdefedf97e95b8da961b7822e0"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/32308517672/attempts/1"
+    mergedSource: true
+  # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
+  # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
+  # materialised from Vault by external-secret-ghcr.yaml.
+  pullSecret:
+    name: ghcr-pull-secret
+    vaultPath: hippius-compute/ghcr
+    refreshInterval: 1h
+
+# vali is single-replica for the MVP — horizontal scaling is a
+# follow-up. A PodDisruptionBudget still accompanies it.
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# §23 scheduler reeval worker (deployment-scheduler-reeval.yaml). A
+# single long-running loop running `vali_scheduler_reeval` so the
+# MinerCapacity mirror is refreshed + departed-miner placements are
+# §13-drained CONTINUOUSLY, not just on-demand at the placement API.
+# Interval is `VALI_SCHEDULER_REEVAL_INTERVAL_S` (default 30s) in
+# vali-config. Lightweight — one chain read + a few DB writes per cycle.
+schedulerReeval:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# §23 scheduler placement policy.
+scheduler:
+  # Soft concentration cap: a miner already hosting ≥ this fraction of all
+  # ACTIVE placements is de-prioritised, so tenant VMs spread across the
+  # fleet rather than piling on the single cheapest miner (the marketplace
+  # ranks by price). 0.5 with 3 miners forces distribution once a miner
+  # reaches ~half the fleet's load. "1.0" = no cap (prior behaviour).
+  maxHostShare: "0.5"
+  # ── #668 CPU/RAM fit gate + slot accounting ────────────────────────
+  #
+  # Per-host headroom the scheduler NEVER hands to a tenant VM (the
+  # hypervisor, the miner-agent, the host attestor), and the reference VM
+  # shape one advertised "slot" is worth.
+  #
+  # These four were set live and NEVER existed in this chart, so `helm
+  # template` silently fell back to settings.py. Two of the four disagree
+  # with that default, and both disagreements are load-bearing:
+  #   slotRefCpus       live 2    default 4    → a sync HALVES every
+  #                                              miner's advertised slots
+  #   hostReserveMemoryMb live 2048 default 4096 → a sync DOUBLES the
+  #                                              per-host RAM reservation
+  # Together that is a large, silent capacity cut across a fleet already
+  # running 14 concurrent VMs on a single miner. The other two match the
+  # default TODAY and are rendered anyway — a value you can only discover
+  # by reading Python is a value that drifts unnoticed.
+  hostReserveCpus: "2"
+  hostReserveMemoryMb: "2048"
+  slotRefCpus: "2"
+  slotRefMemoryMb: "8192"
+
+# §23 uptime billing — how `compute_epoch_weights` ranks miners:
+#   "snapshot" — the on-chain score snapshot (legacy).
+#   "usage"    — the attested per-VM served-receipt UsageAccrual ledger
+#                (pay ONLY for UP VMs; a miner with no attested VM usage
+#                this epoch gets zero weight — fail-closed).
+# Flipped to "usage" 2026-07-01 once the served-receipt pipeline was
+# proven flowing end-to-end (sr-e2e-4: envelopes→UsageAccrual→owed $53).
+epochWeightSource: usage
+
+# ── Operator-owned VMs earn NO reward weight and NO bill ──────────────
+#
+# With `epochWeightSource: usage` the UsageAccrual ledger IS the on-chain
+# reward weight. Measured live on 2026-08-11 (chain epoch 2702), OUR OWN
+# VMs held 30.6 % of the pot — 404,343,360 of 1,322,247,180 unit_seconds —
+# and one single destroyed synthetic-monitor probe
+# (`synmon-debian-1785751760`, gone since 2026-08-06) carried 30 % of it on
+# its own, because a suspended closer never rolls the bucket over. Every
+# unit we hold is diluted away from an honest miner.
+#
+# These are `Placement.owner` values = the launch spec's `user_id`. The
+# synthetic monitor's own tenant (`VALI_SYNTHETIC_TENANT_ID`, i.e.
+# "synthetic-monitor") is excluded BY CONSTRUCTION in
+# `scoring._excluded_owners` and must NOT be listed here — that is what
+# makes editing this list safe. List only the OTHER operator identities.
+#
+# Live inventory of the epoch-2702 ledger, by owner:
+#   synthetic-monitor  32 rows  403,074,750 units  (31 synmon-* + stampproof)
+#   kbsrehearse         1 row     4,580,790 units
+#   julien              1 row   917,329,830 units  ← the REAL tenant; NOT ours
+#
+# ⚠️ `owner` is caller-supplied and unauthenticated. It is safe only while
+# our own product API is the sole holder of a vali credential (architecture
+# A) — a tenant that could set `user_id` itself could name an excluded
+# identity and zero its host miner's epoch. See `scoring._excluded_owners`.
+rewardExcludedOwners:
+  - kbsrehearse
+
+# ── Blackbox host-attestor: the KBS L0 trust anchor + its two gates ───
+#
+# These three were set LIVE and were absent from this chart entirely, so
+# `helm template` fell back to settings.py — which defaults ALL THREE to
+# the disarmed value. A sync would therefore have silently:
+#   - unwired the L0 verifying key ⇒ every ingested attestor cert is
+#     decode-only `pending`, never `attested`; and
+#   - flipped `gateEnforce` true → false ⇒ the §23 dispatchability gate,
+#     ARMED on 2026-07-20 so tenant VMs only land on attested hosts,
+#     stops gating. Nothing errors. Nothing alerts. Tenant VMs simply
+#     start landing on unattested hardware again.
+# That is the whole reason the two GATES are rendered with helm
+# `required`: the arming state of a security gate must be a statement in
+# git, never the shadow of an absent key. The verifying key is NOT
+# blanket-`required` — empty is a legitimate pre-arming state — so the
+# chart enforces the real invariant instead and refuses to render an
+# ARMED gate with no key (see configmap-vali.yaml).
+#
+# All three go in the ConfigMap, not on one Deployment: the cert ingest
+# (web), the §23 dispatchability gate and the liveness meter each read
+# them from a DIFFERENT workload, and `envFrom` reaches all of them.
+hostAttestor:
+  # KBS L0 Ed25519 PUBLIC verifying key, 64 hex chars. PUBLIC — this is a
+  # verifying key, never a signing key, and never a secret; settings.py
+  # says the same at its definition. Must match the KBS's L0 keypair; a
+  # malformed value fail-closes to "unset".
+  #
+  # The `gitleaks:allow` is a scoped, single-line waiver, NOT a ruleset
+  # change: gitleaks' `generic-api-key` fires on any ≥3.5-entropy value
+  # assigned to an identifier containing "key", so a 64-hex PUBLIC key is
+  # unavoidably a false positive (entropy 3.88). Waiving it here keeps
+  # `.gitleaks.toml` untouched, so every other path in the repo — and any
+  # future line in THIS file — is still scanned by the full ruleset.
+  # Pinning this key in git is the point: the value is a trust anchor, and
+  # a trust anchor that lives only in a cluster is what drift D4 was.
+  kbsL0VerifyingKey: "24e6a730dc24e1bfba1e6d21d943924d3ab6f311ea0f2e0b3e585458393bc803"  # gitleaks:allow
+  # ARMED 2026-07-20 — tenant VMs are dispatched only to hosts with a live
+  # `attested` host-attestor row on a currently-desired measurement.
+  gateEnforce: true
+  # NOT armed: the epoch-weight liveness MULTIPLIER. Flipping this pays
+  # miners by attestor liveness × usage; it inherits the same GA-blockers
+  # as `gateEnforce` and is a reward-affecting change — leave false until
+  # the attestor fleet is complete.
+  rewardRequireAttestor: false
+
+# ── §23 uptime-LIVENESS gate — credit only SNP-PROVEN-ALIVE time ──────
+#
+# THE HOLE: a `ServedDeliveryReceipt` is signed ONLY by the guest
+# telemetry key, which is HKDF-derived from the §7 lifecycle key and
+# READABLE BY ROOT INSIDE THE CVM. A miner may launch a tenant VM on its
+# own node (anyone may), lift the key, KILL the VM, and keep signing
+# well-formed uptime receipts forever, from anywhere. A red team
+# reproduced it: one fabricated receipt credited 5,716,050 unit_seconds
+# for a VM that served nothing.
+#
+# THE FIX: when armed, the meter credits only the part of a receipt
+# window COVERED by a KBS-L0-signed `LiveAttestation` — which the KBS
+# mints only after verifying a fresh `SNP_GET_REPORT` (VCEK→ASK→ARK
+# against AMD silicon root, `measurement ∈ §22 allowlist`) whose
+# REPORT_DATA bound a single-use KBS nonce to that vm_id. An extracted
+# software key cannot produce one; a dead VM cannot produce one at all.
+# Uncovered time accrues ZERO.
+#
+# ── ARMED 2026-08-13 ────────────────────────────────────────────────
+# `requireAttestation: true` is rendered EXPLICITLY (helm `required`, no
+# default fallback) so which regime is live is readable straight off the
+# ConfigMap and can never be inferred from an absent key. The compiled
+# default in settings.py stays `False` ON PURPOSE — chart and code no
+# longer agree, and that asymmetry is the point: a missing or unreadable
+# ConfigMap key must fall back to NOT enforcing rather than silently
+# arming. A test asserts the RENDERED value, not the Python default.
+#
+# `false` remains the SAFE value whenever a fleet carries guests that do
+# not run the keepalive agent: they answer no challenges, so arming
+# against them stops ALL their reward accrual. That was true of the
+# pre-keepalive images; `image=ubuntu` now serves the keepalive bake.
+#
+# All four steps below were verified live before flipping, in order:
+#   1. VALI_KBS_L0_VERIFYING_KEY present (64 hex);
+#   2. blessed bake 5d07a905 carries hippius-agent-keepalive, §22 re-pinned;
+#   3. 1/1 live VMs covered (p1final-4, 900 s window vs 300 s cadence);
+#   4. flipped.
+#
+# ARMING SEQUENCE — in order, no step skipped:
+#   1. wire `VALI_KBS_L0_VERIFYING_KEY` (the ingest refuses to record any
+#      coverage without it — 503, fail closed);
+#   2. ship a tenant image that runs `hippius-agent-keepalive` against
+#      KBS `/v1/attest/keepalive` and relays the returned
+#      `SignedLiveAttestation` to `POST /v1/telemetry/vm-liveness`;
+#      re-bake + re-pin the §22 allowlist for the new measurement.
+#      DONE in the bake: `tenant-image-bake.sh --hippius-keepalive-bin`
+#      stages the agent + installs/ENABLES `hippius-keepalive.service`,
+#      and `binaries/tenant-baker/entrypoint.sh` passes it on every
+#      in-cluster bake. The guest ticks every 300 s — see the
+#      `coverageSeconds` note below; `scripts/dev/keepalive-unit-test.sh`
+#      pins the cadence against THIS value, so lowering it below 300
+#      fails CI rather than silently un-crediting honest uptime. Still
+#      required per-fleet: RE-BAKE, re-bless the golden images and re-pin
+#      the §22 allowlist (this changes the measured boot path).
+#   3. LEAVE THIS FALSE and confirm `VmLiveAttestation` rows are landing
+#      for EVERY actively-billing vm_id — the whole fleet, not a sample;
+#   4. only THEN flip `requireAttestation: true`. Any VM still not
+#      answering stops accruing the instant you do. That is the intended
+#      semantics, and the reason step 3 is not optional.
+uptimeLiveness:
+  # ARMED 2026-08-13 (P1). Uncovered time now accrues NOTHING: only uptime a
+  # KBS-signed SNP live attestation vouches for is creditable, so a miner that
+  # holds a tenant's disk but is not actually running the guest stops earning.
+  #
+  # The precondition the register demanded — "VmLiveAttestation rows land
+  # FLEET-WIDE" — was verified immediately before flipping this, not assumed:
+  #   p1final-4  attestations=3  last_age=18s  covered_by_900s_window=True
+  #   ==> 1/1 live VMs covered
+  # and the coverage model has 3x headroom (coverageSeconds 900 vs a 300 s
+  # guest cadence), so two consecutive missed samples still leave uptime
+  # continuously covered.
+  #
+  # What made this armable was NOT this flag. It was, in order: the §22
+  # auto-pin becoming cumulative (#933 — before it, any concurrent launch
+  # evicted the fleet's measurements and killed keepalive outright), the
+  # synthetic monitor being re-pointed at the BLESSED bake (#949 — it had been
+  # exercising an image no tenant receives, so the keepalive path was never
+  # actually tested), and CVM-start capability becoming a placement input
+  # (#955 — the scheduler was PREFERRING a host that could start nothing).
+  #
+  # ⚠️ If you ever pause this, the honest reason to do so is a VM that is
+  # genuinely alive but cannot attest — a pre-keepalive image. The catalog now
+  # serves the keepalive bake for `image=ubuntu`, so that class should be
+  # empty; verify it is before assuming.
+  requireAttestation: true
+  # How far BACK one liveness sample vouches (seconds). MUST be >= the
+  # guest keepalive cadence or honest uptime falls into the gaps between
+  # samples and goes uncredited. Never forward — a sample says nothing
+  # about the future, which is exactly why a killed VM stops earning.
+  coverageSeconds: 900
+  # How recently a receipt's window may have closed for the armed gate to
+  # DEFER (re-queue the envelope) rather than judge it uncovered. The
+  # receipt and its covering attestation travel independently, so the
+  # receipt can arrive first; without this the meter would burn the
+  # receipt's sequence on a verdict that was merely early.
+  graceSeconds: 300
+
+# Uptime usage-meter worker (deployment-usage-meter.yaml). A single loop
+# running `vali_usage_meter`: drains verified served-delivery receipts and
+# accrues resource_units × attested-uptime into the per-(epoch,miner,vm)
+# usage ledger — the input to uptime-integrated epoch weights + the
+# "owed per miner" readout. Lightweight — a batch of receipt verifies +
+# a few DB upserts per cycle; no-ops entirely when no receipts are queued.
+usageMeter:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# StoppedAck ingest garbage-collector (deployment-stopped-ack-gc.yaml,
+# audit M-StoppedAck). A single loop running `vali_stopped_ack_gc`: reaps
+# StoppedAckIngest rows older than VALI_STOPPED_ACK_GC_AGE_HOURS (24h) so
+# the AllowAny guest-ack landing pad stays bounded.
+# RA-N9 — the tenant-bake Job spawner worker (deployment-bake-spawner).
+# The ONLY workload that holds the create-jobs SA token; rendered iff
+# tenantBake.enabled. A tiny headless poll loop.
+bakeSpawner:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+stoppedAckGc:
+  enabled: true
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# UsageAccrual garbage-collector (deployment-usage-gc.yaml, audit M-GC).
+# A single loop running vali_usage_gc: reaps UsageAccrual rows for epochs
+# older than VALI_USAGE_GC_KEEP_EPOCHS (8) so the billing ledger stays
+# bounded (scoring only reads the latest epoch).
+usageGc:
+  enabled: true
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# §23 marketplace price-watch worker (deployment-price-watch.yaml).
+# A single loop running `vali_price_watch`: reads on-chain price-change
+# announcements (`read-pending-prices`) and enqueues a §25 migration for
+# any bound VM whose tenant ceiling (`Vm.max_price_per_unit`) the new
+# price would exceed — before it bites. Lightweight — one chain read +
+# a few DB writes per cycle; no-ops entirely when no change is announced.
+priceWatch:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# §24/§25 orchestration tick worker (deployment-orchestration-tick.yaml).
+# A single loop running `vali_orchestration_tick`: enrols warm migrations
+# for VMs on gracefully-departing (Quarantined/Decommissioned) miners,
+# then advances every in-flight MigrationJob / DecommissionJob one step.
+# Without it, migration jobs are created but never moved. Interval is
+# `VALI_ORCHESTRATION_TICK_INTERVAL_S` (default 10s) in vali-config.
+orchestrationTick:
+  enabled: true
+  # Reboot-recovery — relaunch a tenant CVM that a host reboot powered off,
+  # on its SAME still-alive miner, reusing the existing encrypted overlay
+  # (the miner-agent re-adopts only still-running domains, so a powered-off
+  # tenant CVM is otherwise never relaunched). Runs in this tick's
+  # `service.reboot_recovery_once`. Only recovers a VM PREVIOUSLY observed
+  # running (the `seen_running` gate), so enabling it never mass-resurrects
+  # stale Active-but-down rows. Requires the per-VM `domain-state` endpoint
+  # on the miner-agent (a miner without it → the poll is unavailable → no
+  # action). Set `enabled: false` to disable fleet-wide.
+  rebootRecovery:
+    enabled: true
+    debouncePolls: 3   # consecutive down polls before a relaunch (debounce)
+    maxAttempts: 5     # per-VM relaunch attempt cap
+    backoffBaseS: 120  # exponential-backoff base between attempts
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Async launch worker (deployment-launch-tick.yaml) — drives the
+# `POST /v1/vm/launch` LaunchJob queue via `manage.py vali_launch_tick`.
+# WITHOUT it, API launches sit `queued` forever (the launch only runs via
+# the dev `vali_create_vm` CLI). #587 Phase 1 — the production API path.
+launchTick:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+
+# #587 Phase 3 — outbound job-event webhook delivery worker. Disabled
+# until an upstream product API registers a callback `url` + provisions
+# the HMAC secret (`secretName`, an ExternalSecret from Vault). The
+# webhook CODE ships with the vali image regardless; this only turns on
+# the delivery loop. With `url` empty the worker idles harmlessly.
+webhookTick:
+  enabled: false
+  url: ""
+  secretName: vali-webhook
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# §23 periodic epoch-close CronJob. Advances pallet-compute-scoring's
+# CurrentEpoch (via `Sudo.sudo(valiSubmitEpochClose)`) so the scheduler
+# reads fresh per-miner reward weights instead of the genesis epoch=0
+# (which makes every miner quality=0). The signing key is the
+# `keySecretName` Secret (provisioned OUT of git — should be an
+# ExternalSecret from Vault). `weight` is currently flat; real
+# placement-based merit is a follow-up that feeds vali's scoring.
+epochClose:
+  enabled: true
+  # ✅ RESUMED 2026-08-12. The blocker is gone: the testnet runtime carries
+  # `pallet-compute-scoring` again (spec 92002, metadata 413,221 bytes,
+  # `ComputeScoring` 4 occurrences — the same count every live pallet shows).
+  # The pallet NAME and index 79 were preserved, so the storage written before
+  # the outage was picked up intact: `CurrentEpoch` resumed at 2702 with all
+  # three miners still registered, after nine days frozen.
+  #
+  # HISTORY, kept because the failure mode is worth recognising again. Between
+  # 2026-08-03 and 2026-08-12 the testnet ran a runtime lineage that never
+  # contained this pallet. A runtime upgrade does not delete storage, so the
+  # orphaned prefix kept ANSWERING reads: vali logged
+  # `current_epoch=2702 miners=3` every 30s off bytes nothing could ever
+  # update, and the closer died at its first chain call. Someone silenced the
+  # crash-loop by suspending this CronJob and recorded no reason anywhere.
+  # `hippius-onchain-registry` now probes the runtime METADATA for the pallet
+  # (#895) and vali reports `pallet_live`, so a fossil is detectable rather
+  # than plausible; `ChainScoringPalletFossil` alarms it.
+  #
+  # WHAT WAS FIXED WHILE IT WAS DOWN, all live: a stalled usage bucket was
+  # re-submitted at every close (#896); the bill overstated by x1000 (#902);
+  # operator-owned VMs — our own monitor probes — held 30.9% of the reward pot
+  # (#915, see `rewardExcludedOwners`); placement ranked on the FOSSIL merit,
+  # which was inverted, favouring the miner that had only ever hosted our
+  # probes (#917); and a close is one extrinsic bounded by
+  # `MaxMinerStatusUpdatesPerCall`, so a fleet above that bound could not close
+  # an epoch AT ALL and the closer now refuses loudly instead of failing on an
+  # opaque codec error (#912).
+  #
+  # STILL OPEN, and the reason this is testnet-appropriate rather than
+  # production-ready: `PriceFloor`/`PriceCeiling` are unset on-chain (genesis
+  # values do NOT apply on a runtime upgrade — they need `set_price_bounds`,
+  # call_index 52, from the ComputeScoringAuthorityMembers account, not sudo),
+  # and the SNP-liveness gate that makes uptime unforgeable ships DISABLED —
+  # see `uptimeLiveness` below. Until it is armed, a served receipt is a bare
+  # guest signature.
+  #
+  # BEFORE flipping this back to true after any future pause, run one dry run
+  # and READ IT. `EPOCH_CLOSE_DRY_RUN` is NOT in this CronJob's env, and a Job
+  # created with `--from=cronjob/epoch-close` therefore runs the REAL closer
+  # with the sudo key mounted; `kubectl set env job/...` cannot fix that after
+  # the fact because a Job pod template is immutable. Put the variable in the
+  # Job spec at creation time, or you will submit an epoch close believing you
+  # are dry-running one.
+  suspend: false
+  # CI-built + cosign-signed (`.github/workflows/epoch-closer-image.yml`), pinned
+  # by digest so a registry retag cannot swap what runs. The digest is the one
+  # that workflow's cosign step signed.
+  #
+  # ⚠️ THIS LINE HAS TO BE BUMPED BY HAND, and it silently rotted three releases
+  # deep before anyone noticed. The chart sat on `sha-a857a82e105b` while the
+  # live CronJob had been moved on to #900, then #906, then #912 — so a working
+  # ArgoCD sync would have REVERTED the closer to a build with none of the
+  # metadata guard (#900, exit 3), the dry run (#906) or the batch-bound guard
+  # (#912, exit 4). Merging is not deploying, and deploying is not committing:
+  # after every out-of-band `kubectl patch` of this CronJob, update this line.
+  #
+  # Current: b207cff = #912 (batch-bound refusal + the worker's first tests).
+  #
+  # SHAPE CHANGED (P3): this was one combined
+  # `repo:sha-b207cffed5a6@sha256:6558…` string. It is now the same
+  # `{repository, digest, provenance}` mapping every other first-party pin in
+  # this repo uses, so `verify_image_provenance.py` covers it too — a combined
+  # string has nowhere to hang a `provenance:` block. The rendered reference
+  # resolves to the IDENTICAL image: the digest is what a pull honours, and
+  # the `sha-…` tag beside it was decoration. Dropping it also removes the
+  # last tag-shaped string from the charts, which is where #927 was heading.
+  image:
+    repository: "ghcr.io/thenervelab/hippius-epoch-closer"
+    digest: "sha256:803b357731029d9a043cab059038cd5b3aa7624d251b44de9ed7fb5971d2b50b"
+    # ── Build provenance of the digest above (P3) ─────────────────────
+    # MACHINE-CHECKED against the digest's Sigstore signature — see the
+    # equivalent block in `deploy/gitops/apps/kbs/values.yaml`. Purely
+    # declarative; no template reads it.
+    #
+    # Uniquely among the six, the free-text attribution above was RIGHT:
+    # the signature says b207cffe (#912), which is what "Current: b207cff"
+    # claims and what the live CronJob runs. That is now a checked fact
+    # rather than a lucky one — and this is the pin the comment above
+    # records as having rotted three releases deep unnoticed.
+    #
+    # Why it belongs here: this image signs
+    # `ComputeScoring.valiSubmitEpochClose(...)` DIRECTLY with the
+    # `epoch-close-key` mnemonic. A swapped build submits whatever reward
+    # weights it likes and the extrinsic is authoritative.
+    provenance:
+      workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/epoch-closer-image.yml@refs/heads/main"
+      commitSha: "bb9edb2ec206dd0b9f90af05aceff6d15b9a951e"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/32087054021/attempts/1"
+      mergedSource: true
+  rpcUrl: "wss://rpc.hippius.network"
+  schedule: "*/10 * * * *"
+  # Flat fallback weight used only when the vali merit endpoint is
+  # unreachable. With `weightsUrl` set, each miner's weight is its REAL
+  # bound-placement merit (GET /v1/admin/epoch-weights, AllowAny + CNP-gated).
+  weight: "1"
+  keySecretName: epoch-close-key
+  weightsUrl: "http://vali.vali.svc.cluster.local:8000/v1/admin/epoch-weights"
+
+# Blackbox host-attestor coverage reconcile CronJob (PR-9,
+# cronjob-host-attestor-reconcile.yaml). WARN-ONLY: reports host-attestor
+# coverage across the on-chain-Active fleet (attested rows only, never
+# pending) and logs gaps. Gates NOTHING (no reward / dispatchability —
+# that arms in PR-11). Default-inert (`enabled: false`) — turn on once the
+# blackbox UKI is baked + pinned + the KBS L0 key is wired, so the report
+# is meaningful rather than all-pending.
+hostAttestorReconcile:
+  enabled: false
+  schedule: "*/15 * * * *"
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# Synthetic monitor (apps.synthetic) — continuous self-test of the LIVE
+# control plane. Two CronJobs run `manage.py vali_synthetic_monitor`:
+#   * light  (read-only fleet health, every 15 min)
+#   * full   (real launch→decommission e2e, every 6 h, rotating distro)
+# Both push result metrics to the observability Pushgateway; the
+# `synthetic-monitor` PrometheusRule alerts on failure/staleness → Slack.
+# NON-DISRUPTIVE: the light tier only reads; the full tier launches a
+# THROWAWAY golden VM and ALWAYS decommissions it (self-cleaning).
+syntheticMonitor:
+  light:
+    enabled: true
+    schedule: "*/15 * * * *"
+    # ── Acknowledged light-tier failures ────────────────────────────────
+    # One entry per line: `check | YYYY-MM-DD | reason`. An entry declares
+    # that this NAMED check's CURRENT failure is known and accepted until
+    # that date, so it does not pin `hippius_synthetic_light_success` at 0
+    # and make SyntheticLightFailing unreadable for everything else.
+    #
+    # WHAT AN ACK DOES NOT DO: it does not stop the check running, does not
+    # change its verdict, does not remove it from the Job output/logs, and
+    # does not touch `hippius_synthetic_light_check_success{check=...}`
+    # (still 0). It only excludes it from the TIER roll-up.
+    #
+    # HARD RULES (enforced in apps/synthetic/ack.py, module constants — NOT
+    # tunable from here on purpose; a tunable cap is a blanket mute):
+    #   - expiry MANDATORY and ≤30 days out; a longer date is REFUSED, not
+    #     clamped. An ack is a deferral, never a decision.
+    #   - exactly one check per entry, no wildcards; an unknown name is an
+    #     error, not a silent no-op.
+    #   - at most 3 entries — a 4th VOIDS THE WHOLE SPEC (nothing acked).
+    #   - a substantive reason (≥24 chars) is mandatory.
+    #   - a refused entry acknowledges NOTHING and raises SyntheticAckInvalid.
+    #   - an acked check that starts PASSING raises SyntheticAckStale — a
+    #     resolved condition must not sit silently acknowledged.
+    #   - SyntheticAckExpiring fires 3 days before a lapse, so the
+    #     re-decision happens before the tier reddens.
+    #
+    # STANDING ENTRY (2026-08-12): the testnet runtime dropped
+    # `pallet-compute-scoring` on 2026-08-03 and left its storage prefix
+    # behind, so `check_epoch_close_advancing` correctly reports a FOSSIL.
+    # Restoring the pallet is upstream chain work with no date, and the
+    # check FAILing for ~2 days straight made SyntheticLightFailing carry no
+    # information. The condition itself remains alarmed on its own dedicated
+    # signal: `ChainScoringPalletFossil` off
+    # `hippius_synthetic_chain_pallet_live == 0`, which keeps firing.
+    # When this lapses: re-state it with a CURRENT reason, or delete it if
+    # the runtime carries the pallet again.
+    acknowledgements: ""
+
+    # ── What the KBS process is SUPPOSED to be enforcing ──────────────
+    #
+    # JSON object of posture key → expected value. `check_kbs_config_drift`
+    # diffs it every ~15 min against what the RUNNING kbs-server reports
+    # (`GET /v1/admin/volume-stamp`'s `configured_bound` today;
+    # `GET /v1/admin/config` for the rest, once the KBS is next restarted).
+    #
+    # WHY THIS EXISTS. `Config::load` runs ONCE at kbs-server start, and the
+    # KBS Deployment carries no `checksum/config` annotation — deliberately,
+    # because rolling that pod wipes its state/audit/evidence emptyDirs
+    # inside a Kata CVM. So a KBS config change lands in the ConfigMap and
+    # the running process keeps its old value INDEFINITELY, while ArgoCD
+    # reports `Synced` + `Healthy`. On 2026-08-13 the suppressed-confirm
+    # anti-rollback gate was armed (`maxUnconfirmedReleases: 0 → 3`), merged
+    # and synced; the deployed ConfigMap read 3 while the 152-minute-old
+    # process was still running with the gate DISABLED. Believing the
+    # ConfigMap would have recorded a security gate as ARMED while it was
+    # not.
+    #
+    # WHY IT IS A DECLARATION AND NOT A ConfigMap READ. ConfigMap↔git is the
+    # one thing the gitops badge does check honestly; git↔running process is
+    # what nothing checked. So this states the git side, and CI pins it to
+    # the KBS chart's OWN rendered `config.toml` — `binaries/kbs-server/
+    # tests/chart_deploy_safety.rs` renders that chart with helm, parses it
+    # with the real `Config` parser, derives the posture with the real
+    # `wiring::config_posture`, and asserts every key below agrees. Editing
+    # the KBS chart without editing this fails CI, so the two cannot
+    # silently diverge and the monitor never needs cluster-API credentials.
+    #
+    # RULES:
+    #   - keys are `AdminConfigPostureResponse` field names. An unknown key
+    #     FAILS the CI pin (never silently unverified);
+    #   - declare only what should be alarmed; an undeclared key is not
+    #     compared;
+    #   - a declared key the running KBS does not report yet is counted as
+    #     not-yet-observable, NEVER as drift (that is the pre-restart state
+    #     for everything except `max_unconfirmed_releases`);
+    #   - `null` for `max_unconfirmed_releases` means the gate is DISABLED
+    #     (the KBS resolves the chart's `0` to `None`) — it is NOT "bound 0".
+    #
+    # Start deliberately small: the three most security-critical keys, all
+    # of which have been flipped by hand at some point in this programme.
+    kbsExpectedPosture: '{"max_unconfirmed_releases": 3, "require_wrapped_kek": true, "admin_listener_mode": "mtls"}'
+    resources:
+      requests:
+        cpu: 25m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  full:
+    # Requires the orchestration-root token staged in Vault
+    # (external-secret-synthetic.yaml). The images come from the blessed
+    # `GoldenImage` catalog — there is no bake list to keep in sync.
+    enabled: true
+    schedule: "0 */6 * * *"
+    # Hard wall-clock cap on the Job. Must comfortably exceed the in-process
+    # budget so the `finally` no-leak teardown ALWAYS gets to run before
+    # SIGKILL: E2E_BUDGET_S (1800) + a fresh DECOMMISSION_TIMEOUT_S (720) for
+    # the finally teardown = 2520s worst case, plus pod scheduling/pull +
+    # margin → 2700. (The golden §24 decommission does a ~10-min forced
+    # reclaim — the old 240s decommission / 1500s deadline assumed a fast
+    # legacy erase and tripped on every golden run.)
+    activeDeadlineSeconds: 2700
+    # Vault path holding the orchestration-root ServiceToken bearer used to
+    # drive the real POST /v1/vm/launch + §24 API (property `root-token`).
+    #
+    # SECURITY / FAST-FOLLOW (least-privilege): this token is the full
+    # `orchestration-root` principal — it can launch/decommission/migrate
+    # ANY VM, not just `synthetic-monitor` ones. A scoped token would be
+    # least-privilege, but the identity model (apps/identity: ServiceClient
+    # + ServiceToken) has NO per-tenant scope field today — authz is a
+    # single-principal name check (`IsOrchestrationRoot`). Scoping needs NEW
+    # infra: a token/principal scope model + a tenant-restricted permission
+    # class enforced on the launch/decommission views. That is out of scope
+    # for this PR. Acceptable interim because the full tier is INERT by
+    # default (`enabled: false`) and the token lives only in Vault/k8s.
+    tokenVaultPath: hippius-compute/vali/synthetic-monitor
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+postgres:
+  # Postgres 16 — pinned by digest.
+  image: "postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229"
+  database: vali
+  user: vali
+  # PVC size for the data volume (StatefulSet volumeClaimTemplate).
+  storageSize: 20Gi
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+vault:
+  # KV-v2 path with the vali Postgres password + Django SECRET_KEY.
+  valiSecretPath: hippius-compute/vali
+  # KV-v2 path with the Hippius S3 credentials for the nightly backup.
+  s3SecretPath: hippius-compute/vali/s3
+  refreshInterval: 1h
+
+# §F NetBird tenant-VM overlay enrolment. `enable_netbird` defaults ON per
+# launch, so the mint config is required on BOTH the main vali pod (CLI)
+# and the launch-tick worker (async API). The self-hosted `apiBase` MUST
+# be set — the code's settings default is the PUBLIC `api.netbird.io`.
+# The token is a §20 secret from Vault via the vali-netbird-token
+# ExternalSecret (property `api_token`), NEVER in Git.
+netbird:
+  enabled: true
+  apiBase: https://vpn.hippius.network
+  vaultPath: hippius-compute/vali/netbird
+
+# vali Django config (non-secret — rendered into the vali-config
+# ConfigMap; secrets come from ExternalSecrets).
+config:
+  # HTTP bind port (/healthz, /v1/*).
+  listenPort: 8000
+  # Django ALLOWED_HOSTS. `localhost` is what the health probes send as
+  # their Host header; the others are every in-cluster Service-DNS form
+  # an in-namespace or cross-namespace caller may use, plus the external
+  # DNS names.
+  #
+  # `publicApiIngress.host` MUST appear here. nginx forwards the client's
+  # original Host header, so a public request arrives at Django carrying
+  # `api.hippius.network`; if that name is not allowed, Django answers its
+  # own `Bad Request (400)` HTML page — with no mention of the host, and
+  # from a URL that otherwise looks perfectly routed. Third and last layer
+  # of the same lesson as the Ingress + the network policy: publishing a
+  # hostname touches the route, the policy AND the application, and each
+  # layer fails differently (404 / 504 / 400).
+  allowedHosts: "vali.hippius.network,api.hippius.network,vali.vali.svc.cluster.local,vali.vali.svc,vali.vali,vali,localhost"
+  # Hard cap on an inbound OrderTicket body (bytes). Mirrors the KBS
+  # front door (kbs_server MAX_REQUEST_BYTES = 64 KiB).
+  ticketMaxBytes: "65536"
+  # `ServiceClient.name` that `IsMinerAdmin` accepts on the
+  # `POST /v1/admin/miner/register` + `quarantine` endpoints. Seeded by
+  # `manage.py vali_identity_seed_miner_admin` — see
+  # `vali/apps/miners/README.md`. Empty fails closed (the permission
+  # denies until the principal is named).
+  minerAdminPrincipal: "miner-admin"
+  # `ServiceClient.name` that `IsOrchestrationRoot` accepts on the
+  # root-only orchestration endpoints (`POST /v1/vm/launch` — #587 Phase 1
+  # — plus migrate/decommission). Empty fails closed. Seed the matching
+  # ServiceClient + a Bearer token to drive the production API launch path.
+  orchestrationRootPrincipal: "orchestration-root"
+  # Blackbox host-attestor admin-release (PR-9). `ServiceClient.name` that
+  # `IsHostAttestorAdmin` accepts on `POST /v1/admin/host-attestor/release`.
+  # Empty fails closed. Seed a matching ServiceClient + Bearer token to
+  # drive the release path.
+  hostAttestorAdminPrincipal: ""
+  # PINNED keyless-cosign identity of the blackbox UKI signer
+  # (`blackbox-uki-build.yml`) + its OIDC issuer. NOT secrets. Empty
+  # identity fails closed — set it to the workflow SAN, e.g.
+  # `https://github.com/thenervelab/hippius-compute/.github/workflows/blackbox-uki-build.yml@refs/heads/main`.
+  hostAttestorCosignIdentity: ""
+  hostAttestorCosignIssuer: "https://token.actions.githubusercontent.com"
+  cosignBin: "cosign"
+  # Reconcile: `attested` host-attestor liveness window (seconds). WARN-ONLY.
+  hostAttestorLivenessWindowS: 600
+  # Edge order-dispatch endpoint (§H phase-2, PR #153). vali's
+  # `vali_dispatch_launch` management command POSTs the canonical-CBOR
+  # OrderBody to this URL; the Edge inner listener signs it with the
+  # Ed25519 key from PR #144 and forwards to the miner-agent. The Edge
+  # inner Service is ClusterIP-only on :8444, NetworkPolicy-gated to
+  # allow only the vali namespace, and gated on `orderSigning.enabled`
+  # in the edge-gateway chart. settings.py refuses URLs with embedded
+  # credentials.
+  edgeOrderUrl: "http://edge-gateway-inner.edge-gateway.svc.cluster.local:8444"
+  # thebrain Substrate JSON-RPC endpoint vali reads `pallet-compute-
+  # scoring` (§23) from, for the §23 scheduler AND the Edge registry
+  # feed (GET /v1/edge/registry). vali has `world:443` egress; the
+  # tls-enabled `read-miner-status` reaches this public (Cloudflare-
+  # fronted) mainnet RPC directly. Empty ⇒ the registry feed + scheduler
+  # fail closed (503) rather than silently behave as "no miners".
+  thebrainRpcUrl: "https://rpc.hippius.network"
+  # KBS admin endpoint — §24/§25 lifecycle pre-registration. vali's
+  # `vali_dispatch_launch` POSTs the L1-signed OrderTicket here BEFORE
+  # the order-dispatch step so the downstream §7 release path has a
+  # `VmState::Active` for `vm_states.get` to match. ClusterIP-only,
+  # NetworkPolicy-gated to the vali namespace (see
+  # `deploy/gitops/apps/kbs/templates/networkpolicy.yaml`). Phase B
+  # layers mTLS on the listener.
+  # CUTOVER 2026-08-13 (runbook §4). `https://` is what makes vali
+  # actually present its client identity: the transport is chosen from
+  # this scheme alone, and vali REFUSES to dial https without complete
+  # material rather than falling back to system roots. The host must
+  # stay `kbs-server-admin.kbs.svc.cluster.local` — it is a SAN on the
+  # listener leaf, and the CA bundle REPLACES the system trust store for
+  # this hop, so no public CA can satisfy an internal service.
+  kbsAdminUrl: "https://kbs-server-admin.kbs.svc.cluster.local:8001"
+  # Timeout for the `hippius-kbs-admin-client` subprocess, seconds.
+  # The KBS admin path is in-memory (ticket verify + CAS); 5 s is
+  # generous.
+  kbsAdminTimeoutSecs: "5"
+
+  # `vali_create_vm` operator-CLI kill-switch. The §22 auto-pin signs
+  # with the prod Vault root seed (no committed dev seed), so this gate
+  # is only about whether the operator CLI surface is available — set
+  # `"true"` to force launches through the `POST /v1/vm/launch` API.
+  allowProd: "true"  # prod: dev CLI `vali_create_vm` (committed-dev-L1-seed) disabled; launches go through POST /v1/vm/launch.
+
+  # Vault KV v2 endpoint vali writes tenant secrets to. The token
+  # arrives as an env var at invocation time (NOT in pod state), the
+  # CA bundle is mounted via the same External Secret as the operator
+  # workstation's `vault-ca.crt`.
+  vaultAddr: "https://vault.hippius.network:8200"
+  vaultCacert: "/etc/hippius/vault-ca/ca.crt"
+  vaultKvMount: "secret"
+  vaultKvPrefix: "hippius-compute/kbs/tenants"
+
+  # The synthetic monitor no longer takes a bake_id list. It resolves each
+  # distro through the operator-blessed `GoldenImage` catalog — the same
+  # lookup a real `image=<distro>` launch performs — so the probe and a
+  # tenant launch can never test different artifacts.
+  #
+  # The removed pin was documented here as "A MONITORING BLIND SPOT BY
+  # CONSTRUCTION", and it was: corrected for ubuntu on 2026-08-13, it had
+  # drifted again on ALL FOUR distros by 2026-08-18, because re-blessing an
+  # image and editing this list are two separate acts and only the first is
+  # required to ship. Three distros still passed on their superseded
+  # artifacts; debian failed only because a later bake had overwritten its
+  # S3 prefix. A list that must be hand-synchronised with a catalog is the
+  # defect — not the particular values it drifted to.
+  # Pushgateway the synthetic metrics are pushed to (Prometheus scrapes it).
+  syntheticPushgatewayUrl: "http://prometheus-pushgateway.observability.svc.cluster.local:9091"
+
+  # ── vali's half of the KBS admin mTLS gate ────────────────────────
+  #
+  # Required TOGETHER once `kbsAdminUrl` is `https://`:
+  # `services.kbs_admin_tls` REFUSES to dial rather than fall back to
+  # "TLS with the system trust store and no client cert". With the
+  # plaintext ClusterIP URL above, empty is the correct value and vali
+  # behaves exactly as it does today.
+  #
+  # These are FILE PATHS inside the pod; the files come from the
+  # `kbsAdminMtls` Secret below. Staging them while the URL is still
+  # `http://` is the rollout's verification step — vali validates the
+  # material and logs whether it is usable, without changing how it
+  # dials. See docs/operator/kbs-admin-mtls-cutover-runbook.md.
+  #
+  # The CA bundle PINS the listener's server cert: it REPLACES the
+  # system trust store for this hop, so no public CA can satisfy an
+  # internal service (the coupling #776 had to undo elsewhere).
+  # STAGED 2026-08-13 (runbook §3). The URL above is deliberately still
+  # `http://`: `admin_client_tls_argv()` returns `[]` on the plaintext
+  # arm, so naming the files here changes NOTHING about how vali dials —
+  # it only makes vali LOAD and VALIDATE the material and say so. That
+  # rehearsal is the only place this rollout gets one, because on the
+  # KBS side mounting the material IS the cutover.
+  kbsAdminCacert: "/etc/hippius/kbs-admin-tls/ca.crt"
+  kbsAdminClientCert: "/etc/hippius/kbs-admin-tls/tls.crt"
+  kbsAdminClientKey: "/etc/hippius/kbs-admin-tls/tls.key"
+
+  # L1 OrderTicket signing seed — PRODUCTION source: a Vault KV v2 path
+  # (under `vaultKvMount`) holding the 32-byte seed as `seed=<hex>`.
+  # vali reads it via VAULT_TOKEN (already mounted for vali_launch_tick),
+  # materializes it into a 0600 tmpfs file for the mint binary, and
+  # drops it. #587 Phase 1A — the SOLE source in production (the committed
+  # dev-seed file mount has been removed; the file-path setting remains a
+  # code-level test affordance only, unset here so the mint fails closed
+  # if Vault is ever misconfigured rather than reading a stale file).
+  l1SigningKeyVaultPath: "hippius-compute/vali/l1-order-ticket"
+
+  # §22 allowlist root signing seed — PRODUCTION source: Vault KV v2 path
+  # (under the `secret` mount) holding the 32-byte seed as `seed=<hex>`.
+  # vali reads it via VAULT_TOKEN (already mounted for vali_launch_tick).
+  # Takes precedence over the file path below. #587 Phase 1A.
+  kbsAllowlistRootSeedVaultPath: "hippius-compute/vali/allowlist-root"
+  # Registry-feed signing seed path (audit M-registry-mTLS). vali signs
+  # the Edge admission feed with this; the Edge pins the matching pubkey.
+  edgeRegistryFeedSigningSeedVaultPath: "hippius-compute/vali/registry-feed"
+
+  # C2: independent SNP launch-digest recompute. The pinned OVMF (identical
+  # across Genoa+Turin) staged content-addressed in S3 + its SHA256. WARN
+  # mode validated byte-exactness live: vm=c2-verify-1 on a Turin miner
+  # logged "C2 OK vali recompute == miner digest" (2026-07-06), so ENFORCE
+  # is now on — a miner-reported digest that vali cannot reproduce from its
+  # own launch order is REFUSED (no §22 pin, no KEK release).
+  snpOvmfS3Uri: "s3://hippius-compute-images/ovmf/snp-ovmf-162aa41b.fd"
+  snpOvmfSha256: "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c"
+  snpGuestFeatures: "0x1"
+  launchDigestEnforce: true
+
+  # In-cluster manifest TOML — mounted via a ConfigMap.
+  allowlistManifestPath: "/etc/hippius/allowlist/dev-manifest.toml"
+
+  # S3 URL the KBS init container fetches. MUST equal the KBS chart's
+  # `allowlist.url`.
+  kbsAllowlistS3Url: "https://s3.hippius.com/hippius-compute-images/allowlist/v1/dev.cose"
+  s3EndpointUrl: "https://s3.hippius.com"
+  # Region for SigV4 presigning against the MinIO-compatible store.
+  # The store does not validate the value, but boto requires it to be
+  # non-empty to sign; sign + verify must agree, so it is fixed here.
+  s3RegionName: "us-east-1"
+  # §25 migration snapshots live under the images bucket (the operator
+  # creds cannot create a dedicated bucket); the key is namespaced
+  # `migrations/<vm>/<job>.luks` by the orchestration state machine.
+  snapshotBucket: "hippius-compute-images"
+
+# Toggle to enable the `vali_create_vm` mount set: the manifest TOML +
+# Vault CA. NEITHER signing seed is mounted — both the L1 ticket seed
+# and the §22 allowlist-root seed are fetched from Vault at use (#587
+# Phase 1A). Setting `true` requires the operator to create the
+# corresponding ConfigMaps OUT OF BAND (the chart deliberately does not
+# template them):
+#   - ConfigMap/`vali-allowlist-manifest`  key=`dev-manifest.toml`
+#   - ConfigMap/`vault-ca`                 key=`ca.crt`
+# See `deploy/gitops/apps/vali/README.md` for example manifests.
+createVm:
+  # Enabled: the two backing ConfigMaps (vali-allowlist-manifest,
+  # vault-ca) have been applied out of band per README.md. The signing
+  # seeds come from Vault — no committed dev seed mounted.
+  enabled: true
+
+# Nightly Postgres → Hippius S3 backup. The Job is two containers:
+# an init container `pg_dump`s (the postgres image above) and the main
+# container `aws s3 cp`s (the official aws-cli image) — both upstream,
+# digest-pinned, non-root, no runtime package install.
+backup:
+  schedule: "0 3 * * *"
+  # Official AWS CLI image — pinned by digest.
+  awsCliImage: "amazon/aws-cli@sha256:d12f97286c70c50dafa3313fe6b6dc3aefd5dd71e0a73f3f893ea181aad2bdf8"
+  # Backups land under the `backups/` prefix of the operator's
+  # provisioned `hippius-compute-images` bucket. The Hippius S3
+  # account has no separately-provisioned `hippius-compute-backups`
+  # bucket and the operator creds cannot CreateBucket (provisioning
+  # is out-of-band), so the dump is written to a prefix of the bucket
+  # the creds are actually scoped to. See cronjob key prefix below.
+  s3Bucket: hippius-compute-images
+  s3Endpoint: "https://s3.hippius.com"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+
+# #334 Phase 2 — per-tenant qcow2 bake via k8s Job. When enabled,
+# vali gains a SA + Role to create batch/v1 Jobs in its own
+# namespace, and the POST /v1/tenant-bakes endpoint spawns a
+# `hippius-tenant-baker` pod that drives the bake end-to-end.
+#
+# Default false so a fresh deploy doesn't grant the API-server-
+# touch posture until the operator has explicitly bootstrapped
+# the baker image + the worker token secret (see README).
+#
+# Out-of-band prereqs when `enabled: true`:
+#   - Secret/`vali-tenant-baker-worker-token`  key=`token`
+#     (the bearer token a `ServiceClient` named
+#     `VALI_TENANT_BAKE_WORKER_PRINCIPAL` carries, so the baker
+#     pod can call back into vali's /finalize endpoint).
+#   - The `hippius-tenant-baker` image pushed to
+#     `tenantBake.image.repository@tenantBake.image.digest`.
+#   - Either /dev/kvm exposed on the worker nodes (the bake's
+#     `update-initramfs` benefits from it), or the qemu fallback
+#     accepted at ~3× slower bake time.
+tenantBake:
+  # Phase 2B production flip — the prereqs are verified in-cluster
+  # (2026-06-08 inventory on cc-1):
+  #   - `vali-tenant-baker-worker-token` Secret  ✓ (4d21h)
+  #   - `vali-tenant-bake-spawner` SA + Role + RoleBinding  ✓
+  #   - `hippius-tenant-baker` SA  ✓
+  # AND the baker image now carries the real binaries + Phase 2B
+  # keyscript (`image.digest` below = PR #348 build).
+  enabled: true
+  spawnerServiceAccount:
+    name: vali-tenant-bake-spawner
+  bakerServiceAccount:
+    name: hippius-tenant-baker
+  # Mirrors the configmap-vali wiring (`VALI_TENANT_BAKE_*` env
+  # vars below render directly into `apps.tenant_bake.k8s_jobs.
+  # spec_from_settings` defaults). The image is built + pushed by
+  # the `.github/workflows/tenant-baker-image.yml` workflow on
+  # every main push that touches `binaries/tenant-baker/**`,
+  # `scripts/tenant-image-bake.sh`, `scripts/initramfs/**`, or
+  # any workspace dep of the embedded binaries (per PR #348
+  # workflow paths extension); bump `digest` in lockstep with
+  # the workflow's "tenant-baker image pushed" step summary.
+  image:
+    repository: "ghcr.io/thenervelab/hippius-tenant-baker"
+    # c188af2 (PR #414, #365 data disk) build — the bake now produces a
+    # fixed-minimal flavor-INDEPENDENT rootfs and bakes the
+    # hippius-data-disk-init first-boot unit into the image; on top of
+    # the #360 vault-ca + #356/#352 latency lot. Bumping this is the
+    # operator signal that they have re-verified the image's contents
+    # against the §22 allowlist measurement reproducibility
+    # expectations — a fresh bake + re-pin is REQUIRED (the rootfs
+    # contents + size changed, so the launch measurement changes).
+    # 2b5f1fb (PR #485) build — adds the cloud-init
+    # `ssh_deletekeys: false` drop-in so tenant SSH host keys persist
+    # across reboots. A fresh bake + re-pin is REQUIRED (rootfs contents
+    # changed → the launch measurement changes).
+    # Bumped to the fa234f9 build (#563 eol-sign ExecStop fix): the eol-builder
+    # stage builds the FULL hippius-agent-initramfs (dynamic glibc 2.36
+    # floor, cryptsetup feature ON), the entrypoint passes
+    # --hippius-eol-bin so the bake installs hippius-eol-sign.service
+    # (Before=shutdown.target → eol --sign-only), and the shared
+    # hippius-release-core.sh keyscript materialises the §7 lifecycle key
+    # to /run/hippius/lifecycle.key at boot. This is the FIRST baker that
+    # actually PRODUCES the source stopped-ack. A fresh bake + re-pin is
+    # REQUIRED (rootfs + cmdline changed → measurement changes).
+    # Bumped to the #646 build (HEAD main 3021802): §23 uptime-billing —
+    # the guest tenant-telemetry agent now wraps each receipt in the
+    # miner-agent's GuestFrame CBOR shape ({kind:"served-receipt", body})
+    # so the MA-4 vsock relay actually decodes + forwards it (was
+    # FrameError vsock-frame/decode). Inherits #642 (agent install +
+    # hippius-tenant-telemetry.service). Rootfs change ⇒ a FRESH bake +
+    # re-pin is REQUIRED before the next launch.
+    # Bumped to the #736 build (HEAD main 4321ebd): RA-M1 SSRF hardening —
+    # the baker's https base-image fetch now resolves once, rejects any
+    # non-public IP, PINS that IP (curl --resolve ⇒ no DNS-rebind) and
+    # FORBIDS redirects (--max-redirs 0 ⇒ no redirect into an internal
+    # target); python3 added to the baker toolset. This is a FETCH-tooling
+    # change ONLY — the produced tenant rootfs bytes are IDENTICAL (same
+    # SHA-verified base image + same bake steps), so NO fresh bake / §22
+    # re-pin is required (the launch measurement is unchanged).
+    #
+    # PIN CORRECTED 2026-07-28 — was sha256:cce59b4e…, so stale it no longer
+    # appears in the registry's recent versions. Live is `sha-7af6c9b25b8f`
+    # (7af6c9b, 2026-07-20). Reverting would drop the ENTIRE golden-bake
+    # capability every current tenant image is built with: the dm-verity base
+    # mode (#824), guest per-VM overlay boot (#826), write-redirection +
+    # launch wiring (#827), the fail-closed gate polish (#828), upload/naming
+    # reconcile (#829), squashfs-tools + the golden overlay assets (#830/#831),
+    # the 95hippius-golden dracut module (#835/#836) and the overlay-root
+    # SELinux label fix (#839). Keep this pin honest: it is the contract.
+    #
+    # PIN CORRECTED 2026-08-12 (P7 Phase 0) — was sha256:6a732b75…
+    # (`sha-7af6c9b25b8f`). Live `VALI_TENANT_BAKE_IMAGE` is
+    # `sha-2d6f645860ab` (#908 — stages the SNP-liveness keepalive into the
+    # baked guest, the producer side of `uptimeLiveness`). Reverting would
+    # bake guests that never answer a keepalive challenge, which is the
+    # exact fleet state that makes arming
+    # `uptimeLiveness.requireAttestation` stop all reward accrual.
+    digest: "sha256:8ec3760067c2134fa367c08322aa0db596e7712f9f87a4c897e999821930b4b4"
+    # ── Build provenance of the digest above (P3) ─────────────────────
+    # MACHINE-CHECKED against the digest's Sigstore signature — see the
+    # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
+    # `.github/scripts/verify_image_provenance.py`. Purely declarative;
+    # no template reads it.
+    #
+    # ⚠️ It contradicts the paragraph above, and the signature wins. That
+    # prose says the pin was moved to `sha-2d6f645860ab` (#908); the
+    # SIGNATURE says this digest was built at 7eec0cff (#924, "ship the
+    # keepalive shim the bake script demands") — the follow-up that made
+    # #908's baked keepalive actually present. #926 re-pinned the digest
+    # from the live cluster and left the paragraph alone.
+    #
+    # This image is trust-critical in its own way: it produces the tenant
+    # rootfs whose launch measurement the §22 allowlist pins. A swapped
+    # baker changes what every subsequent guest measures AS, and the
+    # auto-pin then blesses it.
+    provenance:
+      workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/tenant-baker-image.yml@refs/heads/main"
+      commitSha: "7eec0cff6f1fc64cb4edec069f566aef5e93a51a"
+      runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/31585686682/attempts/1"
+      mergedSource: true
+  # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
+  # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the
+  # Job already ran as. `jwtRole: ""` reverts the baker to the static
+  # `bake-vault-token` Secret, which Phase 5 DELETED from this namespace:
+  # the Job's static-token ref is `optional`, so the pod would start and
+  # then fail at the first Vault call. Keep the role set.
+  vault:
+    jwtRole: "tenant-baker"
+    jwtAuthPath: "jwt"
+    jwtAudience: "vault"
+    jwtMountPath: "/var/run/secrets/vault"
+    # Name of the (optional) static-token fallback Secret. Absent from the
+    # cluster today — named so the fallback target is auditable in git.
+    tokenSecret: "bake-vault-token"
+  workerTokenSecret:
+    name: "vali-tenant-baker-worker-token"
+    key: "token"
+  workerPrincipal: "tenant-baker-worker"
+  workDirSize: "32Gi"
+  backoffLimit: 0
+  # Stage-1 bake cache (perf): a PVC shared across bake Jobs that
+  # carries the tenant-INDEPENDENT half of the bake (customised raw
+  # + kernel + initrd, content-addressed + sha256-verified by
+  # `tenant-image-bake.sh`). Cuts ~6-10 min of base-image download +
+  # chroot apt + update-initramfs per bake. RWO is fine on the
+  # single-node deployment; a multi-node cluster needs an RWX
+  # storage class here or accepts node-affinity serialisation.
+  cache:
+    enabled: true
+    pvcName: "vali-tenant-bake-stage1-cache"
+    # One stage-1 entry is ~4-5 GiB (sparse customised raw + kernel
+    # + initrd); 20Gi holds ~4 distinct (base image × script rev)
+    # entries. No auto-GC — prune by deleting stale key dirs.
+    size: "20Gi"
+    # Empty = the cluster's default StorageClass (k3s local-path).
+    storageClassName: ""
+
+# Weekly self-renewal of this namespace's PERIODIC Vault tokens
+# (`vali-vault`, `bake-vault-token`). Both expired unrenewed on
+# 2026-08-06 and took the Edge's miner-admission feed down with them —
+# see templates/vault-token-renew-cronjob.yaml for the full chain.
+#
+# `enabled: true` is NOT sufficient to render the CronJob: it also
+# requires that at least one static token still exists, i.e.
+# `vaultAuth.jwt.enabled: false` or `tenantBake.vault.jwtRole: ""`. With
+# the values shipped here BOTH are on the JWT path, so this renders
+# NOTHING — correct, because there is nothing left to renew. `enabled`
+# stays true so that a rollback to either static-token path brings the
+# renewer back automatically rather than as a step someone must recall
+# mid-incident.
+tokenRenew:
+  enabled: true
+  # Weekly, Wednesday 03:29 local — staggered off the ESO renewer
+  # (Mon 03:17) and the KBS one (Tue 03:23); the period is 32d, so a
+  # weekly cadence keeps ~4x margin against a missed run.
+  schedule: "29 3 * * 3"
+  vaultAddr: "https://vault.example.invalid:8200"
+  image: "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
+
+# Vault authentication for every vali workload (M-k8sauth, #94).
+#
+# `jwt.enabled: false` falls back to the static `VAULT_TOKEN` Secret —
+# the pre-migration behaviour, kept so this can be rolled back without a
+# code change. Taking that rollback ALSO means re-staging the `token` key
+# in the `vali-vault` Secret: it holds only `address` now (the static
+# `vali-orchestrator` token was revoked after the migration), and a
+# `secretKeyRef` to a key that is not there is a hard
+# `CreateContainerConfigError`, not a soft failure. That is why the
+# `VAULT_TOKEN` env is rendered by `vali.vaultStaticTokenEnv` and gated on
+# `not jwt.enabled` — with jwt ON the chart references no key that does
+# not exist, so it can actually be applied.
+#
+# The Vault-side `jwt` backend + `vali` role are operator-configured (they
+# need the root token) and are NOT in Git; see
+# deploy/gitops/addons/external-secrets/README.md for the same pattern.
+#
+# `audience` and `mountPath` are the two silent-failure surfaces:
+#   - `audience` must equal the Vault role's `bound_audiences`. A mismatch
+#     is an HTTP 400 at login, which reads like a broken deployment rather
+#     than a one-word config drift — so vali's error now names the `aud`
+#     claim it actually presented.
+#   - `mountPath` must be the DIRECTORY of `VALI_VAULT_JWT_TOKEN_PATH`
+#     (`<mountPath>/token`, wired in `vali.vaultAuthEnv`). Point them at
+#     different places and every workload authenticates against a file
+#     that is not there. `test_vault_auth_chart.py` asserts the rendered
+#     manifests agree on both.
+# ── KBS admin mTLS material (vali's client identity) ─────────────────
+#
+# ESO projects an operator-minted client leaf + key + the pinned KBS
+# admin CA out of Vault into a Secret, mounted read-only 0400 on every
+# workload that reaches the lifecycle admin API (web, launch-tick,
+# orchestration-tick, both synthetic CronJobs).
+#
+# `secretName` EMPTY (the default) ⇒ no ExternalSecret, no volume, no
+# mount: the chart renders byte-identically to today. Setting it is
+# INERT by itself — vali keeps dialling plaintext until
+# `config.kbsAdminUrl` becomes `https://` AND
+# `config.kbsAdminClientCert/Key/Cacert` name these files. That is the
+# rollout's whole point: the client half can be staged and PROVEN before
+# the KBS starts requiring it (on the KBS side, mounting the material IS
+# enforcement — there is no rehearsal step there).
+#
+# The CA's private key is NOT in Vault and never enters the cluster; only
+# leaves are. See `templates/external-secret-kbs-admin-mtls.yaml` and
+# `docs/operator/kbs-admin-mtls-cutover-runbook.md`.
+kbsAdminMtls:
+  secretName: "vali-kbs-admin-tls"
+  # Vault KV-v2 path holding `cert` / `key` / `ca`.
+  # Minted offline 2026-08-13; the CA key stayed on the operator box and
+  # was never written to Vault. Leaf SAN is exactly
+  # `URI:spiffe://hippius.network/vali`, which becomes `peer_san` on
+  # every admin audit row — a peer that cannot be named cannot be audited.
+  vaultPath: "hippius-compute/vali/kbs-admin-mtls"
+  refreshInterval: 1h
+  # Mount point. `config.kbsAdminClientCert` / `…ClientKey` /
+  # `…Cacert` MUST point at `<mountPath>/{tls.crt,tls.key,ca.crt}` —
+  # they are asserted to agree in `tests/test_gitops_vali_chart.py`,
+  # because a mismatch is a runtime-only failure that surfaces as the
+  # admin API being unreachable.
+  mountPath: /etc/hippius/kbs-admin-tls
+
+vaultAuth:
+  serviceAccountName: "vali"
+  jwt:
+    enabled: true
+    # Must match the Vault role name and its `bound_audiences`.
+    role: "vali"
+    authPath: "jwt"
+    audience: "vault"
+    mountPath: "/var/run/secrets/vault"
+    # Short: the pod re-reads the file, and kubelet rotates it well
+    # before expiry.
+    expirationSeconds: 600
+
+# PUBLIC VM-control API (`api.hippius.network`) via the Cloudflare
+# Tunnel. `allowedPaths` is an ALLOW-LIST: 14 of vali's 45 routes carry
+# no DRF auth (signed-body miner-plane endpoints + schema/docs), so the
+# tunnel must never proxy the whole service. See the ingress template.
+publicApiIngress:
+  enabled: true
+  host: api.hippius.network
+  maxBodySize: 1m
+  allowedPaths:
+    # The surface `clients/python` calls. Every path here is still
+    # AUTH-GATED — the allow-list decides which routes EXIST publicly, the
+    # DRF permission + `object_scope` decide who may use them. Adding a
+    # path never grants access; omitting one makes an SDK method 404 no
+    # matter how good the caller's token is.
+    - /v1/vm
+    # The image catalogue (`list_images`). `NO_TENANT_DATA` — it is the
+    # list of launchable images, which a caller needs before it can pick
+    # one.
+    - /v1/images
+    # BYO-OS bakes (`create_bake` / `get_bake` / `wait_for_bake`).
+    # `OPERATOR_ONLY`. `pathType: Prefix` covers `/v1/tenant-bakes/{id}`.
+    - /v1/tenant-bakes
+    # The fleet measurement ledger (`audit_measurements`). Root-only
+    # (`IsOrchestrationRoot`), and it returns miner CHIP_IDs — published
+    # deliberately so the SDK works in full against the public host.
+    #
+    # ⚠️ The path is EXACT and must stay exact. `/v1/admin` as a prefix
+    # would publish the whole control plane — `/v1/admin/miner/register`,
+    # `/v1/admin/host-attestor/release`, `/v1/admin/miner/{id}/quarantine`
+    # — because `pathType: Prefix` matches everything beneath. One
+    # shortened line here is the difference between one audit endpoint and
+    # the entire admin surface.
+    - /v1/admin/audit/measurements
+    # The PUBLIC docs pair. NOT `/v1/docs` + `/v1/schema` — those describe
+    # all 45 routes, including the miner-plane endpoints whose own
+    # descriptions state they carry no service-token auth, and publishing
+    # that is a labelled map of the internal surface for no benefit. The
+    # `/v1/public/*` pair is the same generator filtered to the entries of
+    # THIS list, so it documents exactly what is reachable here.
+    # Swagger UI fetches its schema over HTTP, so both paths are needed.
+    - /v1/public/docs
+    - /v1/public/schema
+  # The nginx controller that serves the Ingress above. Named here because
+  # the vali CiliumNetworkPolicy is default-deny: it has to admit these
+  # pods on the listen port explicitly, or the route exists and every
+  # request 504s on a dropped connect. `name` + `component` identify the
+  # controller pods; the deployment's `instance` label is deliberately NOT
+  # matched, so a controller re-release under a different Helm name keeps
+  # working.
+  controllerNamespace: ingress-nginx
+  controllerName: ingress-nginx

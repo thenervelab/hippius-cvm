@@ -1,0 +1,418 @@
+---
+# Tier-0 KBS — the first confidential workload. PR-K6, §K (#54).
+#
+# `replicaCount: 1` — `kbs-core`'s `FileAuditSink` holds an exclusive
+# lock and the allowlist high-water-mark assumes a single process (§D
+# #101), so the KBS does not horizontally scale. A PodDisruptionBudget
+# still accompanies it (#1 anti-pattern 6).
+#
+# CONFIDENTIAL: `runtimeClassName: kata-qemu-snp` runs the pod inside
+# an AMD SEV-SNP CVM (PR-K5), pinned to the SEV-SNP node. The pod's
+# launch digest IS the attested measurement (#1 locked topology).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbs-server
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Single-replica stateful-ish workload: never run two KBS processes
+  # against the same state — recreate, don't surge.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kbs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      # ⚠️ THERE IS DELIBERATELY NO `checksum/config` ANNOTATION HERE, AND
+      # THE CONSEQUENCE IS NOT OBVIOUS — read this before adding one.
+      #
+      # The usual helm idiom (annotate the pod with a hash of the
+      # ConfigMap so a config edit rolls the Deployment) is WRONG for this
+      # workload: `state`, `audit` and `evidence` are emptyDirs inside a
+      # Kata SEV-SNP CVM, so every roll wipes the boot counters, the
+      # volume stamps, the hash-chained audit log and every evidence
+      # bundle. Auto-rolling on each config edit would make routine chart
+      # hygiene destructive. Keeping the annotation off is the right call.
+      #
+      # What it COSTS: `Config::load` runs exactly once, at process start
+      # (binaries/kbs-server/src/main.rs) — there is no SIGHUP, no reload
+      # route. So an edited ConfigMap sits next to a process that has
+      # never read it, for the pod's whole life, while ArgoCD reports
+      # `Synced` + `Healthy`. On 2026-08-13 the suppressed-confirm
+      # anti-rollback gate was armed (`maxUnconfirmedReleases: 0 → 3`),
+      # merged and synced, and the 152-minute-old process was still
+      # running with the gate DISABLED.
+      #
+      # What covers it: `apps.synthetic.checks.check_kbs_config_drift`
+      # (vali, ~15 min) diffs the chart's declared posture against what
+      # this RUNNING process reports over the admin listener —
+      # `GET /v1/admin/volume-stamp` (`configured_bound`) and
+      # `GET /v1/admin/config`. `KbsRunningConfigDrift` is the alert.
+      # A KBS config change is not applied until this pod restarts;
+      # restart it deliberately, with the restart-cost table in
+      # `deploy/gitops/apps/kbs/README.md` in front of you.
+      labels:
+        {{- include "kbs.labels" . | nindent 8 }}
+    spec:
+      # Confidential runtime — an AMD SEV-SNP CVM, pinned to the
+      # SEV-SNP node. The RuntimeClass already carries this
+      # nodeSelector; it is repeated here as defence in depth.
+      runtimeClassName: kata-qemu-snp
+      nodeSelector:
+        node-role.hippius.network/confidential-compute: "true"
+      # The KBS never calls the Kubernetes API — no token to mount.
+      automountServiceAccountToken: false
+      # The kata-qemu-snp guest pulls the image ITSELF, inside the CVM
+      # (CoCo guest-pull) — it cannot use `imagePullSecrets`. The image
+      # is therefore PUBLIC; it carries no secrets (see README "Image").
+      #
+      # A kata SEV-SNP guest cannot reach k8s ClusterIP VIPs, so it
+      # cannot use the CoreDNS ClusterIP the kubelet writes into
+      # resolv.conf by default (PR-K5 "Guest-pull + DNS" — verified
+      # live in PR-K6). DNS is pointed at public resolvers; the KBS
+      # resolves only public names (`ghcr.io` for guest-pull, AMD KDS).
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - "1.1.1.1"
+          - "8.8.8.8"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # The state / audit / evidence emptyDirs are chowned to this gid so
+        # the non-root process can write the durable stores, the audit log
+        # and the §280 evidence bundles.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if or .Values.allowlist.url .Values.snp.enabled }}
+      initContainers:
+        {{- if .Values.snp.enabled }}
+        # SEV-SNP self-report device permissions (#102 / #394). The
+        # qemu-snp guest kernel ships CONFIG_SEV_GUEST=y, so
+        # `/dev/sev-guest` exists in the guest devtmpfs at boot; the
+        # `sev-guest` hostPath volume below surfaces that guest node
+        # into the pod (it does NOT exist on the host — kata resolves
+        # the path inside the CVM). The node is created root:root 0600,
+        # but the KBS runs nonroot (uid 65532), so without this it gets
+        # `vault: self-report: open-failed` at `Firmware::open` — the
+        # last gate before the §8 broker call. This init runs as root
+        # (inside the CVM, behind the SNP boundary) and relaxes the
+        # shared node to 0666 so the nonroot main container can open it.
+        # 0666 is safe: the CVM IS the trust boundary — only the KBS +
+        # kata-agent run in it.
+        - name: sev-guest-perms
+          image: "{{ .Values.allowlist.fetcherImage.repository }}@{{ .Values.allowlist.fetcherImage.digest }}"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # MUST be root to chmod the root-owned device node. The pod
+            # securityContext pins nonroot; this init overrides it. Safe:
+            # it touches only the SNP device, inside the CVM.
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              if [ ! -e /dev/sev-guest ]; then
+                echo "sev-guest-perms: /dev/sev-guest absent — guest kernel \
+              lacks CONFIG_SEV_GUEST or the hostPath did not resolve" >&2
+                exit 64
+              fi
+              chmod 0666 /dev/sev-guest
+              echo "sev-guest-perms: $(ls -l /dev/sev-guest)"
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          volumeMounts:
+            - name: sev-guest
+              mountPath: /dev/sev-guest
+        {{- end }}
+        {{- if .Values.allowlist.url }}
+        # Fetch the §22 signed allowlist artifact. The trust anchor is the
+        # KBS binary's own COSE_Sign1 EdDSA verify against the pinned
+        # allowlist-root pubkey PLUS the durable monotonic-epoch HWM
+        # (`kbs-core::allowlist::parse_and_verify` + `InstalledAllowlist::
+        # install`, enforced identically at startup AND the admin reload).
+        # The init container therefore just FETCHES — it does NOT pin a
+        # sha256. A frozen sha here was redundant with the signature (only
+        # the root key can sign an allowlist) and the epoch (rejects
+        # rollback), and it forced a manual gitops sha bump after every §22
+        # auto-pin or the pod crashlooped. Removing it lets the auto-pin
+        # rewrite the S3 object freely; any restart re-fetches the latest
+        # signed, higher-epoch artifact and boots. (#587 Phase 1A.)
+        - name: allowlist-fetch
+          # `curlimages/curl` is a tiny scratch-based image with curl.
+          # Pinned by digest (NOT a tag) — the §F supply-chain discipline
+          # applied to the KBS image extends to the only other image in the
+          # chart. Override via `--set allowlist.fetcherImage.digest=…`
+          # against an operator mirror.
+          image: "{{ .Values.allowlist.fetcherImage.repository }}@{{ .Values.allowlist.fetcherImage.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Confidential-runtime init containers still inherit the
+          # `runtimeClassName` of the pod (kata-qemu-snp). The init
+          # runs INSIDE the same CVM as the main container, so anything
+          # it writes to the shared emptyDir lands behind the SEV-SNP
+          # boundary.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              URL="{{ .Values.allowlist.url }}"
+              OUT=/etc/kbs-allowlist/allowlist.cose
+              echo "allowlist-fetch: GET ${URL}"
+              curl -fsSL --retry 5 --retry-delay 2 --max-time 30 \
+                  -o "${OUT}" "${URL}"
+              echo "allowlist-fetch: fetched $(wc -c < "${OUT}") bytes — KBS verifies COSE_Sign1 signature + monotonic epoch on load"
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          volumeMounts:
+            - name: allowlist
+              mountPath: /etc/kbs-allowlist
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: kbs-server
+          # Content-addressed — digest, never a floating tag.
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config"
+            - "/etc/kbs/config.toml"
+          # RA-KBS-L3 — VAULT_TOKEN is NO LONGER injected. In broker mode
+          # (the deployed posture) the static token is never used for reads
+          # (each release mints a per-VM broker capability token), and the
+          # binary now treats it as optional there, so the attested KBS pod
+          # holds NO resident Vault credential. (The `kbs-vault-creds`
+          # ExternalSecret is retained for the H4 renew CronJob / non-broker
+          # fallback, just not mounted here.)
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.listenPort }}
+              protocol: TCP
+            {{- if .Values.admin.enabled }}
+            # Admin endpoint listener (POST /v1/admin/vm/{vm_id}/
+            # register-vm). Exposed only via the kbs-server-admin
+            # ClusterIP Service + CiliumNetworkPolicy (vali pod
+            # only). The public Ingress on `http` above does NOT
+            # forward this port.
+            - name: admin
+              containerPort: {{ .Values.admin.listenPort }}
+              protocol: TCP
+            {{- end }}
+          # Startup — the kata-qemu-snp microVM boots before the
+          # container, slower than a runc pod. The startup probe gives
+          # it up to ~150s (30 × 5s); liveness + readiness only begin
+          # once it succeeds, so neither can kill a still-booting VM.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          # Liveness — `/healthz` is a static 200 while the process is up.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness — `/readyz` is 200 once the service is fully
+          # wired (stores opened, audit log locked) and serving.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- .Values.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # The binary writes only to the mounted state + audit
+            # volumes; everything else is read-only.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbs
+              readOnly: true
+            - name: signing-key
+              mountPath: /etc/kbs-keys
+              readOnly: true
+            {{- if .Values.allowlist.url }}
+            - name: allowlist
+              mountPath: /etc/kbs-allowlist
+              readOnly: true
+            {{- end }}
+            {{- if .Values.snp.enabled }}
+            - name: vek
+              mountPath: /etc/kbs-vek
+              readOnly: true
+            # The SNP self-report device (#102 / #394) — the guest
+            # `/dev/sev-guest`, chmod 0666 by the `sev-guest-perms`
+            # init. NOT readOnly: SNP_GET_REPORT is an ioctl on a
+            # read-write char device.
+            - name: sev-guest
+              mountPath: /dev/sev-guest
+            {{- end }}
+            {{- if .Values.vault.caCert }}
+            - name: vault-ca
+              mountPath: /etc/vault-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.vault.brokerCaPath }}
+            # RA-KBS-M1 — the broker's TLS leaf, pinned by the KBS.
+            - name: broker-ca
+              mountPath: /etc/kbs-server/broker-ca
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.admin.enabled .Values.admin.mtls.secretName }}
+            # Admin-listener mTLS: `tls.crt` / `tls.key` (the listener's
+            # own identity) + `ca.crt` (the PINNED CA every admin client
+            # cert must chain to). Without these the admin listener
+            # refuses to serve — see `admin.requireMtls`.
+            - name: admin-tls
+              mountPath: {{ .Values.admin.mtls.mountPath }}
+              readOnly: true
+            {{- end }}
+            - name: state
+              mountPath: /var/lib/kbs/state
+            - name: audit
+              mountPath: /var/lib/kbs/audit
+            {{- if .Values.config.evidenceDir }}
+            - name: evidence
+              mountPath: {{ .Values.config.evidenceDir }}
+            {{- end }}
+      volumes:
+        # `config.toml`, from the kbs-config ConfigMap.
+        - name: config
+          configMap:
+            name: kbs-config
+        # The 32-byte Ed25519 response-signing seed — only the
+        # `signing.key` item is projected, as a file. `0440` so the
+        # seed is readable by the runtime uid/gid (via `fsGroup`) and
+        # nobody else.
+        - name: signing-key
+          secret:
+            secretName: kbs-signing-key
+            defaultMode: 0440
+            items:
+              - key: signing.key
+                path: signing.key
+        {{- if .Values.allowlist.url }}
+        # §22 signed allowlist artifact — populated by the
+        # `allowlist-fetch` init container, then read-only from the
+        # main container. Lives in the pod (emptyDir) so a restart
+        # re-fetches against the pinned sha256 (the artifact is
+        # public + integrity-anchored, no durability requirement).
+        - name: allowlist
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.snp.enabled }}
+        # Per-host VEK PEM. ESO materialises this Secret from Vault
+        # via the `external-secret-vek.yaml` template the chart renders
+        # iff `snp.enabled` — operator never `kubectl create`s the
+        # Secret by hand. The §17 follow-up replaces the Vault-staging
+        # step with an in-cluster AMD-KDS fetch sidecar.
+        #
+        # `required` fails the render at template time if the operator
+        # flipped `snp.enabled` true without setting `snp.vekSecretName`
+        # — otherwise the pod would mount a Secret named "" and the
+        # kubelet error would surface only at pod-create time.
+        - name: vek
+          secret:
+            secretName: {{ required ".Values.snp.vekSecretName must be set when snp.enabled is true (the ExternalSecret + Deployment both pin to this name)" .Values.snp.vekSecretName | quote }}
+            defaultMode: 0440
+            items:
+              - key: vek.pem
+                path: vek.pem
+        # SNP self-report device (#102 / #394). hostPath with NO `type`
+        # so the kubelet does not validate it against the HOST (the node
+        # has only /dev/sev — the management device); kata resolves the
+        # path inside the CVM, where the qemu-snp guest kernel
+        # (CONFIG_SEV_GUEST=y) created /dev/sev-guest at boot. Verified
+        # live 2026-06-11: the guest node surfaces into the container,
+        # and the `sev-guest-perms` init makes it nonroot-openable.
+        - name: sev-guest
+          hostPath:
+            path: /dev/sev-guest
+        {{- end }}
+        {{- if .Values.vault.caCert }}
+        # PROD Vault CA bundle (public cert) — see configmap-vault-ca.yaml.
+        - name: vault-ca
+          configMap:
+            name: kbs-vault-ca
+            items:
+              - key: ca.pem
+                path: ca.pem
+        {{- end }}
+        {{- if .Values.vault.brokerCaPath }}
+        # RA-KBS-M1 — the broker's TLS leaf cert (broker-ca Secret,
+        # ESO-sourced from Vault). Pinned byte-exact by the KBS.
+        - name: broker-ca
+          secret:
+            secretName: broker-ca
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- if and .Values.admin.enabled .Values.admin.mtls.secretName }}
+        # Admin-listener mTLS material. A `kubernetes.io/tls` Secret
+        # (`tls.crt`/`tls.key`) that ALSO carries `ca.crt` — the pinned
+        # client CA. 0440 so only the runtime uid/gid can read the key.
+        - name: admin-tls
+          secret:
+            secretName: {{ .Values.admin.mtls.secretName | quote }}
+            defaultMode: 0440
+        {{- end }}
+        # TODO(PR-K4): replace these emptyDirs with PVCs on the
+        # local-path provisioner once PR-K4 ships it — the durable
+        # stores + the hash-chained audit log must survive a pod
+        # restart. With the static-token Vault MVP still in place the
+        # release path is fail-closed at the Vault step regardless, so
+        # the stores stay empty and the durability gap is inert until
+        # #102 lights up releases — but the PVC swap MUST land with #102.
+        - name: state
+          emptyDir: {}
+        {{- if .Values.config.evidenceDir }}
+        # §280 evidence bundles. emptyDir (pod lifetime) to match state /
+        # audit — bundles do NOT survive a restart; swap for a PVC when
+        # durable attestation proof is required.
+        - name: evidence
+          emptyDir: {}
+        {{- end }}
+        - name: audit
+          emptyDir: {}

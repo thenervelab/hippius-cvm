@@ -1,0 +1,17 @@
+# `apps/vali` — vali Django orchestration service + Postgres. PR-K7, §K (#54).
+#
+# A plain (non-wrapper) Helm chart: vali is a first-party Django app
+# and Postgres is a single pinned upstream image, so every manifest
+# lives in `templates/`. Argo CD renders it directly.
+#
+# vali is a NON-confidential runc workload (#1 locked topology) — it
+# drives OrderTicket intake, the Packer trigger, the scheduler, and the
+# §24/§25 lifecycle. This PR deploys the web service + its Postgres +
+# a nightly S3 backup; the scheduler / orchestration management-command
+# workers are a follow-up.
+apiVersion: v2
+name: hippius-vali
+description: vali Django orchestration service + Postgres + nightly S3 backup.
+type: application
+version: 0.1.0
+appVersion: "0.0.1"

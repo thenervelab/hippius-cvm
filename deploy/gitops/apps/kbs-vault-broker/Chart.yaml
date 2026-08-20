@@ -1,0 +1,20 @@
+# `apps/kbs-vault-broker` — SNP-attestation-bound Vault broker (#102).
+#
+# A plain (non-wrapper) Helm chart: the broker is a first-party Rust
+# binary (`hippius-kbs-vault-broker`), so there is no upstream chart to
+# depend on — every manifest lives in `templates/`. Argo CD renders it
+# directly.
+#
+# The broker is a CONFIDENTIAL workload: its pod runs under the
+# `kata-qemu-snp` RuntimeClass inside an AMD SEV-SNP CVM, like the KBS
+# it serves. It is the ONLY holder of a privileged Vault credential —
+# the KBS authenticates with its SNP self-report and receives a
+# per-VM-scoped short-TTL child token (§8).
+apiVersion: v2
+name: hippius-kbs-vault-broker
+description: Hippius SNP-attestation-bound Vault broker — kata-qemu-snp confidential pod.
+type: application
+# Chart version — bump on any change to this directory.
+version: 0.1.0
+# Tracks the `hippius-kbs-vault-broker` crate version.
+appVersion: "0.0.1"

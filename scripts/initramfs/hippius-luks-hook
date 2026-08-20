@@ -1,0 +1,229 @@
+#!/bin/sh
+# `hippius-luks-hook` — initramfs-tools hook (`/etc/initramfs-tools/
+# hooks/hippius-luks`) installed into a BYO base-OS cloud image by
+# `scripts/tenant-image-bake.sh`. When `update-initramfs -u` runs at
+# bake time, this hook stages the Hippius release tooling into the
+# regenerated initrd so the in-image `hippius-luks-keyscript` can
+# fetch the LUKS KEK from KBS at first boot.
+#
+# Contract (initramfs-tools, `/usr/share/initramfs-tools/hook-functions`):
+#   - `PREREQ=""` (we have no inter-hook dependencies).
+#   - `prereqs` invocation must echo `$PREREQ` and exit 0.
+#   - `copy_exec <abs-path>` copies a binary AND its `ldd` deps into
+#     the staged initrd tree under `${DESTDIR}`.
+#   - `manual_add_modules <name>` is the kernel-module variant. We
+#     don't add any modules here — cryptsetup-initramfs already pulls
+#     the LUKS / dm-crypt / aes-xts chain.
+#
+# Why a custom hook (the cryptsetup-initramfs default isn't enough)
+# -----------------------------------------------------------------
+# The Debian/Ubuntu `cryptsetup-initramfs` package ships hooks that
+# stage `cryptsetup` itself + `udev` rules so udev creates proper
+# `/dev/mapper/<name>` symlinks. What it does NOT stage:
+#   - `hippius-guest-release` — the Hippius binary that runs the
+#     SEV-SNP attestation report ioctl + KBS HTTP exchange.
+#   - `hippius-vsock-ticket` — the vsock receiver for the L1-signed
+#     OrderTicket the miner-agent pushes at launch.
+#   - `udhcpc` or `dhclient` — the network bring-up the keyscript
+#     uses; some minimal initrd flavours omit them.
+#   - `curl` — the keyscript shells out to it for the KBS POST.
+#   - The keyscript itself.
+#
+# This hook covers the gap. The companion `hippius-luks-keyscript`
+# (installed at `/etc/initramfs-tools/hooks/../hippius-luks-keyscript`
+# at bake time and referenced from `/etc/crypttab`'s `keyscript=`
+# field) consumes everything this hook stages.
+#
+# §20 secret discipline
+# --------------------
+# This hook NEVER touches plaintext secrets. It only stages binaries
+# + the keyscript. The KEK lives only in the running guest's mlocked
+# RAM at first boot, never in any file the hook writes.
+
+set -eu
+
+PREREQ=""
+
+prereqs() {
+    echo "$PREREQ"
+}
+
+case "${1:-}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# `hook-functions` exposes `copy_exec` + `manual_add_modules` etc. The
+# path is the same on every Debian-family initramfs-tools install.
+. /usr/share/initramfs-tools/hook-functions
+
+# Bundle the SEV-SNP attestation kernel modules. /etc/initramfs-tools/
+# modules does NOT pick these up reliably on Ubuntu noble — even when
+# listed there, MODULES=auto (the default in some chroots) only walks
+# the module dependency graph from the device tree of the build
+# host, not the eventual launch target, so the coco/* tree is
+# stripped out. `manual_add_modules` forces inclusion + pulls deps
+# from depmod's modules.dep. The vsock chain is added the same way
+# for symmetry.
+# #302 — `dm_integrity` is required because #285's `--integrity
+# hmac-sha256` makes the LUKS2 superblock record `integrity:
+# hmac(sha256)`, which means cryptsetup activates the device by
+# stacking dm-integrity under dm-crypt. Without the module the
+# `cryptsetup open` silently fails inside cryptroot-initramfs and the
+# keyscript gets re-invoked every ~11 s in a loop — the guest never
+# reaches userspace. cryptsetup-initramfs's own auto-detection misses
+# this because it analyses the BUILD host's `/dev/vda` (not the
+# to-be-baked image), and the build host isn't integrity-formatted.
+# `ext4` is staged for the Phase 2B per-VM state disk (`/dev/vdd`)
+# the keyscript mounts at `/hippius-state` BEFORE invoking
+# `hippius-guest-release`. The distro's own rootfs may be ext4 too —
+# in which case the auto-detection picks it up — but keying off
+# `manual_add_modules` removes the dependency on the build host's
+# `/` filesystem matching.
+for mod in configfs tsm sev-guest vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport crypto_null gf128mul ghash-generic gcm dm_integrity ext4; do
+    manual_add_modules "$mod" 2>/dev/null || true
+done
+
+# ── Network bring-up tools ──────────────────────────────────────────
+# `dhclient` (isc-dhcp-client) is the primary DHCP client; the
+# `udhcpc` busybox applet symlink is staged as a fallback but the
+# busybox build the initramfs ships often does NOT include the
+# udhcpc applet (invoking it returns rc=127), so the keyscript
+# defaults to dhclient. Stage dhclient's lease-applying script +
+# default config from the chroot — without those dhclient acquires a
+# lease but does not write /etc/resolv.conf.
+for dhcp in /usr/bin/udhcpc /sbin/udhcpc /sbin/dhclient /usr/sbin/dhclient; do
+    if [ -x "$dhcp" ]; then
+        copy_exec "$dhcp"
+    fi
+done
+for helper in /sbin/dhclient-script /usr/sbin/dhclient-script; do
+    if [ -x "$helper" ]; then
+        copy_exec "$helper"
+    fi
+done
+if [ -d /etc/dhcp ]; then
+    mkdir -p "${DESTDIR}/etc/dhcp"
+    cp -r /etc/dhcp/. "${DESTDIR}/etc/dhcp/" 2>/dev/null || true
+fi
+
+# `udhcpc` calls a default lease-applying script (`/usr/share/udhcpc/
+# default.script`) that uses `ip`, `route`, and sed. Stage them.
+for util in /usr/sbin/ip /sbin/ip /usr/bin/sed /bin/sed /usr/bin/sha256sum /usr/bin/base64; do
+    if [ -x "$util" ]; then
+        copy_exec "$util"
+    fi
+done
+# udhcpc requires a script to apply the DHCP lease (set the IP, write
+# /etc/resolv.conf). Ubuntu's `udhcpc` package does NOT ship a default
+# script — without one the lease is acquired but never applied, leaving
+# `/etc/resolv.conf` empty and every later HTTPS DNS lookup failing
+# with `kbs-failed:connect`. Bundle a minimal applier inline so the
+# bake is self-contained.
+mkdir -p "${DESTDIR}/usr/share/udhcpc"
+cat >"${DESTDIR}/usr/share/udhcpc/default.script" <<'UDHCPC_SCRIPT'
+#!/bin/sh
+# Minimal udhcpc lease-applier (Hippius BYO-OS bake). Mirrors the
+# busybox examples/udhcp/simple.script, trimmed to the cases an
+# initramfs keyscript needs: bind / renew / deconfig only.
+[ -z "$1" ] && { echo "udhcpc default.script: missing op"; exit 1; }
+RESOLV=/etc/resolv.conf
+case "$1" in
+    deconfig)
+        /sbin/ip -4 addr flush dev "$interface" 2>/dev/null || true
+        ;;
+    renew|bound)
+        /sbin/ip -4 addr add "${ip}/${mask:-24}" dev "$interface" 2>/dev/null || true
+        if [ -n "$router" ]; then
+            /sbin/ip -4 route flush dev "$interface" default 2>/dev/null || true
+            /sbin/ip -4 route add default via "$router" dev "$interface" 2>/dev/null || true
+        fi
+        : >"$RESOLV"
+        [ -n "$domain" ] && echo "search $domain" >>"$RESOLV"
+        for ns in $dns; do echo "nameserver $ns" >>"$RESOLV"; done
+        ;;
+esac
+exit 0
+UDHCPC_SCRIPT
+chmod 0755 "${DESTDIR}/usr/share/udhcpc/default.script"
+
+# ── KBS HTTP transport ──────────────────────────────────────────────
+# `curl` is what `hippius-guest-release` invokes under the hood for
+# the POST `/v1/kbs/release`. Stage from whichever path the host
+# Debian/Ubuntu has it at.
+for c in /usr/bin/curl /bin/curl; do
+    if [ -x "$c" ]; then
+        copy_exec "$c"
+        break
+    fi
+done
+
+# ── CA bundle for KBS TLS ───────────────────────────────────────────
+# Production KBS runs behind ingress-nginx with cert-manager-managed
+# Let's Encrypt; staging the system CA bundle gives curl the trust
+# anchors. For private-CA KBS endpoints, the operator bakes the CA
+# into the image before this hook runs (e.g. via cloud-init / chroot
+# `update-ca-certificates`); we just stage whatever's there.
+for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+    if [ -r "$ca" ]; then
+        mkdir -p "${DESTDIR}$(dirname "$ca")"
+        cp "$ca" "${DESTDIR}$ca"
+        chmod 0644 "${DESTDIR}$ca"
+    fi
+done
+
+# ── Hippius release tooling ─────────────────────────────────────────
+# `hippius-guest-release` + `hippius-vsock-ticket` are installed by
+# `scripts/tenant-image-bake.sh` into the image's `/usr/sbin/` BEFORE
+# `update-initramfs -u` runs. They were cross-built by `cargo build
+# --release --bin <name> --target x86_64-unknown-linux-gnu` inside
+# the pinned `tenant-uki` Docker image so the bytes are reproducible.
+# `copy_exec` pulls their `ldd` deps (they're dynamically linked; the
+# tenant initramfs has a full glibc unlike the legacy Hippius UKI
+# initramfs which was originally static-PIE).
+for bin in /usr/sbin/hippius-guest-release /usr/sbin/hippius-vsock-ticket; do
+    if [ -x "$bin" ]; then
+        copy_exec "$bin"
+    else
+        echo "hippius-luks-hook: WARNING: $bin not found in image; rebake" >&2
+    fi
+done
+
+# ── Keyscript + shared release core ─────────────────────────────────
+# The keyscript was installed at `/etc/hippius/hippius-luks-keyscript`
+# by `tenant-image-bake.sh`. Stage it at `/sbin/hippius-luks-keyscript`
+# inside the initrd — `/etc/crypttab`'s
+# `keyscript=/sbin/hippius-luks-keyscript` field references that
+# absolute path.
+#
+# The keyscript is a thin wrapper since the multi-OS series: ALL the
+# §21/§296 logic lives in `hippius-release-core.sh` (shared with the
+# RHEL-family dracut runner), which the keyscript sources from
+# `/lib/hippius/hippius-release-core.sh`. Stage both; missing either
+# is a hard hook failure (a wrapper without its core boots a guest
+# that can never unlock).
+KEYSCRIPT_SRC="/etc/hippius/hippius-luks-keyscript"
+CORE_SRC="/etc/hippius/hippius-release-core.sh"
+[ -r "$KEYSCRIPT_SRC" ] \
+    || { echo "hippius-luks-hook: missing $KEYSCRIPT_SRC; rebake" >&2; exit 1; }
+[ -r "$CORE_SRC" ] \
+    || { echo "hippius-luks-hook: missing $CORE_SRC; rebake" >&2; exit 1; }
+mkdir -p "${DESTDIR}/sbin" "${DESTDIR}/lib/hippius"
+cp "$KEYSCRIPT_SRC" "${DESTDIR}/sbin/hippius-luks-keyscript"
+chmod 0755 "${DESTDIR}/sbin/hippius-luks-keyscript"
+cp "$CORE_SRC" "${DESTDIR}/lib/hippius/hippius-release-core.sh"
+chmod 0644 "${DESTDIR}/lib/hippius/hippius-release-core.sh"
+
+# ── init-bottom: tear down the initramfs DHCP lease (#289) ───────────
+# NOTE (2026-07-04): the teardown is NO LONGER staged here. A hook runs
+# AFTER mkinitramfs has generated `/scripts/init-bottom/ORDER` from the
+# rootfs script dirs, so a hook-copied boot script lands in the initrd
+# but is NEVER EXECUTED (it has no ORDER entry) — proven live: smokeip4
+# carried the file, ORDER lacked it, and the release-core's static
+# 192.168.122.253 survived into userspace. The bake now installs the
+# script at `/etc/initramfs-tools/scripts/init-bottom/` in the guest
+# rootfs, where mkinitramfs both copies it AND orders it natively.
+
+exit 0

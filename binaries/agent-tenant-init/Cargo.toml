@@ -1,0 +1,19 @@
+[package]
+name = "hippius-agent-tenant-init"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hippius tenant rootfs `/sbin/init` — the PID 1 binary the initramfs agent execv's after `switch_root` into the dm-verity rootfs. Minimal bring-up: announce on serial, defensively re-mount /proc + /sys + /dev (the initramfs MS_MOVE'd them already, but reaching the mount when they happen to be missing must NOT crash), then block forever on `pause(2)` so the kernel never panics on a PID-1 exit. The post-pivot service launcher (cloud-init seed → NetBird mesh join → tenant-telemetry signer) is layered on top here in follow-up PRs; this binary is the deterministic foothold."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-agent-tenant-init"
+path = "src/main.rs"
+
+[dependencies]
+# `pause(2)` + `mount(2)`. `nix` is the same wrapper the initramfs
+# agent uses; matching avoids dragging in a second FFI surface.
+nix = { version = "0.31", default-features = false, features = ["fs", "mount", "signal"] }

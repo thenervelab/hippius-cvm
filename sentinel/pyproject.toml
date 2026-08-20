@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hippius-sentinel"
+version = "0.0.1"
+description = "Hippius DePIN — read-only LLM observability + security agent (§S). PR-S1 ships only the service skeleton: agent loop, dummy hello_kbs tool, k8s liveness endpoint. Issue #57 tracks the §S scope; tool readers land in PR-S2+."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Pin to a recent minor of the Anthropic Claude Agent SDK. The SDK
+    # is the *only* runtime path that talks to the LLM — keeping the
+    # surface area small so the security review can audit it.
+    "claude-agent-sdk>=0.2,<1",
+    # Canonical CBOR (RFC 8949 §4.2.1) for KBS audit-record verification.
+    # MUST stay in lockstep with the Rust `hippius_types::cbor` rules:
+    # if the encoder rules drift, the Python verifier silently accepts
+    # records the Rust producer would reject (or vice versa).
+    "cbor2>=5.6,<6",
+    # Vault transit client for the sentinel-anchor signing key. The
+    # private Ed25519 key never leaves Vault — the sentinel only calls
+    # /transit/sign and /transit/keys to manage it.
+    "hvac>=2.3,<3",
+    # S3 client for the audit-anchors bucket. Object Lock retention is
+    # set per-PUT so a compromised sentinel cannot rewrite history.
+    "boto3>=1.34,<2",
+    # Vali Postgres read-replica client (PR-S3). Same pin as the vali
+    # Django app for binary-wheel symmetry.
+    "psycopg[binary]>=3.2,<4",
+    # HTTP client for the NetBird API + Substrate JSON-RPC (PR-S3).
+    # httpx is already a transitive dep of `mcp` (claude-agent-sdk);
+    # pinning it explicitly here documents the surface area.
+    "httpx>=0.27,<1",
+    # xxhash for Substrate twox128 storage-key derivation (PR-S3).
+    # Substrate uses the 64-bit non-cryptographic xxhash variant; the
+    # `xxhash` PyPI package exposes it as `xxhash.xxh64_intdigest`.
+    "xxhash>=3.5,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "ruff>=0.6,<1",
+    # In-memory S3 mock for the anchor-publish tests — avoids both
+    # network calls and a real moto/localstack process.
+    "moto[s3]>=5.0,<6",
+    # In-process httpx transport mock (PR-S3) — no extra dependency,
+    # we just exercise httpx.MockTransport from the runtime dep.
+]
+
+[project.scripts]
+hippius-sentinel = "sentinel.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel*"]
+
+# PR-S6 ships the agent system prompt + few-shot examples as Markdown
+# package data, loaded at runtime via `importlib.resources`. They must
+# travel inside the wheel for an installed sentinel to find them.
+[tool.setuptools.package-data]
+"sentinel.prompts" = ["*.md", "examples/*.md"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "*_tests.py"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

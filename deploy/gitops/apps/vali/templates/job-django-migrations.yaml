@@ -1,0 +1,77 @@
+---
+# Django migrations — Argo CD Sync hook. PR-K7, §K (#54).
+#
+# Runs `manage.py migrate` at sync wave 2 — AFTER Postgres (wave 1) is
+# Healthy and BEFORE the vali Deployment (wave 3). A PreSync hook would
+# run before Postgres even exists; a wave-ordered Sync hook is the
+# correct placement. `hook-delete-policy: BeforeHookCreation` recreates
+# the Job each sync — `migrate` is idempotent.
+#
+# The pod carries `app.kubernetes.io/name: vali`, so the Postgres
+# CiliumNetworkPolicy's "ingress from vali" rule admits it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vali-django-migrations
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.valiSelector" . | nindent 4 }}
+    app.kubernetes.io/component: migrations
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        {{- include "vali.valiSelector" . | nindent 8 }}
+        app.kubernetes.io/component: migrations
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "migrate", "--noinput"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi

@@ -1,0 +1,5 @@
+NAME="Hippius KBS"
+ID=hippius-kbs
+PRETTY_NAME="Hippius KBS (PR-F2 development image)"
+VERSION_ID=@IMAGE_VERSION@
+HOME_URL="https://github.com/thenervelab/hippius-compute"

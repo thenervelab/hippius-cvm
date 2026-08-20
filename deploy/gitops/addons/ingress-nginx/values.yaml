@@ -1,0 +1,51 @@
+# Values for the `ingress-nginx` dependency (see Chart.yaml). Nested
+# under the `ingress-nginx:` key — the dependency's name.
+ingress-nginx:
+  # Fleet labels on every ingress-nginx-rendered resource.
+  commonLabels:
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+
+  controller:
+    # ── Exposure ──────────────────────────────────────────────────────
+    # `LoadBalancer` Service — MetalLB assigns it an IP from the L2
+    # pool defined by the metallb addon (`lbPool.addresses`, sync
+    # wave 2).
+    #
+    # `allocateLoadBalancerNodePorts: false` is load-bearing: a
+    # `type: LoadBalancer` Service allocates backing NodePorts by
+    # DEFAULT (a cloud-LB convention). MetalLB L2 routes traffic to the
+    # LB IP directly and never uses those NodePorts, so they would be
+    # pure attack surface on the node — disabling them is what actually
+    # honors the locked "no NodePort" anti-pattern (#2).
+    service:
+      type: LoadBalancer
+      allocateLoadBalancerNodePorts: false
+
+    # ── TLS posture ───────────────────────────────────────────────────
+    # `ssl-redirect: "false"` — nginx does NOT redirect HTTP→HTTPS.
+    # Cloudflare terminates TLS at the edge and fronts the public names
+    # (locked, CLAUDE.md); a redirect here would double-handle TLS.
+    config:
+      ssl-redirect: "false"
+
+    # ── Hardening ─────────────────────────────────────────────────────
+    # Configuration-snippet annotations let any Ingress author inject
+    # raw nginx config — a privilege-escalation surface. Disabled.
+    allowSnippetAnnotations: false
+
+    # ── Prometheus metrics ────────────────────────────────────────────
+    # PR-K14 (issue #128 Phase 1) — turn on the controller's built-in
+    # Prometheus exporter and register a ServiceMonitor so the
+    # kube-prometheus-stack Prometheus discovers and scrapes it. The
+    # metrics power the `IngressNginxHigh5xxRate` alert + the
+    # ingress-nginx panels of the stack-overview dashboard. The
+    # `additionalLabels` carries the fleet labels so Prometheus's
+    # cluster-wide selector picks it up.
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          app.kubernetes.io/part-of: hippius-compute
+          app.kubernetes.io/managed-by: argocd

@@ -1,0 +1,101 @@
+{{- if .Values.stoppedAckGc.enabled }}
+---
+# StoppedAck ingest garbage-collector (audit M-StoppedAck).
+#
+# The `/v1/lifecycle/stopped` ingress (AllowAny) stores one opaque
+# `SignedStoppedAck` per (vm_id, generation) awaiting §24/§25
+# orchestration consumption. A migration / decommission consumes its ack
+# within minutes; nothing then deletes the row, so the table grows one
+# row per lifecycle event forever. This Deployment runs the
+# `vali_stopped_ack_gc` management command (a long-running loop,
+# `VALI_STOPPED_ACK_GC_INTERVAL_S`, default 3600s): each cycle reaps rows
+# whose `received_at` is older than `VALI_STOPPED_ACK_GC_AGE_HOURS`
+# (default 24h — far above the consume window, so an in-flight ack is
+# never reaped). The identity-bind on the ingress already blocks bogus
+# rows for non-existent VMs; this bounds the legit accumulation.
+#
+# Same image + env as the vali web pod (Django app, Postgres DB) via
+# envFrom: vali-config. A worker — no HTTP port, no probes; the loop IS
+# the process, a crash exits the container and the kubelet restarts it.
+# `replicas: 1` + `Recreate` (one deleter is cleanest; the delete is
+# idempotent anyway).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + migrations).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-stopped-ack-gc
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stopped-ack-gc
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: stopped-ack-gc
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: stopped-ack-gc
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every cycle times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The GC loop does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stopped-ack-gc
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the GC loop.
+          command: ["python", "manage.py", "vali_stopped_ack_gc"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+          resources:
+            {{- .Values.stoppedAckGc.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+{{- end }}

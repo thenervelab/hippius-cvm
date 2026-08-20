@@ -1,0 +1,5 @@
+centos-stream-10 {"id":"centos","version":"10","family":"rhel","pkgmgr":"dnf","initramfs":"dracut","unlock":"keyfile","kernel_pkg":"kernel-core","supported":true}
+debian-12 {"id":"debian","version":"12","family":"debian","pkgmgr":"apt","initramfs":"initramfs-tools","unlock":"keyscript","kernel_pkg":"linux-image-amd64","supported":true}
+debian-13 {"id":"debian","version":"13","family":"debian","pkgmgr":"apt","initramfs":"initramfs-tools","unlock":"keyscript","kernel_pkg":"linux-image-amd64","supported":true}
+fedora-41 {"id":"fedora","version":"41","family":"rhel","pkgmgr":"dnf","initramfs":"dracut","unlock":"keyfile","kernel_pkg":"kernel-core","supported":true}
+ubuntu-24.04 {"id":"ubuntu","version":"24.04","family":"debian","pkgmgr":"apt","initramfs":"initramfs-tools","unlock":"keyscript","kernel_pkg":"linux-image-virtual","supported":true}

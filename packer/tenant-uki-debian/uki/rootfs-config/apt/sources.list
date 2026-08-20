@@ -1,0 +1,19 @@
+# /etc/apt/sources.list inside the verity rootfs.
+#
+# The runtime rootfs is dm-verity-locked READ-ONLY at boot — `apt
+# install` would fail closed at the write step (and `apt-daily*` is
+# masked anyway). But cloud-init or operator runcmd may still need
+# to resolve package metadata for diagnostic purposes (e.g.
+# `apt-cache search`), so we ship a coherent sources.list pointing
+# at the SAME snapshot.debian.org timestamp the build itself used.
+#
+# `build-rootfs.sh` substitutes `@DEBIAN_BOOTSTRAP_URL@` +
+# `@DEBIAN_BOOTSTRAP_SECURITY_URL@` from `inputs.lock` at build
+# time (sed) — pinning the rootfs's apt repo to the bootstrap
+# timestamp prevents a future tenant from accidentally resolving
+# against the live Debian mirror and getting a divergent package
+# set than the rootfs was built with.
+
+deb [check-valid-until=no] @DEBIAN_BOOTSTRAP_URL@ trixie main
+deb [check-valid-until=no] @DEBIAN_BOOTSTRAP_SECURITY_URL@ trixie-security main
+deb [check-valid-until=no] @DEBIAN_BOOTSTRAP_URL@ trixie-updates main

@@ -1,0 +1,7 @@
+{
+  "name": "hippius-epoch-closer",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": { "@polkadot/api": "^14.0.0" }
+}

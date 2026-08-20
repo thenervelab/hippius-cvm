@@ -1,0 +1,88 @@
+#cloud-config
+# NetBird-enabled tenant userdata template (#306).
+#
+# Pair this with `vali_create_vm --enable-netbird` — vali mints a
+# one-off NetBird setup-key via the management API and substitutes the
+# literal `{{NETBIRD_SETUP_KEY}}` placeholder below before the userdata
+# is stashed in Vault. The substitution happens in-memory; the
+# plaintext key never touches durable storage on the vali side. The
+# userdata then rides the §21 KBS-released envelope to a tmpfs at
+# `/run/cloud-init/seed/` on the booted tenant (per #264) — also never
+# on disk.
+#
+# Replace the placeholders below as needed. Do NOT remove the
+# `{{NETBIRD_SETUP_KEY}}` token — `vali_create_vm` will refuse the
+# stage if it is missing while `--enable-netbird` is on.
+
+ssh_pwauth: true
+# `default` resolves to the cloud image's OWN built-in admin user, as
+# declared in that image's `/etc/cloud/cloud.cfg` `system_info:
+# default_user`. Do NOT hardcode a distro-specific name here: a literal
+# `name: ubuntu` creates an `ubuntu` user on EVERY image — including
+# CentOS / RHEL / Fedora — leaving the distro's real admin account
+# (`cloud-user` on CentOS Stream / RHEL, `debian` on Debian, `fedora`
+# on Fedora, `ubuntu` on Ubuntu) un-keyed and the operator locked out.
+# Using `default` makes the same template correct on every supported OS.
+users:
+  - default
+
+# Operator SSH public key(s), applied to the distro default user above
+# (top-level `ssh_authorized_keys` keys the default user regardless of
+# its distro-specific name). Replace with one or more real keys before
+# launch — an empty list with no password leaves the VM unreachable.
+ssh_authorized_keys: []
+
+# DEV-SMOKE ONLY: uncomment to also allow password login on the default
+# user. `default` is accepted by chpasswd and maps to the distro admin
+# user resolved above. Prefer SSH keys for anything beyond dev smoke.
+# chpasswd:
+#   expire: false
+#   users:
+#     - name: default
+#       password: hippius
+#       type: text
+
+write_files:
+  # The setup-key file the netbird systemd unit reads at first boot.
+  # `0600` + root:root — netbird runs as root inside the tenant. The
+  # file is on tmpfs (`/var/lib/cloud/seed/nocloud/` is the
+  # NoCloud datasource directory cloud-init wrote into, and the
+  # cmdline `ds=nocloud;s=/run/cloud-init/seed/` routes that into
+  # the §21-released tmpfs).
+  - path: /var/lib/cloud/seed/nocloud/netbird-setup-key
+    permissions: '0600'
+    owner: root:root
+    content: |
+      {{NETBIRD_SETUP_KEY}}
+
+runcmd:
+  # The netbird agent is PRE-INSTALLED in the tenant image at bake time
+  # (scripts/tenant-image-bake.sh, pinned version) — first boot only
+  # ENROLS, no apt/curl at boot. Pre-installing is deliberate: the
+  # upstream first-boot installer runs
+  # `apt-get install -y ca-certificates curl gnupg`, which upgrades the
+  # curl/ca-certificates the bake holds (apt-mark hold) and aborts with
+  # `E: Held packages were changed …`, so netbird never installed and
+  # the guest never joined the overlay (prodcheck-1/-2: setup-key
+  # used=0). Do NOT re-add a `curl … install.sh | sh` line here.
+  #
+  # Enrol with the per-tenant key. The setup-key file is single-use;
+  # `netbird up` consumes it and the daemon supervises the mesh
+  # connection thereafter (the install script puts a systemd unit in
+  # place with `Restart=on-failure`).
+  #
+  # `--hostname={{NETBIRD_HOSTNAME}}` is expanded by `vali_create_vm`
+  # from `--netbird-hostname-template` (default `hippius-tenant-{vm_id}`)
+  # so the joined peer's FQDN is `<template>.hippius.decentralized`.
+  # Per-vm-id stable FQDNs let operators ssh into a specific tenant by
+  # name without an IP lookup (#309).
+  - [ netbird, up,
+      --setup-key-file=/var/lib/cloud/seed/nocloud/netbird-setup-key,
+      --management-url=https://vpn.hippius.network,
+      --hostname={{NETBIRD_HOSTNAME}},
+      --no-browser ]
+  # Belt-and-suspenders: after `netbird up`, shred the setup-key file
+  # so a tenant operator can't read it after the fact. (The file is
+  # already on tmpfs that disappears at shutdown, but explicit shred
+  # protects against a snapshot of the running VM's tmpfs.)
+  - [ shred, -u, /var/lib/cloud/seed/nocloud/netbird-setup-key ]

@@ -1,0 +1,14 @@
+# Python venv / build artefacts
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.pyc
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# uv lock (managed by setuptools, not used by uv directly here)
+uv.lock

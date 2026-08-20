@@ -1,0 +1,28 @@
+---
+# vali Service. PR-K7, §K (#54).
+#
+# `ClusterIP` — vali is reached in-cluster: the Edge gateway relays
+# OrderTickets to it, the Sentinel reads from it. The external
+# L1↔vali path (mTLS-terminated on `vali.hippius.network`) is a
+# follow-up — it needs the PR-K13 mTLS CA and the real DNS pointed at
+# the cluster; until then vali is ClusterIP-only, like the KBS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vali
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    {{- include "vali.valiSelector" . | nindent 4 }}
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "vali.valiWebSelector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.config.listenPort }}
+      targetPort: http
+      protocol: TCP

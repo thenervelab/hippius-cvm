@@ -1,0 +1,79 @@
+---
+# Cloudflare Tunnel connector.
+#
+# `--no-autoupdate` is deliberate: this process holds a credential that
+# can serve traffic for a public hostname, so the binary it runs is
+# pinned by the image digest and changed by a reviewed chart bump — not
+# silently in place by an upstream self-updater.
+#
+# Two replicas: Cloudflare load-balances across connectors, so a rolling
+# chart change or a node drain does not blackhole the API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/part-of: hippius-compute
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+    spec:
+      # Spread the connectors so one node loss never takes the tunnel
+      # down entirely.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudflared
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: cloudflared
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            # The token is read from the Secret the operator created out
+            # of band. It is NEVER rendered into a manifest, a ConfigMap,
+            # or this repository.
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tokenSecret.name }}
+                  key: {{ .Values.tokenSecret.key }}
+          ports:
+            - name: metrics
+              containerPort: 2000
+          # `/ready` is the connector's own view of whether it holds a
+          # live edge connection — a connector that has lost Cloudflare
+          # but is still running would otherwise keep taking traffic.
+          livenessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

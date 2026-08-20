@@ -1,0 +1,4 @@
+NAME="Hippius tenant (Debian 13)"
+ID=hippius-tenant-debian
+VERSION_ID="@IMAGE_VERSION@"
+PRETTY_NAME="Hippius tenant (Debian 13 / @IMAGE_VERSION@)"

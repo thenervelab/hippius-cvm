@@ -1,0 +1,44 @@
+[package]
+name = "hippius-image-provenance"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PR-F4: builds + signs the §11/§22 image provenance map. Reads a `hippius-uki-measure` SNP envelope, binds the SEV-SNP launch digest to every build input (verity root, kernel/initrd/cmdline/OVMF fingerprints, pinned launch config) + the content-addressed S3 location into a canonical-CBOR `ProvenanceMap`, Ed25519-signs it with the §22 offline allowlist root key, and idempotently pushes artifact + provenance to the Hippius S3 image bucket via the `ImageStore` abstraction."
+
+[lints]
+workspace = true
+
+[lib]
+name = "hippius_image_provenance"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hippius-image-provenance"
+path = "src/main.rs"
+
+[dependencies]
+# The provenance wire format (canonical-CBOR encode/decode) is shared
+# with the PR-F5 miner-side fetch tool — it lives in hippius-types so
+# this crate owns only the Ed25519 sign/verify + the S3 push.
+hippius-types = { path = "../../hippius-types" }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+zeroize = "1.8"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# `HippiusS3ImageStore` GET / HEAD against the anonymous-readable
+# `images/` prefix of `s3.hippius.com` — no auth needed for reads.
+# `blocking` keeps the `ImageStore` trait sync (it is); `rustls-tls`
+# avoids native-tls (no OpenSSL dependency on the miner). Default
+# features are dropped to keep the surface small (no charset/cookie
+# machinery, no `gzip` magic).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
+
+[dev-dependencies]
+tempfile = "3"
+hex = "0.4"

@@ -1,0 +1,59 @@
+---
+# Argo CD Application — Kata Containers confidential runtime. PR-K5, §K (#54).
+#
+# Sync wave 5: after the PR-K3 network/ingress addons (cilium wave 1,
+# metallb 2, cert-manager/ingress-nginx 3) and PR-K4 storage (wave 4).
+# Kata depends on a `Ready` node with working pod networking; nothing
+# else here depends on Kata except the PR-K6 KBS app (an `apps/` child,
+# much higher wave).
+#
+# First confidential runtime on the cluster — the prerequisite for
+# every §23 confidential pod (KBS, Audit-VM). The kata-deploy DaemonSet
+# it installs is privileged + uses hostPath: that is intrinsic to a
+# node-level runtime installer (it drops the Kata binaries on the host
+# and rewrites containerd's config), exactly as the Cilium agent is —
+# see README.md "Privileged + hostPath".
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-kata
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-kata
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: confidential-runtime
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  # Cascade-delete the addon's resources if this Application is deleted.
+  # kata-deploy's own pod-delete hook cleanly removes the kata runtime
+  # config from containerd, so a prune is a clean uninstall.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    # The wrapper chart — Argo CD runs `helm dependency build` from
+    # Chart.lock (fetching the pinned `kata-deploy` OCI chart) and
+    # renders it together with templates/runtimeclass.yaml.
+    path: deploy/gitops/addons/kata
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kata-system
+  syncPolicy:
+    # Fully automated GitOps — non-negotiable, fleet-wide.
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

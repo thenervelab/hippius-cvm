@@ -1,0 +1,15 @@
+{
+  "measurement_kind": "snp_launch_digest_v1",
+  "measurement_hex": "b98f249b158891a3d1bd5e5e136be52daabf42f1c87571649f0186086d1f907b3debcbdfac7e52498555334f937ed794",
+  "components": {
+    "kernel_sha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "initrd_sha256": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+    "cmdline_sha256": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+    "ovmf_sha256": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+    "rootfs_verity_root": "871b7fceafd96e40761fc92e12de4da30dee4c407ba4ec9a6343295ca052da3a",
+    "snp_launch_config": { "vcpus": 1, "vcpu_type": "EpycGenoa", "guest_features": "0x1" }
+  },
+  "uki_basename": "kbs.uki",
+  "uki_size_bytes": 92,
+  "note": "PR-F4 provenance known-answer vector — pinned synthetic hippius-uki-measure SNP envelope."
+}

@@ -1,0 +1,34 @@
+# Packer caches + build outputs — never committed.
+output/
+packer_cache/
+*.qcow2
+*.iso
+crash.log
+
+# Operator-supplied secrets / pinning files. Only the `.example`
+# template lives in git (see `kbs-uki.auto.pkrvars.hcl.example`).
+*.auto.pkrvars.hcl
+!*.auto.pkrvars.hcl.example
+*.pkrvars.hcl
+!*.pkrvars.hcl.example
+
+# PR-F2 UKI build artefacts (and the per-run isolation copies the
+# reproducibility check writes under uki/{output,fetched,build}-run-*).
+# The `-bb-*` copies are the blackbox reproducibility check's isolated
+# dirs (host-attestor chantier PR-6).
+uki/output/
+uki/output-run-*/
+uki/output-bb-*/
+uki/fetched/
+uki/fetched-run-*/
+uki/fetched-bb-*/
+uki/build/
+uki/build-run-*/
+uki/build-bb-*/
+
+# Production signing keys — block every *.key in the repo EXCEPT the
+# explicit dev placeholder under `keys/dev/`. If you find yourself
+# wanting to add `!keys/prod/db.key` here, stop and route the key
+# through Vault / an offline ceremony instead.
+*.key
+!keys/dev/db.key

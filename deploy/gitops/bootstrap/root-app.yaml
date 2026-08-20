@@ -1,0 +1,89 @@
+---
+# Argo CD app-of-apps ROOT. PR-K0, §K (#54).
+#
+# This single Application is the entry point of the whole GitOps tree.
+# It is `kubectl apply`-ed exactly once, by an operator, right after the
+# Helm bootstrap of Argo CD itself (argo-cd-install.yaml). That is the
+# second and LAST manual `kubectl apply` in the cluster's life — every
+# other resource, including each addon and each app, is created and
+# reconciled by Argo CD from Git. See deploy/gitops/README.md.
+#
+# ── How it discovers children ─────────────────────────────────────────
+# Two directory sources — addons/ and apps/ — each recursed with an
+# include glob of `*/application.yaml`. So the root app picks up exactly
+# the child Argo CD `Application` manifests and nothing else: the Helm
+# values, Chart.yaml, READMEs and .gitkeep files that will sit next to
+# them (added by PR-K3..K15) are not matched. The glob is a filter, not
+# an enforcement mechanism — but `*` does not cross `/`, so it matches
+# exactly one subdirectory deep, which is precisely the convention:
+# every addon/app lives in its own subdirectory holding one
+# `application.yaml`.
+#
+# addons/ and apps/ are empty of `application.yaml` files today (PR-K0
+# is scaffold only), so this root app syncs green with zero children —
+# exactly the intended scaffold state.
+#
+# ── Ordering ──────────────────────────────────────────────────────────
+# The root app is sync-wave 0. Ordering BETWEEN addons and apps is the
+# children's responsibility: addon `application.yaml`s use low/negative
+# sync-waves, app `application.yaml`s use higher ones, so the cluster
+# infrastructure (CNI, storage, ingress, runtimes, secrets) is healthy
+# before any workload is scheduled. See addons/README.md + apps/README.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-root
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: app-of-apps
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  # Argo CD only deletes an Application's children if the Application
+  # itself is allowed to cascade — the finalizer enables that, so a
+  # `kubectl delete -f root-app.yaml` tears the tree down cleanly.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # Two directory sources: the addons tree and the apps tree. The SSH
+  # deploy key for this private repo is registered with Argo CD at
+  # bootstrap (see deploy/gitops/README.md → "Bootstrap"). The repoURL
+  # below MUST match the form passed to `argocd repo add` exactly —
+  # Argo CD keys credentials by repoURL string, and the SSH and HTTPS
+  # forms are distinct entries.
+  sources:
+    - repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+      targetRevision: main
+      path: deploy/gitops/addons
+      directory:
+        recurse: true
+        include: '*/application.yaml'
+    - repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+      targetRevision: main
+      path: deploy/gitops/apps
+      directory:
+        recurse: true
+        include: '*/application.yaml'
+  destination:
+    # In-cluster: child Application CRs are created in the argocd
+    # namespace that Argo CD watches.
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    # Fully automated GitOps: prune removed children, self-heal drift.
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  # Keep history bounded — this object changes rarely.
+  revisionHistoryLimit: 5

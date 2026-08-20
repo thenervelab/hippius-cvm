@@ -1,0 +1,24 @@
+---
+# Broker Service. #102 PR C.
+#
+# `ClusterIP` — the broker is reached ONLY by the KBS pod (enforced by
+# the CiliumNetworkPolicy). It is never exposed on a public IP or an
+# Ingress: its sole client lives in the same namespace, and the
+# capability it returns (a scoped Vault token) must never transit the
+# public edge.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbs-vault-broker
+  namespace: kbs
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "broker.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.config.listenPort }}
+      targetPort: http
+      protocol: TCP

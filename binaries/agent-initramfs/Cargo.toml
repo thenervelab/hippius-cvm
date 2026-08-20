@@ -1,0 +1,164 @@
+[package]
+name = "hippius-agent-initramfs"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hippius initramfs agent — drives the §21 boot sequence (X25519 keygen → /dev/sev-guest attestation → KBS release → LUKS unlock → NoCloud seed → switch_root) inside an SEV-SNP guest. PR-E1.1 skeleton + PR-E1.2 real X25519 keygen via x25519-dalek + /dev/sev-guest SNP_GET_REPORT via the `sev` crate behind a `SnpReportProvider` trait (production: `SevGuestProvider` on Linux/x86_64; tests / non-SNP dev hosts: `MockSnpReportProvider` that captures REPORT_DATA). PR-E1.4 adds the real LUKS unlock via `libcryptsetup-rs` behind a `LuksUnlocker` trait (production: `RealLuksUnlocker` on Linux; tests / non-Linux dev hosts: `MockLuksUnlocker`)."
+
+[lints]
+workspace = true
+
+[features]
+# `cryptsetup` (default ON) gates the `libcryptsetup-rs` C binding and
+# everything that touches it (`stages/{luks_cryptsetup,verity_cryptsetup}`,
+# `RealEolSink`). The full agent binary needs it; the slim BYO-OS CLIs
+# (`hippius-guest-release`, `hippius-vsock-ticket`) build with
+# `default-features = false` so they can be linked as fully STATIC
+# x86_64-unknown-linux-musl binaries (multi-distro initramfs support —
+# one artifact runs in any distro initrd regardless of glibc). Without
+# the gate, the unconditional `-lcryptsetup` makes a static musl link
+# impossible.
+default = ["cryptsetup"]
+cryptsetup = ["dep:libcryptsetup-rs"]
+
+[[bin]]
+name = "hippius-agent-initramfs"
+path = "src/main.rs"
+# The agent binary wires the Real* cryptsetup-backed implementations.
+required-features = ["cryptsetup"]
+
+[lib]
+name = "hippius_agent_initramfs"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-guest = { path = "../../hippius-guest" }
+hippius-types = { path = "../../hippius-types" }
+thiserror = "2"
+# PR-E1.3 — KBS HTTP client. `reqwest` with `rustls-tls` (NOT
+# native-tls: an initramfs has no system OpenSSL). `blocking` because
+# the §21 pipeline is synchronous — no tokio runtime in `/init`.
+# `default-features = false` drops the native-tls default + the
+# unneeded charset/cookie machinery, keeping the initramfs slim.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Decode the COSE_Sign1 `OrderTicket` envelope (payload extraction
+# only — the agent never verifies the L1 signature; the KBS does, §7).
+coset = "0.3"
+# Encode the canonical-CBOR `ReleaseRequestBody` + decode the
+# `OrderTicket` payload + the KBS `SignedResponse` / `SignedDenial`.
+ciborium = "0.2"
+# Byte-string CBOR fields for the KBS-over-vsock proxy frames
+# (`hippius_types::kbs_vsock`). Same pinning as the host side.
+serde_bytes = "0.11"
+# Reconstruct the pinned KBS Ed25519 `VerifyingKey` from the 32 raw
+# UKI-baked bytes, to hand to `hippius_guest::verify_and_unwrap_release`.
+# `zeroize` so the §24/§25 EOL lifecycle `SigningKey` wipes on drop
+# (PR-E1.5 — `SigningKey: ZeroizeOnDrop` is gated behind this feature).
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+# X25519 keygen for the §20 ephemeral guest keypair. Pinned to the
+# same major version `hippius-guest` already depends on so the secret
+# scalar bytes round-trip cleanly into `verify_and_unwrap_release`.
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
+# `OsRng` for the keygen. `std` so `getrandom` resolves to /dev/urandom
+# inside the initramfs (the kernel pool is fully seeded by the time
+# /init runs — Linux blocks the syscall until then).
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# `sev` provides the SNP guest attestation ioctl wrapper. Target-gated
+# so non-Linux dev hosts (macOS) can still `cargo check` the crate —
+# the `SevGuestProvider` only exists on Linux/x86_64 (where the
+# /dev/sev-guest character device lives); other targets must use
+# `MockSnpReportProvider` or fail at runtime.
+#
+# `default-features = false` drops the host-side (`sev`) feature; we
+# only need the `snp` guest API. Keeps the dep slim — no openssl pull-
+# in for the host firmware verifier.
+# §E1 wire-up 3/3 — bake the KBS response-signing pubkey into the
+# measured UKI as a 32-byte compile-time constant. In main
+# [dependencies] (not target-gated) because trust_anchors.rs uses
+# it unconditionally on all targets.
+hex-literal = "0.4"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+sev = { version = "7.1", default-features = false, features = ["snp"] }
+
+# `libcryptsetup-rs` is the official Rust binding to `libcryptsetup`
+# (PR-E1.4 — the §21 LUKS unlock stage). The C library it links is
+# Linux-only (it drives the kernel device-mapper / dm-crypt), so the
+# dep is target-gated to `target_os = "linux"` — non-Linux dev hosts
+# (macOS) `cargo check`/`cargo test` against `MockLuksUnlocker`
+# instead; only `RealLuksUnlocker` (in `stages/luks_cryptsetup.rs`,
+# same `cfg`) touches it. NOT restricted to `x86_64` like `sev`:
+# dm-crypt is architecture-agnostic. A Linux build needs `pkg-config`
+# + `libcryptsetup` headers present (`libcryptsetup-dev`) — the CI
+# `rust` job installs them; see `.github/workflows/ci.yml`.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `optional` behind the `cryptsetup` feature (see [features]) so the
+# slim BYO-OS CLIs can drop the C linkage for static musl builds.
+libcryptsetup-rs = { version = "0.15", optional = true }
+# PR-E1.5 — safe wrappers for the Linux syscalls the final §21 stages
+# need: `mount`/`umount2` + `MS_MOVE` (NoCloud tmpfs + `switch_root`),
+# `statfs` (the seed tmpfs guard), `chdir`/`chroot`/`execv` (the
+# `switch_root` pivot), and `reboot` (the EOL poweroff + the
+# fail-closed fatal-error poweroff). `nix` encapsulates every raw
+# syscall, so the crate stays `unsafe`-free (workspace
+# `unsafe_code = "forbid"` inherited). Linux-only, like `libcryptsetup-rs`.
+#
+# `kmod` (PR §E2 follow-up): `init_module(2)` so we can pull
+# `vsock` + `vmw_vsock_virtio_transport{,_common}` into the running
+# kernel from the cpio's `/lib/modules/<kver>/`. Debian Trixie
+# ships `CONFIG_VSOCKETS=m`, so `VsockListener::bind` would otherwise
+# fail closed (no `/dev/vsock`) inside `stages::ticket_vsock::recv_ticket`.
+# `feature` exposes `sys::utsname::uname` — used to derive
+# `<kver>` at runtime instead of hardcoding `6.12.63+deb13-amd64`.
+# `net` exposes `if_nametoindex` (needed to bind RTNETLINK messages
+# to the eth0 ifindex when applying a DHCP lease) and `socket`
+# exposes the BSD-socket primitives the hand-rolled DHCP client
+# needs (`socket`/`setsockopt`/`SO_BROADCAST`/`SO_BINDTODEVICE`/
+# `bind`/`sendto`/`recvfrom`). Both layered on the existing safe
+# `nix` wrappers so the agent stays `unsafe_code = "forbid"`.
+nix = { version = "0.31", default-features = false, features = ["mount", "fs", "process", "reboot", "kmod", "feature", "net", "socket"] }
+# PR §E2 wire-up — host→guest OrderTicket vsock receiver. Sync (no
+# tokio in initramfs), rust-vmm-maintained, minimal — just
+# `VsockListener::bind` + `accept`. Linux-only (`AF_VSOCK` is a Linux
+# syscall). Port + cap constants live in `hippius_types::ticket_vsock`.
+vsock = "0.5"
+# PR #194 — in-initramfs network bring-up. `netlink-sys` + the two
+# `netlink-packet-*` crates encode/decode RTNETLINK messages purely
+# in safe Rust (the socket syscalls are encapsulated inside; the
+# caller stays `unsafe_code = "forbid"`). Used for RTM_NEWLINK
+# (set link UP), RTM_NEWADDR (assign the DHCP-leased IP / netmask),
+# RTM_NEWROUTE (default gateway). Six transitive crates total
+# (libc / bytes / bitflags / log / paste / netlink-packet-core) —
+# orders of magnitude smaller than `dhcproto`'s hickory-proto + ICU
+# tables, which would have been the only other turn-key DHCP client
+# in the Rust ecosystem. The DHCP wire protocol itself is
+# hand-rolled (`stages/network.rs`) — RFC 2131, the only DHCP
+# server an initramfs ever talks to is libvirt's dnsmasq, a narrow
+# enough contract that ~250 LOC of bit-flipping beats a heavyweight
+# parser in both audit surface and measurement-stability.
+netlink-sys = "0.8"
+netlink-packet-core = "0.8"
+netlink-packet-route = "0.30"
+
+[dev-dependencies]
+# The KBS HTTP client + verify integration tests mint VALID signed +
+# HPKE-wrapped release responses — i.e. a `MockKbsService`. `kbs-core`
+# supplies `hpke_wrap` + `sign_response`; `ed25519-dalek` with
+# `rand_core` mints the test KBS signing key. `hippius-types` builds
+# the `KbsResponse` / `OrderTicket` / `ReleaseContext` shapes;
+# `ciborium` + `coset` build the on-wire CBOR / COSE_Sign1; `tempfile`
+# backs the ticket-file loader test. None reach the production binary.
+kbs-core = { path = "../../kbs-core" }
+hippius-types = { path = "../../hippius-types" }
+ed25519-dalek = "2.1"
+ciborium = "0.2"
+coset = "0.3"
+tempfile = "3"
+# Drift-gate tests in `trust_anchors.rs` decode the chart's
+# `authPubkeyHex` / `kidHex` strings to compare them against the
+# const bytes — `hex::decode` is a one-shot helper. NOT a runtime
+# dep (the production binary uses `hex_literal!` at compile time).
+hex = "0.4"

@@ -1,0 +1,95 @@
+{{- if .Values.hostAttestorReconcile.enabled }}
+---
+# Blackbox host-attestor coverage reconcile (blackbox host-attestor PR-9).
+#
+# WARN-ONLY. Runs `manage.py vali_host_attestor_reconcile` on a schedule:
+# for each on-chain-Active miner it checks whether there is an `attested`
+# (NEVER `pending`) host-attestor seen within the liveness window on a
+# DESIRED measurement ({current, previous}), and logs coverage gaps. It
+# gates NOTHING — no reward, no dispatchability (that arms in PR-11). The
+# findings are advisory; default-inert (`enabled: false`).
+#
+# Same image + env as the vali web pod (Django app, Postgres DB, the
+# `read-miner-status` chain read) via envFrom vali-config + the
+# `vali.valiSelector` label (Postgres CNP ingress + chain-RPC egress —
+# exactly like the scheduler-reeval chain reader).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: host-attestor-reconcile
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: host-attestor-reconcile
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.hostAttestorReconcile.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: host-attestor-reconcile
+            # Postgres CNP keys :5432 ingress + chain-RPC egress on the vali
+            # identity — without it this pod is DB-blocked / cannot read the
+            # on-chain fleet (mirrors scheduler-reeval).
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          # The reconcile does not call the Kubernetes API.
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: host-attestor-reconcile
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              # Override the gunicorn ENTRYPOINT with a single reconcile.
+              command: ["python", "manage.py", "vali_host_attestor_reconcile"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+              resources:
+                {{- .Values.hostAttestorReconcile.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+{{- end }}

@@ -1,0 +1,21 @@
+---
+# Grafana dashboard ConfigMap — the synthetic-monitor board (apps.synthetic).
+# The Grafana sidecar (../values.yaml `sidecar.dashboards`) imports any
+# ConfigMap labelled `grafana_dashboard: "1"`. Raw JSON lives at
+# `../dashboards/synthetic-monitor.json`; Helm embeds it here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hippius-dashboard-synthetic-monitor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: synthetic-monitor
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: dashboard
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: hippius
+data:
+  synthetic-monitor.json: |
+{{ .Files.Get "dashboards/synthetic-monitor.json" | indent 4 }}

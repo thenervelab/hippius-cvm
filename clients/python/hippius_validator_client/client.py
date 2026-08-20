@@ -1,0 +1,763 @@
+"""Synchronous client for the Hippius validator VM-lifecycle HTTP API."""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Iterator
+from types import TracebackType
+from typing import Any
+
+import requests
+
+from . import _common
+from .errors import (
+    BakeFailedError,
+    DecommissionFailedError,
+    HippiusTimeoutError,
+    LaunchFailedError,
+    MigrationFailedError,
+)
+from .models import (
+    Bake,
+    BakeRequest,
+    DecommissionJob,
+    Image,
+    LaunchJob,
+    LaunchRequest,
+    MigrationJob,
+    OnProgress,
+    ProvisionPhase,
+    ProvisionStep,
+    Vm,
+    VmListPage,
+    VmPower,
+    boot_advanced,
+    boot_phase_of,
+    reports_boot_phase,
+    reports_netbird_ip,
+)
+
+_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_POLL_INTERVAL = 5.0
+_DEFAULT_POLL_TIMEOUT = 1800.0
+# Guest boot is fast relative to bake/launch; keep the boot-wait budget bounded
+# so a validator that never reports ``boot_phase`` (or a stalled boot) ends the
+# provision flow gracefully rather than hanging on the launch-succeeded step.
+_DEFAULT_BOOT_TIMEOUT = 600.0
+# A §25 migration is COLD: the destination downloads the whole encrypted
+# volume (multi-GB) and re-attests before it activates, and the server's own
+# dest-activation budget alone is ~20 min. Give the waiter a budget that
+# comfortably covers snapshot upload + download + attested boot.
+#
+# Server worst case is ~55 min (the per-step deadlines reset on each state
+# CAS: 5 x 300s + 600s awaiting-source-ack + 1200s dest-activation), so 1 h
+# clears it only just. If an operator raises
+# ``VALI_ORCHESTRATION_ACTIVATE_TIMEOUT_S``, this client budget becomes the
+# binding constraint — pass an explicit ``timeout`` then.
+_DEFAULT_MIGRATION_TIMEOUT = 3600.0
+
+
+class HippiusValidatorClient:
+    """Blocking client over ``requests``.
+
+    Auth is ``Authorization: Bearer <ServiceToken>`` where the token belongs
+    to a ServiceClient the endpoint's permission allows (launch / migrate /
+    decommission / transition need the ``orchestration-root`` principal).
+
+    When calling the validator by IP, set ``host_header`` to an allowed name
+    (e.g. ``localhost`` or ``vali.vali.svc.cluster.local``) — the validator
+    validates ``Host`` against ``ALLOWED_HOSTS``.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        host_header: str | None = None,
+        timeout: float = _DEFAULT_TIMEOUT,
+        verify: bool | str = True,
+        session: requests.Session | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.host_header = host_header
+        self.timeout = timeout
+        self.verify = verify
+        self._session = session or requests.Session()
+        self._owns_session = session is None
+
+    # ── context manager ──────────────────────────────────────────────
+
+    def __enter__(self) -> HippiusValidatorClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._owns_session:
+            self._session.close()
+
+    # ── low-level ────────────────────────────────────────────────────
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = _common.build_url(self.base_url, path)
+        headers = _common.build_headers(
+            self.token, self.host_header, json_body=json_body is not None
+        )
+        resp = self._session.request(
+            method,
+            url,
+            headers=headers,
+            json=json_body,
+            params=params,
+            timeout=self.timeout,
+            verify=self.verify,
+        )
+        body = _common.parse_json(resp.status_code, resp.text, json.loads)
+        return _common.handle_response(resp.status_code, body)
+
+    # ── Bakes ────────────────────────────────────────────────────────
+
+    def create_bake(self, req: BakeRequest) -> Bake:
+        """``POST /v1/tenant-bakes`` — queue a per-tenant bake (202)."""
+        body = self._request("POST", "/v1/tenant-bakes", json_body=req.to_body())
+        return Bake.from_dict(body)
+
+    def get_bake(self, bake_id: str) -> Bake:
+        """``GET /v1/tenant-bakes/<bake_id>``."""
+        body = self._request("GET", f"/v1/tenant-bakes/{bake_id}")
+        return Bake.from_dict(body)
+
+    def wait_for_bake(
+        self,
+        bake_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_POLL_TIMEOUT,
+        on_progress: OnProgress | None = None,
+    ) -> Bake:
+        """Poll ``get_bake`` until SUCCEEDED. Raise on FAILED / timeout.
+
+        ``on_progress`` fires on every poll (including the first and terminal
+        one) with the current :class:`ProvisionStep`.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            bake = self.get_bake(bake_id)
+            _common.emit_progress(on_progress, ProvisionStep.from_bake(bake))
+            if bake.is_succeeded:
+                return bake
+            if bake.is_failed:
+                raise BakeFailedError(
+                    f"bake {bake_id} failed: {bake.failure_reason}", bake.raw
+                )
+            if time.monotonic() >= deadline:
+                _common.emit_progress(
+                    on_progress,
+                    ProvisionStep.timed_out(
+                        state=bake.state,
+                        detail=f"bake {bake_id} timed out after {timeout}s",
+                        raw=bake.raw,
+                    ),
+                )
+                raise HippiusTimeoutError(
+                    f"bake {bake_id} not terminal after {timeout}s "
+                    f"(state={bake.state})",
+                    bake.raw,
+                )
+            time.sleep(interval)
+
+    # ── Images (golden-image catalog) ────────────────────────────────
+
+    def list_images(self) -> list[Image]:
+        """``GET /v1/images`` — the operator-blessed golden-image catalog.
+
+        Returns the launchable image NAMES (each mapping to the current
+        blessed golden ``bake_id``) you can pass as
+        :attr:`LaunchRequest.image` for a fast, cache-HIT launch.
+        """
+        body = self._request("GET", "/v1/images")
+        return [Image.from_dict(row) for row in body.get("images", [])]
+
+    # ── Launch ───────────────────────────────────────────────────────
+
+    def launch_vm(
+        self, intent: LaunchRequest, userdata: str | None = None
+    ) -> LaunchJob:
+        """``POST /v1/vm/launch`` — enqueue a launch (202). Root-only."""
+        body = self._request(
+            "POST", "/v1/vm/launch", json_body=intent.to_body(userdata)
+        )
+        return LaunchJob.from_dict(body)
+
+    def get_launch(self, job_id: str) -> LaunchJob:
+        """``GET /v1/vm/launch/<job_id>``."""
+        body = self._request("GET", f"/v1/vm/launch/{job_id}")
+        return LaunchJob.from_dict(body)
+
+    def wait_for_launch(
+        self,
+        job_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_POLL_TIMEOUT,
+        on_progress: OnProgress | None = None,
+    ) -> LaunchJob:
+        """Poll ``get_launch`` until succeeded. Raise on failed / timeout.
+
+        ``on_progress`` fires on every poll (including the first and terminal
+        one) with the current :class:`ProvisionStep`.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            job = self.get_launch(job_id)
+            _common.emit_progress(on_progress, ProvisionStep.from_launch(job))
+            if job.is_succeeded:
+                return job
+            if job.is_failed:
+                raise LaunchFailedError(
+                    f"launch {job_id} failed: {job.reason}", job.raw
+                )
+            if time.monotonic() >= deadline:
+                _common.emit_progress(
+                    on_progress,
+                    ProvisionStep.timed_out(
+                        state=job.state,
+                        detail=f"launch {job_id} timed out after {timeout}s",
+                        raw=job.raw,
+                    ),
+                )
+                raise HippiusTimeoutError(
+                    f"launch {job_id} not terminal after {timeout}s "
+                    f"(state={job.state})",
+                    job.raw,
+                )
+            time.sleep(interval)
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+
+    def wait_for_boot(
+        self,
+        vm_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_BOOT_TIMEOUT,
+    ) -> Iterator[ProvisionStep]:
+        """Poll ``get_vm`` and yield a :class:`ProvisionStep` each time the
+        guest ``boot_phase`` advances (booting → kek_released → running),
+        stopping at ``running`` (terminal success) or ``timeout``.
+
+        The VM row (with ``boot_phase`` / ``boot_phase_at``) is read from
+        ``GET /v1/vm/<vm_id>/state`` via :meth:`get_vm_state`.
+
+        Best-effort and NON-raising: against an older validator that never
+        reports ``boot_phase`` it returns immediately having yielded nothing,
+        so the provision flow ends cleanly at launch-succeeded. If a newer
+        server starts reporting but stalls, the poll gives up at ``timeout``
+        — yielding a ``TIMED_OUT`` step only if it had already seen progress.
+
+        **Usable after a §25 migration** (validator ≥ the fix that resets
+        ``boot_phase`` on destination activation). ``boot_phase`` advances
+        MONOTONICALLY server-side, so a migration that carried the source's
+        terminal ``running`` across used to make this method return
+        immediately — and the destination's real milestones were refused
+        for the rest of the VM's life. A migrated VM now restarts at ``""``
+        and progresses again, so waiting on a destination boot works.
+
+        Against an OLDER validator this still returns immediately after a
+        migration. Treat "no steps yielded right after a migrate" as
+        "cannot tell", not as "booted".
+        """
+        deadline = time.monotonic() + timeout
+        last: ProvisionPhase | None = None
+        while True:
+            vm = self.get_vm_state(vm_id)
+            phase = boot_phase_of(vm)
+            if phase is not None and boot_advanced(last, phase):
+                last = phase
+                yield ProvisionStep.from_boot(vm)
+                if phase is ProvisionPhase.RUNNING:
+                    return
+            if not reports_boot_phase(vm):
+                return  # older validator — no guest-boot reporting
+            if time.monotonic() >= deadline:
+                if last is not None:
+                    yield ProvisionStep.timed_out(
+                        state=vm.state,
+                        detail=f"vm {vm_id} boot timed out after {timeout}s",
+                        raw=vm.raw,
+                    )
+                return
+            time.sleep(interval)
+
+    def wait_for_netbird_ip(
+        self,
+        vm_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_BOOT_TIMEOUT,
+    ) -> str | None:
+        """Poll ``get_vm_state`` until the tenant's NetBird overlay IP resolves.
+
+        Returns the ``100.x.y.z`` overlay IP (the SSH-reachable guest address)
+        as soon as the server reports a non-empty ``netbird_ip``. Best-effort
+        and NON-raising: returns ``None`` if it never resolves within
+        ``timeout``, or immediately (after a single GET) against an older
+        validator that omits the ``netbird_ip`` key entirely.
+
+        ⚠️ **After a §25 migration this value is not guaranteed.** It is
+        PRESERVED across a migration rather than cleared, and it is still
+        correct whenever the guest rejoins as the same peer — its NetBird
+        identity lives on the migrated disk, and nothing in the migration
+        path re-mints a key or revokes the source peer.
+
+        But the setup key is minted EPHEMERAL, so NetBird's management
+        service can garbage-collect a peer that stays offline past its
+        ephemeral window — and a COLD migration (the guest is off from
+        quiesce until the destination boots) can exceed it. The
+        destination cannot re-enrol either: cloud-init re-runs the
+        enrolment with the launch-time key, which is single-use and
+        already consumed. When that happens the VM is off the overlay and
+        this field keeps reporting the old address — nothing re-resolves
+        it, because the server stops probing 30 minutes after launch.
+
+        So: treat a post-migration IP as **last known**, not as verified
+        reachable. Confirm with an actual connection before relying on it.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            vm = self.get_vm_state(vm_id)
+            if vm.netbird_ip:
+                return vm.netbird_ip
+            if not reports_netbird_ip(vm):
+                return None  # older validator — no NetBird reporting
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(interval)
+
+    def get_vm_state(self, vm_id: str) -> Vm:
+        """``GET /v1/vm/<vm_id>/state``."""
+        body = self._request("GET", f"/v1/vm/{vm_id}/state")
+        return Vm.from_dict(body)
+
+    def list_vms(
+        self,
+        *,
+        tenant_id: str | None = None,
+        lease_id: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> VmListPage:
+        """``GET /v1/vm`` — paginated VM list."""
+        params = {
+            "tenant_id": tenant_id,
+            "lease_id": lease_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        body = self._request(
+            "GET", "/v1/vm", params={k: v for k, v in params.items() if v is not None}
+        )
+        return VmListPage.from_dict(body)
+
+    def get_vm_attestation(self, vm_id: str) -> dict[str, Any]:
+        """``GET /v1/vm/<vm_id>/attestation`` — raw attestation bundle.
+
+        ``attested`` is a POSITIVE claim only: ``True`` when the KBS holds a
+        signed release bundle, and ``None`` when that cannot be determined —
+        it is **never** ``False`` merely because no bundle came back. Absent
+        evidence is ambiguous (the KBS records bundles only when its evidence
+        sink is enabled, and the archive does not survive a KBS restart), so
+        branch on ``attestation_status`` — ``evidence-recorded`` /
+        ``no-evidence-recorded`` / ``evidence-unavailable`` — and do not treat
+        a missing bundle as proof the VM is unattested.
+        """
+        return self._request("GET", f"/v1/vm/{vm_id}/attestation")
+
+    def transition_vm(
+        self,
+        vm_id: str,
+        to_state: str,
+        if_version: int,
+        *,
+        new_generation: int | None = None,
+        migration_dest: str | None = None,
+        signed_stopped_ack_hex: str | None = None,
+    ) -> Vm:
+        """``POST /v1/vm/<vm_id>/transition`` — drive the lifecycle SM. Root-only."""
+        payload: dict[str, Any] = {"to_state": to_state, "if_version": if_version}
+        if new_generation is not None:
+            payload["new_generation"] = new_generation
+        if migration_dest is not None:
+            payload["migration_dest"] = migration_dest
+        if signed_stopped_ack_hex is not None:
+            payload["signed_stopped_ack_hex"] = signed_stopped_ack_hex
+        body = self._request(
+            "POST", f"/v1/vm/{vm_id}/transition", json_body=payload
+        )
+        return Vm.from_dict(body)
+
+    def migrate_vm(self, vm_id: str, dest_node_id: str) -> MigrationJob:
+        """``POST /v1/vm/<vm_id>/migrate`` — start a §25 migration. Root-only.
+
+        Returns the job in ``draining``; poll it with :meth:`wait_for_migration`.
+
+        Intake raises :class:`HippiusApiError` with a stable ``category``.
+        Request-shape and lookup failures come first:
+
+        - ``wire`` (**400**)      — the body is not a JSON object, or
+          ``dest_node_id`` is missing / empty / not a string / over 64 chars.
+        - ``not-found`` (**404**) — no such ``vm_id``.
+
+        Then the admission checks, all **409** except ``same-node``:
+
+        - ``vm-not-active``   — the VM is not ``Active``.
+        - ``same-node``       — ``dest_node_id`` is the VM's current host
+          (**400** — the one admission check that is a 400).
+        - ``job-in-flight``   — the VM already has an orchestration job running.
+        - ``miner-unknown``   — a miner has no registered identity. This covers
+          the **source as well as the destination**: the VM's current host is
+          resolved FIRST, so this can mean the miner the VM already runs on.
+        - ``platform-id-invalid`` — a miner's registered ``platform_id`` is
+          malformed (not hex, or not an 8- or 64-byte CHIP_ID), so its SNP
+          generation can't be resolved. Also applies to source or destination.
+        - ``cross-gen``       — the destination is a DIFFERENT SNP generation
+          (e.g. Turin source → Genoa dest). The destination would boot a
+          different launch measurement and the KBS would refuse the key, so
+          this is refused at intake rather than hanging.
+        - ``not-migratable``  — a GOLDEN VM whose destination boot tuple
+          can't be resolved from its launch record: almost always one launched
+          before the measured cmdline was persisted (relaunch it to make it
+          migratable), or an unknown flavor on the record. Refused BEFORE the
+          source is fenced, so the VM is never stranded. Checked for golden
+          VMs only — a legacy VM with the same defect passes intake and fails
+          later at dest-activation, surfacing on the job's ``reason``.
+        - ``no-eol-nonce``    — the launch never baked an EOL nonce, so the
+          guest's stopped-ack could never verify.
+        """
+        body = self._request(
+            "POST",
+            f"/v1/vm/{vm_id}/migrate",
+            json_body={"dest_node_id": dest_node_id},
+        )
+        return MigrationJob.from_dict(body)
+
+    def get_migration(self, vm_id: str, job_id: str) -> MigrationJob:
+        """``GET /v1/vm/<vm_id>/migrate/<job_id>``."""
+        body = self._request("GET", f"/v1/vm/{vm_id}/migrate/{job_id}")
+        return MigrationJob.from_dict(body)
+
+    def wait_for_migration(
+        self,
+        vm_id: str,
+        job_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_MIGRATION_TIMEOUT,
+    ) -> MigrationJob:
+        """Poll ``get_migration`` until the job is terminal.
+
+        Returns the job on ``done`` (the VM is Active on the destination at
+        ``new_gen``; the source is fenced and can no longer unlock its disk).
+        Raises :class:`MigrationFailedError` on ``failed`` and
+        :class:`HippiusTimeoutError` if the job is not terminal within
+        ``timeout``.
+
+        .. warning::
+           ``done`` does NOT yet prove the guest is serving. The server marks
+           the migration done once the destination miner has *launched* the
+           domain — not once the guest has attested and unlocked its disk — so
+           a destination that boots but fails its key release still reports
+           ``done``. Confirm the workload yourself (reach the guest over its
+           overlay IP) rather than trusting the job state. ``boot_phase`` and
+           ``netbird_ip`` are NOT reset by a migration either: they still
+           describe the *source* boot, so :meth:`wait_for_boot` returns
+           immediately on the stale value and cannot wait for a dest boot.
+
+        A §25 migration is COLD and moves the whole encrypted volume, so it is
+        the slowest lifecycle operation: the destination downloads a multi-GB
+        snapshot and re-attests before it activates. ``timeout`` therefore
+        defaults to a generous budget rather than the shared poll default.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            job = self.get_migration(vm_id, job_id)
+            if job.is_done:
+                return job
+            if job.is_failed:
+                raise MigrationFailedError(
+                    f"migration {job_id} failed: {job.reason}", job.raw
+                )
+            if time.monotonic() >= deadline:
+                raise HippiusTimeoutError(
+                    f"migration {job_id} not terminal after {timeout}s "
+                    f"(state={job.state})",
+                    job.raw,
+                )
+            time.sleep(interval)
+
+    def cancel_migration(self, vm_id: str, job_id: str) -> MigrationJob:
+        """``POST /v1/vm/<vm_id>/migrate/<job_id>/cancel``. Root-only.
+
+        Only a job still in ``draining`` can be cancelled: that is the sole
+        state that runs with the VM still ``Active`` and its guest still
+        RUNNING, so abandoning it is a clean no-op. From ``quiescing`` on, the
+        generation fence has flipped the VM to ``Migrating`` AND the guest has
+        been gracefully stopped, so a cancel would orphan a powered-off VM —
+        §25 recovery there is forward-only.
+
+        Raises :class:`HippiusApiError` (409) with category ``past-fence``
+        (the job has advanced past ``draining``) or ``already-terminal``.
+        """
+        body = self._request("POST", f"/v1/vm/{vm_id}/migrate/{job_id}/cancel")
+        return MigrationJob.from_dict(body)
+
+    # ── Power operations ──────────────────────────────────────────────
+    #
+    # These move the VM's POWER state, not its lifecycle `state`. A stopped
+    # VM stays `active`: that field is the KBS release gate, and the VM must
+    # still be able to unlock when it starts again.
+    #
+    # A stopped VM keeps its reservation — overlay, KEK, anti-rollback
+    # counter and its slot on one specific miner — which is what makes
+    # `start_vm` able to succeed on the same host, and what the billing
+    # layer charges for. The MINER is not paid meanwhile: accrual comes from
+    # guest-attested receipts and a stopped guest emits none.
+
+    def stop_vm(self, vm_id: str) -> VmPower:
+        """``POST /v1/vm/<vm_id>/stop`` — graceful stop, reservation kept."""
+        return VmPower.from_dict(self._request("POST", f"/v1/vm/{vm_id}/stop"))
+
+    def start_vm(self, vm_id: str) -> VmPower:
+        """``POST /v1/vm/<vm_id>/start`` — relaunch on the SAME miner.
+
+        Refused for a migrated VM (``generation > 1``): a relaunch bakes
+        generation 1, which the KBS anti-rollback fence declines.
+        """
+        return VmPower.from_dict(self._request("POST", f"/v1/vm/{vm_id}/start"))
+
+    def reboot_vm(self, vm_id: str) -> VmPower:
+        """``POST /v1/vm/<vm_id>/reboot`` — stop, then start on the same miner.
+
+        A guest can also reboot itself from inside; this is for when it will
+        not.
+        """
+        return VmPower.from_dict(self._request("POST", f"/v1/vm/{vm_id}/reboot"))
+
+    def decommission_vm(self, vm_id: str) -> DecommissionJob:
+        """``POST /v1/vm/<vm_id>/decommission`` — start a §24 job. Root-only."""
+        body = self._request("POST", f"/v1/vm/{vm_id}/decommission")
+        return DecommissionJob.from_dict(body)
+
+    def get_decommission(self, vm_id: str, job_id: str) -> DecommissionJob:
+        """``GET /v1/vm/<vm_id>/decommission/<job_id>``."""
+        body = self._request("GET", f"/v1/vm/{vm_id}/decommission/{job_id}")
+        return DecommissionJob.from_dict(body)
+
+    def wait_for_decommission(
+        self,
+        vm_id: str,
+        job_id: str,
+        *,
+        interval: float = _DEFAULT_POLL_INTERVAL,
+        timeout: float = _DEFAULT_POLL_TIMEOUT,
+    ) -> DecommissionJob:
+        """Poll ``get_decommission`` until the job is terminal.
+
+        Returns the job on ``done`` (the disk was crypto-erased server-side +
+        the NetBird peer revoked). Raises :class:`DecommissionFailedError` on
+        ``failed`` and :class:`HippiusTimeoutError` if the job is not terminal
+        within ``timeout``.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            job = self.get_decommission(vm_id, job_id)
+            if job.is_done:
+                return job
+            if job.is_failed:
+                raise DecommissionFailedError(
+                    f"decommission {job_id} failed: {job.reason}", job.raw
+                )
+            if time.monotonic() >= deadline:
+                raise HippiusTimeoutError(
+                    f"decommission {job_id} not terminal after {timeout}s "
+                    f"(state={job.state})",
+                    job.raw,
+                )
+            time.sleep(interval)
+
+    def audit_measurements(
+        self,
+        *,
+        platform_id: str | None = None,
+        vm_id: str | None = None,
+        launch_digest: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /v1/admin/audit/measurements`` — pinned-measurement ledger. Root-only."""
+        params = {
+            "platform_id": platform_id,
+            "vm_id": vm_id,
+            "launch_digest": launch_digest,
+            "limit": limit,
+            "offset": offset,
+        }
+        return self._request(
+            "GET",
+            "/v1/admin/audit/measurements",
+            params={k: v for k, v in params.items() if v is not None},
+        )
+
+    # ── High-level ───────────────────────────────────────────────────
+
+    def provision_vm(
+        self,
+        *,
+        bake: BakeRequest,
+        launch: LaunchRequest,
+        bake_interval: float = _DEFAULT_POLL_INTERVAL,
+        bake_timeout: float = _DEFAULT_POLL_TIMEOUT,
+        launch_interval: float = _DEFAULT_POLL_INTERVAL,
+        launch_timeout: float = _DEFAULT_POLL_TIMEOUT,
+        boot_interval: float = _DEFAULT_POLL_INTERVAL,
+        boot_timeout: float = _DEFAULT_BOOT_TIMEOUT,
+        on_progress: OnProgress | None = None,
+    ) -> LaunchJob:
+        """End-to-end: create the bake, wait for it, then launch and wait.
+
+        Bakes are per-VM (the KEK is scoped to ``vm_id``), so this is the
+        normal provisioning path: ``create_bake`` → ``wait_for_bake`` →
+        fill ``launch.bake_id`` (the server resolves the artefact SHAs, KEK
+        and S3 location from the bake) → ``launch_vm`` → ``wait_for_launch``
+        → ``wait_for_boot`` (the guest boots asynchronously after the miner
+        accepts the order).
+
+        ``on_progress`` (if given) fires on every poll of the bake, launch AND
+        guest-boot phases, so a frontend can drive one progress bar across the
+        whole lifecycle. Raises ``BakeFailedError`` / ``LaunchFailedError`` /
+        ``HippiusTimeoutError`` exactly as before — use :meth:`iter_provision`
+        for a non-raising, iterate-to-terminal stream. The boot-wait is
+        best-effort: against an older validator that never reports
+        ``boot_phase`` this returns at launch-succeeded exactly as before.
+        """
+        created = self.create_bake(bake)
+        done = self.wait_for_bake(
+            created.bake_id,
+            interval=bake_interval,
+            timeout=bake_timeout,
+            on_progress=on_progress,
+        )
+        launch.bake_id = done.bake_id
+        job = self.launch_vm(launch)
+        launched = self.wait_for_launch(
+            job.job_id,
+            interval=launch_interval,
+            timeout=launch_timeout,
+            on_progress=on_progress,
+        )
+        if launched.vm_id:
+            for step in self.wait_for_boot(
+                launched.vm_id, interval=boot_interval, timeout=boot_timeout
+            ):
+                _common.emit_progress(on_progress, step)
+        return launched
+
+    def _iter_bake(
+        self, bake_id: str, *, interval: float, timeout: float
+    ) -> Iterator[ProvisionStep]:
+        deadline = time.monotonic() + timeout
+        while True:
+            bake = self.get_bake(bake_id)
+            yield ProvisionStep.from_bake(bake)
+            if bake.is_terminal:
+                return
+            if time.monotonic() >= deadline:
+                yield ProvisionStep.timed_out(
+                    state=bake.state,
+                    detail=f"bake {bake_id} timed out after {timeout}s",
+                    raw=bake.raw,
+                )
+                return
+            time.sleep(interval)
+
+    def _iter_launch(
+        self, job_id: str, *, interval: float, timeout: float
+    ) -> Iterator[ProvisionStep]:
+        deadline = time.monotonic() + timeout
+        while True:
+            job = self.get_launch(job_id)
+            yield ProvisionStep.from_launch(job)
+            if job.is_terminal:
+                return
+            if time.monotonic() >= deadline:
+                yield ProvisionStep.timed_out(
+                    state=job.state,
+                    detail=f"launch {job_id} timed out after {timeout}s",
+                    raw=job.raw,
+                )
+                return
+            time.sleep(interval)
+
+    def iter_provision(
+        self,
+        *,
+        bake: BakeRequest,
+        launch: LaunchRequest,
+        bake_interval: float = _DEFAULT_POLL_INTERVAL,
+        bake_timeout: float = _DEFAULT_POLL_TIMEOUT,
+        launch_interval: float = _DEFAULT_POLL_INTERVAL,
+        launch_timeout: float = _DEFAULT_POLL_TIMEOUT,
+        boot_interval: float = _DEFAULT_POLL_INTERVAL,
+        boot_timeout: float = _DEFAULT_BOOT_TIMEOUT,
+    ) -> Iterator[ProvisionStep]:
+        """Yield each :class:`ProvisionStep` as the provision progresses.
+
+        Unlike :meth:`provision_vm`, this does NOT raise on a failed / timed-out
+        job: it yields the terminal step (``BAKE_FAILED`` / ``FAILED`` /
+        ``TIMED_OUT``) and stops. Ideal for a ``for step in
+        client.iter_provision(...)`` loop or an SSE / websocket bridge.
+
+        Once the launch reaches ``SUCCEEDED`` the stream CONTINUES into the
+        guest-boot phases (booting → kek_released → running) via
+        :meth:`wait_for_boot`; against an older validator with no boot
+        reporting it ends at ``SUCCEEDED`` exactly as before.
+        """
+        created = self.create_bake(bake)
+        bake_ok = False
+        for step in self._iter_bake(
+            created.bake_id, interval=bake_interval, timeout=bake_timeout
+        ):
+            yield step
+            bake_ok = step.phase is ProvisionPhase.BAKE_SUCCEEDED
+        if not bake_ok:
+            return
+        launch.bake_id = created.bake_id
+        job = self.launch_vm(launch)
+        launch_step: ProvisionStep | None = None
+        for step in self._iter_launch(
+            job.job_id, interval=launch_interval, timeout=launch_timeout
+        ):
+            yield step
+            launch_step = step
+        if launch_step is not None and launch_step.phase is ProvisionPhase.SUCCEEDED:
+            vm_id = str(launch_step.raw.get("vm_id") or "")
+            if vm_id:
+                yield from self.wait_for_boot(
+                    vm_id, interval=boot_interval, timeout=boot_timeout
+                )

@@ -1,0 +1,60 @@
+---
+# ArgoCD Application for the Cloudflare Tunnel connector.
+#
+# The root app discovers children with `include: '*/application.yaml'`,
+# so a chart directory without this file is INERT — the manifests exist
+# in git and nothing ever reconciles them. That is exactly what happened
+# on the first attempt: the vali Ingress landed (its app already
+# existed) while the connector never appeared, leaving the public
+# hostname answering 530.
+#
+# `prune: true` is deliberate: deleting this directory must take the
+# connector down, because a connector left running is a live public
+# entry point nobody is looking at any more.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-cloudflared
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-cloudflared
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: public-ingress-tunnel
+  annotations:
+    # After the ingress controller and vali, so the origin it forwards
+    # to already exists when the connector first dials out.
+    argocd.argoproj.io/sync-wave: "20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/apps/cloudflared
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cloudflared
+  # The tunnel token Secret is created OUT OF BAND by the operator and
+  # is deliberately not in git, so ArgoCD must not prune it.
+  ignoreDifferences:
+    - group: ""
+      kind: Secret
+      name: cloudflared-token
+      jsonPointers:
+        - /data
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m

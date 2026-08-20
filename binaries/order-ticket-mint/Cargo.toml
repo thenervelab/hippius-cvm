@@ -1,0 +1,41 @@
+[package]
+name = "hippius-order-ticket-mint"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Operator tool that mints L1-signed OrderTicket COSE_Sign1 envelopes (ARCHITECTURE.md §6). Reads an Ed25519 signing key + CLI-supplied ticket fields, encodes a deterministic-CBOR body, wraps in COSE_Sign1, and writes the byte-exact envelope the KBS verifier (`kbs_core::ticket::verify_order_ticket`) accepts. NEVER imported from kbs-core/kbs-server — the verifier path stays untouched."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-order-ticket-mint"
+path = "src/main.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+# Mint-side `Value::Map` → canonical-CBOR encoder. NOT brought in via
+# `kbs-core` (the verifier crate stays unused at the minter — see
+# `dev-dependencies` for the test-only reuse).
+ciborium = "0.2"
+# COSE_Sign1 builder (RFC 9052). Matches the `coset` version the KBS
+# verifier compiles against so byte-equality across rebuilds is
+# guaranteed even if the crate's serialization toggles change.
+coset = "0.3"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+# `OsRng` powers the default `--ticket-id` UUID + `--nonce-hex` 32-byte
+# nonce. Pin the same crate version `ed25519-dalek` already uses (its
+# `rand_core 0.6` is what the workspace lock resolves to).
+rand_core = { version = "0.6", features = ["std"] }
+
+[dev-dependencies]
+# `kbs_core::ticket::verify_order_ticket` is the byte-exact verifier
+# the KBS runs in production. Reusing it at test time is the strongest
+# possible cross-impl check — if a mint round-trips through it, the
+# wire shape matches the live KBS.
+kbs-core = { path = "../../kbs-core" }
+tempfile = "3"

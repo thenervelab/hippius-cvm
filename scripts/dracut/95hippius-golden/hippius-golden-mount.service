@@ -1,0 +1,47 @@
+# `hippius-golden-mount.service` — initrd unit (dracut module
+# 95hippius-golden) that assembles the GOLDEN-mode overlay root at
+# /sysroot BEFORE systemd switches into it.
+#
+# Ordering: this is the golden analogue of a generated `sysroot.mount`.
+# It is ordered Before=initrd-root-fs.target and enabled
+# RequiredBy=initrd-root-fs.target (module-setup `systemctl enable` →
+# the initrd-root-fs.target.requires/ symlink), so systemd both pulls it
+# into the boot transaction AND blocks reaching initrd-root-fs.target
+# (hence initrd-parse-etc / initrd-fs.target / switch-root) until
+# /sysroot is mounted — exactly the wiring a `sysroot.mount` gets.
+#
+# The block devices must be udev-settled before the assembler reads them:
+# vdb/vdc = the RO dm-verity golden lower, vda = the blank per-VM upper
+# (all three are always attached by the miner-agent in golden mode). The
+# release core brings its OWN network up for the §21 KBS exchange, so no
+# dracut-initqueue/network dependency is needed (mirrors the legacy
+# hippius-release.service).
+#
+# Fail-closed: FailureAction=poweroff-force — a failed assembly (tampered
+# base, KBS denial, attestation failure, size-anchor miss) powers the
+# guest off rather than dropping to an initrd emergency shell on a
+# miner-visible serial console. The miner learns only "the guest refused".
+
+[Unit]
+Description=Hippius golden overlay root — verify golden base, KBS release, assemble /sysroot
+DefaultDependencies=no
+Before=initrd-root-fs.target
+Conflicts=shutdown.target emergency.target
+Before=shutdown.target
+# The golden block devices must exist (udev-settled) before the assembler
+# opens them: vdb/vdc = RO dm-verity lower, vda = blank per-VM upper.
+Requires=dev-vda.device dev-vdb.device dev-vdc.device
+After=dev-vda.device dev-vdb.device dev-vdc.device
+After=systemd-udev-trigger.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/hippius-golden-mount
+StandardOutput=kmsg+console
+StandardError=kmsg+console
+TimeoutStartSec=300
+FailureAction=poweroff-force
+
+[Install]
+RequiredBy=initrd-root-fs.target

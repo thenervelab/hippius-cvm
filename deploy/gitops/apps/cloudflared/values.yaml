@@ -1,0 +1,47 @@
+# Cloudflare Tunnel connector.
+#
+# WHY A TUNNEL AND NOT A PUBLIC LOADBALANCER. This control plane has no
+# public ingress: the nginx controller's LoadBalancer holds a PRIVATE
+# address reachable only over the WireGuard mesh, and every existing
+# hostname (kbs / argocd / grafana) resolves to it in DNS-only mode. Giving the VM API a public IP would mean opening an inbound port
+# on the host that runs the confidential control plane. The connector
+# dials OUT to Cloudflare instead, so nothing inbound is opened.
+#
+# The tunnel terminates on the in-cluster nginx ingress controller, NOT
+# directly on vali — so the path allow-list in the vali chart's
+# `publicIngress` is what decides which routes exist publicly. Pointing
+# the tunnel straight at `vali:8000` would expose all 45 routes,
+# including the 14 that carry no DRF authentication because they are
+# signed-body miner-plane endpoints meant for the mesh only.
+replicaCount: 2
+
+image:
+  repository: cloudflare/cloudflared
+  # Pin by digest, not by tag — a tag is mutable and this process holds a
+  # credential that can serve traffic for our hostname.
+  tag: "2025.8.1"
+  pullPolicy: IfNotPresent
+
+# The connector credential. NOT rendered by this chart and NOT in git:
+# the operator creates it out of band, exactly like the other
+# credential-bearing secrets in this repo.
+#
+#   kubectl create secret generic cloudflared-token -n cloudflared \
+#     --from-literal=token='<tunnel token from the Cloudflare dashboard>'
+#
+# A tunnel token authorises ONE thing: connecting that one tunnel. It
+# cannot read the DNS zone, touch another tunnel, or reach anything else
+# on the account — and deleting the tunnel revokes it instantly.
+tokenSecret:
+  name: cloudflared-token
+  key: token
+
+# The in-cluster origin the tunnel forwards to. This is the ingress
+# controller, so the Ingress path rules apply.
+origin:
+  service: hippius-compute-ingress-nginx-controller.ingress-nginx.svc.cluster.local
+  port: 80
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits:   { cpu: 500m, memory: 256Mi }

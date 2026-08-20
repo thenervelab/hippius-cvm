@@ -1,0 +1,173 @@
+{{- if .Values.launchTick.enabled }}
+---
+# Async launch worker (PR-A2 / #587 Phase 1) — drives the
+# `POST /v1/vm/launch` job queue.
+#
+# `POST /v1/vm/launch` enqueues a `LaunchJob(queued)` (the API call only
+# stages the userdata to Vault + records the non-secret intent — §20). This
+# worker runs `manage.py vali_launch_tick` on a fixed interval
+# (`VALI_LAUNCH_TICK_INTERVAL_S`, default 5s): each cycle CAS-claims one
+# queued job, reads the secrets back from Vault, and drives
+# `launch.launch_vm` (scheduler place → preflight → §22 auto-pin →
+# L1 OrderTicket mint → KBS admin register → dispatch → re-place on
+# reject), then records the terminal outcome.
+#
+# WITHOUT this worker, `POST /v1/vm/launch` jobs sit `queued` forever and
+# the production API launch path is inert — the launch only ever runs via
+# the dev `vali_create_vm` CLI. This Deployment makes the API path live.
+#
+# Same image + env as the vali web pod: it shares the Django app, Postgres,
+# the Vault creds (KEK + the L1/§22 signing seeds fetched at use — #587
+# Phase 1A, no committed dev seed), the `vali-s3` creds (preflight presigns
+# the S3 artifact URLs), and the `vali-config` knobs (Edge dispatch, KBS
+# admin, thebrain RPC for §23 placement). Worker posture: no HTTP
+# port/probes, replicas 1 + Recreate (the (id,version,state) CAS makes a
+# crash-restart safe, but two concurrent claim loops are not a supported
+# topology — same single-writer posture as vali-orchestration-tick). Sync
+# wave 3.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-launch-tick
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: launch-tick
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: launch-tick
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: launch-tick
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every tick times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: launch-tick
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "vali_launch_tick"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            # Vault: the KEK read-back + the §22 allowlist-root and L1
+            # ticket signing seeds (fetched at use, #587 Phase 1A).
+            {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
+            {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            - name: VALI_VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: vali-vault
+                  key: address
+            # The preflight order presigns the S3 artifact-fetch URLs the
+            # miner downloads (qcow2/kernel/initrd) — SigV4 needs these.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-s3
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.config.s3RegionName | quote }}
+            {{- if .Values.netbird.enabled }}
+            # §F NetBird tenant-VM overlay enrolment. This worker runs
+            # `launch_vm` for the async `POST /v1/vm/launch` path, so it
+            # mints the setup-key — it MUST have both the self-hosted BASE
+            # (settings default is the PUBLIC api.netbird.io) and the TOKEN
+            # (vali-netbird-token ExternalSecret), or every netbird-on
+            # launch 404s at `netbird:list-groups`.
+            - name: VALI_NETBIRD_API_BASE
+              value: {{ .Values.netbird.apiBase | quote }}
+            - name: VALI_NETBIRD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vali-netbird-token
+                  key: VALI_NETBIRD_API_TOKEN
+            {{- end }}
+          resources:
+            {{- .Values.launchTick.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- include "vali.vaultTokenVolumeMount" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 12 }}
+            - name: tmp
+              mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm
+            - name: vault-ca
+              mountPath: /etc/hippius/vault-ca
+              readOnly: true
+            {{- if .Values.createVm.enabled }}
+            # The §22 auto-pin reads the live allowlist manifest (the
+            # signing seed comes from Vault — no dev seed mounted, #587
+            # Phase 1A). Non-secret ConfigMap.
+            - name: allowlist-manifest
+              mountPath: /etc/hippius/allowlist
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "vali.vaultTokenVolume" . | nindent 8 }}
+        {{- include "vali.kbsAdminTlsVolume" . | nindent 8 }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        # tmpfs for the §20 0600 seed files the L1 mint + §22 auto-pin
+        # materialize from Vault (never on a persistent volume).
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: vault-ca
+          configMap:
+            name: vault-ca
+        {{- if .Values.createVm.enabled }}
+        - name: allowlist-manifest
+          configMap:
+            name: vali-allowlist-manifest
+        {{- end }}
+{{- end }}

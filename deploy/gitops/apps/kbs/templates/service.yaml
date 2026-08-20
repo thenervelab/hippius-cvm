@@ -1,0 +1,24 @@
+---
+# KBS Service. PR-K6, §K (#54).
+#
+# `ClusterIP` — the KBS is reached only from inside the cluster (the
+# Edge gateway relays guest release requests to it). It is never
+# exposed on a public IP or an Ingress: the §7 protocol is end-to-end
+# signed + HPKE-wrapped, the Edge is an opaque relay, and the KBS has
+# no business being reachable from outside the mesh.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbs-server
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "kbs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.config.listenPort }}
+      targetPort: http
+      protocol: TCP

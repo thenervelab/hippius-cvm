@@ -1,0 +1,65 @@
+---
+# Tenant-CVM networking — the libvirt `default` NAT network. Tasks
+# file imported by 06-miner-bootstrap.yml play "03".
+#
+# Tenant CVMs get virtio-net through the libvirt `default` network
+# (the `virbr0` NAT bridge). This is the simplest correct choice for
+# the MVP — no Open vSwitch, no host-bridge reconfiguration of the
+# public NIC. `libvirt-daemon-system` ships the `default` network
+# definition; this task makes sure it is defined, autostarted, and
+# running. Every step is guarded — a second run is a zero-diff no-op.
+
+- name: Query the libvirt default network state
+  ansible.builtin.command:
+    cmd: virsh net-info default
+  register: miner_net_info
+  changed_when: false
+  failed_when: false
+
+- name: Define the default network if it is absent
+  when: miner_net_info.rc != 0
+  block:
+    - name: Stage the default network XML
+      ansible.builtin.copy:
+        dest: /etc/libvirt/qemu/networks/hippius-default.xml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          <network>
+            <name>default</name>
+            <forward mode='nat'/>
+            <bridge name='virbr0' stp='on' delay='0'/>
+            <ip address='192.168.122.1' netmask='255.255.255.0'>
+              <dhcp>
+                <range start='192.168.122.2' end='192.168.122.254'/>
+              </dhcp>
+            </ip>
+          </network>
+
+    - name: Define the default network
+      ansible.builtin.command:
+        cmd: virsh net-define /etc/libvirt/qemu/networks/hippius-default.xml
+      changed_when: true
+
+- name: Re-query the default network state (reflects a possible define)
+  ansible.builtin.command:
+    cmd: virsh net-info default
+  register: miner_net_state
+  changed_when: false
+
+- name: Enable autostart for the default network
+  ansible.builtin.command:
+    cmd: virsh net-autostart default
+  changed_when: true
+  when:
+    - libvirt.default_network_enabled | default(true)
+    - not (miner_net_state.stdout is search('Autostart:\s+yes'))
+
+- name: Start the default network
+  ansible.builtin.command:
+    cmd: virsh net-start default
+  changed_when: true
+  when:
+    - libvirt.default_network_enabled | default(true)
+    - not (miner_net_state.stdout is search('Active:\s+yes'))

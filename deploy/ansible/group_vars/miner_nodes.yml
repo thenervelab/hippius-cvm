@@ -1,0 +1,313 @@
+---
+# Defaults for the `miner_nodes` group — the UNTRUSTED miner fleet.
+#
+# Miners are untrusted by design (`project_hippius_compute_locked_
+# decisions.md` → "Miners untrusted invariants" 2026-05-22; #1 comment
+# 4505904116). This group's profile is deliberately DIFFERENT from
+# `cc_nodes`:
+#
+#   - NO Vault access — a miner never authenticates to the
+#     hippius-compute Vault. No `vault_addr`, no `vault_token`.
+#   - NO k3s — a miner is not a cluster node. No `k3s_install_args`,
+#     no `cc_node_labels`.
+#   - Self-generated identity — the miner-agent mints its own Ed25519
+#     key locally; it is never fetched from anywhere.
+#   - NetBird mesh only — the miner joins the NetBird `miner` group;
+#     it is not in the hippius-compute vRack.
+#
+# `group_vars/all.yml` still applies to this group (it is loaded for
+# `all`); the keys it defines that are cc-node-specific
+# (`k3s_install_args`, `cc_node_labels`, `network.vrack_cidr`, …) are
+# simply never referenced by `playbooks/06-miner-bootstrap.yml`.
+
+# ── Supported host OS ───────────────────────────────────────────────
+# A production miner runs Ubuntu 25.10 (6.17
+# kernel); 24.04 (Noble) is also supported. The NetBird apt repo
+# (pkgs.netbird.io/debian) + the agent source-build are codename-
+# independent, so both work. Add a version here once validated on it.
+miner_supported_ubuntu_versions:
+  - "24.04"
+  - "25.10"
+
+# ── Pinned versions ─────────────────────────────────────────────────
+versions:
+  # NetBird agent — keep in lockstep with `group_vars/all.yml`. Pinned
+  # via apt against the NetBird package repo.
+  netbird: "0.71.3"
+  # libvirt / qemu — the Ubuntu 24.04 distro versions. NOT apt-pinned
+  # (pinning a distro's own default is fragile against security point
+  # releases); recorded here as the EXPECTED versions for reference.
+  libvirt: "10.0.0"
+  qemu: "8.2.2"
+  # miner-agent crate version (binaries/miner-agent/Cargo.toml).
+  miner_agent: "0.0.1"
+
+# ── Network — NetBird mesh, no vRack ────────────────────────────────
+network:
+  # The existing NetBird group for miners (dashboard id
+  # d85j0vr36cos73atf2mg). The setup key the operator creates must be
+  # bound to this group; the agent inherits it on join.
+  netbird_group: "miner"
+  # Miners have a public IP only — they are NOT in the hippius-compute
+  # vRack (untrusted fleet).
+  no_vrack: true
+  # Edge gateway address — host:port. The miner-agent config prefixes
+  # `https://`. Reached over the NetBird mesh (or public DNS once the
+  # §H phase-2 relay + LoadBalancer land — PR-H7).
+  edge_endpoint: "edge.hippius.network:443"
+  # Self-hosted NetBird control plane. REQUIRED here: leaving it unset
+  # makes `netbird up` hit the public api.netbird.io, which rejects a
+  # setup key minted on the self-hosted instance ("LoginFailed"). The
+  # whole Hippius mesh (miners + tenant CVMs) lives on this instance.
+  netbird_management_url: "https://vpn.hippius.network"
+
+# ── KBS-over-vsock proxy + §24/§25 stopped-ack relay ────────────────
+# Tenant guests have ZERO network of their own: their §21 KBS release
+# exchange AND their §24/§25 signed stopped-ack ride AF_VSOCK to this
+# miner host, which forwards the OPAQUE bytes onward over ITS OWN
+# network. Both endpoints are publicly-trusted-TLS (the agent's
+# vsock-proxy reqwest client uses webpki built-in roots) and reachable
+# from the miner host over the NetBird mesh subnet route.
+#
+# `[kbs] endpoint` — the KBS release ingress (kbs.hippius.network →
+# the nginx-ingress LB).
+# ── Where per-VM disks live ──────────────────────────────────────────
+#
+# The agent appends its own subdir: `<root>/data/<vm>.img`,
+# `<root>/overlay/<vm>.img`, `<root>/state/<vm>.raw`.
+#
+# `miner_data_disk_root` holds the tenant data disk AND the golden overlay
+# — the two that grow and the two that take the I/O. If this host has a
+# fast NVMe separate from its system disk, this is the variable that puts
+# tenant VMs on it.
+#
+# ⚠️ The STAGING root (downloaded base images: rootfs, kernel, initrd) is
+# NOT configurable — it is a constant at /var/lib/hippius-miner/staging.
+# It is also several GiB per distro. On a host with a small system disk,
+# plan for that even after pointing the roots below elsewhere.
+miner_data_disk_root: "/var/lib/hippius-miner"
+miner_state_disk_root: "/var/lib/hippius-miner"
+
+miner_kbs_endpoint: "https://kbs.hippius.network"
+# CA (or pinned self-signed leaf) the agent trusts when dialling the KBS.
+# Leave EMPTY only if your KBS serves a publicly-trusted certificate; the
+# default deployment does not, because the KBS is an internal service on the
+# mesh rather than a public ACME endpoint.
+#
+# Path on the MINER. `mtls-cert-mount.yml` copies it there from
+# `miner_kbs_ca_cert_src` on your workstation.
+miner_kbs_ca_cert_file: "/etc/hippius-miner/kbs-ca.pem"
+miner_kbs_ca_cert_src: "~/.config/hippius/kbs-ca.crt"
+
+# ── Tenant OVMF — the firmware every tenant CVM boots ────────────────
+#
+# NOT the distro `ovmf` package (play 02 installs that for libvirt's own
+# use). This is the exact firmware image whose bytes are folded into the
+# SNP launch measurement, so it must be the one the validator recomputes
+# against: a different build produces a different measurement, the KBS
+# refuses the release, and the guest never unlocks.
+#
+# Fetched and SHA-256 verified by play 02. A miner that skips this answers
+# every launch with `tenant-preflight/ovmf-missing`.
+miner_tenant_ovmf_url: "https://s3.hippius.com/hippius-compute-images/ovmf/snp-ovmf-162aa41b.fd"
+miner_tenant_ovmf_sha256: "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c"
+miner_tenant_ovmf_path: "/var/lib/hippius-miner/ovmf.fd"
+# `[lifecycle] vali_url` — the §24/§25 guest stopped-ack vali ingress.
+# vali has NO public ingress, so the ack is relayed through the EDGE
+# stopped-ack relay (Edge :8446 LoadBalancer port → forwards the opaque
+# ack to vali's POST /v1/lifecycle/stopped, the StoppedAckIngest store
+# effects.poll_source_ack reads). The Edge serves its OWN server cert
+# (a private CA), and the cert carries the Edge LB IP as a
+# SAN — so this is the LB IP directly (no public DNS / public cert). The
+# [lifecycle].ca_cert in the rendered config trusts that CA. The agent
+# appends `/v1/lifecycle/stopped?vm_id=&generation=` (the guest path).
+miner_vali_lifecycle_url: "<VALI_LIFECYCLE_URL>"
+
+# ── SEV-SNP kernel cmdline ──────────────────────────────────────────
+# Genoa EPYC 9254 — same SEV-SNP requirements as the cc-nodes. These
+# duplicate `group_vars/all.yml` deliberately, so the miner profile is
+# self-documenting about the SNP tokens it depends on.
+grub_cmdline_required:
+  - "kvm_amd.sev=1"
+  - "kvm_amd.sev_es=1"
+  - "kvm_amd.sev_snp=1"
+  - "mem_encrypt=on"
+grub_cmdline_forbidden:
+  # SEV-SNP requires the IOMMU NOT be in passthrough mode.
+  - "iommu=pt"
+
+# ── libvirt — tenant CVM hypervisor ─────────────────────────────────
+libvirt:
+  # Enable the libvirt `default` NAT network for tenant CVM virtio-net.
+  default_network_enabled: true
+  # Add the login user to the `libvirt` group for non-sudo `virsh`.
+  user_can_access: true
+  # The login user added to the `libvirt` group (operator override in
+  # host_vars if your provider image uses a different default account).
+  access_user: "ubuntu"
+
+# ── miner-agent install ─────────────────────────────────────────────
+miner_agent:
+  install_path: "/usr/local/bin/hippius-miner-agent"
+  config_path: "/etc/hippius-miner/config.toml"
+  state_dir: "/var/lib/hippius-miner"
+  systemd_unit_name: "hippius-miner-agent"
+
+# ── miner-agent auto-update (S3 channel) ────────────────────────────
+# A systemd timer on each miner pulls the latest published agent build
+# from Hippius S3 every ~15 min, sha256-verifies it, atomically installs
+# it, and rolls back on an unhealthy restart. The PUBLISH side is
+# operator/CI-driven (deploy/scripts/publish-miner-agent.sh writes
+# ${miner_auto_update_s3_base}/latest.json + the per-tag binary).
+#
+# AUTO-LATEST ROLLOUT: every published build rolls to the whole fleet
+# within ~15 min — ONLY publish validated builds. Freeze a single miner
+# with `touch /var/lib/hippius-miner/.no-auto-update`, or the whole group
+# with `miner_auto_update_enabled: false`.
+#
+# Change-detection is sha256 (the manifest sha256 vs the installed
+# binary's sha256), NOT --version: `hippius-miner-agent --version` prints
+# a static `hippius-miner-agent 0.0.1` (the never-bumped crate version),
+# so a version compare can't see a fresh build.
+
+# Public-read S3 prefix holding latest.json + per-tag binaries. Uses the
+# same Hippius S3 endpoint the agent already reaches for UKI fetch
+# (image.s3_endpoint). Bucket assumption: the existing public images
+# bucket `hippius-compute-images`, under a `miner-agent/` prefix.
+miner_auto_update_s3_base: "https://s3.hippius.com/hippius-compute-images/miner-agent"
+
+# ── miner-agent source (TEMPORARY — until a signed binary release) ────
+# Play 05 clones this and builds `hippius-miner-agent` from it, so it is
+# a CODE-DELIVERY path, not a documentation link: whatever is here is
+# what ends up running on a confidential host. Point it at a repository
+# you have reviewed and can actually reach.
+#
+# It lives here rather than as a default inside the play so that it is a
+# CONFIGURATION value — visible, overridable per fleet, and impossible to
+# inherit by accident. `miner-agent-install.yml` asserts it has been
+# filled in and refuses to run on an unfilled placeholder.
+#
+# If you would rather not build on the production host at all, skip play
+# 05 and place your own binary at /usr/local/bin/hippius-miner-agent —
+# built with `--features snp`, which is load-bearing.
+miner_agent_source_repo: "https://github.com/thenervelab/hippius-compute-internal.git"
+
+# Master switch — set false to disable the timer on the whole group
+# (the playbook stops + disables it).
+miner_auto_update_enabled: true
+
+# OPTIONAL pinned operator Ed25519 public key (64-hex or a PEM path on
+# the miner). When set, the updater REQUIRES the manifest to carry a
+# valid `sig` over the sha256 hex before installing. Leave empty to run
+# on the sha256-over-HTTPS baseline (matches arion's simplicity). The
+# publish script signs the same sha256-hex string when given a key.
+miner_auto_update_pubkey: ""
+
+# ── UKI image fetch ─────────────────────────────────────────────────
+# The miner-agent pulls measured UKIs from Hippius S3. The §22 root
+# public key is compiled into the binary (miner-uki-fetch) — never
+# configured here.
+image:
+  s3_endpoint: "https://s3.hippius.com"
+  s3_bucket: "hippius-compute-images"
+
+# ── Lifecycle orders + vsock relay (MA-4 / MA-5) ────────────────────
+# The miner-agent `serve` loop hosts the AF_VSOCK guest relay and the
+# signed-order HTTP server.
+orders:
+  # TCP port the orders HTTP server binds on the NetBird interface.
+  port: 9700
+# The miner's own NetBird mesh address — the orders server binds it
+# (and ONLY it; the miner-agent rejects any non-NetBird bind). It is
+# assigned by NetBird at mesh-join and is therefore PER-HOST: this is a
+# placeholder, OVERRIDE it in host_vars/<miner>.yml with the real
+# `100.64.x.y` address once the box has joined the mesh.
+orders_bind_ip: "100.64.0.1"
+# The Edge gateway's order-signing Ed25519 PUBLIC key, 64 lowercase-hex
+# chars. The miner-agent's `verify_strict` accepts an order ONLY if the
+# detached signature checks against this key (`binaries/miner-agent/src/
+# orders/auth.rs`).
+#
+# Provisioned by the §H phase-2 order-signing chain:
+# - The matching 32-byte raw seed (priv key) lives in Vault Tier-0 at
+#   `secret/hippius-compute/edge-gateway/order-signing` (property `priv`,
+#   64-hex chars). NEVER in Git.
+# - The Edge ExternalSecret materialises the seed at
+#   `/etc/hippius-edge/order-signing/priv.hex`; `OrderSigner::load`
+#   reads it at boot and logs the derived pubkey for visual confirmation
+#   that it matches THIS value.
+# - The deployment can pin this pubkey via
+#   `EDGE_ORDER_SIGNING_EXPECTED_PUBKEY` to fail-close the Edge on a
+#   drift between the Vault seed and this value (any rotation MUST be
+#   atomic across both sides).
+# Rotation: generate a new keypair offline, vault-write the new seed,
+# update this value, re-run the miner-tasks playbook to re-render the
+# config + reload the agent, then flip the Edge
+# `orderSigning.expectedPubkey`
+# Helm value and roll the Edge.
+edge_order_signing_pubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf8820d2b25ca9"
+# CPU / RAM the host allots to tenant CVMs — a RESERVATION, not the
+# whole machine (headroom is kept for the host OS + miner-agent).
+# Conservative group default; size it per box in host_vars.
+host_cvm:
+  cpu_budget: 8
+  memory_mb_budget: 16384
+
+# ── Edge auth model ─────────────────────────────────────────────────
+# `onchain` (default) — PERMISSIONLESS: the agent self-signs its Edge
+# mTLS client cert from its identity key; the Edge (EDGE_MINER_AUTH=
+# onchain) admits it iff the node_id is registered + `Active` on
+# `pallet-compute-scoring` (§23). The playbook needs NO operator client
+# cert — it installs only the Edge's public server CA (files/edge-ca.crt)
+# and the config omits client_cert/client_key. Onboard with
+# `deploy/register-miner/` (register_child + the agent's node_sig).
+# See docs/design/permissionless-miner-auth.md.
+#
+# `ca` — LEGACY: the operator's CA hand-issues a per-miner client cert
+# (SAN URI:hippius-miner:<host>) and `scp`s it onto the box; the mtls
+# play then reports + SAN-checks it. Set this only to pin to the legacy
+# bootstrap-CA Edge (`EDGE_MINER_AUTH=ca`).
+miner_edge_auth: "onchain"
+
+# ── mTLS material ───────────────────────────────────────────────────
+# In `onchain` mode the playbook installs ONLY ca.crt (the Edge's
+# public server CA). In `ca` mode the material below is
+# OPERATOR-PROVISIONED OUT-OF-BAND: Ansible only creates the directory,
+# REPORTS which expected files are present, and (§17.7 belt-and-
+# suspenders) READS `client.crt` to verify its SAN URI matches this
+# host — never generates a key, never copies a certificate, never
+# touches the content OR metadata of an operator-provisioned file.
+# The operator's own CA signs the miner cert; the operator `scp`s it
+# onto the box with the `mode` documented per file below.
+#
+# §17.7 cert binding (the SAN URI):
+#   `client.crt` MUST carry exactly one URI SAN of the form
+#       URI:hippius-miner:<inventory_hostname>
+#   so the Edge gateway's mTLS acceptor pins this miner's identity. A
+#   cert without that SAN — or with a SAN naming a different host —
+#   will silently fail every handshake at the Edge; the
+#   `mtls-cert-mount.yml` play fails loud at apply when the SAN does
+#   not match. Re-mint the cert with the §17.7 openssl recipe and
+#   re-`scp` it onto the host.
+mtls:
+  cert_dir: "/var/lib/hippius-miner/mtls"
+  expected_files:
+    # The Edge-facing miner client cert. SAN URI requirement above.
+    - name: "client.crt"
+      mode: "0444"
+    - name: "client.key"
+      mode: "0400"
+    - name: "ca.crt"
+      mode: "0444"
+
+# ── Operator-local secrets (workstation, never pushed to the miner) ─
+# The NetBird setup key is read from the operator workstation at run
+# time; it is never written to the repo or copied to a managed host.
+operator_secret_dir: "{{ lookup('env', 'HOME') }}/.config/hippius"
+netbird_setup_key_file: "netbird-miner-1-setupkey"
+
+# ── EXPLICITLY NOT SET for miner_nodes (asserted absent at preflight) ─
+#   - vault_addr        miners never reach the hippius-compute Vault
+#   - vault_token       idem
+#   - k3s_install_args  miners are not cluster nodes
+#   - cc_node_labels    idem

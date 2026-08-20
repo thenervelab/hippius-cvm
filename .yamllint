@@ -1,0 +1,29 @@
+---
+# yamllint configuration. Consumed by `yamllint deploy/gitops/` (the
+# PR-K3 test gate) and any future YAML linting in this repo.
+extends: default
+
+rules:
+  # Generous — the GitOps manifests carry long explanatory comment
+  # blocks and long upstream chart URLs / image references.
+  line-length:
+    max: 120
+    level: warning
+  # Several manifests lead with a comment block rather than `---`;
+  # both are valid YAML. Do not police it.
+  document-start: disable
+  # Kubernetes manifests use `true` / `false` pervasively; do not
+  # police boolean-looking keys.
+  truthy:
+    check-keys: false
+
+# Helm chart `templates/` hold Go-template directives (`{{ ... }}`) —
+# they are NOT plain YAML and are linted by `helm lint` /
+# `helm template`, not yamllint. `charts/` holds fetched dependency
+# tarballs (git-ignored build artifacts). Applies to both the cluster
+# `addons/` and the workload `apps/` charts.
+ignore: |
+  deploy/gitops/addons/*/charts/
+  deploy/gitops/addons/*/templates/
+  deploy/gitops/apps/*/charts/
+  deploy/gitops/apps/*/templates/

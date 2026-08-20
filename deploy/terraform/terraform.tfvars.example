@@ -1,0 +1,42 @@
+# Example variable values — copy to `terraform.tfvars` and fill in.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# `terraform.tfvars` is git-ignored (deploy/.gitignore: `*.tfvars` with
+# a `!*.tfvars.example` exception). It carries LIVE SECRETS — never
+# commit it, never paste its contents anywhere.
+#
+# Lines left commented use the variable's default (see variables.tf).
+
+# ─── Hippius S3 ─────────────────────────────────────────────────────
+# Credentials for the writer key Terraform uses to create the buckets.
+hippius_s3_access_key = "REPLACE_ME_hippius_s3_access_key"
+hippius_s3_secret_key = "REPLACE_ME_hippius_s3_secret_key"
+# hippius_s3_endpoint = "https://s3.hippius.com"  # default
+# hippius_s3_region   = "us-east-1"               # default
+
+# ─── Cloudflare DNS ─────────────────────────────────────────────────
+# API token scoped to DNS:Edit on the hippius.network zone only.
+cloudflare_api_token = "REPLACE_ME_cloudflare_dns_edit_token"
+# Zone id of hippius.network (Cloudflare dashboard → zone → Overview).
+cloudflare_zone_id = "REPLACE_ME_hippius_network_zone_id"
+# dns_zone_name = "hippius.network"  # default
+
+# Public service IPs. ALL defaults are RFC 5737 placeholders (192.0.2.x)
+# and route nowhere; fill the real IP once each service is deployed.
+# kbs_public_ip    = "192.0.2.1"   # placeholder — fill after PR-K6
+# vali_public_ip   = "192.0.2.2"   # placeholder — fill after PR-K7
+# argocd_public_ip = "192.0.2.3"   # placeholder — the ingress public IP
+# edge_loadbalancer_ip — the Edge's MetalLB LoadBalancer IP (PR-H7).
+# A PRIVATE address out of the MetalLB pool, not a public one. Must match
+# deploy/gitops/apps/edge-gateway/values.yaml::service.loadBalancerIP.
+# edge_loadbalancer_ip = "192.0.2.10"   # placeholder
+
+# ─── HashiCorp Vault (Tier-0) ───────────────────────────────────────
+# vault_address = "https://vault.example.invalid:8200"  # placeholder
+# Admin-scoped, short-TTL token Terraform uses to write policies + roles.
+vault_token = "REPLACE_ME_vault_admin_token"
+# Path to the Vault server's CA cert — fetch it from the Vault host
+# (see README) and point this at it.
+vault_ca_cert_file = "REPLACE_ME_path_to_vault-ca.crt"
+# vault_skip_tls_verify = false  # default — keep false; set the CA above

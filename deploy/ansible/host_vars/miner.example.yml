@@ -1,0 +1,57 @@
+---
+# EXAMPLE per-host config for a `miner_nodes` host (untrusted miner).
+#
+#   cp host_vars/miner.example.yml host_vars/<your-hostname>.yml
+#
+# `<your-hostname>` must match the name you put under `miner_nodes` in
+# `inventory.yml`. Real `host_vars/*.yml` files are git-ignored — see
+# `host_vars/README.md` for the full schema.
+#
+# Placeholders below use `<...>` and the RFC 5737 documentation range
+# `192.0.2.0/24`. Nothing here is a working value.
+
+# ── Connection ──────────────────────────────────────────────────────
+ansible_host: 192.0.2.20
+ansible_user: <SSH_USER>
+ansible_ssh_private_key_file: ~/.ssh/<YOUR_SSH_KEY>
+
+# ── Hardware (asserted by 00-preflight.yml) ─────────────────────────
+# Must be an SEV-SNP capable AMD EPYC with SEV-SNP enabled in BIOS.
+# Read the exact string from `/proc/cpuinfo` on the box.
+cpu_model_expected: "<AMD EPYC MODEL STRING FROM /proc/cpuinfo>"
+ram_gb_expected: <RAM_GB>                  # preflight asserts ">="
+
+# ── Lifecycle orders ────────────────────────────────────────────────
+# This miner's OWN NetBird mesh address. The signed-order HTTP server
+# binds this address and only this address (the agent rejects any
+# non-mesh bind). NetBird assigns it at mesh join, so it is per-host and
+# cannot be defaulted: fill it in AFTER the box has joined the mesh,
+# reading it from `netbird status` or the NetBird dashboard. Until then
+# the `group_vars/miner_nodes.yml` placeholder is used and the orders
+# server will fail to bind.
+orders_bind_ip: "<THIS_MINER_NETBIRD_IP>"
+
+# ── Tenant CVM budget ───────────────────────────────────────────────
+# CPU threads / MiB this host offers to tenant CVMs. A RESERVATION, not
+# the whole machine: leave headroom for the host OS + miner-agent
+# (a useful starting point is ~4 threads and ~16-32 GB reserved).
+host_cvm:
+  cpu_budget: <CPU_THREADS_FOR_TENANTS>
+  memory_mb_budget: <MIB_FOR_TENANTS>
+
+# ── Disk layout ─────────────────────────────────────────────────────
+# ⚠️  Re-verify with `lsblk` on the actual box before the first run.
+# `00-preflight.yml` fails closed when these lists do not match reality.
+# The miner bootstrap does NOT format the data disks; the lists exist
+# for the preflight safety assertion.
+nvme_system_devices:                       # boot / root / swap — never formatted
+  - /dev/<SYSTEM_NVME_1>
+  - /dev/<SYSTEM_NVME_2>
+nvme_data_devices: []                      # [] if the box has no extra data disk
+
+# ── NetBird setup key ───────────────────────────────────────────────
+# FILENAME ONLY. Resolved under `operator_secret_dir` (default
+# `~/.config/hippius`) on the OPERATOR WORKSTATION at run time. Mint a
+# single-use, short-expiry key bound to your NetBird miner group; never
+# commit it and never place it on the miner by hand.
+netbird_setup_key_file: "<NETBIRD_SETUP_KEY_FILENAME>"

@@ -1,0 +1,127 @@
+{{- if .Values.syntheticMonitor.full.enabled }}
+---
+# Synthetic monitor — FULL e2e tier (apps.synthetic). Every 6 h, rotating
+# the four distros (ubuntu/debian/cs10/fedora): launch a THROWAWAY golden
+# VM through the REAL `POST /v1/vm/launch` API, watch it boot (kek-released
+# → running, NetBird IP), then DECOMMISSION it via the real §24 API and
+# verify crypto-erase. SELF-CLEANING — a `finally` teardown decommissions
+# (or, if that stalls, force-erases + destroys) the VM on EVERY exit path,
+# so a stuck/failed run never leaks a VM.
+#
+# Same posture as vali-launch-tick (it verifies crypto-erase against Vault
+# + runs the in-process force-teardown fallback), plus the orchestration-
+# root Bearer token (external-secret-synthetic.yaml) it uses to drive the
+# root-only launch/decommission endpoints. Default-inert until the golden
+# bake_ids + root token are provisioned (`syntheticMonitor.full.enabled`).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: synthetic-monitor-full
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: synthetic-monitor-full
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.syntheticMonitor.full.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.syntheticMonitor.full.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: synthetic-monitor-full
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: synthetic-monitor-full
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_synthetic_monitor", "--tier", "full"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+                # Orchestration-root Bearer token — authenticates the real
+                # root-only POST /v1/vm/launch + §24 decommission calls.
+                - name: VALI_SYNTHETIC_ROOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-synthetic-monitor
+                      key: root-token
+                # Vault: the crypto-erase differential — `kek_alive` (the
+                # per-VM Transit key observed ALIVE before §24) and
+                # `crypto_erase` (it is GONE after) — plus the in-process
+                # force-teardown fallback erase. These are the only stages
+                # of the full e2e that touch Vault directly; everything
+                # else goes through the vali API. So the projected token
+                # below is load-bearing for the one security-critical
+                # assertion this tier makes, and a broken Vault credential
+                # now fails the run at `kek_alive`, right after release —
+                # before the boot wait and the decommission — instead of at
+                # the very end. Both stages fail CLOSED: a denied or
+                # unreachable probe raises, it is never read as "gone".
+                {{- include "vali.vaultStaticTokenEnv" . | nindent 16 }}
+                {{- include "vali.vaultAuthEnv" . | nindent 16 }}
+                - name: VALI_VAULT_ADDR
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-vault
+                      key: address
+              resources:
+                {{- .Values.syntheticMonitor.full.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                {{- include "vali.vaultTokenVolumeMount" . | nindent 16 }}
+                {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 16 }}
+                - name: tmp
+                  mountPath: /tmp
+                - name: vault-ca
+                  mountPath: /etc/hippius/vault-ca
+                  readOnly: true
+          volumes:
+            {{- include "vali.vaultTokenVolume" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolume" . | nindent 12 }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+            - name: vault-ca
+              configMap:
+                name: vault-ca
+{{- end }}

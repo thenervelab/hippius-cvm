@@ -1,0 +1,194 @@
+---
+# KBS config — rendered into `config.toml`. PR-K6, §K (#54).
+#
+# The `hippius-kbs-server` binary (§D #101) loads exactly one TOML file
+# (`--config`); every key here maps to a `[section]` of its config
+# schema. Every struct is `deny_unknown_fields` — a stray key fails the
+# pod closed.
+#
+# No secret value lives in this ConfigMap. The response-signing key is
+# a mounted Secret file (`keys.signing_key_path`); the Vault token is
+# the `VAULT_TOKEN` env var. The public keys below (allowlist root,
+# kid, channel pubkey) are safe in Git.
+#
+# `[allowlist].signed_path` is rendered iff `.Values.allowlist.url` is
+# non-empty — the init container fetches the artifact into
+# `/etc/kbs-allowlist/allowlist.cose` and the KBS reads it there. With
+# the URL empty, no `signed_path` is set, the KBS installs no allowlist,
+# and every release fails closed by definition.
+#
+# `[snp]` is rendered iff `.Values.snp.enabled` — present means the
+# binary anchors a real AMD chain to the matching built-in ARK + the
+# operator-mounted VEK; absent means the deny-closed chain verifier
+# (fail-closed at the SNP step).
+#
+# `[[l1_keys]]` is rendered once per entry in `.Values.l1Keys`. An
+# empty list emits no table, which the KBS treats as "no L1 keys
+# loaded" (fail-closed for every release).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbs-config
+  namespace: kbs
+  labels:
+    {{- include "kbs.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- if .Values.config.requireWrappedKek }}
+    # §KEK-HSM — refuse to release a KEK that is not Vault-Transit wrapped
+    # (`vault:v1:…`); without it the KBS would hand back a plaintext KEK
+    # staged at rest. The Rust field is `#[serde(default)]` = FALSE, so
+    # omitting this line silently DISABLES the gate — render it explicitly
+    # rather than rely on a live hand-edit that any re-sync would drop.
+    #
+    # MUST stay above the first [section] header: it is a top-level key, and
+    # TOML would otherwise bind it to the preceding section, which the
+    # deny_unknown_fields structs reject at startup (pod crashloop).
+    require_wrapped_kek = true
+    {{- end }}
+    [listen]
+    addr = "0.0.0.0:{{ .Values.config.listenPort }}"
+
+    [storage]
+    state_dir = "/var/lib/kbs/state"
+    audit_dir = "/var/lib/kbs/audit"
+    {{- if .Values.config.evidenceDir }}
+    # §280 evidence sink — one signed bundle per GRANTED release
+    # (attested measurement + SNP report + VCEK chain + boot counter),
+    # served by the admin `GET /v1/admin/vm/{vm_id}/evidence` and
+    # relayed by vali's attestation endpoint. Omitted ⇒ the KBS wires a
+    # NullEvidenceSink, discards every bundle, and vali can only ever
+    # answer "unknown" when a tenant asks whether their VM is attested.
+    evidence_dir = "{{ .Values.config.evidenceDir }}"
+    {{- end }}
+    nonce_ttl_secs = {{ .Values.config.nonceTtlSecs }}
+    # ⚠️  DEPLOYMENT-SAFETY FUSE — suppressed-confirm anti-rollback bound.
+    # ALWAYS rendered (never conditional, never left to the Rust-side
+    # absent-default) so the armed/disabled state is unmistakable in the
+    # rendered ConfigMap itself, not inferred from a key's absence. `0` =
+    # DISABLED (every release is granted regardless of confirm
+    # suppression) — the value this chart MUST carry until the fleet has
+    # been re-baked to send confirms. See values.yaml
+    # `config.maxUnconfirmedReleases` for the full cutover sequence.
+    # `required` so a values.yaml that drops this key fails the render
+    # LOUDLY rather than silently arming at the Rust compiled default.
+    max_unconfirmed_releases = {{ required "config.maxUnconfirmedReleases must be set explicitly — 0 disables the suppressed-confirm gate; see values.yaml for the cutover sequence" .Values.config.maxUnconfirmedReleases }}
+    {{- if .Values.config.liveAttestation.sinkDir }}
+    # §322 live-attestation sink — one CBOR file per granted
+    # keepalive at `{dir}/pending/{vm_id}/{body_hash16}.cbor`. The
+    # vali batcher (#327) reads from `pending/` + moves submitted
+    # files to `submitted/`. Empty / omitted ⇒ KBS wires a
+    # NullLiveAttestationSink and nothing is archived.
+    live_attestation_dir = "{{ .Values.config.liveAttestation.sinkDir }}"
+    {{- end }}
+
+    [allowlist]
+    root_pubkey_hex = "{{ .Values.config.allowlistRootPubkeyHex }}"
+    {{- if .Values.config.allowlistRootPubkeyHexNext }}
+    # §22 key rotation in flight: accept an allowlist signed by the primary
+    # OR this incoming root. Promote to primary + drop the old when done.
+    root_pubkey_hex_next = "{{ .Values.config.allowlistRootPubkeyHexNext }}"
+    {{- end }}
+    {{- if .Values.allowlist.url }}
+    signed_path = "/etc/kbs-allowlist/allowlist.cose"
+    {{- end }}
+
+    [keys]
+    signing_key_path = "/etc/kbs-keys/signing.key"
+    kid_hex = "{{ .Values.config.kidHex }}"
+    auth_pubkey_hex = "{{ .Values.config.authPubkeyHex }}"
+
+    [vault]
+    address = "{{ .Values.vault.address }}"
+    kv_mount = "{{ .Values.vault.kvMount }}"
+    {{- if .Values.vault.brokerUrl }}
+    # §8 / #102 — SNP-attestation-bound Vault broker. The KBS
+    # authenticates to it for every release with a fresh
+    # `/dev/sev-guest` self-report binding `challenge_nonce ‖
+    # auth_pubkey`; mutually exclusive with
+    # `dev_allow_any_kbs_measurement` (refused at startup — the
+    # broker IS the measurement gate).
+    broker_url = "{{ .Values.vault.brokerUrl }}"
+    {{- if .Values.vault.brokerCaPath }}
+    # RA-KBS-M1 — pin the broker's TLS server cert (byte-exact leaf
+    # match). Required when broker_url is https. Mounted from the
+    # broker-ca Secret (external-secret-broker-ca.yaml).
+    broker_ca_path = "{{ .Values.vault.brokerCaPath }}"
+    {{- end }}
+    {{- end }}
+    {{- if or .Values.vault.devAllowAnyKbsMeasurement .Values.vault.devSkipTlsVerify }}
+    # ⚠️  EXPLICIT non-production opt-in (audit H7). Every DEV-ONLY override
+    # below is default-DENY unless this is set AND `vault.address` is a
+    # loopback/private endpoint — a production config never sets it, so a
+    # slip can't silently enable a dev bypass. This block is only rendered
+    # when a dev override is enabled (dev overlay only).
+    dev_environment = true
+    {{- end }}
+    {{- if .Values.vault.devAllowAnyKbsMeasurement }}
+    # ⚠️  DEV-ONLY override that widens the KBS-side Vault auth gates so
+    # the MVP placeholder VerifiedReport passes — letting downstream dev
+    # exercise the full release chain while #102 is being built. Fail-closed:
+    # refused at startup unless dev_environment=true AND vault.address is a
+    # loopback/private endpoint.
+    dev_allow_any_kbs_measurement = true
+    {{- end }}
+    {{- if .Values.vault.caCertPath }}
+    # PROD: verify the Vault server cert against the mounted CA bundle
+    # (chain + SAN). Mutually exclusive with dev_skip_tls_verify.
+    ca_cert_path = "{{ .Values.vault.caCertPath }}"
+    {{- else if .Values.vault.devSkipTlsVerify }}
+    # ⚠️  DEV-ONLY override that skips TLS server-cert verification on
+    # the Vault KV client — lets the binary talk to the self-signed
+    # Tier-0 Vault without baking its CA bundle into the image. Fail-closed:
+    # refused at startup unless dev_environment=true AND vault.address is a
+    # loopback/private endpoint.
+    dev_skip_tls_verify = true
+    {{- end }}
+
+    [launch_policy]
+    min_tcb = {{ .Values.config.launchPolicy.minTcb }}
+    required_bits = {{ .Values.config.launchPolicy.requiredBits }}
+    allowed_mask = {{ .Values.config.launchPolicy.allowedMask }}
+
+    [live_attestation]
+    compute_chain_genesis_hex = "{{ required "config.liveAttestation.computeChainGenesisHex must be set" .Values.config.liveAttestation.computeChainGenesisHex }}"
+    compute_pallet_instance_hex = "{{ required "config.liveAttestation.computePalletInstanceHex must be set" .Values.config.liveAttestation.computePalletInstanceHex }}"
+    {{- range $k := .Values.l1Keys }}
+
+    [[l1_keys]]
+    kid_hex = "{{ required "l1Keys[*].kidHex must be set" $k.kidHex }}"
+    pubkey_hex = "{{ required "l1Keys[*].pubkeyHex must be set" $k.pubkeyHex }}"
+    {{- end }}
+    {{- if .Values.snp.enabled }}
+
+    [snp]
+    generation = "{{ .Values.snp.generation }}"
+    vek_pem_path = "/etc/kbs-vek/vek.pem"
+    {{- if .Values.snp.kdsUrl }}
+    kds_url = "{{ .Values.snp.kdsUrl }}"
+    {{- end }}
+    {{- end }}
+    {{- if .Values.admin.enabled }}
+    {{- if and .Values.admin.requireMtls (not .Values.admin.mtls.secretName) }}
+    {{- fail "admin.requireMtls=true with an empty admin.mtls.secretName renders a config the binary REFUSES to serve the admin listener for: no register-vm (no launches), no §25 activate (no migrations), no allowlist reload. Provision the PKI and set admin.mtls.secretName FIRST — see docs/operator/kbs-admin-mtls-cutover-runbook.md." }}
+    {{- end }}
+
+    [admin]
+    addr = "0.0.0.0:{{ .Values.admin.listenPort }}"
+    idempotency_subdir = "admin-idempotency"
+    audit_subdir = "admin"
+    idempotency_ttl_secs = {{ .Values.admin.idempotencyTtlSecs }}
+    rate_per_sec = {{ .Values.admin.ratePerSec }}
+    burst = {{ .Values.admin.burst }}
+    # mTLS is the admin listener's ONLY authentication (the routes below
+    # it mutate the lifecycle state that decides which host may unlock a
+    # tenant disk, and none of them carries a per-request credential).
+    # `require_mtls = true` + no material ⇒ the binary REFUSES to bind
+    # the admin listener rather than serving it in plaintext.
+    require_mtls = {{ .Values.admin.requireMtls }}
+    {{- if .Values.admin.mtls.secretName }}
+    tls_cert_path = "{{ .Values.admin.mtls.mountPath }}/tls.crt"
+    tls_key_path = "{{ .Values.admin.mtls.mountPath }}/tls.key"
+    client_ca_path = "{{ .Values.admin.mtls.mountPath }}/ca.crt"
+    {{- end }}
+    {{- end }}

@@ -1,0 +1,166 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "datasource", "uid": "grafana" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Hippius synthetic monitor — continuous light + full-e2e self-test of the live control plane (apps.synthetic).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Full e2e status (per distro)",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_e2e_success", "legendFormat": "{{distro}}", "refId": "A" }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAIL", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "OK", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Light health-check status",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "id": 2,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "hippius_synthetic_light_success", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAIL", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "OK", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Teardown forced (leak-guard fallback)",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "id": 3,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "max(hippius_synthetic_teardown_forced)", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "clean", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "FORCED", "color": "red" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-stage e2e latency (seconds)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 4,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_e2e_duration_seconds", "legendFormat": "{{distro}}/{{stage}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "showPoints": "auto" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-stage e2e success",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 5,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_e2e_stage_success", "legendFormat": "{{distro}}/{{stage}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "showPoints": "auto" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time since last successful e2e (hours)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 6,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "(time() - hippius_synthetic_last_success_timestamp{tier=\"full\"}) / 3600", "legendFormat": "{{distro}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "h", "custom": { "drawStyle": "line" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Light checks — per-check success",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 7,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_light_check_success", "legendFormat": "{{check}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Fleet — dispatchable vs on-chain-active & current epoch",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "id": 8,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_dispatchable_count", "legendFormat": "dispatchable", "refId": "A" },
+        { "expr": "hippius_synthetic_onchain_active_count", "legendFormat": "on-chain active", "refId": "B" },
+        { "expr": "hippius_synthetic_current_epoch", "legendFormat": "current epoch", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stuck jobs (launch / decommission)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "id": 9,
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "hippius_synthetic_stuck_launch_jobs", "legendFormat": "stuck launch", "refId": "A" },
+        { "expr": "hippius_synthetic_stuck_decommission_jobs", "legendFormat": "stuck decommission", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line" } } }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["hippius", "synthetic-monitor"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Hippius — synthetic monitor",
+  "uid": "hippius-synthetic-monitor",
+  "version": 1,
+  "weekStart": ""
+}

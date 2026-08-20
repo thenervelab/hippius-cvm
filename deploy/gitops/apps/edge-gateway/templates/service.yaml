@@ -1,0 +1,80 @@
+---
+# Edge gateway Service. PR-K8 shipped it `ClusterIP`; PR-H7 (§H phase 2)
+# makes it a MetalLB `LoadBalancer` and publishes the miner-facing relay.
+#
+# `LoadBalancer` — the miner-facing :443 mTLS relay listener is live as
+# of PR-H7, so the cluster exposes it via MetalLB out of the addon's
+# L2 pool (PR-K3). `service.loadBalancerIP` (values.yaml) pins which
+# address it takes; it must sit inside that pool and must not collide
+# with the ingress-nginx controller's allocation.
+#
+# That address is deliberately PRIVATE, not public-routable — miners
+# reach it as NetBird mesh peers via the mesh subnet route the control
+# plane advertises, never over the public internet. NetBird-only stays
+# the access model.
+#
+# NetBird-only is enforced in depth: (1) the LB IP is a private address
+# only reachable from the cluster's own segment + the NetBird mesh;
+# (2) every relay connection is mTLS — an unauthenticated peer fails
+# the handshake; (3) `loadBalancerSourceRanges` pins the NetBird CGNAT
+# range. NOTE: MetalLB in L2 mode does no packet filtering (it only
+# ARP-announces), so `loadBalancerSourceRanges` may not be enforced at
+# the LB layer — it is documented intent + defense-in-depth; the
+# CiliumNetworkPolicy (networkpolicy.yaml) is the pod-level enforcer.
+#
+# `externalTrafficPolicy: Local` preserves the client source IP through
+# the LoadBalancer — required for the CiliumNetworkPolicy's NetBird
+# CGNAT `fromCIDR` rule to see the real peer rather than a SNAT'd node
+# address. On the single-node MVP the LB IP is announced from the only
+# node, so `Local` carries no availability cost. On multi-node
+# scale-out `Local` drops cross-node forwarding (a brief
+# maintenance-window unreachability is possible) — revisit
+# `externalTrafficPolicy` together with a hard pod anti-affinity then.
+# The NetBird-CIDR NetworkPolicy depends on `Local`, so the two move
+# together.
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-gateway
+  namespace: edge-gateway
+  labels:
+    {{- include "edge-gateway.labels" . | nindent 4 }}
+  annotations:
+    # Pin the LoadBalancer IP from the MetalLB `hippius-lb-pool`.
+    metallb.universe.tf/loadBalancerIPs: {{ required "service.loadBalancerIP must be set" .Values.service.loadBalancerIP | quote }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  # Defense-in-depth — restrict to the NetBird CGNAT range. The
+  # authoritative enforcer is the CiliumNetworkPolicy + mTLS; see above.
+  loadBalancerSourceRanges:
+    {{- range .Values.service.sourceRanges }}
+    - {{ . | quote }}
+    {{- end }}
+  selector:
+    {{- include "edge-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    # Miner-facing mTLS relay (PR-H7). External :443 → container :8443.
+    - name: edge-relay
+      port: 443
+      targetPort: edge-relay
+      protocol: TCP
+    # Read-only telemetry API (PR-H6). Cluster-internal consumers
+    # (Sentinel, Validator) reach it via the Service ClusterIP; the
+    # CiliumNetworkPolicy gates this port to internal sources only,
+    # so it stays internal even though the Service also carries the LB IP.
+    - name: edge-api
+      port: 9465
+      targetPort: edge-api
+      protocol: TCP
+    # §24/§25 guest stopped-ack relay (PR edge-lifecycle-ack-relay).
+    # Published on the SAME MetalLB LoadBalancer as the miner relay,
+    # external :8446 → container :8446. The miner host's vsock-proxy
+    # reqwest client dials `https://<service.loadBalancerIP>:8446` over
+    # the NetBird mesh and validates the Edge's server cert (whose SAN
+    # is that IP). The CiliumNetworkPolicy pins the NetBird CGNAT
+    # source range, like the :8443 mTLS relay.
+    - name: edge-lifecycle
+      port: 8446
+      targetPort: edge-lifecycle
+      protocol: TCP

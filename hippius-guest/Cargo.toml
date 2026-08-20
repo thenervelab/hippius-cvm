@@ -1,0 +1,28 @@
+[package]
+name = "hippius-guest"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hippius Confidential Compute — guest-side protocol (verify KBS release response per §6/§7/§19/§20 + sign §24/§25 stopped-ack). Pure-Rust crypto, no kernel/cryptsetup dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+hippius-types = { path = "../hippius-types" }
+kbs-core = { path = "../kbs-core" }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+subtle = "2.6"
+thiserror = "2"
+hkdf = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ciborium = "0.2"
+hex = "0.4"
+rand = "0.8"
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+hpke = { version = "0.12", default-features = false, features = ["std", "x25519"] }

@@ -1,0 +1,70 @@
+---
+# Pinned versions — bump deliberately, not opportunistically.
+versions:
+  k3s: "v1.34.3+k3s1"
+  netbird: "0.71.3"
+
+# ── Network plan ────────────────────────────────────────────────────
+# OPERATOR-SET. These are the address ranges of YOUR cluster. The
+# defaults below are RFC 1918 and mirror k3s's own defaults; change them
+# if they collide with anything on your network. The three CIDRs must
+# not overlap each other, and `privnet_cidr` must contain every
+# `privnet_static_cidr` you set in host_vars.
+network:
+  # The private L2 segment the cc_nodes share (03-private-network.yml).
+  # publishability-allow: cluster-net — an addressing PLAN a deployer
+  # picks, not a host anyone can reach. 10.42.0.0/16 is k3s's own
+  # documented pod default; naming it discloses nothing about ours.
+  privnet_cidr: "10.42.0.0/16"
+  k3s_cluster_cidr: "10.42.128.0/17"   # Pod IPs (Cilium will manage)
+  k3s_service_cidr: "10.43.0.0/16"     # Service ClusterIPs
+  netbird_cgnat: "100.64.0.0/10"       # RFC 6598 — NetBird manages this
+  # Value for the `topology.kubernetes.io/region` node label. Free-form;
+  # set it to wherever your hosts actually are.
+  region: "<YOUR_REGION>"
+
+# k3s install flags — these go into INSTALL_K3S_EXEC. Each disable is
+# load-bearing; do not enable a default without coordinating with
+# the corresponding addon PR in #54:
+#   - flannel disabled because Cilium handles CNI (PR-K3)
+#   - network-policy disabled because Cilium provides NetworkPolicy
+#   - traefik disabled because ingress-nginx handles ingress (PR-K3)
+#   - servicelb disabled because MetalLB handles LoadBalancer (PR-K3)
+#   - local-storage disabled because we install a custom local-path on
+#     /var/lib/hippius-data (PR-K4)
+k3s_install_args:
+  - "--disable=traefik"
+  - "--disable=servicelb"
+  - "--disable=local-storage"
+  - "--flannel-backend=none"
+  - "--disable-network-policy"
+  - "--cluster-cidr={{ network.k3s_cluster_cidr }}"
+  - "--service-cidr={{ network.k3s_service_cidr }}"
+  - "--write-kubeconfig-mode=0644"
+
+# Common node labels — applied to every host in cc_nodes. Each cc-node
+# also accepts general workloads (per phase 1 single-node strategy).
+cc_node_labels:
+  - "node-role.hippius.network/confidential-compute=true"
+  - "node-role.hippius.network/general-workloads=true"
+  - "topology.kubernetes.io/region={{ network.region }}"
+
+# Data RAID mount point — local-path-provisioner (PR-K4) will use this
+# as its node path. Postgres + audit logs + KBS Sled stores live here.
+data_mount_path: "/var/lib/hippius-data"
+
+# Required GRUB cmdline tokens for SEV-SNP. Order does not matter; the
+# playbook ensures all are present and no conflicting tokens (iommu=pt)
+# remain. Bump these only when correlated with a §22 allowlist epoch.
+grub_cmdline_required:
+  - "kvm_amd.sev=1"
+  - "kvm_amd.sev_es=1"
+  - "kvm_amd.sev_snp=1"
+  - "mem_encrypt=on"
+grub_cmdline_forbidden:
+  - "iommu=pt"
+
+# Where local config + secrets live on the operator workstation.
+# Playbooks read NetBird setup keys, provider API creds, etc. from here.
+# This directory is never copied to managed hosts; it is operator-local.
+operator_secret_dir: "{{ lookup('env', 'HOME') }}/.config/hippius"

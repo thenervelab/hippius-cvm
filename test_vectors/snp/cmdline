@@ -1,0 +1,1 @@
+quiet panic=0 console=ttyS0 dm-verity.root=871b7fceafd96e40761fc92e12de4da30dee4c407ba4ec9a6343295ca052da3a

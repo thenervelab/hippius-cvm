@@ -1,0 +1,105 @@
+{{- if .Values.webhookTick.enabled }}
+---
+# Outbound job-event webhook worker (#587 Phase 3).
+#
+# Delivers `WebhookDelivery(pending)` rows: `manage.py vali_webhook_tick`
+# POSTs the canonical JSON event body signed `X-Hippius-Signature:
+# sha256=<hmac>` to `VALI_WEBHOOK_URL`, CASing each row delivered on a 2xx
+# or scheduling a backoff retry. Idle no-op when `VALI_WEBHOOK_URL` /
+# `VALI_WEBHOOK_SECRET` are unset — so this Deployment is gated
+# (`webhookTick.enabled`) and only turned on once an upstream callback URL
+# + its HMAC secret (a k8s Secret from Vault) exist.
+#
+# Much lighter than the launch worker: it needs ONLY the DB (read the
+# queue) + the webhook URL/secret + egress to the upstream — NO Vault
+# KEK, NO S3, NO allowlist manifest. Single-writer posture (replicas 1 +
+# Recreate; each delivery is an (id,version) CAS so a crash-restart can't
+# double-deliver). Sync wave 3.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-webhook-tick
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook-tick
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: webhook-tick
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: webhook-tick
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webhook-tick
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "vali_webhook_tick"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            # The upstream callback URL (operator-set; empty ⇒ idle).
+            - name: VALI_WEBHOOK_URL
+              value: {{ .Values.webhookTick.url | quote }}
+            # The HMAC-SHA256 secret the upstream verifies. Delivered as a
+            # k8s Secret materialised from Vault by external-secrets — never
+            # committed. Optional so the pod still starts (idle) before the
+            # secret is provisioned.
+            - name: VALI_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.webhookTick.secretName | quote }}
+                  key: secret
+                  optional: true
+          resources:
+            {{- .Values.webhookTick.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+{{- end }}

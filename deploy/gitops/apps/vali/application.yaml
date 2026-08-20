@@ -1,0 +1,82 @@
+---
+# Argo CD Application — vali Django orchestration service. PR-K7, §K (#54).
+#
+# Sync wave 11: after every addon (waves 1-5) and after the KBS app
+# (wave 10, PR-K6). vali depends on the external-secrets addon (its
+# Vault ExternalSecrets) and on PR-K4's local-path StorageClass (the
+# Postgres PVC).
+#
+# Intra-app ordering is by `argocd.argoproj.io/sync-wave` on the
+# templates: ConfigMap + ExternalSecrets (0) → Postgres (1) → the
+# django-migrations hook Job (2) → vali Deployment + backup CronJob
+# (3). Argo waits for each wave to be Healthy before the next.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hippius-compute-vali
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: hippius-compute-vali
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: orchestration
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  # Two unavoidable server-side mutations Argo CD must ignore, else the
+  # app reports perpetually OutOfSync and self-heal-loops:
+  #
+  #  1. External Secrets Operator re-defaults these fields on every
+  #     ExternalSecret reconcile. Mirrors the PR-K6 / PR-K8 apps.
+  #  2. The Postgres StatefulSet's `volumeClaimTemplates` is an *atomic*
+  #     list — the API server injects `apiVersion`/`kind`/`volumeMode`/
+  #     `status` into it, which a rendered manifest cannot carry, so the
+  #     SSA diff never converges. The field is immutable post-create
+  #     anyway, so ignoring it for diffing is the documented fix.
+  ignoreDifferences:
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
+        - .spec.data[].remoteRef.nullBytePolicy
+        - .spec.target.deletionPolicy
+        - .spec.target.template.engineVersion
+        - .spec.target.template.mergePolicy
+    - group: apps
+      kind: StatefulSet
+      name: postgres
+      jqPathExpressions:
+        - .spec.volumeClaimTemplates
+  source:
+    repoURL: git@github.com:thenervelab/hippius-compute-internal.git
+    targetRevision: main
+    path: deploy/gitops/apps/vali
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: vali
+  syncPolicy:
+    # Argo CD creates the `vali` namespace carrying this label, so the
+    # namespace-restricted `hippius-vault` ClusterSecretStore (PR-K11)
+    # admits this app's ExternalSecrets.
+    managedNamespaceMetadata:
+      labels:
+        hippius.network/vault-secrets: enabled
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 5

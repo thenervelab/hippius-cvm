@@ -1,0 +1,77 @@
+---
+# `hippius-eso-gitops-only` ValidatingAdmissionPolicy — PR-K11, §K (#54).
+#
+# Admission-level enforcement of the §K invariant: every
+# `external-secrets.io` resource is created and modified by Argo CD from
+# Git — never by hand.
+#
+# ## Why this exists — the residual RBAC cannot reach
+#
+# `values.yaml` turns ESO's `rbac.aggregateToEdit/View` off, so ESO's
+# verbs are not folded into the built-in `edit` / `view` ClusterRoles.
+# But the ESO chart ALSO hardcodes
+# `rbac.authorization.k8s.io/aggregate-to-admin: "true"` on its
+# `*-edit` / `*-view` ClusterRoles (chart `rbac.yaml` — no Helm value
+# gates it). A principal holding namespace `admin` therefore still gets
+# `create` on `ExternalSecret`. Against the cluster-wide `hippius-vault`
+# store that is a cross-namespace exfil path: a namespace `admin` could
+# mint an `ExternalSecret` and pull any of the ESO-synced
+# `hippius-compute/…` leaves (RA-N1-scoped, not the whole subtree — but
+# still incl. every tenant KEK) into its own namespace.
+#
+# RBAC cannot close it — the label is upstream-hardcoded. This policy
+# closes it at admission instead: it does not care which ClusterRole
+# granted the verb, it checks WHO is making the request.
+#
+# ## What it allows
+#
+# CREATE / UPDATE / DELETE of any `external-secrets.io` resource
+# (ExternalSecret, ClusterExternalSecret, SecretStore,
+# ClusterSecretStore, PushSecret, ClusterPushSecret) is allowed ONLY
+# for:
+#   - the Argo CD application-controller — GitOps applies;
+#   - the ESO controllers — reconcile writes (finalizers,
+#     ClusterExternalSecret-managed children, …);
+#   - the `system:masters` group — operator break-glass on the direct
+#     cluster kubeconfig, so a broken Argo CD never wedges debugging.
+# Every other identity is denied, regardless of its RBAC.
+#
+# `failurePolicy: Fail` — fail closed: if the policy cannot evaluate,
+# the write is denied.
+#
+# `sync-wave: "1"` — the guard is in place before the
+# `ClusterSecretStore` (wave 2).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hippius-eso-gitops-only
+  labels:
+    app.kubernetes.io/name: hippius-eso-gitops-only
+    app.kubernetes.io/part-of: hippius-compute
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["external-secrets.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*"]
+  validations:
+    - expression: >-
+        request.userInfo.username in [
+          'system:serviceaccount:argocd:argocd-application-controller',
+          'system:serviceaccount:{{ .Release.Namespace }}:hippius-compute-external-secrets',
+          'system:serviceaccount:{{ .Release.Namespace }}:external-secrets-cert-controller',
+          'system:serviceaccount:{{ .Release.Namespace }}:external-secrets-webhook'
+        ] || request.userInfo.groups.exists(g, g == 'system:masters')
+      message: >-
+        external-secrets.io resources are GitOps-managed only: created
+        and modified by Argo CD (and the ESO controllers) from Git, never
+        by hand. This closes the cross-namespace Vault-exfil path the ESO
+        chart's hardcoded aggregate-to-admin ClusterRole leaves open.
+        Operator break-glass: use the system:masters kubeconfig. See
+        deploy/gitops/addons/external-secrets/README.md.

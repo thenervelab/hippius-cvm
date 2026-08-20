@@ -1,0 +1,103 @@
+{{- if .Values.usageMeter.enabled }}
+---
+# Uptime usage-meter worker.
+#
+# Nothing periodically turns the tenant guests' attested served-delivery
+# receipts into billable resource-seconds — so a VM that is down would
+# still be paid (the epoch weight is an instantaneous snapshot). This
+# Deployment runs the `vali_usage_meter` management command (a long-running
+# loop, `VALI_USAGE_METER_INTERVAL_S`, default 30s): each cycle drains the
+# verified `served_receipt` telemetry envelopes and accrues
+# `resource_units × attested_uptime` into the per-(epoch,miner,vm) usage
+# ledger — the input to uptime-integrated `compute_epoch_weights` and to
+# `owed = unit_seconds × MinerPrice`. A down VM emits no receipts ⇒ accrues
+# nothing ⇒ isn't paid.
+#
+# Same image + env as the vali web pod (shares the Django app, the Postgres
+# DB, the Vault creds, and `VALI_TICKET_VALIDATOR_BIN` for the data-bearing
+# `verify-served-receipt` shell-out via envFrom: vali-config). A worker — no
+# HTTP port, no probes; the loop IS the process, a crash exits the container
+# and the kubelet restarts it. `replicas: 1` + `Recreate` so two meters
+# never double-drain (accrual is dedup-safe, but one writer is cleanest).
+#
+# Sync wave 3 — same as the vali web Deployment (after Postgres + migrations).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-usage-meter
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: usage-meter
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: usage-meter
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: usage-meter
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # without it this driver pod is DB-blocked + every cycle times out.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The meter loop does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usage-meter
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the meter loop.
+          command: ["python", "manage.py", "vali_usage_meter"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+          resources:
+            {{- .Values.usageMeter.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # `verify-served-receipt` (the receipt-verify subprocess) +
+            # Python tempfiles need a writable /tmp under readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+{{- end }}
