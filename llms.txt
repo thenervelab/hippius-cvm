@@ -1,0 +1,28 @@
+# hippius-cvm
+
+> Control plane for confidential virtual machines on AMD SEV-SNP. A user cannot launch one of these VMs from the console today.
+
+Part of the Hippius docs for agents. Start at https://docs.hippius.com/llms.txt
+
+## What it is and what it does
+
+This repository is the Hippius Compute control plane. Tenant disks are unlocked only for a guest that presents an allowed SEV-SNP measurement. The README and `docs/security/data-visibility.md` are the description of that contract.
+
+## How to install
+
+Do not offer this as a self-serve product. The console page says virtual machines are coming soon:
+
+https://docs.hippius.com/use/console/virtual-machines
+
+There is no signup flow, no image catalog, and no "create a VM" step an agent should walk a user through.
+
+## Where to read more
+
+- Coming soon notice: https://docs.hippius.com/use/console/virtual-machines
+- Background: https://docs.hippius.com/learn/confidential-computing
+- This repository's README: https://github.com/thenervelab/hippius-cvm/blob/main/README.md
+
+## Links
+
+- Documentation home: https://docs.hippius.com
+- What a user can do today: sign in and use Drive, S3, or Hub from https://docs.hippius.com/llms.txt
