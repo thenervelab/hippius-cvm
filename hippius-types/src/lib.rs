@@ -19,6 +19,8 @@
 //!   length-prefixed streaming SHA-256 the L1 minter and the KBS must
 //!   compute identically. NOT a `ciborium::Value` so the plaintext is
 //!   never copied into non-zeroizing heap buffers.
+//! - `guardian` — customer-held disk keys: the measured cmdline grammar,
+//!   the key-guardian wire types and the `combine_kek` share combine.
 //!
 //! All types use `#[serde(deny_unknown_fields)]` where applicable so a
 //! schema drift between impls fails closed at decode.
@@ -42,10 +44,12 @@ pub mod admin;
 pub mod audit_vm;
 pub mod audit_vm_cert;
 pub mod cbor;
+pub mod custody;
 pub mod digest;
 pub mod evidence_bundle;
 pub mod flavor;
 pub mod graceful_exit;
+pub mod guardian;
 pub mod heartbeat;
 pub mod host_attestor;
 pub mod host_attestor_challenge;
@@ -54,6 +58,7 @@ pub mod live_attestation;
 pub mod provenance;
 pub mod release;
 pub mod report_data;
+pub mod rollback;
 pub mod served_receipt;
 pub mod stopped;
 pub mod telemetry_cert;
@@ -84,6 +89,12 @@ pub enum HippiusTypesError {
     VaultBrokerSchema(String),
     #[error("host attestor schema: {0}")]
     HostAttestorSchema(String),
+    #[error("custody schema: {0}")]
+    CustodySchema(String),
+    #[error("guardian schema: {0}")]
+    GuardianSchema(String),
+    #[error("rollback checkpoint schema: {0}")]
+    RollbackCheckpointSchema(String),
 }
 
 pub type Result<T> = core::result::Result<T, HippiusTypesError>;

@@ -92,7 +92,7 @@ def test_kbs_allowlist_epoch_reader_rejects_bool_json(
 def test_kbs_allowlist_epoch_reader_rejects_negative_int(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Codex round-2 MED: u64 bounds enforced."""
+    """Review round-2 MED: u64 bounds enforced."""
 
     p = tmp_path / "epoch"
     p.write_text("-5")

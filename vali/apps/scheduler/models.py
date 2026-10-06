@@ -80,6 +80,10 @@ class PlacementStatus(models.TextChoices):
     BOUND = "bound", "Bound"
     FAILED = "failed", "Failed"
     MIGRATED = "migrated", "Migrated away"
+    # Closed by a resize (`service.swap_placement_class`): the VM stayed on
+    # this miner at another flavor, and a fresh row records the new size.
+    # Not `Failed` for the reason `Migrated` is not — nothing went wrong.
+    RESIZED = "resized", "Resized"
 
 
 # Statuses that count as "active" — a VM may hold at most one
@@ -90,6 +94,72 @@ class PlacementStatus(models.TextChoices):
 ACTIVE_PLACEMENT_STATES: frozenset[str] = frozenset(
     {PlacementStatus.PENDING.value, PlacementStatus.BOUND.value}
 )
+
+
+class PlacementFailureSource(models.TextChoices):
+    """WHO ended a `Placement` — the provenance of its `reason`.
+
+    `Placement.reason` is free text: the scheduler writes `drain:<cause>`,
+    the launch path writes the miner-agent's outcome, the destroy paths
+    write `released:vm-destroyed`, a §25 hand-over writes `migrated:<job>`
+    and the root-only `/fail` body is whatever the caller typed. The
+    VALUE of `reason` therefore cannot say which code path wrote it — a
+    `/fail` body may literally spell `miner-rejected`. This column can:
+    every write site stamps its own value, and the operator readout
+    selects refusals by SOURCE first, reason second.
+
+    - `scheduler_drain`  `service.reeval_once` — the §13 re-eval judged
+                         the node (or the VM: `drain:vm-terminal`).
+    - `launch`           `orchestration.services.launch._fail_placement`
+                         — the launch on that node did not happen; the
+                         reason is `launch_on_miner`'s outcome string.
+    - `release`          `service.release_placements_for_vm` — the VM
+                         reached a terminal state; the slot is freed.
+    - `manual`           `POST /v1/scheduler/<vm>/fail` — a root caller,
+                         free-text reason.
+    - `migration`        `service.move_placement_to_node` and the 0010
+                         backfill — the row was closed `Migrated` because
+                         the VM moved.
+    - `legacy`           no attributed end: the row is still active, or it
+                         ended before this column existed. A legacy FAILED
+                         row is unattributable and is never surfaced as a
+                         refusal — refuse rather than guess.
+    """
+
+    SCHEDULER_DRAIN = "scheduler_drain", "Scheduler drain (§13 re-eval)"
+    LAUNCH = "launch", "Launch outcome"
+    RELEASE = "release", "VM released"
+    MANUAL = "manual", "Manual /fail"
+    MIGRATION = "migration", "Migrated away"
+    RESIZE = "resize", "Resized"
+    LEGACY = "legacy", "Legacy (unattributed)"
+
+
+class PlacementFailureSourceMissing(ValueError):
+    """A `Placement` is being saved with `failed_at` set but no
+    `failure_source` — a write site forgot to say WHO ended the row.
+    Raised by `Placement.save` for NEW rows (and for a row whose
+    `failed_at` is being set), never for a legacy row loaded from the
+    database that already carried both."""
+
+
+class CapacityTrustClass(models.TextChoices):
+    """How far vali trusts a miner's hardware — capacity v2.
+
+    - `operator` the fleet operator knows the hardware: `total_cpus` /
+                 `total_memory_mb` are an operator-registered anchor and
+                 the budget is derived from it.
+    - `earned`   permissionless: nobody vali trusts has seen the
+                 hardware. The budget is what the miner has PROVEN by
+                 running attested VMs concurrently (`earned_*`), never
+                 what it claims.
+
+    New rows are `earned`. Only `vali_set_miner_capacity --trust` moves a
+    row between classes, and it writes a `MinerCapacityAudit` row.
+    """
+
+    OPERATOR = "operator", "Operator-anchored"
+    EARNED = "earned", "Earned by proof"
 
 
 class MinerCapacity(models.Model):
@@ -171,6 +241,57 @@ class MinerCapacity(models.Model):
                         boot anything. Like `capacity_slots` these
                         fields are NOT chain-sourced and are preserved
                         across every mirror refresh.
+    - `trust_class`     `operator` | `earned` (see `CapacityTrustClass`).
+    - `cpu_ratio`       per-miner vCPU:thread overcommit override; NULL ⇒
+                        the global `VALI_SCHEDULER_CPU_OVERCOMMIT`. RAM
+                        has no ratio: SEV-SNP guest memory is pinned.
+    - `earned_vms` / `earned_vcpus` / `earned_memory_mb`
+                        the ceiling an `earned` miner has proven. NULL ⇒
+                        the configured floor. Written only by the
+                        `vali_capacity_earn` tick, by vali-attributed
+                        penalty events and by the audited command.
+    - `proven_peak_*` / `proven_at`
+                        the largest concurrency of attested, live VMs
+                        vali has watched this miner hold for the whole
+                        proof window, and when it was proven.
+    - `candidate_*` / `candidate_since`
+                        the concurrency currently being held towards the
+                        next proof (it becomes `proven_peak_*` once held
+                        for the window).
+    - `earned_last_change_at` / `earned_last_reason`
+                        the last earned-ceiling change and a closed
+                        vali-side reason code.
+    - `declared_cpu_budget` / `declared_memory_mb_budget` /
+      `declared_asid_capacity` / `declared_asid_used` / `declared_at`
+                        what the miner's heartbeat CLAIMS: its own #668
+                        budget and SEV-ES ASID figures. UNTRUSTED — only
+                        ever a DOWN-ONLY clamp on the budget, exactly
+                        like `reported_memory_available_mib`.
+    - `total_disk_gb`   the OPERATOR-REGISTERED size (GiB) of the host's
+                        tenant DATA-disk filesystem (optional; NULL =
+                        not seeded). Like the RAM anchor it comes from the
+                        fleet operator, never from the miner — but for
+                        disk it is only ever one term of the `min`.
+    - `earned_disk_gb`  the disk ceiling vali CUT on an `earned` miner
+                        after a disk refusal it could not have caused
+                        (`capacity_earn.DISK_INSUFFICIENT`). NULL = never
+                        cut (no term). Reset by `--earned-reset`.
+    - `declared_disk_gb_budget` / `reported_data_disk_total_gb` /
+      `reported_data_disk_available_gb` /
+      `reported_staging_disk_available_gb` / `disk_reported_at`
+                        the heartbeat-v4 disk figures (GiB): the miner's
+                        declared `[host] cvm_disk_gb_budget`, the statvfs
+                        total / available of its data fs, the statvfs
+                        available of its staging fs, and when they landed.
+                        UNTRUSTED — down-only terms of the disk budget
+                        (`capacity.disk_budget`), the available figure
+                        also feeds the disk over-claim ALARM. NULL =
+                        unknown (0 on the wire, or a pre-v4 agent).
+
+                        Every capacity-policy column above is
+                        preserved across chain refreshes, and every
+                        write to one lands a `MinerCapacityAudit` row
+                        (`apps.scheduler.capacity_admin`).
     - `observed_epoch`  the on-chain `CurrentEpoch` when this row was
                         last refreshed.
     - `data_epoch`      the epoch the miner's score actually reflects
@@ -216,6 +337,77 @@ class MinerCapacity(models.Model):
         null=True, blank=True, default=None
     )
     cvm_last_fail_reason = models.CharField(max_length=64, blank=True, default="")
+    # ── capacity v2 policy (see the docstring; audited writes only) ──
+    trust_class = models.CharField(
+        max_length=16,
+        choices=CapacityTrustClass.choices,
+        default=CapacityTrustClass.EARNED,
+        db_default=CapacityTrustClass.EARNED.value,
+    )
+    cpu_ratio = models.DecimalField(
+        max_digits=4, decimal_places=2, null=True, blank=True, default=None
+    )
+    earned_vms = models.PositiveIntegerField(null=True, blank=True, default=None)
+    earned_vcpus = models.PositiveIntegerField(null=True, blank=True, default=None)
+    earned_memory_mb = models.PositiveIntegerField(null=True, blank=True, default=None)
+    proven_peak_vms = models.PositiveIntegerField(default=0, db_default=0)
+    proven_peak_vcpus = models.PositiveIntegerField(default=0, db_default=0)
+    proven_peak_memory_mb = models.PositiveIntegerField(default=0, db_default=0)
+    proven_at = models.DateTimeField(null=True, blank=True, default=None)
+    candidate_vms = models.PositiveIntegerField(default=0, db_default=0)
+    candidate_vcpus = models.PositiveIntegerField(default=0, db_default=0)
+    candidate_memory_mb = models.PositiveIntegerField(default=0, db_default=0)
+    candidate_since = models.DateTimeField(null=True, blank=True, default=None)
+    earned_last_change_at = models.DateTimeField(null=True, blank=True, default=None)
+    earned_last_reason = models.CharField(
+        max_length=64, blank=True, default="", db_default=""
+    )
+    # UNTRUSTED heartbeat declarations — down-only clamps.
+    declared_cpu_budget = models.PositiveIntegerField(null=True, blank=True, default=None)
+    declared_memory_mb_budget = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    declared_asid_capacity = models.PositiveIntegerField(null=True, blank=True, default=None)
+    declared_asid_used = models.PositiveIntegerField(null=True, blank=True, default=None)
+    declared_at = models.DateTimeField(null=True, blank=True, default=None)
+    # ── DATA disk, GiB (see the docstring). Trusted: the operator anchor
+    # and the vali-cut earned ceiling (audited writes only). UNTRUSTED:
+    # the v4 heartbeat figures — down-only terms, NULL = unknown.
+    total_disk_gb = models.PositiveIntegerField(null=True, blank=True, default=None)
+    earned_disk_gb = models.PositiveIntegerField(null=True, blank=True, default=None)
+    declared_disk_gb_budget = models.PositiveIntegerField(null=True, blank=True, default=None)
+    reported_data_disk_total_gb = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    reported_data_disk_available_gb = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    reported_staging_disk_available_gb = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    disk_reported_at = models.DateTimeField(null=True, blank=True, default=None)
+    # ── SEV-SNP host health (v5 heartbeat). UNTRUSTED, observability only:
+    # alerted on (`vali_scheduler_reeval` gauges), never read by placement.
+    # NULL = no v5 report yet.
+    reported_snp_enabled = models.BooleanField(null=True, blank=True, default=None)
+    reported_cpus_offline = models.PositiveIntegerField(null=True, blank=True, default=None)
+    reported_snp_launches_since_boot = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    reported_df_flush_failures = models.PositiveIntegerField(
+        null=True, blank=True, default=None
+    )
+    host_health_reported_at = models.DateTimeField(null=True, blank=True, default=None)
+    # ── operator placement controls (audited writes only, see
+    # `capacity_admin`). `max_booting` overrides
+    # `VALI_SCHEDULER_MAX_BOOTING_PER_MINER` for this miner (NULL = the
+    # fleet value). `cordoned_at` set = the miner takes NO new placements
+    # (launch, feasibility, resize/migration/failover destinations) while
+    # everything already on it runs on untouched: unlike `QUARANTINED` it
+    # changes no status, no telemetry source, enrols no drain/migration.
+    max_booting = models.PositiveIntegerField(null=True, blank=True, default=None)
+    cordoned_at = models.DateTimeField(null=True, blank=True, default=None)
+    cordon_reason = models.CharField(max_length=256, blank=True, default="", db_default="")
     observed_epoch = models.BigIntegerField()
     data_epoch = models.BigIntegerField()
     refreshed_at = models.DateTimeField()
@@ -230,6 +422,42 @@ class MinerCapacity(models.Model):
 
     def __str__(self) -> str:
         return f"MinerCapacity {self.miner_node_id} ({self.status})"
+
+
+class MinerCapacityAudit(models.Model):
+    """One change to one capacity-policy field of one `MinerCapacity`.
+
+    Written in the SAME transaction as the change by
+    `apps.scheduler.capacity_admin.apply_capacity_change` — the only
+    supported writer of the policy columns. Append-only: nothing updates
+    or deletes these rows.
+
+    - `actor`   who: `op:<identity>` (the `--by` of the command),
+                `tick:earn` (the earned-capacity job) or
+                `event:<source>` (a vali-attributed penalty).
+    - `field`   the `MinerCapacity` column, or `note` for an operator
+                note that changes no state.
+    - `before` / `after`  the JSON value either side of the change.
+    - `reason`  free text from the operator, or a closed vali-side code.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    miner_node_id = models.CharField(max_length=64)
+    actor = models.CharField(max_length=128)
+    field = models.CharField(max_length=64)
+    before = models.JSONField(null=True, blank=True)
+    after = models.JSONField(null=True, blank=True)
+    reason = models.CharField(max_length=512, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["miner_node_id", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"MinerCapacityAudit {self.miner_node_id} {self.field} by {self.actor}"
 
 
 class Placement(models.Model):
@@ -262,6 +490,12 @@ class Placement(models.Model):
                           (`""` otherwise). For re-eval drains it is
                           `drain:<cause>`; for a §25 hand-over it is
                           `migrated:<job_id>` on the CLOSED source row.
+    - `failure_source`    WHICH code path ended the row
+                          (`PlacementFailureSource`). `legacy` while
+                          the row is active and on rows that ended
+                          before the column existed; every terminal
+                          write site stamps its own value. The operator
+                          readout trusts THIS, not the text of `reason`.
     - `kbs_release_ref`   audit reference the `/bind` caller supplied
                           as evidence the KBS release succeeded for
                           this VM (`""` until Bound).
@@ -306,6 +540,12 @@ class Placement(models.Model):
     # (the cap is inert for it).
     owner = models.CharField(max_length=256, blank=True, default="", db_index=True)
     resource_class = models.CharField(max_length=128)
+    # The VM's REAL data disk (GiB) when it is not `resource_class`'s: a VM
+    # resized keeps the disk it was launched with (LUKS2 + dm-integrity
+    # cannot be resized), only its vCPU/RAM follow the new flavor. NULL ⇒
+    # the flavor's own `disk_gb`. Copied onto every row that carries the
+    # VM's reservation forward (§25 custody, resize, the live-VM rebind).
+    data_disk_gb = models.PositiveIntegerField(null=True, blank=True)
     miner_node_id = models.CharField(max_length=64, db_index=True)
     status = models.CharField(
         max_length=32,
@@ -314,6 +554,17 @@ class Placement(models.Model):
     )
     chain_epoch = models.BigIntegerField()
     reason = models.CharField(max_length=256, blank=True, default="")
+    # `default` is what the ORM writes; `db_default` is what the DATABASE
+    # writes when an INSERT omits the column. Both are needed: during a
+    # migrate-then-roll the old image's INSERTs still omit this column and
+    # must not fail on NOT NULL — and Django keeps a plain `default` only
+    # for the duration of the `ALTER TABLE`, then drops it server-side.
+    failure_source = models.CharField(
+        max_length=16,
+        choices=PlacementFailureSource.choices,
+        default=PlacementFailureSource.LEGACY,
+        db_default=PlacementFailureSource.LEGACY.value,
+    )
     kbs_release_ref = models.CharField(max_length=256, blank=True, default="")
     decided_by = models.ForeignKey(
         "identity.ServiceClient",
@@ -374,6 +625,70 @@ class Placement(models.Model):
 
     def __str__(self) -> str:
         return f"Placement {self.id} (vm={self.vm_id} → {self.miner_node_id}, {self.status})"
+
+    # `failed_at` as it was READ from the database — `None` for a row that
+    # was not failed when loaded, `_NOT_LOADED` when the column was
+    # deferred. Lets `save` tell "a legacy row that already carried
+    # `failed_at`" (allowed) from "this save is what sets `failed_at`"
+    # (must name a source).
+    _failed_at_in_db: object = None
+    _NOT_LOADED = object()
+
+    def save(self, *args, **kwargs):  # type: ignore[override]
+        """Refuse to write a NEW failed row — or to newly stamp `failed_at`
+        on an existing one — without a `failure_source`. The CAS write
+        sites use `.update()` and bypass this; they are pinned by tests
+        that drive each real path. This guard is for the `create()` /
+        `save()` sites (and the next one somebody adds)."""
+        if (
+            self.failed_at is not None
+            and self.failure_source == PlacementFailureSource.LEGACY
+            and (self._state.adding or self._failed_at_was_null_in_db())
+        ):
+            raise PlacementFailureSourceMissing(
+                f"Placement {self.id}: failed_at is set but failure_source is "
+                f"{PlacementFailureSource.LEGACY.value!r} — the write site must say which "
+                "path ended this placement (see PlacementFailureSource)"
+            )
+        super().save(*args, **kwargs)
+        # The instance now mirrors the row: a later save on it is "existing".
+        self._failed_at_in_db = self.failed_at
+
+    def _failed_at_was_null_in_db(self) -> bool:
+        """`True` when the row, as stored, has no `failed_at` — i.e. this
+        save is what sets it. A deferred `failed_at` (`.only()` / `.defer()`)
+        that was then ASSIGNED never went through the deferred load, so
+        the instance does not know the stored value: an unknown is not a
+        pass — resolve it from the database, on the instance's connection."""
+        in_db = self._failed_at_in_db
+        if in_db is self._NOT_LOADED:
+            in_db = (
+                type(self)
+                ._base_manager.db_manager(self._state.db)
+                .filter(pk=self.pk)
+                .values_list("failed_at", flat=True)
+                .first()
+            )
+            self._failed_at_in_db = in_db
+        return in_db is None
+
+    def refresh_from_db(self, using=None, fields=None, **kwargs):  # type: ignore[override]
+        super().refresh_from_db(using=using, fields=fields, **kwargs)
+        # Only a refresh that actually re-read `failed_at` says anything
+        # about the stored value; a partial refresh of other fields leaves
+        # a locally assigned `failed_at` in `__dict__`, which is not it.
+        if fields is None or "failed_at" in fields:
+            self._failed_at_in_db = self.__dict__.get("failed_at", self._NOT_LOADED)
+
+    @classmethod
+    def from_db(cls, db, field_names, values):  # type: ignore[override]
+        instance = super().from_db(db, field_names, values)
+        instance._failed_at_in_db = (
+            instance.__dict__["failed_at"]
+            if "failed_at" in instance.__dict__
+            else cls._NOT_LOADED
+        )
+        return instance
 
 
 class PriceRecommendationStatus(models.TextChoices):

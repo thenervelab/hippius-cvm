@@ -1,0 +1,95 @@
+{{- if and .Values.schedulerReeval.enabled (eq (toString .Values.schedulerReeval.hostHealthAlerts.enabled) "true") }}
+---
+# SEV-SNP host-health alerts (gauges pushed by `vali_scheduler_reeval`'s
+# `host_health_survey` from each miner's v5 heartbeat). Same routing as the
+# golden re-bake alerts: a `severity` label, the Alertmanager default route.
+#
+# Why these: the kernel recycles a destroyed SNP guest's ASID only through
+# SNP_DF_FLUSH, which the firmware refuses (WBINVD_REQUIRED, dmesg
+# "DF_FLUSH failed ... error=0xe") while any CPU it counted at SNP_INIT is
+# offline — e.g. SMT turned off from the OS. Such a host launches about one
+# ASID pool (99 on the fleet) of guests after boot, then refuses every new
+# one with EBUSY until it reboots. The fix is SMT off in the BIOS, never
+# offlining CPUs from the OS.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-miner-host-health
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-miner-host-health
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-miner-host-health
+      interval: 1m
+      rules:
+        - alert: MinerSevDfFlushFailing
+          expr: hippius_miner_df_flush_failures > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: miner-host-health
+          annotations:
+            summary: "{{`{{ $labels.miner_id }}`}}: SEV-SNP ASID recycling failed, new VMs cannot start"
+            description: |
+              The kernel on {{`{{ $labels.miner_id }}`}} logged
+              {{`{{ $value }}`}} "DF_FLUSH failed" line(s) this boot. Every new SNP
+              guest fails sev_common_kvm_init with EBUSY until the host
+              reboots; running VMs are unaffected. Drain the miner and
+              reboot it (reboot-recovery relaunches its VMs), then find
+              why a CPU was offline (smt/control, /sys/devices/system/cpu/offline).
+        - alert: MinerSnpCpusOffline
+          expr: |
+            (hippius_miner_cpus_offline > 0)
+              and on(node_id)
+            (hippius_miner_snp_enabled == 1)
+          for: 15m
+          labels:
+            severity: warning
+            component: miner-host-health
+          annotations:
+            summary: "{{`{{ $labels.miner_id }}`}}: {{`{{ $value }}`}} CPU(s) offline on an SEV-SNP host"
+            description: |
+              With CPUs offline the firmware refuses SNP_DF_FLUSH, so
+              {{`{{ $labels.miner_id }}`}} cannot recycle SEV-ES ASIDs and will stop
+              launching VMs once its pool is used up. Turn SMT off in the
+              BIOS instead of from the OS, and bring the CPUs back online
+              (or reboot) before the pool runs out.
+        - alert: MinerSnpAsidRecycleImminent
+          expr: |
+            (hippius_miner_snp_launches_since_boot >= {{ .Values.schedulerReeval.hostHealthAlerts.launchesWarn }})
+              and on(node_id)
+            (hippius_miner_cpus_offline > 0)
+              and on(node_id)
+            (hippius_miner_snp_enabled == 1)
+          for: 5m
+          labels:
+            severity: critical
+            component: miner-host-health
+          annotations:
+            summary: "{{`{{ $labels.miner_id }}`}}: SEV-SNP ASID pool nearly used up with CPUs offline"
+            description: |
+              {{`{{ $labels.miner_id }}`}} has started {{`{{ $value }}`}} SNP guests since boot
+              and has CPUs offline, so it cannot recycle ASIDs: it will
+              refuse new VMs within a few launches. Drain and reboot it
+              in a window now. The count starts at the agent's first start
+              in this boot (an agent rolled out mid-boot misses earlier
+              launches), so MinerSnpCpusOffline is the earlier signal.
+        - alert: MinerHostHealthReportStale
+          expr: time() - hippius_miner_host_health_reported_timestamp_seconds > {{ mul .Values.schedulerReeval.hostHealthAlerts.reportStaleMinutes 60 }}
+          for: 15m
+          labels:
+            severity: warning
+            component: miner-host-health
+          annotations:
+            summary: "{{`{{ $labels.miner_id }}`}}: no SEV-SNP host-health report for {{ .Values.schedulerReeval.hostHealthAlerts.reportStaleMinutes }}m"
+            description: |
+              The last v5 heartbeat from {{`{{ $labels.miner_id }}`}} is older than
+              {{ .Values.schedulerReeval.hostHealthAlerts.reportStaleMinutes }} minutes, so the
+              ASID-recycling alerts above are blind for it. Check the
+              miner's heartbeat (agent up, `[heartbeat] schema_host_health`)
+              and the vali-scheduler-reeval pod.
+{{- end }}

@@ -1,0 +1,121 @@
+{{- if and .Values.geoProbe.enabled .Values.netbird.enabled }}
+---
+# Miner geo-probe — DETECTS where every miner is; nothing is declared.
+#
+# Runs `vali_geo_probe` (a long-running loop, `VALI_GEO_PROBE_INTERVAL_S`,
+# default 600s). Each cycle: reads the NetBird management peer list ONCE
+# (the public `connection_ip` each miner's peer connects FROM, plus its
+# GeoLite country), asks RIPEstat for GeoIP/ASN of that IP, times a TCP
+# connect from THIS pod to the miner's `netbird_ip:9700` (light in fibre
+# bounds the distance — a tunnel can only add latency), cross-checks the
+# egress IP the miner's tenant CVMs report, and writes a `MinerLocation`
+# row with a verdict. The scheduler's `region` gate and
+# `GET /v1/operator/regions` read those rows.
+#
+# Needs: the NetBird API token (same Secret the launch path uses), egress
+# to the NetBird CGNAT range on :9700 and to `world:443` — see
+# networkpolicy.yaml. Same image + env as the vali web pod via envFrom.
+# A worker — no HTTP port, no probes; a crash restarts the container.
+# `replicas: 1` + `Recreate` (one writer per row; the upsert is idempotent).
+#
+# Sync wave 3 — after Postgres + migrations (needs miners.0004).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vali-geo-probe
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: geo-probe
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vali.labels" . | nindent 6 }}
+      app.kubernetes.io/component: geo-probe
+  template:
+    metadata:
+      labels:
+        {{- include "vali.labels" . | nindent 8 }}
+        app.kubernetes.io/component: geo-probe
+        # Postgres CNP keys :5432 ingress on app.kubernetes.io/name=vali —
+        # and the vali CNP's geo-probe egress rules key on the same label.
+        {{- include "vali.valiSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
+    spec:
+      nodeSelector:
+        node-role.hippius.network/general-workloads: "true"
+      # The probe does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: {{ .Values.image.pullSecret.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: geo-probe
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          # Override the gunicorn ENTRYPOINT with the probe loop.
+          command: ["python", "manage.py", "vali_geo_probe"]
+          envFrom:
+            - configMapRef:
+                name: vali-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vali-db
+                  key: database-url
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vali-django
+                  key: secret-key
+            - name: VALI_GEO_PROBE_INTERVAL_S
+              value: {{ .Values.geoProbe.intervalS | quote }}
+            - name: VALI_GEO_VANTAGE_NAME
+              value: {{ .Values.geoProbe.vantage.name | quote }}
+            - name: VALI_GEO_VANTAGE_LAT
+              value: {{ .Values.geoProbe.vantage.latitude | quote }}
+            - name: VALI_GEO_VANTAGE_LON
+              value: {{ .Values.geoProbe.vantage.longitude | quote }}
+            - name: VALI_GEO_SLACK_KM
+              value: {{ .Values.geoProbe.slackKm | quote }}
+            {{- if .Values.netbird.enabled }}
+            # The peer list is the root of every other lookup: the
+            # management server's view of where each miner (and each
+            # tenant CVM) connects from.
+            - name: VALI_NETBIRD_API_BASE
+              value: {{ .Values.netbird.apiBase | quote }}
+            - name: VALI_NETBIRD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vali-netbird-token
+                  key: VALI_NETBIRD_API_TOKEN
+            {{- end }}
+          resources:
+            {{- .Values.geoProbe.resources | toYaml | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+{{- end }}

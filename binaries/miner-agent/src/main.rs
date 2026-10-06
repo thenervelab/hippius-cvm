@@ -32,7 +32,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use hippius_image_provenance::store::HippiusS3ImageStore;
+use hippius_miner_agent::heartbeat::{CapacityDeclarer, DiskDeclarer, StatvfsDiskSource};
 use hippius_miner_agent::orders::{IdempotencyStore, OrderState, OrderVerifier, OrdersServer};
+use hippius_miner_agent::sev_asid::SysfsAsidSource;
 use hippius_miner_agent::vsock::MIN_GUEST_CID;
 use hippius_miner_agent::{
     compute_launch_digest, load_cmdline, run_builder, run_pusher, Config, CvmLifecycle, DomainUuid,
@@ -717,6 +719,21 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // Shared — the skeleton Edge client and the §K heartbeat builder
     // both sign with the miner identity.
     let identity = Arc::new(identity);
+    // Count every guest start since the host booted (the `v5` heartbeat's
+    // `snp_launches_since_boot`), whatever the heartbeat schema: the count
+    // must already be right on the day the flag is turned on. Installed
+    // before anything can start a domain. The file sits next to the
+    // heartbeat sequence, in the agent's writable state dir.
+    if let Some(state_dir) = config.heartbeat.sequence_path.parent() {
+        if hippius_miner_agent::host_health::install_launch_counter(
+            state_dir,
+            std::path::Path::new(hippius_miner_agent::host_health::DEFAULT_BOOT_ID_PATH),
+        )
+        .is_none()
+        {
+            eprintln!("hippius-miner-agent: host-health: no kernel boot id, launch counter off");
+        }
+    }
     // The Edge client is consumed only by the AF_VSOCK relay, which is
     // Linux-only — so on a non-Linux dev build it is unused.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -793,7 +810,7 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     let verifier = Arc::new(OrderVerifier::from_hex(&config.edge.order_signing_pubkey)?);
     let idem = Arc::new(IdempotencyStore::new());
     let dispatch_tasks = TaskTracker::new();
-    // `self_miner_id` + `clock` close the gemini-r1 High findings:
+    // `self_miner_id` + `clock` close the review-r1 High findings:
     // every order body MUST name this host (target binding) AND fall
     // within ±MAX_ORDER_AGE_SECS of this clock (freshness window).
     let clock: Arc<dyn hippius_miner_agent::orders::Clock> =
@@ -823,6 +840,38 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // the source, and never activates the dest. See `EolShutdownAckSigner`.
     let ack_signer: Arc<dyn hippius_miner_agent::orders::GuestStoppedAckSigner> =
         Arc::new(hippius_miner_agent::orders::EolShutdownAckSigner::new());
+    // Live VM backups + backup-chain restores. Startup recovery releases
+    // whatever a run of the previous agent process left inside QEMU (job,
+    // fd-passed target, a half-made chain's bitmap) and empties the work
+    // dirs — before any order is served.
+    let backup = Arc::new(
+        hippius_miner_agent::backup::BackupManager::new(
+            Arc::new(hippius_miner_agent::backup::qmp::VirshQmp::default()),
+            Arc::new(hippius_miner_agent::backup::image_tool::QemuImg::default()),
+            Arc::new(hippius_miner_agent::backup::transfer::Transfer::new()?),
+        )
+        .with_host_speed(config.backup.host_speed_bytes_per_sec)
+        // One ledger with the per-VM disk creates (`disk_space`): a backup
+        // cannot take bytes promised to a live guest, nor a launch bytes a
+        // backup or restore holds.
+        .with_space_ledger(Arc::new(
+            hippius_miner_agent::backup::capture::SpaceLedger::host(lifecycle.data_disk_root()),
+        )),
+    );
+    backup.recover_on_startup(&lifecycle.backup_root()).await;
+    let chain_restorer: Arc<dyn hippius_miner_agent::backup::restore::ChainRestorer> = Arc::new(
+        hippius_miner_agent::backup::restore::BackupChainRestorer::new(
+            hippius_miner_agent::backup::transfer::Transfer::new()?,
+            backup.space_ledger(),
+        ),
+    );
+    // Staged restores share the space ledger; a staging the previous
+    // process did not finish is recorded failed before orders are served.
+    let restore = Arc::new(hippius_miner_agent::backup::staged::RestoreManager::new(
+        Arc::new(hippius_miner_agent::backup::transfer::Transfer::new()?),
+        backup.space_ledger(),
+    ));
+    restore.recover_on_startup(&lifecycle.backup_root()).await;
     let state = OrderState::new(
         Arc::clone(&lifecycle),
         verifier,
@@ -835,7 +884,16 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         downloader,
         ack_signer,
         dispatch_tasks.clone(),
-    );
+    )
+    .with_backup(Arc::clone(&backup), chain_restorer)
+    .with_restore(restore)
+    // `net-policy` orders are persisted (replay-safe across restarts)
+    // and acked; nothing is applied to the host yet.
+    .with_net_policy(Arc::new(
+        hippius_miner_agent::netpolicy::NetPolicyStore::new(
+            hippius_miner_agent::netpolicy::DEFAULT_NET_POLICY_DIR,
+        ),
+    ));
 
     // Bind the orders HTTP server. `Config::validate` already proved
     // `bind_addr` is a NetBird-mesh address; a bind failure here is a
@@ -866,12 +924,41 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     let heartbeat_seq = SequenceStore::open(&config.heartbeat.sequence_path)?;
     let heartbeat_queue = Arc::new(HeartbeatQueue::new(config.heartbeat.max_pending));
     let metrics: Arc<dyn MetricsSource> = Arc::new(ProcMetricsSource);
-    let heartbeat_builder = Arc::new(HeartbeatBuilder::new(
+    let mut heartbeat_builder = HeartbeatBuilder::new(
         config.miner.miner_id.clone(),
         Arc::clone(&identity),
         Arc::clone(&lifecycle),
         metrics,
-    ));
+    );
+    // `v3` capacity heartbeat — opt-in, because vali must accept `v3`
+    // before any miner emits it (capacity v2 deploy order).
+    if config.heartbeat.schema_capacity {
+        heartbeat_builder = heartbeat_builder.with_capacity_declaration(CapacityDeclarer {
+            cvm_cpu_budget: config.host.cvm_cpu_budget,
+            cvm_memory_mb_budget: u32::try_from(config.host.cvm_memory_mb_budget)
+                .unwrap_or(u32::MAX),
+            asids: Arc::new(SysfsAsidSource::default()),
+        });
+    }
+    // `v4` disk heartbeat — opt-in for the same reason, and only on top
+    // of `v3` (the config refuses `schema_disk` alone).
+    if config.heartbeat.schema_disk {
+        heartbeat_builder = heartbeat_builder.with_disk_declaration(DiskDeclarer {
+            cvm_disk_gb_budget: u32::try_from(config.host.cvm_disk_gb_budget).unwrap_or(u32::MAX),
+            source: Arc::new(StatvfsDiskSource {
+                data_root: config.storage.data_disk_root.clone(),
+                staging_root: config.image.staging_dir.clone(),
+            }),
+        });
+    }
+    // `v5` host-health heartbeat — opt-in for the same reason, and only on
+    // top of `v4` (the config refuses `schema_host_health` alone).
+    if config.heartbeat.schema_host_health {
+        heartbeat_builder = heartbeat_builder.with_host_health(Arc::new(
+            hippius_miner_agent::host_health::SysHostHealthSource::default(),
+        ));
+    }
+    let heartbeat_builder = Arc::new(heartbeat_builder);
     let heartbeat_client: Arc<dyn HeartbeatClient> =
         Arc::new(ReqwestHeartbeatClient::new(&config.edge, &identity)?);
     let heartbeat_build_task = tokio::spawn(run_builder(
@@ -894,6 +981,39 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         Arc::clone(&edge),
         cancel.clone(),
     ));
+
+    // The key-guardian relay (customer-held keys, Linux-only). Always on:
+    // it only ever dials the `guardian_ep` of the VM that owns the
+    // connecting CID, so an agent with no customer-keys VM refuses every
+    // connection. A client-build failure leaves the relay off (logged) —
+    // customer-keys guests then wait in their initramfs, no other VM is
+    // affected.
+    #[cfg(target_os = "linux")]
+    let guardian_relay_task =
+        match hippius_miner_agent::vsock::guardian_relay::ReqwestGuardianDialer::new() {
+            Ok(dialer) => {
+                let relay = Arc::new(
+                    hippius_miner_agent::vsock::guardian_relay::GuardianRelay::new(
+                        Arc::clone(&lifecycle)
+                            as Arc<
+                                dyn hippius_miner_agent::vsock::guardian_relay::GuardianRouteSource,
+                            >,
+                        Arc::new(dialer),
+                        progress.clone(),
+                    ),
+                );
+                Some(tokio::spawn(
+                    hippius_miner_agent::vsock::guardian_relay::run_guardian_relay_listener(
+                        relay,
+                        cancel.clone(),
+                    ),
+                ))
+            }
+            Err(err) => {
+                eprintln!("hippius-miner-agent: serve — guardian relay disabled: {err}");
+                None
+            }
+        };
 
     // The KBS-over-vsock proxy (Linux-only). When `[kbs].endpoint` is
     // configured, tenant guests relay their §21 release exchange
@@ -958,6 +1078,12 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
                 kbs: kbs_backend,
                 vali: vali_backend,
                 progress: progress.clone(),
+                // `[kbs].custody_relay` (default off): the guest custody
+                // daemon's paths are only relayed — and then per-VM rate
+                // limited — once the operator turns this on.
+                custody: kbs
+                    .custody_relay
+                    .then(|| Arc::new(hippius_miner_agent::vsock::CustodyRelayGate::new())),
             });
             Some(tokio::spawn(
                 hippius_miner_agent::vsock::kbs_proxy::run_kbs_proxy_listener(
@@ -977,6 +1103,14 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // NOT abort the agent. `virsh event` is Linux-only by transitive
     // dependency on libvirtd, so the spawn stays under the same
     // `target_os` gate as the vsock relay.
+    // A survivor whose live domain XML could not be read at re-adoption
+    // holds its recorded CID UNVERIFIED (no ticket push, no relay) until
+    // this loop confirms, re-keys or drops it. Detached: it only ever
+    // touches the lifecycle's own bookkeeping.
+    let _cid_verify_task = tokio::spawn(hippius_miner_agent::lifecycle::cid_verify::run(
+        Arc::clone(&lifecycle),
+        cancel.clone(),
+    ));
     #[cfg(target_os = "linux")]
     let reboot_watcher_task = tokio::spawn(hippius_miner_agent::lifecycle::reboot_watcher::run(
         Arc::clone(&lifecycle),
@@ -1083,6 +1217,14 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         .is_err()
     {
         eprintln!("hippius-miner-agent: serve — vsock-drain-timeout");
+    }
+
+    // (2a-0) Drain the key-guardian relay (if it was spawned).
+    #[cfg(target_os = "linux")]
+    if let Some(task) = guardian_relay_task {
+        if tokio::time::timeout(VSOCK_DRAIN_GRACE, task).await.is_err() {
+            eprintln!("hippius-miner-agent: serve — guardian-relay-drain-timeout");
+        }
     }
 
     // (2a) Drain the KBS-over-vsock proxy (if it was spawned).
@@ -1269,6 +1411,8 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
         // over vsock. An empty COSE buffer is the right placeholder
         // here; the production push lives in `orders::handler::handle_launch`.
         cose_ticket: serde_bytes::ByteBuf::new(),
+        require_existing_disks: false,
+        guardian_ep: None,
     };
 
     // The lifecycle is async (`tokio::process` drives `virsh`); a

@@ -32,6 +32,15 @@ def _accrue(node: str, vm_id: str, *, epoch: int, unit_seconds: int) -> None:
     )
 
 
+
+def _small_units() -> int:
+    """`resource_units("small")` from the catalogue — see the note in
+    `test_scoring`. Hardcoding this product coupled every usage test to the
+    flavor table, so a pricing change broke tests about accrual."""
+    from apps.scheduler import scoring
+
+    return scoring.resource_units("small")
+
 def test_latest_usage_epoch_is_the_newest_bucket() -> None:
     assert scoring.latest_usage_epoch() is None
     _accrue(node_id(1), "vm-a", epoch=4, unit_seconds=10)
@@ -65,7 +74,7 @@ def test_snapshot_mode_ignores_the_usage_ledger() -> None:
     )
     _accrue(node_id(2), "vm-c", epoch=9, unit_seconds=60)
     weights = scoring.compute_epoch_weights()
-    assert weights == {node_id(1): 1590}  # small; the usage row is ignored
+    assert weights == {node_id(1): _small_units()}  # small; the usage row is ignored
 
 
 def test_owed_is_unit_seconds_times_price_over_period_and_scale() -> None:
@@ -90,15 +99,27 @@ def test_owed_is_unit_seconds_times_price_over_period_and_scale() -> None:
 def test_owed_no_longer_overbills_by_the_scale_factor() -> None:
     """CLAIM: reproduces the live overbill and pins the corrected figure.
 
-    A `small` VM is 1590 SCALED units (1.59 real). One hour at a 5e6
-    micro-USD per-real-unit-hour price is ~7.95 USD, not ~7,950 — the
-    three-orders-of-magnitude error seen on the live testnet.
+    The bug was a missing `/ SCALE`: the bill came out THREE ORDERS OF
+    MAGNITUDE high. That factor is what this test defends, so the expected
+    figure is DERIVED from the flavor blend rather than written down — a
+    hardcoded dollar amount silently becomes an assertion about the size of
+    `small`, and the 2026-08-20 grid change made it fail for the one reason
+    the test was never about.
     """
     observe_chain_epoch(9)
-    _accrue(node_id(1), "vm-small", epoch=9, unit_seconds=1590 * 3600)
+    _accrue(node_id(1), "vm-small", epoch=9, unit_seconds=_small_units() * 3600)
     owed = scoring.compute_owed_micro_usd({node_id(1): 5_000_000})
     usd = owed[node_id(1)] / 1_000_000
-    assert 7.9 < usd < 8.0, f"expected ~7.95 USD for one small-VM-hour, got {usd}"
+
+    scale = 1000.0  # VALI_SCORING_SCALE default — the divisor that was missing
+    expected = _small_units() * 5_000_000 / scale / 1_000_000
+    assert usd == pytest.approx(expected, rel=1e-6), (
+        f"one small-VM-hour should bill {expected} USD, got {usd}"
+    )
+    # The teeth: without the `/ SCALE` this is ~1000x larger. One VM-hour
+    # costing more than a month of a mainstream cloud instance is the shape
+    # of the live bug, whatever the flavor grid says.
+    assert usd < 100, f"scale factor is back: one small-VM-hour bills {usd} USD"
 
 
 def test_the_reward_weight_keeps_the_scale() -> None:
@@ -109,9 +130,9 @@ def test_the_reward_weight_keeps_the_scale() -> None:
     miner's reward share.
     """
     observe_chain_epoch(9)
-    _accrue(node_id(1), "vm-a", epoch=9, unit_seconds=1590 * 3600)
+    _accrue(node_id(1), "vm-a", epoch=9, unit_seconds=_small_units() * 3600)
     with override_settings(VALI_EPOCH_WEIGHT_SOURCE="usage"):
-        assert scoring.compute_epoch_weights() == {node_id(1): 1590 * 3600}
+        assert scoring.compute_epoch_weights() == {node_id(1): _small_units() * 3600}
 
 
 def test_owed_omits_unpriced_miner() -> None:
@@ -168,7 +189,7 @@ def test_view_surfaces_a_dead_pallet_alongside_the_bill(monkeypatch, authed_clie
     _accrue(node_id(1), "vm-a", epoch=9, unit_seconds=3600)
     from apps.scheduler import chain, views
 
-    snap = chain.ChainSnapshot(current_epoch=2702, miners=(), pallet_live=False)
+    snap = chain.ChainSnapshot(current_epoch=5002, miners=(), pallet_live=False)
     monkeypatch.setattr(views.chain, "read_miner_status", lambda: snap)
     monkeypatch.setattr(views.service, "price_by_node", lambda snap: {})
 
@@ -281,22 +302,22 @@ def test_a_stalled_ledger_is_not_re_paid_at_every_new_chain_epoch() -> None:
     """CLAIM: one bucket of proven uptime is rewarded ONCE.
 
     Replays the production incident of 2026-08-03: the ledger held a
-    single row for epoch 2696 (100170 unit_seconds) and no receipts
-    arrived after it, while the closer advanced the chain 2700 → 2701 →
-    2702. Under the old max(epoch) selector every one of those closes was
+    single row for epoch 4996 (100170 unit_seconds) and no receipts
+    arrived after it, while the closer advanced the chain 5000 → 5001 →
+    5002. Under the old max(epoch) selector every one of those closes was
     handed the SAME 100170 — one bucket paid three times. Now each close
     reads its OWN epoch's bucket, finds it empty, and submits nothing.
     """
-    _accrue(node_id(1), "vm-stalled", epoch=2696, unit_seconds=100_170)
+    _accrue(node_id(1), "vm-stalled", epoch=4996, unit_seconds=100_170)
 
-    for chain_epoch in (2700, 2701, 2702):
+    for chain_epoch in (5000, 5001, 5002):
         observe_chain_epoch(chain_epoch)
         assert scoring.compute_epoch_weights() == {}, (
-            f"epoch {chain_epoch} re-paid the frozen 2696 bucket"
+            f"epoch {chain_epoch} re-paid the frozen 4996 bucket"
         )
 
     # …and the bucket is still rewarded for the epoch it BELONGS to.
-    observe_chain_epoch(2696)
+    observe_chain_epoch(4996)
     assert scoring.compute_epoch_weights() == {node_id(1): 100_170}
 
 
@@ -333,11 +354,11 @@ def test_the_bill_uses_the_same_epoch_selector_as_the_reward() -> None:
 
     A stale ledger bucket must not keep billing the operator either.
     """
-    _accrue(node_id(1), "vm-a", epoch=2696, unit_seconds=7_200_000)
-    observe_chain_epoch(2702)
+    _accrue(node_id(1), "vm-a", epoch=4996, unit_seconds=7_200_000)
+    observe_chain_epoch(5002)
     assert scoring.compute_owed_micro_usd({node_id(1): 1_000_000}) == {}
 
-    observe_chain_epoch(2696)
+    observe_chain_epoch(4996)
     assert scoring.compute_owed_micro_usd({node_id(1): 1_000_000}) == {node_id(1): 2_000_000}
 
 
@@ -348,17 +369,17 @@ def test_billing_epoch_reads_the_highest_observed_chain_epoch() -> None:
     row must not drag the billing epoch backwards.
     """
     assert scoring.billing_epoch() is None
-    observe_chain_epoch(2702)
-    assert scoring.billing_epoch() == 2702
+    observe_chain_epoch(5002)
+    assert scoring.billing_epoch() == 5002
     MinerCapacity.objects.create(
         miner_node_id=node_id(98),
         status="active",
         capacity_slots=1,
-        observed_epoch=2701,
-        data_epoch=2701,
+        observed_epoch=5001,
+        data_epoch=5001,
         refreshed_at=timezone.now(),
     )
-    assert scoring.billing_epoch() == 2702
+    assert scoring.billing_epoch() == 5002
 
 
 @override_settings(VALI_EPOCH_WEIGHT_SOURCE="usage")
@@ -367,21 +388,21 @@ def test_view_labels_the_bill_with_the_chain_epoch_not_the_ledger(
 ) -> None:
     """CLAIM: `usage_epoch` names the epoch the bill DESCRIBES.
 
-    Ledger frozen at 2696, chain at 2702. Reporting the newest ledger
-    bucket would label an empty bill "2696" — an operator would read it
-    as "we owe nothing for 2696", when the truth is "nothing was proven
-    for 2702".
+    Ledger frozen at 4996, chain at 5002. Reporting the newest ledger
+    bucket would label an empty bill "4996" — an operator would read it
+    as "we owe nothing for 4996", when the truth is "nothing was proven
+    for 5002".
     """
-    observe_chain_epoch(2702)
-    _accrue(node_id(1), "vm-a", epoch=2696, unit_seconds=3600)
+    observe_chain_epoch(5002)
+    _accrue(node_id(1), "vm-a", epoch=4996, unit_seconds=3600)
     from apps.scheduler import chain, views
 
-    snap = chain.ChainSnapshot(current_epoch=2702, miners=())
+    snap = chain.ChainSnapshot(current_epoch=5002, miners=())
     monkeypatch.setattr(views.chain, "read_miner_status", lambda: snap)
     monkeypatch.setattr(views.service, "price_by_node", lambda snap: {node_id(1): 1_000_000})
 
     body = authed_client.get(URL).json()
-    assert body["usage_epoch"] == 2702
+    assert body["usage_epoch"] == 5002
     assert body["owed_usd_micros"] == {}
 
 

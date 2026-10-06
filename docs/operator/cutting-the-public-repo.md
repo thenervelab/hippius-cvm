@@ -161,6 +161,31 @@ git push public publish
 
 ### Four things that cost a cycle each
 
+**`-X ours` preserves the scrub AND the staleness — finish the job.** This
+is the trap the first refresh (2026-08-20) walked into. `-X ours` resolves
+every conflicting hunk in the branch's favour, so on any file BOTH sides
+touched you keep the scrub *and silently lose main's changes to that file*.
+It looked like it worked: the merge was clean, the gate was green, and a
+variable added to `group_vars/miner_nodes.yml` that morning was simply not
+there.
+
+So after the merge, for every file changed on both sides:
+
+```sh
+BASE=<the sha the public repo was last cut from>
+comm -12 <(git diff --name-only $BASE origin/main | sort) \
+         <(git diff --name-only $BASE origin/release/opensource | sort)
+```
+
+take **main's** version of each (`git checkout origin/main -- <file>`), then
+re-gate and neutralise ONLY the lines the gate names. Do not replay the
+branch-vs-main diff wholesale on those files: for `values.yaml` that diff is
+mostly image pins going backwards, and applying it would revert deployed
+digests while looking like de-identification.
+
+To find the offending lines without printing the denylist into a terminal,
+match its patterns and report line NUMBERS only, then read those lines.
+
 **Merge main INTO the scrubbed branch, never the reverse.** The scrub is not
 a set of file deletions — it EDITS content across dozens of files (cluster
 addressing, internal domains, an operator email). Taking `main` and

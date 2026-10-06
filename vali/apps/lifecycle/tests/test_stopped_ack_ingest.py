@@ -319,3 +319,130 @@ def test_gc_reaps_stale_rows_but_keeps_fresh_ones() -> None:
     assert deleted == 1
     assert StoppedAckIngest.objects.filter(pk=fresh.pk).exists()
     assert not StoppedAckIngest.objects.filter(pk=stale.pk).exists()
+
+
+# ── an ack for a power-API stop is verified at once, kept as a proof (#1162)
+
+
+_NONCE = b"\x07" * 32
+
+
+def _stopping_vm(vm_id: str, power: str = "stopping") -> Vm:
+    from django.utils import timezone
+
+    vm = _awaiting_vm(vm_id, 3, state=VmState.ACTIVE)
+    Vm.objects.filter(pk=vm.pk).update(
+        power_state=power, power_state_at=timezone.now(), eol_nonce=_NONCE
+    )
+    vm.refresh_from_db()
+    return vm
+
+
+@pytest.fixture
+def verified(monkeypatch):
+    """The validator boundary: records each call; `fail` makes it reject."""
+    from apps.lifecycle import validator
+
+    calls: list[dict] = []
+    state = {"fail": False, "side_effect": None}
+
+    def fake(**kw):
+        calls.append(kw)
+        if state["side_effect"]:
+            state["side_effect"]()
+        if state["fail"]:
+            raise validator.ValidatorFailed("stopped-window", "now_unix out of window")
+        return None
+
+    monkeypatch.setattr(validator, "verify_stopped_ack", fake)
+    return calls, state
+
+
+@pytest.mark.parametrize("power", ["stopping", "running", "stopped", "starting"])
+def test_only_a_vm_being_stopped_records_a_power_stop_proof(verified, power) -> None:
+    vm = _stopping_vm("vm-pwr", power)
+    resp = _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"signed")
+    vm.refresh_from_db()
+    if power == "stopping":
+        assert resp.status_code == status.HTTP_202_ACCEPTED
+        assert bytes(vm.power_stop_proof) == _NONCE
+    else:
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
+        assert vm.power_stop_proof is None
+    # Only the proof is kept — never the (anonymous-overwritable) bytes.
+    assert StoppedAckIngest.objects.count() == 0
+
+
+def test_the_power_stop_ack_is_verified_now_against_the_boots_nonce(verified) -> None:
+    import time
+
+    calls, _ = verified
+    _stopping_vm("vm-pwr")
+    before = int(time.time())
+    _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"signed")
+    (kw,) = calls
+    assert kw["signed_bytes"] == b"signed"
+    assert kw["nonce_hex"] == _NONCE.hex()
+    assert kw["vm_generation"] == 3
+    skew = settings.VALI_STOPPED_ACK_SKEW_SECS
+    assert before - skew <= kw["now_unix_min"] <= int(time.time()) - skew
+    assert before + skew <= kw["now_unix_max"] <= int(time.time()) + skew
+
+
+def test_an_ack_that_does_not_verify_records_nothing(verified) -> None:
+    _, state = verified
+    state["fail"] = True
+    vm = _stopping_vm("vm-pwr")
+    resp = _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"junk")
+    vm.refresh_from_db()
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert vm.power_stop_proof is None
+
+
+@pytest.mark.parametrize(
+    "moved",
+    [
+        # the stop settled and a start began (no ack can prove that boot)
+        {"power_state": "starting", "at": True},
+        # a NEWER stop claimed the marker (its own guest must prove it)
+        {"power_state": "stopping", "at": True},
+        # the stop settled to what the miner reported, same instant
+        {"power_state": "running", "at": False},
+    ],
+)
+def test_a_power_transition_during_verification_wins(verified, moved) -> None:
+    """The proof is recorded only onto the exact `stopping` marker the ack
+    was read at."""
+    from datetime import timedelta
+
+    _, state = verified
+    vm = _stopping_vm("vm-pwr")
+    at = vm.power_state_at + timedelta(seconds=5) if moved["at"] else vm.power_state_at
+    state["side_effect"] = lambda: Vm.objects.filter(pk=vm.pk).update(
+        power_state=moved["power_state"], power_state_at=at
+    )
+    resp = _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"signed")
+    vm.refresh_from_db()
+    assert resp.status_code == status.HTTP_404_NOT_FOUND
+    assert vm.power_stop_proof is None
+
+
+def test_a_vm_without_a_nonce_records_nothing(verified) -> None:
+    calls, _ = verified
+    vm = _stopping_vm("vm-pwr")
+    Vm.objects.filter(pk=vm.pk).update(eol_nonce=None)
+    resp = _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"signed")
+    assert resp.status_code == status.HTTP_404_NOT_FOUND
+    assert calls == []
+
+
+def test_a_nonce_re_minted_during_verification_wins(verified) -> None:
+    """The ack verified against the nonce read with the row; a proof is only
+    ever the nonce it was verified under."""
+    _, state = verified
+    vm = _stopping_vm("vm-pwr")
+    state["side_effect"] = lambda: Vm.objects.filter(pk=vm.pk).update(eol_nonce=b"\x09" * 32)
+    resp = _post(APIClient(), vm_id="vm-pwr", generation=3, body=b"signed")
+    vm.refresh_from_db()
+    assert resp.status_code == status.HTTP_404_NOT_FOUND
+    assert vm.power_stop_proof is None

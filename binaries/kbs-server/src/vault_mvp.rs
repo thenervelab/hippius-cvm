@@ -349,13 +349,30 @@ fn validate_kv_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Map a `ureq` error to a non-secret, operator-useful reason. The HTTP
-/// status code is safe to surface; the response body and transport
+/// Map a `ureq` error to a non-secret, operator-useful `KbsError`. The
+/// HTTP status code is safe to surface; the response body and transport
 /// detail (which could echo headers) are deliberately dropped.
-fn classify_ureq_error(e: &ureq::Error) -> String {
+///
+/// A **404 becomes [`KbsError::VaultNotFound`]**, everything else
+/// [`KbsError::Vault`]. Only the caller that is allowed to treat "nothing
+/// staged here" as a non-error (the OPTIONAL §7 lifecycle-key read) keys
+/// off that distinction; a transport failure, a 403 or a 500 must never
+/// masquerade as an absent secret. KV-v2 answers 404 both for an unknown
+/// path and for a version that does not exist, which is exactly the
+/// "nothing staged" case.
+///
+/// `label` names the operation — the caller passes `"KV read"` /
+/// `"transit_decrypt"` so a Transit failure is not reported as a KV read
+/// (it was, and it sent operators looking at the wrong Vault path).
+fn classify_ureq_error(label: &str, e: &ureq::Error) -> KbsError {
     match e {
-        ureq::Error::Status(code, _) => format!("KV read: Vault returned HTTP {code}"),
-        ureq::Error::Transport(_) => "KV read: Vault transport error".to_string(),
+        ureq::Error::Status(404, _) => {
+            KbsError::VaultNotFound(format!("{label}: Vault returned HTTP 404"))
+        }
+        ureq::Error::Status(code, _) => {
+            KbsError::Vault(format!("{label}: Vault returned HTTP {code}"))
+        }
+        ureq::Error::Transport(_) => KbsError::Vault(format!("{label}: Vault transport error")),
     }
 }
 
@@ -420,7 +437,7 @@ impl VaultKv for StaticTokenVaultKv {
             .get(&url)
             .set("X-Vault-Token", vault_token)
             .call()
-            .map_err(|e| KbsError::Vault(classify_ureq_error(&e)))?;
+            .map_err(|e| classify_ureq_error("KV read", &e))?;
         let body = resp
             .into_string()
             .map_err(|_| KbsError::Vault("KV read: response body error".into()))?;
@@ -462,7 +479,13 @@ impl VaultKv for StaticTokenVaultKv {
             .set("X-Vault-Token", vault_token)
             .set("Content-Type", "application/json")
             .send_string(&req_body)
-            .map_err(|e| KbsError::Vault(classify_ureq_error(&e)))?;
+            // A Transit failure is NOT a KV read — and a 404 here means the
+            // transit ROUTE/key is gone (a destroyed key answers 400), so it
+            // must stay a hard error, never "nothing staged".
+            .map_err(|e| match classify_ureq_error("transit_decrypt", &e) {
+                KbsError::VaultNotFound(m) => KbsError::Vault(m),
+                other => other,
+            })?;
         let body = resp
             .into_string()
             .map_err(|_| KbsError::Vault("transit_decrypt: response body error".into()))?;
@@ -524,6 +547,112 @@ mod tests {
         assert!(parse_transit_plaintext("{\"data\":{}}").is_err());
         assert!(parse_transit_plaintext("not json").is_err());
         assert!(parse_transit_plaintext("{\"data\":{\"plaintext\":\"@@@\"}}").is_err());
+    }
+
+    /// Only a 404 becomes `VaultNotFound`. The §7 lifecycle read treats
+    /// that variant — and ONLY that variant — as "nothing staged here" and
+    /// releases anyway, so a 403 / 500 / transport failure that collapsed
+    /// into it would silently drop the guest's lifecycle signing key
+    /// during a Vault incident.
+    #[test]
+    fn only_a_404_is_classified_as_not_found() {
+        let not_found = ureq::Error::Status(
+            404,
+            ureq::Response::new(404, "Not Found", "{\"errors\":[]}").unwrap(),
+        );
+        assert!(matches!(
+            classify_ureq_error("KV read", &not_found),
+            KbsError::VaultNotFound(_)
+        ));
+        for code in [403u16, 412, 500, 503] {
+            let e = ureq::Error::Status(code, ureq::Response::new(code, "boom", "{}").unwrap());
+            assert!(
+                matches!(classify_ureq_error("KV read", &e), KbsError::Vault(_)),
+                "HTTP {code} must NOT be reported as not-found"
+            );
+        }
+        // The label is the operation, so a Transit failure is not reported
+        // as a KV read (it was, and it sent operators to the wrong path).
+        let e = ureq::Error::Status(500, ureq::Response::new(500, "boom", "{}").unwrap());
+        assert!(classify_ureq_error("transit_decrypt", &e)
+            .to_string()
+            .contains("transit_decrypt"));
+    }
+
+    /// The CALL SITE, not just the classifier: `read_exact` must return
+    /// `VaultNotFound` for a 404 and `Vault` for everything else.
+    ///
+    /// Pinned over a real socket because the classifier test alone left a
+    /// live mutation: re-wrap every classified error into `VaultNotFound`
+    /// at the `map_err` and the classifier test stays green while the §7
+    /// lifecycle read goes back to swallowing 403s and 500s — releasing a
+    /// KEK to a guest that then holds no lifecycle signing key.
+    #[test]
+    fn read_exact_reports_404_as_not_found_and_403_as_a_hard_error() {
+        use std::io::{Read, Write as _};
+        use std::net::TcpListener;
+
+        fn serve_status(status: u16) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let body = "{\"errors\":[]}";
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let cap = VaultCapability::new(
+            kbs_core::vault::VaultScope {
+                vm_id: "abc".into(),
+                luks_path: "p/abc/luks-kek".into(),
+                luks_version: 1,
+                userdata_path: "p/abc/userdata".into(),
+                userdata_version: 1,
+                lifecycle_path: None,
+                lifecycle_version: None,
+            },
+            u64::MAX,
+            Zeroizing::new(b"cap-token".to_vec()),
+        );
+
+        let c = StaticTokenVaultKv::new(
+            &serve_status(404),
+            "/secret/",
+            Zeroizing::new("t".to_string()),
+        );
+        assert!(
+            matches!(
+                c.read_exact(&cap, "p/abc/lifecycle-key", 1),
+                Err(KbsError::VaultNotFound(_))
+            ),
+            "a Vault 404 must reach the caller as VaultNotFound"
+        );
+
+        for status in [403u16, 500] {
+            let c = StaticTokenVaultKv::new(
+                &serve_status(status),
+                "/secret/",
+                Zeroizing::new("t".to_string()),
+            );
+            assert!(
+                matches!(
+                    c.read_exact(&cap, "p/abc/lifecycle-key", 1),
+                    Err(KbsError::Vault(_))
+                ),
+                "HTTP {status} must be a hard Vault error, never not-found"
+            );
+        }
     }
 
     #[test]

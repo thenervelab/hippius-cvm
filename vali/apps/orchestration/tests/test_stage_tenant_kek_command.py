@@ -16,6 +16,9 @@ from django.core.management import CommandError, call_command
 
 from apps.orchestration.services import vault_kv
 
+# The command reads the VM's customer-keys pin (an M2 VM gets no KEK).
+pytestmark = pytest.mark.django_db
+
 
 @pytest.fixture(autouse=True)
 def _vault_settings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -69,6 +69,30 @@ struct CidState {
     /// records the bad CID here so the scan skips it for the rest of this
     /// process lifetime. Cleared on nothing (a restart re-derives it).
     burned: HashSet<u32>,
+    /// CIDs held on the word of a miner-local record the live domain XML
+    /// has not yet confirmed (a re-adoption whose `dumpxml` failed). The
+    /// mapping is kept so nobody else is handed the CID, but it is NOT an
+    /// identity: [`CidAllocator::vm_id_for_cid`] does not resolve it, and
+    /// [`CidAllocator::owner_of`] reports it as [`CidOwner::Unverified`].
+    unverified: HashSet<u32>,
+    /// Freshly allocated CIDs whose launch has not yet created the domain
+    /// (see [`CidAllocator::allocate`]). Not an identity yet — lookups treat
+    /// them like `unverified` — but, unlike a stale record, never proven
+    /// wrong either: releasing one FREES it (a collision with an orphan
+    /// surfaces at `create_domain`, which burns it there).
+    pending_create: HashSet<u32>,
+}
+
+/// Who a CID belongs to, as far as the allocator can vouch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CidOwner {
+    /// Assigned at launch, or confirmed against the live domain XML.
+    Verified(VmId),
+    /// Reserved for this VM from a record the live XML has not confirmed:
+    /// the guest behind the CID may be someone else. Hold, don't act.
+    Unverified(VmId),
+    /// Nobody.
+    Unknown,
 }
 
 /// Allocates and tracks AF_VSOCK context ids for tenant CVMs.
@@ -104,6 +128,13 @@ impl CidAllocator {
 
     /// Assign a CID to `vm_id`, or return the one it already holds.
     ///
+    /// A NEWLY assigned CID is held pending-create — [`CidOwner::Unverified`]
+    /// to every lookup — until the
+    /// launch's `create_domain` succeeds and marks it verified: until the
+    /// kernel has bound it to this guest, an orphan qemu the allocator never
+    /// tracked may still own it, and its frames must not be attributed to
+    /// the launching tenant.
+    ///
     /// Idempotent: a second `allocate` for a `vm_id` that is already
     /// mapped returns the same CID — a retried launch keeps a stable
     /// AF_VSOCK identity. Fail-closed (`VsockCid("exhausted")`) when no
@@ -121,6 +152,7 @@ impl CidAllocator {
             .ok_or(MinerAgentError::VsockCid("exhausted"))?;
         state.by_vm.insert(vm_id.clone(), cid);
         state.by_cid.insert(cid, vm_id.clone());
+        state.pending_create.insert(cid);
         Ok(cid)
     }
 
@@ -140,22 +172,34 @@ impl CidAllocator {
         }
         if state.by_cid.get(&bad_cid) == Some(vm_id) {
             state.by_cid.remove(&bad_cid);
+            state.unverified.remove(&bad_cid);
+            state.pending_create.remove(&bad_cid);
         }
-        // Fresh lowest free non-burned CID.
+        // Fresh lowest free non-burned CID — unverified until created, like
+        // any fresh allocation.
         let cid = (self.min..=self.max)
             .find(|c| !state.by_cid.contains_key(c) && !state.burned.contains(c))
             .ok_or(MinerAgentError::VsockCid("exhausted"))?;
         state.by_vm.insert(vm_id.clone(), cid);
         state.by_cid.insert(cid, vm_id.clone());
+        state.pending_create.insert(cid);
         Ok(cid)
     }
 
     /// Release the CID held by `vm_id`, if any. Idempotent — releasing
     /// a `vm_id` that holds no CID is a no-op success.
+    ///
+    /// An UNVERIFIED CID is burned, not freed: it came from a record the
+    /// live XML never confirmed, so stopping `vm_id` proves nothing about
+    /// which guest — if any — the kernel gave it to.
     pub fn release(&self, vm_id: &VmId) -> Result<()> {
         let mut state = self.lock()?;
         if let Some(cid) = state.by_vm.remove(vm_id) {
             state.by_cid.remove(&cid);
+            state.pending_create.remove(&cid);
+            if state.unverified.remove(&cid) {
+                state.burned.insert(cid);
+            }
         }
         Ok(())
     }
@@ -190,11 +234,87 @@ impl CidAllocator {
         Ok(())
     }
 
+    /// [`Self::reserve`], but the CID comes from a record the live domain
+    /// XML could not confirm: hold it for `vm_id` (so it is never handed
+    /// out) without vouching that `vm_id`'s guest is the one behind it.
+    /// See [`CidOwner::Unverified`].
+    pub fn reserve_unverified(&self, vm_id: &VmId, cid: u32) -> Result<()> {
+        self.reserve(vm_id, cid)?;
+        self.lock()?.unverified.insert(cid);
+        Ok(())
+    }
+
+    /// The live domain XML confirmed `vm_id` runs on `cid`. Returns false
+    /// (no change) unless `vm_id` holds exactly `cid`.
+    pub fn mark_verified(&self, vm_id: &VmId, cid: u32) -> Result<bool> {
+        let mut state = self.lock()?;
+        if state.by_cid.get(&cid) != Some(vm_id) {
+            return Ok(false);
+        }
+        state.unverified.remove(&cid);
+        state.pending_create.remove(&cid);
+        Ok(true)
+    }
+
+    /// The live domain XML says `vm_id` runs on `live`, not the `held`
+    /// CID its record claimed: move the mapping to `live`, verified, and
+    /// BURN `held` for the rest of this process lifetime.
+    ///
+    /// `live` may be BURNED (a launch collided with it while the record was
+    /// wrong — the "orphan" that held it was this very guest); the XML is
+    /// ground truth, so it is un-burned. Fail-closed `rekey-collision` if a
+    /// DIFFERENT vm holds `live` — two records claiming one kernel CID is
+    /// not something to resolve by guessing.
+    pub fn rekey_verified(&self, vm_id: &VmId, held: u32, live: u32) -> Result<()> {
+        if live < self.min || live > self.max {
+            return Err(MinerAgentError::VsockCid("rekey-out-of-range"));
+        }
+        let mut state = self.lock()?;
+        if state.by_vm.get(vm_id) != Some(&held) {
+            return Err(MinerAgentError::VsockCid("rekey-not-held"));
+        }
+        if state.by_cid.get(&live).is_some_and(|owner| owner != vm_id) {
+            return Err(MinerAgentError::VsockCid("rekey-collision"));
+        }
+        // `held` came from a record just proven WRONG — that proves nothing
+        // about who (if anyone) the kernel gave it to. Burn it rather than
+        // free it: a leaked CID is harmless, a reused one that a live guest
+        // still holds is a cross-tenant attribution.
+        state.by_cid.remove(&held);
+        state.unverified.remove(&held);
+        state.burned.insert(held);
+        // `live` is bound to THIS guest (the caller observed the domain
+        // running with it), so any earlier collision burn of it was this
+        // guest too.
+        state.burned.remove(&live);
+        state.by_vm.insert(vm_id.clone(), live);
+        state.by_cid.insert(live, vm_id.clone());
+        state.unverified.remove(&live);
+        Ok(())
+    }
+
+    /// Who `cid` belongs to — distinguishing a verified owner from one
+    /// held on an unconfirmed record.
+    pub fn owner_of(&self, cid: u32) -> Result<CidOwner> {
+        let state = self.lock()?;
+        Ok(match state.by_cid.get(&cid) {
+            Some(vm) if state.unverified.contains(&cid) || state.pending_create.contains(&cid) => {
+                CidOwner::Unverified(vm.clone())
+            }
+            Some(vm) => CidOwner::Verified(vm.clone()),
+            None => CidOwner::Unknown,
+        })
+    }
+
     /// Resolve an inbound connection's source CID to the tenant CVM it
-    /// belongs to. `Ok(None)` — a CID the allocator never handed out —
-    /// is the relay's signal to reject the connection.
+    /// belongs to. `Ok(None)` — a CID the allocator never handed out, or
+    /// one held [`CidOwner::Unverified`] — is the relay's signal to reject
+    /// the connection: an unconfirmed record is not an identity.
     pub fn vm_id_for_cid(&self, cid: u32) -> Result<Option<VmId>> {
-        Ok(self.lock()?.by_cid.get(&cid).cloned())
+        Ok(match self.owner_of(cid)? {
+            CidOwner::Verified(vm) => Some(vm),
+            CidOwner::Unverified(_) | CidOwner::Unknown => None,
+        })
     }
 
     /// The CID currently assigned to `vm_id`, if any.
@@ -250,10 +370,41 @@ mod tests {
     }
 
     #[test]
-    fn reverse_lookup_resolves_an_allocated_cid() {
+    fn reverse_lookup_resolves_an_allocated_cid_once_created() {
         let alloc = CidAllocator::new();
         let cid = alloc.allocate(&vm("tenant-x")).unwrap();
+        assert!(alloc.mark_verified(&vm("tenant-x"), cid).unwrap());
         assert_eq!(alloc.vm_id_for_cid(cid).unwrap(), Some(vm("tenant-x")));
+    }
+
+    #[test]
+    fn a_fresh_cid_is_not_an_identity_until_its_domain_is_created() {
+        // Until `create_domain` binds it, an orphan qemu the allocator never
+        // tracked may own this CID — its frames must not be attributed to the
+        // launching tenant (#1148).
+        let alloc = CidAllocator::new();
+        let cid = alloc.allocate(&vm("tenant-x")).unwrap();
+        assert_eq!(alloc.vm_id_for_cid(cid).unwrap(), None);
+        assert_eq!(
+            alloc.owner_of(cid).unwrap(),
+            CidOwner::Unverified(vm("tenant-x"))
+        );
+        let fresh = alloc.burn_and_realloc(&vm("tenant-x"), cid).unwrap();
+        assert_eq!(
+            alloc.vm_id_for_cid(fresh).unwrap(),
+            None,
+            "a re-allocation too"
+        );
+    }
+
+    #[test]
+    fn a_never_created_cid_is_freed_not_burned() {
+        // A launch that failed before `create_domain` proved nothing bad
+        // about its CID (unlike a stale re-adoption record, which burns).
+        let alloc = CidAllocator::with_range(3, 3);
+        let cid = alloc.allocate(&vm("tenant-a")).unwrap();
+        alloc.release(&vm("tenant-a")).unwrap();
+        assert_eq!(alloc.allocate(&vm("tenant-b")).unwrap(), cid);
     }
 
     #[test]
@@ -360,5 +511,77 @@ mod tests {
             alloc.reserve(&vm("tenant-a"), 5),
             Err(MinerAgentError::VsockCid("reserve-vm-remap"))
         ));
+    }
+
+    #[test]
+    fn an_unverified_cid_is_held_but_is_not_an_identity() {
+        let alloc = CidAllocator::with_range(3, 4);
+        alloc.reserve_unverified(&vm("tenant-a"), 3).unwrap();
+        // Not an identity: the relay's lookup does not resolve it…
+        assert_eq!(alloc.vm_id_for_cid(3).unwrap(), None);
+        assert_eq!(
+            alloc.owner_of(3).unwrap(),
+            CidOwner::Unverified(vm("tenant-a"))
+        );
+        // …but it is HELD: nobody else is handed it.
+        assert_eq!(alloc.allocate(&vm("tenant-b")).unwrap(), 4);
+        assert!(alloc.allocate(&vm("tenant-c")).is_err());
+    }
+
+    #[test]
+    fn mark_verified_turns_a_held_cid_into_an_identity() {
+        let alloc = CidAllocator::new();
+        alloc.reserve_unverified(&vm("tenant-a"), 7).unwrap();
+        assert!(!alloc.mark_verified(&vm("tenant-b"), 7).unwrap(), "not b's");
+        assert_eq!(alloc.vm_id_for_cid(7).unwrap(), None);
+        assert!(alloc.mark_verified(&vm("tenant-a"), 7).unwrap());
+        assert_eq!(alloc.vm_id_for_cid(7).unwrap(), Some(vm("tenant-a")));
+    }
+
+    #[test]
+    fn rekey_moves_to_the_live_cid_and_burns_the_recorded_one() {
+        let alloc = CidAllocator::with_range(7, 10);
+        alloc.reserve_unverified(&vm("tenant-a"), 7).unwrap();
+        alloc.rekey_verified(&vm("tenant-a"), 7, 9).unwrap();
+        assert_eq!(alloc.vm_id_for_cid(9).unwrap(), Some(vm("tenant-a")));
+        assert_eq!(alloc.owner_of(7).unwrap(), CidOwner::Unknown);
+        assert_eq!(alloc.cid_for_vm(&vm("tenant-a")).unwrap(), Some(9));
+        // 7 was never proven free — a live guest may hold it. Never reuse.
+        assert_eq!(alloc.allocate(&vm("tenant-b")).unwrap(), 8);
+        assert_eq!(alloc.allocate(&vm("tenant-c")).unwrap(), 10);
+        assert!(alloc.allocate(&vm("tenant-d")).is_err());
+    }
+
+    #[test]
+    fn rekey_refuses_a_cid_another_vm_holds() {
+        let alloc = CidAllocator::new();
+        alloc.reserve_unverified(&vm("tenant-a"), 7).unwrap();
+        alloc.reserve(&vm("tenant-b"), 9).unwrap();
+        assert!(alloc.rekey_verified(&vm("tenant-a"), 7, 9).is_err());
+        assert_eq!(alloc.vm_id_for_cid(9).unwrap(), Some(vm("tenant-b")));
+        assert_eq!(
+            alloc.owner_of(7).unwrap(),
+            CidOwner::Unverified(vm("tenant-a"))
+        );
+    }
+
+    #[test]
+    fn releasing_an_unverified_cid_burns_it() {
+        // Never proven to be tenant-a's — another live guest may hold it.
+        let alloc = CidAllocator::with_range(3, 4);
+        alloc.reserve_unverified(&vm("tenant-a"), 3).unwrap();
+        alloc.release(&vm("tenant-a")).unwrap();
+        assert_eq!(alloc.owner_of(3).unwrap(), CidOwner::Unknown);
+        assert_eq!(alloc.allocate(&vm("tenant-b")).unwrap(), 4);
+        assert!(alloc.allocate(&vm("tenant-c")).is_err());
+    }
+
+    #[test]
+    fn releasing_a_verified_cid_frees_it() {
+        let alloc = CidAllocator::with_range(3, 3);
+        alloc.reserve_unverified(&vm("tenant-a"), 3).unwrap();
+        alloc.mark_verified(&vm("tenant-a"), 3).unwrap();
+        alloc.release(&vm("tenant-a")).unwrap();
+        assert_eq!(alloc.allocate(&vm("tenant-b")).unwrap(), 3);
     }
 }

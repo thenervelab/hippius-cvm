@@ -19,7 +19,48 @@ use serde::{Deserialize, Serialize};
 pub const HPKE_SUITE_ID: u16 = 0x0001;
 pub const HPKE_INFO: &[u8] = b"HIPPIUS_KBS_RELEASE_V1";
 pub const RELEASE_DOMAIN: &str = "HIPPIUS_KBS_RELEASE_V1";
+/// Domain of a release response to a guest that ATTESTED stamp protocol
+/// v2 (`crate::report_data::tenant_stamp_v2`). It carries a
+/// [`VolumeStampTransition`]. A guest built before v2 pins
+/// [`RELEASE_DOMAIN`] and refuses this domain outright, so it can never
+/// silently ignore the transition — and the KBS never sends it one
+/// anyway: only a v2 `REPORT_DATA` selects this domain.
+pub const RELEASE_DOMAIN_V2: &str = "HIPPIUS_KBS_RELEASE_V2";
 pub const DENIAL_DOMAIN: &str = "HIPPIUS_KBS_DENIAL_V1";
+/// Length of a volume-stamp timeline id.
+pub const VOLUME_STAMP_TIMELINE_ID_LEN: usize = 32;
+
+/// The timeline move a stamp-protocol-v2 release authorises
+/// (`kbs_core::volume_stamp`). The in-volume stamp is the pair
+/// `(timeline_id, value)`; the guest accepts its volume only when the
+/// volume's timeline is `expected_timeline_id` (and the value is in
+/// `{E, E+1}`), then writes `(target_timeline_id, E+1)`.
+///
+/// - A normal release: `expected == target ==` the VM's current timeline
+///   (all-zero for a VM never rolled back).
+/// - The one release an authorized rollback admits: `expected` = the
+///   timeline of the restored point (from its signed checkpoint),
+///   `target` = a fresh random timeline the KBS never issued before. Every
+///   disk of the abandoned timeline then carries a timeline no later
+///   release expects, whatever its value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeStampTransition {
+    #[serde(with = "serde_bytes")]
+    pub expected_timeline_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub target_timeline_id: Vec<u8>,
+}
+
+impl VolumeStampTransition {
+    /// `(expected, target)` as fixed arrays, or `None` unless both are
+    /// exactly [`VOLUME_STAMP_TIMELINE_ID_LEN`] bytes.
+    pub fn ids(&self) -> Option<([u8; 32], [u8; 32])> {
+        let e: [u8; 32] = self.expected_timeline_id.as_slice().try_into().ok()?;
+        let t: [u8; 32] = self.target_timeline_id.as_slice().try_into().ok()?;
+        Some((e, t))
+    }
+}
 
 /// Per-secret release context. Bound as HPKE `info`+`aad` by the KBS;
 /// carried (its fields) inside the signed `KbsResponse` so the guest
@@ -141,7 +182,24 @@ pub struct KbsResponse {
     pub hpke_suite_id: u16,
     #[serde(with = "serde_bytes")]
     pub allowed_userdata_digest: Vec<u8>,
-    pub luks: WrappedSecret,
+    /// The disk KEK (the golden overlay's LUKS keyslot key), HPKE-wrapped
+    /// to the attested guest.
+    ///
+    /// `Some` for every `hippius` (M0) and `split` (M1) release — in M1
+    /// this IS the Hippius share `share_H`, released by the unchanged path.
+    /// `None` ONLY for a `customer` (M2) release
+    /// ([`crate::guardian::KeyMode::Customer`]): the KBS holds no key
+    /// material for that VM, and the guest derives its KEK from the key
+    /// guardian's share alone.
+    ///
+    /// `skip_serializing_if` so a `None` is OMITTED from the canonical body
+    /// (never CBOR `null`): an M0/M1 release stays byte-identical on the
+    /// wire (`Some(x)` encodes exactly as `x` did when the field was not
+    /// optional), and a guest built before this field became optional —
+    /// where `luks` is required — refuses an M2 body outright instead of
+    /// misreading it. Pinned by `tests/release_response_kat.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luks: Option<WrappedSecret>,
     pub userdata: WrappedSecret,
     /// §7 per-VM guest lifecycle SIGNING key (Ed25519 seed),
     /// HPKE-wrapped to the attested guest exactly like `luks`. `None`
@@ -164,7 +222,7 @@ pub struct KbsResponse {
     /// response (field absent) to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_key: Option<WrappedSecret>,
-    /// Phase 2A of audit follow-up Codex #2 — the per-`vm_id`
+    /// Phase 2A of audit follow-up Review #2 — the per-`vm_id`
     /// monotonic counter the KBS committed for this release. On
     /// first boot the response carries `0` (no counter check ran);
     /// on subsequent boots — once the guest has opted in by submitting
@@ -218,6 +276,12 @@ pub struct KbsResponse {
     /// pre-gate release stays byte-identical on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_stamp_token: Option<WrappedSecret>,
+    /// Stamp protocol v2 only (`domain == RELEASE_DOMAIN_V2`): the timeline
+    /// move this release authorises. ABSENT from every v1 release (never
+    /// CBOR `null`), so a v1 guest's response is byte-identical to what it
+    /// was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_stamp_transition: Option<VolumeStampTransition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -54,14 +54,55 @@ def _launch_record(vm: Any, *, measurement_hex: str = "ab" * 48) -> LaunchJob:
     )
 
 
+#: vali's working copy at rest — the canonical bytes, STAMPED with the
+#: canonical KV version they correspond to, wrapped under `ud-<vm_id>`.
+#: The stamp is what makes "this is that version's plaintext" provable:
+#: the two KV writes are not atomic, so a copy without it could be some
+#: earlier attempt's bytes.
+_CANONICAL_VERSION = 4
+
+
+def _stamped(plaintext: bytes, version: int = _CANONICAL_VERSION) -> bytes:
+    from apps.orchestration.services import launch
+
+    body = launch._WORKING_STAMP + str(version).encode() + b"\n" + plaintext
+    return b"vault:v1:" + body.hex().encode("ascii")
+
+
+_WRAPPED_WORKING_COPY = _stamped(b"#cloud-config\n")
+
+
 @pytest.fixture
 def _vault_and_mint(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Stub the Vault reads + the mint shell-out. Captures the MintArgs the
     re-mint passed so a test can assert `vm_generation == new_gen`.
     """
     captured: dict[str, Any] = {}
-    monkeypatch.setattr(vault_kv, "latest_version", lambda *a, **k: 1)
-    monkeypatch.setattr(vault_kv, "get_kv", lambda *a, **k: b"#cloud-config\n")
+    # DIFFERENT numbers per path, so a test cannot pass by reading the
+    # wrong one: the canonical version is what the ticket binds and what
+    # the working copy must be pinned to.
+    monkeypatch.setattr(
+        vault_kv,
+        "latest_version",
+        lambda mount, path, *a, **k: 9 if path.endswith("-pending") else _CANONICAL_VERSION,
+    )
+    # Production shape: the canonical userdata is wrapped under the
+    # KBS-only `kek-<vm_id>` and vali's working copy under `ud-<vm_id>`.
+    # The re-mint must read the copy it can OPEN — hashing what a read of
+    # the canonical path returns is a digest over ciphertext, and a ticket
+    # that denies at release.
+    def _get_kv(mount, path, **k):
+        captured.setdefault("reads", []).append((path, k.get("version")))
+        if path.endswith("-pending"):
+            return _WRAPPED_WORKING_COPY
+        return b"vault:v1:" + b"#cloud-config\n".hex().encode("ascii")
+
+    monkeypatch.setattr(vault_kv, "get_kv", _get_kv)
+    monkeypatch.setattr(
+        vault_kv, "transit_decrypt", lambda name, ct: bytes.fromhex(
+            ct.removeprefix(b"vault:v1:").decode()
+        )
+    )
 
     def _fake_mint(args: ticket_mint.MintArgs) -> bytes:
         captured["args"] = args
@@ -89,7 +130,7 @@ def test_remint_mints_at_new_gen_with_same_measurement(
     stored: dict[str, Any] = {}
     monkeypatch.setattr(
         migration_ticket,
-        "_persist_intake",
+        "persist_intake",
         lambda blob, **kw: stored.update({"blob": blob, **kw}),
     )
 
@@ -113,7 +154,7 @@ def test_remint_mints_at_new_gen_with_same_measurement(
     # a ticket minted without it boots a guest that can never unlock.
     assert args.platform_id == "22" * 64
     # Persisted for the dispatch to resolve + a re-drive to be idempotent.
-    assert stored["new_gen"] == 6
+    assert stored["generation"] == 6
 
 
 def test_remint_fails_closed_when_the_dest_has_no_platform_id(
@@ -130,7 +171,7 @@ def test_remint_fails_closed_when_the_dest_has_no_platform_id(
     MinerIdentity.objects.create(
         miner_id="node-nochip", pubkey_hex="cc" * 32, platform_id=""
     )
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     with pytest.raises(EffectError, match="empty platform_id"):
         migration_ticket.remint_dest_ticket(
@@ -143,7 +184,7 @@ def test_remint_fails_closed_when_the_dest_miner_is_unknown(
 ) -> None:
     vm = make_vm(generation=5, host="node-src")
     _launch_record(vm, measurement_hex="cd" * 48)
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     with pytest.raises(EffectError, match="no MinerIdentity"):
         migration_ticket.remint_dest_ticket(
@@ -176,6 +217,14 @@ def test_remint_is_idempotent_returns_existing_new_gen_ticket(
         received_from="system:migration-remint",
     )
 
+    # The stored ticket decodes, with the VM's (M0) key mode.
+    from types import SimpleNamespace
+
+    from apps.orders import validator
+
+    monkeypatch.setattr(
+        validator, "validate_ticket", lambda cose: SimpleNamespace(key_mode="hippius")
+    )
     blob = migration_ticket.remint_dest_ticket(
         vm, dest_node_id="node-dst", new_gen=6
     )
@@ -216,7 +265,7 @@ def test_remint_discards_a_pre_fix_ticket_with_an_empty_platform_id(
         cose_blob=b"poisoned-blob",
         received_from="system:migration-remint",
     )
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     blob = migration_ticket.remint_dest_ticket(
         vm, dest_node_id="node-dst", new_gen=6
@@ -240,11 +289,34 @@ def test_remint_fails_closed_on_a_malformed_dest_platform_id(
     MinerIdentity.objects.create(
         miner_id="node-badhex", pubkey_hex="cc" * 32, platform_id="nothex" * 4
     )
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     with pytest.raises(EffectError, match="malformed platform_id"):
         migration_ticket.remint_dest_ticket(
             vm, dest_node_id="node-badhex", new_gen=6
+        )
+
+
+def test_remint_fails_closed_on_a_dest_generation_inconsistent_with_its_chip(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    # A dest registered `turin` with a 64-byte chip cannot be measured: the
+    # remint refuses instead of minting a ticket for an unresolvable host.
+    from apps.miners.models import MinerIdentity
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm)
+    MinerIdentity.objects.create(
+        miner_id="node-badgen",
+        pubkey_hex="cc" * 32,
+        platform_id="ab" * 64,
+        snp_generation="turin",
+    )
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
+
+    with pytest.raises(EffectError, match="snp-generation-chip-id-mismatch"):
+        migration_ticket.remint_dest_ticket(
+            vm, dest_node_id="node-badgen", new_gen=6
         )
 
 
@@ -341,14 +413,14 @@ def test_dest_remint_keeps_the_migration_ticket_namespace_and_audit_string(
     MinerIdentity.objects.create(miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64)
     persisted: dict[str, Any] = {}
     monkeypatch.setattr(
-        migration_ticket, "_persist_intake", lambda blob, **kw: persisted.update(kw)
+        migration_ticket, "persist_intake", lambda blob, **kw: persisted.update(kw)
     )
 
     migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
 
     args = _vault_and_mint["args"]
     assert args.ticket_id.startswith("tk-mig-")
-    assert persisted["new_gen"] == 6
+    assert persisted["generation"] == 6
     # The stored audit string is unchanged for migration rows.
     assert persisted["received_from"] == "system:migration-remint"
 
@@ -366,7 +438,7 @@ def test_recovery_remint_binds_the_vms_own_gen_and_host(
     MinerIdentity.objects.create(miner_id="node-src", pubkey_hex="aa" * 32, platform_id="11" * 64)
     persisted: dict[str, Any] = {}
     monkeypatch.setattr(
-        migration_ticket, "_persist_intake", lambda blob, **kw: persisted.update(kw)
+        migration_ticket, "persist_intake", lambda blob, **kw: persisted.update(kw)
     )
 
     migration_ticket.remint_current_ticket(vm)
@@ -408,7 +480,7 @@ def test_recovery_remint_never_replays_a_stored_current_gen_ticket(
         cose_blob=b"stale-launch-blob",
         received_from="system:launch",
     )
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     blob = migration_ticket.remint_current_ticket(vm)
 
@@ -452,3 +524,177 @@ def test_resolve_ticket_inputs_touches_no_vault_secret_and_writes_nothing(
     assert inputs.platform_id == "11" * 64
     assert inputs.measurement_hex == "cd" * 48
     assert OrderTicketIntake.objects.count() == 0
+
+
+def test_remint_digests_the_plaintext_from_the_copy_vali_can_open(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """THE §25 / KBS-recovery claim.
+
+    The §6 digest is over the cloud-init PLAINTEXT — the guest re-derives
+    it that way and refuses the release otherwise — and it binds a FRESH
+    ticket_id, so it cannot be reused from the launch. vali therefore has
+    to hash the plaintext again, from the only copy it can open: the
+    working copy under `ud-<vm_id>`. Reading the canonical path instead
+    (what this did once that copy started being wrapped) hashes ciphertext
+    and mints a ticket that denies at release — a migration that reports
+    Done and a VM that never unlocks.
+    """
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.services import userdata_digest
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(
+        miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64
+    )
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
+
+    migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    args = _vault_and_mint["args"]
+
+    assert args.allowed_userdata_digest_hex == userdata_digest.userdata_digest_hex(
+        tenant_id="tenant-a",
+        vm_id=vm.vm_id,
+        ticket_id=args.ticket_id,
+        secret_type=userdata_digest.SECRET_TYPE_USERDATA,
+        path=args.userdata_vault_path,
+        version=args.userdata_vault_version,
+        plaintext=b"#cloud-config\n",
+    )
+    # …and NOT over the ciphertext a read of either path returns.
+    assert args.allowed_userdata_digest_hex != userdata_digest.userdata_digest_hex(
+        tenant_id="tenant-a",
+        vm_id=vm.vm_id,
+        ticket_id=args.ticket_id,
+        secret_type=userdata_digest.SECRET_TYPE_USERDATA,
+        path=args.userdata_vault_path,
+        version=args.userdata_vault_version,
+        plaintext=_WRAPPED_WORKING_COPY,
+    )
+    # The ticket binds the CANONICAL version, and the working copy was
+    # read AT THAT SAME version — the pairing is what makes "these bytes
+    # are what that canonical version holds" provable. `launch_on_miner`
+    # writes both in one step, so the numbers line up; reading the working
+    # copy at "latest" instead would hash whatever a later attempt left.
+    # The ticket binds the CANONICAL version, and the working copy it
+    # hashed STAMPS that same version — which is what makes "these bytes
+    # are what that canonical version holds" provable rather than assumed
+    # (the two staging writes are not atomic).
+    assert args.userdata_vault_version == _CANONICAL_VERSION
+
+
+def test_remint_refuses_when_only_a_wrapped_canonical_copy_exists(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """No working copy (a VM staged by hand, or one whose copy was
+    removed) and a canonical copy wrapped under the KBS-only key: vali
+    cannot obtain the plaintext at all. Refuse — the alternative is
+    hashing ciphertext and minting a ticket nobody can redeem."""
+    from apps.miners.models import MinerIdentity
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(
+        miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64
+    )
+
+    def kv(mount, path, **k):
+        if path.endswith("-pending"):
+            raise vault_kv.VaultNotFound("no working copy")
+        return b"vault:v1:" + b"#cloud-config\n".hex().encode("ascii")
+
+    monkeypatch.setattr(vault_kv, "get_kv", kv)
+    with pytest.raises(EffectError, match="no usable working copy"):
+        migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    assert "args" not in _vault_and_mint
+
+
+def test_remint_refuses_a_working_copy_stamped_for_another_version(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """The canonical write and the working-copy write are two independent
+    KV puts. A canonical success followed by a failure here leaves the
+    working copy holding an EARLIER attempt's bytes — with a different
+    NetBird key in them. Hashing those mints a ticket the guest denies at
+    release, so the stamp mismatch has to fail closed instead."""
+    from apps.miners.models import MinerIdentity
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(
+        miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64
+    )
+
+    def kv(mount, path, **k):
+        if path.endswith("-pending"):
+            return _stamped(b"#cloud-config\nolder-attempt", _CANONICAL_VERSION - 1)
+        return b"vault:v1:" + b"#cloud-config\n".hex().encode("ascii")
+
+    monkeypatch.setattr(vault_kv, "get_kv", kv)
+    with pytest.raises(EffectError, match="stamped for canonical version"):
+        migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    assert "args" not in _vault_and_mint
+
+
+def test_remint_falls_back_to_a_legacy_plaintext_canonical_copy(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """A VM from before the wrapping stores its cloud-init in the clear at
+    the canonical path and has no working copy. The plaintext IS readable,
+    so it still migrates — that is what keeps those VMs recoverable."""
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.services import userdata_digest
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(
+        miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64
+    )
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
+
+    def kv(mount, path, **k):
+        if path.endswith("-pending"):
+            raise vault_kv.VaultNotFound("no working copy")
+        return b"#cloud-config\nlegacy"
+
+    monkeypatch.setattr(vault_kv, "get_kv", kv)
+    migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    args = _vault_and_mint["args"]
+    assert args.allowed_userdata_digest_hex == userdata_digest.userdata_digest_hex(
+        tenant_id="tenant-a",
+        vm_id=vm.vm_id,
+        ticket_id=args.ticket_id,
+        secret_type=userdata_digest.SECRET_TYPE_USERDATA,
+        path=args.userdata_vault_path,
+        version=args.userdata_vault_version,
+        plaintext=b"#cloud-config\nlegacy",
+    )
+
+
+def test_remint_refuses_a_plaintext_value_at_the_working_path(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """A VM launched between the canonical wrapping (#1065) and the
+    working copy has a PLAINTEXT value at `…/userdata-pending`: the
+    pre-substitution template an older intake wrote there. It is not a
+    copy of the canonical bytes — it still carries `{{NETBIRD_SETUP_KEY}}`
+    — so digesting it mints a ticket bound to bytes the guest never
+    receives. Refuse rather than pass it through as a legacy plaintext."""
+    from apps.miners.models import MinerIdentity
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(
+        miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 64
+    )
+
+    def kv(mount, path, **k):
+        if path.endswith("-pending"):
+            return b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"  # the template
+        return b"vault:v1:" + b"#cloud-config\nsubstituted".hex().encode("ascii")
+
+    monkeypatch.setattr(vault_kv, "get_kv", kv)
+    with pytest.raises(EffectError, match="no usable working copy"):
+        migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    assert "args" not in _vault_and_mint

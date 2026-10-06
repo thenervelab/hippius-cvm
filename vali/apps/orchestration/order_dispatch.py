@@ -52,6 +52,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -131,7 +132,7 @@ def _required_setting(name: str) -> str:
 def _validated_edge_url() -> str:
     """Return the configured edge URL after a structural sanity check.
 
-    Catches the operator-misconfig path codex r2 Low flagged: a
+    Catches the operator-misconfig path review r2 Low flagged: a
     malformed ``VALI_EDGE_ORDER_URL`` (embedded credentials, whitespace
     in the host, missing scheme) raises ``http.client.InvalidURL`` /
     ``ValueError`` from ``urllib.request.Request`` whose ``str(exc)``
@@ -182,7 +183,7 @@ def _encode_order_body(
     phase-2 wire shape the miner-agent decodes); Python here is
     deliberately blind to the CBOR layout — single source of truth.
 
-    ``target_miner_id`` + ``issued_at_unix`` close the gemini r1 High
+    ``target_miner_id`` + ``issued_at_unix`` close the review r1 High
     findings (cross-miner replay + long-term replay): the body now
     cryptographically binds to a specific host AND a freshness window
     that the miner-agent enforces post-signature-verify.
@@ -251,7 +252,7 @@ def _post_to_edge(
     """
     # Build the Request inside the try/except so even
     # `http.client.InvalidURL` / `ValueError` raised by `Request.__init__`
-    # for a pathological URL value (codex r2 Low) flows through the
+    # for a pathological URL value (review r2 Low) flows through the
     # static-classifier path rather than bubbling a message that
     # contains URL fragments.
     try:
@@ -277,12 +278,12 @@ def _post_to_edge(
         # exception is preserved as `__cause__` for traceback debugging
         # but never interpolated into the message. Some lower-level
         # exceptions (e.g. `socket.gaierror`) can stringify with host
-        # info; keeping the message static — codex r1 Low — keeps the
+        # info; keeping the message static — review r1 Low — keeps the
         # `URL never in exception text` rule airtight against any
         # future exception subclass.
         raise OrderDispatchUnavailable("edge-order: peer unreachable") from exc
     except (http.client.InvalidURL, ValueError) as exc:
-        # Codex r2 Low: an embedded-credential or whitespace-in-host
+        # Review r2 Low: an embedded-credential or whitespace-in-host
         # URL value raises `InvalidURL` / `ValueError` from `Request`
         # whose `str(exc)` echoes URL fragments (incl. the password
         # half of `user:pass@host`). `_validated_edge_url` rejects
@@ -361,6 +362,127 @@ def dispatch_order(
     return DispatchResult(ok=ok, status=status, classifier=classifier)
 
 
+#: Upstream statuses that say "the outcome is UNKNOWN", not "refused": the
+#: Edge gave up waiting on the miner (502/504), or the miner is still
+#: running this very order_id (409 ``order-in-flight``). The order may well
+#: have taken effect — re-asking with the SAME ``order_id`` is safe because
+#: the miner dedups on it, and once it finished it answers
+#: its ORIGINAL outcome class (``idempotent-replay`` from an older agent).
+_OUTCOME_UNKNOWN_STATUSES = frozenset({502, 504})
+_IN_FLIGHT_CLASSIFIER = "order-in-flight"
+#: A re-ask with less time than this left cannot get an answer back.
+_MIN_USEFUL_ATTEMPT_S = 5.0
+
+
+def _outcome_unknown(result: DispatchResult) -> bool:
+    if result.status in _OUTCOME_UNKNOWN_STATUSES:
+        return True
+    return result.status == 409 and result.classifier == _IN_FLIGHT_CLASSIFIER
+
+
+def dispatch_order_settled(
+    *,
+    miner_id: str,
+    netbird_ip: str,
+    order_id: str,
+    kind: str,
+    payload_json: bytes,
+    attempts: int = 4,
+    retry_after_s: float = 10.0,
+    deadline_s: float | None = None,
+    timeout_s: float | None = None,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> DispatchResult:
+    """`dispatch_order`, re-asked with the SAME ``order_id`` until the
+    miner's answer is KNOWN (bounded by ``attempts``).
+
+    A miner order can legitimately outlast the Edge's 30 s forward: a
+    graceful stop is an ACPI shutdown plus up to 30 s of power-off polling,
+    then a force destroy. The Edge then answers 502 while the miner finishes
+    the stop moments later — and a caller that reads that 502 as "failed"
+    records a failure for a VM that is in fact stopped (observed live: a §24
+    EoL stop took the ack-timeout forced-reclaim path for a domain libvirt
+    had destroyed one second after the 502).
+
+    The idempotency contract makes the honest answer cheap to get: re-send
+    the same ``order_id`` and the miner either reports the recorded outcome
+    (its original class; ``idempotent-replay`` from an older agent) or that
+    it is still working (409 in-flight).
+    Only an answer that is still unknown after the last attempt is returned
+    as-is; a transport failure on the last attempt still raises
+    ``OrderDispatchUnavailable``.
+
+    ``deadline_s`` bounds the WHOLE exchange, attempts and pauses included:
+    each attempt's HTTP timeout is clipped to the time left, and no re-ask
+    starts that could not finish before it. A caller inside a synchronous
+    request (the power API, under the gunicorn worker timeout) must pass
+    one; without it the worst case is ``attempts`` full dispatch timeouts.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be >= 1")
+    if deadline_s is not None and deadline_s <= 0:
+        # A spent budget would still SEND one (1 s) attempt, and the miner
+        # would still run the order — refuse rather than half-dispatch.
+        raise ValueError("deadline_s must be > 0")
+    pause = sleep if sleep is not None else time.sleep
+    now = clock if clock is not None else time.monotonic
+    per_attempt = float(timeout_s if timeout_s is not None else DEFAULT_DISPATCH_TIMEOUT_S)
+    started = now()
+
+    def _remaining() -> float | None:
+        return None if deadline_s is None else deadline_s - (now() - started)
+
+    def _may_reask() -> bool:
+        left = _remaining()
+        return left is None or left > retry_after_s + _MIN_USEFUL_ATTEMPT_S
+
+    result: DispatchResult | None = None
+    for attempt in range(1, attempts + 1):
+        left = _remaining()
+        try:
+            result = dispatch_order(
+                miner_id=miner_id,
+                netbird_ip=netbird_ip,
+                order_id=order_id,
+                kind=kind,
+                payload_json=payload_json,
+                timeout_s=per_attempt if left is None else max(min(per_attempt, left), 1.0),
+            )
+        except OrderDispatchUnavailable:
+            if attempt == attempts or not _may_reask():
+                raise
+            log.warning(
+                "order_dispatch: miner=%s kind=%s order_id=%s unreachable "
+                "(attempt %d/%d) — re-asking",
+                miner_id,
+                kind,
+                order_id,
+                attempt,
+                attempts,
+            )
+            pause(retry_after_s)
+            continue
+        if not _outcome_unknown(result):
+            return result
+        if attempt < attempts and _may_reask():
+            log.info(
+                "order_dispatch: miner=%s kind=%s order_id=%s outcome unknown "
+                "(status=%d) — re-asking with the same order_id (attempt %d/%d)",
+                miner_id,
+                kind,
+                order_id,
+                result.status,
+                attempt,
+                attempts,
+            )
+            pause(retry_after_s)
+            continue
+        break
+    assert result is not None  # attempts >= 1 and every path set it or raised
+    return result
+
+
 # ── Convenience builders for typical payloads ────────────────────────
 
 
@@ -379,9 +501,16 @@ def build_launch_payload(
     memory_mb: int,
     cose_ticket: bytes,
     data_disk_size_gb: int = 0,
+    require_existing_disks: bool = False,
 ) -> dict[str, Any]:
     """Build the JSON payload for a ``launch`` order — mirrors the
     Rust ``LaunchOrder`` shape.
+
+    ``require_existing_disks`` marks a RELAUNCH of a VM that already ran on
+    this miner (reboot-recovery, power ``start``): the miner then refuses
+    with the ``relaunch-disks-missing`` class instead of creating blank
+    per-VM disks. Carried only when True, so a first-launch payload is
+    unchanged.
 
     ``cose_ticket`` is the byte-exact L1-emitted COSE_Sign1 envelope —
     the same bytes ``apps.orders.models.OrderTicket.cose_blob`` stores.
@@ -402,7 +531,7 @@ def build_launch_payload(
         # An empty COSE blob would dispatch fine but stall every guest
         # at the §21 ticket-load stage. Fail loud at the producer.
         raise ValueError("cose_ticket is empty — refusing to dispatch")
-    return {
+    payload: dict[str, Any] = {
         "vm_id": vm_id,
         "ovmf_path": ovmf_path,
         "kernel_path": kernel_path,
@@ -423,6 +552,31 @@ def build_launch_payload(
         # convention — same shape as ``SignedOrder.body`` / ``…sig``.
         "cose_ticket": base64.b64encode(bytes(cose_ticket)).decode("ascii"),
     }
+    if require_existing_disks:
+        payload["require_existing_disks"] = True
+    _add_guardian_ep(payload, cmdline)
+    return payload
+
+
+def _add_guardian_ep(payload: dict[str, Any], cmdline: str) -> None:
+    """Customer-held keys: carry `guardian_ep` — the ONE destination the
+    miner's guardian relay may dial for this VM — derived from the measured
+    `hippius.guardian_ep=` token of the order's own `cmdline`.
+
+    Derived rather than passed in, so no launch / relaunch / §25 / restore
+    builder can drop it or disagree with what the guest measured (the
+    encoder refuses a mismatch as `guardian-ep-mismatch` anyway). An M0
+    cmdline has no binding ⇒ no key ⇒ the payload is byte-identical to
+    before. A cmdline the grammar refuses is refused here too.
+    """
+    from .services import customer_keys
+
+    try:
+        binding = customer_keys.parse_cmdline(cmdline)
+    except customer_keys.CustomerKeysError as exc:
+        raise ValueError(f"order cmdline: {exc}") from exc
+    if binding is not None:
+        payload["guardian_ep"] = binding.endpoint
 
 
 def build_stop_payload(*, vm_id: str, graceful: bool) -> dict[str, Any]:
@@ -460,6 +614,11 @@ def build_migrate_activate_payload(
     memory_mb: int,
     cose_ticket: bytes,
     boot_artifacts: dict[str, Any] | None = None,
+    backup_chain: dict[str, Any] | None = None,
+    snapshot_size: int = 0,
+    snapshot_sha256_hex: str = "",
+    settle_by_unix: int = 0,
+    staged_restore_id: str = "",
 ) -> dict[str, Any]:
     """Build the JSON payload for a §25 M4 ``migrate-activate`` order —
     mirrors the Rust ``MigrateActivateOrder`` shape.
@@ -482,9 +641,13 @@ def build_migrate_activate_payload(
         raise TypeError("cose_ticket must be bytes — the raw L1 COSE_Sign1 envelope")
     if len(cose_ticket) == 0:
         raise ValueError("cose_ticket is empty — refusing to dispatch")
+    if staged_restore_id and (get_url or state_get_url or backup_chain or snapshot_size):
+        # The miner refuses this as `staged-restore-conflict`; never build it.
+        raise ValueError(
+            "staged_restore_id excludes get_url / state_get_url / backup_chain / snapshot_size"
+        )
     payload: dict[str, Any] = {
         "vm_id": vm_id,
-        "get_url": get_url,
         "new_gen": int(new_gen),
         "ovmf_path": ovmf_path,
         "kernel_path": kernel_path,
@@ -498,6 +661,13 @@ def build_migrate_activate_payload(
         "memory_mb": int(memory_mb),
         "cose_ticket": base64.b64encode(bytes(cose_ticket)).decode("ascii"),
     }
+    if staged_restore_id:
+        # A restore: the destination installs the backup point it staged
+        # under this id (`restore` op=stage) and downloads nothing, so there
+        # is no `get_url` (the encoder accepts its absence only here).
+        payload["staged_restore_id"] = staged_restore_id
+    else:
+        payload["get_url"] = get_url
     # Presigned GET for the source's anti-rollback state disk. OMITTED
     # when empty, not emitted as "": the encoder's `optional_string_field`
     # rejects an empty string outright, and an omitted key keeps the body
@@ -505,9 +675,29 @@ def build_migrate_activate_payload(
     # the field (`deny_unknown_fields`) still decodes the order.
     if state_get_url:
         payload["state_get_url"] = state_get_url
+    if snapshot_size:
+        # What the source uploaded; the dest verifies its download against
+        # both before attaching it.
+        payload["snapshot_size"] = snapshot_size
+        payload["snapshot_sha256_hex"] = snapshot_sha256_hex
     # Omit `boot_artifacts` entirely when absent — the ticket-validator
     # encoder + the miner-agent's `#[serde(default)]` both treat an absent
     # key as "no staging bundle" (out-of-band / pre-staged artifacts).
     if boot_artifacts is not None:
         payload["boot_artifacts"] = boot_artifacts
+    # A restore from a backup chain (`apps.backup.service.restore_chain`):
+    # the dest rebuilds the overlay and the state disk from these pieces and
+    # ignores `get_url` / `state_get_url`. Omitted when absent so a §25
+    # migration's body is unchanged.
+    if backup_chain is not None:
+        payload["backup_chain"] = backup_chain
+    # vali's `DestActivating` deadline (unix seconds, less a safety margin):
+    # the dest settles by then on every attempt. Omitted when 0 so a body
+    # without it is unchanged; a miner-agent predating the field refuses a
+    # body that carries it (`deny_unknown_fields`), so agents deploy first.
+    if settle_by_unix:
+        payload["settle_by_unix"] = int(settle_by_unix)
+    # The §25 / restore destination boots the same measured cmdline, so it
+    # dials the same guardian (`MigrateActivateOrder.guardian_ep`).
+    _add_guardian_ep(payload, cmdline)
     return payload

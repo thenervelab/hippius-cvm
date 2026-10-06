@@ -40,6 +40,7 @@ use crate::error::{KbsError, Result};
 use crate::lifecycle::{VmState, VmStateStore};
 use crate::persist::{IdempotencyKey, IdempotencyStore};
 use crate::ticket::{verify_order_ticket, L1Keyring, OrderTicket};
+use hippius_types::guardian::KeyMode;
 use sha2::{Digest, Sha256};
 
 /// Maximum admin request body size. The signed `OrderTicket` is a
@@ -55,6 +56,9 @@ pub struct AdminRegisterOk {
     pub vm_generation: u64,
     pub host: String,
     pub lease_id: String,
+    /// The key mode the VM is registered under (the ticket's, absent ⇒
+    /// `hippius`). Recorded in the admin audit; not on the response wire.
+    pub key_mode: KeyMode,
     pub applied_at: u64,
     /// `true` ⇒ this exact ticket_id was previously registered with a
     /// matching body; the KBS returned the cached response without a
@@ -89,6 +93,15 @@ pub enum AdminRegisterErr {
         vm_id: String,
         current: Box<VmState>,
     },
+    /// 409 — the VM is already registered under another key mode
+    /// (customer-held keys). The mode is pinned at the VM's first
+    /// register; switching it is not a re-register (launch-time only).
+    KeyModeConflict {
+        ticket_id: String,
+        vm_id: String,
+        recorded: KeyMode,
+        requested: KeyMode,
+    },
     /// 500 — persistence layer failed. Retry safe.
     Internal(String),
 }
@@ -102,6 +115,7 @@ impl AdminRegisterErr {
             AdminRegisterErr::UrlVmIdMismatch { .. } => 400,
             AdminRegisterErr::StateDivergent { .. } => 409,
             AdminRegisterErr::StateConflict { .. } => 409,
+            AdminRegisterErr::KeyModeConflict { .. } => 409,
             AdminRegisterErr::Internal(_) => 500,
         }
     }
@@ -114,6 +128,7 @@ impl AdminRegisterErr {
             AdminRegisterErr::UrlVmIdMismatch { .. } => "url-vm-id-mismatch",
             AdminRegisterErr::StateDivergent { .. } => "state-divergent",
             AdminRegisterErr::StateConflict { .. } => "state-conflict",
+            AdminRegisterErr::KeyModeConflict { .. } => "key-mode-conflict",
             AdminRegisterErr::Internal(_) => "internal-error",
         }
     }
@@ -121,7 +136,8 @@ impl AdminRegisterErr {
     pub fn ticket_id(&self) -> Option<&str> {
         match self {
             AdminRegisterErr::StateDivergent { ticket_id, .. }
-            | AdminRegisterErr::StateConflict { ticket_id, .. } => Some(ticket_id),
+            | AdminRegisterErr::StateConflict { ticket_id, .. }
+            | AdminRegisterErr::KeyModeConflict { ticket_id, .. } => Some(ticket_id),
             _ => None,
         }
     }
@@ -130,7 +146,8 @@ impl AdminRegisterErr {
         match self {
             AdminRegisterErr::UrlVmIdMismatch { ticket_vm_id, .. } => Some(ticket_vm_id),
             AdminRegisterErr::StateDivergent { vm_id, .. }
-            | AdminRegisterErr::StateConflict { vm_id, .. } => Some(vm_id),
+            | AdminRegisterErr::StateConflict { vm_id, .. }
+            | AdminRegisterErr::KeyModeConflict { vm_id, .. } => Some(vm_id),
             _ => None,
         }
     }
@@ -141,32 +158,66 @@ impl AdminRegisterErr {
 /// (the release path only reads); this trait adds the narrow
 /// register-shaped write.
 pub trait VmStateRegister {
-    /// Apply a `Register` op:
-    /// - if `vm_id` is absent  ⇒ insert `new_state`, return [`RegisterOutcome::Inserted`]
+    /// Apply a `Register` op under `key_mode` (customer-held keys):
+    /// - `vm_id` already pinned to another key mode ⇒ nothing written,
+    ///   [`RegisterOutcome::KeyModeConflict`] (checked first — a matching
+    ///   row does not excuse a mode change);
+    /// - if `vm_id` is absent  ⇒ pin `key_mode`, insert `new_state`, return [`RegisterOutcome::Inserted`]
     /// - if `vm_id == new_state` ⇒ no-op, return [`RegisterOutcome::AlreadyMatching`]
     /// - otherwise ⇒ return [`RegisterOutcome::Conflict`] with the
     ///   current state (handler maps to 409).
-    fn register(&self, vm_id: &str, new_state: VmState) -> Result<RegisterOutcome>;
+    fn register(
+        &self,
+        vm_id: &str,
+        new_state: VmState,
+        key_mode: KeyMode,
+    ) -> Result<RegisterOutcome>;
 
-    /// §25 — atomically transition `vm_id` `Active{old_gen,source,lease}`
-    /// → `Migrating{old_gen,new_gen,source,dest,lease}` (the destination
+    /// After a successful register: the registered ticket's launch is the
+    /// VM's current one unless a strictly newer one already is
+    /// (`crate::lifecycle::LaunchBinding`). From here on the KBS refuses
+    /// every older launch's ticket. Stores that do not track bindings
+    /// (test doubles) ignore it.
+    fn observe_launch(
+        &self,
+        _vm_id: &str,
+        _binding: crate::lifecycle::LaunchBinding,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// §25 — atomically move the fence from the VM's current releasable
+    /// holder to `(new_gen, dest)`: `Active{old_gen,source,lease}` or
+    /// `Migrating{…, new_gen: old_gen, dest: source, lease}` →
+    /// `Migrating{old_gen,new_gen,source,dest,lease}` (the destination
     /// re-activation fence). This is the ONLY admin write that opens the
     /// §25 release path for the destination: after it,
     /// [`crate::lifecycle::check_releasable`] lets exactly
     /// `(new_gen, dest)` unlock and continues to deny the source at
     /// `old_gen` — the split-brain gate.
     ///
+    /// A completed migration is never promoted back to `Active`: for
+    /// `check_releasable`, `Migrating{new_gen, dest, lease}` admits
+    /// exactly what `Active{new_gen, dest, lease}` would. So a VM that
+    /// already migrated is activated again (second §25, failover, or a
+    /// retarget away from a destination that never booted) from its
+    /// `Migrating` row, whose `(new_gen, dest)` becomes the fenced-out
+    /// `(old_gen, source)` of the next hop.
+    ///
     /// CAS semantics (handled by [`Self::activate`]'s default impl over
     /// the store's atomic primitive):
-    /// - `new_gen <= current.gen` ⇒ nothing written,
-    ///   [`ActivateOutcome::NonMonotonic`] (see below);
-    /// - current `Active{gen==old_gen, host==source, lease}` ⇒ swap to
-    ///   `Migrating{…}`, return [`ActivateOutcome::Activated`];
     /// - current already `Migrating{old_gen,new_gen,source,dest,lease}`
     ///   matching this exact request ⇒ no-op
     ///   [`ActivateOutcome::AlreadyMigrating`] (idempotent re-drive);
-    /// - anything else ⇒ [`ActivateOutcome::Conflict`] with the current
-    ///   state (handler maps to 409 — never force a transition).
+    /// - current `Migrating` at this `new_gen` but another `dest` ⇒
+    ///   [`ActivateOutcome::Conflict`] (a re-drive is never re-pointed);
+    /// - `new_gen <=` the current holder's generation ⇒ nothing written,
+    ///   [`ActivateOutcome::NonMonotonic`] (see below);
+    /// - otherwise ⇒ swap to `Migrating{…}`, return
+    ///   [`ActivateOutcome::Activated`];
+    /// - anything else (no row, `Decommissioning`, `Destroyed`) ⇒
+    ///   [`ActivateOutcome::Conflict`] with the current state (handler
+    ///   maps to 409 — never force a transition).
     ///
     /// **The generation must strictly increase.** `check_releasable`
     /// admits exactly `ticket_gen == new_gen` once the row is
@@ -176,6 +227,46 @@ pub trait VmStateRegister {
     /// would re-admit an already-burned generation (rollback). Both are
     /// refused BEFORE the CAS, so nothing is written.
     fn activate(&self, vm_id: &str, new_gen: u64, dest: &str) -> Result<ActivateOutcome>;
+
+    /// §24 decommission fence: `Active | Migrating | no row` →
+    /// `Decommissioning`. Already `Decommissioning` or `Destroyed` ⇒ a
+    /// no-op. Only ever moves a VM FURTHER from releasable, so the worst a
+    /// wrong call can do is deny a release early.
+    ///
+    /// An ABSENT row is fenced too, not refused: after a KBS restart the
+    /// store is empty, and a VM vali is tearing down must answer
+    /// "decommissioning" to its guest, not "unknown".
+    fn decommission(&self, vm_id: &str) -> Result<FenceOutcome>;
+
+    /// §24 tombstone: any state or no row → `Destroyed{gen}`. Already
+    /// `Destroyed{gen}` ⇒ no-op; `Destroyed` at ANOTHER generation ⇒
+    /// [`FenceOutcome::GenerationConflict`], nothing written (two callers
+    /// disagree about what died; neither is overwritten silently).
+    ///
+    /// Permanent by construction: `register` refuses any existing row and
+    /// `activate` refuses a `Destroyed` one, so nothing in the admin API
+    /// can move a VM out of this state — only a store wipe forgets it,
+    /// which is why vali re-installs tombstones after every KBS restart.
+    fn tombstone(&self, vm_id: &str, gen: u64) -> Result<FenceOutcome>;
+
+    /// Read-only: the current row for `vm_id`, `None` when absent. Used by
+    /// `seed-keepalive-binding` to hold a seed to the VM's releasable host.
+    fn current(&self, vm_id: &str) -> Result<Option<VmState>>;
+}
+
+/// Outcome of a §24 [`VmStateRegister::decommission`] /
+/// [`VmStateRegister::tombstone`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceOutcome {
+    /// `previous` = the label of the state before (`"absent"` for no row),
+    /// `state` = the label after, `cached` = nothing was written.
+    Applied {
+        previous: &'static str,
+        state: &'static str,
+        cached: bool,
+    },
+    /// Already `Destroyed` at `current_gen != requested`.
+    GenerationConflict { current_gen: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +274,10 @@ pub enum RegisterOutcome {
     Inserted,
     AlreadyMatching,
     Conflict(VmState),
+    /// The VM is pinned to `recorded`, not the requested mode.
+    KeyModeConflict {
+        recorded: KeyMode,
+    },
 }
 
 /// Outcome of a §25 [`VmStateRegister::activate`].
@@ -206,27 +301,24 @@ pub enum ActivateOutcome {
 }
 
 impl VmStateRegister for crate::persist::FileVmStateStore {
-    fn register(&self, vm_id: &str, new_state: VmState) -> Result<RegisterOutcome> {
-        match self.get(vm_id) {
-            Ok(cur) if cur == new_state => Ok(RegisterOutcome::AlreadyMatching),
-            Ok(other) => Ok(RegisterOutcome::Conflict(other)),
-            Err(KbsError::Lifecycle(_)) => {
-                // `no state for vm_id` ⇒ fresh insert. The internal CAS
-                // is `expected_now == None`. If a racing caller wrote
-                // the same vm_id between our `get` and `cas`, CAS will
-                // fail; we recurse once to surface the conflict.
-                match self.cas(vm_id, |cur| cur.is_none(), new_state.clone()) {
-                    Ok(()) => Ok(RegisterOutcome::Inserted),
-                    Err(KbsError::Lifecycle(_)) => match self.get(vm_id) {
-                        Ok(cur) if cur == new_state => Ok(RegisterOutcome::AlreadyMatching),
-                        Ok(other) => Ok(RegisterOutcome::Conflict(other)),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
+    fn current(&self, vm_id: &str) -> Result<Option<VmState>> {
+        self.lookup(vm_id)
+    }
+
+    fn register(
+        &self,
+        vm_id: &str,
+        new_state: VmState,
+        key_mode: KeyMode,
+    ) -> Result<RegisterOutcome> {
+        // One hold of the store lock decides and writes (mode pin + row),
+        // so a racing register can never interleave between the check and
+        // the insert — see `FileVmStateStore::register_keyed`.
+        self.register_keyed(vm_id, new_state, key_mode)
+    }
+
+    fn observe_launch(&self, vm_id: &str, binding: crate::lifecycle::LaunchBinding) -> Result<()> {
+        self.write_launch_binding(vm_id, binding, true)
     }
 
     fn activate(&self, vm_id: &str, new_gen: u64, dest: &str) -> Result<ActivateOutcome> {
@@ -248,53 +340,146 @@ impl VmStateRegister for crate::persist::FileVmStateStore {
             Err(e) => return Err(e),
         };
 
-        match &current {
+        // The `(gen, host, lease)` that `check_releasable` currently
+        // admits — the holder this activate fences out. For a VM that
+        // already migrated that is its destination at `new_gen`.
+        let (old_gen, source, lease_id) = match &current {
             VmState::Active {
-                gen: old_gen,
-                host: source,
+                gen,
+                host,
                 lease_id,
+            } => (*gen, host.clone(), lease_id.clone()),
+            VmState::Migrating {
+                new_gen: cur_new,
+                dest: cur_dest,
+                lease_id,
+                ..
             } => {
-                // Forward-only gate, BEFORE the CAS so a refusal writes
-                // nothing. `check_releasable` admits exactly `new_gen`
-                // once the row is `Migrating`: at `new_gen == old_gen`
-                // the source's own generation would stay releasable (the
-                // split-brain this fence exists to prevent) and at
-                // `new_gen < old_gen` a burned generation would be
-                // re-admitted (rollback).
-                if new_gen <= *old_gen {
-                    return Ok(ActivateOutcome::NonMonotonic { old_gen: *old_gen });
+                // A re-drive of THIS hop is idempotent; the same
+                // generation to another dest is a divergent re-drive and
+                // is never re-pointed. Only a strictly higher generation
+                // (below) is a new hop.
+                if *cur_new == new_gen {
+                    return Ok(activate_recheck(current, new_gen, dest));
                 }
-                let target = VmState::Migrating {
-                    old_gen: *old_gen,
-                    new_gen,
-                    source: source.clone(),
-                    dest: dest.to_string(),
-                    lease_id: lease_id.clone(),
-                };
-                let old_gen_v = *old_gen;
-                let lease_v = lease_id.clone();
-                // CAS predicate pins the EXACT current Active row — if a
-                // racing write changed it between our `get` and the
-                // `cas`, the predicate fails and we re-read to surface
-                // the conflict rather than clobber.
-                let expected = current.clone();
-                match self.cas(vm_id, |cur| cur == Some(&expected), target) {
-                    Ok(()) => Ok(ActivateOutcome::Activated {
-                        old_gen: old_gen_v,
-                        lease_id: lease_v,
-                    }),
-                    Err(KbsError::Lifecycle(_)) => match self.get(vm_id) {
-                        Ok(other) => Ok(activate_recheck(other, new_gen, dest)),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
+                (*cur_new, cur_dest.clone(), lease_id.clone())
             }
-            // Already migrating — idempotent ONLY if it is the same
-            // forward-only `(new_gen, dest)`; a divergent migration is a
-            // conflict, never silently re-targeted.
-            _ => Ok(activate_recheck(current, new_gen, dest)),
+            VmState::Decommissioning | VmState::Destroyed { .. } => {
+                return Ok(ActivateOutcome::Conflict(Box::new(current)));
+            }
+        };
+
+        // Forward-only gate, BEFORE the CAS so a refusal writes nothing.
+        // `check_releasable` admits exactly `new_gen` once the row is
+        // `Migrating`: at `new_gen == old_gen` the current holder's own
+        // generation would stay releasable (the split-brain this fence
+        // exists to prevent) and at `new_gen < old_gen` a burned
+        // generation would be re-admitted (rollback).
+        if new_gen <= old_gen {
+            return Ok(ActivateOutcome::NonMonotonic { old_gen });
         }
+        let target = VmState::Migrating {
+            old_gen,
+            new_gen,
+            source,
+            dest: dest.to_string(),
+            lease_id: lease_id.clone(),
+        };
+        // CAS predicate pins the EXACT current row — if a racing write
+        // changed it between our `get` and the `cas`, the predicate fails
+        // and we re-read to surface the conflict rather than clobber.
+        let expected = current.clone();
+        match self.cas(vm_id, |cur| cur == Some(&expected), target) {
+            Ok(()) => Ok(ActivateOutcome::Activated { old_gen, lease_id }),
+            Err(KbsError::Lifecycle(_)) => match self.get(vm_id) {
+                Ok(other) => Ok(activate_recheck(other, new_gen, dest)),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decommission(&self, vm_id: &str) -> Result<FenceOutcome> {
+        self.fence(vm_id, |current| match current {
+            Some(VmState::Decommissioning) => FenceStep::Done(FenceOutcome::Applied {
+                previous: "decommissioning",
+                state: "decommissioning",
+                cached: true,
+            }),
+            Some(VmState::Destroyed { .. }) => FenceStep::Done(FenceOutcome::Applied {
+                previous: "destroyed",
+                state: "destroyed",
+                cached: true,
+            }),
+            Some(VmState::Active { .. }) | Some(VmState::Migrating { .. }) | None => {
+                FenceStep::Write(VmState::Decommissioning)
+            }
+        })
+    }
+
+    fn tombstone(&self, vm_id: &str, gen: u64) -> Result<FenceOutcome> {
+        self.fence(vm_id, |current| match current {
+            Some(VmState::Destroyed { gen: cur }) if *cur == gen => {
+                FenceStep::Done(FenceOutcome::Applied {
+                    previous: "destroyed",
+                    state: "destroyed",
+                    cached: true,
+                })
+            }
+            Some(VmState::Destroyed { gen: cur }) => {
+                FenceStep::Done(FenceOutcome::GenerationConflict { current_gen: *cur })
+            }
+            _ => FenceStep::Write(VmState::Destroyed { gen }),
+        })
+    }
+}
+
+/// One classification step of a fence: stop with an outcome, or write.
+enum FenceStep {
+    Done(FenceOutcome),
+    Write(VmState),
+}
+
+impl crate::persist::FileVmStateStore {
+    /// Shared CAS loop of the two fences. `decide` sees the current row
+    /// (`None` = absent) and either ends the call or names the state to
+    /// write; the write is a CAS pinned to the exact row `decide` saw, so a
+    /// racing transition is re-classified instead of overwritten. Bounded:
+    /// every write only moves a VM toward `Destroyed`, so a re-read can
+    /// lose a race at most a handful of times.
+    fn fence(
+        &self,
+        vm_id: &str,
+        decide: impl Fn(Option<&VmState>) -> FenceStep,
+    ) -> Result<FenceOutcome> {
+        for _ in 0..8 {
+            let current = match self.get(vm_id) {
+                Ok(s) => Some(s),
+                Err(KbsError::Lifecycle(_)) => None,
+                Err(e) => return Err(e),
+            };
+            let target = match decide(current.as_ref()) {
+                FenceStep::Done(outcome) => return Ok(outcome),
+                FenceStep::Write(target) => target,
+            };
+            let previous = current.as_ref().map_or("absent", VmState::label);
+            let state = target.label();
+            let expected = current.clone();
+            match self.cas(vm_id, |cur| cur == expected.as_ref(), target) {
+                Ok(()) => {
+                    return Ok(FenceOutcome::Applied {
+                        previous,
+                        state,
+                        cached: false,
+                    })
+                }
+                Err(KbsError::Lifecycle(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(KbsError::Lifecycle(
+            "fence: state kept changing under the CAS".into(),
+        ))
     }
 }
 
@@ -386,6 +571,7 @@ pub fn process_admin_register(
                 vm_generation: ticket.vm_generation,
                 host: ticket.platform_id.clone(),
                 lease_id: ticket.lease_id.clone(),
+                key_mode: ticket.key_mode(),
                 applied_at: now_unix,
                 cached: true,
             });
@@ -409,12 +595,69 @@ pub fn process_admin_register(
         lease_id: ticket.lease_id.clone(),
     };
 
-    // 6. Apply via the lifecycle-store CAS.
-    match vm_states
-        .register(&ticket.vm_id, desired.clone())
-        .map_err(|e| AdminRegisterErr::Internal(format!("vm_states.register: {e}")))?
-    {
+    // 6. Apply via the lifecycle-store CAS, pinning the ticket's key
+    //    mode (absent ⇒ `hippius`). A VM already pinned to another mode
+    //    is refused here — mode switching is launch-time only.
+    let key_mode = ticket.key_mode();
+    let supersedes = ticket
+        .lifecycle_perms
+        .iter()
+        .any(|p| p == crate::lifecycle::SUPERSEDE_PERM);
+    let outcome = vm_states
+        .register(&ticket.vm_id, desired.clone(), key_mode)
+        .map_err(|e| AdminRegisterErr::Internal(format!("vm_states.register: {e}")))?;
+    // A VM §25 moved stays `Migrating{new_gen, dest, lease}` for good (it is
+    // never promoted back to `Active`), so `register` reports a conflict
+    // for its relaunch even when that row admits exactly this ticket. A
+    // SUPERSEDING relaunch (a resize of a moved VM) is accepted there
+    // without touching the row: the row already lets this (generation,
+    // host, lease) unlock; only the current launch moves. Any other ticket
+    // keeps the 409 vali has always relied on.
+    let outcome = match outcome {
+        RegisterOutcome::Conflict(current)
+            if supersedes
+                && crate::lifecycle::check_releasable(
+                    &current,
+                    ticket.vm_generation,
+                    &ticket.lease_id,
+                    &ticket.platform_id,
+                )
+                .is_ok() =>
+        {
+            RegisterOutcome::AlreadyMatching
+        }
+        other => other,
+    };
+    match outcome {
         RegisterOutcome::Inserted | RegisterOutcome::AlreadyMatching => {
+            // A ticket carrying the `supersede` lifecycle perm makes its
+            // launch the VM's current one at REGISTER, before it is even
+            // dispatched: every older launch's ticket (the pre-resize one)
+            // is refused from now on. vali mints it only for a relaunch
+            // of a VM it confirmed stopped (a resize), where no earlier
+            // domain may legitimately keep running. Any other launch
+            // becomes current at its first release
+            // (`lifecycle::check_current_launch`) — a same-miner retry
+            // answered `already-launched` must not strand the domain that
+            // actually runs. Written before the idempotency record and
+            // the 200, so vali never dispatches a superseding launch the
+            // KBS did not bind. A ticket naming several measurements binds
+            // at its first release (the attested one).
+            if let (true, [only]) = (supersedes, ticket.allowed_measurements.as_slice()) {
+                if let Ok(measurement) = <[u8; 48]>::try_from(only.as_ref()) {
+                    vm_states
+                        .observe_launch(
+                            &ticket.vm_id,
+                            crate::lifecycle::LaunchBinding {
+                                measurement,
+                                issue_time: ticket.issue_time,
+                            },
+                        )
+                        .map_err(|e| {
+                            AdminRegisterErr::Internal(format!("vm_states.observe_launch: {e}"))
+                        })?;
+                }
+            }
             // Record into idempotency store. Best-effort — a failure
             // here doesn't unmake the lifecycle write; the next retry
             // will hit `RegisterOutcome::AlreadyMatching` and succeed
@@ -429,6 +672,7 @@ pub fn process_admin_register(
                 vm_generation: ticket.vm_generation,
                 host: ticket.platform_id.clone(),
                 lease_id: ticket.lease_id.clone(),
+                key_mode,
                 applied_at: now_unix,
                 cached: false,
             })
@@ -438,6 +682,26 @@ pub fn process_admin_register(
             vm_id: ticket.vm_id.clone(),
             current: Box::new(current),
         }),
+        RegisterOutcome::KeyModeConflict { recorded } => Err(AdminRegisterErr::KeyModeConflict {
+            ticket_id: ticket.ticket_id.clone(),
+            vm_id: ticket.vm_id.clone(),
+            recorded,
+            requested: key_mode,
+        }),
+    }
+}
+
+/// The admin-audit `reason` of a successful register: empty for an M0
+/// (`hippius`) VM — byte-identical to every register recorded before
+/// customer-held keys — and the pinned mode otherwise, so the hash-chained
+/// admin log says which VMs the KBS holds no (M2) or only half (M1) of the
+/// disk key for. (The mode is also inside the ticket whose `body_sha256`
+/// the record pins; this makes it readable without the ticket.)
+fn register_ok_audit_reason(key_mode: KeyMode) -> Option<&'static str> {
+    match key_mode {
+        KeyMode::Hippius => None,
+        KeyMode::Split => Some("key-mode:split"),
+        KeyMode::Customer => Some("key-mode:customer"),
     }
 }
 
@@ -458,7 +722,7 @@ pub fn record_admin_register_outcome(
         Ok(ok) => (
             !ok.cached,
             200u16,
-            None,
+            register_ok_audit_reason(ok.key_mode),
             Some(ok.ticket_id.as_str()),
             Some(ok.vm_id.as_str()),
         ),
@@ -577,13 +841,18 @@ impl AdminActivateErr {
 ///
 /// `vm_id` is the URL path component. `new_gen` + `dest` come from the
 /// JSON body vali posts. The `old_gen`, `source`, and `lease_id` are
-/// taken from the KBS's OWN authoritative `Active{…}` state — never from
-/// vali — so a compromised vali cert cannot rewrite them.
+/// taken from the KBS's OWN authoritative state — the current `Active{…}`
+/// holder, or for a VM that already migrated the `(new_gen, dest)` of its
+/// `Migrating{…}` row — never from vali, so a compromised vali cert
+/// cannot rewrite them.
 ///
 /// Idempotent: a re-drive that finds the VM already `Migrating` to this
-/// exact `(new_gen, dest)` returns 200 `cached`. A request that would
-/// re-target a different `(new_gen, dest)`, or one against a
-/// non-`Active` state, is a 409 conflict — the fence never force-moves.
+/// exact `(new_gen, dest)` returns 200 `cached`. A re-drive at that same
+/// `new_gen` to a different dest, or an activate over no state /
+/// `Decommissioning` / `Destroyed`, is a 409 conflict — the fence never
+/// force-moves. A strictly higher `new_gen` over a `Migrating` row is the
+/// next hop (second §25, failover, or retarget off a dest that never
+/// booted) and fences the previous dest exactly as it fenced the source.
 ///
 /// Forward-only: `new_gen` MUST strictly exceed the generation the KBS
 /// currently holds, else 409 `activate-not-monotonic` and nothing is
@@ -665,6 +934,152 @@ pub fn record_admin_activate_outcome(
         url_vm_id,
         // No signed ticket on this op — it carries plain control-plane
         // fields (`dest_node_id`, `new_gen`), like `seed-boot-counter`.
+        ticket_id: None,
+        vm_id,
+        applied,
+        status_code: status,
+        reason,
+        peer_san,
+        peer_serial,
+        body_sha256,
+    };
+    audit.append(&record, now_unix)
+}
+
+// ─── §24 decommission fence + tombstone ──────────────────────────────
+
+/// Successful fence (`decommission` or `tombstone`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminFenceOk {
+    pub vm_id: String,
+    pub previous: &'static str,
+    pub state: &'static str,
+    pub cached: bool,
+}
+
+/// Refused fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminFenceErr {
+    /// 400 — malformed body / empty vm_id.
+    BadRequest(&'static str),
+    /// 409 — `tombstone` over a `Destroyed` row at another generation.
+    GenerationConflict {
+        vm_id: String,
+        current_gen: u64,
+        requested: u64,
+    },
+    /// 500 — persistence failed; nothing written. Retry-safe.
+    Internal(String),
+}
+
+impl AdminFenceErr {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            AdminFenceErr::BadRequest(_) => 400,
+            AdminFenceErr::GenerationConflict { .. } => 409,
+            AdminFenceErr::Internal(_) => 500,
+        }
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self {
+            AdminFenceErr::BadRequest(r) => r,
+            AdminFenceErr::GenerationConflict { .. } => "tombstone-generation-conflict",
+            AdminFenceErr::Internal(_) => "internal-error",
+        }
+    }
+
+    pub fn vm_id(&self) -> Option<&str> {
+        match self {
+            AdminFenceErr::GenerationConflict { vm_id, .. } => Some(vm_id.as_str()),
+            AdminFenceErr::BadRequest(_) | AdminFenceErr::Internal(_) => None,
+        }
+    }
+}
+
+fn fence_result(
+    vm_id: &str,
+    requested_gen: u64,
+    outcome: Result<FenceOutcome>,
+) -> core::result::Result<AdminFenceOk, AdminFenceErr> {
+    match outcome.map_err(|e| AdminFenceErr::Internal(format!("vm_states fence: {e}")))? {
+        FenceOutcome::Applied {
+            previous,
+            state,
+            cached,
+        } => Ok(AdminFenceOk {
+            vm_id: vm_id.to_string(),
+            previous,
+            state,
+            cached,
+        }),
+        FenceOutcome::GenerationConflict { current_gen } => {
+            Err(AdminFenceErr::GenerationConflict {
+                vm_id: vm_id.to_string(),
+                current_gen,
+                requested: requested_gen,
+            })
+        }
+    }
+}
+
+/// `POST /v1/admin/vm/{vm_id}/decommission` — the §24 KBS fence.
+///
+/// Before this route the KBS never learnt that a VM was decommissioned:
+/// vali flipped only its own row, the KBS row stayed `Active` for ever,
+/// and a release was refused only because the Vault-Transit key had
+/// been destroyed by then. vali now calls this right after its own
+/// decommission CAS and BEFORE the crypto-erase, so a release (and a
+/// custody renew) is refused from the fence on — including in the window
+/// before the erase, and including for a VM whose erase is delayed.
+pub fn process_admin_decommission(
+    url_vm_id: &str,
+    vm_states: &dyn VmStateRegister,
+) -> core::result::Result<AdminFenceOk, AdminFenceErr> {
+    if url_vm_id.is_empty() {
+        return Err(AdminFenceErr::BadRequest("vm-id-empty"));
+    }
+    fence_result(url_vm_id, 0, vm_states.decommission(url_vm_id))
+}
+
+/// `POST /v1/admin/vm/{vm_id}/tombstone` — the permanent §24 marker.
+pub fn process_admin_tombstone(
+    url_vm_id: &str,
+    gen: u64,
+    vm_states: &dyn VmStateRegister,
+) -> core::result::Result<AdminFenceOk, AdminFenceErr> {
+    if url_vm_id.is_empty() {
+        return Err(AdminFenceErr::BadRequest("vm-id-empty"));
+    }
+    // Generations start at 1; a 0 can only be a caller bug, and a
+    // tombstone is permanent — refuse it rather than record it.
+    if gen == 0 {
+        return Err(AdminFenceErr::BadRequest("tombstone-gen-zero"));
+    }
+    fence_result(url_vm_id, gen, vm_states.tombstone(url_vm_id, gen))
+}
+
+/// Audit a fence call (applied or refused) into the hash-chained admin
+/// log, like every other lifecycle write. `op` is `"decommission"` or
+/// `"tombstone"`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_admin_fence_outcome(
+    audit: &FileAdminAuditSink,
+    op: &'static str,
+    url_vm_id: &str,
+    body_sha256: &[u8; 32],
+    peer_san: Option<&str>,
+    peer_serial: Option<&str>,
+    outcome: &core::result::Result<AdminFenceOk, AdminFenceErr>,
+    now_unix: u64,
+) -> Result<[u8; 32]> {
+    let (applied, status, reason, vm_id) = match outcome {
+        Ok(ok) => (!ok.cached, 200u16, None, Some(ok.vm_id.as_str())),
+        Err(e) => (false, e.status_code(), Some(e.reason()), e.vm_id()),
+    };
+    let record = AdminAuditRecord {
+        op,
+        url_vm_id,
         ticket_id: None,
         vm_id,
         applied,
@@ -873,6 +1288,233 @@ pub fn record_admin_seed_outcome(
         // No signed ticket on this op (it carries a plain control-plane
         // integer, like `activate`) — the field stays empty so the
         // record shape matches the rest of the chain.
+        ticket_id: None,
+        vm_id,
+        applied,
+        status_code: status,
+        reason,
+        peer_san,
+        peer_serial,
+        body_sha256,
+    };
+    audit.append(&record, now_unix)
+}
+
+// ─── keepalive binding seed (operator disaster recovery) ─────────────
+
+/// Discriminated failure shape for `seed-keepalive-binding`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminSeedBindingErr {
+    /// 400 — the request is malformed (vm_id outside `[a-z0-9-]{1,64}`,
+    /// ids not the right length of lower-case hex, an all-zero id).
+    BadRequest(&'static str),
+    /// 412 — the KBS lifecycle holds no releasable row for this `vm_id`
+    /// (absent, decommissioning or destroyed): there is no guest a
+    /// binding could be for. Nothing written.
+    VmNotActive { vm_id: String },
+    /// 412 — the `CHIP_ID` is not the platform the lifecycle row says
+    /// this VM may be released on. Nothing written.
+    ChipNotHost { vm_id: String },
+    /// 409 — a record already names a DIFFERENT guest. Nothing written.
+    AlreadyRecorded { vm_id: String },
+    /// 409 — the VM is poisoned: a release committed but its guest could
+    /// not be recorded. A seed never clears that (the guest vali can
+    /// vouch for is the OLD one); only a release at or after the failed
+    /// one does. Nothing written.
+    Poisoned { vm_id: String },
+    /// 500 — a store failed. Retry-safe (a failed seed writes nothing).
+    Internal(String),
+}
+
+impl AdminSeedBindingErr {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            AdminSeedBindingErr::BadRequest(_) => 400,
+            AdminSeedBindingErr::VmNotActive { .. } | AdminSeedBindingErr::ChipNotHost { .. } => {
+                412
+            }
+            AdminSeedBindingErr::AlreadyRecorded { .. } | AdminSeedBindingErr::Poisoned { .. } => {
+                409
+            }
+            AdminSeedBindingErr::Internal(_) => 500,
+        }
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self {
+            AdminSeedBindingErr::BadRequest(r) => r,
+            AdminSeedBindingErr::VmNotActive { .. } => "binding-vm-not-active",
+            AdminSeedBindingErr::ChipNotHost { .. } => "binding-chip-not-host",
+            AdminSeedBindingErr::AlreadyRecorded { .. } => "binding-already-recorded",
+            AdminSeedBindingErr::Poisoned { .. } => "binding-poisoned",
+            AdminSeedBindingErr::Internal(_) => "internal-error",
+        }
+    }
+
+    pub fn vm_id(&self) -> Option<&str> {
+        match self {
+            AdminSeedBindingErr::VmNotActive { vm_id }
+            | AdminSeedBindingErr::ChipNotHost { vm_id }
+            | AdminSeedBindingErr::AlreadyRecorded { vm_id }
+            | AdminSeedBindingErr::Poisoned { vm_id } => Some(vm_id),
+            _ => None,
+        }
+    }
+}
+
+/// A successful `seed-keepalive-binding`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminSeedBindingOk {
+    pub vm_id: String,
+    /// `true` ⇒ the record was written.
+    pub seeded: bool,
+    /// `true` ⇒ a record already named this same guest; nothing written.
+    pub matched: bool,
+}
+
+fn lower_hex_exact<const N: usize>(h: &str) -> Option<[u8; N]> {
+    if h.len() != N * 2
+        || !h
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    hex::decode(h).ok()?.try_into().ok()
+}
+
+/// The charset vali mints `vm_id`s in (`^[a-z0-9-]{1,64}$`) — the same
+/// lock `hippius_types::vault_broker::BrokerScope::validate` applies.
+fn vm_id_well_formed(vm_id: &str) -> bool {
+    (1..=64).contains(&vm_id.len())
+        && vm_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The host a VM may currently be released on, per the lifecycle row —
+/// exactly who [`crate::lifecycle::check_releasable`] admits: the `host`
+/// of an `Active` row, the `dest` of a `Migrating` one (a completed §25
+/// migration stays `Migrating{new_gen, dest}` and releases there).
+fn releasable_host(state: &VmState) -> Option<&str> {
+    match state {
+        VmState::Active { host, .. } => Some(host),
+        VmState::Migrating { dest, .. } => Some(dest),
+        VmState::Decommissioning | VmState::Destroyed { .. } => None,
+    }
+}
+
+/// `chip_id` belongs to `platform_id` under the release path's rule
+/// (`crate::release` step 3): compare the chip truncated to the platform
+/// id's byte length (Turin registers 8 bytes, Milan/Genoa 64). An empty
+/// or over-long platform id matches nothing.
+fn chip_is_platform(chip_id: &[u8], platform_id: &str) -> bool {
+    let id_len = platform_id.len() / 2;
+    if id_len == 0 || id_len > chip_id.len() {
+        return false;
+    }
+    hex::encode(&chip_id[..id_len]) == platform_id
+}
+
+/// Process a `POST /v1/admin/vm/{vm_id}/seed-keepalive-binding` request:
+/// re-establish, after a pod restart wiped the state dir, the guest a VM
+/// was last released to (see `crate::keepalive_binding`).
+///
+/// Gate order, each refusal writing nothing: request shape (400) → the
+/// lifecycle row is releasable (412 `binding-vm-not-active`) → the chip
+/// is that row's host (412 `binding-chip-not-host`) → the binding store
+/// (200 seeded / 200 matched / 409 `binding-already-recorded` a different
+/// guest on record / 409 `binding-poisoned` the VM is poisoned).
+///
+/// Why it is neither a hijack nor a DoS lever: it fills an EMPTY row only
+/// (a record naming another guest is a 409, so it cannot displace what a
+/// release recorded), the seeded position is before every real release
+/// (the guest's next boot supersedes it), it only binds a chip the VM may
+/// actually be released on, and the route exists only on the mTLS admin
+/// listener. A wrong seed can at worst refuse that one VM's keepalives
+/// until its next release.
+pub fn process_admin_seed_keepalive_binding(
+    url_vm_id: &str,
+    chip_id_hex: &str,
+    report_id_hex: &str,
+    vm_states: &dyn VmStateRegister,
+    store: &dyn crate::keepalive_binding::KeepaliveBindingStore,
+) -> core::result::Result<AdminSeedBindingOk, AdminSeedBindingErr> {
+    use crate::keepalive_binding::{GuestIdentity, SeedOutcome};
+    use hippius_types::live_attestation::{CHIP_ID_LEN, REPORT_ID_LEN};
+
+    if url_vm_id.is_empty() {
+        return Err(AdminSeedBindingErr::BadRequest("vm-id-empty"));
+    }
+    if !vm_id_well_formed(url_vm_id) {
+        return Err(AdminSeedBindingErr::BadRequest("vm-id-invalid"));
+    }
+    let chip_id = lower_hex_exact::<CHIP_ID_LEN>(chip_id_hex)
+        .ok_or(AdminSeedBindingErr::BadRequest("chip-id-malformed"))?;
+    let report_id = lower_hex_exact::<REPORT_ID_LEN>(report_id_hex)
+        .ok_or(AdminSeedBindingErr::BadRequest("report-id-malformed"))?;
+    if chip_id.iter().all(|&b| b == 0) {
+        return Err(AdminSeedBindingErr::BadRequest("chip-id-zero"));
+    }
+    if report_id.iter().all(|&b| b == 0) {
+        return Err(AdminSeedBindingErr::BadRequest("report-id-zero"));
+    }
+
+    let state = vm_states
+        .current(url_vm_id)
+        .map_err(|e| AdminSeedBindingErr::Internal(format!("vm_states.current: {e}")))?;
+    let Some(host) = state.as_ref().and_then(releasable_host) else {
+        return Err(AdminSeedBindingErr::VmNotActive {
+            vm_id: url_vm_id.to_string(),
+        });
+    };
+    if !chip_is_platform(&chip_id, host) {
+        return Err(AdminSeedBindingErr::ChipNotHost {
+            vm_id: url_vm_id.to_string(),
+        });
+    }
+
+    let ok = |seeded: bool, matched: bool| AdminSeedBindingOk {
+        vm_id: url_vm_id.to_string(),
+        seeded,
+        matched,
+    };
+    match store
+        .seed(url_vm_id, GuestIdentity { chip_id, report_id })
+        .map_err(|e| AdminSeedBindingErr::Internal(format!("keepalive_binding.seed: {e}")))?
+    {
+        SeedOutcome::Seeded => Ok(ok(true, false)),
+        SeedOutcome::AlreadyMatching => Ok(ok(false, true)),
+        SeedOutcome::Conflict => Err(AdminSeedBindingErr::AlreadyRecorded {
+            vm_id: url_vm_id.to_string(),
+        }),
+        SeedOutcome::Poisoned => Err(AdminSeedBindingErr::Poisoned {
+            vm_id: url_vm_id.to_string(),
+        }),
+    }
+}
+
+/// Append the `seed-keepalive-binding` outcome to the admin hash chain.
+/// `applied` is `true` only when a record was written (not on a matched
+/// no-op).
+pub fn record_admin_seed_binding_outcome(
+    audit: &FileAdminAuditSink,
+    url_vm_id: &str,
+    body_sha256: &[u8; 32],
+    peer_san: Option<&str>,
+    peer_serial: Option<&str>,
+    outcome: &core::result::Result<AdminSeedBindingOk, AdminSeedBindingErr>,
+    now_unix: u64,
+) -> Result<[u8; 32]> {
+    let (applied, status, reason, vm_id) = match outcome {
+        // `applied` only when a record was written; a matched no-op is
+        // recorded as a 200 that changed nothing.
+        Ok(ok) => (ok.seeded, 200u16, None, Some(ok.vm_id.as_str())),
+        Err(e) => (false, e.status_code(), Some(e.reason()), e.vm_id()),
+    };
+    let record = AdminAuditRecord {
+        op: "seed-keepalive-binding",
+        url_vm_id,
         ticket_id: None,
         vm_id,
         applied,
@@ -1215,10 +1857,74 @@ mod tests {
     }
 
     fn mint_ticket(sk: &SigningKey, kid: &[u8], vm_id: &str, gen: u64) -> Vec<u8> {
+        mint_ticket_keyed(sk, kid, vm_id, gen, "tk-test-1", None)
+    }
+
+    /// [`mint_ticket`] with a chosen `ticket_id` and signed `key_mode`
+    /// (`None` ⇒ the field is absent, exactly as every M0 minter emits).
+    fn mint_ticket_keyed(
+        sk: &SigningKey,
+        kid: &[u8],
+        vm_id: &str,
+        gen: u64,
+        ticket_id: &str,
+        key_mode: Option<KeyMode>,
+    ) -> Vec<u8> {
+        mint_ticket_launch(
+            sk,
+            kid,
+            vm_id,
+            gen,
+            ticket_id,
+            key_mode,
+            1_000,
+            [0x11u8; 48],
+        )
+    }
+
+    /// [`mint_ticket_keyed`] for a chosen launch: its `issue_time` and its
+    /// single allowed measurement.
+    #[allow(clippy::too_many_arguments)]
+    fn mint_ticket_launch(
+        sk: &SigningKey,
+        kid: &[u8],
+        vm_id: &str,
+        gen: u64,
+        ticket_id: &str,
+        key_mode: Option<KeyMode>,
+        issue_time: u64,
+        measurement: [u8; 48],
+    ) -> Vec<u8> {
+        mint_ticket_perms(
+            sk,
+            kid,
+            vm_id,
+            gen,
+            ticket_id,
+            key_mode,
+            issue_time,
+            measurement,
+            &["launch", "supersede"],
+        )
+    }
+
+    /// [`mint_ticket_launch`] with chosen `lifecycle_perms`.
+    #[allow(clippy::too_many_arguments)]
+    fn mint_ticket_perms(
+        sk: &SigningKey,
+        kid: &[u8],
+        vm_id: &str,
+        gen: u64,
+        ticket_id: &str,
+        key_mode: Option<KeyMode>,
+        issue_time: u64,
+        measurement: [u8; 48],
+        perms: &[&str],
+    ) -> Vec<u8> {
         let ticket = OrderTicket {
             v: SCHEMA_V,
-            ticket_id: "tk-test-1".into(),
-            issue_time: 1_000,
+            ticket_id: ticket_id.into(),
+            issue_time,
             expiry: 100_000,
             nonce: ByteBuf::from(vec![1u8; 32]),
             tenant_id: "tenant-1".into(),
@@ -1228,7 +1934,7 @@ mod tests {
             vm_generation: gen,
             node_id: "node-test".into(),
             platform_id: "chip-aaaa".into(),
-            allowed_measurements: vec![ByteBuf::from(vec![0x11u8; 48])],
+            allowed_measurements: vec![ByteBuf::from(measurement.to_vec())],
             userdata_vault_ref: VaultRef {
                 path: "secret/u".into(),
                 version: 1,
@@ -1239,7 +1945,8 @@ mod tests {
             },
             allowed_userdata_digest: ByteBuf::from(vec![0x22u8; 32]),
             flavor: hippius_types::flavor::Flavor::Small,
-            lifecycle_perms: vec!["launch".into()],
+            lifecycle_perms: perms.iter().map(|p| (*p).to_string()).collect(),
+            key_mode,
         };
         let payload_value = ticket_to_cbor_value(&ticket);
         let payload = to_canonical_vec(&payload_value).unwrap();
@@ -1259,7 +1966,18 @@ mod tests {
     }
 
     fn ticket_to_cbor_value(t: &OrderTicket) -> Value {
-        Value::Map(vec![
+        let mut entries = ticket_to_cbor_entries(t);
+        if let Some(mode) = t.key_mode {
+            entries.push((
+                Value::Text("key_mode".into()),
+                Value::Text(mode.as_wire().into()),
+            ));
+        }
+        Value::Map(entries)
+    }
+
+    fn ticket_to_cbor_entries(t: &OrderTicket) -> Vec<(Value, Value)> {
+        vec![
             (
                 Value::Text("allowed_measurements".into()),
                 Value::Array(
@@ -1351,7 +2069,7 @@ mod tests {
                     ),
                 ]),
             ),
-        ])
+        ]
     }
 
     fn fresh_stores() -> (
@@ -1372,6 +2090,195 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(kid.clone(), sk.verifying_key());
         (sk, kid, StaticKeyring(map))
+    }
+
+    /// A relaunch registers its own ticket: from then on the KBS stands for
+    /// that launch, and a register of an OLDER launch's ticket (vali retrying
+    /// a stale one) never rewinds it. Survives a store reopen.
+    #[test]
+    fn a_register_binds_the_vms_current_launch() {
+        use crate::lifecycle::{LaunchBinding, VmStateStore};
+        let (td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let (small, large) = ([0x11u8; 48], [0x22u8; 48]);
+
+        let first = mint_ticket_launch(&sk, &kid, "vm-R", 1, "tk-small", None, 1_000, small);
+        process_admin_register(&first, "vm-R", &keyring, &vm_states, &idem, 2_000).unwrap();
+        assert_eq!(
+            vm_states.launch_binding("vm-R").unwrap(),
+            Some(LaunchBinding {
+                measurement: small,
+                issue_time: 1_000
+            })
+        );
+
+        // The resize relaunch: same (gen, host, lease) ⇒ AlreadyMatching,
+        // but the binding moves to the new launch.
+        let resized = mint_ticket_launch(&sk, &kid, "vm-R", 1, "tk-large", None, 1_500, large);
+        process_admin_register(&resized, "vm-R", &keyring, &vm_states, &idem, 2_000).unwrap();
+        let bound = vm_states.launch_binding("vm-R").unwrap().unwrap();
+        assert_eq!((bound.measurement, bound.issue_time), (large, 1_500));
+
+        // A stale register of the pre-resize ticket (new ticket_id, older
+        // issue_time) is accepted as a row match but does not rewind.
+        let stale = mint_ticket_launch(&sk, &kid, "vm-R", 1, "tk-small-2", None, 1_200, small);
+        process_admin_register(&stale, "vm-R", &keyring, &vm_states, &idem, 2_000).unwrap();
+        assert_eq!(
+            vm_states
+                .launch_binding("vm-R")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            large
+        );
+
+        // Durable: a reopened store still stands for the resized launch.
+        drop(vm_states);
+        let reopened = FileVmStateStore::open(td.path().join("vm-states.json")).unwrap();
+        assert_eq!(
+            reopened
+                .launch_binding("vm-R")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            large
+        );
+    }
+
+    /// Without the `supersede` perm (every launch but a resize relaunch) a
+    /// register binds nothing: the launch becomes current at its first
+    /// release, so a same-miner retry answered `already-launched` cannot
+    /// strand the domain that really runs.
+    #[test]
+    fn a_plain_register_does_not_move_the_current_launch() {
+        use crate::lifecycle::VmStateStore;
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let first = mint_ticket_launch(&sk, &kid, "vm-P", 1, "tk-1", None, 1_000, [0x11u8; 48]);
+        process_admin_register(&first, "vm-P", &keyring, &vm_states, &idem, 2_000).unwrap();
+        let retry = mint_ticket_perms(
+            &sk,
+            &kid,
+            "vm-P",
+            1,
+            "tk-2",
+            None,
+            1_500,
+            [0x22u8; 48],
+            &["launch"],
+        );
+        process_admin_register(&retry, "vm-P", &keyring, &vm_states, &idem, 2_000).unwrap();
+        assert_eq!(
+            vm_states
+                .launch_binding("vm-P")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            [0x11u8; 48]
+        );
+    }
+
+    /// A §25-moved VM's row stays `Migrating{new_gen, dest, lease}`. A
+    /// SUPERSEDING relaunch at that (generation, host, lease) — the resize
+    /// of a moved VM — is accepted without touching the row and binds the
+    /// current launch at register; a plain one keeps the 409, and a
+    /// superseding one the row does not admit (stale generation) too.
+    #[test]
+    fn a_superseding_register_binds_a_moved_vm_without_touching_its_row() {
+        use crate::lifecycle::VmStateStore;
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let first = mint_ticket_launch(&sk, &kid, "vm-M", 1, "tk-1", None, 1_000, [0x11u8; 48]);
+        process_admin_register(&first, "vm-M", &keyring, &vm_states, &idem, 2_000).unwrap();
+        vm_states.activate("vm-M", 2, "chip-aaaa").unwrap();
+        let row = vm_states.current("vm-M").unwrap();
+        assert!(
+            matches!(row, Some(VmState::Migrating { new_gen: 2, .. })),
+            "{row:?}"
+        );
+
+        let plain = mint_ticket_perms(
+            &sk,
+            &kid,
+            "vm-M",
+            2,
+            "tk-2",
+            None,
+            1_500,
+            [0x22u8; 48],
+            &["launch"],
+        );
+        assert!(matches!(
+            process_admin_register(&plain, "vm-M", &keyring, &vm_states, &idem, 2_000),
+            Err(AdminRegisterErr::StateConflict { .. })
+        ));
+
+        let resized = mint_ticket_launch(&sk, &kid, "vm-M", 2, "tk-3", None, 1_600, [0x33u8; 48]);
+        let ok = process_admin_register(&resized, "vm-M", &keyring, &vm_states, &idem, 2_000)
+            .expect("a superseding relaunch of a moved VM registers");
+        assert_eq!(ok.vm_generation, 2);
+        assert_eq!(
+            vm_states.current("vm-M").unwrap(),
+            row,
+            "the row is untouched"
+        );
+        assert_eq!(
+            vm_states
+                .launch_binding("vm-M")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            [0x33u8; 48]
+        );
+
+        let stale = mint_ticket_launch(&sk, &kid, "vm-M", 1, "tk-4", None, 1_700, [0x44u8; 48]);
+        assert!(matches!(
+            process_admin_register(&stale, "vm-M", &keyring, &vm_states, &idem, 2_000),
+            Err(AdminRegisterErr::StateConflict { .. })
+        ));
+        assert_eq!(
+            vm_states
+                .launch_binding("vm-M")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            [0x33u8; 48]
+        );
+    }
+
+    /// A resize whose relaunch failed after its register, then rolled back:
+    /// the rollback is a NEW launch (a new ticket, a new measurement at the
+    /// old size), and it is what the VM stands for afterwards. Neither the
+    /// pre-resize ticket nor the failed target's releases any more; the
+    /// rollback's does — and keeps doing so (`admit_launch`).
+    #[test]
+    fn a_rolled_back_resize_stands_for_the_rollback_launch() {
+        use crate::lifecycle::{check_current_launch, VmStateStore};
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let (small, large, back) = ([0x11u8; 48], [0x22u8; 48], [0x33u8; 48]);
+        for (tid, at, m) in [
+            ("tk-s", 1_000, small),
+            ("tk-l", 1_500, large),
+            ("tk-b", 1_800, back),
+        ] {
+            let t = mint_ticket_launch(&sk, &kid, "vm-R", 1, tid, None, at, m);
+            process_admin_register(&t, "vm-R", &keyring, &vm_states, &idem, 2_000).unwrap();
+        }
+        let current = vm_states.launch_binding("vm-R").unwrap();
+        assert!(check_current_launch(current, &small, 1_000).is_err());
+        assert!(check_current_launch(current, &large, 1_500).is_err());
+        vm_states.admit_launch("vm-R", &back, 1_800).unwrap();
+        // The durable CAS refuses the stale one too, and never moves.
+        assert!(vm_states.admit_launch("vm-R", &small, 1_000).is_err());
+        assert_eq!(
+            vm_states
+                .launch_binding("vm-R")
+                .unwrap()
+                .unwrap()
+                .measurement,
+            back
+        );
     }
 
     #[test]
@@ -1497,6 +2404,140 @@ mod tests {
         assert_eq!(err.reason(), "state-divergent");
     }
 
+    // ── customer-held keys: the key mode is pinned at register ──────
+
+    #[test]
+    fn register_pins_the_ticket_key_mode_and_refuses_a_different_one() {
+        for (first, second) in [
+            (KeyMode::Hippius, KeyMode::Customer),
+            (KeyMode::Split, KeyMode::Hippius),
+            (KeyMode::Customer, KeyMode::Split),
+            (KeyMode::Split, KeyMode::Customer),
+        ] {
+            let (_td, vm_states, idem) = fresh_stores();
+            let (sk, kid, keyring) = fresh_keyring();
+            // An M0 VM is registered with NO `key_mode` on the wire.
+            let wire = |m: KeyMode| (m != KeyMode::Hippius).then_some(m);
+            let body1 = mint_ticket_keyed(&sk, &kid, "vm-K", 1, "tk-1", wire(first));
+            let ok =
+                process_admin_register(&body1, "vm-K", &keyring, &vm_states, &idem, 2_000).unwrap();
+            assert_eq!(ok.key_mode, first);
+            assert_eq!(vm_states.key_mode("vm-K").unwrap(), first);
+
+            // A re-mint (new ticket_id, same row) under another mode:
+            // refused, and nothing moves.
+            let body2 = mint_ticket_keyed(&sk, &kid, "vm-K", 1, "tk-2", wire(second));
+            let err = process_admin_register(&body2, "vm-K", &keyring, &vm_states, &idem, 2_001)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                AdminRegisterErr::KeyModeConflict {
+                    ticket_id: "tk-2".into(),
+                    vm_id: "vm-K".into(),
+                    recorded: first,
+                    requested: second,
+                }
+            );
+            assert_eq!(err.status_code(), 409);
+            assert_eq!(err.reason(), "key-mode-conflict");
+            assert_eq!(err.ticket_id(), Some("tk-2"));
+            assert_eq!(err.vm_id(), Some("vm-K"));
+            assert_eq!(vm_states.key_mode("vm-K").unwrap(), first);
+
+            // The same mode re-registers idempotently (reboot-recovery /
+            // KBS-recover re-mints a fresh ticket_id every time).
+            let body3 = mint_ticket_keyed(&sk, &kid, "vm-K", 1, "tk-3", wire(first));
+            let again =
+                process_admin_register(&body3, "vm-K", &keyring, &vm_states, &idem, 2_002).unwrap();
+            assert!(!again.cached);
+            assert_eq!(again.key_mode, first);
+        }
+    }
+
+    #[test]
+    fn an_explicit_hippius_key_mode_is_refused_m0_is_the_absent_field() {
+        // M0 has one wire encoding (no `key_mode`); the explicit spelling
+        // is refused before anything is written.
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let body = mint_ticket_keyed(&sk, &kid, "vm-H", 1, "tk-1", Some(KeyMode::Hippius));
+        let err =
+            process_admin_register(&body, "vm-H", &keyring, &vm_states, &idem, 2_000).unwrap_err();
+        assert!(matches!(err, AdminRegisterErr::TicketInvalid(_)), "{err:?}");
+        assert!(vm_states.get("vm-H").is_err());
+    }
+
+    #[test]
+    fn a_mode_change_is_refused_even_when_the_row_itself_would_conflict() {
+        // Mode is checked FIRST: a tombstoned VM re-registered under
+        // another mode reports the mode conflict, and nothing is pinned.
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        let body1 = mint_ticket_keyed(&sk, &kid, "vm-T", 1, "tk-1", Some(KeyMode::Customer));
+        process_admin_register(&body1, "vm-T", &keyring, &vm_states, &idem, 2_000).unwrap();
+        process_admin_tombstone("vm-T", 1, &vm_states).unwrap();
+        let body2 = mint_ticket_keyed(&sk, &kid, "vm-T", 2, "tk-2", None);
+        let err =
+            process_admin_register(&body2, "vm-T", &keyring, &vm_states, &idem, 2_001).unwrap_err();
+        assert!(matches!(err, AdminRegisterErr::KeyModeConflict { .. }));
+        // Same mode, conflicting row ⇒ the ordinary state conflict.
+        let body3 = mint_ticket_keyed(&sk, &kid, "vm-T", 2, "tk-3", Some(KeyMode::Customer));
+        let err =
+            process_admin_register(&body3, "vm-T", &keyring, &vm_states, &idem, 2_002).unwrap_err();
+        assert!(matches!(err, AdminRegisterErr::StateConflict { .. }));
+    }
+
+    #[test]
+    fn a_vm_the_kbs_already_holds_without_a_mode_is_hippius() {
+        // Every VM registered before customer-held keys has a row and no
+        // pinned mode; it must read as M0 and refuse an M1/M2 re-mint.
+        let (_td, vm_states, idem) = fresh_stores();
+        let (sk, kid, keyring) = fresh_keyring();
+        seed_active(&vm_states, "vm-old", 1, "chip-aaaa", "lease-1");
+        assert_eq!(vm_states.key_mode("vm-old").unwrap(), KeyMode::Hippius);
+        let body = mint_ticket_keyed(&sk, &kid, "vm-old", 1, "tk-1", Some(KeyMode::Split));
+        let err = process_admin_register(&body, "vm-old", &keyring, &vm_states, &idem, 2_000)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AdminRegisterErr::KeyModeConflict {
+                ticket_id: "tk-1".into(),
+                vm_id: "vm-old".into(),
+                recorded: KeyMode::Hippius,
+                requested: KeyMode::Split,
+            }
+        );
+    }
+
+    #[test]
+    fn register_audit_reason_names_the_mode_only_off_m0() {
+        let td = TempDir::new().unwrap();
+        let audit = FileAdminAuditSink::open(td.path().join("admin-audit")).unwrap();
+        let sha = [0u8; 32];
+        for mode in [KeyMode::Hippius, KeyMode::Split, KeyMode::Customer] {
+            let ok: core::result::Result<AdminRegisterOk, AdminRegisterErr> = Ok(AdminRegisterOk {
+                ticket_id: "tk".into(),
+                vm_id: "vm".into(),
+                vm_generation: 1,
+                host: "h".into(),
+                lease_id: "l".into(),
+                key_mode: mode,
+                applied_at: 1,
+                cached: false,
+            });
+            record_admin_register_outcome(&audit, "vm", &sha, None, None, &ok, 1_000).unwrap();
+        }
+        let lines = decode_admin_log(td.path());
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains(r#"Text("reason"), Text("")"#),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("key-mode:split"), "{}", lines[1]);
+        assert!(lines[2].contains("key-mode:customer"), "{}", lines[2]);
+    }
+
     // ── §25 activate (Active → Migrating) tests ─────────────────────
 
     /// Register an `Active{gen,host,lease}` directly (skips the
@@ -1510,6 +2551,7 @@ mod tests {
                     host: host.into(),
                     lease_id: lease.into(),
                 },
+                KeyMode::Hippius,
             )
             .unwrap();
         assert_eq!(outcome, RegisterOutcome::Inserted);
@@ -1572,9 +2614,141 @@ mod tests {
         let err = process_admin_activate("vm-div", 2, "dst-b", &vm_states).unwrap_err();
         assert_eq!(err.status_code(), 409);
         assert_eq!(err.reason(), "activate-conflict");
-        // A different new_gen is likewise a conflict.
-        let err2 = process_admin_activate("vm-div", 3, "dst-a", &vm_states).unwrap_err();
-        assert_eq!(err2.status_code(), 409);
+        // Nothing moved: dst-a at gen 2 is still the only releasable host.
+        let state = vm_states.get("vm-div").unwrap();
+        crate::lifecycle::check_releasable(&state, 2, "lease-1", "dst-a").unwrap();
+        assert!(crate::lifecycle::check_releasable(&state, 2, "lease-1", "dst-b").is_err());
+        // (A strictly HIGHER new_gen is not a re-drive but the next hop —
+        // see `a_migrated_vm_can_be_migrated_again_…`.)
+    }
+
+    #[test]
+    fn a_migrated_vm_can_be_migrated_again_and_every_prior_holder_stays_fenced() {
+        // CLAIM (bug 4b): after one §25 the row is `Migrating{5→6, dst-a}`
+        // and nothing ever promotes it back to `Active`. A second §25 (or a
+        // failover) must still be able to move the fence forward — the
+        // current holder is `(6, dst-a)`, so the next hop is
+        // `Migrating{6→7, source=dst-a, dest=dst-b}`.
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-2x", 5, "src", "lease-5");
+        process_admin_activate("vm-2x", 6, "dst-a", &vm_states).unwrap();
+
+        let ok = process_admin_activate("vm-2x", 7, "dst-b", &vm_states).unwrap();
+        assert!(!ok.cached);
+        assert_eq!(
+            ok.old_gen, 6,
+            "the fenced-out generation is the prior dest's"
+        );
+        assert_eq!(ok.new_gen, 7);
+        assert_eq!(ok.dest, "dst-b");
+        assert_eq!(
+            ok.lease_id, "lease-5",
+            "the lease is carried, never re-minted"
+        );
+
+        let state = vm_states.get("vm-2x").unwrap();
+        assert_eq!(
+            state,
+            VmState::Migrating {
+                old_gen: 6,
+                new_gen: 7,
+                source: "dst-a".into(),
+                dest: "dst-b".into(),
+                lease_id: "lease-5".into(),
+            }
+        );
+        // Only the new holder unlocks; BOTH earlier holders are fenced, on
+        // any host.
+        crate::lifecycle::check_releasable(&state, 7, "lease-5", "dst-b").unwrap();
+        for (gen, host) in [
+            (6, "dst-a"),
+            (6, "dst-b"),
+            (5, "src"),
+            (5, "dst-b"),
+            (7, "dst-a"),
+        ] {
+            assert!(
+                crate::lifecycle::check_releasable(&state, gen, "lease-5", host).is_err(),
+                "({gen}, {host}) must stay fenced"
+            );
+        }
+
+        // The second hop is idempotent on re-drive, like the first.
+        let again = process_admin_activate("vm-2x", 7, "dst-b", &vm_states).unwrap();
+        assert!(again.cached);
+        assert_eq!(again.old_gen, 6);
+
+        // And a third hop works the same way (failover of a failover).
+        let third = process_admin_activate("vm-2x", 8, "dst-c", &vm_states).unwrap();
+        assert_eq!((third.old_gen, third.new_gen), (7, 8));
+    }
+
+    #[test]
+    fn a_migration_whose_dest_never_booted_can_be_retargeted_at_a_higher_gen() {
+        // CLAIM: `Migrating{1→2, dst-a}` where dst-a died before booting —
+        // vali retargets at gen 3 to dst-b. dst-a at gen 2 must then be
+        // fenced exactly as a source is, so if it comes back it cannot
+        // unlock a second copy.
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-rt", 1, "src", "lease-1");
+        process_admin_activate("vm-rt", 2, "dst-a", &vm_states).unwrap();
+
+        let ok = process_admin_activate("vm-rt", 3, "dst-b", &vm_states).unwrap();
+        assert_eq!((ok.old_gen, ok.new_gen), (2, 3));
+        let state = vm_states.get("vm-rt").unwrap();
+        crate::lifecycle::check_releasable(&state, 3, "lease-1", "dst-b").unwrap();
+        assert!(crate::lifecycle::check_releasable(&state, 2, "lease-1", "dst-a").is_err());
+        assert!(crate::lifecycle::check_releasable(&state, 1, "lease-1", "src").is_err());
+    }
+
+    #[test]
+    fn activate_from_migrating_at_a_non_increasing_gen_is_refused_and_writes_nothing() {
+        // CLAIM: the forward-only gate applies to the Migrating hop too.
+        // `== new_gen` to a different dest would hand the current holder's
+        // generation to a second host; `< new_gen` re-admits a burned one.
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-nm", 5, "src", "lease-5");
+        process_admin_activate("vm-nm", 6, "dst-a", &vm_states).unwrap();
+        let before = vm_states.get("vm-nm").unwrap();
+
+        let same = process_admin_activate("vm-nm", 6, "dst-b", &vm_states).unwrap_err();
+        assert_eq!(same.reason(), "activate-conflict");
+        for bad in [5u64, 1, 0] {
+            let err = process_admin_activate("vm-nm", bad, "dst-b", &vm_states).unwrap_err();
+            assert_eq!(err.status_code(), 409);
+            assert!(
+                matches!(
+                    err,
+                    AdminActivateErr::NonMonotonic {
+                        old_gen: 6,
+                        requested,
+                        ..
+                    } if requested == bad
+                ),
+                "new_gen={bad}: {err:?}"
+            );
+        }
+        assert_eq!(vm_states.get("vm-nm").unwrap(), before, "nothing written");
+    }
+
+    #[test]
+    fn activate_from_migrating_survives_a_kbs_restart() {
+        // CLAIM: the second hop is a plain `Migrating` row — the on-disk
+        // format is unchanged, so it reloads from `vm-states.json`.
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        {
+            let vm_states = FileVmStateStore::open(&path).unwrap();
+            seed_active(&vm_states, "vm-p", 1, "src", "l");
+            process_admin_activate("vm-p", 2, "dst-a", &vm_states).unwrap();
+            process_admin_activate("vm-p", 3, "dst-b", &vm_states).unwrap();
+        }
+        let reopened = FileVmStateStore::open(&path).unwrap();
+        assert!(matches!(
+            reopened.get("vm-p").unwrap(),
+            VmState::Migrating { old_gen: 2, new_gen: 3, ref source, ref dest, .. }
+                if source == "dst-a" && dest == "dst-b"
+        ));
     }
 
     #[test]
@@ -1606,7 +2780,7 @@ mod tests {
         let (_td, vm_states, _idem) = fresh_stores();
         // A VM mid-decommission must never be re-activated for migration.
         vm_states
-            .register("vm-dec", VmState::Decommissioning)
+            .register("vm-dec", VmState::Decommissioning, KeyMode::Hippius)
             .unwrap();
         let err = process_admin_activate("vm-dec", 2, "dst", &vm_states).unwrap_err();
         assert_eq!(err.status_code(), 409);
@@ -1711,6 +2885,196 @@ mod tests {
 
         let verified = audit.verify().unwrap();
         assert_eq!(verified.records, 2, "both outcomes are in the chain");
+    }
+
+    // ── §24 decommission fence + tombstone ───────────────────────────
+
+    #[test]
+    fn decommission_fences_active_and_denies_release_from_then_on() {
+        // CLAIM: the fence moves Active → Decommissioning durably, and
+        // from that write on check_releasable refuses the very ticket
+        // that was releasable a moment before.
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-d", 5, "n1", "l");
+        crate::lifecycle::check_releasable(&vm_states.get("vm-d").unwrap(), 5, "l", "n1").unwrap();
+
+        let ok = process_admin_decommission("vm-d", &vm_states).unwrap();
+        assert_eq!(
+            (ok.previous, ok.state, ok.cached),
+            ("active", "decommissioning", false)
+        );
+        let state = vm_states.get("vm-d").unwrap();
+        assert_eq!(state, VmState::Decommissioning);
+        assert!(crate::lifecycle::check_releasable(&state, 5, "l", "n1").is_err());
+    }
+
+    #[test]
+    fn decommission_fences_a_migrating_vm_and_an_absent_row() {
+        // CLAIM: a VM mid-§25 is fenced too (both source and dest lose
+        // release), and an ABSENT row — a KBS that restarted — is fenced
+        // rather than refused, so its guest hears "decommissioning", not
+        // "unknown".
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-m", 1, "src", "l");
+        process_admin_activate("vm-m", 2, "dst", &vm_states).unwrap();
+        let ok = process_admin_decommission("vm-m", &vm_states).unwrap();
+        assert_eq!((ok.previous, ok.state), ("migrating", "decommissioning"));
+        assert_eq!(vm_states.get("vm-m").unwrap(), VmState::Decommissioning);
+
+        let ok = process_admin_decommission("vm-absent", &vm_states).unwrap();
+        assert_eq!(
+            (ok.previous, ok.state, ok.cached),
+            ("absent", "decommissioning", false)
+        );
+        assert_eq!(
+            vm_states.get("vm-absent").unwrap(),
+            VmState::Decommissioning
+        );
+    }
+
+    #[test]
+    fn decommission_is_idempotent_and_never_undoes_a_tombstone() {
+        // CLAIM: a re-drive writes nothing, and a decommission over a
+        // Destroyed row leaves the tombstone (never walks it back).
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-i", 1, "n", "l");
+        process_admin_decommission("vm-i", &vm_states).unwrap();
+        let again = process_admin_decommission("vm-i", &vm_states).unwrap();
+        assert!(again.cached);
+        assert_eq!(again.previous, "decommissioning");
+
+        process_admin_tombstone("vm-i", 1, &vm_states).unwrap();
+        let after = process_admin_decommission("vm-i", &vm_states).unwrap();
+        assert_eq!(
+            (after.previous, after.state, after.cached),
+            ("destroyed", "destroyed", true)
+        );
+        assert_eq!(
+            vm_states.get("vm-i").unwrap(),
+            VmState::Destroyed { gen: 1 }
+        );
+    }
+
+    #[test]
+    fn tombstone_from_any_state_or_absent_and_idempotent_at_the_same_gen() {
+        let (_td, vm_states, _idem) = fresh_stores();
+        seed_active(&vm_states, "vm-a", 3, "n", "l");
+        let ok = process_admin_tombstone("vm-a", 3, &vm_states).unwrap();
+        assert_eq!(
+            (ok.previous, ok.state, ok.cached),
+            ("active", "destroyed", false)
+        );
+        let again = process_admin_tombstone("vm-a", 3, &vm_states).unwrap();
+        assert!(again.cached);
+
+        let ok = process_admin_tombstone("vm-gone", 7, &vm_states).unwrap();
+        assert_eq!((ok.previous, ok.cached), ("absent", false));
+        assert_eq!(
+            vm_states.get("vm-gone").unwrap(),
+            VmState::Destroyed { gen: 7 }
+        );
+
+        process_admin_decommission("vm-dec", &vm_states).unwrap();
+        let ok = process_admin_tombstone("vm-dec", 2, &vm_states).unwrap();
+        assert_eq!(ok.previous, "decommissioning");
+    }
+
+    #[test]
+    fn tombstone_at_another_generation_is_a_409_and_writes_nothing() {
+        let (_td, vm_states, _idem) = fresh_stores();
+        process_admin_tombstone("vm-t", 4, &vm_states).unwrap();
+        let err = process_admin_tombstone("vm-t", 5, &vm_states).unwrap_err();
+        assert_eq!(err.status_code(), 409);
+        assert_eq!(err.reason(), "tombstone-generation-conflict");
+        assert_eq!(
+            err,
+            AdminFenceErr::GenerationConflict {
+                vm_id: "vm-t".into(),
+                current_gen: 4,
+                requested: 5
+            }
+        );
+        assert_eq!(
+            vm_states.get("vm-t").unwrap(),
+            VmState::Destroyed { gen: 4 }
+        );
+    }
+
+    #[test]
+    fn a_tombstone_is_permanent_against_every_other_admin_write() {
+        // CLAIM: nothing in the admin API moves a VM out of Destroyed —
+        // not a register of the same VM, not an activate. Only a store
+        // wipe forgets it (hence the recovery ceremony re-installs it).
+        let (_td, vm_states, _idem) = fresh_stores();
+        process_admin_tombstone("vm-p", 1, &vm_states).unwrap();
+        let reg = vm_states
+            .register(
+                "vm-p",
+                VmState::Active {
+                    gen: 1,
+                    host: "n".into(),
+                    lease_id: "l".into(),
+                },
+                KeyMode::Hippius,
+            )
+            .unwrap();
+        assert!(matches!(reg, RegisterOutcome::Conflict(_)));
+        assert!(process_admin_activate("vm-p", 2, "dst", &vm_states).is_err());
+        assert_eq!(
+            vm_states.get("vm-p").unwrap(),
+            VmState::Destroyed { gen: 1 }
+        );
+    }
+
+    #[test]
+    fn fences_survive_a_process_restart_on_the_same_state_dir() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        {
+            let vm_states = FileVmStateStore::open(&path).unwrap();
+            process_admin_decommission("vm-1", &vm_states).unwrap();
+            process_admin_tombstone("vm-2", 9, &vm_states).unwrap();
+        }
+        let reopened = FileVmStateStore::open(&path).unwrap();
+        assert_eq!(reopened.get("vm-1").unwrap(), VmState::Decommissioning);
+        assert_eq!(reopened.get("vm-2").unwrap(), VmState::Destroyed { gen: 9 });
+    }
+
+    #[test]
+    fn fence_rejects_an_empty_vm_id() {
+        let (_td, vm_states, _idem) = fresh_stores();
+        assert_eq!(
+            process_admin_decommission("", &vm_states)
+                .unwrap_err()
+                .status_code(),
+            400
+        );
+        assert_eq!(
+            process_admin_tombstone("", 1, &vm_states)
+                .unwrap_err()
+                .status_code(),
+            400
+        );
+        let zero = process_admin_tombstone("vm-z", 0, &vm_states).unwrap_err();
+        assert_eq!(zero.reason(), "tombstone-gen-zero");
+        assert!(
+            vm_states.get("vm-z").is_err(),
+            "a refused tombstone writes nothing"
+        );
+    }
+
+    #[test]
+    fn fence_audit_records_both_outcomes() {
+        let td = TempDir::new().unwrap();
+        let audit = FileAdminAuditSink::open(td.path().join("audit")).unwrap();
+        let (_td2, vm_states, _idem) = fresh_stores();
+        let sha = [1u8; 32];
+        let ok = process_admin_tombstone("vm-x", 1, &vm_states);
+        record_admin_fence_outcome(&audit, "tombstone", "vm-x", &sha, None, None, &ok, 10).unwrap();
+        let refused = process_admin_tombstone("vm-x", 2, &vm_states);
+        record_admin_fence_outcome(&audit, "tombstone", "vm-x", &sha, None, None, &refused, 11)
+            .unwrap();
+        assert_eq!(audit.verify().unwrap().records, 2);
     }
 
     // ── seed-boot-counter (operator disaster recovery) ──────────────

@@ -17,7 +17,7 @@
 # or the step-order CI golden in scripts/dev/release-core-order-test.sh
 # will not protect them).
 #
-# Sequence (audit follow-up Codex finding #8 — cheap, network-free,
+# Sequence (audit follow-up Review finding #8 — cheap, network-free,
 # fail-closed work FIRST):
 #   1. hippius_parse_cmdline   — /proc/cmdline hippius.* tokens.
 #   2. hippius_verify_header   — #296 detached-header sha gate. MUST
@@ -58,6 +58,14 @@
 
 # ── Logging (overridable by the wrapper) ─────────────────────────────
 HIPPIUS_LOG_TAG="${HIPPIUS_LOG_TAG:-hippius-release-core}"
+
+# Where `hippius_run_release` writes the released cloud-init user-data:
+# the NoCloud seed. Assigned here, NOT `${VAR:-default}` — unknown
+# `NAME=value` words on the kernel cmdline reach the initramfs as
+# environment variables, and this path must not follow them. Only the
+# golden overlay's M1/M2 path re-points it, at run time, to its staging
+# file (hippius-golden-overlay.sh, H5b).
+HIPPIUS_USERDATA_OUT="/run/cloud-init/seed/user-data"
 
 if ! command -v hippius_log >/dev/null 2>&1; then
 hippius_log() {
@@ -262,7 +270,18 @@ hippius_net_up() {
 # healthy TLS handshake on the diagnostic while MITMing the real
 # release (audit finding #7). Failure here is non-fatal — the release
 # binary is the actual gate.
+#
+# Customer-held keys (M1/M2): the caller sets HIPPIUS_GUARDIAN_FIRST=1
+# and the probe is skipped — those boots must not contact the KBS at all
+# before the guardian has released its share (the release binary runs
+# the guardian leg first). The call itself stays unconditional (see
+# `hippius_acquire`); only the KBS request is dropped. Unset (M0, every
+# legacy boot) ⇒ unchanged.
 hippius_kbs_preflight() {
+    if [ -n "${HIPPIUS_GUARDIAN_FIRST:-}" ]; then
+        hippius_log "preflight: skipped (customer-held keys: no KBS contact before the guardian)"
+        return 0
+    fi
     command -v curl >/dev/null 2>&1 || return 0
     pf="$(curl -s --max-time 5 -X POST -o /dev/null \
         -w 'remote=%{remote_ip} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s' \
@@ -412,21 +431,21 @@ hippius_run_release() {
     if ! hippius-guest-release \
             --kbs-url "$HIPPIUS_KBS_URL" \
             --ticket "$HIPPIUS_TICKET_FILE" \
-            --userdata-out /run/cloud-init/seed/user-data \
+            --userdata-out "$HIPPIUS_USERDATA_OUT" \
             $HIPPIUS_LIFECYCLE_FLAGS \
             $HIPPIUS_STATE_DISK_FLAGS \
             $HIPPIUS_EXTRA_RELEASE_FLAGS \
             > "$kek_out" \
             2>>/dev/kmsg; then
         shred -u "$kek_out" 2>/dev/null || rm -f "$kek_out"
-        rm -f /run/cloud-init/seed/user-data 2>/dev/null || true
+        rm -f "$HIPPIUS_USERDATA_OUT" 2>/dev/null || true
         hippius_umount_state_disk
         hippius_die "KBS release exchange failed (see kmsg for the fail-closed class)"
     fi
     kek_bytes=$(wc -c < "$kek_out")
     if [ "${kek_bytes:-0}" -ne 32 ]; then
         shred -u "$kek_out" 2>/dev/null || rm -f "$kek_out"
-        rm -f /run/cloud-init/seed/user-data 2>/dev/null || true
+        rm -f "$HIPPIUS_USERDATA_OUT" 2>/dev/null || true
         hippius_umount_state_disk
         hippius_die "KBS release exchange returned ${kek_bytes} bytes; expected 32"
     fi

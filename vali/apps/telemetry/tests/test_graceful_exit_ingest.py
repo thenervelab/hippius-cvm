@@ -33,7 +33,7 @@ pytestmark = pytest.mark.django_db
 
 INGEST_URL = reverse("telemetry_graceful_exit")
 
-MINER_ID = "miner-1"
+MINER_ID = "miner-a"
 PEER_ID = f"hippius-miner:{MINER_ID}"
 DOMAIN = "HIPPIUS_MINER_GRACEFUL_EXIT_V1"
 

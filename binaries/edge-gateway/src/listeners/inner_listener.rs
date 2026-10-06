@@ -7,7 +7,7 @@
 //!
 //! - **Plain HTTP** — no mTLS, no rustls, no ALPN gate. Vali does not
 //!   own a client cert against the Edge CA (the operator-side mTLS
-//!   material under `/Users/dubs/dev/everything/hippius-compute-key/`
+//!   material in the operator's offline CA key store
 //!   issues the Edge server cert + per-miner client certs only); the
 //!   inner listener is gated at L3 by a Cilium NetworkPolicy that
 //!   admits the vali pod's PodSelector and nothing else. See
@@ -31,7 +31,8 @@
 //! ## Body cap + timeouts
 //!
 //! Both already live on the router: a `DefaultBodyLimit` for the
-//! 64 KiB request cap (matching the miner-agent's `MAX_ORDER_BODY`),
+//! request cap (64 KiB, 2 MiB for a multipart order — see
+//! `OrderKind::max_order_body`),
 //! and the [`MinerForward`](crate::forward::MinerForward) client's
 //! own 5 s connect / 30 s request timeouts for the outbound leg. No
 //! listener-level whole-request timeout layer here — the inner

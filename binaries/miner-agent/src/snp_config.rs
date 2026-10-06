@@ -68,10 +68,11 @@ use raw_cpuid::CpuId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnpCpuConfig {
     /// Encryption C-bit position (`EBX[5:0]` of CPUID leaf
-    /// `0x8000001f`). Genoa / Turin: 51. Milan / earlier: 47.
+    /// `0x8000001f`). Milan / Genoa / Turin: 51 (EPYC 7543 Milan
+    /// reads `EBX = 0x4173` ⇒ 51). Naples / Rome: 47.
     pub cbitpos: u32,
     /// Physical-address-reduction (`EBX[11:6]` of the same leaf).
-    /// `1` on current EPYC parts.
+    /// Varies by SKU (Milan EPYC 7543: 5; Genoa EPYC 9254: 6).
     pub reduced_phys_bits: u32,
 }
 
@@ -187,7 +188,8 @@ mod tests {
     /// `snp_probe_returns_nonzero_on_amd_epyc_host`).
     #[test]
     fn extracts_cbitpos_and_reduced_phys_bits_from_ebx_bitfields() {
-        // Genoa / Turin shape: cbitpos=51 (0x33), reduced=1.
+        // Milan / Genoa / Turin C-bit: cbitpos=51 (0x33). reduced=1 is a
+        // synthetic value here (real SKUs report 5 on Milan, 6 on Genoa).
         // EBX = (1 << 6) | 51 = 64 | 51 = 0x73.
         let ebx: u32 = (1 << 6) | 51;
         let cbitpos = ebx & 0x3f;
@@ -195,7 +197,7 @@ mod tests {
         assert_eq!(cbitpos, 51);
         assert_eq!(reduced, 1);
 
-        // Milan shape: cbitpos=47 (0x2f), reduced=1. EBX = 64 | 47.
+        // Naples / Rome shape: cbitpos=47 (0x2f), reduced=1. EBX = 64 | 47.
         let ebx: u32 = (1 << 6) | 47;
         let cbitpos = ebx & 0x3f;
         let reduced = (ebx >> 6) & 0x3f;
@@ -299,7 +301,8 @@ mod tests {
             cfg.cbitpos
         );
         // EPYC SKU `reduced_phys_bits` values observed:
-        //   * 7xx2 (Rome), 7xx3 (Milan): 1
+        //   * 7xx2 (Rome): 1
+        //   * 7xx3 (Milan, e.g. EPYC 7543): 5
         //   * 9004 (Genoa, e.g. the EPYC 9254 in our self-hosted
         //     runner): 6
         // The Turin SKUs report higher still. Widen the range as

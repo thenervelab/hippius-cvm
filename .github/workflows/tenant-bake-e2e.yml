@@ -7,7 +7,7 @@ name: tenant-bake-e2e
 #
 # This is the bake half of the chain only — it needs no SNP hardware, no
 # Vault, no S3, no KBS. The attested-launch half is validated live on
-# miner-1 (see docs/operator/byo-base-os-bake-runbook.md). The dracut
+# an SNP host (see docs/operator/byo-base-os-bake-runbook.md). The dracut
 # module's kernel-module coverage has its own gate (dracut-module.yml);
 # this workflow proves the chroot + package install + initramfs build +
 # LUKS encrypt actually completes per distro and yields a mountable,
@@ -49,6 +49,8 @@ concurrency:
 
 jobs:
   bake:
+    # Stays GitHub-hosted: privileged docker with loop/nbd devices and
+    # qemu-nbd, not guaranteed on the Hippius runner VMs.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:

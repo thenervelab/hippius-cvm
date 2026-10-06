@@ -21,7 +21,7 @@
 //!   keep in sync, no second DoS surface).
 //! - **Hard cap on the bucket map** (`max_tracked_peers`, default
 //!   65k). On insert-at-cap the limiter evicts the oldest-`last_seen`
-//!   bucket, so the map size is **bounded at all times** — codex
+//!   bucket, so the map size is **bounded at all times** — review
 //!   review of PR-H3 v1 caught the original "GC every 4096 calls
 //!   inside the 1h horizon" window where memory could grow linearly.
 //! - Dormant buckets are also GC'd at 1h of inactivity, default —
@@ -153,7 +153,7 @@ impl PerSourceRateLimiter {
             sweep(&mut state.buckets, now, self.idle_horizon);
         }
 
-        // PR-H3 review (codex+gemini): enforce the hard cap BEFORE
+        // PR-H3 review (review): enforce the hard cap BEFORE
         // `or_insert` could allocate a new bucket — sweep + evict-
         // oldest if we're at capacity and the peer is new. Bounded
         // memory under unique-peer flood: the map size never exceeds
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn map_size_is_hard_capped_via_oldest_eviction() {
-        // PR-H3 review (codex blocker, gemini concern): the bucket
+        // PR-H3 review (review blocker, review concern): the bucket
         // map MUST never exceed `max_tracked_peers`. Insert
         // cap+overflow unique peers and assert the map size sits
         // exactly at cap throughout.

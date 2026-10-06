@@ -133,6 +133,21 @@ spec:
             k8s:io.kubernetes.pod.namespace: vali
             k8s:app.kubernetes.io/name: vali
             k8s:app.kubernetes.io/component: launch-tick
+        # The synthetic monitor's leak reaper force-destroys a leaked
+        # synthetic VM's domain through this same listener
+        # (`apps.synthetic.e2e._force_destroy` → `dispatch_destroy`).
+        # Without these entries its connect is dropped (`edge-order: peer
+        # unreachable`) and the domain kept running as a zombie (seen in
+        # production). Same vali image, same order-dispatch code as
+        # orchestration-tick.
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: synthetic-monitor-light
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: vali
+            k8s:app.kubernetes.io/name: vali
+            k8s:app.kubernetes.io/component: synthetic-monitor-full
       toPorts:
         - ports:
             - port: "8444"

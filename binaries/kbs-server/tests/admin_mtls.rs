@@ -14,7 +14,7 @@
 use axum::routing::get;
 use axum::Router;
 use hippius_kbs_server::admin_tls::{build_server_config, AdminTlsPaths};
-use kbs_transport::PeerCertInfo;
+use kbs_transport::{PeerCertInfo, SpiffeId};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
@@ -30,6 +30,18 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const SERVER_DNS: &str = "admin.kbs.test";
 const VALI_SAN_URI: &str = "spiffe://hippius.network/vali";
+
+const OPERATOR_SAN_URI: &str = "spiffe://hippius.network/operator";
+
+/// The identities these harnesses admit: vali's, plus a second SPIFFE ID
+/// so a leaf carrying BOTH can be exercised. Anything else chaining to
+/// the same CA must be dropped.
+fn allowed() -> Arc<Vec<SpiffeId>> {
+    Arc::new(vec![
+        SpiffeId::parse(VALI_SAN_URI).unwrap(),
+        SpiffeId::parse(OPERATOR_SAN_URI).unwrap(),
+    ])
+}
 
 // ── throwaway PKI ───────────────────────────────────────────────────
 
@@ -73,6 +85,31 @@ fn mint_leaf(
     }
     let leaf = params.signed_by(&kp, ca, ca_kp).unwrap();
     (leaf.pem(), kp.serialize_pem())
+}
+
+/// Mint a leaf signed by `ca` with exactly these SANs (none ⇒ no SAN
+/// extension), this CN, and these raw extra extensions.
+fn mint_leaf_sans(
+    ca: &Certificate,
+    ca_kp: &KeyPair,
+    sans: Vec<SanType>,
+    cn: Option<&str>,
+    extra: Vec<rcgen::CustomExtension>,
+) -> (String, String) {
+    let kp = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = sans;
+    params.custom_extensions = extra;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    if let Some(c) = cn {
+        params.distinguished_name.push(DnType::CommonName, c);
+    }
+    let leaf = params.signed_by(&kp, ca, ca_kp).unwrap();
+    (leaf.pem(), kp.serialize_pem())
+}
+
+fn uri_san(s: &str) -> SanType {
+    SanType::URI(s.try_into().unwrap())
 }
 
 fn write(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
@@ -145,9 +182,15 @@ async fn start(dir: &std::path::Path) -> (Harness, Certificate, KeyPair) {
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        hippius_kbs_server::admin_tls::serve_admin_mtls(listener, acceptor, router, async {
-            let _ = rx.await;
-        })
+        hippius_kbs_server::admin_tls::serve_admin_mtls(
+            listener,
+            acceptor,
+            router,
+            allowed(),
+            async {
+                let _ = rx.await;
+            },
+        )
         .await;
     });
 
@@ -310,7 +353,7 @@ async fn peer_with_a_pinned_ca_cert_reaches_the_handler_with_its_identity() {
     let peer = seen[0]
         .as_ref()
         .expect("PeerCertInfo must be injected into the request extensions");
-    assert_eq!(peer.san_uri, VALI_SAN_URI);
+    assert_eq!(peer.audit_identity(), VALI_SAN_URI);
     assert!(
         !peer.serial_hex.is_empty(),
         "the cert serial is the second half of the attribution"
@@ -337,17 +380,100 @@ async fn ca_issued_cert_without_any_identity_carrier_is_dropped() {
 }
 
 #[tokio::test]
-async fn dns_san_is_accepted_as_the_identity_when_there_is_no_uri() {
-    // Extraction order is URI → DNS → CN; an operator minting the
-    // legacy DNS-named admin cert still gets attributable rows.
+async fn every_leaf_that_is_not_uri_sans_only_all_listed_is_dropped() {
+    // Chaining to the admin CA is necessary, not sufficient. Each of
+    // these completes the handshake (the TLS layer accepts it — the gate
+    // under test is ours, not webpki's) and is then dropped before any
+    // handler: a CN or a DNS SAN never stands in for the URI, and a
+    // listed URI beside anything else is an ambiguous leaf, not vali.
     let dir = tempfile::TempDir::new().unwrap();
     let (h, ca, ca_kp) = start(dir.path()).await;
 
-    let dns_only = mint_leaf(&ca, &ca_kp, Some("vali.hippius.svc"), None, None);
-    let resp = response_of(request(&h, Some(dns_only)).await);
+    let email = SanType::Rfc822Name("vali@hippius.network".try_into().unwrap());
+    let ip = SanType::IpAddress("127.0.0.1".parse().unwrap());
+    let dns = |d: &str| SanType::DnsName(d.try_into().unwrap());
+    let other_name = SanType::OtherName((
+        vec![1, 3, 6, 1, 4, 1, 311, 20, 2, 3],
+        rcgen::OtherNameValue::Utf8String("vali@hippius.network".into()),
+    ));
+    let cases: Vec<(&str, Vec<SanType>, Option<&str>)> = vec![
+        ("CN-only spelling the URI", vec![], Some(VALI_SAN_URI)),
+        ("CN-only vali", vec![], Some("vali")),
+        ("DNS SAN spelling the URI", vec![dns(VALI_SAN_URI)], None),
+        (
+            "URI + DNS",
+            vec![uri_san(VALI_SAN_URI), dns("vali.hippius.svc")],
+            None,
+        ),
+        ("URI + IP", vec![uri_san(VALI_SAN_URI), ip], Some("vali")),
+        (
+            "URI + email",
+            vec![uri_san(VALI_SAN_URI), email],
+            Some("vali"),
+        ),
+        (
+            "URI + otherName",
+            vec![uri_san(VALI_SAN_URI), other_name],
+            None,
+        ),
+        (
+            "two URIs, one unlisted",
+            vec![
+                uri_san(VALI_SAN_URI),
+                uri_san("spiffe://hippius.network/evil"),
+            ],
+            None,
+        ),
+        (
+            "one unlisted URI",
+            vec![uri_san("spiffe://hippius.network/evil")],
+            None,
+        ),
+    ];
+    for (label, sans, cn) in cases {
+        let leaf = mint_leaf_sans(&ca, &ca_kp, sans, cn, vec![]);
+        match request(&h, Some(leaf)).await {
+            Exchange::DroppedAfterHandshake => {}
+            other => panic!("{label}: must be dropped after the handshake, got {other:?}"),
+        }
+    }
+    // A CONSTRUCTED [6] wrapping vali's exact bytes: webpki accepts the
+    // leaf and x509-parser reads it as a URI SAN — the gate must not.
+    let mut constructed_uri = vec![0xa6, VALI_SAN_URI.len() as u8];
+    constructed_uri.extend_from_slice(VALI_SAN_URI.as_bytes());
+    let mut san = vec![0x30, constructed_uri.len() as u8];
+    san.extend(constructed_uri);
+    let raw = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 17], san);
+    let leaf = mint_leaf_sans(&ca, &ca_kp, vec![], None, vec![raw]);
+    match request(&h, Some(leaf)).await {
+        Exchange::DroppedAfterHandshake => {}
+        other => panic!("constructed [6] URI: must be dropped after the handshake, got {other:?}"),
+    }
+    settle().await;
+    assert_eq!(h.probe.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_leaf_with_several_listed_uris_is_recorded_by_all_of_them() {
+    // The audit identity is the full sorted URI list — not "the first
+    // SAN" — so neither identity can hide behind the other.
+    let dir = tempfile::TempDir::new().unwrap();
+    let (h, ca, ca_kp) = start(dir.path()).await;
+
+    let both = mint_leaf_sans(
+        &ca,
+        &ca_kp,
+        vec![uri_san(VALI_SAN_URI), uri_san(OPERATOR_SAN_URI)],
+        None,
+        vec![],
+    );
+    let resp = response_of(request(&h, Some(both)).await);
     assert!(resp.starts_with("HTTP/1.1 200"));
     let seen = h.probe.seen_peer.lock().unwrap();
-    assert_eq!(seen[0].as_ref().unwrap().san_uri, "vali.hippius.svc");
+    assert_eq!(
+        seen[0].as_ref().unwrap().audit_identity(),
+        format!("{OPERATOR_SAN_URI},{VALI_SAN_URI}")
+    );
 }
 
 // ── real router coverage: the suppressed-confirm admin reset ──────────
@@ -374,6 +500,7 @@ fn test_posture() -> hippius_types::admin::AdminConfigPostureResponse {
     hippius_types::admin::AdminConfigPostureResponse {
         v: 1,
         require_wrapped_kek: true,
+        require_wrapped_userdata: true,
         max_unconfirmed_releases: Some(3),
         volume_stamp_gate_armed: true,
         admin_listener_mode: "mtls".into(),
@@ -462,6 +589,12 @@ async fn start_with_real_admin_router(
         // read route to decide whether it is safe to arm.
         configured_max_unconfirmed_releases: None,
         posture: Arc::new(test_posture()),
+        custody: None,
+        keepalive_bindings: std::sync::Arc::new(
+            kbs_core::keepalive_binding::InMemoryKeepaliveBindings::default(),
+        ),
+        rollback: None,
+        release_audit: None,
     };
     let router = kbs_transport::build_admin_router(admin_state);
 
@@ -469,9 +602,15 @@ async fn start_with_real_admin_router(
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        hippius_kbs_server::admin_tls::serve_admin_mtls(listener, acceptor, router, async {
-            let _ = rx.await;
-        })
+        hippius_kbs_server::admin_tls::serve_admin_mtls(
+            listener,
+            acceptor,
+            router,
+            allowed(),
+            async {
+                let _ = rx.await;
+            },
+        )
         .await;
     });
 
@@ -578,6 +717,28 @@ async fn reset_volume_stamp_suppression_is_refused_without_a_client_cert() {
         "the seeded count (4) plus this test's own probe call (5) — if the anonymous \
          request's reset had run, this would read 1 instead"
     );
+}
+
+#[tokio::test]
+async fn every_rollback_route_is_refused_by_tls_without_a_client_cert() {
+    // The authorized rollback is the one KBS path that admits a rewound
+    // boot. Nothing without an admin client cert may reach any of its
+    // routes: TLS must drop the peer before routing.
+    let dir = tempfile::TempDir::new().unwrap();
+    let (h, _ca, _ca_kp, _vs) = start_with_real_admin_router(dir.path()).await;
+    for (method, path) in [
+        ("POST", "/v1/admin/vm/vm-1/rollback-checkpoint"),
+        ("POST", "/v1/admin/vm/vm-1/authorize-rollback"),
+        ("DELETE", "/v1/admin/vm/vm-1/authorize-rollback/r-1"),
+        ("GET", "/v1/admin/vm/vm-1/rollback"),
+    ] {
+        match request_method_path(&h, None, method, path).await {
+            Exchange::TlsRejected(msg) => assert!(msg.contains("alert"), "{method} {path}: {msg}"),
+            other => {
+                panic!("{method} {path}: an anonymous peer must be rejected BY TLS, got {other:?}")
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -707,6 +868,7 @@ async fn config_posture_answers_for_a_pinned_ca_peer() {
     assert_eq!(v["max_unconfirmed_releases"], 3);
     assert_eq!(v["volume_stamp_gate_armed"], true);
     assert_eq!(v["require_wrapped_kek"], true);
+    assert_eq!(v["require_wrapped_userdata"], true);
     assert_eq!(v["admin_listener_mode"], "mtls");
     assert_eq!(v["min_tcb"], 7);
     assert_eq!(v["l1_key_count"], 2);
@@ -787,6 +949,12 @@ async fn start_plaintext_admin_router(
             as Arc<dyn kbs_core::volume_stamp::VolumeStampStore>,
         configured_max_unconfirmed_releases: None,
         posture: Arc::new(test_posture()),
+        custody: None,
+        keepalive_bindings: std::sync::Arc::new(
+            kbs_core::keepalive_binding::InMemoryKeepaliveBindings::default(),
+        ),
+        rollback: None,
+        release_audit: None,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

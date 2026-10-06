@@ -1,0 +1,59 @@
+name: golden-integrity
+
+# REAL dm-integrity end-to-end for the golden per-VM upper: the shipped
+# `hippius_golden_open_upper` + `hippius-guest-release --integrity-wipe`
+# against a loop device with the real cryptsetup. Needs root, which a
+# GitHub-hosted runner has (passwordless sudo). See
+# scripts/dev/golden-integrity-e2e.sh.
+on:
+  pull_request:
+    paths:
+      - scripts/initramfs/hippius-golden-overlay.sh
+      - scripts/initramfs/hippius-golden-hook
+      - scripts/dracut/95hippius-golden/**
+      - binaries/guest-release/**
+      - scripts/dev/golden-integrity-e2e.sh
+      - .github/workflows/golden-integrity.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/initramfs/hippius-golden-overlay.sh
+      - scripts/initramfs/hippius-golden-hook
+      - scripts/dracut/95hippius-golden/**
+      - binaries/guest-release/**
+      - scripts/dev/golden-integrity-e2e.sh
+      - .github/workflows/golden-integrity.yml
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    # Stays GitHub-hosted: loop devices + dm-integrity/dm-crypt modules are
+    # not guaranteed on the Hippius runner VMs.
+    runs-on: ubuntu-latest
+    # A regression that brings back a udev-cookie wait while the queue is
+    # stopped would otherwise hang for the 6 h default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcryptsetup-dev clang libclang-dev \
+            cryptsetup-bin e2fsprogs bc
+          cryptsetup --version
+      - name: Install Rust toolchain (rust-toolchain.toml-pinned)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "golden-integrity"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build hippius-guest-release
+        run: cargo build --release -p hippius-guest-release
+      - name: dm-integrity end-to-end
+        run: |
+          sudo modprobe dm_integrity dm_crypt loop
+          sudo WIPE_BIN="$PWD/target/release/hippius-guest-release" \
+            bash scripts/dev/golden-integrity-e2e.sh

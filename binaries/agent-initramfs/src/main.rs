@@ -226,13 +226,13 @@ fn resolve_kernel_release() -> Result<String, &'static str> {
 ///   existing ancestor and refuses anything other than `TMPFS_MAGIC`;
 ///   (2) `stages::switch_root` `MS_MOVE`s `/run` into `/sysroot/run`
 ///   so the cloud-init NoCloud seed survives the pivot
-///   (codex+gemini r1 convergent High).
+///   (review r1 convergent High).
 ///
 /// **Error classes** are compile-time `&'static str` for the §20
 /// logging discipline (`no_seed_logging.rs` enforces this). The mkdir
 /// failure class names the offender (`proc-mkdir` / `sys-mkdir` /
 /// `dev-mkdir` / `run-mkdir`) so an operator never has to guess which
-/// path the kernel refused (gemini r1 Low). The mount failure class
+/// path the kernel refused (review r1 Low). The mount failure class
 /// mirrors the same per-target naming (`proc-mount`, `sys-mount`,
 /// `dev-mount`, `run-mount`).
 #[cfg(target_os = "linux")]
@@ -1250,7 +1250,7 @@ mod tests {
     /// Containerized CI sometimes runs the test binary as the
     /// container entrypoint (so the runner IS PID 1) — `cargo test`
     /// under `docker run --init=false`, certain nextest setups
-    /// (codex r2 P2). In that case the test skips with a stderr note
+    /// (review r2 P2). In that case the test skips with a stderr note
     /// rather than driving a real mount; the dev-VM CI path
     /// (`~/bin/run-ci-locally.sh`) runs the binary natively, so the
     /// gate is exercised there.

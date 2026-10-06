@@ -14,8 +14,8 @@ The two `*.example.yml` files here are tracked and document the full schema:
 | `miner.example.yml` | `miner_nodes` (untrusted miner fleet) | `host_vars/<your-miner-hostname>.yml` |
 
 ```sh
-cp host_vars/miner.example.yml host_vars/my-miner-1.yml
-$EDITOR host_vars/my-miner-1.yml
+cp host_vars/miner.example.yml host_vars/my-miner.yml
+$EDITOR host_vars/my-miner.yml
 ```
 
 Ansible ignores the `*.example.yml` files themselves: it only reads the file

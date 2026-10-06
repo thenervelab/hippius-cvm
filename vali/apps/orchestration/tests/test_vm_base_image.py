@@ -6,17 +6,17 @@ CONTENT, never a shared mutable path.
 `LaunchSpec.rootfs_data_path` defaults to `/var/lib/hippius-miner/
 rootfs.img`: fixed, shared and MUTABLE. Verified live on 2026-08-13:
 
-  - `miner-2` — that path is a SYMLINK to `staging/rootfs.img`
+  - `miner-b` — that path is a SYMLINK to `staging/rootfs.img`
     (17 MB, 2026-06-29, the legacy base every legacy VM boots);
-  - `miner-3` — that path is a REAL 709 MB file dated
+  - `miner-c` — that path is a REAL 709 MB file dated
     2026-07-29 14:20 whose sha256 (`c6ffbc4a…`) is byte-identical to
-    `staging/realtenant-ubuntu-1/rootfs.img`.
+    `staging/tenant-ubuntu-1/rootfs.img`.
 
 One spec, two miners, two different operating systems — and a §25
 dest-activation was what put the 709 MB file there, because
 `effects._launch_paths` resolved `rootfs_data_path` from the SPEC and the
 dest miner STAGES to whatever path the order names. The same order aimed
-at miner-2 would have followed the symlink and replaced the shared legacy
+at miner-b would have followed the symlink and replaced the shared legacy
 base under every VM booting it.
 
 These tests kill exactly that, one mutation at a time.
@@ -48,7 +48,7 @@ def _spec(**overrides) -> launch.LaunchSpec:
     base = dict(
         tenant_id="t-1",
         user_id="u-1",
-        vm_id="realtenant-ubuntu-1",
+        vm_id="tenant-ubuntu-1",
         lease_id="lease-1",
         s3_bucket="b",
         s3_key_prefix="tenant/x/",
@@ -74,10 +74,10 @@ def _spec(**overrides) -> launch.LaunchSpec:
 
 def test_a_shared_base_path_is_refused_for_a_golden_launch() -> None:
     # The exact value the spec defaults to — and the exact path that means
-    # a 17 MB legacy base on miner-2 and a 709 MB golden base on miner-3.
+    # a 17 MB legacy base on miner-b and a 709 MB golden base on miner-c.
     with pytest.raises(ValueError, match="shared, mutable base image"):
         launch._assert_per_vm_base(
-            "realtenant-ubuntu-1", _SHARED_IMG, _SHARED_VERITY
+            "tenant-ubuntu-1", _SHARED_IMG, _SHARED_VERITY
         )
 
 
@@ -86,7 +86,7 @@ def test_another_vms_staged_base_is_refused() -> None:
     # would be cross-tenant, and staging onto it is a clobber.
     with pytest.raises(ValueError, match="not inside this VM's own staging"):
         launch._assert_per_vm_base(
-            "realtenant-ubuntu-1",
+            "tenant-ubuntu-1",
             "/var/lib/hippius-miner/staging/p1-liveness-1/rootfs.img",
             "/var/lib/hippius-miner/staging/p1-liveness-1/rootfs.verity",
         )
@@ -97,25 +97,25 @@ def test_a_missing_base_path_is_refused_rather_than_defaulted() -> None:
     # code silently fell back to the shared path; there is nothing to fall
     # back TO, so this must be terminal.
     with pytest.raises(ValueError, match="did not\n?\\s*return a per-VM staged base"):
-        launch._assert_per_vm_base("realtenant-ubuntu-1", "", "")
+        launch._assert_per_vm_base("tenant-ubuntu-1", "", "")
 
 
 def test_the_vms_own_staged_base_is_accepted() -> None:
     launch._assert_per_vm_base(
-        "realtenant-ubuntu-1",
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img",
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity",
+        "tenant-ubuntu-1",
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img",
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity",
     )
 
 
 def test_path_traversal_cannot_dress_a_shared_path_as_per_vm() -> None:
-    # `…/staging/realtenant-ubuntu-1/../rootfs.img` normalises to the
+    # `…/staging/tenant-ubuntu-1/../rootfs.img` normalises to the
     # SHARED path. A naive "does it contain the vm_id" check would pass it.
     with pytest.raises(ValueError):
         launch._assert_per_vm_base(
-            "realtenant-ubuntu-1",
-            "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/../rootfs.img",
-            "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity",
+            "tenant-ubuntu-1",
+            "/var/lib/hippius-miner/staging/tenant-ubuntu-1/../rootfs.img",
+            "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity",
         )
 
 
@@ -134,10 +134,10 @@ def test_the_dispatched_base_is_recorded_by_content() -> None:
     spec = _spec(bake_id="bake-abc", image_name="ubuntu")
     launch._record_base_image(
         spec,
-        rootfs_data_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img",
-        rootfs_hash_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity",
+        rootfs_data_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img",
+        rootfs_hash_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity",
     )
-    row = VmBaseImage.objects.get(vm_id="realtenant-ubuntu-1")
+    row = VmBaseImage.objects.get(vm_id="tenant-ubuntu-1")
     # CONTENT is the identity…
     assert row.rootfs_img_sha256_hex == "c" * 64
     assert row.rootfs_verity_sha256_hex == "d" * 64
@@ -148,25 +148,25 @@ def test_the_dispatched_base_is_recorded_by_content() -> None:
     assert row.image_name == "ubuntu"
     assert row.disk_mode == _GOLDEN
     # The paths are recorded as evidence of the per-VM layout.
-    assert row.rootfs_data_path.endswith("/realtenant-ubuntu-1/rootfs.img")
+    assert row.rootfs_data_path.endswith("/tenant-ubuntu-1/rootfs.img")
 
 
 def test_a_relaunch_onto_a_newer_base_updates_the_record() -> None:
     # Without this the record would freeze at the FIRST base a VM ever
-    # booted — i.e. it would still claim `realtenant-ubuntu-1` is on the
+    # booted — i.e. it would still claim `tenant-ubuntu-1` is on the
     # 2026-07-29 image after P1 moved it.
     launch._record_base_image(
         _spec(bake_id="bake-old", rootfs_img_sha256_hex="1" * 64),
-        rootfs_data_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img",
-        rootfs_hash_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity",
+        rootfs_data_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img",
+        rootfs_hash_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity",
     )
     launch._record_base_image(
         _spec(bake_id="bake-keepalive", rootfs_img_sha256_hex="2" * 64),
-        rootfs_data_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img",
-        rootfs_hash_path="/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity",
+        rootfs_data_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img",
+        rootfs_hash_path="/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity",
     )
-    assert VmBaseImage.objects.filter(vm_id="realtenant-ubuntu-1").count() == 1
-    row = VmBaseImage.objects.get(vm_id="realtenant-ubuntu-1")
+    assert VmBaseImage.objects.filter(vm_id="tenant-ubuntu-1").count() == 1
+    row = VmBaseImage.objects.get(vm_id="tenant-ubuntu-1")
     assert row.rootfs_img_sha256_hex == "2" * 64
     assert row.bake_id == "bake-keepalive"
 
@@ -239,35 +239,35 @@ _MEASURED_GOLDEN = "ro quiet dm-verity.root=" + "ab" * 32 + " boot=hippius-golde
 
 def test_migrate_activate_never_aims_a_golden_base_at_a_shared_path() -> None:
     # THE LIVE DATA-LOSS EVENT. The dest miner stages to the path this
-    # dict names; naming the shared one is how miner-3 ended up with a
+    # dict names; naming the shared one is how miner-c ended up with a
     # 709 MB `/var/lib/hippius-miner/rootfs.img`, and how the same order
-    # would have overwritten miner-2's shared legacy base through a
+    # would have overwritten miner-b's shared legacy base through a
     # symlink.
-    vm = make_vm(vm_id="realtenant-ubuntu-1")
+    vm = make_vm(vm_id="tenant-ubuntu-1")
     _record(
         vm.vm_id,
         disk_mode=_GOLDEN,
         emit={
             "measured_cmdline": _MEASURED_GOLDEN,
             "rootfs_data_path": (
-                "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img"
+                "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img"
             ),
             "rootfs_hash_path": (
-                "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity"
+                "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity"
             ),
         },
     )
     paths = effects._launch_paths(vm)
     assert paths["rootfs_data_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img"
     )
     assert paths["rootfs_hash_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity"
     )
     for key in ("rootfs_data_path", "rootfs_hash_path", "kernel_path", "initrd_path"):
         assert paths[key] != _SHARED_IMG
         assert paths[key].startswith(
-            "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/"
+            "/var/lib/hippius-miner/staging/tenant-ubuntu-1/"
         ), f"{key} escaped the per-VM staging dir: {paths[key]}"
 
 
@@ -275,20 +275,20 @@ def test_a_golden_record_from_before_this_fix_falls_back_per_vm_not_shared() -> 
     # Every VM on the fleet TODAY was launched before `rootfs_data_path`
     # was echoed onto the emit. Those records must NOT fall back to the
     # spec's shared path — that is precisely the bytes-clobbering order.
-    vm = make_vm(vm_id="realtenant-ubuntu-1")
+    vm = make_vm(vm_id="tenant-ubuntu-1")
     _record(vm.vm_id, disk_mode=_GOLDEN, emit={"measured_cmdline": _MEASURED_GOLDEN})
     paths = effects._launch_paths(vm)
     assert paths["rootfs_data_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.img"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.img"
     )
     assert paths["rootfs_hash_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/rootfs.verity"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/rootfs.verity"
     )
     assert paths["kernel_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/tenant.vmlinuz"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/tenant.vmlinuz"
     )
     assert paths["initrd_path"] == (
-        "/var/lib/hippius-miner/staging/realtenant-ubuntu-1/tenant.initrd.img"
+        "/var/lib/hippius-miner/staging/tenant-ubuntu-1/tenant.initrd.img"
     )
 
 
@@ -324,7 +324,7 @@ def _register_miner():
     from apps.miners.models import MinerIdentity, MinerStatus
 
     return MinerIdentity.objects.create(
-        miner_id="miner-1",
+        miner_id="miner-a",
         pubkey_hex=format(1, "064x"),
         platform_id="01" + "cd" * 15,
         netbird_ip="100.64.0.1",

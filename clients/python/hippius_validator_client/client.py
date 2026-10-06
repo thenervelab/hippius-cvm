@@ -14,6 +14,7 @@ from . import _common
 from .errors import (
     BakeFailedError,
     DecommissionFailedError,
+    HippiusApiError,
     HippiusTimeoutError,
     LaunchFailedError,
     MigrationFailedError,
@@ -22,6 +23,7 @@ from .models import (
     Bake,
     BakeRequest,
     DecommissionJob,
+    Feasibility,
     Image,
     LaunchJob,
     LaunchRequest,
@@ -29,6 +31,7 @@ from .models import (
     OnProgress,
     ProvisionPhase,
     ProvisionStep,
+    RegionsReport,
     Vm,
     VmListPage,
     VmPower,
@@ -45,17 +48,17 @@ _DEFAULT_POLL_TIMEOUT = 1800.0
 # so a validator that never reports ``boot_phase`` (or a stalled boot) ends the
 # provision flow gracefully rather than hanging on the launch-succeeded step.
 _DEFAULT_BOOT_TIMEOUT = 600.0
-# A §25 migration is COLD: the destination downloads the whole encrypted
-# volume (multi-GB) and re-attests before it activates, and the server's own
-# dest-activation budget alone is ~20 min. Give the waiter a budget that
-# comfortably covers snapshot upload + download + attested boot.
+# A §25 migration is COLD: the source uploads the whole encrypted volume
+# (multi-GB), the destination downloads + verifies it and re-attests before
+# it activates. Give the waiter a budget that covers the server's worst case.
 #
-# Server worst case is ~55 min (the per-step deadlines reset on each state
-# CAS: 5 x 300s + 600s awaiting-source-ack + 1200s dest-activation), so 1 h
-# clears it only just. If an operator raises
+# Server worst case is ~2 h 15 min (the per-step deadlines reset on each
+# state CAS: 4 x 300s + 3600s uploading + 600s awaiting-source-ack + 2700s
+# dest-activation = 8100s), so 2.5 h clears it. If an operator raises
+# ``VALI_ORCHESTRATION_UPLOAD_TIMEOUT_S`` or
 # ``VALI_ORCHESTRATION_ACTIVATE_TIMEOUT_S``, this client budget becomes the
 # binding constraint — pass an explicit ``timeout`` then.
-_DEFAULT_MIGRATION_TIMEOUT = 3600.0
+_DEFAULT_MIGRATION_TIMEOUT = 9000.0
 
 
 class HippiusValidatorClient:
@@ -193,6 +196,109 @@ class HippiusValidatorClient:
         """
         body = self._request("GET", "/v1/images")
         return [Image.from_dict(row) for row in body.get("images", [])]
+
+    # ── Pre-sale feasibility ─────────────────────────────────────────
+
+    def feasibility(
+        self,
+        flavor: str | None = None,
+        *,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        region: str | None = None,
+    ) -> list[Feasibility]:
+        """``GET /v1/scheduler/feasibility`` — can we place it before we sell it?
+
+        Omit ``flavor`` for the whole catalogue (the "what can I sell right
+        now" board). Pass ``tenant_id`` / ``user_id`` to get the answer for
+        THAT customer — they feed anti-affinity and the per-owner budget —
+        rather than for anybody. Pass ``region`` (ISO 3166-1 alpha-2) to ask
+        for ONE country — the answer a launch with the same
+        :attr:`LaunchRequest.region` would get.
+
+        Read-only: asking never creates a VM or a placement.
+        """
+        params: dict[str, str] = {}
+        if flavor:
+            params["flavor"] = flavor
+        if tenant_id:
+            params["tenant_id"] = tenant_id
+        if user_id:
+            params["user_id"] = user_id
+        if region:
+            params["region"] = region
+        body = self._request("GET", "/v1/scheduler/feasibility", params=params)
+        return [Feasibility.from_dict(row) for row in body.get("flavors", [])]
+
+    def can_place(
+        self,
+        flavor: str,
+        *,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        region: str | None = None,
+    ) -> Feasibility:
+        """:meth:`feasibility` for ONE flavor — the pre-sale gate.
+
+        Typical use::
+
+            answer = client.can_place("2xlarge", tenant_id=tenant)
+            if answer.verdict == "never":
+                raise OutOfStock(answer.reason)   # do NOT take the money
+            if not answer.sellable:
+                retry_later()                     # fleet full, not broken
+        """
+        results = self.feasibility(flavor, tenant_id=tenant_id, user_id=user_id, region=region)
+        # Select by NAME rather than taking the first row. The server
+        # filters, but this is a sales gate: a proxy or cache that drops
+        # the query parameter would otherwise hand back some other
+        # flavor's verdict, and the caller would price on it.
+        for row in results:
+            if row.flavor == flavor:
+                if region and row.region.upper() != region.strip().upper():
+                    # The answer is not FOR the region we asked about — a
+                    # validator that pre-dates `?region=` ignores the
+                    # parameter and answers fleet-wide, with no echo. Selling
+                    # "FR" on that answer would place anywhere; refuse it.
+                    raise HippiusApiError(
+                        200,
+                        f"validator did not answer feasibility for region {region!r} "
+                        f"(echoed {row.region!r}); it may not support region "
+                        "constraints yet",
+                        "wire",
+                    )
+                return row
+        # `wire` is the documented category for a response that does not
+        # match the contract — which this is: we asked for one flavor and
+        # got a body without it.
+        raise HippiusApiError(
+            200,
+            f"validator returned no feasibility row for flavor {flavor!r}",
+            "wire",
+        )
+
+    # ── Regions ──────────────────────────────────────────────────────
+
+    def regions(self, *, verified_only: bool = True) -> RegionsReport:
+        """``GET /v1/operator/regions`` — where miners exist, with capacity.
+
+        Every region is one the validator DETECTED a miner in (server-observed
+        IP + GeoIP, bounded by measured latency, cross-checked against the
+        egress of the tenant VMs on that host); miners declare nothing. The
+        :attr:`Region.region` codes are what :attr:`LaunchRequest.region` and
+        :meth:`can_place` accept.
+
+        ``verified_only=True`` (the default, and the scheduler's own rule)
+        counts only miners whose location passed every physical check; pass
+        ``False`` to see unverified ones in the per-region counts too. Only
+        the non-default is sent, so an older validator keeps answering.
+        Operator token required.
+        """
+        params: dict[str, str] = {}
+        if not verified_only:
+            params["verified_only"] = "false"
+        body = self._request("GET", "/v1/operator/regions", params=params)
+        return RegionsReport.from_dict(body)
 
     # ── Launch ───────────────────────────────────────────────────────
 
@@ -378,14 +484,15 @@ class HippiusValidatorClient:
     def get_vm_attestation(self, vm_id: str) -> dict[str, Any]:
         """``GET /v1/vm/<vm_id>/attestation`` — raw attestation bundle.
 
-        ``attested`` is a POSITIVE claim only: ``True`` when the KBS holds a
-        signed release bundle, and ``None`` when that cannot be determined —
-        it is **never** ``False`` merely because no bundle came back. Absent
-        evidence is ambiguous (the KBS records bundles only when its evidence
-        sink is enabled, and the archive does not survive a KBS restart), so
-        branch on ``attestation_status`` — ``evidence-recorded`` /
-        ``no-evidence-recorded`` / ``evidence-unavailable`` — and do not treat
-        a missing bundle as proof the VM is unattested.
+        ``attested`` is a POSITIVE claim only: ``True`` when the VM is proven
+        attested, ``None`` otherwise — **never** ``False``. ``attestation_state``
+        says which proof: ``attested-live`` (a KBS-verified live attestation of
+        the current launch, fresh — survives a KBS restart), ``attested-at-boot``
+        (the KBS release bundle in ``kbs_evidence``), ``stale``, ``unavailable``
+        or ``unproven`` (nothing on record — not proof the VM is unattested).
+        ``attestation_status`` is its legacy three-value form —
+        ``evidence-recorded`` / ``no-evidence-recorded`` /
+        ``evidence-unavailable``.
         """
         return self._request("GET", f"/v1/vm/{vm_id}/attestation")
 

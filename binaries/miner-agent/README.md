@@ -7,7 +7,7 @@ identity, and the UKI image fetch + §22 verification.
 
 ## Trust model — the miner is UNTRUSTED
 
-Per `project_hippius_compute_locked_decisions.md`, miners are untrusted
+By design, miners are untrusted
 by design. The miner-agent therefore:
 
 - **never** authenticates to the hippius-compute Vault — no lookup, no
@@ -21,6 +21,23 @@ by design. The miner-agent therefore:
 - authenticates miner→Edge traffic with the NetBird WireGuard mesh
   (transport) plus signed envelopes (application layer) — never with a
   Vault credential.
+
+## Building
+
+On a miner host (Linux x86_64, from the repository root):
+
+```sh
+cargo build --release --locked -p hippius-miner-agent --features snp
+sudo install -m 0755 target/release/hippius-miner-agent /usr/local/bin/
+```
+
+**`--features snp` is mandatory for a production binary.** The default
+feature set is empty so `cargo test --workspace` stays cross-platform;
+a binary built without it answers every launch order with
+`cvm-launch-digest/feature-disabled`. Play 05 of
+`deploy/ansible/playbooks/06-miner-bootstrap.yml` builds it this way;
+see [`docs/operator/onboarding-a-miner.md`](../../docs/operator/onboarding-a-miner.md)
+for the full onboarding.
 
 ## What MA-1/2 ships
 
@@ -103,7 +120,7 @@ scp edge-ca.crt    miner:/var/lib/hippius-miner/edge-ca.crt
 ### 4. Join the NetBird mesh
 
 Install the NetBird agent and join the mesh with a setup key carrying
-the **`miner`** tag (group id `d85j0vr36cos73atf2mg`). A `miner`-tagged
+the **`miner`** tag (the miner group's id `<miner-group-id>`). A `miner`-tagged
 peer can reach only the Edge gateway endpoint — never the control
 plane directly.
 

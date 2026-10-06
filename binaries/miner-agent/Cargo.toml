@@ -106,10 +106,14 @@ coset = { version = "0.3", default-features = false, features = ["std"] }
 # JSON encoder for the `tenant-preflight` HTTP response body. CBOR is
 # the wire shape for every other signed in/out path; the preflight
 # reply is operator-facing diagnostics that vali parses with stdlib
-# `json` (keeps the vali side dep-free). One direction only — we never
-# deserialize JSON in the miner-agent.
+# `json` (keeps the vali side dep-free). The backup module also PARSES
+# JSON: the QMP replies `virsh qemu-monitor-command` prints.
 serde_json = "1"
 serde_bytes = "0.11"
+# Backup part uploads: `StreamExt::map` hashes each chunk of a streamed
+# presigned-PUT body as it goes out. Already in the tree via reqwest.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 # MA-4/5 graceful-shutdown plumbing — `CancellationToken` fans one
 # shutdown signal out to the vsock listener, the orders server and the
 # heartbeat task; `TaskTracker` (the `rt` feature) tracks the detached
@@ -157,6 +161,9 @@ raw-cpuid = "11"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
+# `test-util` — paused time, so a test can run the backup release's real
+# one-minute cancel bound instantly.
+tokio = { version = "1", default-features = false, features = ["test-util"] }
 # Integration tests verify the on-disk identity round-trip + drive the
 # image cache against the committed `test_vectors/provenance/`, and the
 # PR-MA-6 heartbeat KAT decodes the heartbeat wire format.

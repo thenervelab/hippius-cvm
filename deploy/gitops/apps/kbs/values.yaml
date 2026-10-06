@@ -6,35 +6,32 @@ image:
   # deployed image is content-addressed). Produced by the
   # `kbs-image.yml` workflow; see README.md "Image".
   #
-  # Bumped to the f8c570c main build (#581): the §7 TCB anti-rollback
-  # check now keys off the ACTUAL RUNNING tcb (current_tcb >= launch_tcb
-  # AND committed_tcb >= launch_tcb), NOT the host-settable reported_tcb.
-  # miner-3's Turin firmware (API 1.55) reports reported_tcb.microcode=0
-  # while current_tcb == launch_tcb == 0x47 (a NON-rolled-back platform),
-  # so the prior build false-denied it "policy: TCB rollback". This is
-  # the 4th and final Turin attestation gate — completes the §25
-  # dest-activation KEK release on miner-3. VERIFIER-ONLY change.
-  # Carries #579 (VCEK keyed by whichever TCB signs), #573 (report-sig
-  # over RAW WIRE BYTES), #571 (v3/v4 version gate), Flavor xlarge+,
-  # two-phase boot counter, MultiGenChainVerifier #541.
-  # f54902e (RA-L-NEW-2 shared admin boot-counter handle + RA-KBS-VL4
-  # classifier drops `.internal`). Carries df39f22 (RA-KBS-M1) broker
-  # TLS + CA-pin, #581 anti-rollback, #579 VCEK, #573 raw-wire sig,
-  # #571 v3/v4 gate, two-phase boot counter, xlarge+, MultiGenChainVerifier.
-  # ⚠️  SUPERSEDED / INACCURATE — the next line's attribution is wrong. The
-  # digest below was signed 2026-08-10 by a `refs/pull/897/merge` build, not
-  # by b62d6db. Trust `provenance:` below it, which is machine-checked
-  # against the digest's Sigstore signature; this narrative block is kept
-  # only for the deployment-hazard history it records.
-  # b62d6db (2026-07-16) — what the cluster ACTUALLY runs. The pin had
-  # drifted 3 weeks behind an out-of-band deploy, and that stale binary
-  # (f54902e) predates the KEK-HSM series: it has no `require_wrapped_kek`
-  # field, and `Config` is `deny_unknown_fields`, so a sync that reverted
-  # the image while rendering that key would have failed config parse and
-  # crashlooped the KBS — with `strategy: Recreate` deleting the old pod
-  # first, i.e. a hard outage of the component that releases every tenant
-  # disk key. Keep this pin honest: it is the contract, not a comment.
-  digest: "sha256:3304358b335f157630c48a132742892cf53433a61a34215e38d1e42cc65e4f9d"
+  # Keep this pin equal to what the cluster runs: it is the contract, not
+  # a comment. Record the reason for each bump in the commit message.
+  #
+  # ⚠️ ROLLING THE KBS IS A CEREMONY, never a casual sync:
+  #   - `strategy: Recreate` + `state` on an emptyDir (deliberate — the KBS
+  #     is a Kata CVM, its state lives inside the confidential boundary and
+  #     a PVC is not an option) means every restart WIPES
+  #     boot-counters.json. Read each running VM's counter off its miner's
+  #     `state/<vm>.raw` BEFORE the sync and re-seed it through the admin
+  #     mTLS listener straight after (`vali_kbs_recover`,
+  #     seed-then-register). A VM whose host is dark at that moment has an
+  #     unreadable counter and cannot be recovered.
+  #   - `Config` is `deny_unknown_fields`: reverting the image while the
+  #     chart renders a key the older binary does not know fails config
+  #     parse and crashloops the KBS — with `Recreate` deleting the old pod
+  #     first, i.e. a hard outage of the component that releases every
+  #     tenant disk key.
+  #   - Ordering: a KBS change that a vali/guest change depends on (e.g.
+  #     accepting Transit-wrapped userdata) must be running BEFORE that
+  #     change rolls; a KBS that hashed `vault:v1:…` verbatim would fail
+  #     every launch with DigestMismatch.
+  #   - Once any VM has released under volume-stamp protocol v2, NEVER roll
+  #     this image back below v2.
+  # The app has NO auto-sync, so merging a pin does not roll anything: the
+  # roll is a deliberate, separate step.
+  digest: "sha256:5dbe66ae18124ee6b1b77e4df2573ac72207c05503e543b389f611ff91b28f2c"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED, not a comment. `.github/scripts/verify_image_
   # provenance.py` runs `cosign verify` with these exact values as
@@ -44,21 +41,19 @@ image:
   # declaration fails CI. The offline half of the policy runs in the
   # required `rust` job (scripts/dev/image-provenance-test.sh).
   #
-  # This exists because the free-text pin comments above were WRONG: they
-  # named `b62d6db (2026-07-16)` while the digest was in fact signed on
-  # 2026-08-10 by a pre-merge PR build. The SNP measurement cannot tell
-  # you which binary is in the CVM (see README.md "What the KBS
-  # measurement does not cover"); this at least makes the claim about it
-  # checkable.
+  # This exists because free-text pin comments drift from the digest they
+  # describe. The SNP measurement cannot tell you which binary is in the
+  # CVM (see README.md "What the KBS measurement does not cover"); this at
+  # least makes the claim about it checkable.
   #
   # Purely declarative: no template reads `image.provenance`, so it
   # cannot change what the pod renders to.
   provenance:
     # Fulcio SAN on the signature — workflow AND the git ref it ran on.
-    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/kbs-image.yml@refs/heads/main"
+    workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/kbs-image.yml@refs/heads/main"
     # `githubWorkflowSha` on the signing cert — the exact source commit.
-    commitSha: "d15b850aae931ff21e7ac696e6af286e3d7c46c1"
-    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/31686939409/attempts/1"
+    commitSha: "760465900e8cb2478f2f4b12e34eb1882c715b20"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37291000180/attempts/1"
     # false ⇒ built from a ref other than refs/heads/main, i.e. from a
     # tree that is NOT in this repo's history.
     mergedSource: true
@@ -264,7 +259,7 @@ config:
   #   - bit 16 = SMT_ALLOWED (QEMU sets it for SNP guests by default)
   #   - bits 0..15 = ABI_MINOR / ABI_MAJOR floor the firmware enforces
   #   - bit 18 = MigrateMA, bit 19 = Debug, bit 20 = SingleSocket
-  # QEMU 10.1 on miner-1 emits `policy = 0x30000` (bits 16 + 17 set,
+  # QEMU 10.1 on a Genoa host emits `policy = 0x30000` (bits 16 + 17 set,
   # i.e. SMT_ALLOWED + reserved-must-be-1, ABI bits zero) — observed
   # live 2026-05-26 via the debug-initrd KBS-denial body capture.
   #
@@ -288,15 +283,15 @@ config:
   #   `const SEV_SNP_POLICY: &str = "0x30000"`  (bit 16 SMT_ALLOWED +
   #   bit 17 reserved-must-be-1), passed verbatim into the libvirt
   #   <policy> → SNP_LAUNCH_START, so report.policy == 0x30000 exactly on
-  #   both Turin and Genoa (live-observed 0x30000 on miner-1 Genoa
-  #   2026-05-26 + miner-3 Turin / miner-1 Genoa grants 2026-06-30).
+  #   both Turin and Genoa (live-observed 0x30000 on Genoa 2026-05-26 +
+  #   Turin / Genoa grants 2026-06-30).
   # So the ONLY non-required bit a legitimate guest sets is bit 16 (SMT).
   # We therefore allow EXACTLY bit 16 and require bit 17 → required|allowed
   # = 0x30000 = the launcher policy. ANY other bit — Debug(19),
   # MigrateMA(18), SingleSocket(20), the ABI-version bits, AND every
   # currently-undefined bit 21..63 — now fails `report.policy &
   # ~(required|allowed) != 0 → deny`. Re-verified granted=true on BOTH
-  # Turin (miner-3) and Genoa (miner-1) after this tightening.
+  # Turin and Genoa hosts after this tightening.
   #
   # SMT is ALLOWED (not required) so a future SMT-off transition (clearing
   # bit 16 in the launcher to kill cross-thread side-channels — an infra
@@ -336,6 +331,18 @@ config:
   # value silently produces attestations the pallet rejects on
   # submit_live_attestation. Bumped in lockstep with the substrate
   # runtime's pinned constants — never edit blindly.
+  # Authorized rollback (A2, kbs_core::rollback) — rendered as a
+  # `[rollback]` section ONLY when set. Leave it UNSET: absent means the
+  # compiled defaults (minIntervalS 1800, maxTtlS 3600, the user's
+  # binding limits), and the KBS image currently pinned above predates
+  # the section and refuses it (`Config` is deny_unknown_fields), so
+  # rendering it before that image is replaced would crashloop the KBS
+  # on its next restart. A KBS config change is inert until a restart
+  # anyway (no checksum/config annotation). maxTtlS is capped at 3600 by
+  # the binary.
+  # rollback:
+  #   minIntervalS: 1800
+  #   maxTtlS: 3600
   liveAttestation:
     # Pre-mainnet placeholder — matches the mock-runtime sentinel in
     # `pallets/compute-scoring/src/mock.rs::ComputeChainGenesis`.
@@ -343,6 +350,16 @@ config:
     # Pre-mainnet placeholder — matches the mock-runtime sentinel in
     # `pallets/compute-scoring/src/mock.rs::ComputePalletInstance`.
     computePalletInstanceHex: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+    # Keepalive ↔ released-guest binding (kbs_core::keepalive_binding):
+    # off | record | enforce. `off` = legacy v1 live-attestation bodies.
+    # vali's verifier must accept v2 before this leaves `off`. `record` is
+    # the operating mode: VMs with no release on record (booted before the
+    # last KBS restart) are served as `first-use`, which proof ignores.
+    # `enforce` refuses those — and every KBS restart wipes the records, so
+    # it would cut every running VM's liveness until its next boot. Do not
+    # use it while the records live in the wiped state dir.
+    # RECORD since the 2026-09-28 ceremony (sha-7e9982e9f1cc).
+    keepaliveBinding: "record"
     # §322 PR 3b.1 — directory the KBS writes per-keepalive signed
     # bodies into so the vali batcher (#327) can pick them up + ship
     # on chain. EMPTY = the sink is disabled (NullLiveAttestationSink
@@ -359,6 +376,15 @@ config:
   # silently dropped, re-opening plaintext KEKs at rest.
   requireWrappedKek: true
 
+  # §6 — refuse to release a userdata that is not Transit-wrapped at rest.
+  # The userdata counterpart of `requireWrappedKek`, and the fail-closed
+  # enforcement of "no plaintext cloud-init at rest": the digest gate
+  # proves the bytes are the ones the ticket named, never that they are
+  # ciphertext. FALSE until every VM whose userdata was staged before the
+  # wrapping landed is gone — such a VM holds plaintext and would be
+  # refused (it would not boot). Observable on `GET /v1/admin/config`.
+  requireWrappedUserdata: false
+
   # ⚠️  DEPLOYMENT-SAFETY FUSE — suppressed-confirm anti-rollback bound
   # (`kbs_core::volume_stamp::MAX_UNCONFIRMED_RELEASES`). The Rust field
   # is `#[serde(default)]` = absent ⇒ the binary's compiled default is
@@ -368,8 +394,8 @@ config:
   # LEGACY VM — any guest whose initramfs predates the
   # `/v1/kbs/volume-stamp/confirm` route — can NEVER confirm. Arming
   # the gate before every golden image has been re-baked to send
-  # confirms would refuse each legacy VM (incl. `realtenant-ubuntu-1`
-  # on miner-3) after `bound` releases — a boot, a §25 migration, and a
+  # confirms would refuse each legacy VM (including long-running tenant
+  # VMs) after `bound` releases — a boot, a §25 migration, and a
   # reboot-recovery relaunch each count as one. The admin reset buys
   # exactly `bound` more releases before it trips again; it is not a
   # fix.
@@ -417,17 +443,11 @@ config:
   # every row, so a post-restart report reads an empty fleet and is
   # vacuously `ready_to_arm: true` with `vms: 0`. Check `vms` against
   # the number of live VMs before believing a green verdict.
-  # ARMED 2026-08-13 at the compiled default bound. Every step of the
-  # cutover above was completed and evidenced first:
-  #   1. this KBS build deployed;
-  #   2. ALL FOUR blessed golden images re-baked post-#897 and re-blessed
-  #      (ubuntu / debian / cs10 / fedora);
-  #   3. the admin PKI issued and the read route queried with a real
-  #      client identity — `?bound=3` returned, non-vacuously:
-  #        vms=4  never_confirmed=0  would_refuse_now=0  ready_to_arm=true
-  #      with all four distros showing confirmed=1, has_ever_confirmed=true.
-  #      `vms` was checked against the live VM count, because a
-  #      post-restart read is vacuously green with vms=0.
+  # ARMED here at the compiled default bound — only after every step of
+  # the cutover above was completed and evidenced: every blessed golden
+  # image (ubuntu / debian / cs10 / fedora) re-baked post-#897, and a
+  # non-vacuous `?bound=3` read (`vms` equal to the live VM count,
+  # never_confirmed=0, would_refuse_now=0, ready_to_arm=true).
   #
   # Reversible: set back to 0 and restart to disable the gate entirely.
   maxUnconfirmedReleases: 3
@@ -440,9 +460,17 @@ config:
   # had no way to obtain proof their VM was attested.
   #
   # NOTE this is an emptyDir (pod lifetime), matching state/audit: bundles
-  # do NOT survive a KBS restart, so a VM that attested before the last
-  # restart still reads as unknown until it releases again. Point it at a
-  # PVC for durable proof.
+  # do NOT survive a KBS restart; a VM that attested before the last
+  # restart has no bundle until it releases again (its next boot). vali's
+  # attestation verdict therefore rests first on the VM's live attestations
+  # (`VmLiveAttestation`, in vali's DB), which do survive it.
+  #
+  # A filesystem PVC does NOT fix this here: the kata-qemu-snp runtime runs
+  # with `shared_fs = "none"`, so a host filesystem volume is copied INTO
+  # the CVM at start and the guest's writes never reach the host. Only a
+  # block device assigned to the guest and encrypted + integrity-protected
+  # inside the CVM could hold them — the same work the state + audit stores
+  # need, not an evidence-only change.
   evidenceDir: "/var/lib/kbs/evidence"
 
 # §22 signed allowlist artifact — fetched by an init container at pod
@@ -509,13 +537,13 @@ snp:
   # (broker = #102), but the SNP gate itself is now production-shape.
   enabled: true
   # `generation` is the STATIC-VEK fallback anchor (a report carrying no
-  # VCEK in its cert table — the Genoa miner-1 path with the operator-
-  # mounted vek.pem). `genoa` matches miner-1 (EPYC 9254); `milan` for
+  # VCEK in its cert table — the Genoa path with the operator-mounted
+  # vek.pem). `genoa` matches 4th-gen EPYC (e.g. EPYC 9254); `milan` for
   # 3rd-gen EPYC. Multi-generation (Milan/Genoa/TURIN) is now handled
   # PER-REPORT by the MultiGenChainVerifier (#541): it identifies each
   # report's generation from its CPUID/chip_id, anchors to the matching
   # built-in AMD ARK, and resolves the VCEK from AMD KDS (kdsUrl below).
-  # So Turin miners (EPYC 9255, miner-2/3) attest without changing this.
+  # So Turin miners (e.g. EPYC 9255) attest without changing this.
   generation: "genoa"
   # AMD KDS base URL for per-CHIP_ID VCEK fetch — REQUIRED for Turin
   # (Turin guest reports do NOT embed their cert chain). The KBS already

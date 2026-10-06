@@ -94,6 +94,7 @@ pub fn config_posture(cfg: &Config) -> hippius_types::admin::AdminConfigPostureR
     hippius_types::admin::AdminConfigPostureResponse {
         v: 1,
         require_wrapped_kek: cfg.require_wrapped_kek,
+        require_wrapped_userdata: cfg.require_wrapped_userdata,
         max_unconfirmed_releases,
         volume_stamp_gate_armed: max_unconfirmed_releases.is_some(),
         admin_listener_mode,
@@ -211,6 +212,69 @@ pub struct WiredKbs {
     /// `boot_counter` above: a second `FileVolumeStampStore::open` would
     /// cache its own stale snapshot.
     pub volume_stamp: Arc<dyn kbs_core::volume_stamp::VolumeStampStore>,
+    /// The custody runtime (`[custody] enabled = true`), shared by the
+    /// public custody routes and the admin report/policy routes. `None` ⇒
+    /// custody off.
+    pub custody: Option<Arc<kbs_core::custody::CustodyRuntime>>,
+    /// The SAME keepalive binding store the release path records into and
+    /// the keepalive path checks — `{state_dir}/keepalive-bindings.json`.
+    /// The admin listener seeds it after a pod restart wiped the file.
+    pub keepalive_bindings: Arc<dyn kbs_core::keepalive_binding::KeepaliveBindingStore>,
+    /// The release audit sink the service appends through — shared with
+    /// the admin router's read-only `GET /v1/admin/audit?log=release`.
+    pub release_audit: Arc<FileAuditSink>,
+}
+
+/// When `enforce`'s post-restart grace window closes, counted from the
+/// state epoch (so a crash loop cannot reopen it). `None` when the mode is
+/// not `enforce` or no grace is configured.
+///
+/// The epoch file is stamped on EVERY start, whatever the mode, so the
+/// epoch is the pod's first start even if grace is only configured on a
+/// later process restart. The close time is clamped to `now + grace`: an
+/// epoch stamped under a fast clock (or a clock that later stepped back)
+/// cannot stretch the window beyond its configured length.
+pub fn keepalive_grace_closes_at(cfg: &Config) -> Result<Option<u64>, Error> {
+    use kbs_core::keepalive_binding::{grace_epoch_start, BindingMode};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let epoch = grace_epoch_start(&cfg.storage.state_dir, now)
+        .map_err(|e| Error::Config(format!("keepalive grace epoch: {e}")))?;
+    let grace = cfg.live_attestation.keepalive_binding_grace_secs;
+    if cfg.live_attestation.keepalive_binding_mode() != BindingMode::Enforce || grace == 0 {
+        return Ok(None);
+    }
+    let closes = epoch.saturating_add(grace).min(now.saturating_add(grace));
+    eprintln!(
+        "kbs-server: keepalive binding ENFORCE with a post-restart grace window: state epoch \
+         {epoch}, unbound VMs served first-use until {closes} ({} s left)",
+        closes.saturating_sub(now)
+    );
+    Ok(Some(closes))
+}
+
+/// Build the custody runtime iff `[custody] enabled = true`. Its store is
+/// `{state_dir}/custody.json` — wiped with the rest of the state dir on a
+/// pod restart, after which every guest re-binds on `rebind-required`.
+pub fn build_custody(
+    cfg: &Config,
+) -> Result<Option<Arc<kbs_core::custody::CustodyRuntime>>, Error> {
+    let Some(c) = cfg.custody.as_ref().filter(|c| c.enabled) else {
+        return Ok(None);
+    };
+    let store =
+        kbs_core::custody::MapCustodyStore::open(cfg.storage.state_dir.join("custody.json"))
+            .map_err(|e| Error::Wiring(format!("custody store: {e}")))?;
+    let rt = kbs_core::custody::CustodyRuntime::new(Arc::new(store), c.policy(), c.skew())
+        .map_err(|e| Error::Config(format!("[custody]: {e}")))?;
+    eprintln!(
+        "kbs-server: custody lease ENABLED (ttl_s={} stage2_s={} renew_s={}; clock=untrusted, skew \
+         tolerance {} ppm)",
+        c.ttl_s, c.stage2_s, c.renew_s, c.skew_tolerance_ppm
+    );
+    Ok(Some(Arc::new(rt)))
 }
 
 /// Build the fully-wired KBS service.
@@ -246,8 +310,10 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
     // process blocks here and never reaches the allowlist HWM mutation
     // below, so that file CAS cannot race cross-process. The lock is
     // also held before any store opens or any release path can run.
-    let audit = FileAuditSink::open(&cfg.storage.audit_dir)
-        .map_err(|e| Error::Wiring(format!("audit sink: {e}")))?;
+    let audit = Arc::new(
+        FileAuditSink::open(&cfg.storage.audit_dir)
+            .map_err(|e| Error::Wiring(format!("audit sink: {e}")))?,
+    );
 
     // ── §280 evidence-bundle sink ──────────────────────────────────
     // Best-effort archive of per-release cryptographic evidence — see
@@ -579,7 +645,7 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         &cfg.live_attestation.compute_pallet_instance_hex,
     )?;
 
-    // Phase 1 of audit follow-up Codex #2 — anti-rollback wiring.
+    // Phase 1 of audit follow-up Review #2 — anti-rollback wiring.
     // Defaults to `{state_dir}/boot-counters.json` so a fresh deploy
     // gets the file without an explicit config bump.
     let boot_counter_path = cfg
@@ -591,6 +657,19 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         kbs_core::boot_counter::FileBootCounterStore::open(&boot_counter_path)
             .map_err(|e| Error::Config(format!("boot-counter store: {e}")))?,
     ) as Arc<dyn kbs_core::boot_counter::BootCounterStore>;
+
+    // Keepalive ↔ released-guest records (`kbs_core::keepalive_binding`),
+    // `{state_dir}/keepalive-bindings.json`: written through on every
+    // release so a PROCESS restart keeps them; a POD restart wipes the
+    // state dir and the admin `seed-keepalive-binding` route refills it.
+    let keepalive_bindings = Arc::new(
+        kbs_core::keepalive_binding::FileKeepaliveBindings::open(
+            cfg.storage
+                .state_dir
+                .join(kbs_core::keepalive_binding::BINDINGS_FILE),
+        )
+        .map_err(|e| Error::Config(format!("keepalive-binding store: {e}")))?,
+    ) as Arc<dyn kbs_core::keepalive_binding::KeepaliveBindingStore>;
 
     // Anti-rollback for the guest-keyed overlay (`kbs_core::volume_stamp`).
     // Defaults to `{state_dir}/volume-stamps.json` — same sibling-file
@@ -638,7 +717,7 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         Arc::new(auth_pubkey),
         Arc::new(signing_key),
         Arc::new(kid),
-        Arc::new(audit),
+        Arc::clone(&audit) as Arc<dyn kbs_core::release::AuditSink + Send + Sync>,
         evidence,
         live_attestation_state,
         live_attestation_sink,
@@ -650,7 +729,21 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
     )
     // KEK-HSM RA-08a/F2 — opt into fail-closed refusal of a non-`vault:`
     // (plaintext) KEK at release, from `[require_wrapped_kek]` config.
-    .with_require_wrapped_kek(cfg.require_wrapped_kek);
+    .with_require_wrapped_kek(cfg.require_wrapped_kek)
+    // §6 — opt into at-rest-only userdata digests, from
+    // §6 — opt into fail-closed refusal of a non-`vault:` (plaintext)
+    // userdata at rest, from `[require_wrapped_userdata]` config.
+    .with_require_wrapped_userdata(cfg.require_wrapped_userdata)
+    // Keepalives bound to the guest the KBS released to, from
+    // `[live_attestation] keepalive_binding` (default `off`).
+    .with_keepalive_binding(cfg.live_attestation.keepalive_binding_mode())
+    .with_keepalive_bindings(Arc::clone(&keepalive_bindings))
+    .with_keepalive_grace(keepalive_grace_closes_at(cfg)?);
+    let custody = build_custody(cfg)?;
+    let service = match &custody {
+        Some(rt) => service.with_custody(Arc::clone(rt)),
+        None => service,
+    };
 
     Ok(WiredKbs {
         service,
@@ -659,6 +752,9 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         allowlist: allowlist_arc,
         boot_counter,
         volume_stamp,
+        custody,
+        keepalive_bindings,
+        release_audit: audit,
     })
 }
 
@@ -670,13 +766,18 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
 /// under the same trust anchor the release path later checks against.
 /// `vm_states` is the SAME `Arc<FileVmStateStore>` — admin writes the
 /// state the release path reads.
+#[allow(clippy::too_many_arguments)] // one shared store handle per admin route family
 pub fn build_admin_state(
     cfg: &Config,
     l1_keyring: Arc<ConfigL1Keyring>,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
     vm_states: Arc<FileVmStateStore>,
     allowlist: Arc<InstalledAllowlist>,
     boot_counter: Arc<dyn kbs_core::boot_counter::BootCounterStore>,
     volume_stamp: Arc<dyn kbs_core::volume_stamp::VolumeStampStore>,
+    custody: Option<Arc<kbs_core::custody::CustodyRuntime>>,
+    keepalive_bindings: Arc<dyn kbs_core::keepalive_binding::KeepaliveBindingStore>,
+    release_audit: Arc<FileAuditSink>,
 ) -> Result<AdminState, Error> {
     let admin_cfg = cfg
         .admin
@@ -704,6 +805,16 @@ pub fn build_admin_state(
     });
 
     let kr_dyn: Arc<dyn L1Keyring + Send + Sync> = l1_keyring as _;
+    // Authorized rollback (A2): the SAME response key the release path
+    // signs with (checkpoints must verify after a restart, so it has to
+    // be the persistent one) and a read handle on the SAME lifecycle
+    // store the admin writes.
+    let rollback = Arc::new(kbs_transport::admin_handler::RollbackAdmin {
+        signing_key,
+        vm_states: Arc::clone(&vm_states)
+            as Arc<dyn kbs_core::lifecycle::VmStateStore + Send + Sync>,
+        policy: cfg.rollback_policy(),
+    });
     let vm_dyn: Arc<dyn VmStateRegister + Send + Sync> = vm_states as _;
     let idem_dyn: Arc<dyn IdempotencyStore + Send + Sync> = Arc::new(idem);
 
@@ -748,5 +859,12 @@ pub fn build_admin_state(
         // from — never re-read from disk, so it cannot answer a
         // question about a file the running process has never seen.
         posture: Arc::new(config_posture(cfg)),
+        custody,
+        keepalive_bindings,
+        rollback: Some(rollback),
+        // The SAME release sink the release path appends through, read
+        // by `GET /v1/admin/audit?log=release` (a second
+        // `FileAuditSink::open` would block on the exclusive lock).
+        release_audit: Some(release_audit),
     })
 }

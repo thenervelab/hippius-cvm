@@ -76,7 +76,7 @@ from sentinel.tools import (
 # Object Lock); the §S posture is that the agent is a strict read-only
 # observer — "an analyst, not an actor". Anchoring runs on its own
 # deterministic schedule in `sentinel.main._anchor_loop`, never on the
-# model's discretion. (PR-S6 review — codex HIGH.)
+# model's discretion. (PR-S6 review — review HIGH.)
 
 log = logging.getLogger("sentinel.agent")
 

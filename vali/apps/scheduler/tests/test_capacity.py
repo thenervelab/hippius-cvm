@@ -238,15 +238,15 @@ def test_capacity_flags_a_fossil_beside_the_quality_it_taints(
     _mock_chain(
         monkeypatch,
         make_snapshot(
-            2702,
-            [make_miner(1, status="active", data_epoch=2702, quality=100170)],
+            5002,
+            [make_miner(1, status="active", data_epoch=5002, quality=100170)],
             pallet_live=False,
         ),
     )
 
     body = authed_client.get(CAPACITY_URL).json()
     assert body["pallet_live"] is False
-    assert body["current_epoch"] == 2702
+    assert body["current_epoch"] == 5002
     assert body["miners"][0]["quality"] == "100170"
 
 

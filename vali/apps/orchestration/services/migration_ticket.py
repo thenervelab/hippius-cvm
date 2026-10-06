@@ -81,7 +81,7 @@ from apps.orders.models import OrderTicketIntake
 
 from ..effects import EffectError, EffectUnavailable
 from ..models import LaunchJob, LaunchJobState
-from . import ticket_mint, userdata_digest, vault_kv
+from . import customer_keys, ticket_mint, userdata_digest, vault_kv
 
 log = logging.getLogger("apps.orchestration.migration_ticket")
 
@@ -128,8 +128,19 @@ class TicketInputs:
     platform_id: str
     luks_path: str
     userdata_path: str
+    #: vali's own WORKING COPY of the userdata (`…/userdata-pending`),
+    #: wrapped under `ud-<vm_id>` — the only copy vali can open. The
+    #: canonical `userdata_path` above is wrapped under the KBS-only
+    #: `kek-<vm_id>`, so re-deriving the §6 digest reads THIS one.
+    userdata_working_path: str
     vault_mount: str
     expiry_seconds: int
+    #: Customer-held keys — the VM's PINNED mode (`hippius` / `split` /
+    #: `customer`), checked against the binding its measured cmdline
+    #: carries (`customer_keys.resolve_for_remint`). Never defaulted from a
+    #: record: an M1/M2 VM re-minted as M0 would be refused by the KBS at
+    #: best and would un-bind the guardian at worst.
+    key_mode: str = "hippius"
 
 
 def _zeroize(buf: bytes) -> None:
@@ -214,13 +225,41 @@ def remint_ticket(
     # generation rather than the ticket_id, and release-once dedup is keyed
     # per ticket_id, so nothing is lost by replacing it.
     if reuse_existing:
+        # The guest components floor holds for a reused ticket too: it
+        # replays the boot on record, which a raised floor may now forbid.
+        from . import guest_components
+        from .launch_record import booted_artifacts
+
+        record = _latest_launch_record(vm_id)
+        if record is not None:
+            epoch_refusal = guest_components.launch_epoch_refusal(
+                vm_id, booted_artifacts(record)[1]
+            )
+            if epoch_refusal:
+                raise EffectError(f"remint: {epoch_refusal}")
         existing = (
             OrderTicketIntake.objects.filter(vm_id=vm_id, vm_generation=generation)
             .order_by("-received_at")
             .first()
         )
         if existing is not None and existing.platform_id:
-            return bytes(existing.cose_blob)
+            # Customer-held keys: the reuse shortcut is held to the same
+            # pin + recorded-cmdline check a fresh re-mint applies (binding,
+            # cloud-init markers), BEFORE any stored blob is handed back.
+            _check_recorded_binding(vm)
+            if _stored_ticket_has_pinned_mode(vm, bytes(existing.cose_blob)):
+                return bytes(existing.cose_blob)
+            # Customer-held keys: a stored ticket whose signed key_mode is
+            # not the VM's pinned mode (ingested from elsewhere, or minted
+            # before a pin) would be refused by the KBS at release. Re-mint
+            # — the re-mint path checks the pin against the measured cmdline.
+            log.warning(
+                "remint: discarding a stored ticket for vm_id=%s gen=%s whose "
+                "key_mode is not the VM's pinned mode",
+                vm_id,
+                generation,
+            )
+            existing = None
         if existing is not None:
             log.warning(
                 "remint: discarding an unreleasable ticket for vm_id=%s "
@@ -233,6 +272,52 @@ def remint_ticket(
     return _mint_from(inputs, ticket_id_prefix=ticket_id_prefix)
 
 
+def _latest_launch_record(vm_id: str) -> LaunchJob | None:
+    return (
+        LaunchJob.objects.filter(vm_id=vm_id, state=LaunchJobState.SUCCEEDED)
+        .order_by("-finished_at")
+        .first()
+    )
+
+
+def _recorded_measured_cmdline(record: LaunchJob | None) -> str | None:
+    emit = ((record.result_json if record is not None else None) or {}).get("emit") or {}
+    return str(emit.get("measured_cmdline") or "") or None
+
+
+def _check_recorded_binding(
+    vm: object, record: LaunchJob | None = None
+) -> customer_keys.GuardianBinding | None:
+    """`customer_keys.resolve_for_remint` on the VM's recorded measured
+    cmdline, as an `EffectError`. Every re-mint path runs it, the stored-
+    ticket reuse included."""
+    vm_id = vm.vm_id  # type: ignore[attr-defined]
+    try:
+        return customer_keys.resolve_for_remint(
+            vm, _recorded_measured_cmdline(record or _latest_launch_record(vm_id))
+        )
+    except customer_keys.CustomerKeysError as exc:
+        raise EffectError(f"remint: vm {vm_id!r}: {exc}") from exc
+
+
+def _stored_ticket_has_pinned_mode(vm: object, cose_ticket: bytes) -> bool:
+    """Whether a stored ticket's SIGNED `key_mode` (read back by the Rust
+    decoder) is the VM's pinned mode. An undecodable blob is not reusable."""
+    from apps.orders import validator
+
+    try:
+        pinned = customer_keys.ticket_key_mode(customer_keys.binding_of(vm))
+    except customer_keys.CustomerKeysError as exc:
+        raise EffectError(f"remint: vm {vm.vm_id!r}: {exc}") from exc  # type: ignore[attr-defined]
+    try:
+        parsed = validator.validate_ticket(cose_ticket)
+    except validator.ValidatorFailed:
+        return False
+    except validator.ValidatorUnavailable as exc:
+        raise EffectUnavailable(f"remint: validator unavailable: {exc}") from exc
+    return parsed.key_mode == pinned
+
+
 def current_placement(vm: object) -> tuple[str, int]:
     """The VM's CURRENT `(host, generation)` — what a KBS-state recovery
     re-registers, as opposed to a §25 `(dest, new_gen)`.
@@ -242,6 +327,16 @@ def current_placement(vm: object) -> tuple[str, int]:
     (the attested chip_id would not match). Refuse instead.
     """
     vm_id = str(getattr(vm, "vm_id", "") or "")
+    # Only an ACTIVE VM has a "current placement" the KBS may hold as
+    # `Active{gen, host}`. Re-registering a decommissioning/destroyed VM would
+    # re-open its release after a KBS wipe; a migrating one would be pinned
+    # back to `Active{old_gen, source}` — the split-brain §25 fences out.
+    state = str(getattr(vm, "state", "") or "")
+    if state != "active":
+        raise EffectError(
+            f"remint: vm {vm_id!r} is {state!r}, not 'active' — refusing to mint a "
+            "current-placement ticket for it"
+        )
     host = str(getattr(vm, "host", "") or "")
     if not host:
         raise EffectError(
@@ -278,11 +373,7 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
     vm_id = vm.vm_id  # type: ignore[attr-defined]
     lease_id = vm.lease_id  # type: ignore[attr-defined]
 
-    record = (
-        LaunchJob.objects.filter(vm_id=vm_id, state=LaunchJobState.SUCCEEDED)
-        .order_by("-finished_at")
-        .first()
-    )
+    record = _latest_launch_record(vm_id)
     if record is None:
         raise EffectError(f"remint: vm {vm_id!r} has no successful launch record")
     spec = record.spec_json or {}
@@ -293,8 +384,8 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
 
     # Non-secret binding metadata the dest ticket must echo
     # (tenant/user/platform). The launch record's spec_json is authoritative
-    # (the pipeline path does not persist an OrderTicketIntake); a stored
-    # source intake row, when present, is a supplemental fallback only.
+    # (launches before `launch_on_miner` recorded its ticket have no intake
+    # row); a stored source intake row is a supplemental fallback only.
     src_ticket = (
         OrderTicketIntake.objects.filter(vm_id=vm_id)
         .order_by("-vm_generation", "-received_at")
@@ -302,6 +393,16 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
     )
 
     measurement_hex = str(spec.get("measurement_hex") or emit.get("measurement_hex") or "")
+    # The guest components floor (G3): a re-mint replays the boot on
+    # record, so it is refused when that boot's set is below the VM's
+    # required epoch (a §25 hop or a KBS recovery must not bring a VM back
+    # onto the release an upgrade is moving it off).
+    from . import guest_components
+    from .launch_record import booted_artifacts
+
+    epoch_refusal = guest_components.launch_epoch_refusal(vm_id, booted_artifacts(record)[1])
+    if epoch_refusal:
+        raise EffectError(f"remint: {epoch_refusal}")
     if not measurement_hex:
         # The launch record did not persist the measurement. Without it we
         # cannot mint a ticket the KBS will gate — fail closed rather than
@@ -309,7 +410,12 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
         # the allowlist never pinned, and the KBS would refuse the KEK).
         raise EffectError(f"remint: launch record for {vm_id!r} has no measurement_hex")
 
-    flavor = str(spec.get("flavor") or "")
+    # The flavor the measured boot ran at (a stopped VM resized on the
+    # books has the spec's ahead of it): the ticket's flavor and vCPU count
+    # must be the measurement's.
+    from .launch_record import booted_flavor
+
+    flavor = booted_flavor(record)
     if not flavor:
         raise EffectError(f"remint: launch record for {vm_id!r} has no flavor")
 
@@ -324,6 +430,12 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
     prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", "") or "")
     if not prefix:
         raise EffectUnavailable("VALI_VAULT_KV_PREFIX is not configured")
+
+    # Customer-held keys: the mode is the Vm pin, and the cmdline the VM
+    # actually boots (the one this ticket's measurement covers) must carry
+    # exactly that binding. Any disagreement fails closed — this path must
+    # never re-mint an M1/M2 VM as M0.
+    binding = _check_recorded_binding(vm, record)
 
     return TicketInputs(
         vm_id=vm_id,
@@ -342,8 +454,10 @@ def resolve_ticket_inputs(vm: object, *, node_id: str, generation: int) -> Ticke
         platform_id=_node_platform_id(node_id),
         luks_path=f"{prefix}/{vm_id}/luks-kek",
         userdata_path=f"{prefix}/{vm_id}/userdata",
+        userdata_working_path=f"{prefix}/{vm_id}/userdata-pending",
         vault_mount=mount,
         expiry_seconds=int(spec.get("expiry_seconds") or 86400),
+        key_mode=customer_keys.ticket_key_mode(binding),
     )
 
 
@@ -356,11 +470,35 @@ def _mint_from(inputs: TicketInputs, *, ticket_id_prefix: str) -> bytes:
     generation = inputs.generation
 
     # ── Re-derive the §6 userdata digest for a FRESH ticket_id ──────────
-    fresh_ticket_id = f"{ticket_id_prefix}-{vm_id}-{generation}-{uuid.uuid4().hex[:8]}"
+    #
+    # The digest binds the ticket_id, and this is a NEW ticket, so the
+    # launch's digest cannot be reused — it has to be recomputed over the
+    # cloud-init PLAINTEXT (the KBS recomputes it over what it unwraps and
+    # the GUEST re-derives it a third time over what it receives, so the
+    # preimage is not ours to change).
+    #
+    # Which means reading a copy vali can actually OPEN. The canonical
+    # `userdata_path` is wrapped under the KBS-only `kek-<vm_id>`: hashing
+    # what a read of it returns — which is what this did the moment the
+    # canonical copy started being wrapped — produces a digest over
+    # ciphertext and a ticket that denies at release, i.e. a §25 migration
+    # that reports Done and leaves a VM that cannot unlock. vali's working
+    # copy is wrapped under `ud-<vm_id>` and unwraps here.
+    # Full UUID, not a truncation: the ticket_id keys the KBS register's
+    # idempotency, which refuses a DIFFERENT body under an id it has seen
+    # (`kbs_core::admin::process_admin_register`). A collision would
+    # surface as a re-mint that cannot be registered.
+    fresh_ticket_id = f"{ticket_id_prefix}-{vm_id}-{generation}-{uuid.uuid4().hex}"
 
-    luks_version = vault_kv.latest_version(inputs.vault_mount, inputs.luks_path)
+    if inputs.key_mode == customer_keys.KEY_MODE_CUSTOMER:
+        # M2: there is no KEK at `luks_path` (none was ever staged) and the
+        # KBS never reads it; the ref only names the path, at the constant
+        # version every M2 ticket uses. See `customer_keys.M2_LUKS_REF_VERSION`.
+        luks_version = customer_keys.M2_LUKS_REF_VERSION
+    else:
+        luks_version = vault_kv.latest_version(inputs.vault_mount, inputs.luks_path)
     ud_version = vault_kv.latest_version(inputs.vault_mount, inputs.userdata_path)
-    userdata = vault_kv.get_kv(inputs.vault_mount, inputs.userdata_path, version=ud_version)
+    userdata = _read_userdata_plaintext(inputs, ud_version)
     try:
         digest_hex = userdata_digest.userdata_digest_hex(
             tenant_id=inputs.tenant_id,
@@ -396,15 +534,17 @@ def _mint_from(inputs: TicketInputs, *, ticket_id_prefix: str) -> bytes:
             vm_generation=generation,
             lifecycle_perm=("launch",),
             expiry_seconds=inputs.expiry_seconds,
+            key_mode=inputs.key_mode,
         )
     )
 
-    _persist_intake(
+    persist_intake(
         cose_ticket,
         vm_id=vm_id,
-        new_gen=generation,
+        generation=generation,
         ticket_id=fresh_ticket_id,
         received_from=_RECEIVED_FROM.get(ticket_id_prefix, "system:remint"),
+        expected_key_mode=inputs.key_mode,
     )
     log.info(
         "remint: minted ticket vm=%s gen=%d ticket_id=%s node=%s",
@@ -414,6 +554,142 @@ def _mint_from(inputs: TicketInputs, *, ticket_id_prefix: str) -> bytes:
         inputs.node_id,
     )
     return cose_ticket
+
+
+class UserdataNotRebindable(EffectError):
+    """The §6 userdata digest for a NEW ticket could not be re-derived for
+    this VM — raised by [`assert_userdata_rebindable`] at §25 intake, and
+    ONLY for that verdict. Any other failure of the probe (Vault down,
+    unconfigured, permission) is not this class: those are not statements
+    about the VM, and the paths that need Vault will report them anyway.
+    """
+
+
+def assert_userdata_rebindable(vm: object) -> None:
+    """Raise unless a dest/recovery ticket for `vm` could have its §6
+    userdata digest re-derived — WITHOUT reading a secret.
+
+    Called at §25 intake, while the source is still running. The mint
+    itself happens after the source is quiesced, stopped and KBS-fenced,
+    and recovery from there is forward-only, so "vali cannot obtain the
+    plaintext for this VM" has to surface here or not at all.
+
+    Deliberately narrow: it reads the canonical value's PREFIX (plaintext
+    ⇒ usable as-is) and, when that is wrapped, applies the mint's own
+    pairing check to the working copy — opened under `ud-<vm_id>`, stamp
+    required, stamp == this canonical version — and zeroizes what it
+    opened. It never touches the canonical copy's plaintext (vali cannot:
+    that is `kek-<vm_id>`, KBS-only). A VM with nothing staged at all is
+    NOT judged here — that is a different failure with its own message
+    on the mint path.
+    """
+    vm_id = str(getattr(vm, "vm_id", "") or "")
+    mount = str(getattr(settings, "VALI_VAULT_KV_MOUNT", "secret"))
+    prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", "") or "")
+    if not vm_id or not prefix:
+        return
+    # No Vault ADDRESS configured at all is a deployment with no Vault —
+    # the dev/test shape. Distinct from a configured Vault that fails to
+    # answer, which IS a reason to refuse (below): there, secrets exist
+    # and the probe simply could not read them.
+    if not str(getattr(settings, "VALI_VAULT_ADDR", "") or "").strip():
+        return
+    # The re-mint reads its non-secret binding metadata off the last
+    # SUCCEEDED launch record. Without one it raises — and it raises at
+    # `DestActivating`, after the fence. `vali_create_vm` writes no such
+    # record, which is why a CLI-launched VM could be quiesced, stopped,
+    # fenced, and only then found unmigratable.
+    if not LaunchJob.objects.filter(vm_id=vm_id, state=LaunchJobState.SUCCEEDED).exists():
+        raise UserdataNotRebindable(
+            f"vm {vm_id!r} has no successful launch record — a destination "
+            "ticket cannot be minted for it (the re-mint reads the launch's "
+            "measurement, flavor and identity from that row). VMs launched "
+            "with `vali_create_vm` are in this state; relaunch through the "
+            "launch API to make one migratable."
+        )
+    canonical_path = f"{prefix}/{vm_id}/userdata"
+    working_path = f"{prefix}/{vm_id}/userdata-pending"
+    try:
+        version = vault_kv.latest_version(mount, canonical_path)
+        canonical = vault_kv.get_kv(mount, canonical_path, version=version)
+    except vault_kv.VaultNotFound as exc:
+        # Nothing staged at the canonical path at all. The mint would read
+        # it and fail — after the fence.
+        raise UserdataNotRebindable(
+            f"vm {vm_id!r} has no canonical userdata staged ({exc}) — a "
+            "destination ticket's §6 digest could not be re-derived"
+        ) from exc
+    wrapped = canonical.startswith(b"vault:")
+    _zeroize(canonical)
+    if not wrapped:
+        return  # legacy plaintext canonical — the digest re-derives from it
+    # The SAME check the mint will apply, run now rather than after the
+    # fence: open the working copy under `ud-<vm_id>` and require its
+    # stamp to name this canonical version. A shape-only probe (is there a
+    # `vault:`-prefixed value at the working path?) admitted an unstamped
+    # copy, or one stamped for another version, and the strict check at
+    # `DestActivating` then refused it — with the source already quiesced,
+    # stopped and KBS-fenced. The plaintext this opens is zeroized at once;
+    # the mint will open it again later on the same path anyway.
+    from apps.orchestration.services import launch
+
+    try:
+        opened = launch.open_userdata_working_copy(mount, working_path, vm_id, version)
+    except (vault_kv.VaultNotFound, launch.UserdataPairingError) as exc:
+        raise UserdataNotRebindable(
+            f"vm {vm_id!r} has a Transit-wrapped canonical userdata and no "
+            f"working copy paired to version {version} ({exc}) — a "
+            "destination ticket's §6 digest could not be re-derived (vali "
+            "holds no `transit/decrypt` for the KBS key). Re-stage the "
+            "userdata, which writes both copies, before migrating this VM."
+        ) from exc
+    _zeroize(opened)
+
+
+def _read_userdata_plaintext(inputs: TicketInputs, canonical_version: int) -> bytes:
+    """The cloud-init PLAINTEXT the §6 digest for this VM must be taken
+    over — the bytes that live at the canonical `path@canonical_version`
+    the ticket is about to bind.
+
+    Two ways to obtain them, and which one applies is decided by the
+    canonical value's own form:
+
+    - **Plaintext at rest** (a VM staged before the wrapping): the
+      canonical value IS the plaintext. Use it.
+    - **Wrapped** (every VM since): vali cannot open the canonical copy —
+      it is wrapped under the KBS-only `kek-<vm_id>`. `launch_on_miner`
+      therefore writes vali's working copy of the SAME bytes, under
+      `ud-<vm_id>`, in the same step, so the two paths share a version
+      number. Read it at that same version, which is what makes "these
+      are the bytes that canonical version holds" provable rather than
+      assumed.
+
+    Anything else fails closed. Hashing the wrong bytes mints a ticket
+    that passes every local check and denies at release — a §25 migration
+    that reports Done and a tenant VM that never unlocks.
+    """
+    from apps.orchestration.services import launch
+
+    canonical = vault_kv.get_kv(inputs.vault_mount, inputs.userdata_path, version=canonical_version)
+    if not canonical.startswith(b"vault:"):
+        return canonical
+    _zeroize(canonical)
+    try:
+        return launch.open_userdata_working_copy(
+            inputs.vault_mount,
+            inputs.userdata_working_path,
+            inputs.vm_id,
+            canonical_version,
+        )
+    except (vault_kv.VaultNotFound, launch.UserdataPairingError) as exc:
+        raise EffectError(
+            f"remint: vm {inputs.vm_id!r} has a Transit-wrapped canonical "
+            f"userdata and no usable working copy for version "
+            f"{canonical_version} ({exc}) — vali cannot recover the plaintext "
+            "the §6 digest is taken over (it holds no `transit/decrypt` for "
+            "the KBS key). Re-stage the userdata, or relaunch, so both paths "
+            "describe the same bytes."
+        ) from exc
 
 
 def _attr(obj: object | None, name: str) -> str:
@@ -464,12 +740,13 @@ def _node_platform_id(node_id: str) -> str:
     from apps.miners.models import MinerIdentity
 
     try:
-        pid = str(MinerIdentity.objects.get(miner_id=node_id).platform_id or "")
+        miner = MinerIdentity.objects.get(miner_id=node_id)
     except MinerIdentity.DoesNotExist as exc:
         raise EffectError(
             f"remint: miner {node_id!r} has no MinerIdentity — "
             "cannot bind the ticket to its SNP chip identity"
         ) from exc
+    pid = str(miner.platform_id or "")
     if not pid:
         raise EffectError(
             f"remint: miner {node_id!r} has an empty platform_id — "
@@ -492,7 +769,7 @@ def _node_platform_id(node_id: str) -> str:
     from .launch_digest import _vcpu_type_for_platform
 
     try:
-        _vcpu_type_for_platform(pid)
+        _vcpu_type_for_platform(pid, miner.snp_generation)
     except EffectError as exc:
         raise EffectError(
             f"remint: miner {node_id!r} has a malformed platform_id "
@@ -501,16 +778,19 @@ def _node_platform_id(node_id: str) -> str:
     return pid
 
 
-def _persist_intake(
+def persist_intake(
     cose_ticket: bytes,
     *,
     vm_id: str,
-    new_gen: int,
+    generation: int,
     ticket_id: str,
     received_from: str = "system:migration-remint",
+    expected_key_mode: str | None = None,
 ) -> None:
-    """Store the re-minted COSE blob as an `OrderTicketIntake` so the
-    dispatch resolves the new_gen ticket + a re-drive is idempotent. A
+    """Store a ticket vali minted as an `OrderTicketIntake` — vali's record
+    of every ticket it can have been granted a release against (the KBS
+    evidence names only the ticket_id). For a re-mint it also lets the
+    dispatch resolve the new_gen ticket and a re-drive stay idempotent. A
     racing duplicate (same ticket_id) is benign — keep the first.
     """
     from django.db import IntegrityError, transaction
@@ -526,6 +806,14 @@ def _persist_intake(
         raise EffectError(f"remint: self-minted ticket rejected: {exc}") from exc
     except validator.ValidatorUnavailable as exc:
         raise EffectUnavailable(f"remint: validator unavailable: {exc}") from exc
+    # Customer-held keys: read the mode back out of the ticket we just
+    # signed (the Rust decoder, not our argv) — a mint that dropped or
+    # changed it is never persisted, never dispatched.
+    if expected_key_mode is not None and parsed.key_mode != expected_key_mode:
+        raise EffectError(
+            f"remint: self-minted ticket for {vm_id!r} carries key_mode="
+            f"{parsed.key_mode!r}, the VM is {expected_key_mode!r} — refusing it"
+        )
 
     try:
         with transaction.atomic():
@@ -546,12 +834,12 @@ def _persist_intake(
                 received_from=received_from,
             )
     except IntegrityError:
-        # A concurrent tick persisted the same ticket_id — benign idempotent
-        # race. The existing row is byte-identical (same mint inputs), so
-        # there is nothing to reconcile.
+        # The same ticket_id is already on record — a concurrent tick's
+        # re-mint, or a launch re-using a caller-supplied ticket_id. Keep
+        # the first row; a veto reading it only ever fails closed.
         log.info(
             "remint: intake race vm=%s gen=%d ticket_id=%s (benign)",
             vm_id,
-            new_gen,
+            generation,
             ticket_id,
         )

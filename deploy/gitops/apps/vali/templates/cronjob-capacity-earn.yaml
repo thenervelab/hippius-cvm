@@ -1,0 +1,90 @@
+{{- if .Values.capacityEarn.enabled }}
+---
+# Capacity v2 §3 — earned capacity for permissionless (`earned`) miners.
+#
+# Runs `manage.py vali_capacity_earn` once per schedule: a vali-side pass
+# over every `earned` MinerCapacity row that records the concurrency the
+# miner is proven to hold and grows its ceiling from a HELD proof. Every
+# change is an audited MinerCapacityAudit row (`tick:earn`). `operator`
+# rows are never touched, and with `VALI_CAPACITY_EARN_PROOF=off` (the
+# default — no proof source is trusted yet) nothing grows: the pass only
+# resets an observed SNP-incapable earned host to the floor.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: capacity-earn
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: capacity-earn
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.capacityEarn.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: capacity-earn
+            # Postgres CNP keys :5432 ingress on the vali identity — without
+            # it this pod is DB-blocked and hangs with no logs.
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          # The tick does not call the Kubernetes API.
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: capacity-earn
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              # Override the gunicorn ENTRYPOINT with a single earned-capacity pass.
+              command: ["python", "manage.py", "vali_capacity_earn"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+              resources:
+                {{- .Values.capacityEarn.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+{{- end }}

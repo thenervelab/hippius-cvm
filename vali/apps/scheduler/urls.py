@@ -11,6 +11,7 @@ from .views import (
     SchedulerBindView,
     SchedulerCapacityView,
     SchedulerFailView,
+    SchedulerFeasibilityView,
     SchedulerPlaceView,
 )
 
@@ -46,6 +47,13 @@ urlpatterns = [
     # §23 marketplace price-migration alerts (vSphere-DRS-manual): a price
     # breach raises a recommendation an operator approves (→ migration) or
     # dismisses. The watcher NEVER auto-migrates on price.
+    # Pre-sale feasibility — "can we place this flavor?" (flavor-aware,
+    # unlike /scheduler/capacity which answers in reference-flavor slots).
+    path(
+        "scheduler/feasibility",
+        SchedulerFeasibilityView.as_view(),
+        name="scheduler_feasibility",
+    ),
     path(
         "price-recommendations",
         PriceRecommendationListView.as_view(),

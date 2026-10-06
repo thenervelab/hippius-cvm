@@ -39,6 +39,7 @@ import secrets
 import uuid
 
 from django.db import models
+from django.utils import timezone
 
 
 class VmState(models.TextChoices):
@@ -72,6 +73,9 @@ class VmPowerState(models.TextChoices):
     STOPPING = "stopping", "Stopping"
     STOPPED = "stopped", "Stopped"
     STARTING = "starting", "Starting"
+    # Terminal: the VM is `destroyed` (§24), so no guest can run again.
+    # Set in the same CAS as the tombstone; nothing moves it afterwards.
+    OFF = "off", "Off"
 
 
 class VmBootPhase(models.TextChoices):
@@ -128,9 +132,11 @@ class VmNetbirdStatus(models.TextChoices):
 
     A §25 COLD migration moves the guest-keyed overlay intact, so the
     guest's own NetBird identity (`/var/lib/netbird/config.json`) survives
-    the move. What does NOT survive is the MANAGEMENT-SIDE peer record:
-    `effects.mint_netbird_setup_key` mints every tenant key
-    `ephemeral: True`, and NetBird deletes an ephemeral peer after ~10 min
+    the move. What did NOT survive is the MANAGEMENT-SIDE peer record:
+    `effects.mint_netbird_setup_key` minted every tenant key
+    `ephemeral: True` until tenant peers became persistent (VMs launched
+    since keep their record across any downtime; older ones still carry
+    the ephemeral peer), and NetBird deletes an ephemeral peer after ~10 min
     offline — a window a cold migration (quiesce → snapshot → upload →
     download → boot; the dest-activation poll alone budgets 20 min)
     routinely exceeds. The destination cannot re-enrol either: cloud-init
@@ -150,7 +156,10 @@ class VmNetbirdStatus(models.TextChoices):
     - `ok`       — the peer was observed connected after the migration.
     - `lost`     — the peer record is gone from NetBird management (or
                    never reconnected before the deadline). The tenant is
-                   OFF the overlay and cannot self-heal.
+                   OFF the overlay and cannot self-heal. Also set, with
+                   `netbird_ip` cleared, for any `active` VM whose peer
+                   record disappears (`netbird_binding.refresh_overlay_ips`),
+                   and back to `ok` once its peer is seen connected.
     """
 
     PENDING = "pending", "Verification pending"
@@ -183,6 +192,29 @@ def _fresh_eol_nonce() -> bytes:
     Migrating).
     """
     return secrets.token_bytes(32)
+
+
+def destroyed_power_fields() -> dict:
+    """What a `Destroyed` tombstone sets on the power axis, in the same CAS
+    as the state: terminal `off`, and no stop proof (it described a boot
+    that can never run again). A tombstone left reading `running` looks
+    like a zombie to anyone reading the row."""
+    return {
+        "power_state": VmPowerState.OFF.value,
+        "power_state_at": timezone.now(),
+        "power_stop_proof": None,
+        "power_stop_ordered_at": None,
+    }
+
+
+class VmQuerySet(models.QuerySet):
+    """`update()` stamps `updated_at`: a queryset update skips `auto_now`,
+    and the §24/§25 transitions are CAS updates — without this a row
+    destroyed on 09-27 read `updated_at` from 09-25."""
+
+    def update(self, **kwargs):
+        kwargs.setdefault("updated_at", timezone.now())
+        return super().update(**kwargs)
 
 
 class Vm(models.Model):
@@ -268,6 +300,21 @@ class Vm(models.Model):
     # would exceed this. Set at launch; survives migration (the row is
     # keyed by the stable `vm_id`).
     max_price_per_unit = models.BigIntegerField(null=True, blank=True)
+    # ── Customer-held disk keys — pinned at first launch, IMMUTABLE ──
+    # Who holds the disk key: `hippius` (M0, every VM before this column),
+    # `split` (M1) or `customer` (M2), plus the guardian the measured
+    # cmdline names. Written ONCE by `launch._ensure_vm_row` when it
+    # creates the row; every relaunch / re-mint / §25 / restore path
+    # compares against it (`services.customer_keys`) and refuses a
+    # difference, so an M1/M2 VM is never re-minted as M0. Mode switching
+    # is launch-time only.
+    key_mode = models.CharField(max_length=16, default="hippius", db_default="hippius")
+    guardian_endpoint = models.CharField(
+        max_length=259, blank=True, default="", db_default=""
+    )
+    guardian_pubkey = models.CharField(
+        max_length=64, blank=True, default="", db_default=""
+    )
     version = models.PositiveBigIntegerField(default=1)
     # Guest-boot progress mirror (miner-agent → Edge → vali). Blank until
     # the first signed `verify-vm-progress` milestone lands; advanced
@@ -281,6 +328,13 @@ class Vm(models.Model):
     )
     # When `boot_phase` was last advanced. NULL until the first milestone.
     boot_phase_at = models.DateTimeField(null=True, blank=True)
+    # When the VM's CURRENT boot began: the first host bind of a launch, a
+    # §25 dest activation, or a reboot-recovery / power-start relaunch. The
+    # clock for the boot-stall verdict (`apps.lifecycle.boot_stall`): no
+    # in-guest signal since this instant, past a per-flavor deadline, reads
+    # stalled. NULL on rows from before the column; the verdict falls back
+    # to `created_at`.
+    boot_started_at = models.DateTimeField(null=True, blank=True)
     # ── Power state — ORTHOGONAL to `state`, deliberately ─────────────
     # `state` mirrors `kbs_core::lifecycle::VmState`, which the KBS checks
     # serializably before EVERY release. A stopped VM must still be able to
@@ -310,6 +364,23 @@ class Vm(models.Model):
     # the billing layer reads it to know how long the reservation has been
     # held idle.
     power_state_at = models.DateTimeField(null=True, blank=True)
+    # The `eol_nonce` of the boot a power stop shut down, recorded when that
+    # guest's signed stopped-ack verified at ingest (while `stopping`).
+    # Cleared by every power transition other than to `stopped`. §24 of a
+    # stopped VM takes it as its EOL ack: the ack itself cannot verify then,
+    # its signed time being out of skew by the time anyone decommissions.
+    power_stop_proof = models.BinaryField(max_length=32, null=True, blank=True)
+    # The `power_state_at` of a `stopped` reached by a COMPLETED power stop
+    # order (`power.stop_vm`): the miner then holds the domain as stopped by
+    # the agent and never restarts it on its own. It describes the CURRENT
+    # stop only while it EQUALS `power_state_at` — every power write stamps
+    # `power_state_at` (including those of an older image during a rollout,
+    # which does not know this column), so any later transition, an
+    # abandoned marker settled from one "down" poll, a refused start, a
+    # restore abort, makes it stale without having to clear it. What
+    # `vali_swap_vm_initrd --revert` needs before it rewrites a relaunched
+    # VM's recorded boot (`Vm.stopped_by_order`).
+    power_stop_ordered_at = models.DateTimeField(null=True, blank=True)
     # ── In-guest liveness watermark ──────────────────────────────────
     # Wall-clock of the newest signal that could ONLY have come from
     # inside a running guest: a §23 `served_receipt` (universal across
@@ -328,6 +399,32 @@ class Vm(models.Model):
     # | "" when never). Display/diagnostic only — the verdict depends on
     # the timestamp, not on which agent produced it.
     guest_signal_kind = models.CharField(max_length=32, blank=True, default="")
+    # ── Customer-held keys: waiting on the tenant's key guardian ──────
+    # The latest signed `awaiting-guardian` vm-progress milestone for an
+    # M1/M2 VM (`apps.lifecycle.guardian_wait`): the guest sits in its
+    # initramfs until the customer's guardian answers, BEFORE any KBS
+    # release (design §6). DISPLAY-only and weak (the miner derives it from
+    # the traffic it relays, so it can suppress or forge it); its one
+    # automated use is to hold back timers that would otherwise read the
+    # wait as a failure — bounded by `VALI_GUARDIAN_WAIT_MAX_PAUSE_S`.
+    #
+    # `guardian_wait_reason` — the closed-vocabulary reason
+    # (`unreachable`, `timeout`, `refused:<reason>`, `bad-response`), ""
+    # once a later milestone (`kek-released` / `running`) proves the guest
+    # got past its guardian. `guardian_wait_since` — when this wait began.
+    # `guardian_wait_at` — the newest report (freshness), kept after the
+    # clear so a timer can credit the time the guest spent waiting.
+    guardian_wait_reason = models.CharField(
+        max_length=64, blank=True, default="", db_default=""
+    )
+    guardian_wait_since = models.DateTimeField(null=True, blank=True)
+    guardian_wait_at = models.DateTimeField(null=True, blank=True)
+    # Ordering on the SIGNED timestamps (delivery is fire-and-forget and can
+    # reorder): the newest recorded wait report's, and the newest clearing
+    # milestone's (`kek-released` / `running`). A wait report no newer than
+    # the latter is dropped, so a late report never re-arms a cleared wait.
+    guardian_wait_signed_at = models.DateTimeField(null=True, blank=True)
+    guardian_wait_cleared_at = models.DateTimeField(null=True, blank=True)
     # Tenant NetBird overlay IP (`100.x.y.z`). Resolved OPPORTUNISTICALLY
     # from the NetBird management API on the first served-receipt ingest
     # after the guest enrols (see telemetry `service.
@@ -336,6 +433,13 @@ class Vm(models.Model):
     # NEVER makes an outbound NetBird call (the value is populated on the
     # receipt-ingest worker path so `/state` reads are a pure DB lookup).
     netbird_ip = models.CharField(max_length=64, blank=True, default="")
+    # The NetBird peer id of THIS VM's peer: the peer that last enrolled
+    # with a setup key vali minted for it (`VmNetbirdKey`, bound by
+    # `orchestration.netbird_binding`). Blank until bound, and forever for a
+    # VM launched before keys were recorded. When set it is AUTHORITATIVE:
+    # the resolvers find the peer by this id, not by its name (a name is
+    # whatever hostname the guest sent — a claim), and §24 deletes it by id.
+    netbird_peer_id = models.CharField(max_length=64, blank=True, default="")
     # Post-§25 overlay reachability verdict — see `VmNetbirdStatus` for the
     # failure it exists to make visible. Set to `pending` by the §25
     # dest-activation CAS (only for a VM that HAD a resolved `netbird_ip`,
@@ -361,8 +465,8 @@ class Vm(models.Model):
     # boots is never invisible to the control plane. The mirror hazard is
     # a launch that dies AFTER those effects and never binds a host: the
     # row is left `state=active host=""` with a LIVE per-VM Vault-Transit
-    # KEK and no VM anywhere. Proved live 2026-08-13 (`p1final-1/2/3`,
-    # three consecutive `dispatch-failed-after-register` onto a miner that
+    # KEK and no VM anywhere. Seen in production 2026-08-13 (three
+    # consecutive `dispatch-failed-after-register` onto a miner that
     # could not start a CVM). Such a row is counted LIVE by every sweep
     # that filters `exclude(state='destroyed')`, and nothing ever reaps it.
     #
@@ -404,6 +508,8 @@ class Vm(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = VmQuerySet.as_manager()
+
     class Meta:
         ordering = ["-updated_at"]
         indexes = [
@@ -419,22 +525,37 @@ class Vm(models.Model):
             # also honours `CHECK` constraints.
             models.CheckConstraint(
                 name="lifecycle_vm_migrating_requires_dest",
-                condition=(
-                    ~models.Q(state=VmState.MIGRATING)
-                    | ~models.Q(migration_dest="")
-                ),
+                condition=(~models.Q(state=VmState.MIGRATING) | ~models.Q(migration_dest="")),
             ),
             models.CheckConstraint(
                 name="lifecycle_vm_migrating_requires_new_generation",
                 condition=(
-                    ~models.Q(state=VmState.MIGRATING)
-                    | models.Q(new_generation__isnull=False)
+                    ~models.Q(state=VmState.MIGRATING) | models.Q(new_generation__isnull=False)
                 ),
             ),
         ]
 
     def __str__(self) -> str:
         return f"Vm {self.vm_id} ({self.state}, gen={self.generation})"
+
+    def save(self, *args, **kwargs):
+        """`auto_now` only fires for a field in `update_fields`: every
+        partial save stamps `updated_at` too."""
+        fields = kwargs.get("update_fields")
+        # An empty list stays Django's no-op.
+        if fields and "updated_at" not in fields:
+            kwargs["update_fields"] = [*fields, "updated_at"]
+        super().save(*args, **kwargs)
+
+    @property
+    def stopped_by_order(self) -> bool:
+        """`stopped`, and by a completed stop order — see
+        `power_stop_ordered_at`."""
+        return (
+            self.power_state == VmPowerState.STOPPED
+            and self.power_state_at is not None
+            and self.power_stop_ordered_at == self.power_state_at
+        )
 
     # ─── Helpers ──────────────────────────────────────────────────
 
@@ -480,6 +601,18 @@ class Vm(models.Model):
         from . import guest_liveness as _guest_liveness
 
         return _guest_liveness.verdict_for(self, now=now)
+
+    def boot_stall(self, now=None, disk_gb_by_vm_id=None):
+        """The boot-stall `BootStall` readout, derived at read time.
+
+        `disk_gb_by_vm_id` lets a list resolve every row's flavor in one
+        query; omitted, this row's is looked up.
+        """
+        from . import boot_stall as _boot_stall
+
+        if disk_gb_by_vm_id is None:
+            disk_gb_by_vm_id = _boot_stall.disk_gb_by_vm_id([self.vm_id])
+        return _boot_stall.classify(self, disk_gb=disk_gb_by_vm_id.get(self.vm_id), now=now)
 
     @classmethod
     def issue_eol_nonce(cls) -> bytes:
@@ -563,12 +696,12 @@ class VmBaseImage(models.Model):
     The launch spec carried the base as a PATH with a fixed, shared,
     mutable default (`/var/lib/hippius-miner/rootfs.img`). A path is not
     an identity: on 2026-08-13 that same path was a SYMLINK into the
-    shared legacy base on `miner-2` and a real 709 MB
-    2026-07-29 file on `miner-3`. One spec, two miners, two
+    shared legacy base on one miner and a real 709 MB
+    2026-07-29 file on another. One spec, two miners, two
     different operating systems — and no way, from vali, to tell which
     bytes a live tenant was running. That is what kept
     `VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION` unarmable: nothing recorded
-    that `realtenant-ubuntu-1` was on a base predating the
+    that `tenant-vm-1` was on a base predating the
     `hippius-agent-keepalive` shim.
 
     ## What a row means
@@ -628,3 +761,92 @@ class VmBaseImage(models.Model):
 
     def __str__(self) -> str:
         return f"VmBaseImage {self.vm_id} img={self.rootfs_img_sha256_hex[:12]}"
+
+
+class ZombieObservation(models.Model):
+    """A guest frame from a VM whose data vali has already killed.
+
+    Once a §24 crypto-erase has run (or the VM is `destroyed`), the guest
+    has no business running: its disk key is gone from Vault and the next
+    boot can never unlock. If a served receipt, a live attestation or a
+    boot milestone for it still arrives, some miner is still running it —
+    the destroy never reached the domain (miner unreachable, 502, or a
+    miner that ignores the order). That is a data-death gap: the guest
+    keeps its LUKS master key in memory for as long as the domain lives.
+
+    One row per `(vm_id, miner_id)` — the relaying miner when the Edge
+    stamped its mTLS peer, else vali's own record of where the destroy
+    was aimed. `apps.lifecycle.zombie` derives the miner quarantine from
+    the FRESH rows; nothing here is ever flipped by hand.
+    """
+
+    vm_id = models.CharField(max_length=64, db_index=True)
+    # `MinerIdentity.miner_id` / `chain_node_id` of the miner the frame is
+    # attributed to. `miner_node_id` is the key placement and epoch
+    # weights use; blank when the miner has no chain identity (the row is
+    # still recorded — and alerted on — but can quarantine nobody).
+    miner_id = models.CharField(max_length=128, blank=True, default="")
+    miner_node_id = models.CharField(max_length=128, blank=True, default="", db_index=True)
+    # `peer` (the Edge-stamped relaying miner) or `destroy-target` (vali's
+    # own record, used when the frame carried no relay identity).
+    attribution = models.CharField(max_length=16, default="peer")
+    last_kind = models.CharField(max_length=32, default="")
+    count = models.PositiveBigIntegerField(default=0)
+    first_seen_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField(db_index=True)
+    # Last UNFORGEABLE frame — a KBS-signed live attestation (needs the real
+    # SNP guest) or a miner-signed boot milestone. Only these quarantine a
+    # miner: a served receipt is signed by a guest key root can extract, so
+    # a former tenant could forge one to grief its old host. Receipts are
+    # still refused, alerted on and counted.
+    strong_last_seen_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Last time this row raised its ERROR — once per VM per window.
+    alerted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vm_id", "miner_id"], name="lifecycle_zombie_vm_miner_uniq"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"ZombieObservation {self.vm_id} on {self.miner_id or '?'} x{self.count}"
+
+
+class VmNetbirdKey(models.Model):
+    """One NetBird setup key vali minted for a VM, and the peer that used it.
+
+    Recorded by `launch.launch_on_miner` right after the mint, BEFORE the
+    key leaves vali (it rides the userdata to the guest), so every peer that
+    can ever enrol with a vali-minted tenant key is traceable to its VM.
+
+    The key→peer binding comes from NetBird's own audit log: when a peer
+    registers with a setup key, the management server records a
+    `peer.setupkey.add` event whose `initiator_id` is the setup key's id and
+    whose `target_id` is the new peer's id (`AddPeer`,
+    `management/server/peer.go`). Neither is tenant-controlled — unlike the
+    peer's NAME, which is the hostname the guest sends. Whoever enrolled with
+    the key held a credential minted for this VM, so its peer is this VM's
+    to revoke, whatever it calls itself.
+
+    - `peer_id`    the peer that enrolled with the key; blank until bound, and
+                   blank forever for a key that expired unused.
+    - `settled_at` when the binding concluded (bound, or expired unused). A
+                   NULL row is still being looked for — the only rows that
+                   cost a NetBird audit-log read.
+    """
+
+    vm = models.ForeignKey(Vm, on_delete=models.CASCADE, related_name="netbird_keys")
+    setup_key_id = models.CharField(max_length=64, unique=True)
+    persistent = models.BooleanField()
+    expires_at = models.DateTimeField()
+    peer_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    settled_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self) -> str:
+        return f"VmNetbirdKey({self.vm_id}, key={self.setup_key_id}, peer={self.peer_id or '-'})"

@@ -109,7 +109,7 @@ def spy(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Spy:
     monkeypatch.setattr(ticket_mint, "mint", _fake_mint)
     # The intake persistence shells out to the ticket-validator binary; the
     # mint blob above is a stand-in, so stub the store.
-    monkeypatch.setattr(migration_ticket, "_persist_intake", lambda blob, **kw: None)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
 
     def _fake_register(*, vm_id: str, cose_ticket: bytes) -> Any:
         if s.register_error is not None and vm_id in s.register_error_for:
@@ -135,13 +135,72 @@ def spy(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Spy:
     return s
 
 
-def _vm_with_launch(vm_id: str = "vm-a", *, gen: int = 7, host: str = "miner-1"):
+def _vm_with_launch(vm_id: str = "vm-a", *, gen: int = 7, host: str = "miner-a"):
     vm = make_vm(vm_id, generation=gen, host=host)
     _launch_record(vm)
     MinerIdentity.objects.get_or_create(
         miner_id=host, defaults={"pubkey_hex": "bb" * 32, "platform_id": "22" * 64}
     )
     return vm
+
+
+# ── CLAIM 0: a VM whose digest cannot be re-derived is refused up front ──
+#
+# The re-mint hashes the cloud-init plaintext. For a VM staged before the
+# working copy existed, the canonical copy is Transit-wrapped under the
+# KBS-only key and the working path holds the pre-substitution template —
+# nothing vali can re-derive the §6 digest from. Live on 2026-09-21: the
+# dry-run said `would-recover`, the commit seeded the one-shot boot counter
+# and THEN failed the mint, leaving three tenant VMs seeded but
+# unregistered in a fresh KBS. Both paths must refuse before any write.
+
+
+def _pre_wrapping_vm(monkeypatch: pytest.MonkeyPatch, vm_id: str = "vm-legacy") -> None:
+    _vm_with_launch(vm_id)
+    monkeypatch.setattr(settings, "VALI_VAULT_ADDR", "https://vault.invalid:8200", raising=False)
+
+    def get_kv(mount: str, path: str, **kw: Any) -> bytes:
+        if path.endswith("-pending"):
+            return b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"  # plaintext template
+        return b"vault:v1:" + b"#cloud-config\n".hex().encode("ascii")  # wrapped
+
+    monkeypatch.setattr(vault_kv, "get_kv", get_kv)
+
+
+def test_dry_run_refuses_a_vm_whose_digest_cannot_be_rederived(
+    spy: Spy, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    _pre_wrapping_vm(monkeypatch)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-legacy")
+    out = capsys.readouterr().out
+    assert "outcome=failed" in out
+    assert "would-recover" not in out
+    assert "Re-stage the userdata" in out
+
+
+def test_commit_refuses_such_a_vm_before_the_one_shot_seed(
+    spy: Spy, monkeypatch: pytest.MonkeyPatch, tmp_path: Any, capsys: Any
+) -> None:
+    _pre_wrapping_vm(monkeypatch)
+    counter_file = tmp_path / "bc"
+    counter_file.write_text("1")
+    with pytest.raises(SystemExit):
+        call_command(
+            COMMAND,
+            "--vm-id",
+            "vm-legacy",
+            "--boot-counter-file",
+            str(counter_file),
+            "--counter-source",
+            "miner-a",
+            "--commit",
+            "--yes",
+        )
+    out = capsys.readouterr().out
+    assert "outcome=failed" in out
+    assert spy.seeded == []  # the one-shot seed never happened
+    assert spy.mint_args == [] and spy.registered == []
 
 
 # ── CLAIM 1: dry-run is the default and mutates nothing ────────────────
@@ -162,7 +221,7 @@ def test_dry_run_still_reports_the_resolved_plan(spy: Spy, capsys: Any) -> None:
     call_command(COMMAND, "--vm-id", "vm-a")
     out = capsys.readouterr().out
     assert "outcome=would-recover" in out
-    assert "gen=7" in out and "node=miner-1" in out
+    assert "gen=7" in out and "node=miner-a" in out
     assert "mode=dry-run" in out
 
 
@@ -177,9 +236,9 @@ def test_dry_run_and_commit_together_are_refused(spy: Spy) -> None:
 
 
 def test_commit_remints_at_the_vms_own_generation_and_host(spy: Spy) -> None:
-    _vm_with_launch(gen=7, host="miner-1")
+    _vm_with_launch(gen=7, host="miner-a")
     # A second miner exists so "picked the VM's own host" is a real assertion.
-    MinerIdentity.objects.create(miner_id="miner-9", pubkey_hex="cc" * 32, platform_id="33" * 64)
+    MinerIdentity.objects.create(miner_id="miner-i", pubkey_hex="cc" * 32, platform_id="33" * 64)
 
     call_command(COMMAND, "--vm-id", "vm-a", "--commit")
 
@@ -187,7 +246,7 @@ def test_commit_remints_at_the_vms_own_generation_and_host(spy: Spy) -> None:
     args = spy.mint_args[0]
     # NOT new_gen (8), NOT a destination — the VM's CURRENT placement.
     assert args.vm_generation == 7
-    assert args.node_id == "miner-1"
+    assert args.node_id == "miner-a"
     assert args.platform_id == "22" * 64
     assert args.allowed_measurement_hex == "ab" * 48
     # ...and exactly that blob is what gets registered.
@@ -214,7 +273,7 @@ def test_commit_remints_even_when_a_stored_same_gen_ticket_exists(spy: Spy) -> N
         vm_generation=7,
         issue_time=1,
         expiry=2,  # long expired — tickets live 24h
-        node_id="miner-1",
+        node_id="miner-a",
         platform_id="22" * 64,
         resource_class="small",
         kid_hex="6b6964",
@@ -232,11 +291,11 @@ def test_commit_remints_even_when_a_stored_same_gen_ticket_exists(spy: Spy) -> N
 
 
 def test_a_vm_without_a_measurement_is_refused_without_minting(spy: Spy) -> None:
-    vm = make_vm("vm-nomeas", generation=7, host="miner-1")
+    vm = make_vm("vm-nomeas", generation=7, host="miner-a")
     rec = _launch_record(vm)
     rec.result_json = {"emit": {}}
     rec.save(update_fields=["result_json"])
-    MinerIdentity.objects.create(miner_id="miner-1", pubkey_hex="bb" * 32, platform_id="22" * 64)
+    MinerIdentity.objects.create(miner_id="miner-a", pubkey_hex="bb" * 32, platform_id="22" * 64)
 
     with pytest.raises(SystemExit) as exc:
         call_command(COMMAND, "--vm-id", "vm-nomeas", "--commit")
@@ -258,8 +317,8 @@ def test_a_vm_without_a_host_is_refused_without_minting(spy: Spy) -> None:
 
 
 def test_a_vm_without_a_launch_record_is_refused_without_minting(spy: Spy) -> None:
-    make_vm("vm-nolaunch", generation=7, host="miner-1")
-    MinerIdentity.objects.create(miner_id="miner-1", pubkey_hex="bb" * 32, platform_id="22" * 64)
+    make_vm("vm-nolaunch", generation=7, host="miner-a")
+    MinerIdentity.objects.create(miner_id="miner-a", pubkey_hex="bb" * 32, platform_id="22" * 64)
 
     with pytest.raises(SystemExit):
         call_command(COMMAND, "--vm-id", "vm-nolaunch", "--commit")
@@ -272,11 +331,11 @@ def test_a_vm_without_a_launch_record_is_refused_without_minting(spy: Spy) -> No
 
 def test_one_vms_failure_does_not_prevent_the_next(spy: Spy, capsys: Any) -> None:
     # vm-bad has no measurement (fails resolution); vm-ok is healthy.
-    bad = make_vm("vm-bad", generation=7, host="miner-1")
+    bad = make_vm("vm-bad", generation=7, host="miner-a")
     rec = _launch_record(bad)
     rec.result_json = {"emit": {}}
     rec.save(update_fields=["result_json"])
-    _vm_with_launch("vm-ok", gen=7, host="miner-1")
+    _vm_with_launch("vm-ok", gen=7, host="miner-a")
 
     with pytest.raises(SystemExit) as exc:
         call_command(COMMAND, "--vm-id", "vm-bad", "--vm-id", "vm-ok", "--commit")
@@ -290,8 +349,8 @@ def test_one_vms_failure_does_not_prevent_the_next(spy: Spy, capsys: Any) -> Non
 
 
 def test_a_register_failure_does_not_prevent_the_next(spy: Spy, capsys: Any) -> None:
-    _vm_with_launch("vm-1", gen=7, host="miner-1")
-    _vm_with_launch("vm-2", gen=7, host="miner-1")
+    _vm_with_launch("vm-1", gen=7, host="miner-a")
+    _vm_with_launch("vm-2", gen=7, host="miner-a")
     spy.register_error = kbs_admin.KbsAdminConflict("409 conflict — state drift")
     spy.register_error_for = {"vm-1"}
 
@@ -303,9 +362,9 @@ def test_a_register_failure_does_not_prevent_the_next(spy: Spy, capsys: Any) -> 
 
 
 def test_all_active_selects_every_active_vm(spy: Spy) -> None:
-    _vm_with_launch("vm-act-1", host="miner-1")
-    _vm_with_launch("vm-act-2", host="miner-1")
-    gone = make_vm("vm-dead", generation=7, host="miner-1", state=VmState.DESTROYED)
+    _vm_with_launch("vm-act-1", host="miner-a")
+    _vm_with_launch("vm-act-2", host="miner-a")
+    gone = make_vm("vm-dead", generation=7, host="miner-a", state=VmState.DESTROYED)
     _launch_record(gone)
 
     call_command(COMMAND, "--all-active", "--commit")
@@ -722,8 +781,8 @@ def test_committing_a_seed_without_yes_is_refused(spy: Spy, tmp_path: Any) -> No
 
 
 def test_a_seed_across_many_vms_is_refused(spy: Spy, tmp_path: Any) -> None:
-    _vm_with_launch("vm-1", host="miner-1")
-    _vm_with_launch("vm-2", host="miner-1")
+    _vm_with_launch("vm-1", host="miner-a")
+    _vm_with_launch("vm-2", host="miner-a")
     counter_file = tmp_path / "boot-counter"
     counter_file.write_bytes(b"3")
 
@@ -786,3 +845,461 @@ def test_vm_id_and_all_active_together_are_refused(spy: Spy) -> None:
 def test_an_unknown_vm_id_is_refused_loudly(spy: Spy) -> None:
     with pytest.raises(CommandError, match="unknown vm_id"):
         call_command(COMMAND, "--vm-id", "vm-ghost")
+
+
+# ── CLAIM 14: only an ACTIVE VM is ever re-registered ──────────────────
+#
+# Seed + register re-creates `Active{gen, host}` in a wiped KBS. For a
+# decommissioning/destroyed VM that re-opens a release vali already killed;
+# for a migrating one it re-admits the fenced-out source. Refused before any
+# write, and re-checked from the DB right before the seed and the register.
+
+
+def _set_state(vm: Any, state: str) -> None:
+    extra: dict[str, Any] = {}
+    if state == VmState.MIGRATING:
+        extra = {"migration_dest": "miner-b", "new_generation": vm.generation + 1}
+    type(vm).objects.filter(id=vm.id).update(state=state, **extra)
+
+
+def _counter(tmp_path: Any, value: str = "3") -> str:
+    f = tmp_path / "bc"
+    f.write_text(value)
+    return str(f)
+
+
+@pytest.mark.parametrize(
+    "state", [VmState.DECOMMISSIONING, VmState.DESTROYED, VmState.MIGRATING]
+)
+def test_a_vm_that_is_not_active_is_refused_before_any_write(
+    spy: Spy, tmp_path: Any, capsys: Any, state: str
+) -> None:
+    vm = _vm_with_launch()
+    _set_state(vm, state)
+    with pytest.raises(SystemExit) as info:
+        call_command(
+            COMMAND,
+            "--vm-id",
+            "vm-a",
+            "--boot-counter-file",
+            _counter(tmp_path),
+            "--commit",
+            "--yes",
+        )
+    assert info.value.code == 1
+    out = capsys.readouterr().out
+    assert "outcome=refused-not-active" in out
+    assert spy.seeded == [] and spy.mint_args == [] and spy.registered == []
+
+
+def test_the_dry_run_refuses_it_too(spy: Spy, capsys: Any) -> None:
+    vm = _vm_with_launch()
+    type(vm).objects.filter(id=vm.id).update(state=VmState.DESTROYED)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a")
+    out = capsys.readouterr().out
+    assert "outcome=refused-not-active" in out
+    assert "would-recover" not in out
+    assert "--reinstall-tombstones" in out
+
+
+def test_a_migrating_vm_is_sent_to_the_migration_tooling(spy: Spy, capsys: Any) -> None:
+    vm = _vm_with_launch()
+    _set_state(vm, VmState.MIGRATING)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert "recover the migration first" in capsys.readouterr().out
+    assert spy.registered == []
+
+
+def test_a_vm_decommissioned_mid_run_is_not_seeded(
+    spy: Spy, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vm = _vm_with_launch()
+    real = migration_ticket.assert_userdata_rebindable
+
+    def and_decommission(v: Any) -> None:
+        real(v)
+        type(vm).objects.filter(id=vm.id).update(state=VmState.DECOMMISSIONING)
+
+    monkeypatch.setattr(migration_ticket, "assert_userdata_rebindable", and_decommission)
+    with pytest.raises(SystemExit):
+        call_command(
+            COMMAND,
+            "--vm-id",
+            "vm-a",
+            "--boot-counter-file",
+            _counter(tmp_path),
+            "--commit",
+            "--yes",
+        )
+    assert spy.seeded == [] and spy.registered == []
+
+
+def test_a_vm_decommissioned_after_its_seed_is_not_registered(
+    spy: Spy, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    vm = _vm_with_launch()
+    real_seed = effects.seed_boot_counter
+
+    def seed_then_decommission(vm_id: str, *, counter: int) -> Any:
+        res = real_seed(vm_id, counter=counter)
+        type(vm).objects.filter(id=vm.id).update(state=VmState.DECOMMISSIONING)
+        return res
+
+    monkeypatch.setattr(effects, "seed_boot_counter", seed_then_decommission)
+    with pytest.raises(SystemExit):
+        call_command(
+            COMMAND,
+            "--vm-id",
+            "vm-a",
+            "--boot-counter-file",
+            _counter(tmp_path),
+            "--commit",
+            "--yes",
+        )
+    assert spy.seeded == [("vm-a", 3)]
+    assert spy.mint_args == [] and spy.registered == []
+    assert "before-register" in capsys.readouterr().out
+
+
+def test_a_vm_decommissioned_mid_run_without_a_seed_is_not_registered(
+    spy: Spy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vm = _vm_with_launch()
+    real = migration_ticket.assert_userdata_rebindable
+
+    def and_decommission(v: Any) -> None:
+        real(v)
+        type(vm).objects.filter(id=vm.id).update(state=VmState.DESTROYED)
+
+    monkeypatch.setattr(migration_ticket, "assert_userdata_rebindable", and_decommission)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert spy.mint_args == [] and spy.registered == []
+
+
+def test_current_placement_refuses_a_vm_that_is_not_active() -> None:
+    vm = make_vm("vm-x", state=VmState.DECOMMISSIONING, host="miner-a")
+    with pytest.raises(effects.EffectError, match="not 'active'"):
+        migration_ticket.current_placement(vm)
+
+
+def test_a_vm_decommissioned_during_the_remint_is_not_registered(
+    spy: Spy, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    vm = _vm_with_launch()
+    real_mint = ticket_mint.mint
+
+    def mint_then_decommission(args: Any) -> bytes:
+        out = real_mint(args)
+        type(vm).objects.filter(id=vm.id).update(state=VmState.DECOMMISSIONING)
+        return out
+
+    monkeypatch.setattr(ticket_mint, "mint", mint_then_decommission)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert spy.mint_args  # the remint ran…
+    assert spy.registered == []  # …but its ticket was never registered
+    assert "before-register" in capsys.readouterr().out
+
+
+def test_a_ticket_minted_for_a_placement_that_moved_is_not_registered(
+    spy: Spy, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    # A §25 move that completed during the remint leaves the VM `active` —
+    # at a NEW generation and host. The ticket in hand is for the old ones.
+    vm = _vm_with_launch(gen=7, host="miner-a")
+    real_mint = ticket_mint.mint
+
+    def mint_then_move(args: Any) -> bytes:
+        out = real_mint(args)
+        type(vm).objects.filter(id=vm.id).update(generation=8, host="miner-b")
+        return out
+
+    monkeypatch.setattr(ticket_mint, "mint", mint_then_move)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert spy.registered == []
+    assert "vm moved since the plan" in capsys.readouterr().out
+
+
+def test_a_rate_limited_reinstall_is_retried_not_failed() -> None:
+    # 2026-09-25: 400 of 440 tombstones came back 429 and had to be redone
+    # by hand. A 429 is "later": it is retried with backoff until it lands.
+    from apps.orchestration.management.commands import vali_kbs_recover as rec
+
+    answers = [
+        rec.VmOutcome("vm", 1, "", rec._FAILED, "tombstone error=... KBS returned HTTP 429"),
+        rec.VmOutcome("vm", 1, "", rec._FAILED, "tombstone error=... KBS returned HTTP 429"),
+        rec.VmOutcome("vm", 1, "", rec._OK_TOMBSTONED, "ok"),
+    ]
+    slept: list[float] = []
+    got = rec._paced(lambda: answers.pop(0), sleep=slept.append)
+    assert got.outcome == rec._OK_TOMBSTONED
+    assert slept == [rec._RATE_LIMIT_BACKOFF_S, rec._RATE_LIMIT_BACKOFF_S * 2]
+
+
+def test_a_non_rate_limit_failure_is_not_retried() -> None:
+    from apps.orchestration.management.commands import vali_kbs_recover as rec
+
+    calls: list[int] = []
+
+    def attempt() -> rec.VmOutcome:
+        calls.append(1)
+        return rec.VmOutcome("vm", 1, "", rec._FAILED, "tombstone error=... HTTP 500")
+
+    assert rec._paced(attempt, sleep=lambda _s: None).outcome == rec._FAILED
+    assert len(calls) == 1
+
+
+# ── step 3: the keepalive-binding re-seed ──────────────────────────────
+
+BIND_CHIP = "22" * 64  # the platform `_vm_with_launch` registers for miner-a
+
+
+def _released(vm_id: str = "vm-a", *, report: str = "7a") -> None:
+    """A guest the KBS released to, attesting a minute ago, whose
+    measurement is the VM's current launch (`_launch_record`'s "ab"*48)."""
+    import hashlib
+    import time
+
+    from apps.telemetry.models import VmLiveAttestation
+
+    at = int(time.time()) - 60
+    VmLiveAttestation.objects.create(
+        vm_id=vm_id,
+        node_id_hex="aa" * 32,
+        attestation_seq=1,
+        epoch=1,
+        observed_at_unix=at,
+        verified_at_unix=at,
+        expiry_unix=at + 900,
+        measurement="ab" * 48,
+        snp_report_digest="11" * 32,
+        body_digest=hashlib.sha256(f"{vm_id}/{report}".encode()).hexdigest(),
+        binding_source="release",
+        chip_id=BIND_CHIP,
+        report_id=report * 32,
+    )
+
+
+_BIND_STATE: dict[str, Any] = {}
+
+
+@pytest.fixture
+def bindings(monkeypatch: pytest.MonkeyPatch, spy: Spy) -> list[tuple[str, str, str]]:
+    """Stub the binding seed; `_BIND_STATE` steers its answer."""
+    calls: list[tuple[str, str, str]] = []
+    _BIND_STATE.clear()
+    _BIND_STATE.update(result="seeded", error=None)
+
+    def _fake(vm_id: str, *, chip_id_hex: str, report_id_hex: str) -> str:
+        spy.order.append(f"binding:{vm_id}")
+        calls.append((vm_id, chip_id_hex, report_id_hex))
+        if _BIND_STATE["error"] is not None:
+            raise _BIND_STATE["error"]
+        return str(_BIND_STATE["result"])
+
+    monkeypatch.setattr(effects, "seed_keepalive_binding", _fake)
+    return calls
+
+
+def test_the_released_guest_is_seeded_right_after_the_register(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any
+) -> None:
+    _vm_with_launch()
+    _released()
+    call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert bindings == [("vm-a", BIND_CHIP, "7a" * 32)]
+    assert spy.order == ["register:vm-a", "binding:vm-a"]
+    out = capsys.readouterr().out
+    assert "binding=seeded" in out
+    assert "keepalive binding: skipped=0 problems=0" in out
+
+
+def test_the_dry_run_plans_the_binding_but_never_seeds(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any
+) -> None:
+    _vm_with_launch()
+    _released()
+    call_command(COMMAND, "--vm-id", "vm-a")
+    assert bindings == []
+    assert "3:seed-binding(report=" in capsys.readouterr().out
+
+
+def test_no_vouchable_guest_skips_the_binding_and_still_succeeds(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any
+) -> None:
+    _vm_with_launch()  # no release-bound sample at all
+    call_command(COMMAND, "--vm-id", "vm-a", "--commit")  # exit 0
+    assert bindings == []
+    out = capsys.readouterr().out
+    assert spy.registered and "binding=skipped(no release-bound sample)" in out
+    assert "skipped=1 problems=0" in out
+
+
+def test_a_matched_guest_is_not_a_problem(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any
+) -> None:
+    _vm_with_launch()
+    _released()
+    _BIND_STATE.update(result="matched")
+    call_command(COMMAND, "--vm-id", "vm-a", "--commit")  # exit 0
+    assert "binding=matched" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (effects.KbsBindingConflict("409"), "binding=CONFLICT"),
+        (effects.KbsBindingPrecondition("412"), "binding=REFUSED"),
+        (effects.EffectError("boom"), "binding=FAILED"),
+    ],
+)
+def test_a_binding_problem_keeps_the_register_but_fails_the_run(
+    spy: Spy,
+    bindings: list[tuple[str, str, str]],
+    capsys: Any,
+    error: Exception,
+    text: str,
+) -> None:
+    _vm_with_launch()
+    _released()
+    _BIND_STATE.update(error=error)
+    with pytest.raises(SystemExit) as exit_:
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert exit_.value.code != 0
+    out = capsys.readouterr().out
+    assert text in out and "problems=1 (vm-a)" in out
+    assert spy.registered
+
+
+def test_a_400_from_the_binding_route_aborts_the_run(
+    spy: Spy, bindings: list[tuple[str, str, str]]
+) -> None:
+    _vm_with_launch()
+    _released()
+    _BIND_STATE.update(error=effects.KbsAdminContractMismatch("400"))
+    with pytest.raises(CommandError, match="ABORTING"):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+
+
+def test_a_relaunch_during_the_recovery_is_never_vouched_for(
+    spy: Spy,
+    bindings: list[tuple[str, str, str]],
+    capsys: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plan read measurement A; by the time the row lock is held the
+    VM's launch record says B. The old guest (A) must not be seeded."""
+    _vm_with_launch()
+    _released()
+    real = migration_ticket.resolve_ticket_inputs
+    calls = {"n": 0}
+
+    def _moving(vm: Any, **kw: Any) -> Any:
+        calls["n"] += 1
+        inputs = real(vm, **kw)
+        if calls["n"] >= 3:  # plan, re-mint, then the in-lock re-read
+            from dataclasses import replace
+
+            return replace(inputs, measurement_hex="cd" * 48)
+        return inputs
+
+    monkeypatch.setattr(migration_ticket, "resolve_ticket_inputs", _moving)
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    assert bindings == []
+    assert "measurement changed during the recovery" in capsys.readouterr().out
+
+
+def test_the_launch_record_is_locked_before_the_measurement_is_re_read(
+    spy: Spy, bindings: list[tuple[str, str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Vm row lock does not cover the launch record; `record_relaunch`
+    writes it under its own row lock, so the recovery must take that lock
+    before its in-lock re-read (sqlite has no row locks — assert the call)."""
+    from django.db import connection
+
+    from apps.orchestration.services import launch_record
+
+    _vm_with_launch()
+    _released()
+    seen: list[tuple[str, bool]] = []
+    real_lock = launch_record.lock_latest_succeeded
+    real_resolve = migration_ticket.resolve_ticket_inputs
+
+    def _lock(vm_id: str) -> None:
+        seen.append(("lock", connection.in_atomic_block))
+        real_lock(vm_id)
+
+    def _resolve(vm: Any, **kw: Any) -> Any:
+        seen.append(("resolve", connection.in_atomic_block))
+        return real_resolve(vm, **kw)
+
+    monkeypatch.setattr(launch_record, "lock_latest_succeeded", _lock)
+    monkeypatch.setattr(migration_ticket, "resolve_ticket_inputs", _resolve)
+    call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    i = seen.index(("lock", True))
+    assert ("resolve", True) in seen[i + 1 :]
+    assert bindings
+
+
+def test_a_kbs_without_the_binding_route_is_a_skip_not_a_failure(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any
+) -> None:
+    """Against a KBS image from before binding persistence the recovery
+    behaves exactly as it did before step 3 existed."""
+    _vm_with_launch()
+    _released()
+    _BIND_STATE.update(error=effects.KbsRouteMissing("404"))
+    call_command(COMMAND, "--vm-id", "vm-a", "--commit")  # exit 0
+    out = capsys.readouterr().out
+    assert "binding=skipped(KBS 404" in out and "skipped=1 problems=0" in out
+
+
+def test_a_different_guest_since_the_release_is_an_anomaly_not_a_skip(
+    spy: Spy, bindings: list[tuple[str, str, str]], capsys: Any, caplog: Any
+) -> None:
+    """Inside enforce's post-restart grace window a VM with no record is
+    served first-use by whichever guest asks. If that guest is NOT the one
+    the KBS released to, the re-seed must refuse it LOUDLY."""
+    import hashlib
+    import time
+
+    from apps.telemetry.models import VmLiveAttestation
+
+    _vm_with_launch()
+    _released()  # the released guest, "7a"
+    at = int(time.time()) - 10
+    VmLiveAttestation.objects.create(
+        vm_id="vm-a",
+        node_id_hex="aa" * 32,
+        attestation_seq=2,
+        epoch=1,
+        observed_at_unix=at,
+        verified_at_unix=at,
+        expiry_unix=at + 900,
+        measurement="ab" * 48,
+        snp_report_digest="11" * 32,
+        body_digest=hashlib.sha256(b"squatter").hexdigest(),
+        binding_source="first-use",
+        chip_id=BIND_CHIP,
+        report_id="7b" * 32,
+    )
+    import logging
+
+    # `LOGGING` pins `apps` with `propagate: False`; caplog listens on root.
+    monkeypatch_propagate = logging.getLogger("apps")
+    old = monkeypatch_propagate.propagate
+    monkeypatch_propagate.propagate = True
+    try:
+        with pytest.raises(SystemExit):
+            call_command(COMMAND, "--vm-id", "vm-a", "--commit")
+    finally:
+        monkeypatch_propagate.propagate = old
+    assert bindings == []
+    out = capsys.readouterr().out
+    assert "binding=ANOMALY" in out and "problems=1 (vm-a)" in out
+    assert "keepalive-binding ANOMALY vm=vm-a" in caplog.text

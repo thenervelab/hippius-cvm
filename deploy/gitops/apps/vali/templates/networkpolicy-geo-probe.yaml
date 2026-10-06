@@ -1,0 +1,52 @@
+{{- if and .Values.geoProbe.enabled .Values.netbird.enabled }}
+---
+# Egress the miner geo-probe needs, scoped to THAT pod only
+# (`app.kubernetes.io/component: geo-probe`) — not folded into the shared
+# vali policy, because none of the other vali workloads should be able to
+# open a socket to a miner's NetBird address or to arbitrary `world:443`.
+# Cilium unions the rules of every policy that selects a pod, so the probe
+# keeps the shared policy's Postgres/DNS egress and gains only these.
+#
+# (1) A TCP connect to each miner's NetBird address on the orders port —
+#     the round-trip time is the physical distance bound the location
+#     verdict rests on. The node routes the CGNAT range through its own
+#     NetBird interface (the same L3 path the Edge uses to dispatch
+#     orders); this rule only admits it at the policy layer. The miner
+#     listener is mTLS; a bare connect is inert.
+# (2) `world:443` — the NetBird management API + RIPEstat.
+# (3) The Pushgateway on :9091 for the per-miner verdict gauges.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: vali-geo-probe
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: geo-probe
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "vali.valiSelector" . | nindent 6 }}
+      app.kubernetes.io/component: geo-probe
+  egress:
+    - toCIDR:
+        - "100.64.0.0/10"
+      toPorts:
+        - ports:
+            - port: "9700"
+              protocol: TCP
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: observability
+            k8s:app.kubernetes.io/name: prometheus-pushgateway
+      toPorts:
+        - ports:
+            - port: "9091"
+              protocol: TCP
+{{- end }}

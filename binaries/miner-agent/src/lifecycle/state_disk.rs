@@ -1,5 +1,5 @@
 //! Per-VM 1 MiB ext4 state disk — the on-host substrate for the
-//! anti-rollback boot counter (audit follow-up Codex #2 / Phase 2B,
+//! anti-rollback boot counter (audit follow-up Review #2 / Phase 2B,
 //! companion to PR #346's wire-level Phase 2A).
 //!
 //! ## Why a separate raw disk

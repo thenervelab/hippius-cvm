@@ -32,17 +32,14 @@ ROOT_PRINCIPAL = "orchestration-root"
 def pytest_configure(config: Any) -> None:
     config.addinivalue_line(
         "markers",
-        "real_idempotency: exercise the real idempotency shell-out "
-        "(skip the in-memory mock)",
+        "real_idempotency: exercise the real idempotency shell-out (skip the in-memory mock)",
     )
 
 
 @pytest.fixture(autouse=True)
 def _orchestration_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Pin orchestration settings deterministically for every test."""
-    monkeypatch.setattr(
-        settings, "VALI_ORCHESTRATION_ROOT_PRINCIPAL", ROOT_PRINCIPAL
-    )
+    monkeypatch.setattr(settings, "VALI_ORCHESTRATION_ROOT_PRINCIPAL", ROOT_PRINCIPAL)
     monkeypatch.setattr(settings, "VALI_ORCHESTRATION_STEP_TIMEOUT_S", 60.0)
     monkeypatch.setattr(settings, "VALI_ORCHESTRATION_ACK_TIMEOUT_S", 60.0)
     monkeypatch.setattr(settings, "VALI_IDEMPOTENCY_DIR", str(tmp_path / "idem"))
@@ -56,6 +53,18 @@ def _orchestration_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setattr(settings, "VALI_KBS_ADMIN_CLIENT_KEY", "")
     monkeypatch.setattr(settings, "VALI_KBS_ADMIN_CACERT", "")
     monkeypatch.setattr(settings, "VALI_NETBIRD_API_TOKEN", "test-token")
+    # The token above would let every `tick_once` in this suite send the
+    # peer janitor's `GET /api/peers` to the real NetBird API. Off here;
+    # `test_netbird_janitor.py` turns it on against a fake.
+    monkeypatch.setattr(settings, "VALI_NETBIRD_PEER_JANITOR_ENABLED", False)
+    # Same token, same problem for the public-IP sweep `tick_once` runs:
+    # its NetBird half (peer listing + edge-routing GC) would call the real
+    # API on every tick. Its database half (releasing a departed VM's
+    # address) still runs; `apps/network/tests` drive the NetBird half
+    # against a fake.
+    from apps.network import service as network_service
+
+    monkeypatch.setattr(network_service, "_netbird_sync_due", lambda: False)
 
 
 class FakeEffects:
@@ -73,11 +82,23 @@ class FakeEffects:
 
     def __init__(self) -> None:
         self.snapshot_status = "done"
+        #: What `poll_snapshot_status` reports as the multipart receipts.
+        self.snapshot_disk: dict[str, Any] | None = None
+        #: The last multipart snapshot dispatched: `(part_size, part_urls)`.
+        self.multipart: tuple[int, list[str]] | None = None
+        #: `(snapshot_size, snapshot_sha256_hex)` the last activation carried.
+        self.activate_snapshot: tuple[int, str] | None = None
+        # `settle_by_unix` of each `dispatch_migrate_activate`, in order.
+        self.activate_settle_by: list[int] = []
         # §25 M4 — what `poll_dest_activation` returns (the dest's async
         # restore/boot outcome). Defaults to a happy `done`.
         self.dest_activation_status = "done"
+        #: The class a `failed` dest activation reports ("" = none).
+        self.dest_activation_class = ""
         self.source_ack: bytes | None = b"fake-source-ack"
         self.eol_ack: bytes | None = b"fake-eol-ack"
+        #: The miner's class for the graceful stop (`stopped` / `not-running`).
+        self.graceful_stop_outcome: str = "stopped"
         self.ack_valid = True
         # §25 M4 — the resolved dest-staging bundle (None ⇒ dest relies on
         # its pre-staged-artifact existence check). Tests can set a dict.
@@ -87,8 +108,31 @@ class FakeEffects:
         # survived the move" case); tests set `None` to model NetBird's
         # ephemeral GC having deleted the record.
         self.netbird_peer: Any = effects.NetbirdPeer(ip="100.9.9.9", connected=True)
+        #: What `kbs_evidence.fetch_evidence` answers: a bundle dict, `None`
+        #: (no bundle recorded), or an exception to raise. Defaults to the
+        #: KBS admin being unreachable — the fail-safe answer, and what the
+        #: suite used to get by resolving `kbs.test` for real.
+        self.kbs_evidence: Any = effects.EffectUnavailable(
+            "kbs-evidence: KBS admin unreachable (test default)"
+        )
+        self._minted = 0
         self.fail: set[str] = set()
+        # §24 KBS fence — `kbs_tombstone` raises `KbsTombstoneConflict` when
+        # set (the KBS holds a tombstone at another generation).
+        self.tombstone_conflict = False
         self.calls: list[tuple] = []
+        #: `restore` orders sent, in order: `(miner_id, order_id, payload)`.
+        self.restore_orders: list[tuple[str, str, dict[str, Any]]] = []
+        #: What `poll_restore_status` answers per miner: a status dict, or
+        #: `None` (404). Tests set it.
+        self.restore_status: dict[str, Any] = {}
+        #: `(classifier, status)` the next `dispatch_restore` is refused with.
+        self.restore_reject: tuple[str, int] | None = None
+        #: What `poll_domain_running_on` answers once a test installs it
+        #: (`test_restore.py` does; the rest of the suite keeps the real one).
+        self.domain_running: bool | None = False
+        #: The last `migrate-activate`'s restore fields.
+        self.activate_restore: dict[str, Any] = {}
         # `name -> the REAL effects callable`, captured by the `fx` fixture
         # before it swaps them out.
         self.real: dict[str, Any] = {}
@@ -101,9 +145,7 @@ class FakeEffects:
         self.calls.append(("relay_quiesce", vm.vm_id, source_gen))
         self._maybe_fail("relay_quiesce")
 
-    def trigger_snapshot(
-        self, vm: Any, *, put_url: str, state_put_url: str = ""
-    ) -> None:
+    def trigger_snapshot(self, vm: Any, *, put_url: str, state_put_url: str = "") -> None:
         self.calls.append(("trigger_snapshot", vm.vm_id, put_url, state_put_url))
         self._maybe_fail("trigger_snapshot")
 
@@ -111,13 +153,58 @@ class FakeEffects:
         self._maybe_fail("poll_snapshot")
         return self.snapshot_status
 
+    def trigger_multipart_snapshot(
+        self,
+        vm: Any,
+        *,
+        job_id: str,
+        part_size: int,
+        part_urls: list[str],
+        state_put_url: str,
+    ) -> None:
+        self.calls.append(
+            ("trigger_multipart_snapshot", vm.vm_id, part_size, len(part_urls), state_put_url)
+        )
+        self._maybe_fail("trigger_multipart_snapshot")
+        self.multipart = (part_size, part_urls)
+
+    def poll_snapshot_status(self, vm: Any) -> tuple[str, dict[str, Any] | None]:
+        self._maybe_fail("poll_snapshot")
+        if self.snapshot_status == "done" and self.snapshot_disk is None and self.multipart:
+            self.snapshot_disk = self._upload_every_part_but_the_spare()
+        return self.snapshot_status, self.snapshot_disk
+
+    def _upload_every_part_but_the_spare(self) -> dict[str, Any]:
+        """A healthy miner: PUT full parts through all but the last presigned
+        URL (the plan's headroom), then report their receipts."""
+        from urllib.parse import parse_qs, urlsplit
+
+        from apps.storage import s3
+
+        assert self.multipart is not None
+        part_size, urls = self.multipart
+        used = urls[: max(1, len(urls) - 1)]
+        client = s3.get_s3_client()
+        parts = []
+        for url in used:
+            q = parse_qs(urlsplit(url).query)
+            number = int(q["part_number"][0])
+            client.record_part(upload_id=q["upload_id"][0], part_number=number, size=part_size)
+            parts.append(
+                {
+                    "part_number": number,
+                    "etag": f'"e{number}"',
+                    "sha256_hex": "0" * 64,
+                    "size": part_size,
+                }
+            )
+        return {"parts": parts, "size": part_size * len(parts), "sha256_hex": "1" * 64}
+
     def poll_source_ack(self, vm: Any) -> bytes | None:
         self._maybe_fail("poll_source_ack")
         return self.source_ack
 
-    def kbs_activate_dest(
-        self, vm: Any, *, dest_node_id: str, new_gen: int, get_url: str
-    ) -> None:
+    def kbs_activate_dest(self, vm: Any, *, dest_node_id: str, new_gen: int, get_url: str) -> None:
         self.calls.append(("kbs_activate_dest", vm.vm_id, dest_node_id, new_gen))
         self._maybe_fail("kbs_activate_dest")
 
@@ -136,7 +223,20 @@ class FakeEffects:
         state_get_url: str = "",
         boot_artifacts: Any,
         job_id: str = "",
+        attempt: int = 0,
+        snapshot_size: int = 0,
+        snapshot_sha256_hex: str = "",
+        settle_by_unix: int = 0,
+        staged_restore_id: str = "",
+        backup_chain: Any = None,
     ) -> None:
+        self.activate_restore = {
+            "staged_restore_id": staged_restore_id,
+            "get_url": get_url,
+            "backup_chain": backup_chain,
+        }
+        self.activate_snapshot = (snapshot_size, snapshot_sha256_hex)
+        self.activate_settle_by.append(settle_by_unix)
         self.calls.append(
             (
                 "dispatch_migrate_activate",
@@ -145,6 +245,7 @@ class FakeEffects:
                 new_gen,
                 state_get_url,
                 job_id,
+                attempt,
             )
         )
         self._maybe_fail("dispatch_migrate_activate")
@@ -153,9 +254,17 @@ class FakeEffects:
         self._maybe_fail("poll_dest_activation")
         return self.dest_activation_status
 
-    def dispatch_graceful_stop(self, vm: Any) -> None:
+    def poll_dest_activation_status(self, vm: Any, *, dest_node_id: str) -> tuple[str, str]:
+        self._maybe_fail("poll_dest_activation")
+        failure_class = self.dest_activation_class
+        return self.dest_activation_status, (
+            failure_class if self.dest_activation_status == "failed" else ""
+        )
+
+    def dispatch_graceful_stop(self, vm: Any, **_kw: Any) -> str:
         self.calls.append(("dispatch_graceful_stop", vm.vm_id))
         self._maybe_fail("dispatch_graceful_stop")
+        return self.graceful_stop_outcome
 
     def poll_eol_ack(self, vm: Any) -> bytes | None:
         self._maybe_fail("poll_eol_ack")
@@ -179,8 +288,9 @@ class FakeEffects:
         vm_id: str,
         tenant_id: str,
         auto_group_name: str,
+        persistent: bool,
         expires_in_seconds: int = 3600,
-    ) -> str:
+    ) -> effects.MintedSetupKey:
         self.calls.append(
             (
                 "mint_netbird_setup_key",
@@ -188,17 +298,71 @@ class FakeEffects:
                 tenant_id,
                 auto_group_name,
                 expires_in_seconds,
+                persistent,
             )
         )
         self._maybe_fail("mint_netbird_setup_key")
         # Deterministic fake key so tests can assert the substitution
         # happened end-to-end without depending on network entropy.
-        return f"fake-setup-key-{vm_id}"
+        self._minted += 1
+        return effects.MintedSetupKey(
+            id=f"fake-sk-{vm_id}-{self._minted}", key=f"fake-setup-key-{vm_id}"
+        )
 
     def resolve_netbird_peer(self, vm_id: str) -> Any:
         self.calls.append(("resolve_netbird_peer", vm_id))
         self._maybe_fail("resolve_netbird_peer")
         return self.netbird_peer
+
+    def kbs_fence_decommission(self, vm_id: str) -> Any:
+        self.calls.append(("kbs_fence_decommission", vm_id))
+        self._maybe_fail("kbs_fence_decommission")
+        return effects.KbsFenceOk(previous="active", state="decommissioning", cached=False)
+
+    def kbs_tombstone(self, vm_id: str, *, generation: int) -> Any:
+        self.calls.append(("kbs_tombstone", vm_id, generation))
+        self._maybe_fail("kbs_tombstone")
+        if self.tombstone_conflict:
+            raise effects.KbsTombstoneConflict("injected 409 tombstone-generation-conflict")
+        return effects.KbsFenceOk(previous="decommissioning", state="destroyed", cached=False)
+    def resolve_netbird_peer_ip(self, vm_id: str) -> str | None:
+        # The real effect's projection, over the same fake peer.
+        self.calls.append(("resolve_netbird_peer_ip", vm_id))
+        self._maybe_fail("resolve_netbird_peer_ip")
+        peer = self.netbird_peer
+        return peer.ip if peer is not None and peer.ip else None
+
+    def fetch_evidence(self, vm_id: str) -> Any:
+        self.calls.append(("fetch_evidence", vm_id))
+        if isinstance(self.kbs_evidence, Exception):
+            raise self.kbs_evidence
+        return self.kbs_evidence
+
+    def dispatch_restore(
+        self,
+        *,
+        miner_id: str,
+        order_id: str,
+        payload: dict[str, Any],
+        in_flight_ok: bool = True,
+    ) -> None:
+        self.calls.append(("dispatch_restore", miner_id, payload["op"], order_id))
+        self._maybe_fail("dispatch_restore")
+        if self.restore_reject is not None:
+            raise effects.RestoreRejected(*self.restore_reject)
+        self.restore_orders.append((miner_id, order_id, payload))
+        status = self.restore_status.get(miner_id)
+        final = {"abort": "aborted", "reclaim": "reclaimed"}.get(payload["op"])
+        if final and status and status.get("restore_id") == payload["restore_id"]:
+            status.update(state=final, op=payload["op"], domain_live=False)
+
+    def poll_restore_status(self, *, vm_id: str, miner_id: str) -> Any:
+        self._maybe_fail("poll_restore_status")
+        return self.restore_status.get(miner_id)
+
+    def poll_domain_running_on(self, vm: Any, node_id: str) -> bool | None:
+        self.calls.append(("poll_domain_running_on", vm.vm_id, node_id))
+        return self.domain_running
 
     def did(self, name: str) -> bool:
         """True iff a side-effect named `name` was performed."""
@@ -218,11 +382,14 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
         "relay_quiesce",
         "trigger_snapshot",
         "poll_snapshot",
+        "poll_snapshot_status",
+        "trigger_multipart_snapshot",
         "poll_source_ack",
         "kbs_activate_dest",
         "resolve_boot_artifacts",
         "dispatch_migrate_activate",
         "poll_dest_activation",
+        "poll_dest_activation_status",
         "dispatch_graceful_stop",
         "poll_eol_ack",
         "crypto_erase_kek_transit",
@@ -230,9 +397,20 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
         "revoke_netbird",
         "mint_netbird_setup_key",
         "resolve_netbird_peer",
+        "kbs_fence_decommission",
+        "kbs_tombstone",
+        "resolve_netbird_peer_ip",
+        "dispatch_restore",
+        "poll_restore_status",
     ):
         fake.real[name] = getattr(effects, name)
         monkeypatch.setattr(effects, name, getattr(fake, name))
+    # The KBS admin evidence read (§25 source reclaim, stranded-migration
+    # veto) lives outside `effects` but is just as much a peer call.
+    from apps.orchestration.services import kbs_evidence
+
+    fake.real["fetch_evidence"] = kbs_evidence.fetch_evidence
+    monkeypatch.setattr(kbs_evidence, "fetch_evidence", fake.fetch_evidence)
 
     def _fake_verify(**_kwargs: Any) -> Any:
         if fake.ack_valid:
@@ -246,9 +424,7 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
 
 
 @pytest.fixture(autouse=True)
-def _mock_idempotency(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _mock_idempotency(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """In-memory §14 idempotency store so the tick loop needs no
     built Rust binary. `test_idempotency.py` opts out via the
     `real_idempotency` marker.

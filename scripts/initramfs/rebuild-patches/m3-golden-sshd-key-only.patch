@@ -1,0 +1,109 @@
+sshd key-only from the measured initramfs, as a strict patch on top of
+m0..m2 (it adds the 00-hippius-harden.conf drop-in to
+`hippius_golden_write_masks`, exactly as on main). A seed with
+`ssh_pwauth: true` leaves 50-cloud-init.conf turning password login on;
+sshd keeps the first value it reads and reads sshd_config.d in name order,
+so the 00- drop-in re-asserted into the overlay upper every boot brings an
+existing golden VM back to key-only (PasswordAuthentication,
+KbdInteractiveAuthentication, PermitRootLogin, X11Forwarding,
+GSSAPIAuthentication, GSSAPIKeyExchange all `no`).
+On an SELinux base the drop-in is labeled like sshd_config and removed
+again (with a WARN) if the label did not take, so sshd never meets an
+unreadable Include.
+Applies with no fuzz after m0-initramfs-guard.patch,
+m1-golden-data-bind.patch and m2-golden-mask-data-disk.patch, on the
+pre-M0, M0-era and stamp-v2 bases alike.
+
+diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
+--- a/scripts/initramfs/hippius-golden-overlay.sh
++++ b/scripts/initramfs/hippius-golden-overlay.sh
+@@ -1664,6 +1664,14 @@ _hippius_golden_relabel_from() {
+         || hippius_log "golden: WARN could not relabel ${_hgrf_dst} (best-effort)"
+ }
+ 
++# The security.selinux label of a path, or nothing (non-SELinux base, or no
++# getfattr to read it with).
++_hippius_golden_selinux_ctx() {
++    command -v getfattr >/dev/null 2>&1 || return 0
++    getfattr --absolute-names -h -n security.selinux --only-values "$1" 2>/dev/null \
++        | tr -d '\000' || true
++}
++
+ # Directory-safe mask: point ${path} at /dev/null (systemd's masked
+ # sentinel), removing whatever is there first. `ln -sf /dev/null dir` would
+ # create dir/null and falsely succeed, so remove any existing node, create
+@@ -1681,7 +1689,8 @@ _hippius_golden_mask_path() {
+ }
+ 
+ # Pure filesystem writer (testable): stamp the guest-side masks + the
+-# cloud-init NoCloud pin into ${root}'s /etc (the overlay upper at boot).
++# cloud-init NoCloud pin + the sshd key-only drop-in into ${root}'s /etc (the
++# overlay upper at boot).
+ # Fail-closed on any write error — a healthy overlay upper never fails
+ # these, so a failure means the boot is broken.
+ hippius_golden_write_masks() {
+@@ -1752,6 +1761,55 @@ HIPPIUS_HARDEN_CC
+     else
+         _hippius_golden_relabel_from "${_hgwm_cc}" "${_hgwm_ccf}"
+     fi
++
++    # sshd key-only: the bake's 00-hippius-harden.conf, byte for byte
++    # (golden-overlay-test pins the two equal). sshd keeps the first value
++    # it reads and reads sshd_config.d in name order, so 00- wins over the
++    # 50-cloud-init.conf a seed with `ssh_pwauth: true` wrote. Re-asserted
++    # every boot like the masks above, which also brings VMs whose base
++    # predates the bake-time file to key-only. The tenant overrides it with
++    # an earlier-sorting drop-in or a `Match` block, not by editing it.
++    _hgwm_sshd="${_hgwm_root}/etc/ssh/sshd_config.d"
++    mkdir -p "${_hgwm_sshd}" \
++        || hippius_die "golden: write_masks could not create ${_hgwm_sshd} in the overlay upper"
++    _hgwm_sshdf="${_hgwm_sshd}/00-hippius-harden.conf"
++    # Remove whatever sits at the path first (a tenant symlink or file): the
++    # drop-in is always a fresh regular file, never written through a link.
++    rm -f "${_hgwm_sshdf}" \
++        || hippius_die "golden: write_masks could not replace ${_hgwm_sshdf}"
++    cat > "${_hgwm_sshdf}" <<'HIPPIUS_SSHD_HARDEN' \
++        || hippius_die "golden: write_masks could not write the sshd hardening drop-in"
++# hippius: SSH is key-only by default. sshd keeps the first value it reads
++# for each keyword and reads sshd_config.d in name order, so this file wins
++# over cloud-init's 50-cloud-init.conf (ssh_pwauth) and the distro defaults.
++# On golden images it is re-written at every boot. To change a setting on
++# your VM, put it in a drop-in that sorts BEFORE this one (for example
++# 00-00-local.conf) or in a `Match` block, which overrides it.
++PasswordAuthentication no
++KbdInteractiveAuthentication no
++PermitRootLogin no
++X11Forwarding no
++GSSAPIAuthentication no
++GSSAPIKeyExchange no
++HIPPIUS_SSHD_HARDEN
++    chmod 0644 "${_hgwm_sshdf}" \
++        || hippius_die "golden: write_masks could not chmod the sshd hardening drop-in"
++    # Labeled like sshd_config (else like its directory) so enforcing
++    # SELinux (CS10/Fedora) lets sshd read it. A label that did not take is
++    # NOT left behind: sshd exits when an Included file cannot be opened, so
++    # an unreadable drop-in would lock the tenant out of SSH. The drop-in is
++    # removed instead (the base's own config applies, as before this file
++    # existed) and the boot goes on, with a WARN in the boot log.
++    _hgwm_sshref="${_hgwm_root}/etc/ssh/sshd_config"
++    [ -f "${_hgwm_sshref}" ] || _hgwm_sshref="${_hgwm_sshd}"
++    _hippius_golden_relabel_from "${_hgwm_sshref}" "${_hgwm_sshdf}"
++    _hgwm_want="$(_hippius_golden_selinux_ctx "${_hgwm_sshref}")"
++    if [ -n "${_hgwm_want}" ] \
++        && [ "$(_hippius_golden_selinux_ctx "${_hgwm_sshdf}")" != "${_hgwm_want}" ]; then
++        rm -f "${_hgwm_sshdf}" \
++            || hippius_die "golden: could not remove the unlabeled sshd drop-in ${_hgwm_sshdf} (sshd would not start)"
++        hippius_log "golden: WARN sshd drop-in not labeled ${_hgwm_want}; removed it so sshd still starts (SSH is NOT forced key-only this boot)"
++    fi
+ }
+ 
+ hippius_golden_harden_root() {
+@@ -1770,7 +1828,7 @@ hippius_golden_harden_root() {
+ 
+     hippius_golden_write_masks "${_hghr_root}"
+ 
+-    hippius_log "golden: M0 guest masks + cloud-init pin re-asserted into the overlay upper"
++    hippius_log "golden: M0 guest masks + cloud-init pin + sshd key-only re-asserted into the overlay upper"
+ }
+ 
+ # Caller MUST have already sourced hippius-release-core.sh.

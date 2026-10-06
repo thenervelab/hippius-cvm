@@ -493,6 +493,12 @@ mod tests {
             memory_available_mib: 0,
             domain: DOMAIN.into(),
             graceful_exit_requested: false,
+            cvm_cpu_budget: 0,
+            cvm_memory_mb_budget: 0,
+            asid_capacity: 0,
+            asid_used: 0,
+            disk: hippius_types::heartbeat::DiskDeclaration::default(),
+            host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
         };
         SignedMinerHeartbeat {
             body: h.canonical().expect("canonical encode"),

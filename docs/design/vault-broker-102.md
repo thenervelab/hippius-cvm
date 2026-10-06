@@ -41,7 +41,7 @@ exact `path@version`, short-TTL, and audited.
 **Does NOT close (residual):** the broker's own Vault bootstrap
 credential. With the broker in-cluster and no Vault SNP-auth plugin,
 its privileged Vault token is delivered via an ExternalSecret (k8s
-Secret) — readable by a compromised cc-1 control plane. The broker's
+Secret) — readable by a compromised control-plane cluster. The broker's
 *runtime* is confidential (kata-snp), but its token *bootstrap*
 transits the host. Closing this needs the Vault SNP-auth plugin
 (declined) or confidential secret provisioning — a follow-up. v1 is

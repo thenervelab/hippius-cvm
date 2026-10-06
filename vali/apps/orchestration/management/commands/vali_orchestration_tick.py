@@ -76,17 +76,26 @@ class Command(BaseCommand):
             try:
                 report = service.tick_once()
                 log.info(
-                    "orchestration tick: migrations=%d decommissions=%d "
-                    "netbird_checks=%d wedged_guests=%d source_reclaims=%d "
-                    "unbound_launches=%d stranded_migrations=%d "
-                    "abandoned_launches=%d",
+                    "orchestration tick: migrations=%d decommissions=%d resizes=%d "
+                    "netbird_checks=%d wedged_guests=%d boot_stalls=%d source_reclaims=%d "
+                    "unbound_launches=%d stranded_migrations=%d stranded_decommissions=%d "
+                    "abandoned_launches=%d public_ip_retargets=%d "
+                    "backup_runs_started=%d zombie_vms=%d zombie_quarantined_miners=%d "
+                    "placements_repaired=%d pending_promoted=%d pending_cancelled=%d "
+                    "orphan_launches_completed=%d orphan_launches_failed=%d "
+                    "netbird_orphan_peers_deleted=%d relaunch_disks_missing=%d "
+                    "kbs_audit_ingested=%d kbs_audit_breaks=%d",
                     report.migration_jobs,
                     report.decommission_jobs,
+                    report.resize_jobs,
                     report.netbird_checks,
                     # Active VMs whose libvirt domain is up but whose GUEST
                     # has gone silent — the silent-green case. The detail
                     # line is the WARNING from `sweep_guest_liveness`.
                     report.wedged_guests,
+                    # Active VMs that never got past `booting` — the detail
+                    # line is the ERROR from `sweep_boot_stalls`.
+                    report.boot_stalls,
                     report.source_reclaims,
                     # vm_ids vali launched but has no `Vm` row for — see
                     # `sweep_unbound_launches`. Should be a FLAT historical
@@ -98,11 +107,49 @@ class Command(BaseCommand):
                     # outage — the detail line is the ERROR from
                     # `sweep_stranded_migrations`.
                     report.stranded_migrations,
+                    # §24 jobs re-opened for VMs stuck in `decommissioning`
+                    # behind a FAILED job (`sweep_stranded_decommissions`).
+                    report.stranded_decommissions,
                     # `Vm` rows a failed launch left `active` with NO host
                     # and a LIVE per-VM KEK — phantoms that every other
                     # sweep counts as running tenants. The detail line is
                     # the WARNING from `sweep_abandoned_launches`.
                     report.abandoned_launches,
+                    # Public IPs re-pointed at a VM's new NetBird address.
+                    report.public_ip_retargets,
+                    # Live VM backups dispatched (`apps.backup`).
+                    report.backup_runs_started,
+                    # Crypto-erased VMs a miner is still running, and the
+                    # miners quarantined for it (`apps.lifecycle.zombie`).
+                    # ANY non-zero value is a data-death gap; the detail
+                    # line is the ERROR from `zombie.observe`.
+                    report.zombie_vms,
+                    report.zombie_quarantined_miners,
+                    # Live VMs re-bound to the host they run on — each was
+                    # an admission under-count. The detail line is the
+                    # ERROR from `sweep_live_vm_placements`.
+                    report.placements_repaired,
+                    # Stale Pending placements resolved — the detail lines
+                    # are the ERRORs from `sweep_stale_pending_placements`.
+                    report.pending_promoted,
+                    report.pending_cancelled,
+                    # `running` launch jobs whose worker died, resolved —
+                    # detail lines are the ERRORs from the launch janitor.
+                    report.orphan_launches_completed,
+                    report.orphan_launches_failed,
+                    # Tenant NetBird peers of gone VMs collected — each one a
+                    # §24 revoke that was missed or failed.
+                    report.netbird_orphan_peers_deleted,
+                    # Active VMs reboot-recovery REFUSED to relaunch: the
+                    # bound host lacks their disks. ANY non-zero value is a
+                    # tenant down with its data elsewhere; the detail line
+                    # is the ERROR from `sweep_relaunch_disks_missing`.
+                    report.relaunch_disks_missing,
+                    # KBS audit records copied out of the CVM, and chain
+                    # breaks in them. ANY non-zero break count is an ERROR
+                    # line from `kbs_audit` — a KBS log that does not verify.
+                    report.kbs_audit_ingested,
+                    report.kbs_audit_breaks,
                 )
             except Exception:  # noqa: BLE001 — daemon loop must survive.
                 log.exception("orchestration tick raised — continuing")

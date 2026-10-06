@@ -97,7 +97,8 @@ pub use forward::{
     ForwardClient, ForwardError, ForwardResponse, MinerForward, MinerForwardError,
     MinerForwardResponse, MockForwardClient, MockMinerForward, OrderKind, RecordedForward,
     RecordedMinerForward, RecordedStatusForward, ReqwestForwardClient, ReqwestMinerForward,
-    MAX_ENVELOPE_BYTES, MAX_MINER_ORDER_BODY, MAX_MINER_RESPONSE_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_MINER_ORDER_BODY, MAX_MINER_RESPONSE_BYTES, MAX_MULTIPART_ORDER_BODY,
+    MAX_MULTIPART_STATUS_RESPONSE_BYTES,
 };
 pub use ha::{
     HaConfig, HaError, HaHandle, HaNode, HaTiming, HealthMonitor, LocalShedSource, Metrics,

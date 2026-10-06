@@ -1,0 +1,233 @@
+M0 untrusted-miner initramfs guard, exactly as #1305 landed on main
+(6ae9be74, `git diff 6ae9be74^ 6ae9be74 -- scripts/initramfs/hippius-golden-overlay.sh`),
+as a strict patch against the hippius-golden-overlay.sh a golden base already
+carries. scripts/tenant-initrd-rebuild.sh applies it (no fuzz, no rejects) on top
+of the scripts it reads OUT OF the source base, so a rebuilt initrd differs from
+the source one only by this guard: none of the other main changes to that file
+(e.g. H5, #1307) come along. The guard calls nothing the base's
+hippius-release-core.sh / hippius-guest-release lack.
+CI (scripts/dev/tenant-initrd-rebuild-test.sh) reverse-applies it to the repo's
+hippius-golden-overlay.sh and requires that EVERY guard function and call is gone,
+so a stale or partial patch, or a later guard change on main, fails the build.
+
+diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
+index 3503230c..2b17996f 100644
+--- a/scripts/initramfs/hippius-golden-overlay.sh
++++ b/scripts/initramfs/hippius-golden-overlay.sh
+@@ -1021,6 +1021,203 @@ hippius_golden_shred_kek() {
+ # also lives only in SNP-encrypted RAM, so this is defense-in-depth, but
+ # it is now uniform across every golden exit path.
+ #
++# ── M0 UNTRUSTED-MINER GUEST HARDENING ──────────────────────────────
++# The miner writes the libvirt domain XML and can attach devices the SNP
++# launch measurement does NOT cover (only OVMF+kernel+initrd+cmdline are):
++# a `cidata`-labelled disk cloud-init would merge, a virtio-serial channel
++# a guest agent would answer on, unmeasured SMBIOS/fw_cfg strings systemd
++# would import credentials from. The tenant bake removes/masks these, but
++# we ALSO re-assert them here, from the MEASURED initramfs, into the per-VM
++# overlay UPPER on EVERY boot — so an existing VM is made safe by a
++# relaunch onto this initramfs (no rootfs re-bake needed), a mask in the
++# upper overrides whatever the base ships, and a wiped mask is restored
++# next boot. A `/dev/null` symlink is systemd's own "masked" sentinel; a
++# mask is equivalent to a purge for our purpose.
++#
++# Runs AFTER the overlay is mounted at ${rootmnt} (writes land in the
++# guest-keyed upper) and BEFORE switch_root. Fail-closed, like every other
++# step on this path.
++# Pure predicate (testable): does a cmdline STRING disable systemd
++# credential import with the SAME effective semantics systemd uses?
++# systemd keeps the LAST matching value, and in an initrd
++# `rd.systemd.import_credentials=` also applies, so a naive substring check
++# would accept `...=no ...=yes`. Require at least one
++# `systemd.import_credentials=no` and REJECT any `systemd.import_credentials=`
++# whose value is not `no`, or any `rd.systemd.import_credentials=` whose
++# value is not `no`. Matches what the vali emitter now forces (exactly one
++# canonical =no, no rd. override).
++#
++# Two things systemd does that a shell word split does not, both closed
++# here rather than emulated:
++#   - systemd UNQUOTES and concatenates quoted fragments (EXTRACT_UNQUOTE):
++#     `'systemd.import_credentials'=yes` or `"x systemd.import_credentials=no"`
++#     mean something other than their shell words. vali never emits a quote
++#     or a backslash (0 of 600 recorded cmdlines on 2026-09-28), so ANY
++#     `"`, `'` or `\` in the cmdline refuses outright.
++#   - systemd splits on space, tab, newline AND carriage return; a CR is
++#     refused too, since the shell split would not see it as a separator.
++#   - an unquoted `$1` would also GLOB against the initramfs filesystem
++#     (`systemd.import_credentials=n?` matching a file named `...=no`). The
++#     body is a subshell with `set -f`, so pathname expansion is off here
++#     and nowhere else.
++hippius_golden_has_no_credential_import() (
++    set -f
++    case "$1" in
++        *\"* | *\'* | *\\*) exit 1 ;;
++    esac
++    # systemd also splits on CR, the shell's default IFS does not: refuse it
++    # (vali never emits one) rather than let `x<CR>key=yes` hide a token.
++    _hci_cr="$(printf '\r')"
++    case "$1" in
++        *"${_hci_cr}"*) exit 1 ;;
++    esac
++    _hci_seen_no=0
++    for _hci_tok in $1; do
++        _hci_key="${_hci_tok%%=*}"
++        _hci_val="${_hci_tok#*=}"
++        # systemd treats `-` and `_` as equivalent in a cmdline key, so both
++        # spellings of import_credentials (and the rd.* initrd variant) count.
++        case "${_hci_key}" in
++            systemd.import_credentials | systemd.import-credentials)
++                if [ "${_hci_val}" = no ]; then _hci_seen_no=1; else exit 1; fi ;;
++            rd.systemd.import_credentials | rd.systemd.import-credentials)
++                [ "${_hci_val}" = no ] || exit 1 ;;
++        esac
++    done
++    [ "${_hci_seen_no}" -eq 1 ]
++)
++
++# Best-effort SELinux relabel: copy the security.selinux context of a
++# reference path in the SAME base onto a path we just created, so the file
++# is not left unlabeled under enforcing SELinux (Fedora/CS10). NON-fatal:
++# the real cidata/agent protection comes from the MEASURED base (dm-verity
++# lower, labeled at bake) — the upper copy here is defense-in-depth, so a
++# labeling miss must never fail-close the boot. No-op on a non-SELinux base
++# (getfattr returns nothing).
++_hippius_golden_relabel_from() {
++    _hgrf_ref="$1"
++    _hgrf_dst="$2"
++    command -v getfattr >/dev/null 2>&1 || return 0
++    command -v setfattr >/dev/null 2>&1 || return 0
++    # `|| _hgrf_ctx=""`: a ref with no security.selinux attr makes getfattr
++    # exit non-zero — that just means "non-SELinux base", not an error (and
++    # must not trip a caller's `set -e`).
++    _hgrf_ctx="$(getfattr --absolute-names -h -n security.selinux --only-values \
++        "${_hgrf_ref}" 2>/dev/null | tr -d '\000')" || _hgrf_ctx=""
++    [ -n "${_hgrf_ctx}" ] || return 0
++    case "${_hgrf_ctx}" in
++        *[!:_a-zA-Z0-9.,-]* | *:*:*:* ) : ;;
++        * ) return 0 ;;
++    esac
++    setfattr -h -n security.selinux -v "${_hgrf_ctx}" "${_hgrf_dst}" 2>/dev/null \
++        || hippius_log "golden: WARN could not relabel ${_hgrf_dst} (best-effort)"
++}
++
++# Directory-safe mask: point ${path} at /dev/null (systemd's masked
++# sentinel), removing whatever is there first. `ln -sf /dev/null dir` would
++# create dir/null and falsely succeed, so remove any existing node, create
++# the symlink, and VERIFY it is a symlink to exactly /dev/null. Fail-closed.
++_hippius_golden_mask_path() {
++    _hgmp_path="$1"
++    _hgmp_ref="$2"
++    rm -rf "${_hgmp_path}" 2>/dev/null || true
++    ln -s /dev/null "${_hgmp_path}" \
++        || hippius_die "golden: write_masks could not mask ${_hgmp_path}"
++    { [ -L "${_hgmp_path}" ] && [ "$(readlink "${_hgmp_path}")" = /dev/null ]; } \
++        || hippius_die "golden: mask verify failed for ${_hgmp_path} (not a /dev/null symlink)"
++    [ -n "${_hgmp_ref}" ] && _hippius_golden_relabel_from "${_hgmp_ref}" "${_hgmp_path}"
++    return 0
++}
++
++# Pure filesystem writer (testable): stamp the guest-side masks + the
++# cloud-init NoCloud pin into ${root}'s /etc (the overlay upper at boot).
++# Fail-closed on any write error — a healthy overlay upper never fails
++# these, so a failure means the boot is broken.
++hippius_golden_write_masks() {
++    _hgwm_root="$1"
++    [ -n "${_hgwm_root}" ] || hippius_die "golden: write_masks needs a root arg"
++
++    # Mask host->guest control surfaces: an `/etc` unit/generator symlinked
++    # to /dev/null wins over the vendor copy in /usr/lib. Guest agents
++    # (qemu-guest-agent / spice / vmtools) answer on a miner-attachable
++    # virtio channel — mask spice's socket too, not only its service.
++    # systemd-ssh-generator binds sshd to AF_VSOCK. The getty TEMPLATES are
++    # masked (not only serial-getty@ttyS0): systemd-getty-generator
++    # auto-instantiates serial-getty@ for any miner-attached console incl.
++    # virtio /dev/hvc0, and getty@ for /dev/tty1. systemd-imds-generator /
++    # systemd-imds-import (systemd >=261) fetch credentials from
++    # miner-controlled DMI/network — masked for a future Fedora bump
++    # (no-op on today's systemd 258).
++    _hgwm_sysd="${_hgwm_root}/etc/systemd/system"
++    _hgwm_gen="${_hgwm_root}/etc/systemd/system-generators"
++    mkdir -p "${_hgwm_sysd}" "${_hgwm_gen}" \
++        || hippius_die "golden: write_masks could not create ${_hgwm_sysd} / ${_hgwm_gen} in the overlay upper"
++    for _hgwm_unit in \
++        qemu-guest-agent.service \
++        spice-vdagentd.service \
++        spice-vdagentd.socket \
++        spice-vdagent.service \
++        vmtoolsd.service \
++        open-vm-tools.service \
++        serial-getty@.service \
++        getty@.service \
++        systemd-imds-import.service; do
++        _hippius_golden_mask_path "${_hgwm_sysd}/${_hgwm_unit}" "${_hgwm_sysd}"
++    done
++    for _hgwm_g in systemd-ssh-generator systemd-imds-generator; do
++        _hippius_golden_mask_path "${_hgwm_gen}/${_hgwm_g}" "${_hgwm_gen}"
++    done
++
++    # cloud-init: pin NoCloud to the tenant tmpfs seed and turn OFF the
++    # `cidata` volume probe, so a miner-attached disk labelled `cidata`
++    # cannot merge user-data/meta-data (public-keys, runcmd) over ours. The
++    # `99-zz-` prefix sorts LAST in cloud.cfg.d so this wins the merge; the
++    # measured base (which we control) must never ship a later-sorting file
++    # that re-enables the probe. Restores the setting even on a base that
++    # predates the bake-time fix.
++    _hgwm_cc="${_hgwm_root}/etc/cloud/cloud.cfg.d"
++    mkdir -p "${_hgwm_cc}" \
++        || hippius_die "golden: write_masks could not create ${_hgwm_cc} in the overlay upper"
++    _hgwm_ccf="${_hgwm_cc}/99-zz-hippius-harden.cfg"
++    cat > "${_hgwm_ccf}" <<'HIPPIUS_HARDEN_CC' \
++        || hippius_die "golden: write_masks could not write the cloud-init hardening drop-in"
++# hippius M0 hardening — re-asserted by the measured initramfs every boot.
++# NoCloud reads ONLY the tenant tmpfs seed; the `cidata` volume probe is
++# OFF so an unmeasured, miner-attached disk labelled `cidata` is ignored.
++datasource_list: [ NoCloud, None ]
++datasource:
++  NoCloud:
++    fs_label: null
++    seedfrom: /run/cloud-init/seed/
++HIPPIUS_HARDEN_CC
++    # Label the new drop-in like an existing /etc/cloud file so enforcing
++    # SELinux (Fedora/CS10) does not deny cloud-init reading it.
++    if [ -f "${_hgwm_root}/etc/cloud/cloud.cfg" ]; then
++        _hippius_golden_relabel_from "${_hgwm_root}/etc/cloud/cloud.cfg" "${_hgwm_ccf}"
++    else
++        _hippius_golden_relabel_from "${_hgwm_cc}" "${_hgwm_ccf}"
++    fi
++}
++
++hippius_golden_harden_root() {
++    _hghr_root="$1"
++    [ -n "${_hghr_root}" ] || hippius_die "golden: harden_root needs a rootmnt arg"
++
++    # Defense-in-depth measured guarantee: vali bakes
++    # `systemd.import_credentials=no` into the measured cmdline (the only
++    # kill switch for systemd credential import from the unmeasured SMBIOS
++    # type 11 / fw_cfg surfaces the miner controls — root ssh keys,
++    # tmpfiles.extra, fstab.extra). If some launch path emitted a cmdline
++    # without it, refuse to switch_root rather than boot a guest whose
++    # systemd would import a miner-set credential.
++    hippius_golden_has_no_credential_import "$(cat /proc/cmdline 2>/dev/null || true)" \
++        || hippius_die "golden: measured cmdline lacks systemd.import_credentials=no — refusing switch_root (unmeasured SMBIOS/fw_cfg credential import would be enabled)"
++
++    hippius_golden_write_masks "${_hghr_root}"
++
++    hippius_log "golden: M0 guest masks + cloud-init pin re-asserted into the overlay upper"
++}
++
+ # Caller MUST have already sourced hippius-release-core.sh.
+ hippius_golden_run() {
+     _hgrun_rootmnt="$1"
+@@ -1083,5 +1280,12 @@ hippius_golden_run() {
+     [ "${_hgrun_rc}" -eq 0 ] \
+         || hippius_die "golden: KBS release / overlay assembly failed — fail-closed (disk stays locked; KEK shredded)"
+ 
++    # M0 untrusted-miner hardening: re-assert the guest-side masks into the
++    # per-VM overlay upper before switch_root. Runs from the MEASURED
++    # initramfs, so it is trusted; it makes existing VMs safe on a relaunch
++    # without a rootfs re-bake, and defends against a base that predates the
++    # bake-time hardening. Fail-closed like the rest of this path.
++    hippius_golden_harden_root "${_hgrun_rootmnt}"
++
+     hippius_log "golden: boot assembled — handing control back for switch_root into ${_hgrun_rootmnt}"
+ }

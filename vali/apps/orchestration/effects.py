@@ -33,7 +33,8 @@ import re
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, no runtime import edge
@@ -86,6 +87,7 @@ def _http(
     json_body: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     context: ssl.SSLContext | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, bytes]:
     """One HTTP round-trip. Returns `(status, body)` for any HTTP
     response (incl. 4xx/5xx, so callers can treat e.g. 404 as "not
@@ -111,7 +113,7 @@ def _http(
     request = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(  # noqa: S310
-            request, timeout=_timeout(), context=context
+            request, timeout=timeout or _timeout(), context=context
         ) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
@@ -404,13 +406,68 @@ def poll_snapshot(vm: Vm) -> str:
     """§25 step 4 — poll the snapshot/upload progress. Returns
     `"running"`, `"done"`, or `"failed"`.
     """
+    return poll_snapshot_status(vm)[0]
+
+
+def poll_snapshot_status(vm: Vm) -> tuple[str, dict[str, Any] | None]:
+    """[`poll_snapshot`] plus, for a finished MULTIPART snapshot, the
+    miner's part receipts (`{"parts": [{part_number, etag, sha256_hex,
+    size}], "size", "sha256_hex"}`) vali completes the upload from."""
     status, body = _edge_get(vm, "snapshot")
+    if status == 404:
+        # The miner has no record of this migration — its agent restarted
+        # after the quiesce and lost the in-memory upload task. Nothing on
+        # that host will finish it.
+        return "failed", None
     if status != 200:
         raise EffectError(f"edge-relay:snapshot: poll returned HTTP {status}")
-    state = _json(body, label="edge-relay:snapshot").get("status")
+    doc = _json(body, label="edge-relay:snapshot")
+    state = doc.get("status")
     if state not in ("running", "done", "failed"):
         raise EffectError(f"edge-relay:snapshot: unknown status {state!r}")
-    return str(state)
+    disk = doc.get("disk")
+    return str(state), disk if isinstance(disk, dict) else None
+
+
+def trigger_multipart_snapshot(
+    vm: Vm, *, job_id: str, part_size: int, part_urls: list[str], state_put_url: str
+) -> None:
+    """[`trigger_snapshot`] as a MULTIPART upload: one presigned
+    `UploadPart` URL per part. Dispatched as a signed `migrate-snapshot`
+    order through the Edge's generic order path (the relay route rebuilds
+    only the single-PUT shape). The miner ACKs at once and uploads in the
+    background; `poll_snapshot_status` reads the outcome + part receipts.
+    """
+    import json as _json
+
+    from . import order_dispatch
+
+    miner_id, netbird_ip = _miner_identity(_bound_miner_id(vm))
+    payload = {
+        "vm_id": vm.vm_id,
+        "node_id": miner_id,
+        "part_size": part_size,
+        "disk_part_urls": part_urls,
+        "state_put_url": state_put_url,
+    }
+    try:
+        result = order_dispatch.dispatch_order(
+            miner_id=miner_id,
+            netbird_ip=netbird_ip,
+            # Per job: a new migration re-snapshots rather than replaying.
+            order_id=f"mig-snapshot-{vm.vm_id}-{job_id}",
+            kind="migrate-snapshot",
+            payload_json=_json.dumps(payload).encode("utf-8"),
+        )
+    except order_dispatch.OrderDispatchUnavailable as exc:
+        raise EffectUnavailable(f"migrate-snapshot: {exc}") from exc
+    except order_dispatch.OrderDispatchError as exc:
+        raise EffectError(f"migrate-snapshot: {exc}") from exc
+    if not result.ok and not (result.status == 409 and result.classifier == "order-in-flight"):
+        raise EffectError(
+            f"migrate-snapshot: source miner rejected (status={result.status} "
+            f"class={result.classifier!r})"
+        )
 
 
 def poll_domain_running(vm: Vm) -> bool | None:
@@ -492,7 +549,22 @@ def _poll_domain_running_at(vm: Vm, target_addr: str) -> bool | None:
     return running if isinstance(running, bool) else None
 
 
-def dispatch_graceful_stop(vm: Vm) -> None:
+#: Total budget for a destroy / source-reclaim dispatch, one re-ask
+#: included. It runs inside the orchestration tick, serially per job, so it
+#: stays near the old one-shot worst case (45 s): a 502 at the Edge's 30 s
+#: forward still leaves room for the re-ask, a dark miner (5 s connect
+#: failure) costs ~20 s, and a hanging Edge gets one 45 s attempt and no
+#: re-ask.
+DESTROY_DEADLINE_S = 50.0
+
+#: Total budget for the §24 EoL graceful stop, re-asks included — bounds how
+#: long one decommission can hold the orchestration tick.
+EOL_STOP_DEADLINE_S = 120.0
+
+
+def dispatch_graceful_stop(
+    vm: Vm, *, order_id: str | None = None, deadline_s: float = EOL_STOP_DEADLINE_S
+) -> str:
     """§24 step 1 — GRACEFULLY stop the VM's guest so its baked
     `hippius-eol-sign.service` (`ExecStop`, `Before=shutdown.target`) fires,
     signs the `StoppedAck` from the measured cmdline, and pushes it over the
@@ -519,32 +591,49 @@ def dispatch_graceful_stop(vm: Vm) -> None:
     """
     from . import order_dispatch
 
+    # Named for the caller in errors: the power API shares this effect.
+    label = "power-stop" if (order_id or "").startswith("pwr-stop-") else "decommission-eol-stop"
     node_id = _bound_miner_id(vm)
     if not node_id:
         raise EffectError(
-            f"decommission-eol-stop: vm {vm.vm_id!r} has no bound miner "
+            f"{label}: vm {vm.vm_id!r} has no bound miner "
             "(empty host and no SUCCEEDED launch) — cannot route the stop"
         )
     miner_id, netbird_ip = _miner_identity(node_id)
     payload = order_dispatch.build_stop_payload(vm_id=vm.vm_id, graceful=True)
-    order_id = f"dec-eol-stop-{vm.vm_id}-{vm.generation}"
+    # The miner dedups on order_id and a replay answers the ORIGINAL outcome
+    # without acting again, so every distinct stop needs its own id: the
+    # power API passes a fresh one per stop, §24 a job-scoped one (a job
+    # reopened at the same generation must stop the guest itself). This
+    # per-generation fallback is only for callers that pass none.
+    order_id = order_id or f"dec-eol-stop-{vm.vm_id}-{vm.generation}"
     try:
-        result = order_dispatch.dispatch_order(
+        # Settled, not one-shot: a graceful stop can outlast the Edge's
+        # forward timeout, and a 502 then says nothing about whether the
+        # guest stopped. Re-asking the same order_id gets the miner's
+        # recorded answer.
+        result = order_dispatch.dispatch_order_settled(
             miner_id=miner_id,
             netbird_ip=netbird_ip,
             order_id=order_id,
             kind="stop",
             payload_json=json.dumps(payload).encode("utf-8"),
+            deadline_s=deadline_s,
         )
     except order_dispatch.OrderDispatchUnavailable as exc:
-        raise EffectUnavailable(f"decommission-eol-stop: {exc}") from exc
+        raise EffectUnavailable(f"{label}: {exc}") from exc
     except order_dispatch.OrderDispatchError as exc:
-        raise EffectError(f"decommission-eol-stop: {exc}") from exc
+        raise EffectError(f"{label}: {exc}") from exc
     if not result.ok:
         raise EffectError(
-            f"decommission-eol-stop: miner rejected (status={result.status} "
+            f"{label}: miner rejected (status={result.status} "
             f"class={result.classifier!r})"
         )
+    # The miner's outcome class: `stopped` (it stopped the guest),
+    # `not-running` (there was nothing to stop) — echoed unchanged on a
+    # re-ask of an order that already finished — or `idempotent-replay`
+    # from an older miner-agent that does not echo the original class.
+    return result.classifier
 
 
 def poll_source_ack(vm: Vm) -> bytes | None:
@@ -733,7 +822,7 @@ def seed_boot_counter(vm_id: str, *, counter: int) -> SeedBootCounterOk:
     status keeps a CBOR dependency out of vali for a distinction with no
     reachable values.
     """
-    if not isinstance(vm_id, str) or not _VM_ID_RE.match(vm_id):
+    if not isinstance(vm_id, str) or not _VM_ID_RE.fullmatch(vm_id):
         raise EffectError("seed-boot-counter: vm_id failed the charset lock")
     if not isinstance(counter, int) or isinstance(counter, bool):
         raise EffectError("seed-boot-counter: counter must be an integer")
@@ -788,6 +877,184 @@ def seed_boot_counter(vm_id: str, *, counter: int) -> SeedBootCounterOk:
         raise EffectError(f"{label}: 200 body missing `counter`") from exc
 
 
+_CHIP_ID_HEX_RE = re.compile(r"^[0-9a-f]{128}$")
+_REPORT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class KbsBindingConflict(EffectError):
+    """`409`: the KBS holds a record for this VM naming a DIFFERENT guest
+    (`binding-already-recorded`), or the VM is poisoned because its last
+    release could not be recorded (`binding-poisoned`). The CBOR body is
+    not decoded, so the two are not told apart. Nothing was written; only
+    the VM's next release can change either."""
+
+
+class KbsBindingPrecondition(EffectError):
+    """`412`: the KBS has no `Active` lifecycle row for the VM, or the
+    chip is not its registered host. Nothing was written."""
+
+
+def seed_keepalive_binding(vm_id: str, *, chip_id_hex: str, report_id_hex: str) -> str:
+    """`POST {VALI_KBS_ADMIN_URL}/v1/admin/vm/{vm_id}/seed-keepalive-binding`
+    — re-establish the guest the KBS released `vm_id` to, after a restart
+    wiped its keepalive-binding store (`kbs_core::keepalive_binding`).
+
+    Returns `"seeded"` (written) or `"matched"` (a record naming the SAME
+    guest already exists — a retry, or that guest released since the
+    restart). Raises [`KbsBindingConflict`] on 409 (a DIFFERENT guest is on
+    record), [`KbsBindingPrecondition`] on 412 (not `Active` in the KBS, or
+    the chip is not its registered host), [`KbsRouteMissing`] on 404,
+    [`KbsAdminContractMismatch`] on 400 (vali's own checks make it
+    unreachable), [`EffectError`] on any other non-2xx and
+    [`EffectUnavailable`] when the admin listener is unreachable.
+
+    Not one-shot and cannot brick a VM: a wrong seed refuses that VM's
+    keepalives only until its next release supersedes it. Nothing secret
+    crosses this call — CHIP_ID and REPORT_ID are public report fields.
+    Non-2xx bodies are CBOR and are not decoded; the status decides.
+    """
+    if not isinstance(vm_id, str) or not _VM_ID_RE.fullmatch(vm_id):
+        raise EffectError("seed-keepalive-binding: vm_id failed the charset lock")
+    if not _CHIP_ID_HEX_RE.match(chip_id_hex or "") or set(chip_id_hex) == {"0"}:
+        raise EffectError("seed-keepalive-binding: chip_id_hex must be 128 lower hex, non-zero")
+    if not _REPORT_ID_HEX_RE.match(report_id_hex or "") or set(report_id_hex) == {"0"}:
+        raise EffectError("seed-keepalive-binding: report_id_hex must be 64 lower hex, non-zero")
+
+    transport = _kbs_admin_transport()
+    label = "kbs-admin:seed-keepalive-binding"
+    status, body = _http(
+        "POST",
+        transport.url(f"/v1/admin/vm/{vm_id}/seed-keepalive-binding"),
+        label=label,
+        json_body={"chip_id_hex": chip_id_hex, "report_id_hex": report_id_hex},
+        context=transport.context,
+    )
+    if status == 404:
+        raise KbsRouteMissing(
+            f"{label}: KBS returned 404 — the route is not served by the deployed KBS image"
+        )
+    if status == 400:
+        raise KbsAdminContractMismatch(
+            f"{label}: KBS returned 400 — vali and the deployed KBS disagree about "
+            "the seed contract. ABORT."
+        )
+    if status == 409:
+        raise KbsBindingConflict(
+            f"{label}: a DIFFERENT guest is on record, or the VM is poisoned"
+        )
+    if status == 412:
+        raise KbsBindingPrecondition(
+            f"{label}: the KBS holds no Active row for this VM on this chip"
+        )
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: KBS returned HTTP {status}")
+    parsed = _json(body, label=label)
+    if parsed.get("vm_id") != vm_id:
+        raise EffectError(f"{label}: 200 body is for another vm_id")
+    if parsed.get("seeded") is True:
+        return "seeded"
+    if parsed.get("matched") is True:
+        return "matched"
+    raise EffectError(f"{label}: 200 body neither seeded nor matched")
+
+
+class KbsTombstoneConflict(EffectError):
+    """The KBS answered `409 tombstone-generation-conflict`: it already holds
+    a tombstone for this VM at a DIFFERENT generation. Nothing was written
+    and no retry can change it — the caller records it for an operator
+    instead of re-driving it forever.
+    """
+
+
+@dataclass(frozen=True)
+class KbsFenceOk:
+    """Parsed `200` body of the KBS `decommission` / `tombstone` routes.
+
+    `previous` is what the KBS held before this call (`absent`, `active`,
+    `migrating`, `decommissioning`, `destroyed`), `state` what it holds now
+    (`decommissioning` or `destroyed`); `cached` ⇒ nothing was written (an
+    idempotent re-drive).
+    """
+
+    previous: str
+    state: str
+    cached: bool
+
+
+def kbs_fence_decommission(vm_id: str) -> KbsFenceOk:
+    """`POST {VALI_KBS_ADMIN_URL}/v1/admin/vm/{vm_id}/decommission` — move
+    the KBS's lifecycle row to `Decommissioning`.
+
+    From then on the KBS refuses every release for the VM, and answers its
+    custody lease with a signed "revoked" — the in-guest daemon then wipes
+    the disk keys and powers the guest off without waiting for anything the
+    miner has to relay. Idempotent: an already-fenced or destroyed row is a
+    `cached` 200, and an ABSENT row (a KBS restart wiped it) is fenced too.
+
+    Raises [`KbsRouteMissing`] on 404 (the deployed KBS predates the
+    route), [`EffectError`] on any other non-2xx, [`EffectUnavailable`] when
+    the admin listener is unreachable. Non-2xx bodies are CBOR and are not
+    decoded — the status carries the decision, as for `seed_boot_counter`.
+    """
+    return _kbs_fence_post(
+        vm_id, "decommission", {"v": 1}, accept=frozenset({"decommissioning", "destroyed"})
+    )
+
+
+def kbs_tombstone(vm_id: str, *, generation: int) -> KbsFenceOk:
+    """`POST {VALI_KBS_ADMIN_URL}/v1/admin/vm/{vm_id}/tombstone` — move the
+    KBS's lifecycle row to the permanent `Destroyed{gen}`.
+
+    Raises [`KbsTombstoneConflict`] on 409 (a tombstone at another
+    generation is already there — never retried), otherwise as
+    [`kbs_fence_decommission`].
+    """
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise EffectError("kbs-admin:tombstone: generation must be an integer >= 1")
+    return _kbs_fence_post(
+        vm_id, "tombstone", {"v": 1, "gen": generation}, accept=frozenset({"destroyed"})
+    )
+
+
+def _kbs_fence_post(
+    vm_id: str, command: str, body: dict[str, Any], *, accept: frozenset[str]
+) -> KbsFenceOk:
+    label = f"kbs-admin:{command}"
+    # Charset-lock FIRST, so a 404 can only mean "route not deployed", never
+    # "empty or mangled path segment".
+    if not isinstance(vm_id, str) or not _VM_ID_RE.fullmatch(vm_id):
+        raise EffectError(f"{label}: vm_id failed the charset lock")
+    transport = _kbs_admin_transport()
+    url = transport.url(f"/v1/admin/vm/{vm_id}/{command}")
+    status, raw = _http("POST", url, label=label, json_body=body, context=transport.context)
+    if status == 404:
+        raise KbsRouteMissing(
+            f"{label}: KBS returned 404 — the {command} route is not served by "
+            "the deployed KBS image"
+        )
+    if status == 409 and command == "tombstone":
+        raise KbsTombstoneConflict(
+            f"{label}: KBS returned 409 — it already holds a tombstone for this "
+            "VM at a different generation"
+        )
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: KBS returned HTTP {status}")
+    parsed = _json(raw, label=label)
+    try:
+        ok = KbsFenceOk(
+            previous=str(parsed["previous"]),
+            state=str(parsed["state"]),
+            cached=bool(parsed["cached"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise EffectError(f"{label}: 200 body missing previous/state/cached") from exc
+    # A 200 that does not report the fenced state is not a fence: treat it as
+    # a failure (retried) rather than recording a fence the KBS never applied.
+    if ok.state not in accept:
+        raise EffectError(f"{label}: KBS reported state {ok.state!r} after the call")
+    return ok
+
+
 def crypto_erase_kek_transit(vm: Vm) -> None:
     """§24 — crypto-erase ANY VM's tenant data (golden or legacy) by
     DESTROYING its Vault-Transit KEK + the wrapped-KEK KV secret.
@@ -825,7 +1092,7 @@ def crypto_erase_kek_transit(vm: Vm) -> None:
     from .services import vault_kv
 
     vm_id = vm.vm_id
-    if not isinstance(vm_id, str) or not _VM_ID_RE.match(vm_id):
+    if not isinstance(vm_id, str) or not _VM_ID_RE.fullmatch(vm_id):
         # Fail closed — never interpolate an unvalidated vm_id into a Vault
         # write/delete path (defeats any `../` traversal out of the per-VM
         # namespace, and refuses to erase an ambiguous target).
@@ -834,12 +1101,26 @@ def crypto_erase_kek_transit(vm: Vm) -> None:
     prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", "") or "").strip()
     if not prefix:
         raise EffectUnavailable("VALI_VAULT_KV_PREFIX is not configured")
-    transit_key = vault_kv.transit_key_name(vm_id)  # `kek-<vm_id>`
-    luks_path = f"{prefix}/{vm_id}/luks-kek"
-    # (1) THE data-death: destroy the Transit key. (2) Delete the wrapped-KEK
-    # KV blob. Both idempotent + fail-closed inside `vault_kv`.
-    vault_kv.transit_key_delete(transit_key)
-    vault_kv.delete_kv_all_versions(mount, luks_path)
+    # (1) THE data-death: destroy the per-VM Transit keys. `kek-<vm_id>`
+    # wraps the disk KEK and the canonical userdata the KBS releases;
+    # `ud-<vm_id>` wraps vali's own userdata working copy. Destroying both
+    # makes every wrapped copy unopenable by anyone, forever.
+    #
+    # (2) Delete the KV blobs. The KEK blob was the only one this ever
+    # deleted, so a destroyed VM's cloud-init — SSH keys, API tokens, the
+    # NetBird enrolment secret — outlived it indefinitely, version history
+    # included. The deletes also cover the versions staged BEFORE the
+    # wrapping landed, which are PLAINTEXT and which no key destruction
+    # can reach.
+    #
+    # Order is the retry story: the irreversible step first, then the
+    # deletes. A Vault blip between them leaves the decommission retryable
+    # with the data already dead — never the reverse. All idempotent +
+    # fail-closed inside `vault_kv`.
+    vault_kv.transit_key_delete(vault_kv.transit_key_name(vm_id))
+    vault_kv.transit_key_delete(vault_kv.userdata_transit_key_name(vm_id))
+    for leaf in ("luks-kek", "userdata", "userdata-pending", "userdata-intake"):
+        vault_kv.delete_kv_all_versions(mount, f"{prefix}/{vm_id}/{leaf}")
 
 
 def dispatch_destroy(vm: Vm) -> None:
@@ -882,12 +1163,19 @@ def dispatch_destroy(vm: Vm) -> None:
     payload = order_dispatch.build_destroy_payload(vm_id=vm.vm_id)
     order_id = f"dec-destroy-{vm.vm_id}-{vm.generation}"
     try:
-        result = order_dispatch.dispatch_order(
+        # Settled: a destroy can outlast the Edge's 30 s forward (force
+        # stop + unlinking multi-GB files), and a 502 then says nothing
+        # about whether it happened. One re-ask of the same order_id reads
+        # the miner's recorded outcome; bounded because this runs inside
+        # the orchestration tick (a still-unknown answer retries next tick).
+        result = order_dispatch.dispatch_order_settled(
             miner_id=miner_id,
             netbird_ip=netbird_ip,
             order_id=order_id,
             kind="destroy",
             payload_json=json.dumps(payload).encode("utf-8"),
+            attempts=2,
+            deadline_s=DESTROY_DEADLINE_S,
         )
     except order_dispatch.OrderDispatchUnavailable as exc:
         raise EffectUnavailable(f"decommission-destroy: {exc}") from exc
@@ -971,12 +1259,19 @@ def dispatch_source_reclaim(vm: Vm, *, source_node_id: str, job_id: str) -> None
     # `dec-destroy-<vm>-<gen>` namespace may already have been used.
     order_id = f"mig-reclaim-{vm.vm_id}-{job_id}"
     try:
-        result = order_dispatch.dispatch_order(
+        # Settled: a destroy can outlast the Edge's 30 s forward (force
+        # stop + unlinking multi-GB files), and a 502 then says nothing
+        # about whether it happened. One re-ask of the same order_id reads
+        # the miner's recorded outcome; bounded because this runs inside
+        # the orchestration tick (a still-unknown answer retries next tick).
+        result = order_dispatch.dispatch_order_settled(
             miner_id=miner_id,
             netbird_ip=netbird_ip,
             order_id=order_id,
             kind="destroy",
             payload_json=json.dumps(payload).encode("utf-8"),
+            attempts=2,
+            deadline_s=DESTROY_DEADLINE_S,
         )
     except order_dispatch.OrderDispatchUnavailable as exc:
         raise EffectUnavailable(f"source-reclaim: {exc}") from exc
@@ -1020,17 +1315,18 @@ def kbs_activate_dest(
             f"migrate-activate: dest miner {dest_node_id!r} has no platform_id "
             "(the KBS release gate compares the attested chip_id against this)"
         )
-    _kbs_post(
-        vm,
-        "activate",
-        {
-            # The KBS lifecycle `dest` is the attested chip_id, not the
-            # node_id (see the docstring).
-            "dest_node_id": dest_platform_id,
-            "new_gen": new_gen,
-            "snapshot_get_url": get_url,
-        },
-    )
+    body: dict[str, Any] = {
+        # The KBS lifecycle `dest` is the attested chip_id, not the
+        # node_id (see the docstring).
+        "dest_node_id": dest_platform_id,
+        "new_gen": new_gen,
+    }
+    # Optional on the KBS side (`snapshot_get_url: Option<String>`): a
+    # restore from a staged backup, and the revert that re-activates the
+    # source, have no snapshot to point at.
+    if get_url:
+        body["snapshot_get_url"] = get_url
+    _kbs_post(vm, "activate", body)
 
 
 # ─── §25 M4 — dest-activation order dispatch ─────────────────────────
@@ -1099,11 +1395,21 @@ def resolve_boot_artifacts(vm: Vm) -> dict[str, Any] | None:
     )
     if record is None:
         return None
+    from .services import launch_record
+
     spec = record.spec_json or {}
     bucket = str(spec.get("s3_bucket") or "")
-    prefix = str(spec.get("s3_key_prefix") or "").rstrip("/")
+    # The artefacts the RUNNING boot measured — not necessarily the spec's:
+    # an initrd swap (`vali_swap_vm_initrd`) moves the spec onto a rebuilt
+    # initrd for the NEXT boot, while the dest replays the CURRENT boot's
+    # measured cmdline against a ticket for the CURRENT measurement. Staging
+    # the swapped initrd before the VM relaunched would change the dest's
+    # launch digest and the KBS would deny it. Kernel + dm-verity base are
+    # identical across a swap (the command refuses otherwise), and the booted
+    # prefix still holds all of them.
+    booted_prefix, initrd_sha = launch_record.booted_artifacts(record)
+    prefix = booted_prefix.rstrip("/")
     kernel_sha = str(spec.get("kernel_sha256_hex") or "")
-    initrd_sha = str(spec.get("initrd_sha256_hex") or "")
     if not (bucket and prefix and kernel_sha and initrd_sha):
         # An incomplete launch record cannot stage a measured boot — fall
         # back to the dest's pre-staged artifacts (existence-checked).
@@ -1162,8 +1468,19 @@ def dispatch_migrate_activate(
     state_get_url: str = "",
     boot_artifacts: dict[str, Any] | None,
     job_id: str = "",
+    attempt: int = 0,
+    backup_chain: dict[str, Any] | None = None,
+    snapshot_size: int = 0,
+    snapshot_sha256_hex: str = "",
+    settle_by_unix: int = 0,
+    staged_restore_id: str = "",
 ) -> None:
     """§25 M4 — dispatch the ``migrate-activate`` order to the DEST miner.
+
+    ``staged_restore_id`` (a restore, `apps.orchestration.restore`): the
+    destination installs the backup point it already staged under that id
+    instead of downloading anything, so ``get_url`` / ``state_get_url`` /
+    ``backup_chain`` / the snapshot digest must all be empty.
 
     The transport vali's `_h_mig_dest_activating` was missing: after the
     KBS releases the key to the destination at ``new_gen`` (the split-brain
@@ -1228,6 +1545,16 @@ def dispatch_migrate_activate(
     # cmdline token (see the docstring).
     paths = _launch_paths(vm)
     cmdline = paths["cmdline"]
+    # Customer-held keys: the dest boots this cmdline and its order carries
+    # the guardian it names (`order_dispatch._add_guardian_ep`). It must be
+    # the VM's PINNED mode + guardian — refuse rather than move an M1/M2 VM
+    # under a cmdline that dropped or changed its binding.
+    from .services import customer_keys
+
+    try:
+        customer_keys.resolve_for_remint(vm, cmdline)
+    except customer_keys.CustomerKeysError as exc:
+        raise EffectError(f"migrate-activate: vm {vm.vm_id!r}: {exc}") from exc
 
     # The order_id is the dest miner's idempotency key
     # (`orders::IdempotencyStore`), and `migrate-activate` ACKs
@@ -1242,9 +1569,18 @@ def dispatch_migrate_activate(
     # letting a NEW job re-drive the same destination at the same
     # generation. `job_id` is optional so a caller with no job (tests)
     # keeps the historical key.
+    #
+    # `attempt` scopes it WITHIN the job: the handler's bounded retry
+    # re-dispatches under a new attempt number, and each must be a new
+    # order or the dest answers `replay:activate-accepted` and never runs
+    # the restore again (seen live: one transient artifact failure,
+    # then every retry replayed). Attempt 0 keeps the job-scoped key, so
+    # a job already in flight across this deploy is not re-dispatched.
     order_id = f"mig-activate-{vm.vm_id}-{new_gen}"
     if job_id:
         order_id = f"{order_id}-{job_id}"
+    if attempt:
+        order_id = f"{order_id}-a{attempt}"
     payload = order_dispatch.build_migrate_activate_payload(
         vm_id=vm.vm_id,
         get_url=get_url,
@@ -1262,6 +1598,11 @@ def dispatch_migrate_activate(
         memory_mb=paths["memory_mb"],
         cose_ticket=cose_ticket,
         boot_artifacts=boot_artifacts,
+        backup_chain=backup_chain,
+        snapshot_size=snapshot_size,
+        snapshot_sha256_hex=snapshot_sha256_hex,
+        settle_by_unix=settle_by_unix,
+        staged_restore_id=staged_restore_id,
     )
     import json as _json
 
@@ -1306,15 +1647,25 @@ def poll_dest_activation(vm: Vm, *, dest_node_id: str) -> str:
     local `MigrationPhase::Activating → Done/Failed`) to learn the terminal
     outcome, targeting the DEST's socket address rather than the source's.
     """
+    return poll_dest_activation_status(vm, dest_node_id=dest_node_id)[0]
+
+
+def poll_dest_activation_status(vm: Vm, *, dest_node_id: str) -> tuple[str, str]:
+    """`poll_dest_activation` plus, for a ``failed``, the class the dest
+    reported for it (``migration/dest-settle-by-passed``, …) — ``""`` when
+    it reported none (an agent predating the field, or any other status).
+    """
     _, netbird_ip = _miner_identity(dest_node_id)
     dest_addr = f"{netbird_ip}:{_MINER_ORDERS_PORT}"
     status, body = _edge_get_addr(vm, "snapshot", dest_addr)
     if status != 200:
         raise EffectError(f"edge-relay:dest-activation: poll returned HTTP {status}")
-    state = _json(body, label="edge-relay:dest-activation").get("status")
+    doc = _json(body, label="edge-relay:dest-activation")
+    state = doc.get("status")
     if state not in ("running", "done", "failed"):
         raise EffectError(f"edge-relay:dest-activation: unknown status {state!r}")
-    return str(state)
+    failure_class = doc.get("class") if state == "failed" else ""
+    return str(state), failure_class if isinstance(failure_class, str) else ""
 
 
 def _launch_paths(vm: Vm) -> dict[str, Any]:
@@ -1375,8 +1726,12 @@ def _launch_paths(vm: Vm) -> dict[str, Any]:
     # the same `resolve_flavor` the launch path uses, so the dest measures
     # the SAME tuple. A bad/absent flavor on the record is a corrupt launch
     # record — fail closed rather than guess a size.
+    from .services.launch_record import booted_flavor
+
     try:
-        size = flavors.resolve_flavor(str(spec.get("flavor") or ""))
+        # The size the measured boot ran at — not a stopped-VM resize's
+        # spec flavor its next start will boot (`launch_record.booted_flavor`).
+        size = flavors.resolve_flavor(booted_flavor(record))
     except flavors.UnknownFlavor as exc:
         raise EffectError(
             f"migrate-activate: launch record for {vm.vm_id!r} has an unknown flavor"
@@ -1394,10 +1749,10 @@ def _launch_paths(vm: Vm) -> dict[str, Any]:
     # migration::stage_dest_artifacts`), so a §25 activation wrote multi-GB
     # verified bytes onto files that are not the migrating VM's:
     #
-    #   miner-3 carries all four at the miner root, dated 2026-07-29 14:20,
+    #   one host carried all four at the miner root, dated 2026-07-29 14:20,
     #     and `/var/lib/hippius-miner/rootfs.img` is byte-identical
-    #     (`c6ffbc4a…`) to `staging/realtenant-ubuntu-1/rootfs.img`;
-    #   miner-2 has the SAME two paths as SYMLINKS into `staging/`, the
+    #     (`c6ffbc4a…`) to a tenant VM's `staging/<vm_id>/rootfs.img`;
+    #   another has the SAME two paths as SYMLINKS into `staging/`, the
     #     shared legacy base — the identical order would have replaced the
     #     base image every legacy VM on that host boots, in place.
     #
@@ -1484,13 +1839,26 @@ def _resolve_netbird_group_ids(
     return resolved
 
 
+@dataclass(frozen=True)
+class MintedSetupKey:
+    """A setup key [`mint_netbird_setup_key`] minted.
+
+    `key` is the §20 secret the guest enrols with; `id` is NetBird's id for
+    the key object — NOT secret, and the handle NetBird's audit log names as
+    the initiator of the peer that enrols with it (`VmNetbirdKey`)."""
+
+    id: str
+    key: str = field(repr=False)
+
+
 def mint_netbird_setup_key(
     *,
     vm_id: str,
     tenant_id: str,
     auto_group_name: str,
+    persistent: bool,
     expires_in_seconds: int = 3600,
-) -> str:
+) -> MintedSetupKey:
     """§F (#306) — mint a one-off NetBird setup key for the tenant VM.
 
     Calls `POST /api/setup-keys` on the configured NetBird management
@@ -1498,6 +1866,16 @@ def mint_netbird_setup_key(
     in 1 hour by default (operator-tunable), and the new peer auto-
     joins `auto_group_name` so ACL rules can isolate the tenant from
     operator infra.
+
+    `persistent` is required, so every caller decides: `True` mints
+    `ephemeral: False` (the FIRST launch — see the body for why, and who
+    deletes the peer); `False` mints `ephemeral: True` (a RELAUNCH, whose
+    guest already holds its identity and never uses the key — see
+    `launch._netbird_key_is_persistent`).
+
+    Every caller is a tenant VM launch (`launch_on_miner`, which the
+    async worker, reboot-recovery and power start all go through); no
+    infra peer (ingress edge, miner) enrols with a key minted here.
 
     The setup key is treated as a §20 secret end-to-end:
     - `Authorization` header carries `VALI_NETBIRD_API_TOKEN`, never
@@ -1507,10 +1885,10 @@ def mint_netbird_setup_key(
       userdata); it MUST NOT be written to durable storage on the
       vali side.
 
-    Returns the setup-key string (UUID-shaped). Raises:
+    Returns the key (UUID-shaped) and its NetBird object id. Raises:
       EffectUnavailable — peer unreachable / token unconfigured.
       EffectError       — NetBird returned a 4xx/5xx, or the
-                          response body lacked the `key` field.
+                          response body lacked the `key` or `id` field.
     """
     base = _required_setting("VALI_NETBIRD_API_BASE").rstrip("/")
     token = _required_setting("VALI_NETBIRD_API_TOKEN")
@@ -1527,7 +1905,19 @@ def mint_netbird_setup_key(
         "usage_limit": 1,
         "auto_groups": group_ids,
         "revoked": False,
-        "ephemeral": True,
+        # A first launch's key is PERSISTENT. NetBird deletes an ephemeral peer
+        # after ~10 min offline — a window a §25 cold migration, a tenant
+        # stop or a long reboot-recovery routinely exceeds — and the guest
+        # can never re-enrol (this key is a consumed one-off). A
+        # persistent peer survives any downtime: the guest's next
+        # `netbird up` LOGS IN with the WireGuard identity it already
+        # holds, so it keeps its peer and its overlay IP. The peer's
+        # lifetime is therefore vali's job: §24 revokes it
+        # (`revoke_netbird`) and `netbird_janitor` collects any a failed
+        # revoke leaked. Peers minted before this change stay ephemeral.
+        # A relaunch's key stays ephemeral: the guest never uses it, so it
+        # is only a spare credential a tenant could enrol elsewhere with.
+        "ephemeral": not persistent,
         # The `description` field is operator-visible in the NetBird
         # dashboard and surfaces which tenant the key was minted for.
         # Never embed secret material here.
@@ -1548,7 +1938,12 @@ def mint_netbird_setup_key(
     key = parsed.get("key")
     if not isinstance(key, str) or not key:
         raise EffectError("netbird:mint-setup-key: response missing 'key'")
-    return key
+    key_id = parsed.get("id")
+    if not isinstance(key_id, str) or not key_id:
+        raise EffectError("netbird:mint-setup-key: response missing 'id'")
+    return MintedSetupKey(
+        id=_require_netbird_id(key_id, label="netbird:mint-setup-key"), key=key
+    )
 
 
 @dataclass(frozen=True)
@@ -1561,8 +1956,9 @@ class NetbirdPeer:
 
     The DISTINCTION this type exists for: a peer record that is ABSENT is
     categorically different from one that is present-but-disconnected. An
-    absent record means NetBird's ephemeral GC has deleted it (every
-    tenant key is minted `ephemeral: True`), and since the launch-time
+    absent record means it was deleted — by NetBird's ephemeral GC for a
+    peer enrolled before tenant peers became persistent (those keys were
+    minted `ephemeral: True`), or by a revoke — and since the launch-time
     setup key is `usage_limit=1` and already consumed, the guest can never
     re-register — the loss is PERMANENT. A present-but-disconnected peer
     is merely a guest that has not finished booting.
@@ -1570,6 +1966,170 @@ class NetbirdPeer:
 
     ip: str
     connected: bool
+    #: The management-side peer id — what every NetBird write (group
+    #: membership, route routing peer, peer DELETE) is keyed on. Never the
+    #: vm_id: peers are only ever FOUND by name.
+    id: str = ""
+    #: Names of the NetBird groups the peer belongs to.
+    groups: frozenset[str] = frozenset()
+    #: NetBird's `ephemeral` flag; `None` when the record does not say.
+    #: A `False` peer is never GC'd while offline.
+    ephemeral: bool | None = None
+    #: The record's `last_seen` as NetBird reported it (ISO 8601), or "".
+    last_seen: str = ""
+
+
+#: Shape of a NetBird object id (an xid today). Every id that goes into a
+#: URL path is checked against it, so a malformed listing can never steer a
+#: write at another path.
+_NETBIRD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _require_netbird_id(value: str, *, label: str) -> str:
+    if not _NETBIRD_ID_RE.fullmatch(value):
+        raise EffectError(f"{label}: NetBird returned a malformed object id")
+    return value
+
+
+def _netbird_api() -> tuple[str, dict[str, str]]:
+    """`(base, auth headers)` for the NetBird management API. The token
+    rides the `Authorization` header only and is never logged."""
+    base = _required_setting("VALI_NETBIRD_API_BASE").rstrip("/")
+    token = _required_setting("VALI_NETBIRD_API_TOKEN")
+    return base, {"Authorization": f"Token {token}"}
+
+
+def list_netbird_peers() -> list[dict[str, Any]]:
+    """The raw `GET /api/peers` listing — one call, for sweeps that match
+    many VMs (and edges) against the same snapshot.
+
+    Raises `EffectUnavailable` / `EffectError` like [`_resolve_netbird_peer`];
+    a raise is NOT evidence that any peer is absent.
+    """
+    base, headers = _netbird_api()
+    status, raw = _http(
+        "GET", f"{base}/api/peers", label="netbird:resolve-peer-ip", headers=headers
+    )
+    if status != 200:
+        raise EffectError(f"netbird:resolve-peer-ip: API returned HTTP {status}")
+    try:
+        peers = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError("netbird:resolve-peer-ip: non-JSON response") from exc
+    if not isinstance(peers, list):
+        raise EffectError("netbird:resolve-peer-ip: expected a JSON list")
+    return [p for p in peers if isinstance(p, dict)]
+
+
+def _as_peer(p: dict[str, Any], *, ip: str) -> NetbirdPeer:
+    groups = frozenset(
+        str(g.get("name")) for g in p.get("groups") or [] if isinstance(g, dict) and g.get("name")
+    )
+    ephemeral = p.get("ephemeral")
+    return NetbirdPeer(
+        ip=ip,
+        connected=bool(p.get("connected")),
+        id=str(p.get("id") or ""),
+        groups=groups,
+        ephemeral=ephemeral if isinstance(ephemeral, bool) else None,
+        last_seen=str(p.get("last_seen") or ""),
+    )
+
+
+@dataclass(frozen=True)
+class PeerIndex:
+    """A [`list_netbird_peers`] snapshot indexed once — by id and by name —
+    so a pass resolving every VM costs O(VMs + peers), not O(VMs × peers)."""
+
+    by_id: Mapping[str, dict[str, Any]]
+    by_name: Mapping[str, tuple[dict[str, Any], ...]]
+
+    @classmethod
+    def of(cls, peers: list[dict[str, Any]]) -> PeerIndex:
+        by_id: dict[str, dict[str, Any]] = {}
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for p in peers:
+            peer_id = p.get("id")
+            if isinstance(peer_id, str) and peer_id:
+                by_id[peer_id] = p
+            name = p.get("name")
+            if isinstance(name, str):
+                by_name.setdefault(name, []).append(p)
+        return cls(by_id=by_id, by_name={k: tuple(v) for k, v in by_name.items()})
+
+
+def tenant_peer_from_listing(
+    peers: list[dict[str, Any]] | PeerIndex,
+    vm_id: str,
+    *,
+    peer_ids: Sequence[str] = (),
+    bound_owners: Mapping[str, str] | None = None,
+) -> NetbirdPeer | None:
+    """The VM's peer in a [`list_netbird_peers`] snapshot (or its
+    [`PeerIndex`] — pass the index when resolving many VMs).
+
+    `peer_ids` are the VM's BOUND peer ids in preference order
+    (`netbird_binding.PeerBinding.ranked`). When given they are
+    AUTHORITATIVE: the first CONNECTED one the listing holds, else the
+    first it holds at all, else `None` — never a name match, because a name
+    is only the hostname the guest sent and any tenant can send any VM's.
+    Without them, the name rule [`_resolve_netbird_peer`] documents (exact
+    `name`, connected first), skipping every peer `bound_owners`
+    (`{peer id: vm_id}`) gives to another VM."""
+    index = peers if isinstance(peers, PeerIndex) else PeerIndex.of(peers)
+    if peer_ids:
+        present = [index.by_id[i] for i in peer_ids if i in index.by_id]
+        if not present:
+            return None
+        p = next((q for q in present if q.get("connected")), present[0])
+        ip = p.get("ip")
+        ok = isinstance(ip, str) and ip.startswith("100.")
+        return _as_peer(p, ip=ip if ok else "")
+    owners = bound_owners or {}
+    want = f"hippius-tenant-{vm_id}"
+    matches = [
+        p
+        for p in index.by_name.get(want, ())
+        if owners.get(str(p.get("id") or ""), vm_id) == vm_id
+    ]
+    if not matches:
+        return None
+    # A name collision should never happen (one setup-key per VM), but if
+    # it does, prefer a live (connected) peer over a stale one.
+    matches.sort(key=lambda p: bool(p.get("connected")), reverse=True)
+    for p in matches:
+        ip = p.get("ip")
+        if isinstance(ip, str) and ip.startswith("100."):
+            return _as_peer(p, ip=ip)
+    # Matched by name but with no assigned overlay address: the peer
+    # RECORD exists (so it has not been GC'd) — report it with an empty
+    # `ip` rather than pretending it is absent.
+    return _as_peer(matches[0], ip="")
+
+
+def peer_by_ip_from_listing(peers: list[dict[str, Any]], ip: str) -> NetbirdPeer | None:
+    """The peer holding overlay address `ip` in a listing, or `None`.
+    Overlay addresses are unique within a NetBird account."""
+    for p in peers:
+        if p.get("ip") == ip:
+            return _as_peer(p, ip=ip)
+    return None
+
+
+def peer_by_id_from_listing(peers: list[dict[str, Any]], peer_id: str) -> NetbirdPeer | None:
+    """The peer with NetBird id `peer_id` in a listing, or `None`."""
+    for p in peers:
+        if peer_id and p.get("id") == peer_id:
+            return _as_peer(p, ip=str(p.get("ip") or ""))
+    return None
+
+
+def peer_name_from_listing(peers: list[dict[str, Any]], peer_id: str) -> str:
+    """The enrolment name of peer `peer_id`, or `""`."""
+    for p in peers:
+        if peer_id and p.get("id") == peer_id:
+            return str(p.get("name") or "")
+    return ""
 
 
 def _resolve_netbird_peer(vm_id: str) -> NetbirdPeer | None:
@@ -1585,7 +2145,14 @@ def _resolve_netbird_peer(vm_id: str) -> NetbirdPeer | None:
     redacts URLs from exceptions). Lists the peers (`GET /api/peers`) and
     returns the record of the peer enrolled for THIS VM.
 
-    Robust VM→peer association (verified against the LIVE NetBird API):
+    A VM with BOUND peers (from the setup keys vali minted —
+    `netbird_binding`) is found among them by id and by nothing else; the
+    name rule below is the fallback for a VM without one, and never matches
+    a peer bound to another VM. The VM's open key bindings are closed first; if
+    that audit-log read fails and nothing is found, the failure is RAISED —
+    an unreadable binding is not evidence of absence.
+
+    Name association (verified against the LIVE NetBird API):
     the peer's `name` is the per-VM setup-key name `hippius-tenant-<vm_id>`
     minted by `mint_netbird_setup_key` — a STABLE, exact identifier. The
     peer's `hostname`, by contrast, is the guest-reported OS hostname
@@ -1605,39 +2172,29 @@ def _resolve_netbird_peer(vm_id: str) -> NetbirdPeer | None:
     gone" MUST distinguish `None` (a successful listing with no match)
     from an exception (we simply could not ask).
     """
-    base = _required_setting("VALI_NETBIRD_API_BASE").rstrip("/")
-    token = _required_setting("VALI_NETBIRD_API_TOKEN")
-    status, raw = _http(
-        "GET",
-        f"{base}/api/peers",
-        label="netbird:resolve-peer-ip",
-        headers={"Authorization": f"Token {token}"},
-    )
-    if status != 200:
-        raise EffectError(f"netbird:resolve-peer-ip: API returned HTTP {status}")
+    from .netbird_binding import bind_netbird_keys, bindings_for
+
+    peers = list_netbird_peers()
+    # Close this VM's open key bindings first (no NetBird call without an
+    # open key; at most one audit-log read per resolve), so a peer the guest
+    # enrolled is found by the id NetBird recorded, not by its name.
+    bind_error: EffectError | None = None
     try:
-        peers = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-        raise EffectError("netbird:resolve-peer-ip: non-JSON response") from exc
-    if not isinstance(peers, list):
-        raise EffectError("netbird:resolve-peer-ip: expected a JSON list")
-    want = f"hippius-tenant-{vm_id}"
-    matches = [
-        p for p in peers if isinstance(p, dict) and p.get("name") == want
-    ]
-    if not matches:
-        return None
-    # A name collision should never happen (one setup-key per VM), but if
-    # it does, prefer a live (connected) peer over a stale one.
-    matches.sort(key=lambda p: bool(p.get("connected")), reverse=True)
-    for p in matches:
-        ip = p.get("ip")
-        if isinstance(ip, str) and ip.startswith("100."):
-            return NetbirdPeer(ip=ip, connected=bool(p.get("connected")))
-    # Matched by name but with no assigned overlay address: the peer
-    # RECORD exists (so it has not been GC'd) — report it with an empty
-    # `ip` rather than pretending it is absent.
-    return NetbirdPeer(ip="", connected=bool(matches[0].get("connected")))
+        bind_netbird_keys(vm_ids=[vm_id])
+    except EffectError as exc:  # EffectUnavailable included
+        bind_error = exc
+    binding = bindings_for([vm_id])[vm_id]
+    peer = tenant_peer_from_listing(
+        peers, vm_id, peer_ids=binding.ranked, bound_owners=binding.owners
+    )
+    if bind_error is not None and (peer is None or not peer.connected):
+        # Absence — or a disconnected peer, when the guest may have
+        # re-enrolled as a peer only the unread binding names — cannot be
+        # concluded while the binding could not be read: a NetBird outage
+        # must never read as "the peer is gone" (the §25 verify would
+        # settle the VM `lost`).
+        raise bind_error
+    return peer
 
 
 def resolve_netbird_peer(vm_id: str) -> NetbirdPeer | None:
@@ -1645,7 +2202,8 @@ def resolve_netbird_peer(vm_id: str) -> NetbirdPeer | None:
     NetBird holds no peer for this VM.
 
     `None` is the load-bearing answer for the post-§25 sweep: it means the
-    ephemeral GC deleted the record, which the guest cannot undo (its
+    record was deleted (NetBird's ephemeral GC, for a peer enrolled before
+    tenant peers became persistent), which the guest cannot undo (its
     launch setup key is a consumed one-off). See [`_resolve_netbird_peer`]
     for the association rule, the auth discipline and the raise semantics
     — a raise is NOT evidence of absence.
@@ -1668,22 +2226,694 @@ def resolve_netbird_peer_ip(vm_id: str) -> str | None:
 
 
 def revoke_netbird(vm: Vm) -> None:
-    """§24 — revoke the VM's NetBird peer (and its one-off enrol key).
+    """§24 — revoke the VM's NetBird peer(s).
 
     Best-effort graceful teardown (§24: "NOT trusted for data
-    destruction"). The peer is keyed by `vm_id`; a `404` means it was
-    already revoked ⇒ success (idempotent). The admin token rides in
-    the `Authorization` header and is never logged.
+    destruction"). NetBird keys a peer on its own opaque id, never on the
+    vm_id. The admin token rides in the `Authorization` header and is never
+    logged. A `404` on a delete means already gone ⇒ success (idempotent).
+
+    1. BY ID — every peer bound to a setup key vali minted for this VM
+       (`VmNetbirdKey.peer_id`, and `Vm.netbird_peer_id`), whatever name it
+       enrolled under. Keys not bound yet are bound first
+       (`netbird_binding`); a failure to read NetBird's audit log is logged
+       and the revoke goes on with the bindings it has.
+    2. BY NAME — the fallback for a VM launched before keys were recorded,
+       or whose binding could not be read: every peer named
+       `hippius-tenant-<vm_id>` (see [`_resolve_netbird_peer`]), or that
+       name plus a NetBird clash suffix (`<name>-<d>-<d>`, see
+       [`tenant_peer_vm_ids`]) — unless its name is also, read literally,
+       the name of another VM vali still runs, or its id is bound to one.
     """
-    base = _required_setting("VALI_NETBIRD_API_BASE").rstrip("/")
-    token = _required_setting("VALI_NETBIRD_API_TOKEN")
-    url = f"{base}/api/peers/{vm.vm_id}"
+    from apps.lifecycle.models import VmState
+
+    from .netbird_binding import bind_netbird_keys, bound_peer_ids, live_bound_peer_ids
+
+    try:
+        bind_netbird_keys(vm_ids=[vm.vm_id])
+    except EffectError as exc:  # EffectUnavailable included
+        log.warning(
+            "netbird:revoke-peer: could not bind vm %s's setup keys to peers "
+            "(revoking with the bindings already recorded): %s",
+            vm.vm_id,
+            exc,
+        )
+    own = bound_peer_ids(vm.vm_id)
+    for peer_id in sorted(own):
+        delete_netbird_peer(peer_id, label="netbird:revoke-peer")
+
+    others = live_bound_peer_ids(exclude_vm_id=vm.vm_id)
+    for p in list_netbird_peers():
+        peer_id = str(p.get("id") or "")
+        if peer_id in own or peer_id in others:
+            continue
+        candidates = tenant_peer_vm_ids(str(p.get("name") or ""))
+        if vm.vm_id not in candidates:
+            continue
+        if candidates[0] != vm.vm_id and (
+            Vm.objects.filter(vm_id=candidates[0])
+            .exclude(state=VmState.DESTROYED)
+            .exists()
+        ):
+            continue
+        delete_netbird_peer(peer_id, label="netbird:revoke-peer")
+
+
+#: Every tenant peer's enrolment name is this prefix + its vm_id — the
+#: setup-key name `mint_netbird_setup_key` mints and the hostname vali
+#: renders into the tenant userdata (`netbird up --hostname`). Intake only
+#: accepts a hostname template that renders to exactly this
+#: (`launch.check_netbird_hostname`). The guest's userdata is the tenant's
+#: own, though, so a name is a CLAIM, never proof of ownership.
+TENANT_PEER_PREFIX = "hippius-tenant-"
+
+#: NetBird disambiguates a clashing peer name by appending the peer's last
+#: two overlay octets (`hippius-tenant-<vm_id>-12-34` — the
+#: backend's `find_peer_by_vm_id` matches it the same way).
+_NETBIRD_CLASH_SUFFIX_RE = re.compile(r"-\d{1,3}-\d{1,3}$")
+
+
+def tenant_peer_name(vm_id: str) -> str:
+    return f"{TENANT_PEER_PREFIX}{vm_id}"
+
+
+def tenant_peer_vm_ids(name: str) -> tuple[str, ...]:
+    """The vm_ids a tenant peer name can belong to: the literal remainder
+    after the prefix first, then that remainder minus a NetBird clash
+    suffix. `()` for a name that is not a tenant peer name."""
+    if not name.startswith(TENANT_PEER_PREFIX):
+        return ()
+    rest = name[len(TENANT_PEER_PREFIX):]
+    if not rest:
+        return ()
+    match = _NETBIRD_CLASH_SUFFIX_RE.search(rest)
+    if match is None or match.start() == 0:
+        return (rest,)
+    return (rest, rest[: match.start()])
+
+
+def delete_netbird_peer(peer_id: str, *, label: str) -> None:
+    """`DELETE /api/peers/<peer_id>`. A `404` means already gone ⇒
+    success (idempotent); any other non-2xx raises `EffectError`. The id
+    is shape-checked before it goes into the URL path."""
+    base, headers = _netbird_api()
+    _require_netbird_id(peer_id, label=label)
     status, _ = _http(
-        "DELETE",
-        url,
-        label="netbird:revoke-peer",
-        headers={"Authorization": f"Token {token}"},
+        "DELETE", f"{base}/api/peers/{peer_id}", label=label, headers=headers
     )
-    if status in (200, 204, 404):
-        return  # 404 ⇒ already revoked
-    raise EffectError(f"netbird:revoke-peer: API returned HTTP {status}")
+    if status not in (200, 204, 404):  # 404 ⇒ already deleted
+        raise EffectError(f"{label}: API returned HTTP {status}")
+
+
+#: The NetBird audit-log activity code of "a peer registered with a setup
+#: key": `initiator_id` = the setup key's id, `target_id` = the new peer's.
+NETBIRD_PEER_ADDED_WITH_SETUP_KEY = "peer.setupkey.add"
+
+
+def delete_netbird_setup_key(key_id: str, *, label: str) -> None:
+    """Delete a setup key vali minted, so it can enrol nothing more. A key
+    NetBird no longer holds (404) is already what this asks for."""
+    _require_netbird_id(key_id, label=label)
+    base, headers = _netbird_api()
+    status, _raw = _http(
+        "DELETE", f"{base}/api/setup-keys/{key_id}", label=label, headers=headers
+    )
+    if status not in (200, 204, 404):
+        raise EffectError(f"{label}: API returned HTTP {status}")
+
+
+def list_netbird_setup_key_enrolments() -> dict[str, str]:
+    """`{setup-key id: peer id}` for every peer NetBird's audit log shows
+    registering with a setup key — one `GET /api/events/audit` (the pre-
+    `/audit` path `/api/events` on a `404`, for an older management server).
+
+    The pairing is written by the management server itself when it adds the
+    peer (`AddPeer` → `peer.setupkey.add`, initiator = key id, target = peer
+    id); nothing the peer sends enters it. The server returns the newest
+    10 000 events, newest first; a key used twice (only possible with a
+    `usage_limit` above 1, which vali never mints) maps to its NEWEST peer.
+
+    Raises `EffectUnavailable` / `EffectError` like [`list_netbird_peers`];
+    a raise is NOT evidence that any key is unused.
+    """
+    base, headers = _netbird_api()
+    label = "netbird:list-enrolments"
+    status, raw = _http("GET", f"{base}/api/events/audit", label=label, headers=headers)
+    if status == 404:
+        status, raw = _http("GET", f"{base}/api/events", label=label, headers=headers)
+    if status != 200:
+        raise EffectError(f"{label}: API returned HTTP {status}")
+    try:
+        events = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError(f"{label}: non-JSON response") from exc
+    if not isinstance(events, list):
+        raise EffectError(f"{label}: expected a JSON list")
+    out: dict[str, str] = {}
+    for e in events:
+        if not isinstance(e, dict) or e.get("activity_code") != NETBIRD_PEER_ADDED_WITH_SETUP_KEY:
+            continue
+        key_id, peer_id = e.get("initiator_id"), e.get("target_id")
+        if not isinstance(key_id, str) or not isinstance(peer_id, str):
+            continue
+        if not _NETBIRD_ID_RE.fullmatch(peer_id):
+            continue  # never bind an id that could not go into a URL path
+        out.setdefault(key_id, peer_id)
+    return out
+
+
+# ─── NetBird exit routing for public IPs (ingress edges) ──────────────
+#
+# A VM with a public IP egresses through the ingress edge that owns that
+# IP: the edge is a NetBird routing peer for `0.0.0.0/0` (an exit route,
+# `masquerade=false` so the edge sees the VM's overlay source and can SNAT
+# it to the public IP), distributed to one group per edge. Membership of
+# that group is the ONLY thing that moves a VM's default route.
+#
+# Every object is found by a deterministic name, so each call below is an
+# idempotent "make it so" that repairs drift and never duplicates.
+
+
+# Group names carry a fixed tag right after the common prefix (`vms-` /
+# `gw-`), so no edge name can make one edge's group name equal another
+# edge's: `hippius-pip-vms-<a>` and `hippius-pip-gw-<b>` differ at the
+# tag whatever `a` and `b` are. The route and the policy live in their own
+# namespaces and take the bare `hippius-pip-<edge>` (a route `network_id`
+# is capped at 40 characters, hence the 28-character edge name).
+NETBIRD_PIP_PREFIX = "hippius-pip-"
+
+
+def netbird_pip_route_name(edge_name: str) -> str:
+    """The exit route's `network_id`, and the policy's name."""
+    return f"{NETBIRD_PIP_PREFIX}{edge_name}"
+
+
+def netbird_pip_group_name(edge_name: str) -> str:
+    """The distribution group of an edge's exit route: its VMs."""
+    return f"{NETBIRD_PIP_PREFIX}vms-{edge_name}"
+
+
+def netbird_pip_edge_group_name(edge_name: str) -> str:
+    """The group holding the edge's own peer (policy destination)."""
+    return f"{NETBIRD_PIP_PREFIX}gw-{edge_name}"
+
+
+@dataclass(frozen=True)
+class EdgeRouting:
+    """What [`ensure_edge_routing`] found or made."""
+
+    pip_group_id: str
+    #: Peer ids currently in the distribution group.
+    pip_peer_ids: frozenset[str]
+
+
+def _netbird_call(
+    method: str, path: str, *, label: str, body: dict[str, Any] | None = None
+) -> Any:
+    """One NetBird API call that must succeed (2xx); the parsed JSON body,
+    or `None` when there is none."""
+    base, headers = _netbird_api()
+    status, raw = _http(method, f"{base}{path}", label=label, json_body=body, headers=headers)
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: API returned HTTP {status}")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError(f"{label}: non-JSON response") from exc
+
+
+def _netbird_list(path: str, *, label: str) -> list[dict[str, Any]]:
+    parsed = _netbird_call("GET", path, label=label)
+    if not isinstance(parsed, list):
+        raise EffectError(f"{label}: expected a JSON list")
+    return [x for x in parsed if isinstance(x, dict)]
+
+
+def _ids(items: Any) -> list[str]:
+    """Object ids from a NetBird field that holds either ids or objects
+    (a GET returns `{id, name, …}` objects where a write takes ids)."""
+    out: list[str] = []
+    for item in items or []:
+        value = item.get("id") if isinstance(item, dict) else item
+        if isinstance(value, str) and value:
+            out.append(value)
+    return out
+
+
+def _created_id(parsed: Any, *, label: str) -> str:
+    if not isinstance(parsed, dict):
+        raise EffectError(f"{label}: response is not a JSON object")
+    return _require_netbird_id(str(parsed.get("id") or ""), label=label)
+
+
+def _group_body(group: dict[str, Any], peer_ids: list[str]) -> dict[str, Any]:
+    """A group PUT that changes the peers and keeps everything else — the
+    PUT replaces the whole object, so resources must be carried over."""
+    body: dict[str, Any] = {"name": group.get("name"), "peers": sorted(set(peer_ids))}
+    resources = group.get("resources")
+    if resources:
+        body["resources"] = [
+            {"id": r.get("id"), "type": r.get("type")} for r in resources if isinstance(r, dict)
+        ]
+    return body
+
+
+def _ensure_group(
+    groups: list[dict[str, Any]], name: str, *, peers: list[str] | None
+) -> dict[str, Any]:
+    """The group named `name`, created if missing. With `peers`, its
+    membership is set to exactly that list; with `None` it is left alone."""
+    label = "netbird:ensure-group"
+    found = next((g for g in groups if g.get("name") == name), None)
+    if found is None:
+        created = _netbird_call(
+            "POST", "/api/groups", label=label, body={"name": name, "peers": peers or []}
+        )
+        _created_id(created, label=label)
+        return created
+    group_id = _require_netbird_id(str(found.get("id") or ""), label=label)
+    if peers is not None and set(_ids(found.get("peers"))) != set(peers):
+        found = _netbird_call(
+            "PUT", f"/api/groups/{group_id}", label=label, body=_group_body(found, peers)
+        )
+        if not isinstance(found, dict):
+            raise EffectError(f"{label}: response is not a JSON object")
+    return found
+
+
+def ensure_edge_routing(edge_name: str, edge_peer_id: str) -> EdgeRouting:
+    """Make the edge's exit routing exist and match, and report the
+    distribution group's current members.
+
+    - group `hippius-pip-vms-<edge>` (its VMs — membership is managed by
+      the caller through [`group_add_peer`] / [`group_remove_peer`]);
+    - group `hippius-pip-gw-<edge>` holding exactly the edge's peer;
+    - route `0.0.0.0/0`, routing peer = the edge, distributed to the first
+      group, `masquerade=false` (the edge must see the VM's overlay source
+      to SNAT it to the VM's own public IP);
+    - an accept policy, all protocols, bidirectional, between the two.
+    """
+    _require_netbird_id(edge_peer_id, label="netbird:edge-routing")
+    route_name = netbird_pip_route_name(edge_name)
+    groups = _netbird_list("/api/groups", label="netbird:list-groups")
+    pip = _ensure_group(groups, netbird_pip_group_name(edge_name), peers=None)
+    edge_group = _ensure_group(
+        groups, netbird_pip_edge_group_name(edge_name), peers=[edge_peer_id]
+    )
+    pip_id = _require_netbird_id(str(pip.get("id") or ""), label="netbird:edge-routing")
+    edge_group_id = _require_netbird_id(
+        str(edge_group.get("id") or ""), label="netbird:edge-routing"
+    )
+
+    route_body: dict[str, Any] = {
+        "description": f"public-IP exit route via ingress edge {edge_name}",
+        "network_id": route_name,
+        "enabled": True,
+        "peer": edge_peer_id,
+        "network": "0.0.0.0/0",
+        "metric": 9999,
+        "masquerade": False,
+        "groups": [pip_id],
+        "keep_route": True,
+        # Newer clients can skip auto-applying an exit route; ours must
+        # apply it, or the VM keeps egressing through its miner.
+        "skip_auto_apply": False,
+    }
+    routes = _netbird_list("/api/routes", label="netbird:list-routes")
+    route = next((r for r in routes if r.get("network_id") == route_name), None)
+    if route is None:
+        _created_id(
+            _netbird_call("POST", "/api/routes", label="netbird:create-route", body=route_body),
+            label="netbird:create-route",
+        )
+    elif (
+        route.get("peer") != edge_peer_id
+        or route.get("network") != "0.0.0.0/0"
+        or bool(route.get("masquerade"))
+        or not route.get("enabled")
+        or bool(route.get("skip_auto_apply"))
+        or _ids(route.get("groups")) != [pip_id]
+        or route.get("peer_groups")
+    ):
+        route_id = _require_netbird_id(str(route.get("id") or ""), label="netbird:update-route")
+        _netbird_call(
+            "PUT", f"/api/routes/{route_id}", label="netbird:update-route", body=route_body
+        )
+
+    policy_body: dict[str, Any] = {
+        "name": route_name,
+        "description": f"VMs with a public IP on ingress edge {edge_name} <-> that edge",
+        "enabled": True,
+        "rules": [
+            {
+                "name": route_name,
+                "description": "",
+                "enabled": True,
+                "action": "accept",
+                "bidirectional": True,
+                "protocol": "all",
+                "sources": [pip_id],
+                "destinations": [edge_group_id],
+            }
+        ],
+    }
+    policies = _netbird_list("/api/policies", label="netbird:list-policies")
+    policy = next((p for p in policies if p.get("name") == route_name), None)
+    if policy is None:
+        _created_id(
+            _netbird_call(
+                "POST", "/api/policies", label="netbird:create-policy", body=policy_body
+            ),
+            label="netbird:create-policy",
+        )
+    elif not _policy_matches(policy, pip_id, edge_group_id):
+        policy_id = _require_netbird_id(
+            str(policy.get("id") or ""), label="netbird:update-policy"
+        )
+        _netbird_call(
+            "PUT", f"/api/policies/{policy_id}", label="netbird:update-policy", body=policy_body
+        )
+
+    return EdgeRouting(pip_group_id=pip_id, pip_peer_ids=frozenset(_ids(pip.get("peers"))))
+
+
+def _policy_matches(policy: dict[str, Any], pip_id: str, edge_group_id: str) -> bool:
+    rules = policy.get("rules") or []
+    if not policy.get("enabled") or len(rules) != 1 or not isinstance(rules[0], dict):
+        return False
+    rule = rules[0]
+    return (
+        bool(rule.get("enabled"))
+        and rule.get("action") == "accept"
+        and bool(rule.get("bidirectional"))
+        and rule.get("protocol") == "all"
+        and _ids(rule.get("sources")) == [pip_id]
+        and _ids(rule.get("destinations")) == [edge_group_id]
+    )
+
+
+def edge_pip_group(edge_name: str) -> EdgeRouting | None:
+    """The edge's distribution group and its members, read-only — for an
+    edge whose routing must not be (re)programmed but whose departures
+    must still happen. `None` when the group does not exist."""
+    name = netbird_pip_group_name(edge_name)
+    for group in _netbird_list("/api/groups", label="netbird:list-groups"):
+        if group.get("name") == name:
+            group_id = _require_netbird_id(str(group.get("id") or ""), label="netbird:list-groups")
+            members = frozenset(_ids(group.get("peers")))
+            return EdgeRouting(pip_group_id=group_id, pip_peer_ids=members)
+    return None
+
+
+def _set_group_member(group_id: str, peer_id: str, *, present: bool) -> None:
+    label = "netbird:group-add-peer" if present else "netbird:group-remove-peer"
+    _require_netbird_id(group_id, label=label)
+    _require_netbird_id(peer_id, label=label)
+    group = _netbird_call("GET", f"/api/groups/{group_id}", label=label)
+    if not isinstance(group, dict):
+        raise EffectError(f"{label}: response is not a JSON object")
+    members = set(_ids(group.get("peers")))
+    if (peer_id in members) == present:
+        return
+    members = members | {peer_id} if present else members - {peer_id}
+    _netbird_call(
+        "PUT", f"/api/groups/{group_id}", label=label, body=_group_body(group, sorted(members))
+    )
+
+
+def group_add_peer(group_id: str, peer_id: str) -> None:
+    """Add one peer to a group (read-modify-write; no-op when present)."""
+    _set_group_member(group_id, peer_id, present=True)
+
+
+def group_remove_peer(group_id: str, peer_id: str) -> None:
+    """Remove one peer from a group (no-op when absent)."""
+    _set_group_member(group_id, peer_id, present=False)
+
+
+def remove_edge_routing(edge_name: str) -> None:
+    """Delete an edge's policy, route and both groups."""
+    gc_edge_routing(keep=frozenset(), only=frozenset({edge_name}))
+
+
+def _pip_owner(kind: str, name: str) -> str | None:
+    """The edge an object named `name` of `kind` belongs to, or `None` when
+    it is not one of ours."""
+    if not name.startswith(NETBIRD_PIP_PREFIX):
+        return None
+    rest = name[len(NETBIRD_PIP_PREFIX):]
+    if kind != "groups":
+        return rest
+    for tag in ("vms-", "gw-"):
+        if rest.startswith(tag):
+            return rest[len(tag):]
+    return None
+
+
+def gc_edge_routing(
+    *, keep: frozenset[str], only: frozenset[str] | None = None
+) -> list[str]:
+    """Delete the exit-routing objects of every edge NOT in `keep` (or,
+    with `only`, of just those edges). Policies and routes go first:
+    NetBird refuses to delete a group they still reference. Returns what
+    was deleted, as `kind/name`. Safe to repeat."""
+    deleted: list[str] = []
+    for path, key in (
+        ("/api/policies", "name"),
+        ("/api/routes", "network_id"),
+        ("/api/groups", "name"),
+    ):
+        kind = path.rsplit("/", 1)[1]
+        for item in _netbird_list(path, label="netbird:gc-edge-routing"):
+            name = str(item.get(key) or "")
+            owner = _pip_owner(kind, name)
+            if owner is None or owner in keep or (only is not None and owner not in only):
+                continue
+            item_id = _require_netbird_id(
+                str(item.get("id") or ""), label="netbird:gc-edge-routing"
+            )
+            _netbird_call("DELETE", f"{path}/{item_id}", label="netbird:gc-edge-routing")
+            deleted.append(f"{kind}/{name}")
+    return deleted
+
+
+# ─── Live VM backups (`apps.backup`) ─────────────────────────────────
+
+
+class BackupRejected(EffectError):
+    """The miner refused a `backup` order with a static classifier
+    (`backup-in-flight`, `bitmap-missing`, `not-golden`, …). Carried so the
+    backup tick can act on the reason (e.g. force a full on
+    `bitmap-missing`)."""
+
+    def __init__(self, classifier: str, status: int) -> None:
+        super().__init__(f"backup: miner rejected (status={status} class={classifier!r})")
+        self.classifier = classifier
+        self.status = status
+
+
+def dispatch_backup(*, miner_id: str, order_id: str, payload: dict[str, Any]) -> None:
+    """Send a `backup` order to `miner_id` through the signed-order path
+    (`order_dispatch` → Edge `/v1/edge/order` → the miner's
+    `/v1/miner/order/backup`). The miner ACKs at once and runs the backup
+    on a background task; `poll_backup_status` follows it.
+
+    `payload` carries presigned write URLs — passed through, never logged.
+    Raises `EffectUnavailable` when the Edge or miner is unreachable (the
+    caller retries with the same `order_id`, which the miner dedups) and
+    `BackupRejected` when the miner refused the order.
+    """
+    from . import order_dispatch
+
+    _, netbird_ip = _miner_identity(miner_id)
+    try:
+        result = order_dispatch.dispatch_order(
+            miner_id=miner_id,
+            netbird_ip=netbird_ip,
+            order_id=order_id,
+            kind="backup",
+            payload_json=json.dumps(payload).encode("utf-8"),
+        )
+    except order_dispatch.OrderDispatchUnavailable as exc:
+        raise EffectUnavailable(f"backup: {exc}") from exc
+    except order_dispatch.OrderDispatchError as exc:
+        raise EffectError(f"backup: {exc}") from exc
+    if result.ok:
+        return
+    # `order-in-flight`: the miner already accepted this very order_id and
+    # is working on it — the dispatch succeeded.
+    if result.status == 409 and result.classifier == "order-in-flight":
+        return
+    if result.status >= 500:
+        raise EffectUnavailable(f"backup: miner answered HTTP {result.status}")
+    raise BackupRejected(result.classifier, result.status)
+
+
+def poll_backup_status(*, vm_id: str, miner_id: str) -> dict[str, Any] | None:
+    """Read the miner's `BackupStatus` for `vm_id` through the Edge relay
+    (`GET /v1/relay/{vm_id}/backup` → the miner's
+    `/v1/miner/backup/{vm_id}/status`). Returns the parsed JSON object, or
+    `None` when the miner has no domain for the VM (404). The shape is
+    checked by the caller (`apps.backup.service.parse_status`)."""
+    _, netbird_ip = _miner_identity(miner_id)
+    base = _required_setting("VALI_EDGE_GATEWAY_URL").rstrip("/")
+    url = f"{base}/v1/relay/{vm_id}/backup"
+    status, body = _http(
+        "GET",
+        url,
+        label="edge-relay:backup",
+        headers={_TARGET_ADDR_HEADER: f"{netbird_ip}:{_MINER_ORDERS_PORT}"},
+        timeout=float(getattr(settings, "VALI_BACKUP_POLL_TIMEOUT_S", 32.0)),
+    )
+    if status == 404:
+        return None
+    if status >= 500:
+        raise EffectUnavailable(f"edge-relay:backup: poll returned HTTP {status}")
+    if status != 200:
+        raise EffectError(f"edge-relay:backup: poll returned HTTP {status}")
+    return _json(body, label="edge-relay:backup")
+
+
+# ─── Restore from a backup (`apps.orchestration.restore`) ────────────
+
+
+class RestoreRejected(EffectError):
+    """The miner refused a `restore` order with a static classifier
+    (`restore-busy`, `restore-vm-live`, `insufficient-space`, …)."""
+
+    def __init__(self, classifier: str, status: int) -> None:
+        super().__init__(f"restore: miner rejected (status={status} class={classifier!r})")
+        self.classifier = classifier
+        self.status = status
+
+
+def dispatch_restore(
+    *, miner_id: str, order_id: str, payload: dict[str, Any], in_flight_ok: bool = True
+) -> None:
+    """Send a `restore` order (`op` = `stage` / `abort` / `reclaim`) to
+    `miner_id` through the signed-order path (`order_dispatch` → Edge
+    `/v1/edge/order` → the miner's `/v1/miner/order/restore`), like
+    `dispatch_backup`. `stage` is ACKed at once and runs on a background
+    task (`poll_restore_status` follows it); `abort` / `reclaim` are
+    idempotent on the miner.
+
+    `payload` carries presigned read URLs for `stage` — passed through,
+    never logged. Raises `EffectUnavailable` when the Edge or miner is
+    unreachable or answers 5xx, `RestoreRejected` when the miner refused
+    (507 `insufficient-space` included: that one is definite).
+
+    `in_flight_ok`: a `409 order-in-flight` means the miner is still running
+    this very order. For `stage` (answered at once, followed through the
+    status) that is success; for a caller that needs the order FINISHED
+    (`abort`, `reclaim`: pass False) it is `EffectUnavailable`, and the
+    same order id is asked again later."""
+    from . import order_dispatch
+
+    _, netbird_ip = _miner_identity(miner_id)
+    try:
+        result = order_dispatch.dispatch_order(
+            miner_id=miner_id,
+            netbird_ip=netbird_ip,
+            order_id=order_id,
+            kind="restore",
+            payload_json=json.dumps(payload).encode("utf-8"),
+        )
+    except order_dispatch.OrderDispatchUnavailable as exc:
+        raise EffectUnavailable(f"restore: {exc}") from exc
+    except order_dispatch.OrderDispatchError as exc:
+        raise EffectError(f"restore: {exc}") from exc
+    if result.ok:
+        return
+    if result.status == 409 and result.classifier == "order-in-flight":
+        if in_flight_ok:
+            return
+        raise EffectUnavailable("restore: the miner is still running this order")
+    if result.status >= 500 and result.status != 507:
+        raise EffectUnavailable(f"restore: miner answered HTTP {result.status}")
+    raise RestoreRejected(result.classifier, result.status)
+
+
+def poll_restore_status(*, vm_id: str, miner_id: str) -> dict[str, Any] | None:
+    """Read the miner's restore status for `vm_id` through the Edge relay
+    (`GET /v1/relay/{vm_id}/restore` → the miner's
+    `/v1/miner/restore/{vm_id}/status`). `None` on 404 (the miner knows
+    nothing about a restore of the VM). The shape is checked by the caller
+    (`apps.orchestration.restore.parse_restore_status`)."""
+    _, netbird_ip = _miner_identity(miner_id)
+    base = _required_setting("VALI_EDGE_GATEWAY_URL").rstrip("/")
+    url = f"{base}/v1/relay/{vm_id}/restore"
+    status, body = _http(
+        "GET",
+        url,
+        label="edge-relay:restore",
+        headers={_TARGET_ADDR_HEADER: f"{netbird_ip}:{_MINER_ORDERS_PORT}"},
+        timeout=float(getattr(settings, "VALI_BACKUP_POLL_TIMEOUT_S", 32.0)),
+    )
+    if status == 404:
+        return None
+    if status >= 500:
+        raise EffectUnavailable(f"edge-relay:restore: poll returned HTTP {status}")
+    if status != 200:
+        raise EffectError(f"edge-relay:restore: poll returned HTTP {status}")
+    return _json(body, label="edge-relay:restore")
+
+
+# ─── Manual failover (`apps.orchestration.restore`) ──────────────────
+
+#: The Edge's answers when it could not reach the miner at all.
+_EDGE_NO_SESSION_STATUSES = frozenset({502, 504})
+
+
+def probe_edge_session(vm: Vm, node_id: str) -> str:
+    """Whether the Edge can reach `node_id` right now, asked through the
+    same relay every per-VM poll uses: `"unreachable"` when the Edge
+    answers that it could not reach the miner (502 / 504), `"reachable"`
+    for any answer the miner itself gave (a 404 or a 503 is a live miner),
+    `"unknown"` when vali cannot tell (no identity, the Edge itself
+    unreachable). Never raises."""
+    try:
+        _miner_id, netbird_ip = _miner_identity(node_id)
+        status, _ = _edge_get_addr(
+            vm, "domain-state", f"{netbird_ip}:{_MINER_ORDERS_PORT}"
+        )
+    except EffectError:  # `EffectUnavailable` is a subclass.
+        return "unknown"
+    return "unreachable" if status in _EDGE_NO_SESSION_STATUSES else "reachable"
+
+
+def dispatch_force_stop_on(vm: Vm, *, node_id: str, order_id: str) -> None:
+    """Force-stop the VM's domain on `node_id` — a miner vali names from its
+    own records (a failover's dead SOURCE), never `vm.host`. Used when that
+    miner reappears still running a domain for a VM that now runs
+    elsewhere: the KBS already fences that instance from any key release,
+    this takes it off the host. Disks are untouched (the reclaim is gated
+    separately). Raises `EffectError` / `EffectUnavailable`."""
+    from . import order_dispatch
+
+    node_id = str(node_id or "").strip()
+    if not node_id or node_id == str(vm.host or ""):
+        raise EffectError(
+            f"failover-stop: {node_id!r} is the vm's current host (or empty) — refusing"
+        )
+    miner_id, netbird_ip = _miner_identity(node_id)
+    payload = order_dispatch.build_stop_payload(vm_id=vm.vm_id, graceful=False)
+    try:
+        result = order_dispatch.dispatch_order_settled(
+            miner_id=miner_id,
+            netbird_ip=netbird_ip,
+            order_id=order_id,
+            kind="stop",
+            payload_json=json.dumps(payload).encode("utf-8"),
+            attempts=2,
+            deadline_s=DESTROY_DEADLINE_S,
+        )
+    except order_dispatch.OrderDispatchUnavailable as exc:
+        raise EffectUnavailable(f"failover-stop: {exc}") from exc
+    except order_dispatch.OrderDispatchError as exc:
+        raise EffectError(f"failover-stop: {exc}") from exc
+    if not result.ok:
+        raise EffectError(
+            f"failover-stop: miner refused (status={result.status} class={result.classifier!r})"
+        )

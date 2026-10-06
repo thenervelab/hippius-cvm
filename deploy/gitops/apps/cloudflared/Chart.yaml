@@ -2,7 +2,7 @@ apiVersion: v2
 name: cloudflared
 description: >-
   Cloudflare Tunnel connector. Gives `api.hippius.network` a public
-  entry point WITHOUT opening an inbound port on cc-1 — the connector
+  entry point WITHOUT opening an inbound port on the control-plane host — the connector
   dials out, so the host keeps its default-deny inbound posture.
 type: application
 version: 0.1.0

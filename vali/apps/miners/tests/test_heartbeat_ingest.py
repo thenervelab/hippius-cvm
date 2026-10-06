@@ -39,7 +39,7 @@ pytestmark = pytest.mark.django_db
 
 INGEST_URL = reverse("telemetry_ingest")
 
-MINER_ID = "miner-1"
+MINER_ID = "miner-a"
 PEER_ID = f"hippius-miner:{MINER_ID}"
 DOMAIN = "HIPPIUS_MINER_HEARTBEAT_V1"
 
@@ -66,6 +66,9 @@ class FakeHeartbeatVerifier:
         self.schema_version = 1
         self.graceful_exit_requested = False
         self.memory_available_mib: int | None = None
+        self.declared_capacity: verifier.DeclaredCapacity | None = None
+        self.declared_disk: verifier.DeclaredDisk | None = None
+        self.declared_host_health: verifier.DeclaredHostHealth | None = None
         self.fail_category = "signature_invalid"
         self.calls: list[tuple[bytes, bytes]] = []
 
@@ -91,6 +94,9 @@ class FakeHeartbeatVerifier:
             sequence=self.sequence,
             memory_available_mib=self.memory_available_mib,
             graceful_exit_requested=self.graceful_exit_requested,
+            declared_capacity=self.declared_capacity,
+            declared_disk=self.declared_disk,
+            declared_host_health=self.declared_host_health,
         )
 
 
@@ -686,3 +692,439 @@ def test_heartbeat_without_bridge_does_not_write_mirror(
     assert not MinerCapacity.objects.filter(
         reported_memory_available_mib__isnull=False
     ).exists()
+
+
+# ─── v3 capacity declarations → scheduler mirror (capacity v2 §4.2) ───
+
+_DECLARED_COLUMNS = (
+    "declared_cpu_budget",
+    "declared_memory_mb_budget",
+    "declared_asid_capacity",
+    "declared_asid_used",
+)
+
+
+def _declared(mc) -> tuple:
+    return tuple(getattr(mc, c) for c in _DECLARED_COLUMNS)
+
+
+def test_v3_heartbeat_records_the_capacity_declaration(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "ab" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 3
+    fake_heartbeat_verifier.memory_available_mib = 94_000
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(
+        cvm_cpu_budget=44, cvm_memory_mb_budget=120_000, asid_capacity=99, asid_used=2
+    )
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _declared(mc) == (44, 120_000, 99, 2)
+    assert mc.declared_at is not None
+    assert mc.declared_at == mc.reported_at
+    assert mc.reported_memory_available_mib == 94_000
+
+
+def test_v3_unknown_zero_values_are_stored_as_null(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    """`0` on the wire = the miner could not read it ⇒ NULL (no clamp),
+    never a literal 0 that would read as a zero budget."""
+    from apps.scheduler.models import MinerCapacity
+
+    node = "ac" * 32
+    _make_bridged_miner(node)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        declared_cpu_budget=10,
+        declared_memory_mb_budget=10,
+        declared_asid_capacity=10,
+        declared_asid_used=10,
+    )
+    fake_heartbeat_verifier.schema_version = 3
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(
+        cvm_cpu_budget=0, cvm_memory_mb_budget=64_000, asid_capacity=0, asid_used=0
+    )
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _declared(mc) == (None, 64_000, None, None)
+    assert mc.declared_at is not None
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_pre_v3_heartbeat_leaves_the_declaration_untouched(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, schema_version: int
+) -> None:
+    """A `v1`/`v2` heartbeat carries no declaration: the stored one (and
+    its `declared_at`) is left exactly as it was — neither refreshed nor
+    NULLed — so it ages out through the staleness window on its own."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "ad" * 32
+    _make_bridged_miner(node)
+    stamped = timezone.now() - timedelta(minutes=3)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        declared_cpu_budget=44,
+        declared_memory_mb_budget=120_000,
+        declared_asid_capacity=99,
+        declared_asid_used=2,
+        declared_at=stamped,
+    )
+    fake_heartbeat_verifier.schema_version = schema_version
+    fake_heartbeat_verifier.memory_available_mib = 90_000
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _declared(mc) == (44, 120_000, 99, 2)
+    assert mc.declared_at == stamped
+    # The RAM report on the same heartbeat still landed.
+    assert mc.reported_memory_available_mib == 90_000
+
+
+def test_v3_declaration_write_is_a_targeted_update(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    """The declaration lands through a filtered UPDATE that sets ONLY the
+    `declared_*` columns — never a full-row save that could roll back a
+    concurrent chain refresh / policy write on the same row."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "ae" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 3
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(
+        cvm_cpu_budget=44, cvm_memory_mb_budget=120_000, asid_capacity=99, asid_used=2
+    )
+
+    with CaptureQueriesContext(connection) as ctx:
+        assert _post_heartbeat().status_code == 202
+    table = MinerCapacity._meta.db_table
+    declared_updates = [
+        q["sql"]
+        for q in ctx.captured_queries
+        if q["sql"].startswith(f'UPDATE "{table}"') and "declared_at" in q["sql"]
+    ]
+    assert len(declared_updates) == 1, declared_updates
+    set_clause = declared_updates[0].split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+    columns = sorted(part.split(" = ")[0].strip('"') for part in set_clause.split(", "))
+    assert columns == sorted([*_DECLARED_COLUMNS, "declared_at"])
+
+
+def test_v3_heartbeat_without_bridge_writes_no_declaration(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    _make_miner()  # no chain_node_id
+    fake_heartbeat_verifier.schema_version = 3
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 2)
+
+    assert _post_heartbeat().status_code == 202
+    assert not MinerCapacity.objects.filter(declared_at__isnull=False).exists()
+
+
+def test_v3_declaration_reaches_the_scheduler_budget_as_a_clamp(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    """The ingested declaration is what `budget_inputs` reads (fresh-only)."""
+    from apps.scheduler.models import MinerCapacity
+    from apps.scheduler.service import _Committed, budget_inputs
+
+    node = "af" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 3
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 2)
+
+    assert _post_heartbeat().status_code == 202
+    inp = budget_inputs(MinerCapacity.objects.get(miner_node_id=node), _Committed(0, 0, 0))
+    assert inp.declared_cpu_budget == 44
+    assert inp.declared_memory_mb_budget == 120_000
+    assert inp.declared_asid_capacity == 99
+
+
+# ─── v4 DATA-disk figures → scheduler mirror (storage-aware placement) ───
+
+_DISK_COLUMNS = (
+    "declared_disk_gb_budget",
+    "reported_data_disk_total_gb",
+    "reported_data_disk_available_gb",
+    "reported_staging_disk_available_gb",
+)
+
+
+def _disk(mc) -> tuple:
+    return tuple(getattr(mc, c) for c in _DISK_COLUMNS)
+
+
+def test_v4_heartbeat_records_the_disk_figures(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "b1" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 4
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 2)
+    fake_heartbeat_verifier.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _disk(mc) == (3000, 3500, 3200, 400)
+    assert mc.disk_reported_at is not None
+    assert mc.declared_cpu_budget == 44  # the v3 half of a v4 body still lands
+
+
+def test_v4_unknown_zero_disk_values_are_stored_as_null(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "b2" * 32
+    _make_bridged_miner(node)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        declared_disk_gb_budget=1, reported_data_disk_total_gb=1
+    )
+    fake_heartbeat_verifier.schema_version = 4
+    fake_heartbeat_verifier.declared_disk = verifier.DeclaredDisk(0, 0, 3200, 2**32 - 1)
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    # 0 = unknown; a u32 above the column's range is not a real host either.
+    assert _disk(mc) == (None, None, 3200, None)
+
+
+def test_v4_zero_available_next_to_a_total_is_a_full_disk_not_unknown(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    """statvfs rounds down: a full data fs reports available 0. Next to a
+    known total that 0 is kept — it is the figure that stops placements."""
+    from apps.scheduler.models import MinerCapacity
+
+    node = "b5" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 4
+    fake_heartbeat_verifier.declared_disk = verifier.DeclaredDisk(3000, 3500, 0, 0)
+
+    assert _post_heartbeat().status_code == 202
+    assert _disk(MinerCapacity.objects.get(miner_node_id=node)) == (3000, 3500, 0, None)
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_pre_v4_heartbeat_leaves_the_disk_figures_unknown_or_untouched(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, schema_version: int
+) -> None:
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    fresh = "b3" * 32
+    _make_bridged_miner(fresh)
+    fake_heartbeat_verifier.schema_version = schema_version
+    if schema_version == 3:
+        fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(44, 1, 99, 2)
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=fresh)
+    assert _disk(mc) == (None, None, None, None)
+    assert mc.disk_reported_at is None
+
+    # A stored v4 report is left exactly as it was (it ages out on its own).
+    stamped = timezone.now() - timedelta(minutes=3)
+    MinerCapacity.objects.filter(miner_node_id=fresh).update(
+        declared_disk_gb_budget=3000, disk_reported_at=stamped
+    )
+    fake_heartbeat_verifier.sequence += 1
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=fresh)
+    assert mc.declared_disk_gb_budget == 3000 and mc.disk_reported_at == stamped
+
+
+def test_v4_disk_figures_reach_the_scheduler_disk_budget(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler import service
+
+    node = "b4" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 4
+    fake_heartbeat_verifier.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+
+    assert _post_heartbeat().status_code == 202
+    d = service.disk_budgets_by_node()[node]
+    assert (d.known, d.budget_gb, d.binding) == (True, 3000, "disk:declared")
+
+
+# ─── v5 SEV-SNP host health → scheduler mirror (observability) ───────────
+
+_HOST_HEALTH_COLUMNS = (
+    "reported_snp_enabled",
+    "reported_cpus_offline",
+    "reported_snp_launches_since_boot",
+    "reported_df_flush_failures",
+)
+
+
+def _host_health(mc) -> tuple:
+    return tuple(getattr(mc, c) for c in _HOST_HEALTH_COLUMNS)
+
+
+def test_v5_heartbeat_records_the_host_health_report(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c1" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 5
+    fake_heartbeat_verifier.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 4)
+    fake_heartbeat_verifier.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+    fake_heartbeat_verifier.declared_host_health = verifier.DeclaredHostHealth(
+        snp_enabled=True, cpus_offline=24, snp_launches_since_boot=97, df_flush_failures=3
+    )
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _host_health(mc) == (True, 24, 97, 3)
+    assert mc.host_health_reported_at is not None
+    # The v3 and v4 halves of a v5 body still land.
+    assert mc.declared_asid_used == 4
+    assert mc.reported_data_disk_total_gb == 3500
+
+
+def test_v5_zero_is_a_real_reading_and_an_out_of_range_count_is_null(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c2" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 5
+    fake_heartbeat_verifier.declared_host_health = verifier.DeclaredHostHealth(
+        snp_enabled=False, cpus_offline=0, snp_launches_since_boot=2**32 - 1, df_flush_failures=0
+    )
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _host_health(mc) == (False, 0, None, 0)
+
+
+@pytest.mark.parametrize("schema_version", [1, 3, 4])
+def test_pre_v5_heartbeat_leaves_the_host_health_report_untouched(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, schema_version: int
+) -> None:
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c3" * 32
+    _make_bridged_miner(node)
+    stamped = timezone.now() - timedelta(minutes=3)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        reported_snp_enabled=True,
+        reported_cpus_offline=24,
+        reported_snp_launches_since_boot=50,
+        reported_df_flush_failures=0,
+        host_health_reported_at=stamped,
+    )
+    fake_heartbeat_verifier.schema_version = schema_version
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _host_health(mc) == (True, 24, 50, 0)
+    assert mc.host_health_reported_at == stamped
+
+
+def test_the_reeval_survey_pushes_the_stored_host_health_report(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from django.test import override_settings
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.synthetic import metrics
+
+    node = "c4" * 32
+    _make_bridged_miner(node)
+    fake_heartbeat_verifier.schema_version = 5
+    fake_heartbeat_verifier.declared_host_health = verifier.DeclaredHostHealth(
+        snp_enabled=True, cpus_offline=24, snp_launches_since_boot=97, df_flush_failures=3
+    )
+    assert _post_heartbeat().status_code == 202
+
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        metrics, "push", lambda ms, **k: pushed.append((k["job"], ms.render())) or True
+    )
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    assert [job for job, _ in pushed] == ["vali-host-health"]
+    body = pushed[0][1]
+    labels = f'{{miner_id="{MINER_ID}",node_id="{node}"}}'
+    assert f"hippius_miner_snp_enabled{labels} 1" in body
+    assert f"hippius_miner_cpus_offline{labels} 24" in body
+    assert f"hippius_miner_snp_launches_since_boot{labels} 97" in body
+    assert f"hippius_miner_df_flush_failures{labels} 3" in body
+    assert f"hippius_miner_host_health_reported_timestamp_seconds{labels} " in body
+    assert f"hippius_miner_host_health_reporting{labels} 1" in body
+
+
+def test_the_reeval_survey_marks_an_active_miner_without_a_v5_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from django.test import override_settings
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.synthetic import metrics
+
+    node = "c5" * 32
+    _make_bridged_miner(node)
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    assert len(pushed) == 1
+    labels = f'{{miner_id="{MINER_ID}",node_id="{node}"}}'
+    assert f"hippius_miner_host_health_reporting{labels} 0" in pushed[0]
+    assert "hippius_miner_cpus_offline" not in pushed[0]
+
+
+def test_the_reeval_survey_drops_a_miner_that_left_the_active_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quarantined / retired miner's last report must not keep alerting."""
+    from django.test import override_settings
+    from django.utils import timezone
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.scheduler.models import MinerCapacity
+    from apps.synthetic import metrics
+
+    node = "c6" * 32
+    miner = _make_bridged_miner(node)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        reported_snp_enabled=True,
+        reported_cpus_offline=24,
+        reported_df_flush_failures=3,
+        host_health_reported_at=timezone.now(),
+    )
+    miner.status = MinerStatus.QUARANTINED.value
+    miner.save(update_fields=["status"])
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    # The group is still replaced (empty), so the old series go away.
+    assert len(pushed) == 1
+    assert node not in pushed[0]

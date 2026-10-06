@@ -8,7 +8,7 @@
 //! revoke any individual cert without re-issuing the whole fleet.
 //! That's what the CRL is for.
 //!
-//! Codex review of PR-H4 v1 pre-empted the soft failure: if the
+//! Review of PR-H4 v1 pre-empted the soft failure: if the
 //! CRL file is missing, malformed, or simply hasn't been refreshed
 //! recently, a naïve loader might "ignore CRL on error and let all
 //! certs through" — which is exactly the wrong direction. This
@@ -101,7 +101,7 @@ impl CrlStore {
     /// healthy store. On failure returns `Err` — caller decides
     /// whether to start in unhealthy state or refuse to boot.
     /// Production main starts unhealthy if the initial load fails
-    /// (matches the gemini review note: "boot success without a
+    /// (matches the review note: "boot success without a
     /// usable CRL is a soft failure we shouldn't pretend isn't one").
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, CrlError> {
         let path = path.into();
@@ -175,7 +175,7 @@ impl CrlStore {
 /// Spawn the background CRL poller. Loops forever, ticking every
 /// [`POLL_INTERVAL`]. Each tick calls [`super::MtlsRuntime::refresh`],
 /// which re-reads the CRL file AND rebuilds the live `ServerConfig`
-/// with the fresh CRL snapshot — closes the Blocker codex flagged
+/// with the fresh CRL snapshot — closes the Blocker review flagged
 /// in PR-H4 v1 review where the boot-time verifier never picked up
 /// new revocations.
 ///

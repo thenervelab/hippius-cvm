@@ -1,0 +1,31 @@
+{
+  "bake_id": "cd0ea31604f84da9aabe8a7d0d4aaf43",
+  "disk_mode": "golden_verity_overlay",
+  "kernel_sha256": "036a5d07decf25290fececc997ad8858f5fd9a9440700678d500df1d6a3850b4",
+  "initrd_sha256": "17b40c1860ff6e55c58b8adb72ee4f605da83cc14cd084daf84e24411770cf0c",
+  "rootfs_img_sha256": "ee9b5339dc4884a41e8199512cdd6205630e221f1e4c0ff6f91136dc5506984f",
+  "rootfs_verity_sha256": "3cd3ea577d506c913ed42a399144c4bbff6189edccb3cd476ca981a457660b45",
+  "verity_root_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "initrd_rebuild": {
+    "source_bake_id": "cd0ea31604f84da9aabe8a7d0d4aaf43",
+    "source_location": "s3://hippius-compute-images/tenant/golden-ubuntu-x/",
+    "source_initrd_sha256": "4296ed623e94daffa8c9a43f47fcca96f9ea8dd4f7c3dd7b1eba593431ad4d7f",
+    "source_measurement_sha256": "0bd43a8fd7ec67e494172fdafe9385874d3b4396fe3755c3a2b8fd63b9f02b0b",
+    "repo_commit": "03d1bb82911fce303cae2d7b0e046abe575325cd",
+    "family": "initramfs-tools",
+    "method": "append-guest-release",
+    "tool": "scripts/guest/guest-initrd-build.sh",
+    "tool_sha256": "51fd62310cd4ad73df033ccb022e0d7ce5550d994dc9752153a469ee024b1f6d"
+  },
+  "guest_release": {
+    "version": 1,
+    "security_epoch": 1,
+    "commit": "03d1bb82911fce303cae2d7b0e046abe575325cd",
+    "squashfs_sha256": "2ac149beecec05e28d3920f64c64ab95b22129266e38df8b113843cab0ab56f8",
+    "release_cpio_sha256": "7f2b3e4ef86faa287165479100f3db0cc4d532c4e8a294e889e5cc1e153da51d",
+    "family": "initramfs-tools",
+    "pad_bytes": 1
+  },
+  "s3_bucket": "hippius-compute-images",
+  "s3_key_prefix": "tenant/golden-ubuntu-x-gr1-abcdef"
+}

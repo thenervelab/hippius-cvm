@@ -2037,9 +2037,15 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "clap",
+ "coset",
+ "ed25519-dalek",
  "hippius-agent-initramfs",
  "hippius-guest",
  "hippius-types",
+ "kbs-core",
+ "libc",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -2169,10 +2175,12 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "ciborium",
  "clap",
  "coset",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "hippius-image-provenance",
  "hippius-miner-uki-fetch",
@@ -2238,6 +2246,7 @@ dependencies = [
  "hippius-types",
  "kbs-core",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "tempfile",
  "uuid",
 ]
@@ -2269,14 +2278,18 @@ dependencies = [
 name = "hippius-types"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "ciborium",
  "ed25519-dalek",
  "hex",
+ "hkdf",
  "serde",
  "serde_bytes",
+ "serde_json",
  "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -2726,6 +2739,7 @@ dependencies = [
 name = "kbs-core"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "ciborium",
  "coset",
  "ed25519-dalek",
@@ -2752,6 +2766,7 @@ name = "kbs-transport"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "ciborium",
  "coset",

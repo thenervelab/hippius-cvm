@@ -477,6 +477,20 @@ def get_kv_field(mount: str, secret_path: str, field: str, *, version: int | Non
     return val
 
 
+def kv_exists(mount: str, secret_path: str) -> bool:
+    """Whether ANY KV v2 metadata exists at `<mount>/metadata/<path>` —
+    i.e. a secret (current, deleted or destroyed version history) was ever
+    written there. Reads metadata only, never the value. 404 ⇒ `False`;
+    any other non-2xx fails loudly (`EffectError`)."""
+    label = f"vault-kv-metadata:{mount}"
+    status, _raw = _round_trip("GET", f"/v1/{mount}/metadata/{secret_path}", label=label)
+    if status == 404:
+        return False
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: vault returned HTTP {status}")
+    return True
+
+
 def latest_version(mount: str, secret_path: str) -> int:
     """Read the metadata of the KV v2 secret at `<mount>/metadata/<path>`
     and return the current latest integer version. Useful when a caller
@@ -522,6 +536,62 @@ def transit_key_name(vm_id: str) -> str:
     """The PER-VM Transit key name — must match the KBS (`kek-<vm_id>`,
     `kbs-core::release`) and the broker cap grant."""
     return f"kek-{vm_id}"
+
+
+def userdata_transit_key_name(vm_id: str) -> str:
+    """The per-VM Transit key for vali's OWN working copy of the
+    cloud-init userdata (`ud-<vm_id>`) — deliberately NOT `kek-<vm_id>`.
+
+    Two keys because the two copies answer to different readers:
+
+    - `{vm}/userdata` — what the ticket binds and the KBS releases. Wrapped
+      under `kek-<vm_id>`, which vali may encrypt with and never decrypt.
+      Only the attested SNP KBS opens it.
+    - `{vm}/userdata-pending` — vali's working copy. Wrapped under this
+      key, which vali MAY decrypt, because three vali paths still need the
+      cloud-init PLAINTEXT after intake: the NetBird setup-key
+      substitution at launch, and the §6 digest re-derivation on a §25
+      migration or a KBS-state recovery (the digest is over the plaintext
+      and binds a FRESH ticket_id each time, so it cannot be precomputed).
+
+    What this buys, precisely: the userdata is CIPHERTEXT at rest in both
+    copies — a Vault storage / etcd-snapshot / backup compromise, or a
+    token with KV read but no Transit grant, yields nothing — and §24
+    destroys both keys, so decommission is a real crypto-erase. What it
+    does NOT buy: protection against an RCE holding vali's own Vault
+    credentials, which can call `transit/decrypt/ud-<vm_id>`. Closing that
+    requires removing the ticket_id from the §6 digest preimage, which the
+    GUEST also computes (`hippius_guest::release`) — i.e. a fleet-wide
+    image re-bake. Tracked as the follow-up; deliberately not smuggled in
+    here.
+    """
+    return f"ud-{vm_id}"
+
+
+def transit_decrypt(name: str, ciphertext: bytes) -> bytes:
+    """Unwrap `ciphertext` with the Transit key `name`.
+
+    Granted ONLY for `ud-*` (vali's userdata working copy) — the policy
+    denies `transit/decrypt/kek-*`, so this can never recover a tenant
+    disk KEK or the canonical userdata the KBS releases. §20: the
+    plaintext is returned to the caller and never logged.
+    """
+    label = "vault-transit-decrypt"
+    body = {"ciphertext": ciphertext.decode("ascii", errors="strict")}
+    status, raw = _round_trip("POST", f"/v1/transit/decrypt/{name}", label=label, json_body=body)
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: vault returned HTTP {status}")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError(f"{label}: non-JSON response") from exc
+    b64 = ((parsed or {}).get("data") or {}).get("plaintext") if isinstance(parsed, dict) else None
+    if not isinstance(b64, str):
+        raise EffectError(f"{label}: response missing data.plaintext")
+    try:
+        return base64.b64decode(b64, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise EffectError(f"{label}: data.plaintext is not valid base64") from exc
 
 
 def ensure_transit_key(name: str) -> None:

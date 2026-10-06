@@ -23,8 +23,10 @@
 use crate::error::{GuestError, Result};
 use ed25519_dalek::VerifyingKey;
 use hippius_types::digest::userdata_digest;
+use hippius_types::guardian::KeyMode;
 use hippius_types::release::{
     KbsResponse, ReleaseContext, SignedResponse, WrappedSecret, HPKE_SUITE_ID, RELEASE_DOMAIN,
+    RELEASE_DOMAIN_V2,
 };
 use kbs_core::crypto::{hpke_unwrap, verify_response};
 use subtle::ConstantTimeEq;
@@ -70,7 +72,12 @@ pub struct ExpectedRelease<'a> {
 /// the plaintext. LUKS unlock should `take`/consume the bytes; user-
 /// data should be written to a tmpfs NoCloud seed and then dropped.
 pub struct UnwrappedSecrets {
-    pub luks: Zeroizing<Vec<u8>>,
+    /// The KBS-released LUKS KEK — the whole keyslot key in `hippius`
+    /// (M0) mode and `share_H` in `split` (M1). `None` ONLY for a
+    /// `customer` (M2) release, which carries no KEK at all;
+    /// [`verify_and_unwrap_release`] (the M0 entry point) never returns
+    /// `None`.
+    pub luks: Option<Zeroizing<Vec<u8>>>,
     pub userdata: Zeroizing<Vec<u8>>,
     /// §7 per-VM guest lifecycle SIGNING key (Ed25519 seed), `None` when
     /// the KBS response carried no `lifecycle_key` (pre-§7 VM). The
@@ -79,7 +86,7 @@ pub struct UnwrappedSecrets {
     /// signer loads it to sign the §24/§25 StoppedAck. `Zeroizing` —
     /// the seed wipes on drop, exactly like `luks`/`userdata`.
     pub lifecycle_key: Option<Zeroizing<Vec<u8>>>,
-    /// Phase 2A of audit follow-up Codex #2 — the KBS-committed
+    /// Phase 2A of audit follow-up Review #2 — the KBS-committed
     /// boot counter for THIS release. The guest persists this
     /// post-unlock so the NEXT boot can submit `prev + 1` and the
     /// KBS detects a rolled-back disk. `0` when the request
@@ -104,6 +111,28 @@ pub struct UnwrappedSecrets {
     /// VM's expectation ahead of an unstamped volume (a permanent
     /// remote brick — see `kbs-core::volume_stamp` module docs).
     pub volume_stamp_token: Option<Zeroizing<[u8; 32]>>,
+    /// Stamp protocol v2 only: `(expected_timeline, target_timeline)` from
+    /// the KBS-signed `volume_stamp_transition`. `None` for a release the
+    /// guest attested as v1 (the only kind a pre-v2 KBS answers). The
+    /// caller accepts its volume only on `expected_timeline` and stamps
+    /// `target_timeline` (see the golden overlay's v2 gate).
+    pub volume_stamp_transition: Option<([u8; 32], [u8; 32])>,
+}
+
+/// The stamp protocol the guest ATTESTED in the SNP report of the release
+/// it is verifying (it chose the `REPORT_DATA` layout itself). It decides
+/// the ONLY response shape the guest accepts — the KBS derives its answer
+/// from that same attested value, so any other shape is a KBS (or a
+/// forgery) that is not answering this report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestedStampProtocol {
+    /// `REPORT_DATA = nonce ‖ pub` (`hippius_types::report_data::tenant`):
+    /// the response MUST be `HIPPIUS_KBS_RELEASE_V1` with no transition.
+    V1,
+    /// `REPORT_DATA = SHA-256(v2 domain ‖ nonce) ‖ pub`
+    /// (`hippius_types::report_data::tenant_stamp_v2`): the response MUST
+    /// be `HIPPIUS_KBS_RELEASE_V2` with a well-formed transition.
+    V2,
 }
 
 // `Debug` that NEVER touches plaintext — only field lengths. Useful for
@@ -113,7 +142,7 @@ pub struct UnwrappedSecrets {
 impl core::fmt::Debug for UnwrappedSecrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UnwrappedSecrets")
-            .field("luks_len", &self.luks.len())
+            .field("luks_len", &self.luks.as_ref().map(|k| k.len()))
             .field("userdata_len", &self.userdata.len())
             .field(
                 "lifecycle_key_len",
@@ -125,18 +154,73 @@ impl core::fmt::Debug for UnwrappedSecrets {
                 "volume_stamp_token_present",
                 &self.volume_stamp_token.is_some(),
             )
+            .field(
+                "volume_stamp_transition_present",
+                &self.volume_stamp_transition.is_some(),
+            )
             .finish()
     }
 }
 
 /// Verify a KBS `SignedResponse` and unwrap both secrets, enforcing
 /// every §6/§7/§19/§20 binding. See module-level doc for the exact
-/// order of checks.
+/// order of checks. The `hippius` (M0) key mode: the response MUST carry
+/// the LUKS KEK, and the returned [`UnwrappedSecrets::luks`] is always
+/// `Some`.
 pub fn verify_and_unwrap_release(
     signed: &SignedResponse,
     kbs_vk: &VerifyingKey,
     guest_x25519_sk: &[u8; 32],
     exp: &ExpectedRelease,
+) -> Result<UnwrappedSecrets> {
+    verify_and_unwrap_release_for_mode(signed, kbs_vk, guest_x25519_sk, exp, KeyMode::Hippius)
+}
+
+/// [`verify_and_unwrap_release`] for a VM whose disk key mode is `mode`
+/// (customer-held keys). Every binding is identical in every mode; only
+/// the KEK's presence differs:
+///
+/// - `hippius` (M0) and `split` (M1): the response MUST carry `luks` —
+///   in M1 it is `share_H`, the Hippius half of the keyslot key;
+/// - `customer` (M2): the response MUST NOT carry `luks`. The KBS
+///   releases no KEK in M2, so a `luks` secret here is a KBS (or a
+///   ticket) that does not know this VM's mode — refused rather than
+///   silently dropped, since the guest's KEK must then come from the
+///   guardian's share alone.
+pub fn verify_and_unwrap_release_for_mode(
+    signed: &SignedResponse,
+    kbs_vk: &VerifyingKey,
+    guest_x25519_sk: &[u8; 32],
+    exp: &ExpectedRelease,
+    mode: KeyMode,
+) -> Result<UnwrappedSecrets> {
+    verify_and_unwrap_release_attested(
+        signed,
+        kbs_vk,
+        guest_x25519_sk,
+        exp,
+        mode,
+        AttestedStampProtocol::V1,
+    )
+}
+
+/// [`verify_and_unwrap_release_for_mode`] for a release whose SNP report
+/// attested `attested` (stamp protocol v2). A v1 attestation is exactly
+/// the function above; a v2 one accepts ONLY a `HIPPIUS_KBS_RELEASE_V2`
+/// response carrying a well-formed `volume_stamp_transition`:
+///
+/// - both ids exactly 32 bytes;
+/// - a move to ANOTHER timeline — an authorized rollback, or the fresh
+///   timeline of an unconfirmed (`E = 0`) VM — only to a non-zero target,
+///   and at `E = 0` only FROM the zero timeline (gate 5c'); a
+///   rollback-style move at `E = 0` is refused.
+pub fn verify_and_unwrap_release_attested(
+    signed: &SignedResponse,
+    kbs_vk: &VerifyingKey,
+    guest_x25519_sk: &[u8; 32],
+    exp: &ExpectedRelease,
+    mode: KeyMode,
+    attested: AttestedStampProtocol,
 ) -> Result<UnwrappedSecrets> {
     // 1+2: signature + decode.
     let resp = verify_response(kbs_vk, signed)
@@ -144,8 +228,22 @@ pub fn verify_and_unwrap_release(
 
     // 3: every guest-known binding MUST match. We check each field
     // explicitly (instead of one big eq) so a regression test pins
-    // which field drifted.
-    bind_str("domain", RELEASE_DOMAIN, &resp.domain)?;
+    // which field drifted. The domain is the one the attested protocol
+    // selects — never "either".
+    let (want_domain, transition) = match attested {
+        AttestedStampProtocol::V1 => {
+            if resp.volume_stamp_transition.is_some() {
+                return Err(GuestError::Binding {
+                    field: "volume_stamp_transition",
+                    expected: "absent (stamp protocol v1)".into(),
+                    got: "a transition".into(),
+                });
+            }
+            (RELEASE_DOMAIN, None)
+        }
+        AttestedStampProtocol::V2 => (RELEASE_DOMAIN_V2, Some(check_transition(&resp)?)),
+    };
+    bind_str("domain", want_domain, &resp.domain)?;
     bind_u32("v", exp.schema_v, resp.v)?;
     bind_str("vm_id", exp.vm_id, &resp.vm_id)?;
     bind_str("ticket_id", exp.ticket_id, &resp.ticket_id)?;
@@ -167,13 +265,30 @@ pub fn verify_and_unwrap_release(
     // Wrapped-secret refs must match what the guest expects, and the
     // secret_type must be the corresponding type — `luks` is the LUKS
     // slot key, `userdata` is the cloud-init user-data ciphertext-blob.
-    expect_wrapped(
-        &resp.luks,
-        "luks",
-        exp.luks_path,
-        exp.luks_version,
-        "luks_vault_ref",
-    )?;
+    // Only a `customer`-mode (M2) release omits the KEK: in every other
+    // mode a KEK-less response is a binding failure, never a silently
+    // empty KEK, and in M2 a KEK-carrying one is.
+    let wrapped_luks = match (mode, resp.luks.as_ref()) {
+        (KeyMode::Customer, None) => None,
+        (KeyMode::Customer, Some(_)) => {
+            return Err(GuestError::Binding {
+                field: "luks_vault_ref",
+                expected: "absent (key_mode customer)".into(),
+                got: "a luks secret".into(),
+            })
+        }
+        (_, Some(w)) => Some(w),
+        (_, None) => {
+            return Err(GuestError::Binding {
+                field: "luks_vault_ref",
+                expected: "a luks secret".into(),
+                got: "absent".into(),
+            })
+        }
+    };
+    if let Some(w) = wrapped_luks {
+        expect_wrapped(w, "luks", exp.luks_path, exp.luks_version, "luks_vault_ref")?;
+    }
     expect_wrapped(
         &resp.userdata,
         "userdata",
@@ -191,8 +306,12 @@ pub fn verify_and_unwrap_release(
         exp.userdata_path,
         exp.userdata_version,
     );
-    let luks = hpke_unwrap(guest_x25519_sk, &resp.luks, &luks_ctx)
-        .map_err(|e| GuestError::Hpke(format!("luks: {e}")))?;
+    let luks = wrapped_luks
+        .map(|w| {
+            hpke_unwrap(guest_x25519_sk, w, &luks_ctx)
+                .map_err(|e| GuestError::Hpke(format!("luks: {e}")))
+        })
+        .transpose()?;
     let userdata = hpke_unwrap(guest_x25519_sk, &resp.userdata, &ud_ctx)
         .map_err(|e| GuestError::Hpke(format!("userdata: {e}")))?;
 
@@ -314,7 +433,58 @@ pub fn verify_and_unwrap_release(
         boot_counter: resp.boot_counter,
         expected_volume_stamp: resp.expected_volume_stamp,
         volume_stamp_token,
+        volume_stamp_transition: transition,
     })
+}
+
+/// The v2 response's `volume_stamp_transition`, checked (see
+/// [`verify_and_unwrap_release_attested`]).
+fn check_transition(resp: &KbsResponse) -> Result<([u8; 32], [u8; 32])> {
+    let t = resp
+        .volume_stamp_transition
+        .as_ref()
+        .ok_or_else(|| GuestError::Binding {
+            field: "volume_stamp_transition",
+            expected: "a transition (stamp protocol v2)".into(),
+            got: "absent".into(),
+        })?;
+    let (expected, target) = t.ids().ok_or_else(|| GuestError::Binding {
+        field: "volume_stamp_transition",
+        expected: "32-byte timeline ids".into(),
+        got: format!(
+            "{}/{} bytes",
+            t.expected_timeline_id.len(),
+            t.target_timeline_id.len()
+        ),
+    })?;
+    // A MOVE (expected != target) must land on a non-zero timeline (the
+    // zero timeline is the one every VM counts from after a KBS store
+    // wipe — never a target). At `E = 0` the ONLY legitimate move is the
+    // zero → fresh one of gate 5c': a v2 release of an unconfirmed VM
+    // (fresh, or a wiped KBS row) moves it to a fresh timeline so every
+    // older disk is refusable afterwards; with `E = 0` the gate adopts
+    // whatever it finds anyway, so writing `(target, 1)` loses nothing. A
+    // rollback-style move at `E = 0` (from a NON-zero timeline) is never
+    // issued by the KBS — an authorized rollback restores a confirmed
+    // point, `E_T > 0` — and would let the E = 0 adopt land any disk on
+    // the new timeline: refused (defence in depth).
+    let zero = [0u8; 32];
+    let is_move = expected != target;
+    let move_from_nonzero_at_e0 = resp.expected_volume_stamp == 0 && expected != zero;
+    if is_move && (target == zero || move_from_nonzero_at_e0) {
+        return Err(GuestError::Binding {
+            field: "volume_stamp_transition",
+            expected: "a move to a non-zero timeline, and at E = 0 only from the zero timeline"
+                .into(),
+            got: format!(
+                "target_zero={} expected_zero={} expected_volume_stamp={}",
+                target == zero,
+                expected == zero,
+                resp.expected_volume_stamp
+            ),
+        });
+    }
+    Ok((expected, target))
 }
 
 fn release_ctx_for<'a>(

@@ -14,7 +14,9 @@
 //!   (untrusted) envelope.
 //! - stdout, one JSON object:
 //!   - accept → `{"ok":true,"body":{schema_version,domain,miner_id,
-//!     vm_id,milestone,timestamp_unix}}`
+//!     vm_id,milestone,timestamp_unix}}`, plus `reason` for (and only
+//!     for) an `awaiting-guardian` milestone — every other milestone's
+//!     output is byte-identical to before `reason` existed
 //!   - reject → `{"ok":false,"error_class":"<class>"}` (no body echoed).
 //! - exit: `0` on any validation outcome; `2` on a malformed `--vk-hex`
 //!   (stderr line, no JSON); `1` on a stdin/stdout IO failure.
@@ -22,7 +24,20 @@
 //! Gate order (fail-closed, identical to `verify-graceful-exit`): size
 //! cap → envelope canonical-CBOR → envelope decode → strict-shape
 //! re-encode → Ed25519 `verify_strict` over `body` → body canonical-CBOR
-//! → body decode → schema/domain/miner_id/vm_id/milestone.
+//! → body decode → schema/domain/miner_id/vm_id/milestone(+reason).
+//!
+//! ## Body shape
+//!
+//! Six fields, exactly as before, for `booting` / `kek-released` /
+//! `running`. A SEVENTH field, `reason`, is accepted only alongside
+//! `awaiting-guardian` (customer-held keys, design §6) and only with a
+//! value from the closed [`GuardianWaitReason`] vocabulary — the pair is
+//! checked by `VmProgressMilestone::from_wire_parts`, the same parser the
+//! miner-agent's encoder is validated against. Any other seventh key, a
+//! reason on another milestone, or an `awaiting-guardian` without one is
+//! refused.
+//!
+//! [`GuardianWaitReason`]: hippius_types::vm_progress::GuardianWaitReason
 
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
@@ -41,13 +56,15 @@ const EXIT_INTERNAL: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 
 /// Hard cap on the envelope read from stdin — a vm-progress report is
-/// tiny (six small fields + a 64-byte signature). Rejected BEFORE any
+/// tiny (six or seven small fields + a 64-byte signature). Rejected BEFORE any
 /// decode. Matches the `_MAX_VM_PROGRESS_BYTES` cap the Django consumer
 /// enforces.
 const MAX_REQUEST_BYTES: u64 = 4096;
 
-/// A canonical `VmProgressReport` body is exactly this many fields.
+/// A canonical `VmProgressReport` body is exactly this many fields…
 const FIELD_COUNT: usize = 6;
+/// …plus `reason`, for an `awaiting-guardian` milestone only.
+const REASON_FIELD: &str = "reason";
 
 /// Closed `error_class` vocabulary — `&'static str` only, so no envelope
 /// byte is ever interpolated into the output. Keep in sync with the
@@ -84,6 +101,11 @@ struct VmProgressBody {
     vm_id: String,
     milestone: String,
     timestamp_unix: i64,
+    /// The closed-vocabulary guardian wait reason — present iff
+    /// `milestone == "awaiting-guardian"`. Skipped when absent, so a
+    /// six-field milestone's JSON is exactly what it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// `verify-vm-progress` entry point.
@@ -172,7 +194,10 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<VmProgressBody, &'static str>
     if body.vm_id.is_empty() || body.vm_id.len() > MAX_VM_ID_LEN {
         return Err(error_class::VM_ID_INVALID);
     }
-    if VmProgressMilestone::from_wire(&body.milestone).is_none() {
+    // The (milestone, reason) PAIR: a reason is required for
+    // `awaiting-guardian`, must be in the closed vocabulary, and is
+    // forbidden for every other milestone.
+    if VmProgressMilestone::from_wire_parts(&body.milestone, body.reason.as_deref()).is_none() {
         return Err(error_class::MILESTONE_INVALID);
     }
     Ok(body)
@@ -191,15 +216,23 @@ fn parse_vk(vk_hex: &str) -> Result<VerifyingKey, String> {
 }
 
 /// Decode the signed `body` into a [`VmProgressBody`] — a canonical CBOR
-/// map of exactly [`FIELD_COUNT`] fields; any extra/missing key is
-/// rejected.
+/// map of exactly [`FIELD_COUNT`] fields, or [`FIELD_COUNT`] + 1 when the
+/// extra one is [`REASON_FIELD`]; any other extra/missing key is
+/// rejected. Whether the reason fits the milestone is checked by
+/// [`verify`], after the decode.
 fn decode_body(body: &[u8]) -> Result<VmProgressBody, &'static str> {
     let value: Value =
         ciborium::de::from_reader(body).map_err(|_| error_class::BODY_DECODE_FAILED)?;
     let Value::Map(entries) = value else {
         return Err(error_class::BODY_DECODE_FAILED);
     };
-    if entries.len() != FIELD_COUNT {
+    let reason = match field(&entries, REASON_FIELD) {
+        None => None,
+        Some(Value::Text(r)) => Some(r.clone()),
+        Some(_) => return Err(error_class::BODY_DECODE_FAILED),
+    };
+    let want = FIELD_COUNT + usize::from(reason.is_some());
+    if entries.len() != want {
         return Err(error_class::BODY_DECODE_FAILED);
     }
     Ok(VmProgressBody {
@@ -211,6 +244,7 @@ fn decode_body(body: &[u8]) -> Result<VmProgressBody, &'static str> {
         milestone: text_field(&entries, "milestone")?,
         timestamp_unix: i64::try_from(int_field(&entries, "timestamp_unix")?)
             .map_err(|_| error_class::BODY_DECODE_FAILED)?,
+        reason,
     })
 }
 
@@ -318,6 +352,234 @@ mod tests {
             let body = verify(&env, &sk.verifying_key()).unwrap();
             assert_eq!(body.milestone, wire);
         }
+    }
+
+    /// The JSON a six-field milestone produces is EXACTLY the pre-reason
+    /// one: no `reason` key, same six keys.
+    #[test]
+    fn six_field_milestones_emit_no_reason_key() {
+        let sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let env = signed_envelope(kat().canonical().unwrap(), &sk);
+        let body = verify(&env, &sk.verifying_key()).unwrap();
+        assert_eq!(body.reason, None);
+        let json = serde_json::to_value(&body).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "domain",
+                "milestone",
+                "miner_id",
+                "schema_version",
+                "timestamp_unix",
+                "vm_id"
+            ]
+        );
+    }
+
+    #[test]
+    fn awaiting_guardian_with_each_closed_reason_verifies() {
+        use hippius_types::guardian::GuardianDenyReason;
+        use hippius_types::vm_progress::GuardianWaitReason;
+
+        let sk = SigningKey::from_bytes(&[0x12u8; 32]);
+        let mut reasons = vec![
+            GuardianWaitReason::Unreachable,
+            GuardianWaitReason::Timeout,
+            GuardianWaitReason::BadResponse,
+        ];
+        reasons.extend(
+            GuardianDenyReason::ALL
+                .into_iter()
+                .map(GuardianWaitReason::Refused),
+        );
+        for r in reasons {
+            let report = VmProgressReport::new(
+                "m".into(),
+                "vm-1".into(),
+                VmProgressMilestone::AwaitingGuardian(r),
+                1_700_000_000,
+            );
+            let env = signed_envelope(report.canonical().unwrap(), &sk);
+            let body = verify(&env, &sk.verifying_key()).unwrap();
+            assert_eq!(body.milestone, "awaiting-guardian");
+            assert_eq!(body.reason.as_deref(), Some(r.to_wire().as_str()));
+            let json = serde_json::to_value(&body).unwrap();
+            assert_eq!(json["reason"], r.to_wire());
+        }
+    }
+
+    /// A hand-built canonical body: the six base fields, plus `extra`.
+    fn raw_body(milestone: &str, extra: &[(&str, Value)]) -> Vec<u8> {
+        let mut entries = vec![
+            (Value::Text("domain".into()), Value::Text(DOMAIN.into())),
+            (
+                Value::Text("milestone".into()),
+                Value::Text(milestone.into()),
+            ),
+            (Value::Text("miner_id".into()), Value::Text("m".into())),
+            (
+                Value::Text("schema_version".into()),
+                Value::Integer(1.into()),
+            ),
+            (
+                Value::Text("timestamp_unix".into()),
+                Value::Integer(1_700_000_000.into()),
+            ),
+            (Value::Text("vm_id".into()), Value::Text("vm-1".into())),
+        ];
+        for (k, v) in extra {
+            entries.push((Value::Text((*k).into()), v.clone()));
+        }
+        hippius_types::cbor::to_canonical_vec(&Value::Map(entries)).unwrap()
+    }
+
+    /// A canonical six-field `booting` body for an arbitrary identity
+    /// (including ones the typed encoder itself refuses).
+    fn identity_body(miner_id: &str, vm_id: &str) -> Vec<u8> {
+        let entries = vec![
+            (Value::Text("domain".into()), Value::Text(DOMAIN.into())),
+            (
+                Value::Text("milestone".into()),
+                Value::Text("booting".into()),
+            ),
+            (Value::Text("miner_id".into()), Value::Text(miner_id.into())),
+            (
+                Value::Text("schema_version".into()),
+                Value::Integer(1.into()),
+            ),
+            (
+                Value::Text("timestamp_unix".into()),
+                Value::Integer(1_700_000_000.into()),
+            ),
+            (Value::Text("vm_id".into()), Value::Text(vm_id.into())),
+        ];
+        hippius_types::cbor::to_canonical_vec(&Value::Map(entries)).unwrap()
+    }
+
+    #[test]
+    fn identity_bounds_are_exact() {
+        let sk = SigningKey::from_bytes(&[0x14u8; 32]);
+        let run = |miner: &str, vm: &str| {
+            let env = signed_envelope(identity_body(miner, vm), &sk);
+            verify(&env, &sk.verifying_key())
+        };
+        assert!(run(&"m".repeat(MAX_MINER_ID_LEN), "vm-1").is_ok());
+        assert_eq!(
+            run(&"m".repeat(MAX_MINER_ID_LEN + 1), "vm-1").unwrap_err(),
+            error_class::MINER_ID_INVALID
+        );
+        assert_eq!(run("", "vm-1").unwrap_err(), error_class::MINER_ID_INVALID);
+        assert!(run("m", &"v".repeat(MAX_VM_ID_LEN)).is_ok());
+        assert_eq!(
+            run("m", &"v".repeat(MAX_VM_ID_LEN + 1)).unwrap_err(),
+            error_class::VM_ID_INVALID
+        );
+        assert_eq!(run("m", "").unwrap_err(), error_class::VM_ID_INVALID);
+    }
+
+    /// The size cap is inclusive: an envelope of exactly the cap goes on to
+    /// the next gates (here the signature) instead of `body_too_large`.
+    #[test]
+    fn an_envelope_of_exactly_the_cap_is_not_too_large() {
+        let sk = SigningKey::from_bytes(&[0x15u8; 32]);
+        let mut n = 3900;
+        let env = loop {
+            let e = SignedVmProgress {
+                body: vec![0u8; n],
+                sig: vec![0u8; SIGNATURE_LEN],
+            }
+            .canonical()
+            .unwrap();
+            if e.len() as u64 == MAX_REQUEST_BYTES {
+                break e;
+            }
+            assert!((e.len() as u64) < MAX_REQUEST_BYTES, "stepped over the cap");
+            n += 1;
+        };
+        assert_eq!(
+            verify(&env, &sk.verifying_key()).unwrap_err(),
+            error_class::SIGNATURE_INVALID
+        );
+    }
+
+    fn verdict(milestone: &str, extra: &[(&str, Value)]) -> Result<VmProgressBody, &'static str> {
+        let sk = SigningKey::from_bytes(&[0x13u8; 32]);
+        let env = signed_envelope(raw_body(milestone, extra), &sk);
+        verify(&env, &sk.verifying_key())
+    }
+
+    /// The hand builder IS the typed encoder for a six-field milestone, so
+    /// the refusals below are about the reason field and nothing else.
+    #[test]
+    fn the_hand_built_six_field_body_is_the_typed_one() {
+        let typed = VmProgressReport::new(
+            "m".into(),
+            "vm-1".into(),
+            VmProgressMilestone::KekReleased,
+            1_700_000_000,
+        );
+        assert_eq!(raw_body("kek-released", &[]), typed.canonical().unwrap());
+        assert!(verdict("kek-released", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_reason_is_accepted_only_with_awaiting_guardian_and_a_closed_value() {
+        let text = |s: &str| Value::Text(s.into());
+        let ok = verdict("awaiting-guardian", &[("reason", text("refused:erased"))]).unwrap();
+        assert_eq!(ok.reason.as_deref(), Some("refused:erased"));
+        // awaiting-guardian WITHOUT a reason (six fields)
+        assert_eq!(
+            verdict("awaiting-guardian", &[]).unwrap_err(),
+            error_class::MILESTONE_INVALID
+        );
+        // a reason outside the closed vocabulary
+        for bad in [
+            "",
+            "down",
+            "refused:",
+            "refused:nope",
+            "Timeout",
+            "refused:erased ",
+        ] {
+            assert_eq!(
+                verdict("awaiting-guardian", &[("reason", text(bad))]).unwrap_err(),
+                error_class::MILESTONE_INVALID,
+                "{bad:?}"
+            );
+        }
+        // a (valid) reason on any other milestone
+        for m in ["booting", "kek-released", "running"] {
+            assert_eq!(
+                verdict(m, &[("reason", text("timeout"))]).unwrap_err(),
+                error_class::MILESTONE_INVALID,
+                "{m}"
+            );
+        }
+        // a non-text reason, and a seventh key that is not `reason`
+        assert_eq!(
+            verdict("awaiting-guardian", &[("reason", Value::Integer(1.into()))]).unwrap_err(),
+            error_class::BODY_DECODE_FAILED
+        );
+        assert_eq!(
+            verdict("booting", &[("extra", text("x"))]).unwrap_err(),
+            error_class::BODY_DECODE_FAILED
+        );
+        // eight fields: reason AND another key
+        assert_eq!(
+            verdict(
+                "awaiting-guardian",
+                &[("reason", text("timeout")), ("zzz", text("x"))]
+            )
+            .unwrap_err(),
+            error_class::BODY_DECODE_FAILED
+        );
     }
 
     #[test]

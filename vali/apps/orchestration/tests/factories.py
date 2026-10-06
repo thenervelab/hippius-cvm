@@ -78,8 +78,14 @@ def make_launch_record(
     measurement_hex: str | None = None,
     flavor: str = "small",
     decided_by: ServiceClient | None = None,
+    region: str | None = None,
 ) -> LaunchJob:
     """A SUCCEEDED `LaunchJob` for `vm` carrying `disk_mode` in `spec_json`.
+
+    `region` is written into `spec_json` only when given, so the default
+    record keeps the pre-region shape (what every VM launched before the
+    field existed looks like) — `launch_region_for_vm` must read that as
+    unconstrained.
 
     `service._is_golden` reads a VM's disk_mode from its most recent
     succeeded launch record; a golden decommission test builds one with
@@ -95,17 +101,20 @@ def make_launch_record(
         emit["measured_cmdline"] = measured_cmdline
     if measurement_hex is not None:
         emit["measurement_hex"] = measurement_hex
+    spec_json: dict[str, str] = {
+        "disk_mode": disk_mode,
+        "vm_id": vm.vm_id,
+        "cmdline": cmdline,
+        "flavor": flavor,
+    }
+    if region is not None:
+        spec_json["region"] = region
     return LaunchJob.objects.create(
         job_id=secrets.token_hex(16),
         vm_id=vm.vm_id,
         tenant_id="tenant-1",
         flavor=flavor,
-        spec_json={
-            "disk_mode": disk_mode,
-            "vm_id": vm.vm_id,
-            "cmdline": cmdline,
-            "flavor": flavor,
-        },
+        spec_json=spec_json,
         userdata_vault_path=f"secret/data/x/{vm.vm_id}/userdata",
         userdata_vault_version=1,
         kek_vault_path=f"x/{vm.vm_id}/luks-kek",

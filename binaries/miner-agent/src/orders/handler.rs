@@ -34,7 +34,7 @@ use crate::lifecycle::CvmLifecycle;
 use super::migration::{MigrationStore, SnapshotDownloader, SnapshotUploader};
 use super::types::{
     DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder, MigrateQuiesceOrder,
-    MigrateSnapshotOrder, StopOrder, TenantPreflightOrder,
+    MigrateSnapshotOrder, NetPolicyOrder, StopOrder, TenantPreflightOrder,
 };
 
 /// Default upper bound on tracked `order_id`s. A miner processes a
@@ -99,6 +99,19 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
         MinerAgentError::InsufficientResources => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "insufficient-resources")
         }
+        // The host's tenant DISK is full — the declared budget, or the
+        // measured free space the per-VM disk create gates on. Its own
+        // class (and 507, like the restore path's `insufficient-space`) so
+        // vali reads it as a capacity event and re-places, never as the
+        // generic `dispatch-failed` that is evidence of a SEV start fault.
+        MinerAgentError::InsufficientDisk
+        | MinerAgentError::DataDisk("insufficient-space")
+        | MinerAgentError::OverlayDisk("insufficient-space") => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: insufficient-disk-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INSUFFICIENT_STORAGE, "insufficient-disk")
+        }
         MinerAgentError::VsockCid(_) => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "vsock-cid-exhausted")
         }
@@ -109,12 +122,30 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
         MinerAgentError::NotYetWired => {
             OrderRejection::new(StatusCode::NOT_IMPLEMENTED, "not-yet-wired")
         }
+        // A relaunch found none of the VM's disks to reuse — this host
+        // does not hold the VM. Its own class (vali must stop relaunching
+        // here and escalate, not retry), and a detail line naming WHICH
+        // disk, because that is what an operator checks first.
+        MinerAgentError::RelaunchDisksMissing(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: relaunch-disks-missing-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::PRECONDITION_FAILED, "relaunch-disks-missing")
+        }
+        // Could not tell — retryable (503), and a class vali does NOT
+        // latch on: nothing is known to be missing.
+        MinerAgentError::RelaunchDisksUnreadable(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: relaunch-disks-unreadable-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "relaunch-disks-unreadable")
+        }
         // The L1-minted OrderTicket could not be pushed to the guest
         // over vsock — a launch-blocking condition (the §21 boot
         // pipeline reads the ticket on the very first stage) but a
         // distinct class from libvirt / lock-poisoned failures, so the
         // operator can wire a targeted alert. The dedicated arm ALSO
-        // emits a detail-log line (codex r2 P3) — the public class
+        // emits a detail-log line (review r2 P3) — the public class
         // `ticket-delivery-failed` flattens five sub-classes
         // (`empty` / `oversize` / `no-cid` / `connect-timeout` /
         // `write-failed`), and an operator can't tell a bad payload
@@ -138,6 +169,30 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
             ));
             OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "migration-failed")
         }
+        // `net-policy` refusals. The replay classes are vali's to act on
+        // (409: send a higher revision); a bad shape or a store fault also
+        // logs its sub-class.
+        MinerAgentError::NetPolicyStaleRevision => {
+            OrderRejection::new(StatusCode::CONFLICT, "net-policy-stale-revision")
+        }
+        MinerAgentError::NetPolicyRevisionConflict => {
+            OrderRejection::new(StatusCode::CONFLICT, "net-policy-revision-conflict")
+        }
+        MinerAgentError::NetPolicyExpired => {
+            OrderRejection::new(StatusCode::UNPROCESSABLE_ENTITY, "net-policy-expired")
+        }
+        MinerAgentError::NetPolicyInvalid(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: net-policy-invalid-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::UNPROCESSABLE_ENTITY, "net-policy-invalid")
+        }
+        MinerAgentError::NetPolicyStore(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: net-policy-store-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "net-policy-store")
+        }
         // Everything else — a libvirt fault, a poisoned lock, a launch
         // that did not reach running — is an internal failure. The
         // public class stays `dispatch-failed` (no wire-side breaking
@@ -151,6 +206,20 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
             OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "dispatch-failed")
         }
     }
+}
+
+/// Dispatch a `net-policy` order: persist it under the replay rules
+/// and answer `applied:<revision>:<content sha256 hex>`. Applies
+/// nothing to the host yet.
+pub fn handle_net_policy(
+    store: &crate::netpolicy::NetPolicyStore,
+    now: u64,
+    order: NetPolicyOrder,
+) -> Result<String, OrderRejection> {
+    store
+        .accept(order, now)
+        .map(|applied| applied.ack())
+        .map_err(|err| reject_dispatch(&err, "host"))
 }
 
 /// Dispatch a `launch` order.
@@ -170,11 +239,19 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
 /// receiver is a one-shot listener that closes after the prior
 /// launch's `recv_ticket` returned, so a second push would hang for
 /// `PUSH_TIMEOUT_SECS` and surface a false `ticket-delivery-failed`
-/// (codex r2 P2). The prior launch's push outcome already determined
-/// the §21 pipeline's fate; a `Running` domain whose original push
-/// failed would already be torn down by `teardown_failed_launch`, so
-/// any `AlreadyLaunched` we see here means the original push *did*
-/// succeed.
+/// (review r2 P2).
+///
+/// `AlreadyLaunched` does NOT prove the guest got its ticket. A launch
+/// whose own push failed (`ticket-delivery-failed`) leaves the domain
+/// running on purpose: the reboot-watcher's re-push keeps trying for its
+/// window after `Started`, which is how a slow boot still gets its ticket
+/// — so a same-miner retry inside that window is answered
+/// `already-launched` — the pre-existing behaviour. Nothing here, and
+/// today nothing in vali either, catches a guest that never gets its
+/// ticket (it never signals, so vali reads it `unknown`, not `wedged`):
+/// that gap is tracked on the vali side. The §25 destination, where the
+/// answer becomes vali's `done`, settles the re-push outcome itself
+/// (`migration::launch_dest`).
 pub async fn handle_launch(
     lifecycle: &CvmLifecycle,
     pusher: &dyn crate::vsock::ticket_push::TicketPusher,
@@ -210,12 +287,28 @@ pub async fn handle_launch(
         Err(err) => return Err(reject_dispatch(&err, &vm_id_str)),
     };
 
+    // Guarded: this push can spin in its connect loop for minutes, and a
+    // stop landing meanwhile frees `cid` for the next launch — the ticket
+    // must never reach whoever inherits it.
+    let still_owner = || lifecycle.ticket_push_current(&vm_id, cid, cose_ticket.as_ref());
     if let Err(err) = pusher
-        .push(cid, hippius_types::ticket_vsock::PORT, cose_ticket.as_ref())
+        .push_guarded(
+            cid,
+            hippius_types::ticket_vsock::PORT,
+            cose_ticket.as_ref(),
+            &still_owner,
+        )
         .await
     {
+        // The reboot-watcher's re-push races this one for the guest's
+        // one-shot listener; if it won, the guest has its ticket.
+        if lifecycle.ticket_delivered(&vm_id) {
+            return Ok("launched".to_string());
+        }
+        lifecycle.note_ticket_push_failed(&vm_id, cid, cose_ticket.as_ref());
         return Err(reject_dispatch(&err, &vm_id_str));
     }
+    lifecycle.note_ticket_delivered(&vm_id, cid, cose_ticket.as_ref());
 
     Ok("launched".to_string())
 }
@@ -238,9 +331,10 @@ pub async fn handle_stop(
 /// is a success no-op.
 pub async fn handle_destroy(
     lifecycle: &CvmLifecycle,
+    restore: Option<&crate::backup::staged::RestoreManager>,
     order: DestroyOrder,
 ) -> std::result::Result<String, OrderRejection> {
-    match lifecycle.destroy(&order.vm_id).await {
+    match lifecycle.destroy(&order.vm_id, restore).await {
         Ok(()) => Ok("destroyed".to_string()),
         Err(err) => Err(reject_dispatch(&err, order.vm_id.as_str())),
     }
@@ -318,6 +412,8 @@ pub async fn handle_migrate_snapshot(
         Err(err) => return Err(reject_dispatch(&err, &vm_id_str)),
     };
     let put_url = order.put_url.clone();
+    let disk_part_urls = order.disk_part_urls.clone();
+    let part_size = order.part_size;
     // The anti-rollback state disk travels WITH the volume. The guest is
     // already quiesced (the gate above), so the file is static — no torn
     // read. Resolved from the lifecycle's own `state_disk_root`, never
@@ -332,11 +428,25 @@ pub async fn handle_migrate_snapshot(
         // otherwise report as a successful migration. So the state upload
         // failing marks the whole snapshot failed — fail closed, vali
         // aborts the migration and the source stays authoritative.
-        let volume = uploader.upload(&disk_path, &put_url).await;
-        if volume.is_err() {
-            migration.mark_snapshot_failed(&vm_id);
-            return;
-        }
+        let volume = if disk_part_urls.is_empty() {
+            uploader.upload(&disk_path, &put_url).await.map(|()| None)
+        } else {
+            uploader
+                .upload_parts(&disk_path, part_size, &disk_part_urls)
+                .await
+                .map(Some)
+        };
+        let receipt = match volume {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                eprintln!(
+                    "hippius-miner-agent: migrate-snapshot: vm={vm_id_str} volume upload \
+                     failed: {err}"
+                );
+                migration.mark_snapshot_failed(&vm_id);
+                return;
+            }
+        };
         // Empty URL ⇒ a vali predating the field; nothing to carry, and
         // the pre-fix behaviour is what the dest already tolerates.
         if !state_put_url.is_empty() {
@@ -361,11 +471,11 @@ pub async fn handle_migrate_snapshot(
             // legacy alike, so a VM that booted has one.
             match tokio::fs::metadata(&state_disk_path).await {
                 Ok(meta) if meta.len() > 0 => {
-                    if uploader
-                        .upload(&state_disk_path, &state_put_url)
-                        .await
-                        .is_err()
-                    {
+                    if let Err(err) = uploader.upload(&state_disk_path, &state_put_url).await {
+                        eprintln!(
+                            "hippius-miner-agent: migrate-snapshot: vm={vm_id_str} state disk \
+                             upload failed: {err}"
+                        );
                         migration.mark_snapshot_failed(&vm_id);
                         return;
                     }
@@ -381,7 +491,10 @@ pub async fn handle_migrate_snapshot(
                 }
             }
         }
-        let _ = migration.mark_snapshot_done(&vm_id);
+        let _ = match receipt {
+            Some(receipt) => migration.mark_multipart_snapshot_done(&vm_id, receipt),
+            None => migration.mark_snapshot_done(&vm_id),
+        };
     });
     Ok("snapshot-accepted".to_string())
 }
@@ -419,6 +532,7 @@ pub async fn handle_migrate_activate(
     lifecycle: Arc<CvmLifecycle>,
     downloader: Arc<dyn SnapshotDownloader>,
     pusher: Arc<dyn crate::vsock::ticket_push::TicketPusher>,
+    restorer: Option<Arc<dyn crate::backup::restore::ChainRestorer>>,
     migration: Arc<MigrationStore>,
     tasks: tokio_util::task::TaskTracker,
     order: MigrateActivateOrder,
@@ -438,13 +552,31 @@ pub async fn handle_migrate_activate(
     // proven §25 M1 snapshot coordination, mirrored on the dest side.
     let vm_id = order.vm_id.clone();
     let vm_id_str = vm_id.as_str().to_owned();
-    if let Err(err) = migration.begin_activate(&vm_id) {
-        return Err(reject_dispatch(&err, &vm_id_str));
+    // Every activation enters `Activating` under the restore lock: an
+    // abort or a reclaim (which renames or deletes this VM's disks) then
+    // sees either no activation or the activation, never both at once.
+    // A staged restore's cheap preconditions also answer on the order;
+    // the background swap re-checks all of them under the same lock.
+    let _restore_lock = crate::backup::staged::restore_lock().await;
+    if let Err(class) = check_staged_activate(&lifecycle, &order).await {
+        let status = match class {
+            "restore-not-staged" | "restore-vm-live" => StatusCode::CONFLICT,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        return Err(OrderRejection::new(status, class));
+    }
+    match migration.begin_activate(&vm_id) {
+        Ok(true) => {}
+        // The first activation is still running — its outcome is what
+        // vali's status poll will see.
+        Ok(false) => return Ok("activate-in-progress".to_string()),
+        Err(err) => return Err(reject_dispatch(&err, &vm_id_str)),
     }
     tasks.spawn(async move {
-        match super::migration::activate_dest(
+        match super::migration::activate_dest_with_chain(
             lifecycle.as_ref(),
             downloader.as_ref(),
+            restorer.as_deref(),
             pusher.as_ref(),
             order,
         )
@@ -460,11 +592,172 @@ pub async fn handle_migrate_activate(
                 eprintln!(
                     "hippius-miner-agent: migrate-activate: vm={vm_id_str} dest restore failed: {err}"
                 );
-                migration.mark_activate_failed(&vm_id);
+                migration.mark_activate_failed(&vm_id, &err);
             }
         }
     });
     Ok("activate-accepted".to_string())
+}
+
+/// The synchronous half of a staged restore's `migrate-activate`: field
+/// consistency, and — unless this restore is already swapped in — a
+/// `staged` record for the id and a domain that is not running.
+async fn check_staged_activate(
+    lifecycle: &CvmLifecycle,
+    order: &MigrateActivateOrder,
+) -> std::result::Result<(), &'static str> {
+    order.check_staged_restore()?;
+    if order.staged_restore_id.is_empty() {
+        return Ok(());
+    }
+    let status = crate::backup::staged::RestoreManager::peek(lifecycle, &order.vm_id).await;
+    let rid = order.staged_restore_id.as_str();
+    let swapped = status
+        .as_ref()
+        .is_some_and(|s| s.restore_id == rid && s.swapped);
+    if swapped {
+        return Ok(());
+    }
+    if !status.as_ref().is_some_and(|s| {
+        s.restore_id == rid && s.state == crate::backup::staged::RestoreState::Staged
+    }) {
+        return Err("restore-not-staged");
+    }
+    if lifecycle.tenant_domain_liveness(&order.vm_id).await
+        != crate::lifecycle::DomainLiveness::Down
+    {
+        return Err("restore-vm-live");
+    }
+    Ok(())
+}
+
+/// Staged restore — `stage` validates and registers synchronously (so
+/// vali sees `restore-busy` / a bad chain / no room on the order
+/// response), then runs on the serve loop's TaskTracker and ACKs;
+/// `abort` and `reclaim` run inline. See [`crate::backup::staged`].
+pub async fn handle_restore(
+    lifecycle: Arc<CvmLifecycle>,
+    restore: Arc<crate::backup::staged::RestoreManager>,
+    migration: Arc<MigrationStore>,
+    tasks: tokio_util::task::TaskTracker,
+    order: crate::orders::types::RestoreOrder,
+) -> std::result::Result<String, OrderRejection> {
+    use crate::backup::staged::{RestoreOp, StageRequest, StageStart};
+    order.validate().map_err(|e| restore_rejection(&e))?;
+    let vm_id = order.vm_id.clone();
+    match order.op {
+        RestoreOp::Stage => {
+            let chain = order.chain.ok_or(OrderRejection::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "restore-chain-missing",
+            ))?;
+            let req = StageRequest {
+                vm_id,
+                restore_id: order.restore_id,
+                chain,
+                disk_bytes: order.disk_bytes,
+                streams: crate::backup::transfer::clamp_streams(order.streams),
+            };
+            match restore.begin_stage(&lifecycle, req).await {
+                Ok(StageStart::Started(job)) => {
+                    tasks.spawn(async move { restore.run_stage(job).await });
+                    Ok("restore-staging".to_string())
+                }
+                Ok(StageStart::Staging) => Ok("restore-staging".to_string()),
+                Ok(StageStart::Staged) => Ok("restore-staged".to_string()),
+                Err(e) => Err(restore_rejection(&e)),
+            }
+        }
+        RestoreOp::Abort => restore
+            .abort(&lifecycle, &migration, &vm_id, &order.restore_id)
+            .await
+            .map(|()| "restore-aborted".to_string())
+            .map_err(|e| restore_rejection(&e)),
+        RestoreOp::Reclaim => restore
+            .reclaim(&lifecycle, &migration, &vm_id, &order.restore_id)
+            .await
+            .map(|()| "restore-reclaimed".to_string())
+            .map_err(|e| restore_rejection(&e)),
+    }
+}
+
+/// Map a restore error to its order response: a state conflict is `409`,
+/// no room `507`, a stop that did not take `503`, any other static class
+/// `422` (the order itself is wrong), everything else `500`.
+fn restore_rejection(err: &MinerAgentError) -> OrderRejection {
+    match err {
+        MinerAgentError::Backup(
+            c @ ("restore-busy"
+            | "restore-finished"
+            | "restore-vm-live"
+            | "restore-reclaim-refused"
+            | "restore-activating"),
+        ) => OrderRejection::new(StatusCode::CONFLICT, c),
+        MinerAgentError::Backup(c @ "restore-host-busy") => {
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, c)
+        }
+        MinerAgentError::Backup(c @ "insufficient-space") => {
+            OrderRejection::new(StatusCode::INSUFFICIENT_STORAGE, c)
+        }
+        MinerAgentError::Backup(c @ ("restore-stop-failed" | "restore-cancel-timeout")) => {
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, c)
+        }
+        MinerAgentError::Backup(
+            c @ ("restore-record" | "restore-remove" | "restore-stat" | "restore-dir"
+            | "restore-abort-io"),
+        ) => OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, c),
+        MinerAgentError::Backup(c) => OrderRejection::new(StatusCode::UNPROCESSABLE_ENTITY, c),
+        _ => OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "restore-internal"),
+    }
+}
+
+/// Live backup — validate + register the run synchronously (so vali sees
+/// `backup-in-flight` / a bad request on the order response), then run it
+/// on the serve loop's TaskTracker and ACK. A repeat of the same `run_id`
+/// is `backup-already-accepted` and starts nothing.
+pub fn handle_backup(
+    lifecycle: Arc<CvmLifecycle>,
+    backup: Arc<crate::backup::BackupManager>,
+    tasks: tokio_util::task::TaskTracker,
+    order: crate::orders::types::BackupOrder,
+) -> std::result::Result<String, OrderRejection> {
+    let req = order.into_request();
+    match backup.begin(&req) {
+        Ok(true) => {}
+        Ok(false) => return Ok("backup-already-accepted".to_string()),
+        Err(MinerAgentError::Backup("backup-in-flight")) => {
+            return Err(OrderRejection::new(
+                StatusCode::CONFLICT,
+                "backup-in-flight",
+            ));
+        }
+        Err(MinerAgentError::Backup(_)) => {
+            return Err(OrderRejection::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "backup-invalid",
+            ));
+        }
+        Err(_) => {
+            return Err(OrderRejection::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backup-internal",
+            ));
+        }
+    }
+    tasks.spawn(async move {
+        let vm = req.vm_id.clone();
+        let run_id = req.run_id.clone();
+        backup.run(lifecycle.as_ref(), req).await;
+        if let Some(st) = backup.status(&vm) {
+            eprintln!(
+                "hippius-miner-agent: backup: vm={} run={run_id:?} status={:?} error={}",
+                vm.as_str(),
+                st.status,
+                st.error.unwrap_or("-"),
+            );
+        }
+    });
+    Ok("backup-started".to_string())
 }
 
 /// Parse the attested `hippius.disk_gb=<N>` token out of a kernel
@@ -497,12 +790,19 @@ pub async fn handle_tenant_preflight(
     // DATA-disk capacity fail-fast — BEFORE vali mints + KBS-registers.
     // The attested `hippius.disk_gb=` token in the cmdline is the same
     // size the launch will reserve; rejecting an over-budget disk here
-    // (503 insufficient-resources) lets vali re-place onto another miner,
+    // (507 insufficient-disk) lets vali re-place onto another miner,
     // whereas the launch-time reservation lands after KBS-register and
     // can't be cleanly re-placed. The launch path still reserves under
     // the lock (the race-safe gate).
     let add_disk_gb = parse_disk_gb_token(order.cmdline.as_str());
     if let Err(err) = lifecycle.check_disk_budget(add_disk_gb) {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
+    // …and against the MEASURED free space (net of every existing disk's
+    // unwritten sparse tail), so a host whose filesystem can't hold the
+    // disk is refused here too — the declared budget may be 0 (disabled)
+    // or simply wrong. Both answer 507 `insufficient-disk`.
+    if let Err(err) = lifecycle.check_disk_space(&order.vm_id, add_disk_gb) {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
     // CPU + memory capacity fail-fast — SAME pre-register rationale as the
@@ -531,7 +831,22 @@ pub async fn handle_tenant_preflight(
     // fail-closed reading §24's reclaim uses. It costs nothing: a launch
     // could not proceed on that host anyway, and vali re-places.
     let policy = match lifecycle.tenant_domain_liveness(&order.vm_id).await {
-        crate::lifecycle::DomainLiveness::Down => crate::lifecycle::preflight::StagePolicy::Replace,
+        crate::lifecycle::DomainLiveness::Down => {
+            // SEV-ES ASID fail-fast — same pre-register rationale as the
+            // cpu/mem gate: an exhausted pool fails the launch inside
+            // `sev_common_kvm_init`, after KBS-register. Only a DOWN domain
+            // needs a new ASID (a live one already holds its own), and the
+            // pass RESERVES it until the launch ends, so concurrent
+            // preflights at the edge of the pool cannot all pass. Keeps one
+            // ASID for the host-attestor / a migration destination; an
+            // unreadable pool never gates.
+            if let Err(err) =
+                lifecycle.reserve_asid(&order.vm_id, crate::lifecycle::DomainProfile::Tenant)
+            {
+                return Err(reject_dispatch(&err, &vm_id_str));
+            }
+            crate::lifecycle::preflight::StagePolicy::Replace
+        }
         crate::lifecycle::DomainLiveness::Live | crate::lifecycle::DomainLiveness::Unknown => {
             crate::lifecycle::preflight::StagePolicy::PinnedByLiveVm
         }
@@ -542,28 +857,38 @@ pub async fn handle_tenant_preflight(
     }
 }
 
+/// Longest success class a replay can echo. Stop/launch/destroy classes are
+/// a few bytes; a preflight's JSON is a few hundred. Anything longer is not
+/// kept (bounded memory: [`DEFAULT_IDEM_CAPACITY`] entries) and replays as
+/// the generic `idempotent-replay`.
+pub const MAX_REPLAY_CLASS_LEN: usize = 1024;
+
 /// What [`IdempotencyStore::begin`] decided about an `order_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginOutcome {
     /// First sight of this `order_id` (or a retry of one that failed)
     /// — the caller owns it and must dispatch, then [`IdempotencyStore::finish`].
     Claimed,
     /// This `order_id` already completed successfully — the caller
-    /// must NOT dispatch again; return a no-op success.
-    AlreadyOk,
+    /// must NOT dispatch again; return a no-op success, echoing the
+    /// original outcome class when it was kept. A replayed `stop` must
+    /// still say whether it `stopped` a guest or found it `not-running`:
+    /// vali's §24 counts only the former as its stop.
+    AlreadyOk(Option<String>),
     /// This `order_id` is being processed by another in-flight
     /// request right now — the caller must reject with a conflict.
     InFlight,
 }
 
 /// One tracked `order_id`'s state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum IdemEntry {
     /// A request claimed this id and is dispatching it.
     InFlight,
-    /// Dispatch finished — `true` = success, `false` = failure
-    /// (failure is left retryable: a fresh claim overwrites it).
-    Done(bool),
+    /// Dispatch succeeded, with its outcome class when short enough to keep.
+    Ok(Option<String>),
+    /// Dispatch failed — left retryable: a fresh claim overwrites it.
+    Failed,
 }
 
 /// State behind the idempotency lock.
@@ -608,12 +933,12 @@ impl IdempotencyStore {
     /// completed / in-flight. A poisoned lock fails closed.
     pub fn begin(&self, order_id: &str) -> crate::error::Result<BeginOutcome> {
         let mut state = self.lock()?;
-        match state.entries.get(order_id).copied() {
-            Some(IdemEntry::Done(true)) => Ok(BeginOutcome::AlreadyOk),
+        match state.entries.get(order_id).cloned() {
+            Some(IdemEntry::Ok(class)) => Ok(BeginOutcome::AlreadyOk(class)),
             Some(IdemEntry::InFlight) => Ok(BeginOutcome::InFlight),
             // A previously-failed order is retryable — re-claim it
             // (the map slot + FIFO position are reused, no new entry).
-            Some(IdemEntry::Done(false)) => {
+            Some(IdemEntry::Failed) => {
                 state
                     .entries
                     .insert(order_id.to_string(), IdemEntry::InFlight);
@@ -635,17 +960,22 @@ impl IdempotencyStore {
         }
     }
 
-    /// Record the outcome of a [`BeginOutcome::Claimed`] dispatch. A
-    /// success becomes a cached no-op for any replay; a failure stays
-    /// retryable. A poisoned lock fails closed.
-    pub fn finish(&self, order_id: &str, success: bool) -> crate::error::Result<()> {
+    /// Record the outcome of a [`BeginOutcome::Claimed`] dispatch:
+    /// `Some(class)` for a success — a cached no-op for any replay, which
+    /// echoes `class` — or `None` for a failure, which stays retryable. A
+    /// poisoned lock fails closed.
+    pub fn finish(&self, order_id: &str, success: Option<&str>) -> crate::error::Result<()> {
         let mut state = self.lock()?;
         // Only update an entry that still exists — an id evicted while
         // its dispatch ran is simply not re-inserted.
         if state.entries.contains_key(order_id) {
-            state
-                .entries
-                .insert(order_id.to_string(), IdemEntry::Done(success));
+            let entry = match success {
+                Some(class) => {
+                    IdemEntry::Ok((class.len() <= MAX_REPLAY_CLASS_LEN).then(|| class.to_string()))
+                }
+                None => IdemEntry::Failed,
+            };
+            state.entries.insert(order_id.to_string(), entry);
         }
         Ok(())
     }
@@ -665,6 +995,237 @@ impl Default for IdempotencyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pusher whose guest never takes the ticket.
+    struct UnreachableGuestPusher;
+    #[async_trait::async_trait]
+    impl crate::vsock::ticket_push::TicketPusher for UnreachableGuestPusher {
+        async fn push(&self, _cid: u32, _port: u32, _cose: &[u8]) -> crate::error::Result<()> {
+            Err(MinerAgentError::TicketDelivery("connect-timeout"))
+        }
+    }
+
+    fn medium_ticket() -> Vec<u8> {
+        use ciborium::value::Value;
+        use coset::{iana, CborSerializable, CoseSign1Builder, HeaderBuilder};
+        let payload = Value::Map(vec![
+            (Value::Text("v".into()), Value::Integer(2.into())),
+            (Value::Text("flavor".into()), Value::Text("medium".into())),
+        ]);
+        let mut payload_buf = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut payload_buf).unwrap();
+        CoseSign1Builder::new()
+            .protected(
+                HeaderBuilder::new()
+                    .algorithm(iana::Algorithm::EdDSA)
+                    .build(),
+            )
+            .payload(payload_buf)
+            .create_signature(b"", |_| vec![0u8; 64])
+            .build()
+            .to_vec()
+            .unwrap()
+    }
+
+    fn lifecycle() -> CvmLifecycle {
+        use crate::lifecycle::{MockLaunchDigest, MockLibvirtDriver};
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        CvmLifecycle::new(
+            Arc::new(MockLibvirtDriver::new()),
+            Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+            crate::HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+        )
+        .skip_state_disk_provision_for_tests()
+    }
+
+    fn preflight_order(vm: &str) -> TenantPreflightOrder {
+        let art = |n: &str| super::super::types::PreflightArtifact {
+            url: format!("https://s3.invalid/{n}"),
+            sha256_hex: "0".repeat(64),
+        };
+        TenantPreflightOrder {
+            vm_id: crate::VmId::new(vm).unwrap(),
+            ovmf_path: "/var/lib/hippius-miner/ovmf.fd".into(),
+            luks_disk: art("disk"),
+            kernel: art("vmlinuz"),
+            initrd: art("initrd"),
+            rootfs_hash: None,
+            cmdline: "quiet".to_string(),
+            cpu_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_a_tenant_when_the_asid_pool_is_full() {
+        // capacity 99, used 98 ⇒ one more would eat the attestor reserve.
+        let full = crate::sev_asid::AsidUsage {
+            capacity: 99,
+            used: 98,
+        };
+        let lc = lifecycle().with_asid_source(Arc::new(crate::sev_asid::FixedAsidSource(full)));
+        let Err(rej) = handle_tenant_preflight(&lc, preflight_order("vm-asid-full")).await else {
+            panic!("a full ASID pool must refuse the preflight");
+        };
+        assert_eq!(rej.class, "insufficient-resources");
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_a_disk_the_filesystem_cannot_hold() {
+        // No declared budget (0 = off): the MEASURED gate alone refuses a
+        // disk larger than the data root's filesystem, with the typed class.
+        let tmp = tempfile::tempdir().unwrap();
+        let lc = lifecycle().with_state_disk_root(tmp.path().to_path_buf());
+        let mut order = preflight_order("vm-disk-full");
+        order.cmdline = format!("quiet hippius.disk_gb={}", u32::MAX);
+        let Err(rej) = handle_tenant_preflight(&lc, order).await else {
+            panic!("an unholdable disk must refuse the preflight");
+        };
+        assert_eq!(rej.class, "insufficient-disk");
+        assert_eq!(rej.status, StatusCode::INSUFFICIENT_STORAGE);
+    }
+
+    #[tokio::test]
+    async fn preflight_over_the_declared_disk_budget_is_insufficient_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lc = CvmLifecycle::new(
+            Arc::new(crate::lifecycle::MockLibvirtDriver::new()),
+            Arc::new(crate::lifecycle::MockLaunchDigest::fixed([0u8; 48])),
+            crate::HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 1,
+            },
+        )
+        .with_state_disk_root(tmp.path().to_path_buf());
+        let mut order = preflight_order("vm-disk-budget");
+        order.cmdline = "quiet hippius.disk_gb=2".to_string();
+        let Err(rej) = handle_tenant_preflight(&lc, order).await else {
+            panic!("over the declared budget must refuse the preflight");
+        };
+        assert_eq!(rej.class, "insufficient-disk");
+    }
+
+    #[tokio::test]
+    async fn preflight_of_an_already_running_vm_is_not_asid_gated() {
+        // A re-dispatched preflight for a LIVE domain needs no new ASID.
+        let lc = std::sync::Arc::new(lifecycle());
+        handle_launch(
+            &lc,
+            &WatcherWinsAny(lc.clone()),
+            launch_order("tenant-live"),
+        )
+        .await
+        .unwrap();
+        let full = crate::sev_asid::AsidUsage {
+            capacity: 99,
+            used: 98,
+        };
+        let lc = std::sync::Arc::try_unwrap(lc)
+            .ok()
+            .expect("sole owner")
+            .with_asid_source(Arc::new(crate::sev_asid::FixedAsidSource(full)));
+        let res = handle_tenant_preflight(&lc, preflight_order("tenant-live")).await;
+        if let Err(rej) = res {
+            assert_ne!(rej.class, "insufficient-resources");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_launch_frees_its_asid_reservation() {
+        // 99 / 97 in use ⇒ exactly one more tenant fits.
+        let usage = crate::sev_asid::AsidUsage {
+            capacity: 99,
+            used: 97,
+        };
+        let lc = std::sync::Arc::new(
+            lifecycle().with_asid_source(Arc::new(crate::sev_asid::FixedAsidSource(usage))),
+        );
+        let vm = |n: &str| crate::VmId::new(n).unwrap();
+        lc.reserve_asid(&vm("tenant-live"), crate::lifecycle::DomainProfile::Tenant)
+            .unwrap();
+        assert!(lc
+            .reserve_asid(&vm("tenant-next"), crate::lifecycle::DomainProfile::Tenant)
+            .is_err());
+        handle_launch(
+            &lc,
+            &WatcherWinsAny(lc.clone()),
+            launch_order("tenant-live"),
+        )
+        .await
+        .unwrap();
+        lc.reserve_asid(&vm("tenant-next"), crate::lifecycle::DomainProfile::Tenant)
+            .unwrap();
+    }
+
+    /// A pusher that reports the ticket delivered for whichever VM.
+    struct WatcherWinsAny(std::sync::Arc<CvmLifecycle>);
+    #[async_trait::async_trait]
+    impl crate::vsock::ticket_push::TicketPusher for WatcherWinsAny {
+        async fn push(&self, cid: u32, _port: u32, cose: &[u8]) -> crate::error::Result<()> {
+            let vm = crate::VmId::new("tenant-live").unwrap();
+            self.0.note_ticket_delivered(&vm, cid, cose);
+            Ok(())
+        }
+    }
+
+    fn launch_order(vm: &str) -> LaunchOrder {
+        LaunchOrder {
+            vm_id: crate::VmId::new(vm).unwrap(),
+            ovmf_path: "/var/lib/hippius-miner/ovmf.fd".into(),
+            kernel_path: "/var/lib/hippius-miner/vmlinuz".into(),
+            initrd_path: "/var/lib/hippius-miner/initrd".into(),
+            cmdline: "quiet".to_string(),
+            luks_disk_path: format!("/var/lib/hippius-miner/{vm}.img").into(),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 0,
+            rootfs_data_path: "/var/lib/hippius-miner/rootfs.img".into(),
+            rootfs_hash_path: "/var/lib/hippius-miner/rootfs.verity".into(),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: serde_bytes::ByteBuf::from(medium_ticket()),
+            require_existing_disks: false,
+            guardian_ep: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_leaves_the_domain_to_the_re_push() {
+        let lc = lifecycle();
+        let rej = handle_launch(&lc, &UnreachableGuestPusher, launch_order("tenant-slow"))
+            .await
+            .unwrap_err();
+        assert_eq!(rej.class, "ticket-delivery-failed");
+        assert_eq!(lc.list_tenants().await.unwrap().len(), 1);
+        assert!(!lc.ticket_delivered(&crate::VmId::new("tenant-slow").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_push_the_reboot_watcher_won_is_a_launch() {
+        // The watcher races the launch for the guest's one-shot listener;
+        // when it wins, the launch's own push fails with the ticket
+        // already delivered.
+        struct WatcherWins(std::sync::Arc<CvmLifecycle>);
+        #[async_trait::async_trait]
+        impl crate::vsock::ticket_push::TicketPusher for WatcherWins {
+            async fn push(&self, cid: u32, _port: u32, cose: &[u8]) -> crate::error::Result<()> {
+                let vm = crate::VmId::new("tenant-race").unwrap();
+                self.0.note_ticket_delivered(&vm, cid, cose);
+                Err(MinerAgentError::TicketDelivery("connect-reset"))
+            }
+        }
+        let lc = std::sync::Arc::new(lifecycle());
+        let out = handle_launch(&lc, &WatcherWins(lc.clone()), launch_order("tenant-race"))
+            .await
+            .unwrap();
+        assert_eq!(out, "launched");
+    }
 
     #[test]
     fn parse_disk_gb_token_extracts_the_attested_value() {
@@ -693,10 +1254,16 @@ mod tests {
     fn a_completed_success_replays_as_already_ok() {
         let store = IdempotencyStore::new();
         assert_eq!(store.begin("ord-1").unwrap(), BeginOutcome::Claimed);
-        store.finish("ord-1", true).unwrap();
-        assert_eq!(store.begin("ord-1").unwrap(), BeginOutcome::AlreadyOk);
+        store.finish("ord-1", Some("stopped")).unwrap();
+        assert_eq!(
+            store.begin("ord-1").unwrap(),
+            BeginOutcome::AlreadyOk(Some("stopped".into()))
+        );
         // ... and stays AlreadyOk on every further replay.
-        assert_eq!(store.begin("ord-1").unwrap(), BeginOutcome::AlreadyOk);
+        assert_eq!(
+            store.begin("ord-1").unwrap(),
+            BeginOutcome::AlreadyOk(Some("stopped".into()))
+        );
     }
 
     #[test]
@@ -711,7 +1278,7 @@ mod tests {
     fn a_failed_order_is_retryable() {
         let store = IdempotencyStore::new();
         assert_eq!(store.begin("ord-1").unwrap(), BeginOutcome::Claimed);
-        store.finish("ord-1", false).unwrap();
+        store.finish("ord-1", None).unwrap();
         // A failed order can be re-claimed and re-dispatched.
         assert_eq!(store.begin("ord-1").unwrap(), BeginOutcome::Claimed);
     }
@@ -721,13 +1288,19 @@ mod tests {
         let store = IdempotencyStore::with_capacity(2);
         for id in ["a", "b", "c"] {
             assert_eq!(store.begin(id).unwrap(), BeginOutcome::Claimed);
-            store.finish(id, true).unwrap();
+            store.finish(id, Some("stopped")).unwrap();
         }
         // The two most-recent ids are still cached. Check them first:
         // a cache HIT (`AlreadyOk`) does not mutate the store, so the
         // assertions do not perturb each other.
-        assert_eq!(store.begin("c").unwrap(), BeginOutcome::AlreadyOk);
-        assert_eq!(store.begin("b").unwrap(), BeginOutcome::AlreadyOk);
+        assert_eq!(
+            store.begin("c").unwrap(),
+            BeginOutcome::AlreadyOk(Some("stopped".into()))
+        );
+        assert_eq!(
+            store.begin("b").unwrap(),
+            BeginOutcome::AlreadyOk(Some("stopped".into()))
+        );
         // "a" — the oldest — was evicted when "c" was claimed, so it is
         // a fresh claim again. (This DOES mutate, so it is checked last.)
         assert_eq!(store.begin("a").unwrap(), BeginOutcome::Claimed);
@@ -803,6 +1376,45 @@ mod tests {
         }
     }
 
+    /// Every disk refusal — the declared budget, the preflight measured
+    /// gate, and the launch-time create gate of either writable disk —
+    /// answers ONE typed class, 507 `insufficient-disk`, never the generic
+    /// `dispatch-failed` vali would read as a SEV start failure. Other
+    /// disk-create faults keep `dispatch-failed`.
+    #[test]
+    fn every_disk_refusal_is_a_typed_insufficient_disk() {
+        for (err, display) in [
+            (MinerAgentError::InsufficientDisk, "cvm-insufficient-disk"),
+            (
+                MinerAgentError::DataDisk("insufficient-space"),
+                "data-disk/insufficient-space",
+            ),
+            (
+                MinerAgentError::OverlayDisk("insufficient-space"),
+                "overlay-disk/insufficient-space",
+            ),
+        ] {
+            let (rej, line) = capture_detail(&err, "tenant-d");
+            assert_eq!(rej.class, "insufficient-disk", "{display}");
+            assert_eq!(rej.status, StatusCode::INSUFFICIENT_STORAGE, "{display}");
+            assert_eq!(
+                line.as_deref(),
+                Some(
+                    format!(
+                        "hippius-miner-agent: orders: insufficient-disk-detail vm=tenant-d class={display}"
+                    )
+                    .as_str()
+                ),
+            );
+        }
+        for err in [
+            MinerAgentError::DataDisk("create"),
+            MinerAgentError::OverlayDisk("statvfs"),
+        ] {
+            assert_eq!(capture_detail(&err, "t").0.class, "dispatch-failed");
+        }
+    }
+
     /// The already-classified variants are NOT double-logged: their
     /// `class` already names the precise failure, so an extra
     /// `dispatch-failed-detail` line would only pollute the channel.
@@ -835,8 +1447,36 @@ mod tests {
         }
     }
 
+    /// A relaunch refused for missing disks gets its OWN class and a
+    /// `412` — vali keys "stop relaunching here and escalate" off that
+    /// exact string, so it must never flatten into `dispatch-failed`
+    /// (which vali reads as a SEV start failure) or `launch-input`.
+    #[test]
+    fn relaunch_disks_missing_has_its_own_class_and_detail_log() {
+        let err = MinerAgentError::RelaunchDisksMissing("overlay");
+        let (rej, line) = capture_detail(&err, "tenant-x");
+        assert_eq!(rej.class, "relaunch-disks-missing");
+        assert_eq!(rej.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "hippius-miner-agent: orders: relaunch-disks-missing-detail vm=tenant-x \
+                 class=relaunch-disks-missing/overlay"
+            ),
+        );
+    }
+
+    #[test]
+    fn relaunch_disks_unreadable_is_a_retryable_class_of_its_own() {
+        let err = MinerAgentError::RelaunchDisksUnreadable("state-disk");
+        let (rej, line) = capture_detail(&err, "tenant-x");
+        assert_eq!(rej.class, "relaunch-disks-unreadable");
+        assert_eq!(rej.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(line.is_some_and(|l| l.contains("relaunch-disks-unreadable/state-disk")));
+    }
+
     /// `TicketDelivery` is a dedicated arm AND emits a detail-log line
-    /// (codex r2 P3) — the public class `ticket-delivery-failed`
+    /// (review r2 P3) — the public class `ticket-delivery-failed`
     /// flattens five sub-classes; an operator needs the sub-class to
     /// distinguish a guest-listener timeout from a bad payload.
     #[test]
@@ -878,5 +1518,27 @@ mod tests {
                 ),
             );
         }
+    }
+
+    #[test]
+    fn a_replay_echoes_the_original_outcome_class() {
+        // vali's §24 counts a replayed stop as ITS stop only if the guest was
+        // actually `stopped` — a bare "replay" would hide a `not-running`.
+        let store = IdempotencyStore::new();
+        assert_eq!(store.begin("s").unwrap(), BeginOutcome::Claimed);
+        store.finish("s", Some("not-running")).unwrap();
+        assert_eq!(
+            store.begin("s").unwrap(),
+            BeginOutcome::AlreadyOk(Some("not-running".into()))
+        );
+    }
+
+    #[test]
+    fn an_oversize_class_is_not_kept() {
+        let store = IdempotencyStore::new();
+        let long = "x".repeat(MAX_REPLAY_CLASS_LEN + 1);
+        assert_eq!(store.begin("p").unwrap(), BeginOutcome::Claimed);
+        store.finish("p", Some(&long)).unwrap();
+        assert_eq!(store.begin("p").unwrap(), BeginOutcome::AlreadyOk(None));
     }
 }

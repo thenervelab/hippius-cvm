@@ -48,6 +48,7 @@ const CANARIES: &[&str] = &[
 const PINNED_FIELDS: &[&str] = &[
     "v",
     "require_wrapped_kek",
+    "require_wrapped_userdata",
     "max_unconfirmed_releases",
     "volume_stamp_gate_armed",
     "admin_listener_mode",
@@ -75,6 +76,7 @@ const PINNED_FIELDS: &[&str] = &[
 /// section present, every path/URL a canary.
 const CANARY_CONFIG: &str = r#"
 require_wrapped_kek = true
+require_wrapped_userdata = true
 
 [listen]
 addr = "10.11.12.13:8000"
@@ -191,6 +193,7 @@ fn posture_reports_the_resolved_values_the_process_enforces() {
     assert_eq!(posture.max_unconfirmed_releases, Some(3));
     assert!(posture.volume_stamp_gate_armed);
     assert!(posture.require_wrapped_kek);
+    assert!(posture.require_wrapped_userdata);
     // The mode `AdminListenerMode::decide` ACTUALLY picked — material is
     // complete, so mTLS, and it would say so even with require_mtls
     // false (see the next test).
@@ -274,9 +277,18 @@ fn posture_reports_the_listener_mode_decide_picks_not_the_require_mtls_flag() {
         .replace("client_ca_path = \"/etc/CANARY-admin-tls/ca.crt\"\n", "");
     assert_eq!(
         config_posture(&load(&no_material_flag_off)).admin_listener_mode,
+        "refuse",
+        "no material + require_mtls = false alone ⇒ still refused: plaintext needs the dev flag"
+    );
+    let dev_plaintext = no_material_flag_off.replace(
+        "require_mtls = false",
+        "require_mtls = false\ndev_allow_plaintext = true",
+    );
+    assert_eq!(
+        config_posture(&load(&dev_plaintext)).admin_listener_mode,
         "plaintext-opt-in",
-        "no material + the explicit opt-out ⇒ an UNAUTHENTICATED admin API, and the readout \
-         must name that state distinctly"
+        "no material + the explicit dev opt-out ⇒ an UNAUTHENTICATED admin API, and the \
+         readout must name that state distinctly"
     );
 
     let no_material_flag_on = CANARY_CONFIG

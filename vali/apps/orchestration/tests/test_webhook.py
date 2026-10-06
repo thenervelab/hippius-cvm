@@ -48,7 +48,7 @@ def _mk_job(state: str = LaunchJobState.SUCCEEDED.value) -> LaunchJob:
         state=state,
         phase_started_at=timezone.now(),
         finished_at=timezone.now(),
-        miner_id="miner-1",
+        miner_id="miner-a",
         decided_by=sc,
     )
 
@@ -91,7 +91,7 @@ def test_enqueue_creates_pending_delivery(_webhook_on: None) -> None:
     assert d.event == "launch.succeeded"
     assert d.state == WebhookDeliveryState.PENDING.value
     assert d.payload["vm_id"] == "vm-1"
-    assert d.payload["miner_id"] == "miner-1"
+    assert d.payload["miner_id"] == "miner-a"
 
 
 def test_enqueue_failed_job_event_name(_webhook_on: None) -> None:
@@ -194,7 +194,7 @@ def test_finish_enqueues_webhook(
         LaunchJobState.SUCCEEDED,
         reason="",
         result={"ok": True},
-        miner_id="miner-1",
+        miner_id="miner-a",
         phase=LaunchPhase.LAUNCHED,
     )
     d = WebhookDelivery.objects.get()

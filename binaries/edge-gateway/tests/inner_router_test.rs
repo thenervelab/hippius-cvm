@@ -228,6 +228,62 @@ async fn wire_envelope_decodes_through_the_miner_agent_signed_order_shape() {
         .expect("end-to-end verify_strict");
 }
 
+/// `net-policy`: the ticket-validator's encoded body from the shared
+/// vector is signed verbatim, forwarded under its kind, and verifies and
+/// decodes on the miner-agent side into the same content hash.
+#[tokio::test]
+async fn a_net_policy_vector_is_signed_and_decodes_on_the_miner() {
+    use hippius_miner_agent::netpolicy;
+    use hippius_miner_agent::orders::types::{NetPolicyOrder, OrderBody, SignedOrder};
+    use hippius_miner_agent::orders::OrderVerifier;
+    use serde_bytes::ByteBuf;
+
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/net_policy_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let signer = test_signer();
+    let verifier =
+        OrderVerifier::from_hex(&hex::encode(signer.verifying_key().to_bytes())).unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(
+            signer.clone(),
+            forward,
+            "100.100.100.100:9700",
+            "net-policy",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}");
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "{name}");
+        assert_eq!(calls[0].kind, OrderKind::NetPolicy);
+        assert_eq!(calls[0].body, body, "{name}");
+
+        let signed = SignedOrder {
+            body: ByteBuf::from(calls[0].body.clone()),
+            sig: ByteBuf::from(calls[0].sig.to_vec()),
+        };
+        verifier.verify(&signed).unwrap();
+        let order: OrderBody<NetPolicyOrder> = ciborium::de::from_reader(body.as_slice()).unwrap();
+        assert_eq!(order.order_id, vector["order_id"].as_str().unwrap());
+        netpolicy::validate(&order.payload, order.issued_at_unix).unwrap();
+        assert_eq!(
+            netpolicy::content_sha256_hex(&order.payload).unwrap(),
+            case["content_sha256"].as_str().unwrap(),
+            "{name}"
+        );
+    }
+}
+
 // ─── error paths ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -369,6 +425,44 @@ async fn oversize_body_returns_413_before_signing() {
         mock.calls().is_empty(),
         "DefaultBodyLimit must trip before any signing / forwarding"
     );
+}
+
+#[tokio::test]
+async fn a_multipart_order_may_carry_its_part_list() {
+    use hippius_edge_gateway::{MAX_MINER_ORDER_BODY, MAX_MULTIPART_ORDER_BODY};
+    // ~2,600 presigned part URLs: the largest flavor's overlay at the
+    // store's 512 MiB part ceiling. Only the two multipart kinds
+    // (`migrate-snapshot`, `backup`) get the room.
+    let big = vec![0u8; 1_500_000];
+    assert!(big.len() > MAX_MINER_ORDER_BODY);
+
+    for kind in ["migrate-snapshot", "backup", "restore"] {
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(
+            test_signer(),
+            forward,
+            "100.100.100.100:9700",
+            kind,
+            big.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{kind}");
+        assert_eq!(mock.calls().len(), 1, "{kind}");
+    }
+
+    for (kind, body) in [
+        ("launch", big),
+        ("migrate-snapshot", vec![0u8; MAX_MULTIPART_ORDER_BODY + 1]),
+        ("backup", vec![0u8; MAX_MULTIPART_ORDER_BODY + 1]),
+        ("restore", vec![0u8; MAX_MULTIPART_ORDER_BODY + 1]),
+    ] {
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(test_signer(), forward, "100.100.100.100:9700", kind, body).await;
+        assert_eq!(status, 413, "{kind}");
+        assert!(mock.calls().is_empty(), "{kind}: refused before signing");
+    }
 }
 
 // ─── tampered signature scenario (smoke 5b from the PR brief) ───────

@@ -110,8 +110,8 @@ itself. `vali_kbs_recover` enforces this; read its module docstring.
 
 ⚠️ Therefore: do step 4 in a window where you can immediately run
 `vali_kbs_recover` for every live VM, and where you already hold each VM's boot
-counter read off its miner. With one tenant VM live (`realtenant-ubuntu-1`) that
-is a small job — do not let it become a large one.
+counter read off its miner. With few tenant VMs live that is a small job — do
+not let it become a large one.
 
 ---
 
@@ -152,7 +152,9 @@ openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out server.crt -days 825 -extfile server.cnf -extensions ext
 
-# 1c. vali's CLIENT leaf — the SAN URI becomes `peer_san` in the audit chain
+# 1c. vali's CLIENT leaf — the SAN URI becomes `peer_san` in the audit chain.
+#     It must carry ONLY URI SANs, each listed in admin.allowed_client_identities:
+#     the KBS drops a leaf with any DNS/IP/email/otherName SAN, and never reads the CN.
 cat > vali.cnf <<'EOF'
 [req]
 distinguished_name = dn

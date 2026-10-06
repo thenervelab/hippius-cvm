@@ -94,6 +94,20 @@ pub fn report_data(kbs_nonce: &[u8; 32], guest_pub: &[u8; 32]) -> ReportData {
     ReportData::new(rd)
 }
 
+/// Build the 64-byte `REPORT_DATA` of a release by a guest that speaks
+/// **stamp protocol v2** (a timeline-bound volume stamp):
+/// [`hippius_types::report_data::tenant_stamp_v2`] — `[0..32]` is
+/// `SHA-256(v2 domain ‖ nonce)` instead of the bare nonce, `[32..64]` the
+/// same X25519 key. This is the guest's ONLY v2 claim, and the KBS reads
+/// it from nowhere else: it is inside the PSP-signed report, so the miner
+/// relaying the release can neither forge it for an older guest nor strip
+/// it from this one.
+pub fn stamp_v2_report_data(kbs_nonce: &[u8; 32], guest_pub: &[u8; 32]) -> ReportData {
+    ReportData::new(hippius_types::report_data::tenant_stamp_v2(
+        kbs_nonce, guest_pub,
+    ))
+}
+
 /// Build the 64-byte `REPORT_DATA` value for a §322 live-attestation
 /// keepalive report — single source of truth for the layout (same
 /// structural-enforcement story as [`report_data`]).
@@ -109,6 +123,58 @@ pub fn live_attestation_report_data(
 ) -> Result<ReportData, AgentError> {
     let rd = hippius_types::report_data::live_attestation(kbs_nonce, vm_id)
         .map_err(|_| AgentError::SnpDevice("live-attestation-rd-build"))?;
+    Ok(ReportData::new(rd))
+}
+
+/// Build the 64-byte `REPORT_DATA` of a keepalive report that also
+/// attests the guest's resources — same single-source-of-truth role as
+/// [`live_attestation_report_data`], wrapping
+/// `hippius_types::report_data::live_attestation_with_resources`.
+pub fn live_attestation_resources_report_data(
+    kbs_nonce: &[u8; 32],
+    vm_id: &str,
+    resources: &hippius_types::live_attestation::GuestResources,
+) -> Result<ReportData, AgentError> {
+    let rd =
+        hippius_types::report_data::live_attestation_with_resources(kbs_nonce, vm_id, resources)
+            .map_err(|_| AgentError::SnpDevice("live-attestation-rd-build"))?;
+    Ok(ReportData::new(rd))
+}
+
+/// Build the 64-byte `REPORT_DATA` of a keepalive report that attests the
+/// guest components release and its health (and the resources, when
+/// given) — wrapping
+/// `hippius_types::report_data::live_attestation_with_components`.
+pub fn live_attestation_components_report_data(
+    kbs_nonce: &[u8; 32],
+    vm_id: &str,
+    components: &hippius_types::live_attestation::GuestComponents,
+    resources: Option<&hippius_types::live_attestation::GuestResources>,
+) -> Result<ReportData, AgentError> {
+    let rd = hippius_types::report_data::live_attestation_with_components(
+        kbs_nonce, vm_id, components, resources,
+    )
+    .map_err(|_| AgentError::SnpDevice("live-attestation-rd-build"))?;
+    Ok(ReportData::new(rd))
+}
+
+/// Build the 64-byte `REPORT_DATA` of a customer-held-keys **guardian**
+/// release — single source of truth for the layout, same structural
+/// enforcement as [`report_data`].
+///
+/// Wraps [`hippius_types::report_data::guardian`]: `SHA-256(domain ‖
+/// nonce ‖ u16be len ‖ vm_id ‖ u32be share_c_version) ‖ guest_pub`. It
+/// is domain-separated from the KBS layout (`nonce ‖ guest_pub`), so a
+/// report made for one party never verifies at the other.
+pub fn guardian_report_data(
+    guardian_nonce: &[u8; 32],
+    vm_id: &str,
+    guest_pub: &[u8; 32],
+    share_c_version: Option<u32>,
+) -> Result<ReportData, AgentError> {
+    let rd =
+        hippius_types::report_data::guardian(guardian_nonce, vm_id, guest_pub, share_c_version)
+            .map_err(|_| AgentError::SnpDevice("guardian-rd-build"))?;
     Ok(ReportData::new(rd))
 }
 
@@ -149,6 +215,15 @@ pub fn request(
 ) -> Result<SnpReport, AgentError> {
     let rd = report_data(kbs_nonce, guest_pub);
     provider.get_report(rd)
+}
+
+/// [`request`] with the stamp-protocol-v2 layout ([`stamp_v2_report_data`]).
+pub fn request_stamp_v2(
+    provider: &dyn SnpReportProvider,
+    kbs_nonce: &[u8; 32],
+    guest_pub: &[u8; 32],
+) -> Result<SnpReport, AgentError> {
+    provider.get_report(stamp_v2_report_data(kbs_nonce, guest_pub))
 }
 
 /// Byte offset of the `MEASUREMENT` field inside a `struct
@@ -247,6 +322,36 @@ impl SnpReportProvider for MockSnpReportProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guardian_report_data_is_the_hippius_types_layout() {
+        let nonce = [0x11u8; 32];
+        let pk = [0x22u8; 32];
+        for v in [None, Some(3)] {
+            let rd = guardian_report_data(&nonce, "vm-1", &pk, v).unwrap();
+            let want = hippius_types::report_data::guardian(&nonce, "vm-1", &pk, v).unwrap();
+            assert_eq!(rd.as_bytes(), &want);
+            // Never the KBS layout.
+            assert_ne!(rd.as_bytes(), report_data(&nonce, &pk).as_bytes());
+        }
+        assert!(matches!(
+            guardian_report_data(&nonce, "vm-1", &pk, Some(0)),
+            Err(AgentError::SnpDevice("guardian-rd-build"))
+        ));
+    }
+
+    #[test]
+    fn the_stamp_v2_layout_is_the_hippius_types_one_and_never_the_v1_one() {
+        let nonce = [0x11; 32];
+        let pk = [0x22; 32];
+        let rd = stamp_v2_report_data(&nonce, &pk);
+        assert_eq!(
+            rd.as_bytes(),
+            &hippius_types::report_data::tenant_stamp_v2(&nonce, &pk)
+        );
+        assert_ne!(rd.as_bytes(), report_data(&nonce, &pk).as_bytes());
+        assert_eq!(&rd.as_bytes()[32..], &pk);
+    }
 
     #[test]
     fn report_data_layout_is_exact() {

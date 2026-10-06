@@ -23,10 +23,11 @@
 //! `register-vm` ships the verified-ticket write. `activate` (§25 M2 —
 //! the destination re-activation fence, `Active → Migrating`) ships a
 //! JSON request ([`AdminActivateRequest`]) + response
-//! ([`AdminActivateResponse`]). The `decommission` / `crypto-erase` ops
-//! referenced by `vali/apps/orchestration/effects.py` (§24) remain
-//! follow-ups; their handlers return 501 until implemented. `AdminOp`
-//! carries the full enum today so the wire shape is locked at v1.
+//! ([`AdminActivateResponse`]). The §24 fences `decommission` and
+//! `tombstone` take [`AdminDecommissionRequest`] /
+//! [`AdminTombstoneRequest`] and answer [`AdminFenceResponse`]. The §24
+//! crypto-erase itself is vali's Vault-Transit key destroy; the KBS
+//! serves no `crypto-erase` route.
 
 #[allow(unused_imports)]
 use alloc::{
@@ -46,12 +47,19 @@ pub enum AdminOp {
     /// `cur.is_none() || cur == Some(Active { gen, host, lease_id })`.
     /// Idempotent on identical state.
     RegisterVm,
-    /// Phase B — Active → Decommissioning. Currently 501.
+    /// §24 fence — Active | Migrating | absent → Decommissioning. Body is
+    /// [`AdminDecommissionRequest`].
     Decommission,
-    /// Phase B — Decommissioning → Destroyed{gen}. Currently 501.
+    /// Not served: the §24 crypto-erase is vali's Vault-Transit key
+    /// destroy, not a KBS write. Kept so the v1 discriminator set stays
+    /// stable.
     CryptoErase,
-    /// §25 M2 — Active → Migrating{new_gen, dest}: the destination
-    /// re-activation fence. Body is [`AdminActivateRequest`].
+    /// §24 permanent marker — any state | absent → Destroyed{gen}. Body
+    /// is [`AdminTombstoneRequest`].
+    Tombstone,
+    /// §25 M2 — Active | Migrating → Migrating{new_gen, dest}: the
+    /// destination re-activation fence (a VM that already migrated moves
+    /// on from its `Migrating` row). Body is [`AdminActivateRequest`].
     Activate,
     /// Operator disaster recovery — restore a WIPED per-VM boot counter
     /// to the value recovered from the miner-side state disk. Refuses
@@ -83,6 +91,12 @@ pub enum AdminOp {
     /// from the signed release response. Empty request body; response is
     /// [`AdminArmBootCounterResyncResponse`].
     ArmBootCounterResync,
+    /// Operator recovery for the keepalive binding records
+    /// (`kbs_core::keepalive_binding`) after a pod restart wiped them:
+    /// re-establish the `(CHIP_ID, REPORT_ID)` of the guest a VM was last
+    /// released to. Fills an EMPTY row only (409 otherwise). Body is
+    /// [`AdminSeedKeepaliveBindingRequest`].
+    SeedKeepaliveBinding,
 }
 
 impl AdminOp {
@@ -93,10 +107,12 @@ impl AdminOp {
             AdminOp::RegisterVm => "register-vm",
             AdminOp::Decommission => "decommission",
             AdminOp::CryptoErase => "crypto-erase",
+            AdminOp::Tombstone => "tombstone",
             AdminOp::Activate => "activate",
             AdminOp::SeedBootCounter => "seed-boot-counter",
             AdminOp::ResetVolumeStampSuppression => "reset-volume-stamp-suppression",
             AdminOp::ArmBootCounterResync => "arm-boot-counter-resync",
+            AdminOp::SeedKeepaliveBinding => "seed-keepalive-binding",
         }
     }
 }
@@ -140,6 +156,46 @@ pub struct AdminSeedBootCounterResponse {
     /// The value now stored. The guest's next boot must submit
     /// `counter + 1`.
     pub counter: u64,
+}
+
+/// Request body for `POST /v1/admin/vm/{vm_id}/seed-keepalive-binding`.
+///
+/// A pod restart wipes the KBS state dir, and with it every keepalive
+/// binding record. vali holds the last `(CHIP_ID, REPORT_ID)` the KBS
+/// itself signed into a release-bound live attestation for the VM, and
+/// posts it here. The KBS writes it only into an EMPTY row, at a position
+/// before every real release, so the guest's next release always
+/// supersedes it. Replies:
+///
+/// - 200 `seeded:true, matched:false` — written.
+/// - 200 `seeded:false, matched:true` — a record already names this same
+///   guest; nothing written (a retry, or the guest's own release).
+/// - 409 `binding-already-recorded` — a record names a DIFFERENT guest.
+/// - 409 `binding-poisoned` — a release committed but its guest could not
+///   be recorded; only a release at or after it clears that, never a seed.
+/// - 412 `binding-vm-not-active` — no releasable lifecycle row.
+/// - 412 `binding-chip-not-host` — the chip is not the row's host.
+/// - 400 — malformed input (see the handler for the reasons).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSeedKeepaliveBindingRequest {
+    /// The guest's SNP `CHIP_ID`: 64 bytes, 128 lower-case hex chars.
+    pub chip_id_hex: String,
+    /// The guest's SNP `REPORT_ID`: 32 bytes, 64 lower-case hex chars,
+    /// not all zero.
+    pub report_id_hex: String,
+}
+
+/// 200 OK body for `POST /v1/admin/vm/{vm_id}/seed-keepalive-binding`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSeedKeepaliveBindingResponse {
+    /// Schema version (always 1 for now).
+    pub v: u32,
+    /// The VM whose binding was seeded (echoed from the URL).
+    pub vm_id: String,
+    /// `true` ⇒ the record was written.
+    pub seeded: bool,
+    /// `true` ⇒ a record already named this same guest; nothing written.
+    pub matched: bool,
 }
 
 /// 200 OK body for `POST /v1/admin/vm/{vm_id}/reset-volume-stamp-suppression`.
@@ -309,6 +365,12 @@ pub struct AdminConfigPostureResponse {
     /// which is exactly the kind of change this endpoint exists to make
     /// observable.
     pub require_wrapped_kek: bool,
+    /// §6 — `true` ⇒ this process REFUSES a userdata that is not
+    /// Transit-wrapped at rest. The userdata counterpart of
+    /// [`Self::require_wrapped_kek`], and observable for the same reason:
+    /// an omitted config key reads `false`, and "am I still accepting
+    /// plaintext cloud-init at rest?" has no other answer from outside.
+    pub require_wrapped_userdata: bool,
     /// The RESOLVED suppressed-confirm bound (`kbs_core::volume_stamp`)
     /// gate 5c is enforcing. `None` ⇒ the gate is DISABLED. Identical
     /// to [`AdminVolumeStampReportResponse::configured_bound`] — same
@@ -444,7 +506,8 @@ pub struct AdminActivateResponse {
     pub v: u32,
     /// The VM that was re-activated for migration.
     pub vm_id: String,
-    /// The fenced-out source generation (the KBS's prior `Active{gen}`).
+    /// The fenced-out source generation (the KBS's prior `Active{gen}`, or
+    /// the prior `Migrating{new_gen}` for a VM that already migrated).
     pub old_gen: u64,
     /// The destination generation that may now unlock.
     pub new_gen: u64,
@@ -453,6 +516,102 @@ pub struct AdminActivateResponse {
     /// `true` ⇒ the VM was already `Migrating` to this exact
     /// `(new_gen, dest)` — an idempotent re-drive, no fresh write.
     pub cached: bool,
+}
+
+/// Request body for `POST /v1/admin/vm/{vm_id}/decommission` — the §24
+/// KBS fence vali posts (as JSON) right after its own decommission CAS,
+/// before the crypto-erase. Carries nothing but the schema version: the
+/// transition (`Active | Migrating | absent` → `Decommissioning`) needs no
+/// input, so there is nothing a caller could get wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminDecommissionRequest {
+    pub v: u32,
+}
+
+/// Request body for `POST /v1/admin/vm/{vm_id}/tombstone` — the permanent
+/// `Destroyed{gen}` marker vali posts when §24 destroys the VM, and again
+/// from `vali_kbs_recover --reinstall-tombstones` after a KBS restart
+/// wiped the store (`vali_kbs_recover --reinstall-tombstones`, which
+/// ships with the vali half of the fence).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminTombstoneRequest {
+    pub v: u32,
+    /// The generation recorded in the tombstone (vali's `Vm.generation`).
+    pub gen: u64,
+}
+
+/// 200 body for both fence routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminFenceResponse {
+    pub v: u32,
+    pub vm_id: String,
+    /// The KBS lifecycle state before this call: `absent`, `active`,
+    /// `migrating`, `decommissioning` or `destroyed`.
+    pub previous: String,
+    /// The state after it: `decommissioning` or `destroyed`.
+    pub state: String,
+    /// `true` ⇒ nothing was written (the VM was already fenced at least
+    /// this far).
+    pub cached: bool,
+}
+
+/// The custody-lease fleet parameters (`GET /v1/admin/custody`, and the
+/// JSON body of `POST /v1/admin/custody/policy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCustodyPolicy {
+    pub v: u32,
+    pub ttl_s: u32,
+    pub stage2_s: u32,
+    pub renew_s: u32,
+}
+
+/// One bound guest in `GET /v1/admin/custody`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCustodyRow {
+    pub vm_id: String,
+    pub generation: u64,
+    pub boot_counter: u64,
+    pub node: String,
+    pub bound_at: u64,
+    pub last_request_at: u64,
+    /// `None` ⇒ never granted since this binding.
+    pub last_grant_at: Option<u64>,
+    /// Seconds since the last Grant (or since the bind).
+    pub age_s: u64,
+    /// `granted` / `revoked` / `superseded` / `none`.
+    pub last_verdict: String,
+    /// Guest-reported: `armed` / `suspended` / `unbound`.
+    pub phase: String,
+    /// Guest-reported seconds since IT last received a Grant. Unlike
+    /// `age_s` (KBS side), this sees a relay that forwards requests but
+    /// drops the answers.
+    pub since_last_grant_s: u32,
+    pub suspended_s: u32,
+    /// The mode the guest CLAIMS (`untrusted` / `secure_tsc`).
+    pub clock_mode: String,
+    /// Whether the KBS can vouch for the guest clock. Always `false`
+    /// until Secure TSC is provable from the launch measurement.
+    pub clock_trusted: bool,
+    pub lag_s: i64,
+    pub skew_suspected: bool,
+    pub rebinds_1h: u32,
+}
+
+/// 200 body for `GET /v1/admin/custody`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCustodyReport {
+    pub v: u32,
+    /// `false` ⇒ the custody routes answer 404 and `vms` is empty.
+    pub enabled: bool,
+    pub policy: Option<AdminCustodyPolicy>,
+    pub now: u64,
+    pub vms: Vec<AdminCustodyRow>,
 }
 
 /// 200 body for `POST /v1/admin/allowlist/reload`. Confirms what the
@@ -478,6 +637,56 @@ pub struct AdminReloadAllowlistResponse {
     /// mangled in transit) and the install would have already
     /// rejected on signature; included for belt-and-suspenders.
     pub sha256_hex: String,
+}
+
+/// Hard cap on the entries one `GET /v1/admin/audit` page returns. A
+/// larger `limit` is clamped to it, never refused, so a reader cannot
+/// tell a cap from the end of the log except by `head_seq`.
+pub const ADMIN_AUDIT_PAGE_MAX: u32 = 500;
+
+/// One persisted record of a KBS hash-chained audit log, exactly as it
+/// sits on disk (`{seq}:{hex(body)}:{hex(sha256)}`).
+///
+/// `body_cbor_hex` and `sha256_hex` are the stored bytes, NOT recomputed:
+/// the reader recomputes `sha256(body)` and checks `prev_hash_hex`
+/// against the previous entry's `sha256_hex` itself — the KBS vouching
+/// for its own chain would prove nothing. `prev_hash_hex` is the
+/// `prev_hash` field decoded out of the body, surfaced so a reader can
+/// follow the chain without a CBOR decoder; it is only a convenience and
+/// a reader that decodes the body must find the same value there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAuditEntry {
+    pub seq: u64,
+    pub body_cbor_hex: String,
+    pub sha256_hex: String,
+    pub prev_hash_hex: String,
+}
+
+/// 200 body for `GET /v1/admin/audit?log=<admin|release>&after_seq=N&limit=M`.
+///
+/// `genesis_hash_hex` is the `sha256` of record `seq=0` — the identity
+/// of THIS chain. The audit logs live on an emptyDir inside the KBS CVM,
+/// so a pod restart starts a new chain at `seq=0` with a different
+/// genesis: a reader tells "the KBS restarted" (new genesis) from "the
+/// chain was cut" (same genesis, `head_seq` below what it already holds)
+/// by this field alone. `None` (with `head_seq: None` and an all-zero
+/// `head_hash_hex`) ⇔ the log is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAuditPageResponse {
+    /// Schema version (always 1 for now).
+    pub v: u32,
+    /// `"admin"` or `"release"` — echoes the query.
+    pub log: String,
+    pub genesis_hash_hex: Option<String>,
+    /// Highest `seq` in the log when the page was cut.
+    pub head_seq: Option<u64>,
+    /// `sha256` of record `head_seq` (64 zeros when the log is empty).
+    pub head_hash_hex: String,
+    /// Records `after_seq+1 ..= min(after_seq+limit, head_seq)`, in order,
+    /// none skipped.
+    pub entries: Vec<AdminAuditEntry>,
 }
 
 /// 4xx body (400/401/403/409/429). Symmetric across error codes so
@@ -513,6 +722,7 @@ mod tests {
         assert_eq!(AdminOp::RegisterVm.path_segment(), "register-vm");
         assert_eq!(AdminOp::Decommission.path_segment(), "decommission");
         assert_eq!(AdminOp::CryptoErase.path_segment(), "crypto-erase");
+        assert_eq!(AdminOp::Tombstone.path_segment(), "tombstone");
         assert_eq!(AdminOp::Activate.path_segment(), "activate");
         assert_eq!(AdminOp::SeedBootCounter.path_segment(), "seed-boot-counter");
         assert_eq!(
@@ -523,6 +733,36 @@ mod tests {
             AdminOp::ArmBootCounterResync.path_segment(),
             "arm-boot-counter-resync"
         );
+        assert_eq!(
+            AdminOp::SeedKeepaliveBinding.path_segment(),
+            "seed-keepalive-binding"
+        );
+    }
+
+    #[test]
+    fn admin_seed_keepalive_binding_round_trips() {
+        let r = AdminSeedKeepaliveBindingRequest {
+            chip_id_hex: "11".repeat(64),
+            report_id_hex: "22".repeat(32),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&r, &mut bytes).unwrap();
+        let back: AdminSeedKeepaliveBindingRequest =
+            ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.chip_id_hex, r.chip_id_hex);
+        assert_eq!(back.report_id_hex, r.report_id_hex);
+        let resp = AdminSeedKeepaliveBindingResponse {
+            v: 1,
+            vm_id: "vm-1".into(),
+            seeded: true,
+            matched: false,
+        };
+        let mut rbytes = Vec::new();
+        ciborium::ser::into_writer(&resp, &mut rbytes).unwrap();
+        let rback: AdminSeedKeepaliveBindingResponse =
+            ciborium::de::from_reader(rbytes.as_slice()).unwrap();
+        assert!(rback.seeded);
+        assert_eq!(rback.vm_id, "vm-1");
     }
 
     #[test]
@@ -553,6 +793,7 @@ mod tests {
         let r = AdminConfigPostureResponse {
             v: 1,
             require_wrapped_kek: true,
+            require_wrapped_userdata: true,
             max_unconfirmed_releases: Some(3),
             volume_stamp_gate_armed: true,
             admin_listener_mode: "mtls".into(),
@@ -655,7 +896,7 @@ mod tests {
             ticket_id: "tk-1".into(),
             vm_id: "vm-1".into(),
             vm_generation: 3,
-            host: "chip-aa84a3f0".into(),
+            host: "chip-0a1b2c3d".into(),
             lease_id: "lease-q2".into(),
             applied_at: 1700000000,
             cached: false,

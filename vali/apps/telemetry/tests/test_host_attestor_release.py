@@ -142,17 +142,26 @@ class FakePin:
         *,
         measurement_hex: str,
         measurement_class: str = allowlist_pin.ALLOWLIST_CLASS_TENANT,
+        ledger: allowlist_pin.PinLedger | None = None,
         **_: Any,
     ) -> allowlist_pin.PinResult:
         self.calls.append(
-            {"measurement_hex": measurement_hex, "measurement_class": measurement_class}
+            {
+                "measurement_hex": measurement_hex,
+                "measurement_class": measurement_class,
+                "ledger": ledger,
+            }
         )
         self.epoch += 1
-        return allowlist_pin.PinResult(
+        result = allowlist_pin.PinResult(
             new_epoch=self.epoch,
             new_cose_sha256_hex="00" * 32,
             s3_url="s3://x/y",
         )
+        if ledger is not None:
+            # What the real pin does under its lock once the KBS installed.
+            allowlist_pin._record_ledger(ledger, measurement_hex, measurement_class, result)
+        return result
 
 
 @pytest.fixture
@@ -178,6 +187,7 @@ def _release_body(**overrides: Any) -> dict[str, Any]:
     body = {
         "measurement_hex": MEAS_A,
         "version": "v1",
+        "generation": "genoa",
         "artifact_b64": _ARTIFACT_B64,
         "cosign_signature_b64": _SIG_B64,
         "cosign_certificate_pem": _CERT_PEM,
@@ -203,13 +213,70 @@ def test_release_cosign_ok_pins_host_attestor_class(
     assert row.is_active is True
     assert row.cosign_identity == "https://ci/workflow.yml@refs/heads/main"
     assert resp.data["allowlist_epoch"] == fake_pin.epoch
-    # The audit ledger records the HOST-ATTESTOR class. The §22
-    # carry-forward reads this column as a veto: a blank/`tenant` value
-    # here would let a later re-pin re-emit this measurement as tenant.
+    # The pin records the audit-ledger row (under its lock, with the pin's
+    # HOST-ATTESTOR class — the §22 carry-forward reads that column as a
+    # veto: a blank/`tenant` value would let a later re-pin re-emit this
+    # measurement as tenant).
+    assert fake_pin.calls[0]["ledger"] == allowlist_pin.PinLedger(
+        vm_id="host-attestor-release"
+    )
+
+
+def test_a_release_row_failure_after_the_install_keeps_the_ledger_row(
+    fake_cosign: FakeCosign, fake_pin: FakePin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step 3 fails AFTER the KBS installed the measurement: the pin's
+    ledger row must still commit — it is the epoch floor and the class
+    veto that stops a later pin re-emitting this measurement as tenant —
+    while the half-written release row rolls back and the error surfaces."""
     from apps.orchestration.models import MeasurementLedger
 
-    ledger = MeasurementLedger.objects.get(launch_digest_hex=MEAS_A)
-    assert ledger.measurement_class == "host_attestor"
+    def boom(generation: str) -> None:
+        raise RuntimeError("db hiccup in step 3")
+
+    monkeypatch.setattr(release_service, "_trim_grace_window", boom)
+
+    with pytest.raises(RuntimeError, match="db hiccup in step 3"):
+        release_service.admit_release(
+            measurement_hex=MEAS_A,
+            version="v1",
+            generation="genoa",
+            artifact=b"a-blackbox-uki-blob",
+            signature_b64=_SIG_B64,
+            certificate_pem=_CERT_PEM,
+        )
+
+    assert len(fake_pin.calls) == 1
+    row = MeasurementLedger.objects.get(vm_id="host-attestor-release")
+    assert row.launch_digest_hex == MEAS_A
+    assert row.measurement_class == allowlist_pin.ALLOWLIST_CLASS_HOST_ATTESTOR
+    assert not HostAttestorRelease.objects.filter(measurement=MEAS_A).exists()
+
+
+def test_a_generation_conflict_raced_in_before_the_lock_is_refused_unpinned(
+    admin_client: APIClient,
+    fake_cosign: FakeCosign,
+    fake_pin: FakePin,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generation pre-check runs before cosign, outside the pin lock. A
+    conflicting release recorded in that window is caught UNDER the lock,
+    before the pin — not in step 3, after the KBS already installed it."""
+    real_verify = fake_cosign.verify_blob
+
+    def verify_while_milan_is_admitted(**kwargs: Any) -> cosign_verify.CosignPins:
+        _active_release(MEAS_A, generation="milan")
+        return real_verify(**kwargs)
+
+    monkeypatch.setattr(
+        release_service.cosign_verify, "verify_blob", verify_while_milan_is_admitted
+    )
+
+    resp = admin_client.post(RELEASE_URL, _release_body(generation="genoa"), format="json")
+
+    assert resp.status_code == 409, resp.data
+    assert resp.data["category"] == "generation-conflict"
+    assert fake_pin.calls == []
 
 
 def test_release_rejects_unsigned_no_pin_no_row(
@@ -268,6 +335,13 @@ def test_desired_returns_current_and_previous_grace_window(
     )
     assert b.status_code == 201
 
+    # The window served is the miner's generation's: register NODE_1 as a
+    # 64-byte-CHIP_ID (⇒ genoa) host, the generation both were admitted for.
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.create(
+        miner_id="miner-a", pubkey_hex="ab" * 32, platform_id=CHIP_1, chain_node_id=NODE_1
+    )
     url = reverse("host_attestor_desired", args=[NODE_1])
     resp = APIClient().get(url)
     assert resp.status_code == 200
@@ -340,9 +414,9 @@ def _fake_chain(monkeypatch: pytest.MonkeyPatch, node_ids: list[str]) -> None:
     )
 
 
-def _active_release(measurement: str) -> None:
+def _active_release(measurement: str, generation: str = "") -> None:
     HostAttestorRelease.objects.create(
-        measurement=measurement, version="v1", is_active=True
+        measurement=measurement, version="v1", is_active=True, generation=generation
     )
 
 

@@ -1,0 +1,35 @@
+#!/bin/sh
+# initramfs-tools hook: the initramfs DHCP client presents the raw-MAC
+# client-id (option 61 = 01:<MAC>), the same one the booted guest's
+# systemd-networkd sends (50-hippius-dhcp.network, ClientIdentifier=mac).
+#
+# Why: the miner's dnsmasq keys a lease on the client-id. Ubuntu 24.04's
+# initramfs-tools runs dhcpcd (hooks/dhcpcd), whose generated
+# /etc/dhcpcd.conf says `duid ll`: client-id = IAID + DUID-LL, not
+# 01:<MAC>. dnsmasq then sees two clients on one NIC and gives userspace a
+# SECOND lease; hippius-net-teardown flushes the initramfs address, so the
+# guest keeps one, but dnsmasq holds the first lease until it expires
+# (#289 multi-IP). dhcpcd's `clientid` sends the hardware address instead.
+#
+# Hooks under /etc/initramfs-tools/hooks run AFTER every
+# /usr/share/initramfs-tools/hooks one, so the stock dhcpcd hook has
+# already written DESTDIR/etc/dhcpcd.conf. A no-op where the initramfs has
+# no dhcpcd (Debian 12/13 run klibc ipconfig, which sends no client-id at
+# all; dnsmasq then keys on the MAC, as networkd's 01:<MAC> resolves to).
+# tenant-image-bake.sh re-checks the shipped initrd (exit 3).
+
+PREREQ=""
+prereqs() { echo "${PREREQ}"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+set -e
+: "${DESTDIR:?DESTDIR unset — not run by mkinitramfs}"
+conf="${DESTDIR}/etc/dhcpcd.conf"
+[ -f "${conf}" ] || exit 0
+
+# Drop every `duid` line (any DUID type), then ask for the MAC client-id.
+sed -i '/^[[:space:]]*duid\([[:space:]]\|$\)/d' "${conf}"
+grep -qx 'clientid' "${conf}" || printf '\n# hippius: client-id = 01:<MAC>, as the booted guest sends (#289)\nclientid\n' >> "${conf}"
+exit 0

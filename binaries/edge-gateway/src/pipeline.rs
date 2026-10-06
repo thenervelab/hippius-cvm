@@ -384,7 +384,7 @@ pub async fn relay_once(
     // false — no double-attribution downstream. PR-H4: key is the
     // mTLS-derived `PeerId`, not the socket IP.
     //
-    // Codex nit on PR-H3 v1: the "accepted" log used to fire BEFORE
+    // Review nit on PR-H3 v1: the "accepted" log used to fire BEFORE
     // this check, doubling log volume under a flood. Moved here so
     // shed envelopes log exactly once ("rate-limited") instead of
     // twice ("accepted" + "rate-limited").

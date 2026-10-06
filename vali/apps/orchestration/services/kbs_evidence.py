@@ -34,7 +34,8 @@ def fetch_evidence(vm_id: str) -> dict[str, Any] | None:
     and the archive does not survive a KBS restart. So absence is
     genuinely AMBIGUOUS between "never attested" and "attested but
     unrecorded", and callers must not render it as a negative attestation
-    verdict (see `VmAttestationView.attestation_status`).
+    verdict. The VM's live attestations are the restart-proof source
+    (see `apps.lifecycle.attestation`).
 
     Raises [`EffectUnavailable`] if the KBS admin endpoint is unreachable
     / unconfigured, [`EffectError`] on a non-200/404 status or a malformed

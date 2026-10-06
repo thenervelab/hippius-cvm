@@ -17,7 +17,7 @@
 # read its signing seed) → the Edge's admission poller goes
 # `registry-unhealthy` → the Edge FAILS CLOSED and rejects every NEW miner
 # mTLS handshake. The fleet looked healthy because the miners that never
-# dropped their socket kept streaming; miner-2 rebooted, could not
+# dropped their socket kept streaming; a miner that rebooted could not
 # re-handshake, and stayed dark for ~2 days.
 #
 # A periodic token renews ITSELF via `auth/token/renew-self` (in the

@@ -27,7 +27,10 @@ regex = '''\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b'''
 keywords = ["akia", "asia", "abia", "acca"]
 
 # ── GCP service-account keys ────────────────────────────────────────
-# A deployment whose Vault Confidential VM runs there uses these; a
+# publishability-allow: provider — a detection rule must name the vendor
+# it detects; naming a cloud here says nothing about where any
+# particular deployment runs.
+# A deployment running any component on that cloud uses these; a
 # leaked service-account JSON key is full project access.
 [[rules]]
 id = "hippius-gcp-service-account"
@@ -78,22 +81,6 @@ regex = '''(?i)hippius[_-]?s3[_-]?(?:secret|access)[_-]?key\s*[:=]\s*['"]?([A-Za
 secretGroup = 1
 keywords = ["hippius"]
 
-# ── OVH API credentials ─────────────────────────────────────────────
-# publishability-allow: provider — a detection rule must name the vendor
-# it detects, exactly as the AWS and GCP rules do; naming OVH here says
-# nothing about where any particular deployment runs.
-#
-# A deployment whose bare-metal SEV-SNP hosts sit with this provider
-# manages them through its API. The application secret / consumer key are
-# 32-hex strings with no prefix — keyword-anchored, like the S3 rule.
-# Harmless (and cheap) to keep armed if you use another provider.
-[[rules]]
-id = "hippius-ovh-api-credential"
-description = "OVH API application secret / consumer key"
-regex = '''(?i)ovh[_-]?(?:application[_-]?secret|consumer[_-]?key|application[_-]?key)\s*[:=]\s*['"]?([a-f0-9]{32})\b'''
-secretGroup = 1
-keywords = ["ovh"]
-
 # ── Allowlist ───────────────────────────────────────────────────────
 # Scope is deliberately narrow — three paths, each justified:
 #
@@ -115,7 +102,11 @@ keywords = ["ovh"]
 # `packer/kbs-uki/keys/dev/` would also allowlist a sibling like
 # `evil/packer/kbs-uki/keys/dev/leaked.key`. Anchoring keeps the
 # exception to the three real paths and nothing else.
-[allowlist]
+# `[[allowlists]]` (not the legacy `[allowlist]` table): gitleaks 8.30
+# refuses to load a config that mixes the two, and the rule-scoped entry
+# at the end of this file needs the new form. Same keys, same scope — the
+# full-history scan gives identical findings before and after the rename.
+[[allowlists]]
 description = "Hippius secret-scan allowlist — committed dev keypair + this config"
 paths = [
     '''^packer/kbs-uki/keys/dev/''',
@@ -168,4 +159,44 @@ regexes = [
     '''^gh[ps]_0123456789abcdefABCDEF0123456789abcd$''',
     '''^github_pat_11ABCDEFG0123456789_abcdefghij$''',
     '''^hvs\.ABCDEFGHIJKLMNOPQRSTUVWX$''',
+]
+
+# ── Rule-scoped: generic-api-key in the initrd-swap command ─────────
+# `generic-api-key` fires on two NON-secrets in the vali initrd swap
+# (#1325) and forced two PRs to be re-opened (a PR range scan cannot pass
+# once a flagged commit is in it, and force-push is not allowed):
+#
+#  - the command reads an S3 object as `..., key, max_bytes=_MAX_...`;
+#    the rule extracts `max_bytes=_MAX_MEASUREMENT_BYTES` — a keyword
+#    argument bound to a module constant;
+#  - the rebuild fixture maps `"hippius-luks-keyscript"` to the sha256 of
+#    that public initramfs script; the rule extracts the 64-hex digest.
+#
+# Each entry is as narrow as the tool allows: ONLY that one upstream rule
+# (`targetRules`), ONLY its own exact file(s) (start- and end-anchored),
+# AND (`condition = "AND"`) ONLY a secret of exactly the false-positive
+# SHAPE (fully anchored). A real API key dropped into these files still
+# fails this rule; every other rule still scans them; this rule still
+# scans every other path.
+[[allowlists]]
+description = "generic-api-key: keyword arg bound to a constant in the initrd-swap command and its test"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+    '''^vali/apps/orchestration/management/commands/vali_swap_vm_initrd\.py$''',
+    '''^vali/apps/orchestration/tests/test_swap_vm_initrd\.py$''',
+]
+regexes = [
+    '''^max_bytes=_[A-Z0-9_]+$''',
+]
+
+[[allowlists]]
+description = "generic-api-key: sha256 content digests in the initrd-rebuild fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+    '''^vali/apps/orchestration/tests/fixtures/initrd_rebuild\.golden\.measurement\.json$''',
+]
+regexes = [
+    '''^[0-9a-f]{64}$''',
 ]

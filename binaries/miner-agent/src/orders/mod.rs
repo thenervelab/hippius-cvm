@@ -33,6 +33,10 @@
 //!   guest-signed source stopped-ack to vali's `poll_source_ack`
 //! - `POST /v1/miner/migration/{vm_id}/source-ack` — §25 M2 ingest the
 //!   guest-signed source stopped-ack into the store
+//! - `POST /v1/miner/order/restore`  — [`RestoreOrder`] (staged restore)
+//! - `POST /v1/miner/order/net-policy` — [`NetPolicyOrder`] (host-wide;
+//!   persisted, not applied yet)
+//! - `GET  /v1/miner/restore/{vm_id}/status` — staged-restore status
 //! - `GET  /v1/miner/vm/{vm_id}/domain-state` — read-only tenant-domain
 //!   liveness probe for the reboot-recovery reconcile loop (NOT a
 //!   signed order — no lifecycle change, no secret)
@@ -71,9 +75,10 @@ pub use migration::{
     SnapshotUploader, SourceAckInputs, StagedArtifact,
 };
 pub use types::{
-    DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder, MigrateQuiesceOrder,
-    MigrateSnapshotOrder, Order, OrderBody, OrderKind, PreflightArtifact, SignedOrder, StopOrder,
-    TenantPreflightOrder, ORDER_DOMAIN,
+    BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
+    MigrateQuiesceOrder, MigrateSnapshotOrder, NetEndpoint, NetPolicyLocalAction, NetPolicyMode,
+    NetPolicyOrder, NetProto, Order, OrderBody, OrderKind, OrderSubject, PreflightArtifact,
+    RestoreOrder, SignedOrder, StopOrder, TenantPreflightOrder, ORDER_DOMAIN,
 };
 
 /// Default TCP port the orders HTTP server binds (on the NetBird
@@ -89,7 +94,7 @@ pub const MAX_ORDER_BODY: usize = 64 * 1024;
 /// Maximum age of a signed order — `|now - issued_at_unix|` must fit
 /// in this window for the order to be dispatched. Closes the
 /// long-term-replay vector: a signed order captured today cannot be
-/// replayed weeks later (gemini r1 High). Symmetric ±5 min to absorb
+/// replayed weeks later (review r1 High). Symmetric ±5 min to absorb
 /// the operator's clock-skew tolerance budget across the vali pod,
 /// the Edge, and the miner host (the same `±300 s` window vali's
 /// heartbeat ingest applies — see `vali/apps/telemetry/` discipline).
@@ -99,7 +104,7 @@ pub const MAX_ORDER_AGE_SECS: u64 = 300;
 /// `SystemClock` saturates to `0` (a host with a clock before UNIX
 /// epoch — broken RTC) would otherwise accept an attacker-crafted
 /// order with `issued_at_unix == 0`, since `|0 - 0| == 0 <=
-/// MAX_ORDER_AGE_SECS` (gemini r2 Medium). Reject any order whose
+/// MAX_ORDER_AGE_SECS` (review r2 Medium). Reject any order whose
 /// timestamp is older than this floor — 2023-11-14 — independently of
 /// the local clock. Picked to pre-date every §H phase-2 release
 /// artefact in the repo: an order older than this is necessarily
@@ -122,7 +127,7 @@ pub struct OrderState {
     /// This miner's own `miner_id` — the receiving agent asserts
     /// `OrderBody::target_miner_id == self_miner_id` AFTER the
     /// signature verifies, so a signed order intended for a sibling
-    /// miner is rejected here (gemini r1 High — cross-miner replay).
+    /// miner is rejected here (review r1 High — cross-miner replay).
     pub self_miner_id: Arc<str>,
     /// Clock used to enforce the `MAX_ORDER_AGE_SECS` freshness window.
     /// Production wires `SystemClock`; tests inject a
@@ -160,6 +165,18 @@ pub struct OrderState {
     /// dispatch task is detached from its HTTP handler but must NOT be
     /// silently cancelled when the runtime is torn down.
     pub tasks: TaskTracker,
+    /// Live VM backups (`backup` order + status route). `None` ⇒ the
+    /// routes answer `503 backup-disabled`.
+    pub backup: Option<Arc<crate::backup::BackupManager>>,
+    /// Backup-chain restore for `migrate-activate` chain mode. `None` ⇒ a
+    /// chain order fails `chain-unsupported`.
+    pub chain_restorer: Option<Arc<dyn crate::backup::restore::ChainRestorer>>,
+    /// Staged restores (`restore` order + status route). `None` ⇒ the
+    /// routes answer `503 restore-disabled`.
+    pub restore: Option<Arc<crate::backup::staged::RestoreManager>>,
+    /// The persisted host net policy. `None` ⇒ the `net-policy` route
+    /// answers `503 net-policy-disabled`.
+    pub net_policy: Option<Arc<crate::netpolicy::NetPolicyStore>>,
 }
 
 impl OrderState {
@@ -190,7 +207,34 @@ impl OrderState {
             downloader,
             ack_signer,
             tasks,
+            backup: None,
+            chain_restorer: None,
+            restore: None,
+            net_policy: None,
         }
+    }
+
+    /// Enable live backups and backup-chain restores.
+    pub fn with_backup(
+        mut self,
+        backup: Arc<crate::backup::BackupManager>,
+        chain_restorer: Arc<dyn crate::backup::restore::ChainRestorer>,
+    ) -> Self {
+        self.backup = Some(backup);
+        self.chain_restorer = Some(chain_restorer);
+        self
+    }
+
+    /// Accept `net-policy` orders into `store`.
+    pub fn with_net_policy(mut self, store: Arc<crate::netpolicy::NetPolicyStore>) -> Self {
+        self.net_policy = Some(store);
+        self
+    }
+
+    /// Enable staged restores.
+    pub fn with_restore(mut self, restore: Arc<crate::backup::staged::RestoreManager>) -> Self {
+        self.restore = Some(restore);
+        self
     }
 }
 
@@ -275,10 +319,6 @@ pub fn build_orders_router(state: OrderState) -> Router {
             post(route_migrate_quiesce),
         )
         .route(
-            "/v1/miner/order/migrate-snapshot",
-            post(route_migrate_snapshot),
-        )
-        .route(
             "/v1/miner/order/migrate-activate",
             post(route_migrate_activate),
         )
@@ -295,10 +335,146 @@ pub fn build_orders_router(state: OrderState) -> Router {
             "/v1/miner/order/tenant-preflight",
             post(route_tenant_preflight),
         )
+        .route("/v1/miner/order/net-policy", post(route_net_policy))
         .route("/healthz", get(route_healthz))
         // Size cap BEFORE any decode — an oversize body never buffers.
         .layer(DefaultBodyLimit::max(MAX_ORDER_BODY))
+        // Added after the global cap so its own, larger cap applies: a
+        // backup order carries one presigned URL per multipart part.
+        .route(
+            "/v1/miner/order/backup",
+            post(route_backup).layer(DefaultBodyLimit::max(MAX_MULTIPART_ORDER_BODY)),
+        )
+        .route("/v1/miner/backup/:vm_id/status", get(route_backup_status))
+        // A `stage` carries one per-part sha256 per 512 MiB of each piece.
+        .route(
+            "/v1/miner/order/restore",
+            post(route_restore).layer(DefaultBodyLimit::max(MAX_MULTIPART_ORDER_BODY)),
+        )
+        .route("/v1/miner/restore/:vm_id/status", get(route_restore_status))
+        // A multipart snapshot carries one presigned URL per part.
+        .route(
+            "/v1/miner/order/migrate-snapshot",
+            post(route_migrate_snapshot).layer(DefaultBodyLimit::max(MAX_MULTIPART_ORDER_BODY)),
+        )
         .with_state(state)
+}
+
+/// Body cap for the multipart orders (`backup`, `migrate-snapshot`): one
+/// ~530-byte presigned URL per part, and the store takes parts of at most
+/// 512 MiB, so the largest flavor's overlay (1280 GiB) needs ~2,600.
+/// Mirrors the Edge's `MAX_MULTIPART_REQUEST_BYTES`. Still a hard bound
+/// before decode.
+pub const MAX_MULTIPART_ORDER_BODY: usize = 2 * 1024 * 1024;
+
+/// Live VM backup — a signed order. Validates and registers the run,
+/// spawns it on the serve loop's TaskTracker and ACKs at once; vali
+/// polls `backup/{vm}/status`.
+async fn route_backup(State(st): State<OrderState>, body: Bytes) -> Response {
+    let Some(backup) = st.backup.clone() else {
+        return reject(
+            OrderKind::Backup,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backup-disabled",
+        );
+    };
+    let tasks = st.tasks.clone();
+    process_order(
+        st,
+        body,
+        OrderKind::Backup,
+        move |lifecycle, order: BackupOrder| async move {
+            handler::handle_backup(lifecycle, backup, tasks, order)
+        },
+    )
+    .await
+}
+
+/// `GET /v1/miner/backup/{vm_id}/status` — [`crate::backup::BackupStatus`]
+/// as JSON: `{vm_id, live: {boot_counter, point_run_ids}, run}`, `run`
+/// null when no run is known since the agent started. Unsigned and
+/// side-effect-free like `migration/{vm}/status`; it carries no URL.
+/// `404 no-domain` only when this host has no domain for the VM; `503`
+/// when libvirt/QMP cannot be asked (never a guessed answer).
+async fn route_backup_status(State(st): State<OrderState>, Path(vm_id): Path<String>) -> Response {
+    let Some(backup) = st.backup.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "backup-disabled").into_response();
+    };
+    let vm_id = match crate::lifecycle::VmId::new(&vm_id) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "bad-vm-id").into_response(),
+    };
+    match backup.live_status(&st.lifecycle, &vm_id).await {
+        Ok(status) => match serde_json::to_string(&status) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "encode").into_response(),
+        },
+        Err(crate::backup::LiveStatusError::NoDomain) => {
+            (StatusCode::NOT_FOUND, "no-domain").into_response()
+        }
+        Err(crate::backup::LiveStatusError::Unavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "status-unavailable").into_response()
+        }
+    }
+}
+
+/// Staged restore — a signed order (`stage` / `abort` / `reclaim`).
+/// `stage` registers and ACKs, the rebuild runs on the serve loop's
+/// TaskTracker; vali polls `restore/{vm}/status`.
+async fn route_restore(State(st): State<OrderState>, body: Bytes) -> Response {
+    let Some(restore) = st.restore.clone() else {
+        return reject(
+            OrderKind::Restore,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "restore-disabled",
+        );
+    };
+    let tasks = st.tasks.clone();
+    let migration = Arc::clone(&st.migration);
+    process_order(
+        st,
+        body,
+        OrderKind::Restore,
+        move |lifecycle, order: RestoreOrder| async move {
+            handler::handle_restore(lifecycle, restore, migration, tasks, order).await
+        },
+    )
+    .await
+}
+
+/// `GET /v1/miner/restore/{vm_id}/status` —
+/// [`crate::backup::staged::RestoreStatus`] as JSON. Unsigned and
+/// side-effect-free like `backup/{vm}/status`; it carries no URL. `404
+/// no-restore` when nothing is known for the VM; `503` when libvirt
+/// cannot say whether the domain runs.
+async fn route_restore_status(State(st): State<OrderState>, Path(vm_id): Path<String>) -> Response {
+    let Some(restore) = st.restore.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "restore-disabled").into_response();
+    };
+    let vm_id = match crate::lifecycle::VmId::new(&vm_id) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "bad-vm-id").into_response(),
+    };
+    match restore.status(&st.lifecycle, &vm_id).await {
+        Ok(Some(status)) => match serde_json::to_string(&status) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "encode").into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no-restore").into_response(),
+        Err(crate::backup::staged::StatusError::Unavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "status-unavailable").into_response()
+        }
+    }
 }
 
 /// `GET /healthz` — liveness. The server binds only after the
@@ -359,12 +535,30 @@ async fn route_stop(State(st): State<OrderState>, body: Bytes) -> Response {
 }
 
 async fn route_destroy(State(st): State<OrderState>, body: Bytes) -> Response {
+    let migration = Arc::clone(&st.migration);
+    let restore = st.restore.clone();
     process_order(
         st,
         body,
         OrderKind::Destroy,
-        |lifecycle, order: DestroyOrder| async move {
-            handler::handle_destroy(&lifecycle, order).await
+        move |lifecycle, order: DestroyOrder| {
+            let migration = Arc::clone(&migration);
+            let restore = restore.clone();
+            async move {
+                let vm_id = order.vm_id.clone();
+                let out = handler::handle_destroy(&lifecycle, restore.as_deref(), order).await;
+                if out.is_ok() {
+                    // The VM's copy on this host is gone (vali reclaims a
+                    // migration's source only after the migration is
+                    // Done), so a completed SOURCE entry describes nothing
+                    // any more. Left behind, it refused a later migration
+                    // BACK to this host (`activate-on-source`), and the
+                    // status route kept reporting its `done` to the new
+                    // job's destination poll (seen in production, A→B→A).
+                    migration.clear_completed_source(&vm_id);
+                }
+                out
+            }
         },
     )
     .await
@@ -448,6 +642,7 @@ async fn route_migrate_activate(State(st): State<OrderState>, body: Bytes) -> Re
     let downloader = Arc::clone(&st.downloader);
     let pusher = Arc::clone(&st.ticket_pusher);
     let migration = Arc::clone(&st.migration);
+    let restorer = st.chain_restorer.clone();
     // The restore runs on the serve loop's TaskTracker so it survives the
     // order ACK (the order returns the instant the restore is launched; vali
     // polls `migration/{vm}/status` on the DEST for completion) — mirroring
@@ -464,7 +659,7 @@ async fn route_migrate_activate(State(st): State<OrderState>, body: Bytes) -> Re
             let tasks = tasks.clone();
             async move {
                 handler::handle_migrate_activate(
-                    lifecycle, downloader, pusher, migration, tasks, order,
+                    lifecycle, downloader, pusher, restorer, migration, tasks, order,
                 )
                 .await
             }
@@ -495,7 +690,29 @@ async fn route_migration_status(
     };
     match st.migration.phase(&vm_id) {
         Some(phase) => {
-            let body = format!(r#"{{"status":"{}"}}"#, phase.as_status_str());
+            // A finished multipart snapshot also reports its part receipts:
+            // vali completes the upload from them.
+            let receipt = match phase {
+                crate::orders::migration::MigrationPhase::Done => {
+                    st.migration.snapshot_receipt(&vm_id)
+                }
+                _ => None,
+            };
+            // A failed dest activation also reports its class, so vali can
+            // tell a restore that never booted from a CVM that could not
+            // start. Absent for every other status — those bodies are as
+            // before.
+            let class = st.migration.failure_class(&vm_id);
+            let body = match (receipt, class) {
+                (Some(disk), _) => {
+                    serde_json::json!({ "status": phase.as_status_str(), "disk": disk }).to_string()
+                }
+                (None, Some(class)) => {
+                    serde_json::json!({ "status": phase.as_status_str(), "class": class })
+                        .to_string()
+                }
+                (None, None) => format!(r#"{{"status":"{}"}}"#, phase.as_status_str()),
+            };
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -625,6 +842,29 @@ async fn route_tenant_preflight(State(st): State<OrderState>, body: Bytes) -> Re
     .await
 }
 
+/// Host-wide net policy — a signed order naming no VM. Persisted under
+/// the replay rules of [`crate::netpolicy::store`]; the response is the
+/// ack `applied:<revision>:<sha256>`.
+async fn route_net_policy(State(st): State<OrderState>, body: Bytes) -> Response {
+    let Some(store) = st.net_policy.clone() else {
+        return reject(
+            OrderKind::NetPolicy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "net-policy-disabled",
+        );
+    };
+    let clock = Arc::clone(&st.clock);
+    process_order(
+        st,
+        body,
+        OrderKind::NetPolicy,
+        move |_lifecycle, order: NetPolicyOrder| async move {
+            handler::handle_net_policy(&store, clock.now_unix(), order)
+        },
+    )
+    .await
+}
+
 /// The shared order pipeline: decode → verify → decode body → domain /
 /// kind check → idempotency → dispatch → record → respond.
 ///
@@ -641,7 +881,7 @@ async fn process_order<T, F, Fut>(
     dispatch: F,
 ) -> Response
 where
-    T: serde::de::DeserializeOwned + Order + Send + 'static,
+    T: serde::de::DeserializeOwned + OrderSubject + Send + 'static,
     F: FnOnce(Arc<CvmLifecycle>, T) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = std::result::Result<String, OrderRejection>> + Send + 'static,
 {
@@ -679,10 +919,10 @@ where
         return reject(expected, StatusCode::BAD_REQUEST, "order-id-invalid");
     }
     // (4a) Target binding — the order MUST name THIS miner. Closes the
-    //      cross-miner replay vector (gemini r1 High): every miner pins
+    //      cross-miner replay vector (review r1 High): every miner pins
     //      the same Edge order-signing key, so a signed order for
     //      sibling miner B is otherwise cryptographically valid here
-    //      too. `eq_ignore_ascii_case` (gemini r2 Low) gives defense-
+    //      too. `eq_ignore_ascii_case` (review r2 Low) gives defense-
     //      in-depth against a manual config-vs-Ansible casing typo —
     //      Ansible enforces lowercase, but a hand-edited config that
     //      uppercased the id should still match.
@@ -697,11 +937,11 @@ where
     //      `MAX_ORDER_AGE_SECS` away from this miner's clock in EITHER
     //      direction (symmetric ±5 min absorbs the operator's
     //      tolerated clock skew). Closes the long-term-replay vector
-    //      (gemini r1 High): a captured order from a week ago will not
+    //      (review r1 High): a captured order from a week ago will not
     //      be dispatched even if its signature still verifies.
     //
     //      `EARLIEST_VALID_ISSUED_AT_UNIX` is the independent absolute
-    //      floor on the timestamp (gemini r2 Medium): a broken-RTC host
+    //      floor on the timestamp (review r2 Medium): a broken-RTC host
     //      whose `SystemClock` saturated to `0` would otherwise accept
     //      an attacker-crafted order with `issued_at_unix == 0`, since
     //      `|0 - 0| <= MAX_ORDER_AGE_SECS`. With the floor we ALSO
@@ -716,14 +956,24 @@ where
         return reject(expected, StatusCode::BAD_REQUEST, "order-stale");
     }
     let order_id = order.order_id;
-    // `vm_id` is charset-validated at construction — safe to log raw.
-    let vm_id = order.payload.vm_id().clone();
+    // A `VmId` is charset-validated at construction, and a host-wide
+    // order logs the constant `host` — safe to log raw.
+    let vm_id = order.payload.log_subject().to_string();
 
     // (5) Idempotency — claim the order_id, or short-circuit a replay.
     match st.idem.begin(&order_id) {
-        Ok(BeginOutcome::AlreadyOk) => {
-            log_outcome(expected, &order_id, vm_id.as_str(), "idempotent-replay");
-            return (StatusCode::OK, "idempotent-replay").into_response();
+        Ok(BeginOutcome::AlreadyOk(class)) => {
+            // Echo the ORIGINAL outcome — a replayed stop must still say
+            // `stopped` vs `not-running` — or the generic marker when it
+            // was not kept (too long, or recorded by an older build).
+            let class = class.unwrap_or_else(|| "idempotent-replay".to_string());
+            log_outcome(
+                expected,
+                &order_id,
+                vm_id.as_str(),
+                &format!("replay:{class}"),
+            );
+            return (StatusCode::OK, class).into_response();
         }
         Ok(BeginOutcome::InFlight) => {
             return reject(expected, StatusCode::CONFLICT, "order-in-flight");
@@ -748,28 +998,36 @@ where
     //     the `TaskTracker` — NOT bare `tokio::spawn` — so the serve
     //     loop drains it at shutdown rather than the runtime cancelling
     //     a detached task mid-launch.
+    //
+    //     The outcome is LOGGED inside the task too: a graceful stop can
+    //     outlast the Edge's forward timeout, which then hangs up — the
+    //     handler future is dropped, and a log line written after
+    //     `task.await` would never appear although the order completed.
     let lifecycle = Arc::clone(&st.lifecycle);
     let idem = Arc::clone(&st.idem);
     let dispatch_id = order_id.clone();
+    let task_vm_id = vm_id.clone();
     let task = st.tasks.spawn(async move {
         let result = dispatch(lifecycle, order.payload).await;
-        let _ = idem.finish(&dispatch_id, result.is_ok());
+        let _ = idem.finish(
+            &dispatch_id,
+            result.as_ref().ok().map(|class| class.as_str()),
+        );
+        let class = match &result {
+            Ok(class) => class.as_str(),
+            Err(rej) => rej.class,
+        };
+        log_outcome(expected, &dispatch_id, task_vm_id.as_str(), class);
         result
     });
     match task.await {
-        Ok(Ok(class)) => {
-            log_outcome(expected, &order_id, vm_id.as_str(), class.as_str());
-            (StatusCode::OK, class).into_response()
-        }
-        Ok(Err(rej)) => {
-            log_outcome(expected, &order_id, vm_id.as_str(), rej.class);
-            rej.into_response()
-        }
+        Ok(Ok(class)) => (StatusCode::OK, class).into_response(),
+        Ok(Err(rej)) => rej.into_response(),
         // The dispatch task panicked — `finish` inside it may not have
         // run, so mark the order failed (retryable). `panic` is denied
         // crate-wide, so this is near-unreachable; handled fail-closed.
         Err(_join) => {
-            let _ = st.idem.finish(&order_id, false);
+            let _ = st.idem.finish(&order_id, None);
             log_outcome(expected, &order_id, vm_id.as_str(), "dispatch-panic");
             OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "dispatch-panic").into_response()
         }

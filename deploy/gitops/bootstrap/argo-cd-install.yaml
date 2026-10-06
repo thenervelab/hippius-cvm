@@ -57,7 +57,7 @@
 # repo carries the fleet labels.
 global:
   # DNS only — no hard-coded IPs anywhere (locked invariant, #1).
-  domain: argocd.hippius.network
+  domain: argocd.example.com
 
 # Single-node MVP ("MVP single-node = prod, scale by adding nodes").
 # HA Redis needs 3 replicas → off until the cluster has 3 nodes; flip
@@ -125,7 +125,7 @@ server:
   ingress:
     enabled: true
     ingressClassName: nginx
-    hostname: argocd.hippius.network
+    hostname: argocd.example.com
     annotations:
       nginx.ingress.kubernetes.io/ssl-redirect: "false"
     path: /

@@ -4,7 +4,7 @@
 # `hippius-miner-agent` Rust binary + the libvirt / qemu / cryptsetup /
 # e2fsprogs / util-linux runtime tooling it shells out to) and pushes
 # it to the GitHub Container Registry. Replaces the legacy "scp the
-# binary to miner-1" workflow with a cluster-driven `docker pull` so
+# binary to a miner" workflow with a cluster-driven `docker pull` so
 # the validator-side ops never SSH the miner.
 #
 # Trigger: push to main / v* tags, pull_request, and workflow_dispatch
@@ -65,7 +65,7 @@ env:
 
 jobs:
   miner-agent-image:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

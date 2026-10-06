@@ -283,14 +283,14 @@ def test_the_exclusion_does_not_expire_into_another_burned_launch(
     quietly undid itself:
 
     ```
-    12:00  synmon-cs10-…  → miner-3, 3 rejected dispatches
+    12:00  synmon-cs10-…  → miner-c, 3 rejected dispatches
     12:01  ledger: streak=3 ⇒ INCAPABLE            ← the gate fired
-    13:51  stamp-fed-1    → miner-3 AGAIN          ← 1 h 50 m later
+    13:51  vm-fed-1    → miner-c AGAIN          ← 1 h 50 m later
     13:52  outcome=dispatch-failed-after-register  ← a second tenant
                                                      launch burned
     ```
 
-    Nothing had observed miner-3 recover. The 1 h failure window had
+    Nothing had observed miner-c recover. The 1 h failure window had
     simply elapsed, the verdict fell back to UNKNOWN — i.e. to
     indistinguishable from a host nobody had ever tried — and since a host
     that starts nothing has all its capacity free, it ranked FIRST.
@@ -427,3 +427,70 @@ def test_the_class_that_carried_the_live_failure_DOES_count(monkeypatch) -> None
     # The miner's string is never persisted — the reason stays vali's own.
     assert row.cvm_last_fail_reason == cvm_capability.REASON_LAUNCH_REJECTED
 
+
+
+# ─── capacity v2 §3: the same observations feed the earned ceiling ──
+
+
+def _record_events(monkeypatch) -> list[tuple[str, str, str]]:
+    from apps.scheduler import capacity_earn
+
+    seen: list[tuple[str, str, str]] = []
+
+    def record(nid: str, kind: str, *, incident: str = "", **_k: object) -> bool:
+        seen.append((nid, kind, incident))
+        return True
+
+    monkeypatch.setattr(capacity_earn, "record_event", record)
+    return seen
+
+
+def test_a_rejected_start_charges_the_earned_ceiling_once_per_vm(monkeypatch) -> None:
+    _mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=False)
+    seen = _record_events(monkeypatch)
+    launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+    assert seen == [(node_id(1), "start-failed", f"vm={_spec().vm_id}")]
+
+
+def test_an_accepted_start_charges_nothing(monkeypatch) -> None:
+    _mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_events(monkeypatch)
+    launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+    assert seen == []
+
+
+def test_a_full_host_at_preflight_is_charged_its_refusal(monkeypatch) -> None:
+    from apps.orchestration.services import preflight as preflight_svc
+
+    _mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_events(monkeypatch)
+
+    def full(*a, **k):
+        raise preflight_svc.PreflightRejected("full", classifier="insufficient-resources")
+
+    monkeypatch.setattr(preflight_svc, "dispatch_preflight", full)
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+    assert out.disposition == launch.RETRIABLE
+    assert seen == [(node_id(1), "preflight-insufficient", f"vm={_spec().vm_id}")]
+
+
+def test_an_artifact_preflight_failure_is_not_a_capacity_event(monkeypatch) -> None:
+    from apps.orchestration.services import preflight as preflight_svc
+
+    _mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_events(monkeypatch)
+
+    def sha(*a, **k):
+        raise preflight_svc.PreflightRejected("bad", classifier="preflight-sha-mismatch")
+
+    monkeypatch.setattr(preflight_svc, "dispatch_preflight", sha)
+    launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+    assert seen == []

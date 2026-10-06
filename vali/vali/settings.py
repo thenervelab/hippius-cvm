@@ -116,6 +116,9 @@ INSTALLED_APPS = [
     "apps.images",
     "apps.lifecycle",
     "apps.miners",
+    "apps.network",
+    "apps.backup",
+    "apps.operator",
     "apps.orchestration",
     "apps.orders",
     "apps.packer",
@@ -499,6 +502,11 @@ VALI_TENANT_BAKE_IMAGE_PULL_SECRET = os.environ.get(
 # bake across tenants — see `apps.tenant_bake.k8s_jobs.JobSpec.
 # cache_pvc_name` for the manifest shape.
 VALI_TENANT_BAKE_CACHE_PVC = os.environ.get("VALI_TENANT_BAKE_CACHE_PVC", "")
+# A Running bake whose worker claimed it longer ago than this is an orphan
+# (its pod died without finalizing) and no longer counts as in flight for
+# the golden re-bake's serial gate (`live_in_flight_q`). A bake takes
+# minutes; 6 h is far past any real one.
+VALI_TENANT_BAKE_ORPHAN_RUNNING_S = _env_int("VALI_TENANT_BAKE_ORPHAN_RUNNING_S", 6 * 3600)
 # Vault `jwt` auth for the bake Job (M-k8sauth, #94). Empty role ⇒ the
 # static `bake-vault-token` Secret, unchanged. The Vault role is bound to
 # `system:serviceaccount:vali:hippius-tenant-baker` — the SA the Job
@@ -634,6 +642,21 @@ VALI_EDGE_REGISTRY_FEED_SIGNING_SEED_HEX = os.environ.get(
 # treated as ineligible (don't trust a stale score).
 VALI_SCHEDULER_MAX_EPOCH_LAG = _env_int("VALI_SCHEDULER_MAX_EPOCH_LAG", 2)
 
+# How long the §13 drain keeps a live VM's placement after its host's last
+# heartbeat (`scheduler.service.placement_hold_grace_s`, floored at twice
+# the liveness timeout) — longer than a host reboot.
+VALI_PLACEMENT_HOLD_GRACE_S = _env_int("VALI_PLACEMENT_HOLD_GRACE_S", 1800)
+# Age past which a `Pending` placement is no longer a launch in flight
+# (`scheduler.service.stale_pending_after_s`).
+VALI_PENDING_PLACEMENT_STALE_S = _env_int("VALI_PENDING_PLACEMENT_STALE_S", 7200)
+# Age of a `running` LaunchJob's CURRENT phase past which the launch
+# worker is presumed dead (`launch_jobs.reap_orphaned_launch_jobs`),
+# floored at twice the longest phase (1 + retries preflights).
+VALI_LAUNCH_JOB_ORPHAN_S = _env_int("VALI_LAUNCH_JOB_ORPHAN_S", 10800)
+# Silence (no boot milestone, no in-guest frame) after which a launch that
+# died in `dispatching` with no host is concluded to have started no guest.
+VALI_LAUNCH_JOB_SILENT_GUEST_S = _env_int("VALI_LAUNCH_JOB_SILENT_GUEST_S", 86400)
+
 # §23 placement concentration cap (soft): a miner already hosting
 # `≥ this fraction` of ALL active placements is de-prioritised so tenant
 # VMs spread across the fleet instead of piling on the single cheapest
@@ -653,6 +676,18 @@ VALI_SCHEDULER_MAX_OWNER_PLACEMENTS_PER_MINER = _env_int(
     "VALI_SCHEDULER_MAX_OWNER_PLACEMENTS_PER_MINER", 4
 )
 
+# §23 gate (g), concurrent boots per miner (launch path only): a miner
+# already booting this many guests (a launch being dispatched, or a guest
+# with no in-guest signal yet since its current boot began, inside the
+# boot-stall deadline) is skipped. When every eligible miner is at the cap
+# the launch WAITS up to BOOT_WAIT_S for a slot, re-asking every
+# BOOT_WAIT_POLL_S, then fails `miners-booting`. Admission only prices the
+# reserved vCPU, so without this a burst all lands on the roomiest host and
+# boots at once (2026-10-05: 13 boots on one host). `0` = no cap.
+VALI_SCHEDULER_MAX_BOOTING_PER_MINER = _env_int("VALI_SCHEDULER_MAX_BOOTING_PER_MINER", 3)
+VALI_SCHEDULER_BOOT_WAIT_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_S", 900)
+VALI_SCHEDULER_BOOT_WAIT_POLL_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_POLL_S", 15)
+
 # §23 admission bound — default per-miner VM-slot cap seeded into a
 # fresh `MinerCapacity` mirror row. v1 carries no detailed hardware
 # specs on-chain; operators tune `capacity_slots` per miner after.
@@ -671,10 +706,60 @@ VALI_SCHEDULER_DEFAULT_CAPACITY_SLOTS = _env_int("VALI_SCHEDULER_DEFAULT_CAPACIT
 #   HOST_RESERVE_* — RAM/vCPU withheld for the host OS / hypervisor.
 #   SLOT_REF_*     — the reference-flavor size one admission slot is
 #                    worth (default = the `large` flavor: 8 GiB / 4 vCPU).
-VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB = _env_int("VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB", 4096)
+VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB = _env_int("VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB", 8192)
 VALI_SCHEDULER_HOST_RESERVE_CPUS = _env_int("VALI_SCHEDULER_HOST_RESERVE_CPUS", 2)
 VALI_SCHEDULER_SLOT_REF_MEMORY_MB = _env_int("VALI_SCHEDULER_SLOT_REF_MEMORY_MB", 8192)
 VALI_SCHEDULER_SLOT_REF_CPUS = _env_int("VALI_SCHEDULER_SLOT_REF_CPUS", 4)
+
+# The largest flavor a tenant may launch (`flavors.max_offered_flavor`
+# validates it). Empty (the default) = no cap: every catalogue flavor is
+# sold wherever a host can hold it. A flavor name withdraws the larger
+# sizes, independently of whether a host could hold them.
+VALI_SCHEDULER_MAX_FLAVOR = os.environ.get("VALI_SCHEDULER_MAX_FLAVOR", "")
+
+# Capacity v2 (`scheduler.capacity_config` documents and validates each
+# knob; the getters there own the defaults — these only carry the env).
+# Resource-true admission is FLAG-FIRST: with RESOURCE_ADMISSION off, v2
+# runs in shadow (computed + diff-logged) and v1 slots decide.
+_CAPACITY_V2_ENV = (
+    "VALI_SCHEDULER_RESOURCE_ADMISSION",
+    "VALI_SCHEDULER_CPU_OVERCOMMIT",
+    "VALI_SCHEDULER_PER_VM_OVERHEAD_MB",
+    "VALI_SCHEDULER_ASID_RESERVE",
+    "VALI_SCHEDULER_OPERATOR_VM_HARD_CAP",
+    "VALI_CAPACITY_EARN_FLOOR_VMS",
+    "VALI_CAPACITY_EARN_FLOOR_VCPUS",
+    "VALI_CAPACITY_EARN_FLOOR_MEMORY_MB",
+    "VALI_CAPACITY_EARN_HARD_CAP_VMS",
+    "VALI_CAPACITY_EARN_HARD_CAP_VCPUS",
+    "VALI_CAPACITY_EARN_HARD_CAP_MEMORY_MB",
+    "VALI_CAPACITY_EARN_GROWTH",
+    "VALI_CAPACITY_EARN_MIN_STEP_VMS",
+    "VALI_CAPACITY_EARN_MIN_STEP_VCPUS",
+    "VALI_CAPACITY_EARN_MIN_STEP_MEMORY_MB",
+    "VALI_CAPACITY_EARN_UTIL_TRIGGER",
+    "VALI_CAPACITY_EARN_HOLD_S",
+    "VALI_CAPACITY_EARN_PENALTY_FACTOR",
+    "VALI_CAPACITY_EARNED_INFLIGHT_MAX",
+    "VALI_CAPACITY_EARN_DECAY_AFTER_S",
+    "VALI_CAPACITY_EARN_PROOF",
+    # Storage-aware placement — the DATA-disk gate and its knobs.
+    "VALI_SCHEDULER_DISK_GATE",
+    "VALI_SCHEDULER_DISK_UNKNOWN",
+    "VALI_DISK_RESERVE_GB",
+    "VALI_DISK_OVERCLAIM_SLACK_GB",
+    "VALI_SCHEDULER_SLOT_REF_DISK_GB",
+)
+
+
+def _capacity_v2_env(environ: dict[str, str] | os._Environ[str]) -> dict[str, str]:
+    """The capacity v2 knobs PRESENT in `environ`, as raw strings. Unset
+    knobs are omitted so the `capacity_config` getter default applies;
+    the getters parse and validate (a malformed value raises there)."""
+    return {name: environ[name] for name in _CAPACITY_V2_ENV if name in environ}
+
+
+globals().update(_capacity_v2_env(os.environ))
 
 # §23 gate (e) — OBSERVED SEV-SNP start capability
 # (`scheduler.cvm_capability`). Every other admission input models a
@@ -846,6 +931,78 @@ VALI_UPTIME_LIVENESS_SKEW_S = _env_int("VALI_UPTIME_LIVENESS_SKEW_S", 300)
 # is being paid correctly.
 VALI_UPTIME_LIVENESS_STALL_S = _env_int("VALI_UPTIME_LIVENESS_STALL_S", 1800)
 
+# How old a VM's newest live attestation may be for
+# `GET /v1/vm/<id>/attestation` to report it `attested-live` (the guest is
+# running now). Default 600 s = two 300 s keepalives, so one dropped beat
+# does not flip the verdict; a sample past its signed `expiry_unix` never
+# counts regardless. See `apps.lifecycle.attestation`.
+VALI_ATTESTATION_LIVE_MAX_AGE_S = _env_int("VALI_ATTESTATION_LIVE_MAX_AGE_S", 600)
+
+# ── Attested guest resources (`apps.telemetry.guest_resources`) ───────
+# SEV-SNP measures the vCPU count but NOT the RAM, so a guest on a
+# keepalive image that understands it attests both in its live
+# attestation (schema v3) and vali compares them with the flavor the
+# launch was measured for.
+#
+# ARMING SEQUENCE — in order:
+#   1. deploy vali (decodes v3 bodies) and the KBS (accepts the field) —
+#      EVERY replica: an old pod refuses what step 3 starts sending;
+#   2. re-bake the golden images (new keepalive agent + shim);
+#   3. set VALI_GUEST_ATTEST_RESOURCES=true: launches and relaunches put
+#      the MEASURED `hippius.attest_resources=1` token on the cmdline (an
+#      older image ignores it). Not before step 1;
+#   4. LEAVE ENFORCE FALSE and read the attested figures fleet-wide
+#      (`VmLiveAttestation.mem_*`, `resource_verdict`) — calibrate the
+#      thresholds below on every distro and flavor; relaunch every VM whose
+#      latest sample is not `ok` (launched before step 3, or `unattested`)
+#      until `hippius_synthetic_guest_resources_unproven_vms` reads 0;
+#   5. only then set VALI_GUEST_RESOURCES_ENFORCE=true: only an `ok`
+#      sample is coverage, so a VM that does not prove its size earns its
+#      miner nothing. Evidence (`GuestResourceShortfall`) and the alert
+#      fire in both modes.
+VALI_GUEST_ATTEST_RESOURCES = _env_bool("VALI_GUEST_ATTEST_RESOURCES", False)
+VALI_GUEST_RESOURCES_ENFORCE = _env_bool("VALI_GUEST_RESOURCES_ENFORCE", False)
+# `accept_memory=eager` on the measured cmdline: the guest accepts all of
+# its RAM at boot, so the host must back the whole flavor up front (no
+# lazily-promised memory to overcommit), and RAM still unaccepted is a
+# finding. Separate from the attestation because boot time grows with the
+# RAM size — measure it on the largest flavor before turning it on.
+VALI_GUEST_ACCEPT_MEMORY_EAGER = _env_bool("VALI_GUEST_ACCEPT_MEMORY_EAGER", False)
+# Guest upgrades (`apps.orchestration.guest_upgrade`,
+# docs/design/guest-component-rollout.md): the orchestration tick advances
+# the `GuestUpgradeJob`s an operator admitted (`vali_guest_upgrade`). Off:
+# admitted jobs wait in `pending`. Each state's deadline, the soak, the
+# dispatch pacing and the window an ambiguous dispatch may still land in.
+VALI_GUEST_UPGRADE_ENABLED = _env_bool("VALI_GUEST_UPGRADE_ENABLED", False)
+VALI_GUEST_UPGRADE_STOP_TIMEOUT_S = _env_float("VALI_GUEST_UPGRADE_STOP_TIMEOUT_S", 1500.0)
+VALI_GUEST_UPGRADE_LAUNCH_TIMEOUT_S = _env_float("VALI_GUEST_UPGRADE_LAUNCH_TIMEOUT_S", 1800.0)
+VALI_GUEST_UPGRADE_GUEST_TIMEOUT_S = _env_float("VALI_GUEST_UPGRADE_GUEST_TIMEOUT_S", 1200.0)
+VALI_GUEST_UPGRADE_SOAK_S = _env_float("VALI_GUEST_UPGRADE_SOAK_S", 900.0)
+VALI_GUEST_UPGRADE_ROLLBACK_TIMEOUT_S = _env_float("VALI_GUEST_UPGRADE_ROLLBACK_TIMEOUT_S", 2400.0)
+VALI_GUEST_UPGRADE_PARK_TIMEOUT_S = _env_float("VALI_GUEST_UPGRADE_PARK_TIMEOUT_S", 1500.0)
+VALI_GUEST_UPGRADE_ATTESTATION_FRESH_S = _env_float(
+    "VALI_GUEST_UPGRADE_ATTESTATION_FRESH_S", 600.0
+)
+VALI_GUEST_UPGRADE_DISPATCH_PACING_S = _env_float("VALI_GUEST_UPGRADE_DISPATCH_PACING_S", 60.0)
+VALI_GUEST_UPGRADE_DISPATCH_SETTLE_S = _env_float("VALI_GUEST_UPGRADE_DISPATCH_SETTLE_S", 300.0)
+# The firmware memory map's `System RAM` may fall short of the flavor by
+# what the firmware keeps for itself (holes below 1 MiB, ACPI, runtime
+# services) — a fixed amount, not a share, so the slack is absolute. Also
+# the unaccepted RAM tolerated under eager acceptance.
+VALI_GUEST_MEM_FIRMWARE_SLACK_MIB = _env_int("VALI_GUEST_MEM_FIRMWARE_SLACK_MIB", 64)
+# Only for a guest kernel with no firmware map: `MemTotal` may fall short
+# of the flavor by the kernel's own reservations — the struct page array
+# (2 %) and the SEV swiotlb (6 %, capped at 1 GiB), modelled — plus this
+# slack for the rest (kernel image, firmware ranges).
+VALI_GUEST_MEM_TOTAL_SLACK_MIB = _env_int("VALI_GUEST_MEM_TOTAL_SLACK_MIB", 256)
+# How long after vali's newer launch of a VM was accepted a sample from an
+# older launch is still accepted (an attestation in flight when the old
+# guest was stopped). It compares vali's clock with the KBS's, so it is the
+# ingest skew bound (VALI_UPTIME_LIVENESS_SKEW_S), not less.
+VALI_GUEST_SUPERSEDED_GRACE_S = _env_int("VALI_GUEST_SUPERSEDED_GRACE_S", 300)
+# How long a finding keeps a VM flagged after its last occurrence.
+VALI_GUEST_RESOURCES_FLAG_S = _env_int("VALI_GUEST_RESOURCES_FLAG_S", 3600)
+
 # Source of the on-chain epoch reward weight (`compute_epoch_weights`):
 #   `snapshot` — the instantaneous Σ resource_units of BOUND placements
 #                (v1; pays a bound-but-down VM in full);
@@ -855,11 +1012,22 @@ VALI_UPTIME_LIVENESS_STALL_S = _env_int("VALI_UPTIME_LIVENESS_STALL_S", 1800)
 # served receipts are confirmed flowing live, then flip to `usage`.
 VALI_EPOCH_WEIGHT_SOURCE = os.environ.get("VALI_EPOCH_WEIGHT_SOURCE", "snapshot")
 
+# Zombie VMs (`apps.lifecycle.zombie`): a guest frame for a VM past its §24
+# crypto-erase quarantines the relaying miner (no placement, no epoch
+# weight) for this long, and re-alerts at most once per window per VM.
+VALI_ZOMBIE_WINDOW_S = int(os.environ.get("VALI_ZOMBIE_WINDOW_S", "900"))
+# Relay-lag slack after a §24 job reports `done` during which a last
+# in-flight frame is not held against the miner.
+VALI_ZOMBIE_CONFIRM_GRACE_S = int(os.environ.get("VALI_ZOMBIE_CONFIRM_GRACE_S", "120"))
+# Frames arriving this soon after a VM's erase are still taken at face value
+# (and billed): the guest's final telemetry drain can race the stop ack.
+VALI_ZOMBIE_ERASE_GRACE_S = int(os.environ.get("VALI_ZOMBIE_ERASE_GRACE_S", "300"))
+
 # VM owners (`Placement.owner`, i.e. the launch spec's `user_id`) whose
 # hosting earns NO reward weight and NO bill — OUR OWN infrastructure, not
 # tenants. With `VALI_EPOCH_WEIGHT_SOURCE=usage` the ledger IS the reward,
-# and measured live on 2026-08-11 our own VMs held 30.6 % of the whole pot
-# (one destroyed synthetic-monitor probe carried 30 % by itself). Paying
+# and without this filter an operator VM could hold a large share of the
+# epoch's units (even a destroyed synthetic-monitor probe). Paying
 # ourselves out of the miner pot dilutes every honest miner.
 #
 # Comma-separated. EMPTY IS A STRICT NO-OP — the default cannot zero a real
@@ -867,7 +1035,7 @@ VALI_EPOCH_WEIGHT_SOURCE = os.environ.get("VALI_EPOCH_WEIGHT_SOURCE", "snapshot"
 # `scoring._excluded_owners`, so editing this list to add a one-off
 # rehearsal identity can never drop the probe fleet back into the pot.
 # Live, this needs the operator identities that are NOT the synthetic
-# tenant — e.g. `kbsrehearse`.
+# tenant — e.g. a one-off operator harness identity.
 VALI_REWARD_EXCLUDED_OWNERS = _env_list("VALI_REWARD_EXCLUDED_OWNERS", [])
 
 # Time basis of `MinerPrice`: USD-micros per resource-unit per this many
@@ -907,6 +1075,9 @@ VALI_REBOOT_RECOVERY_DEBOUNCE_POLLS = _env_int("VALI_REBOOT_RECOVERY_DEBOUNCE_PO
 VALI_REBOOT_RECOVERY_MAX_ATTEMPTS = _env_int("VALI_REBOOT_RECOVERY_MAX_ATTEMPTS", 5)
 # Exponential-backoff base (seconds) between relaunch attempts.
 VALI_REBOOT_RECOVERY_BACKOFF_BASE_S = _env_float("VALI_REBOOT_RECOVERY_BACKOFF_BASE_S", 120.0)
+# How long after its last relaunch a VM must be seen up (and not wedged)
+# before its relaunch budget resets — one budget per host-down incident.
+VALI_REBOOT_RECOVERY_STABLE_S = _env_float("VALI_REBOOT_RECOVERY_STABLE_S", 1800.0)
 
 # ── In-guest liveness — "is there positive evidence from INSIDE the
 #    guest, recently?". `poll_domain_running` only proves a QEMU process
@@ -921,6 +1092,22 @@ VALI_REBOOT_RECOVERY_BACKOFF_BASE_S = _env_float("VALI_REBOOT_RECOVERY_BACKOFF_B
 # measured on the live fleet — a healthy VM must never be called wedged.
 VALI_GUEST_LIVENESS_STALE_S = _env_int("VALI_GUEST_LIVENESS_STALE_S", 600)
 
+# ── Boot stall — an Active, running VM with NO in-guest signal since its
+#    current boot began (`Vm.boot_started_at`) for longer than
+#        VALI_BOOT_STALL_S + min(VALI_BOOT_STALL_PER_DISK_GB_S × disk_gb,
+#                                VALI_BOOT_STALL_DISK_CAP_S)
+#    reads `boot_stalled` (and `guest_liveness=wedged` on the API) and is
+#    logged (`apps.lifecycle.boot_stall`). The base covers the boot to
+#    `kek_released` (~340 s on Milan) + the first receipt; the per-GiB term
+#    covers the golden first-boot integrity wipe (~6.8 s/GiB measured on
+#    Milan, doubled — the backend's own boot budget), capped at 3 h.
+VALI_BOOT_STALL_S = _env_int("VALI_BOOT_STALL_S", 900)
+VALI_BOOT_STALL_PER_DISK_GB_S = _env_int("VALI_BOOT_STALL_PER_DISK_GB_S", 15)
+VALI_BOOT_STALL_DISK_CAP_S = _env_int("VALI_BOOT_STALL_DISK_CAP_S", 10800)
+# How often the boot-stall ERROR may repeat for an UNCHANGED set of stalled
+# VMs (any change re-logs immediately).
+VALI_BOOT_STALL_WARN_INTERVAL_S = _env_float("VALI_BOOT_STALL_WARN_INTERVAL_S", 3600.0)
+
 # ── Unbound-launch surfacing (P9/#18) — how often `sweep_unbound_launches`
 #    may repeat its WARNING for an UNCHANGED set of orphaned vm_ids. The
 #    condition is permanent until an operator acts and the tick runs every
@@ -934,7 +1121,7 @@ VALI_UNBOUND_LAUNCH_WARN_INTERVAL_S = _env_float(
 #    the `Vm` row, stages the per-VM KEK and KBS-registers the vm_id
 #    BEFORE it dispatches; a launch that fails after that leaves the row
 #    `state=active host=""` with a LIVE Vault-Transit KEK and no VM
-#    anywhere (proved live 2026-08-13: p1final-1/2/3). Nothing reaped
+#    anywhere (seen in production 2026-08-13). Nothing reaped
 #    them, and every sweep filtering `exclude(state='destroyed')` counted
 #    them as running tenants.
 #
@@ -1001,6 +1188,43 @@ VALI_ORCHESTRATION_STEP_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_STEP_TIMEOUT_
 # decommission forces the reclaim (§24 — crypto-erase runs anyway).
 VALI_ORCHESTRATION_ACK_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_ACK_TIMEOUT_S", 600.0)
 
+# ── §24 KBS decommission fence. When on, a decommission tells the KBS
+#    the VM is decommissioning (`/v1/admin/vm/<id>/decommission`) right
+#    after vali freezes the ticket, BEFORE the KEK is erased, and
+#    tombstones it (`/tombstone`) once it is destroyed. The KBS row
+#    otherwise stays `Active` for good after §24, so nothing the KBS
+#    issues (a release, a custody lease) can tell the VM is dead.
+#    DEFAULT-OFF: the routes only exist once the KBS that serves them is
+#    deployed; until then they 404 and every call would be wasted.
+VALI_KBS_FENCE_ENABLED = _env_bool("VALI_KBS_FENCE_ENABLED", False)
+# How long, from the start of the decommission, a failing fence may hold
+# the crypto-erase back. Past it the erase proceeds anyway — the erase is
+# the data-death guarantee, the fence only brings it forward — and the job
+# is marked `kbs_fence=pending` for the tick sweep to re-drive. Clamped to
+# `VALI_ORCHESTRATION_STEP_TIMEOUT_S`, so the wait can never fail the job.
+VALI_KBS_FENCE_WINDOW_S = _env_float("VALI_KBS_FENCE_WINDOW_S", 600.0)
+
+# ── KBS audit-log ingest (`apps.orchestration.kbs_audit`). The KBS keeps
+#    its hash-chained release + admin audit logs on an emptyDir inside
+#    its CVM (unreadable from the host, wiped by a restart); the tick
+#    copies them out through `GET /v1/admin/audit` on the mTLS admin
+#    listener, re-verifies the chain, and stores `KbsAuditEntry` rows.
+#    DEFAULT-OFF: turn on only once the KBS serving the route is deployed
+#    (a KBS without it answers 404 and the ingest skips quietly).
+VALI_KBS_AUDIT_INGEST_ENABLED = _env_bool("VALI_KBS_AUDIT_INGEST_ENABLED", False)
+# Minimum seconds between two ingest runs (the tick runs every ~10 s).
+VALI_KBS_AUDIT_INGEST_INTERVAL_S = _env_float("VALI_KBS_AUDIT_INGEST_INTERVAL_S", 60.0)
+# Records per page (the KBS clamps to 500) and pages per log per run —
+# every page is one token of the KBS admin rate-limit bucket that
+# launches also draw on, so a backlog catches up over several runs.
+VALI_KBS_AUDIT_PAGE_LIMIT = _env_int("VALI_KBS_AUDIT_PAGE_LIMIT", 500)
+VALI_KBS_AUDIT_MAX_PAGES_PER_RUN = _env_int("VALI_KBS_AUDIT_MAX_PAGES_PER_RUN", 4)
+# Retention, explicit: 0 = keep every entry forever (the default — the
+# copy in vali is the ONLY one that survives a KBS restart). N > 0 prunes
+# verified entries fetched more than N days ago; an entry flagged as a
+# chain break is never pruned.
+VALI_KBS_AUDIT_RETENTION_DAYS = _env_int("VALI_KBS_AUDIT_RETENTION_DAYS", 0)
+
 # S3 bucket holding §25 LUKS2+dm-integrity migration snapshots + the
 # TTL of the presigned PUT/GET URLs. The signed URLs are short-lived
 # capabilities — generated on demand, NEVER persisted in a job row.
@@ -1008,6 +1232,19 @@ VALI_ORCHESTRATION_SNAPSHOT_BUCKET = os.environ.get(
     "VALI_ORCHESTRATION_SNAPSHOT_BUCKET", "hippius-compute-migrations"
 )
 VALI_ORCHESTRATION_PRESIGN_TTL_SECS = _env_int("VALI_ORCHESTRATION_PRESIGN_TTL_SECS", 3600)
+# §25 snapshot upload: how long `Uploading` waits for the source miner's
+# multi-GB upload (every part URL is presigned for the TTL above, so keep
+# this within it), and the multipart part size. vali's operator S3 account
+# refuses any single request over ~10 GiB, and the store any part over
+# 512 MiB.
+VALI_ORCHESTRATION_UPLOAD_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_UPLOAD_TIMEOUT_S", 3600.0)
+# §25 `DestActivating`: the dest downloads the snapshot, verifies its length
+# + sha256 (and re-downloads, up to 3 times, one that does not verify), then
+# boots. A 40 GiB overlay takes ~4 min to fetch and ~1-2 min to hash.
+VALI_ORCHESTRATION_ACTIVATE_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_ACTIVATE_TIMEOUT_S", 2700.0)
+VALI_ORCHESTRATION_SNAPSHOT_PART_BYTES = _env_int(
+    "VALI_ORCHESTRATION_SNAPSHOT_PART_BYTES", 512 * 1024**2
+)
 
 # Per-HTTP-call timeout for the `effects` peer calls.
 VALI_ORCHESTRATION_EFFECT_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_EFFECT_TIMEOUT_S", 15.0)
@@ -1123,6 +1360,29 @@ VALI_ORDER_TICKET_MINT_BIN = os.environ.get(
     "/usr/local/bin/hippius-order-ticket-mint",
 )
 
+# Customer-held disk keys (M1 `split` / M2 `customer`, see
+# `apps.orchestration.services.customer_keys`). OFF by default: while off,
+# a launch intent naming `key_mode=split|customer` is refused at intake.
+# Gates only NEW launches — a relaunch / re-mint of an existing M1/M2 VM is
+# held to the mode pinned on its `Vm` row, so turning this off never
+# strands a running customer-keys VM.
+VALI_CUSTOMER_KEYS_ENABLED = _env_bool("VALI_CUSTOMER_KEYS_ENABLED", False)
+# The NetBird group every miner's peer is in (a name or an id): the SOURCE
+# of each tenant's `miners -> key guardian` policy
+# (`services.guardian_netbird`). Empty = the guardian endpoints refuse
+# `guardian-netbird-misconfigured` rather than guess.
+VALI_NETBIRD_MINERS_GROUP = os.environ.get("VALI_NETBIRD_MINERS_GROUP", "")
+# The guardian's TCP port when the operator names none (design §1.1).
+VALI_GUARDIAN_DEFAULT_PORT = _env_int("VALI_GUARDIAN_DEFAULT_PORT", 7443)
+# An M1/M2 guest waiting on its guardian (`apps.lifecycle.guardian_wait`):
+# how long one `awaiting-guardian` report stays fresh, and the most such a
+# wait can hold back a restore's auto-revert past its own deadline (bounds a
+# forged wait).
+VALI_GUARDIAN_WAIT_FRESH_S = float(os.environ.get("VALI_GUARDIAN_WAIT_FRESH_S", "600"))
+VALI_GUARDIAN_WAIT_MAX_PAUSE_S = float(
+    os.environ.get("VALI_GUARDIAN_WAIT_MAX_PAUSE_S", "86400")
+)
+
 # §22 allowlist signing seed (Ed25519) — PRODUCTION source: a Vault KV
 # v2 path under `VALI_VAULT_KV_MOUNT` holding the 32-byte seed as a
 # `seed=<64-hex>` field (e.g. `hippius-compute/vali/allowlist-root`).
@@ -1161,6 +1421,12 @@ VALI_SNP_OVMF_SHA256 = os.environ.get("VALI_SNP_OVMF_SHA256", "")
 # SEV-SNP guest-features bitmap the miner measures with (`SNP_GUEST_
 # FEATURES` = 0x1 = SNPActive). MUST match the miner-agent constant.
 VALI_SNP_GUEST_FEATURES = os.environ.get("VALI_SNP_GUEST_FEATURES", "0x1")
+# Per-pod cache of the sha-pinned launch artifacts the C2 recompute fetches
+# (OVMF, each bake's kernel/initrd), keyed by sha and re-verified on every
+# load (`apps.orchestration.services.s3_artifacts`). Empty ⇒ a directory
+# under the system temp dir. LRU-capped at MAX_BYTES.
+VALI_ARTIFACT_CACHE_DIR = os.environ.get("VALI_ARTIFACT_CACHE_DIR", "")
+VALI_ARTIFACT_CACHE_MAX_BYTES = _env_int("VALI_ARTIFACT_CACHE_MAX_BYTES", 300 << 20)
 # ENFORCE gate. `False` (default) ⇒ WARN mode: recompute + compare +
 # loud-log a mismatch but still pin the miner value (validation window).
 # `True` ⇒ fail-closed: a mismatch REFUSES the launch (no pin, no KEK)
@@ -1225,6 +1491,86 @@ VALI_NETBIRD_API_BASE = os.environ.get("VALI_NETBIRD_API_BASE", "https://api.net
 # header of the peer-revoke call only; never logged, never persisted.
 VALI_NETBIRD_API_TOKEN = os.environ.get("VALI_NETBIRD_API_TOKEN", "")
 
+# ─── Tenant NetBird peer janitor (`apps.orchestration.netbird_janitor`) ───
+# Tenant peers are PERSISTENT (NetBird never GCs them), so a §24 revoke that
+# failed would leak one forever. The janitor deletes `hippius-tenant-<vm_id>`
+# peers whose VM is Destroyed, or has no `Vm` row and has been offline past
+# the grace below. Kill switch:
+VALI_NETBIRD_PEER_JANITOR_ENABLED = _env_bool("VALI_NETBIRD_PEER_JANITOR_ENABLED", True)
+# Log what WOULD be deleted, delete nothing.
+VALI_NETBIRD_PEER_JANITOR_DRY_RUN = _env_bool("VALI_NETBIRD_PEER_JANITOR_DRY_RUN", False)
+# One pass (one `GET /api/peers`) at most every this many seconds.
+VALI_NETBIRD_PEER_JANITOR_INTERVAL_S = _env_int("VALI_NETBIRD_PEER_JANITOR_INTERVAL_S", 300)
+# At most this many deletions per pass — a bad listing or a bad join can
+# never sweep the account in one go.
+VALI_NETBIRD_PEER_JANITOR_MAX_DELETES = _env_int("VALI_NETBIRD_PEER_JANITOR_MAX_DELETES", 5)
+# A peer with NO `Vm` row is deleted only once it is disconnected AND NetBird
+# last saw it at least this long ago. Longer than any launch (the row exists
+# before dispatch anyway) and far longer than the ~10 min an ephemeral peer
+# used to survive offline.
+VALI_NETBIRD_PEER_JANITOR_ORPHAN_GRACE_S = _env_int(
+    "VALI_NETBIRD_PEER_JANITOR_ORPHAN_GRACE_S", 3600
+)
+# ASSUMPTION: this vali is the ONLY control plane enrolling
+# `hippius-tenant-*` peers in its NetBird account (true since the testnet
+# was abandoned — one vali, one account). Another vali's VMs would have no
+# `Vm` row here, so the "no row" rule would delete their peers. Set False if
+# the account is ever shared: then only peers of Destroyed VMs are deleted.
+VALI_NETBIRD_PEER_JANITOR_SOLE_OWNER = _env_bool(
+    "VALI_NETBIRD_PEER_JANITOR_SOLE_OWNER", True
+)
+
+# ─── Miner geo-probe (`vali_geo_probe`) — DETECTED location, nothing declared ───
+# Every input is measured by a party the miner does not control: the public
+# IP its NetBird peer connects FROM (management server), GeoIP/ASN of that
+# IP (RIPEstat), the round-trip time vali measures to it, and the egress IP
+# its tenant CVMs report. `apps/miners/geo.py` explains each.
+VALI_GEO_PROBE_INTERVAL_S = _env_float("VALI_GEO_PROBE_INTERVAL_S", 600.0)
+# RIPEstat data API (public, key-free). Empty ⇒ every lookup fails and
+# every miner stays `unknown` — never silently "verified".
+VALI_GEO_RIPESTAT_BASE = os.environ.get("VALI_GEO_RIPESTAT_BASE", "https://stat.ripe.net")
+# Outbound HTTP timeout for the NetBird + RIPEstat calls.
+VALI_GEO_HTTP_TIMEOUT_S = _env_float("VALI_GEO_HTTP_TIMEOUT_S", 10.0)
+# WHERE the RTT is measured from — the control plane's own coordinates.
+# The latency bound is `distance(vantage, geo) <= rtt_ms * KM_PER_MS +
+# SLACK_KM`; a wrong vantage flips every miner to `latency-inconsistent`
+# (fail-closed, visible), never to a false `verified`. Set these to the
+# control plane's own location.
+VALI_GEO_VANTAGE_NAME = os.environ.get("VALI_GEO_VANTAGE_NAME", "vali")
+VALI_GEO_VANTAGE_LAT = _env_float("VALI_GEO_VANTAGE_LAT", 0.0)
+VALI_GEO_VANTAGE_LON = _env_float("VALI_GEO_VANTAGE_LON", 0.0)
+# Light in fibre ≈ 200 km/ms one way ⇒ ~100 km per ms of ROUND-TRIP. Raising
+# this loosens the bound (more tunnels pass); it is physics, leave it.
+VALI_GEO_KM_PER_MS = _env_float("VALI_GEO_KM_PER_MS", 100.0)
+# Tolerance for GeoIP centroid error + queueing: a country-level GeoLite
+# point (a provider's ranges may resolve to its capital whatever the DC)
+# needs a few hundred km.
+VALI_GEO_SLACK_KM = _env_float("VALI_GEO_SLACK_KM", 300.0)
+# A peer not seen by NetBird within this window is `peer-stale`
+# (unverified) — its connection_ip may be history.
+VALI_GEO_PEER_STALE_S = _env_float("VALI_GEO_PEER_STALE_S", 900.0)
+# Re-ask RIPEstat only when the observed IP changed or the row is older
+# than this; the RTT is re-measured every cycle regardless.
+VALI_GEO_GEOIP_TTL_S = _env_float("VALI_GEO_GEOIP_TTL_S", 86400.0)
+VALI_GEO_RTT_SAMPLES = _env_int("VALI_GEO_RTT_SAMPLES", 5)
+# The OTHER side of the latency check — a nearby claim must answer with a
+# nearby round-trip: `rtt <= (distance / KM_PER_MS) * PATH_FACTOR + EXTRA_MS`.
+# Real paths wander ~2-2.5× the great circle and queue a few tens of ms;
+# a host on another continent tunnelling through a nearby VPN exit cannot
+# get under this because its packets still travel to where it really is.
+# Loosening these is what lets a VPN pass.
+VALI_GEO_RTT_PATH_FACTOR = _env_float("VALI_GEO_RTT_PATH_FACTOR", 2.5)
+VALI_GEO_RTT_EXTRA_MS = _env_float("VALI_GEO_RTT_EXTRA_MS", 30.0)
+# A `MinerLocation` older than this is not in ANY region for the scheduler
+# or the regions API — a probe that stopped, or a miner that vanished from
+# NetBird, must not leave a `verified` verdict standing. 12 probe cycles.
+VALI_GEO_MAX_AGE_S = _env_float("VALI_GEO_MAX_AGE_S", 7200.0)
+# The scheduler's region gate and `GET /v1/operator/regions` count a miner
+# as being in a region only when its verdict is `verified`. False widens
+# both to `unverified` rows as well (never `mismatch` — a contradiction —
+# nor `unknown`) — a debugging posture, not a production one.
+VALI_GEO_REQUIRE_VERIFIED = _env_bool("VALI_GEO_REQUIRE_VERIFIED", True)
+
 # Grace window a §25-migrated VM's NetBird peer gets to come back
 # CONNECTED before `orchestration.service.verify_netbird_enrolments`
 # declares it `lost` (P9/#17). Only bounds the AMBIGUOUS case (the peer
@@ -1234,6 +1580,121 @@ VALI_NETBIRD_API_TOKEN = os.environ.get("VALI_NETBIRD_API_TOKEN", "")
 VALI_NETBIRD_VERIFY_GRACE_S = float(
     os.environ.get("VALI_NETBIRD_VERIFY_GRACE_S", "900")
 )
+
+# Public IPs (`apps.network`). A released address is held out of the pool
+# this long before another TENANT can get it (the tenant that released it
+# may take it back at once), so traffic still aimed at the previous holder
+# never reaches someone else. The edge drops the address's rules and flushes
+# its conntrack entries on its next render, so no established flow outlives
+# the detach; what the window still covers is DNS records and caches that
+# point at the address (TTLs of minutes, rarely more than an hour).
+VALI_PUBLIC_IP_QUARANTINE_S = _env_float("VALI_PUBLIC_IP_QUARANTINE_S", 3600.0)
+# How often the orchestration tick re-reads NetBird to follow attached
+# VMs' overlay addresses and fix the edges' exit routing. An attach or a
+# detach forces the next tick regardless.
+VALI_PUBLIC_IP_NETBIRD_SYNC_S = _env_int("VALI_PUBLIC_IP_NETBIRD_SYNC_S", 30)
+# When set, an ingress edge's NetBird peer must belong to this group (the
+# group its setup key enrols it in) to be registered or routed through.
+# A tenant VM's peer is refused either way.
+VALI_PUBLIC_IP_EDGE_PEER_GROUP = os.environ.get("VALI_PUBLIC_IP_EDGE_PEER_GROUP", "")
+
+# Live VM backups (`apps.backup`, docs/design/backup-failover.md). Off by
+# default: while off the backup tick does nothing and a new backup policy
+# is refused; existing policies and restore points are kept as they are.
+VALI_BACKUP_ENABLED = _env_bool("VALI_BACKUP_ENABLED", False)
+# vali's own bucket on its own S3 account — never a tenant's. The tenant has
+# no right on it, so it can neither delete nor hide a backup. No default: it
+# must be a DEDICATED private bucket, and vali refuses the images or the
+# migration-snapshot bucket (the images one is public-read). The tick checks
+# it is reachable before doing anything and logs an ERROR when it is not.
+VALI_BACKUP_BUCKET = os.environ.get("VALI_BACKUP_BUCKET", "")
+# The backup bucket's OWN key (e.g. `hippius-vm-backup`), separate from the
+# default boto chain vali's images key rides: an object-level token scoped
+# to that one bucket (object read/write + multipart; no bucket-admin calls).
+# Fed from the `vali-backup-s3` Secret by the chart. Never logged.
+VALI_BACKUP_S3_ACCESS_KEY_ID = os.environ.get("VALI_BACKUP_S3_ACCESS_KEY_ID", "")
+VALI_BACKUP_S3_SECRET_ACCESS_KEY = os.environ.get("VALI_BACKUP_S3_SECRET_ACCESS_KEY", "")
+VALI_BACKUP_S3_ENDPOINT_URL = os.environ.get("VALI_BACKUP_S3_ENDPOINT_URL", "")
+# A chain is rebased (a new full is taken) once it holds this many
+# incrementals, or once its incrementals add up to more than half the full.
+VALI_BACKUP_MAX_CHAIN = _env_int("VALI_BACKUP_MAX_CHAIN", 24)
+# Smallest multipart part vali hands out, clamped to the store's 512 MiB
+# ceiling. The default IS the ceiling: the fewest parts (a 40 GiB disk
+# stays within 100), so the smallest orders and status polls.
+VALI_BACKUP_MIN_PART_BYTES = _env_int("VALI_BACKUP_MIN_PART_BYTES", 512 * 1024 * 1024)
+# A run not done by then is failed (and its upload aborted). Also the TTL of
+# the presigned part URLs, so it is capped at 24 h.
+VALI_BACKUP_RUN_TIMEOUT_S = _env_int("VALI_BACKUP_RUN_TIMEOUT_S", 6 * 3600)
+# A miner that no longer knows a run it accepted (agent restart) gets this
+# long before the run is declared lost.
+VALI_BACKUP_LOST_GRACE_S = _env_int("VALI_BACKUP_LOST_GRACE_S", 180)
+# Consecutive failed status polls of a running backup before it is logged as
+# a WARNING (fewer are INFO). A single miss is normal: while a run sets up its
+# QMP job, libvirt serialises the status route's own monitor query behind it.
+VALI_BACKUP_POLL_MISS_WARN = _env_int("VALI_BACKUP_POLL_MISS_WARN", 3)
+# Client timeout of one status poll. Just above the Edge relay's own 30 s
+# request cap, so a slow miner surfaces as the Edge's answer rather than a
+# vali-side timeout (the generic effect timeout is 15 s).
+VALI_BACKUP_POLL_TIMEOUT_S = _env_float("VALI_BACKUP_POLL_TIMEOUT_S", 32.0)
+# How often an idle backed-up VM is probed for a reboot (new boot counter or
+# a vanished dirty bitmap). A reboot makes every earlier backup
+# unrestorable, so the post-boot full is taken as soon as one is seen.
+VALI_BACKUP_PROBE_INTERVAL_S = _env_int("VALI_BACKUP_PROBE_INTERVAL_S", 300)
+# Wait after a failed run before the next attempt (the next interval wins if
+# it is sooner).
+VALI_BACKUP_RETRY_AFTER_S = _env_int("VALI_BACKUP_RETRY_AFTER_S", 900)
+# The backup janitor — what bucket lifecycle rules would do, done by vali
+# because Hippius S3 acknowledges PutBucketLifecycle without enforcing it.
+# Multipart uploads under `backups/` older than this that no active run
+# owns are aborted; staged state disks under `uploads/` older than this
+# that no active run owns are deleted.
+VALI_BACKUP_MPU_MAX_AGE_S = _env_int("VALI_BACKUP_MPU_MAX_AGE_S", 2 * 86400)
+VALI_BACKUP_STAGING_MAX_AGE_S = _env_int("VALI_BACKUP_STAGING_MAX_AGE_S", 2 * 86400)
+# Items the janitor handles per tick per listing, and how often it starts a
+# new sweep of the bucket once the previous one finished.
+VALI_BACKUP_JANITOR_BATCH = _env_int("VALI_BACKUP_JANITOR_BATCH", 100)
+VALI_BACKUP_JANITOR_INTERVAL_S = _env_int("VALI_BACKUP_JANITOR_INTERVAL_S", 3600)
+
+# Restore a VM from one of its backups (`apps.orchestration.restore`,
+# docs/design/backup-failover.md). Off by default: `POST /v1/vm/<id>/restore`
+# answers `restore-disabled`; jobs already open keep being driven.
+VALI_RESTORE_ENABLED = _env_bool("VALI_RESTORE_ENABLED", False)
+# Parallel ranged GETs the destination opens per object while staging.
+VALI_RESTORE_STREAMS = _env_int("VALI_RESTORE_STREAMS", 8)
+# Throughput assumed for a destination with no measured full backup (the
+# ETA), in bytes per second.
+VALI_RESTORE_DEFAULT_THROUGHPUT_BPS = _env_int("VALI_RESTORE_DEFAULT_THROUGHPUT_BPS", 100_000_000)
+# Phase deadlines. Staging gets three times its ETA, at least this, at most
+# 12 h (the presigned URLs' cap).
+VALI_RESTORE_STAGE_TIMEOUT_S = _env_float("VALI_RESTORE_STAGE_TIMEOUT_S", 3600.0)
+VALI_RESTORE_STOP_TIMEOUT_S = _env_float("VALI_RESTORE_STOP_TIMEOUT_S", 600.0)
+# How long the restored guest has to release its key (the commit point, read
+# from the KBS evidence) once the destination booted it; past it with no
+# sign of a release, the restore reverts.
+VALI_RESTORE_VERIFY_TIMEOUT_S = _env_float("VALI_RESTORE_VERIFY_TIMEOUT_S", 900.0)
+VALI_RESTORE_REVERT_TIMEOUT_S = _env_float("VALI_RESTORE_REVERT_TIMEOUT_S", 1800.0)
+# A restore that fails AFTER its commit point keeps the original disk on the
+# destination at least this long (and after it, until the restored VM is
+# proven on the destination and alive).
+VALI_RESTORE_KEEP_ORIGINAL_S = _env_float("VALI_RESTORE_KEEP_ORIGINAL_S", 86400.0)
+# A2: restore a point of an EARLIER boot through a KBS-authorized rollback
+# (`authorize-rollback`). Off by default: such points answer
+# `rollback-unsupported`. Needs a KBS serving the rollback routes. Turning it
+# off also fails a rollback restore that has not armed the KBS yet.
+VALI_RESTORE_ROLLBACK_ENABLED = _env_bool("VALI_RESTORE_ROLLBACK_ENABLED", False)
+# At most one rollback per VM this often (the KBS enforces its own too).
+VALI_RESTORE_ROLLBACK_MIN_INTERVAL_S = _env_float("VALI_RESTORE_ROLLBACK_MIN_INTERVAL_S", 1800.0)
+# An operator undo whose KBS arm is refused past its fence retries it this long
+# (capped at half the undo phase's deadline), then gives the VM back to the
+# restored disk at `undo_gen + 1` instead of leaving it fenced.
+VALI_RESTORE_UNDO_ARM_RETRY_S = _env_float("VALI_RESTORE_UNDO_ARM_RETRY_S", 300.0)
+# Operator-only manual failover of a VM whose miner is dead
+# (`POST /v1/vm/<id>/failover`). Off by default: the route answers
+# `failover-disabled`.
+VALI_FAILOVER_MANUAL_ENABLED = _env_bool("VALI_FAILOVER_MANUAL_ENABLED", False)
+# A miner is dead for a failover only when its heartbeat AND its NetBird peer
+# have both been silent at least this long, and the Edge cannot reach it.
+VALI_FAILOVER_DEAD_AFTER_S = _env_float("VALI_FAILOVER_DEAD_AFTER_S", 600.0)
 
 # §25 SOURCE-side reclaim (P9/#15). A migration is a COPY: the source host
 # keeps the tenant's LUKS overlay, the boot-counter state disk and the
@@ -1251,6 +1712,20 @@ VALI_MIGRATION_SOURCE_RECLAIM_ENABLED = _env_bool(
 # How long a completed migration waits for that proof before the reclaim is
 # abandoned with a LOUD `skipped` (the artifacts stay put). Generous: the
 # cost of waiting is idle disk, the cost of giving up early is nothing.
+# A §25 source is reclaimed only once the DESTINATION guest has proved it is
+# running — an in-guest signal (served receipt / live attestation) at least
+# this long after the migration finished — on top of the KBS grant proof. A
+# destination that dies after its unlock (a volume the length/sha check did
+# not catch) then never costs the source copy. Same gate for deleting the
+# migration's S3 snapshot.
+VALI_MIGRATION_RECLAIM_LIVENESS_GRACE_S = _env_float(
+    "VALI_MIGRATION_RECLAIM_LIVENESS_GRACE_S", 600.0
+)
+# How long a FAILED migration's S3 snapshot is kept once its VM is back on
+# its source (a re-drive is then impossible, so the snapshot is dead weight).
+VALI_MIGRATION_SNAPSHOT_RETENTION_S = _env_float(
+    "VALI_MIGRATION_SNAPSHOT_RETENTION_S", 3 * 86400.0
+)
 VALI_MIGRATION_SOURCE_RECLAIM_WINDOW_S = _env_float(
     "VALI_MIGRATION_SOURCE_RECLAIM_WINDOW_S", 6 * 3600.0
 )
@@ -1273,6 +1748,12 @@ VALI_MIGRATION_SOURCE_RECLAIM_WINDOW_S = _env_float(
 VALI_MIGRATION_STRAND_RESTORE_ENABLED = _env_bool(
     "VALI_MIGRATION_STRAND_RESTORE_ENABLED", True
 )
+# Kill-switch for AUTOMATIC §25 enrolment (`enroll_departing_miner_migrations`:
+# every Active VM on a quarantined / decommissioned / exiting miner). Off, a
+# departing miner's VMs stay where they are; operator-started migrations are
+# unaffected. For when §25 itself cannot succeed (e.g. an upload path that
+# refuses the volume), so VMs do not cycle fence → fail → restore.
+VALI_MIGRATION_AUTO_ENROL_ENABLED = _env_bool("VALI_MIGRATION_AUTO_ENROL_ENABLED", True)
 # How often the stranded-VM ERROR line repeats while the condition
 # persists (it is permanent until an operator acts, and the tick runs
 # every ~10 s). A change to the stranded SET always re-warns immediately.
@@ -1512,7 +1993,14 @@ VALI_SYNTHETIC_TENANT_ID = os.environ.get("VALI_SYNTHETIC_TENANT_ID", "synthetic
 # never hang the CronJob past its activeDeadline.
 VALI_SYNTHETIC_E2E_BUDGET_S = _env_int("VALI_SYNTHETIC_E2E_BUDGET_S", 1800)
 VALI_SYNTHETIC_LAUNCH_TIMEOUT_S = _env_int("VALI_SYNTHETIC_LAUNCH_TIMEOUT_S", 420)
-VALI_SYNTHETIC_BOOT_TIMEOUT_S = _env_int("VALI_SYNTHETIC_BOOT_TIMEOUT_S", 300)
+# Fresh per-wait cap for the `release`, `boot` (-> `running`) and NetBird
+# waits; the whole run is still hard-capped by E2E_BUDGET_S. Measured
+# 2026-09-25: an Ubuntu golden VM reaches `running` in ~150-250 s on the
+# NVMe hosts and ~340 s on a Milan host with rotational disks — 300 s failed
+# a healthy slow host. The budget holds a slow run: launch (≤420) + boot
+# (≤600, release included) + decommission (≤720) = 1740 s < 1800 s; NetBird
+# lands seconds after `running`.
+VALI_SYNTHETIC_BOOT_TIMEOUT_S = _env_int("VALI_SYNTHETIC_BOOT_TIMEOUT_S", 600)
 # The golden §24 decommission includes a ~10-min FORCED-RECLAIM before the
 # crypto-erase (live full-run measured ~630s), so the timeout must clear
 # that with margin — the old 240s tripped on every golden decommission.
@@ -1550,6 +2038,34 @@ VALI_SYNTHETIC_REAP_AGE_S = _env_int("VALI_SYNTHETIC_REAP_AGE_S", 5400)
 # tunable cap or horizon is itself the blanket mute. Read that module's
 # preamble before adding an entry.
 VALI_SYNTHETIC_ACK = os.environ.get("VALI_SYNTHETIC_ACK", "")
+
+# ── Scheduled golden re-bake (F6, apps.images.rebake) ────────────────
+# `vali_scheduled_golden_rebake` re-bakes every golden image with a
+# package refresh, one bake at a time, and NEVER blesses. Off by default:
+# with the flag off the command queues nothing (`--report-only` is
+# read-only and runs regardless).
+VALI_GOLDEN_REBAKE_ENABLED = _env_bool("VALI_GOLDEN_REBAKE_ENABLED", False)
+VALI_GOLDEN_REBAKE_IMAGES = _env_list(
+    "VALI_GOLDEN_REBAKE_IMAGES", ["ubuntu", "debian", "cs10", "fedora"]
+)
+# Run the synthetic full e2e against each new, unblessed bake.
+VALI_GOLDEN_REBAKE_E2E = _env_bool("VALI_GOLDEN_REBAKE_E2E", False)
+VALI_GOLDEN_REBAKE_POLL_INTERVAL_S = _env_float("VALI_GOLDEN_REBAKE_POLL_INTERVAL_S", 30.0)
+# Per-bake wait. A warm golden bake is ~3 min; a refreshed one is a cache
+# MISS (download + chroot + upgrade), measured ~7-15 min cold.
+VALI_GOLDEN_REBAKE_BAKE_TIMEOUT_S = _env_int("VALI_GOLDEN_REBAKE_BAKE_TIMEOUT_S", 3600)
+# How long to wait for an unrelated in-flight bake before giving up.
+VALI_GOLDEN_REBAKE_IDLE_TIMEOUT_S = _env_int("VALI_GOLDEN_REBAKE_IDLE_TIMEOUT_S", 3600)
+VALI_GOLDEN_REBAKE_PUSH_JOB = os.environ.get("VALI_GOLDEN_REBAKE_PUSH_JOB", "golden-rebake")
+# Pushgateway job of the guest upgrade report (`vali_guest_report`).
+VALI_GUEST_REPORT_PUSH_JOB = os.environ.get("VALI_GUEST_REPORT_PUSH_JOB", "guest-upgrade")
+# The guest report's KBS T4 signal (keepalives refused as the VM's own
+# superseded guest). Turn on only once the KBS carries #1405 (it checks the
+# guest binding before `superseded-launch`); needs the audit ingest.
+VALI_GUEST_KBS_T4_ENABLED = _env_bool("VALI_GUEST_KBS_T4_ENABLED", False)
+# Must equal the KBS's `nonce_ttl_secs` (chart `kbs.nonceTtlSecs`): the
+# grace a request in flight at a hand-over gets before it counts as T4.
+VALI_KBS_NONCE_TTL_S = _env_int("VALI_KBS_NONCE_TTL_S", 300)
 
 # ── What the KBS process is SUPPOSED to be enforcing ─────────────────
 # JSON object of posture key → expected value, diffed every ~15 min

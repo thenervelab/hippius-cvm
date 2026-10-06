@@ -305,9 +305,15 @@ def test_the_grace_window_is_operator_tunable(
 
     _migrate_to_done(vm)
 
+    after = timezone.now()
     vm.refresh_from_db()
     assert vm.netbird_verify_deadline is not None
-    assert vm.netbird_verify_deadline <= before + timedelta(seconds=61)
+    # The deadline is armed at some instant in [before, after]; with the
+    # grace tuned to 60 s it must land exactly 60 s past that instant
+    # (the 900 s default would overshoot `after + 60 s`), however long
+    # the tick itself took.
+    grace = timedelta(seconds=60)
+    assert before + grace <= vm.netbird_verify_deadline <= after + grace
 
 
 # ─── the signal reaches an operator ──────────────────────────────────

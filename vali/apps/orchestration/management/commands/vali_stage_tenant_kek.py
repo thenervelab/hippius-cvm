@@ -27,7 +27,8 @@ from __future__ import annotations
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.orchestration.services import vault_kv
+from apps.lifecycle.models import Vm
+from apps.orchestration.services import customer_keys, vault_kv
 
 # Same charset the canonical path + the broker BrokerScope::validate accept.
 _VM_ID_OK = set("abcdefghijklmnopqrstuvwxyz0123456789-")
@@ -63,6 +64,16 @@ class Command(BaseCommand):
         if not prefix:
             raise CommandError("VALI_VAULT_KV_PREFIX is not configured")
         luks_path = f"{prefix}/{vm_id}/luks-kek"
+
+        # Customer-held keys M2 (`customer`): Hippius holds NO disk KEK for
+        # that VM. Staging one here would put provider key material beside
+        # a disk the customer alone is meant to unlock.
+        pinned = Vm.objects.filter(vm_id=vm_id).values_list("key_mode", flat=True).first()
+        if pinned == customer_keys.KEY_MODE_CUSTOMER:
+            raise CommandError(
+                f"vm {vm_id!r} is pinned key_mode=customer: Hippius holds no disk KEK "
+                "for it, refusing to stage one"
+            )
 
         transit_key = vault_kv.transit_key_name(vm_id)
         vault_kv.ensure_transit_key(transit_key)

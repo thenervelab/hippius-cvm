@@ -108,6 +108,26 @@ spec:
                   key: secret-key
             - name: AWS_DEFAULT_REGION
               value: {{ .Values.config.s3RegionName | quote }}
+            {{- /* Live VM backups: the backup bucket's own key. Renders nothing
+                   unless vmBackup.credentials.enabled (see vali.backupEnv). */}}
+            {{- with include "vali.backupEnv" . }}{{ . | nindent 12 }}{{- end }}
+            # §25 auto-enrolment of a departing miner's VMs (kill-switch).
+            - name: VALI_MIGRATION_AUTO_ENROL_ENABLED
+              value: {{ .Values.orchestrationTick.migrationAutoEnrol | quote }}
+            # §24 KBS fence (#1132): decommission fences the KBS before the
+            # crypto-erase and tombstones it on destroy. The §24 handlers and
+            # the pending-fence sweep run in THIS tick.
+            - name: VALI_KBS_FENCE_ENABLED
+              value: {{ .Values.orchestrationTick.kbsFence | quote }}
+            # KBS audit-log ingest: GET /v1/admin/audit → KbsAuditEntry.
+            - name: VALI_KBS_AUDIT_INGEST_ENABLED
+              value: {{ .Values.orchestrationTick.kbsAuditIngest | quote }}
+            - name: VALI_KBS_AUDIT_RETENTION_DAYS
+              value: {{ .Values.orchestrationTick.kbsAuditRetentionDays | quote }}
+            # Guest upgrades: advances the operator-admitted GuestUpgradeJobs
+            # (tick_guest_upgrades). Set on THIS deployment only.
+            - name: VALI_GUEST_UPGRADE_ENABLED
+              value: {{ .Values.orchestrationTick.guestUpgrade | default "false" | quote }}
             {{- if .Values.orchestrationTick.rebootRecovery.enabled }}
             # Reboot-recovery (service.reboot_recovery_once): relaunch an
             # Active VM that a host reboot powered off, on its SAME alive
@@ -122,14 +142,15 @@ spec:
               value: {{ .Values.orchestrationTick.rebootRecovery.maxAttempts | quote }}
             - name: VALI_REBOOT_RECOVERY_BACKOFF_BASE_S
               value: {{ .Values.orchestrationTick.rebootRecovery.backoffBaseS | quote }}
+            {{- end }}
             {{- if .Values.netbird.enabled }}
-            # Reboot-recovery calls `launch_on_miner`, which — for a
-            # netbird-on VM (every real tenant) — mints a NetBird setup-key.
-            # This tick historically ran ONLY migration/decommission (no key
-            # mint) so it lacked these creds; reboot-recovery adds a LAUNCH
-            # here, so it now needs the SAME NetBird BASE + TOKEN the
-            # launch-tick has, or every recovery of a netbird-on VM fails
-            # `terminal` at `netbird:list-groups` and burns the attempt cap.
+            # NetBird BASE + TOKEN, independent of reboot-recovery: this tick
+            # also runs the post-§25 overlay check and the public-IP
+            # reconcile (`apps.network`), which read peers and manage the
+            # ingress edges' exit routes on every pass. Reboot-recovery needs
+            # them too — its `launch_on_miner` mints a setup key for every
+            # netbird-on VM, and without them each recovery fails `terminal`
+            # at `netbird:list-groups` and burns the attempt cap.
             - name: VALI_NETBIRD_API_BASE
               value: {{ .Values.netbird.apiBase | quote }}
             - name: VALI_NETBIRD_API_TOKEN
@@ -137,7 +158,6 @@ spec:
                 secretKeyRef:
                   name: vali-netbird-token
                   key: VALI_NETBIRD_API_TOKEN
-            {{- end }}
             {{- end }}
           resources:
             {{- .Values.orchestrationTick.resources | toYaml | nindent 12 }}
@@ -152,6 +172,9 @@ spec:
             {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 12 }}
             - name: tmp
               mountPath: /tmp
+            # sha-keyed cache of the C2 recompute inputs (s3_artifacts).
+            - name: artifact-cache
+              mountPath: /var/cache/vali-artifacts
             - name: vault-ca
               mountPath: /etc/hippius/vault-ca
               readOnly: true
@@ -171,6 +194,11 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        # Holds VALI_ARTIFACT_CACHE_MAX_BYTES (300 MiB) plus a download
+        # in flight; /tmp (100 Mi) is far too small for it.
+        - name: artifact-cache
+          emptyDir:
+            sizeLimit: 512Mi
         - name: vault-ca
           configMap:
             name: vault-ca

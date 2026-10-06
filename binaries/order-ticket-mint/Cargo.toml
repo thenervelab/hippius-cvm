@@ -39,3 +39,4 @@ rand_core = { version = "0.6", features = ["std"] }
 # wire shape matches the live KBS.
 kbs-core = { path = "../../kbs-core" }
 tempfile = "3"
+sha2 = "0.10"

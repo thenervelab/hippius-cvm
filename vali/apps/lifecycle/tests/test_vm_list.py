@@ -172,3 +172,25 @@ def test_list_exposes_boot_phase_fields(authed_client: APIClient) -> None:
 
     assert by_id["vm-running"]["boot_phase"] == VmBootPhase.RUNNING.value
     assert by_id["vm-running"]["boot_phase_at"] is not None
+
+
+def test_list_applies_each_rows_flavor_deadline(authed_client: APIClient) -> None:
+    """A small (40 GiB ⇒ 1500 s) VM silent for 30 min is stalled; the list
+    must resolve its flavor rather than fall back to the full cap."""
+    from datetime import timedelta
+
+    from apps.orchestration.models import LaunchJob
+    from apps.orchestration.tests.factories import make_service_client
+
+    vm = _mk_vm("vm-small")
+    Vm.objects.filter(pk=vm.pk).update(
+        boot_started_at=timezone.now() - timedelta(minutes=30)
+    )
+    LaunchJob.objects.create(
+        job_id="j-small", vm_id="vm-small", tenant_id="t", flavor="small",
+        userdata_vault_path="x", userdata_vault_version=1, kek_vault_path="x",
+        phase_started_at=timezone.now(), decided_by=make_service_client(),
+    )
+    row = authed_client.get(reverse("vm_list")).json()["vms"][0]
+    assert row["boot_stalled"] is True
+    assert row["guest_liveness"] == "wedged"

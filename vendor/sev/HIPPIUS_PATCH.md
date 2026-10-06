@@ -36,6 +36,15 @@ would fail-close `attestation: measurement not in ticket's allowed set`.
 We therefore pin the genuine silicon value on `EpycTurin` and keep the
 upstream placeholder on `EpycTurinV1` for reference.
 
+## Milan — verified, no patch needed
+
+Upstream's `EpycMilan => cpu_sig(25, 1, 1)` = CPUID `0x00A00F11` is
+already the genuine silicon value: an EPYC 7543 host reads leaf 1 EAX
+`0x00A00F11` off `/dev/cpu/0/cpuid` (family 25, model 1, stepping 1),
+byte-for-byte equal. `EpycMilan` is therefore left as shipped; the
+miner-agent test `milan_cpu_sig_is_the_genuine_silicon_value` guards it
+across bumps.
+
 Every byte outside these two `vcpu_types.rs` patches is byte-identical
 to the published crate.
 
@@ -100,7 +109,8 @@ When sev publishes a new release on crates.io:
 5. Verify both patches survive:
    - `grep 'EpycGenoa => cpu_sig(25, 17, 1)' vendor/sev/src/measurement/vcpu_types.rs`
    - `grep 'EpycTurin => cpu_sig(26, 2, 1)'  vendor/sev/src/measurement/vcpu_types.rs`
-   must each return their one line.
+   must each return their one line, and the unpatched Milan value must
+   still be `grep 'EpycMilan => cpu_sig(25, 1, 1)'`.
 
 ## Why vendor instead of git-fork
 

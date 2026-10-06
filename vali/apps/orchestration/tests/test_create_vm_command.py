@@ -8,6 +8,7 @@ a prod cluster cannot ship.
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any
 
 import pytest
@@ -204,6 +205,25 @@ def test_netbird_enabled_requires_placeholder(
         )
 
 
+def test_a_vault_prefixed_userdata_file_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`vault:` means "these bytes are already Transit ciphertext"
+    everywhere downstream: `launch_on_miner` would copy the file to the
+    canonical path verbatim, skipping both the NetBird substitution and
+    the wrap, and the KBS would then fail to decrypt it — a confusing
+    failure two systems away from the typo. The launch API rejects the
+    same shape at intake."""
+    monkeypatch.setattr(settings, "VALI_ALLOW_PROD", False)
+    ud = tmp_path / "userdata.yaml"
+    ud.write_bytes(b"vault:v1:looks-like-ciphertext\n# {{NETBIRD_SETUP_KEY}}\n")
+    with pytest.raises(CommandError, match="vault:"):
+        call_command(
+            "vali_create_vm",
+            **_required_argv(userdata_file=str(ud), enable_netbird=True),
+        )
+
+
 def test_netbird_hostname_template_rejects_unknown_placeholders(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -228,14 +248,34 @@ def test_netbird_hostname_template_rejects_unknown_placeholders(
         )
 
 
+def test_netbird_hostname_template_must_render_the_revocable_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The tenant peer is persistent and revoked BY NAME — the CLI refuses a
+    template that renders anything but `hippius-tenant-<vm_id>`."""
+    monkeypatch.setattr(settings, "VALI_ALLOW_PROD", False)
+    ud = tmp_path / "userdata.yaml"
+    ud.write_bytes(b"#cloud-config\n# placeholder: {{NETBIRD_SETUP_KEY}}\n")
+    with pytest.raises(CommandError, match="netbird_hostname_template must render"):
+        call_command(
+            "vali_create_vm",
+            **_required_argv(
+                userdata_file=str(ud),
+                enable_netbird=True,
+                netbird_hostname_template="custom-{vm_id}",
+            ),
+        )
+
+
 # ── #312 flavor catalogue ───────────────────────────────────────────
 
 
-def test_flavor_choices_match_rust_catalogue() -> None:
+def test_flavor_choices_are_the_launchable_flavors() -> None:
     """#312 — argparse `choices` MUST list every variant the Rust
-    `hippius_types::flavor::Flavor` enum carries (Small / Medium /
-    Large). If a future PR adds a new flavor, this test catches the
-    Python-side drift loud."""
+    `hippius_types::flavor::Flavor` enum carries, plus the unlisted
+    runner flavors (minted as their compute class, not Rust variants).
+    If a future PR adds a new flavor, this test catches the Python-side
+    drift loud."""
     from apps.orchestration.management.commands import vali_create_vm
 
     parser = vali_create_vm.Command().create_parser("manage.py", "vali_create_vm")
@@ -250,6 +290,9 @@ def test_flavor_choices_match_rust_catalogue() -> None:
         "xlarge",
         "2xlarge",
         "4xlarge",
+        "runner-small",
+        "runner-medium",
+        "runner-large",
     }
     assert actions["flavor"].required is True
 
@@ -263,18 +306,50 @@ def test_flavor_python_catalogue_matches_rust_enum() -> None:
     says 8 vcpus) but actually launch with 4 vcpus on the miner-agent.
     That's a silent contract violation; this test catches it at CI.
     """
+    # PARSE the Rust source of record instead of hand-copying it. This
+    # used to be a third copy of the numbers, with a comment promising
+    # "drift here = drift loud" that it could not keep: it compared Python
+    # to itself, so Rust and Python could disagree silently and the two
+    # tables were resynchronised by hand. `flavors.py`'s own docstring
+    # names a `test_flavor_catalogue_matches_rust_enum` that never existed.
+    #
+    # The numbers are load-bearing beyond bookkeeping: `vcpus` enters the
+    # SNP launch measurement and `disk_gb` rides the measured cmdline, so a
+    # silent divergence between the L1-mint/KBS-verify surface (Rust) and
+    # what vali actually requests (Python) is a guest the KBS declines.
+    import re
+
     from apps.orchestration.services import flavors
 
-    # Mirror of the Rust `vcpus()`/`memory_mb()`/`disk_gb()` constants
-    # from `hippius-types/src/flavor.rs`. Drift here = drift loud.
-    expected = {
-        "small": (1, 2048, 8),
-        "medium": (2, 4096, 16),
-        "large": (4, 8192, 32),
-        "xlarge": (8, 16384, 64),
-        "2xlarge": (16, 32768, 128),
-        "4xlarge": (32, 65536, 256),
+    rust = (
+        pathlib.Path(__file__).resolve().parents[4]
+        / "hippius-types"
+        / "src"
+        / "flavor.rs"
+    ).read_text()
+
+    def _rust_table(fn: str) -> dict[str, int]:
+        body = re.search(rf"fn {fn}\b.*?match self \{{(.*?)\n        \}}", rust, re.S)
+        assert body, f"cannot find `fn {fn}` in flavor.rs"
+        return {
+            m.group(1): int(m.group(2))
+            for m in re.finditer(r"Self::(\w+) => (\d+),", body.group(1))
+        }
+
+    # Rust variant name -> the wire/flavor name Python uses.
+    variant_to_name = {
+        "Small": "small",
+        "Medium": "medium",
+        "Large": "large",
+        "Xlarge": "xlarge",
+        "X2large": "2xlarge",
+        "X4large": "4xlarge",
     }
+    cpus, mems, disks = (_rust_table(f) for f in ("vcpus", "memory_mb", "disk_gb"))
+    expected = {
+        variant_to_name[v]: (cpus[v], mems[v], disks[v]) for v in variant_to_name
+    }
+
     assert set(flavors.FLAVOR_NAMES) == set(expected)
     for name, (cpu, mem, disk) in expected.items():
         size = flavors.resolve_flavor(name)
@@ -303,7 +378,7 @@ def test_resolve_flavor_splits_rootfs_and_data_disk() -> None:
 
 
 def test_augment_cmdline_with_rootfs_sha_appends_when_absent() -> None:
-    """Audit follow-up Gemini #1 / Codex #1 — the rootfs SHA token
+    """Audit follow-up Review #1 / Review #1 — the rootfs SHA token
     binds the rootfs into the SEV-SNP launch_digest. The shared
     `_augment_cmdline_with_token` helper must append when absent and be
     idempotent / no-op when already present (so the operator can

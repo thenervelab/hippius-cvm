@@ -8,11 +8,30 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# `runs-on` reads the CI_RUNS_ON_{DEFAULT,BUILD,HEAVY} repo variables
+# (Hippius runner labels). Unset → GitHub-hosted ubuntu-latest.
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_HEAVY || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      # The workspace links some very large test binaries (the vendored
+      # Substrate pallets in particular). On a stock ubuntu-latest runner
+      # the root filesystem fills mid-link and `ld` dies with SIGBUS —
+      # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
+      # while linking `hippius-onchain-registry`. That reads like a
+      # toolchain bug and is really a full disk, which is why it cost
+      # several re-runs across #1055/#1056 before the pattern was legible.
+      #
+      # These preinstalled toolchains are worth ~20 GB and nothing in this
+      # workspace uses them. `df` is printed either side so the next
+      # occurrence is diagnosable from the log rather than by inference.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "after:"; df -h /
       # ubuntu-latest ships build-essential + pkg-config but NOT the
       # cryptsetup / clang stack the `cryptsetup-rs` + bindgen crates
       # need at build time. Mirror the `hippius-runner-k8s` image's
@@ -24,6 +43,19 @@ jobs:
             build-essential pkg-config libcryptsetup-dev clang libclang-dev
       - name: Install Rust toolchain (rust-toolchain.toml-pinned)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
+      # The epoch-closer gate runs `node` and the kbs chart tests run `helm`;
+      # only ubuntu-latest preinstalls them.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+      # Tests compare st_dev of a tempdir against the files in it; on an
+      # overlayfs /tmp (Hippius runner root) files report the upper layer's
+      # device, not the overlay's. Keep temp files on a plain filesystem.
+      - name: Temp dir on the runner work disk
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
       - name: Toolchain show
         run: rustup show
       # Cache `~/.cargo/registry`, `~/.cargo/git`, and `target/` keyed
@@ -94,11 +126,30 @@ jobs:
         run: |
           sudo apt-get install -y -q shellcheck
           bash -n scripts/tenant-image-bake.sh
-          shellcheck -S error scripts/tenant-image-bake.sh scripts/dev/distro-plan-test.sh scripts/dev/disk-mode-test.sh
+          shellcheck -S error scripts/tenant-image-bake.sh scripts/dev/distro-plan-test.sh scripts/dev/disk-mode-test.sh scripts/dev/package-refresh-test.sh scripts/dev/tenant-rootfs-kernel-hold-test.sh scripts/dev/tenant-image-bake-kernel-hold-test.sh
           bash scripts/dev/distro-plan-test.sh
           # golden-bake PR1: the --disk-mode selector gate (legacy_luks
           # default intact; golden_verity_overlay accepted). Root-free.
           bash scripts/dev/disk-mode-test.sh
+          # F6: --package-refresh gate, stage-1 cache key, and the gated
+          # upgrade in both chroot arms. Root-free.
+          bash scripts/dev/package-refresh-test.sh
+          # Kernel hold in both bake chroots: per-distro meta-package
+          # installed AND held, every concrete kernel held, no swallowed
+          # miss. Root-free (PATH-shimmed dpkg-query/apt-mark/apt-get).
+          bash scripts/dev/tenant-rootfs-kernel-hold-test.sh
+          bash scripts/dev/tenant-image-bake-kernel-hold-test.sh
+          # Untrusted-miner (M0) guest hardening: the NoCloud pin
+          # (fs_label null — no miner `cidata` disk), ds-identify
+          # enabled, no guest agent on a miner-attachable virtio channel,
+          # ssh-generator + serial-getty masked. Runs the bake's own
+          # sections + exit-3 assertions root-free, then feeds the written
+          # config to the REAL cloud-init NoCloud datasource against an
+          # attacker cidata disk + SMBIOS serial (cloud-init installed
+          # for its Python module only; the runner never boots with it).
+          sudo apt-get install -y -q --no-install-recommends cloud-init
+          shellcheck -S error scripts/dev/tenant-image-bake-m0-harden-test.sh
+          bash scripts/dev/tenant-image-bake-m0-harden-test.sh
           # golden-bake PR3: the guest overlay boot library — GOLDEN-mode
           # detection (both-tokens fail-closed) + param validation.
           shellcheck -S error -s sh scripts/initramfs/hippius-golden-overlay.sh scripts/initramfs/hippius-golden-boot scripts/initramfs/hippius-golden-hook
@@ -119,12 +170,72 @@ jobs:
           # NON-ACCUMULATION property: comparing against the boot counter
           # instead would let repeated aborted boots widen the gap until the
           # disk is permanently unopenable. Root-free, temp-dir only.
+          # busybox: section 26 also runs the #1347 data bind under the
+          # shells the initramfs really uses (busybox ash, dash).
+          sudo apt-get install -y -q --no-install-recommends busybox
           shellcheck -S error scripts/dev/golden-stamp-test.sh
           bash scripts/dev/golden-stamp-test.sh
+          # Per-VM upper init: no-wipe 4K format + parallel journal-less
+          # wipe before mkfs, and the interrupted-first-boot re-init that
+          # fires ONLY for (init label, KBS expectation 0, no filesystem).
+          shellcheck -S error scripts/dev/golden-upper-init-test.sh
+          bash scripts/dev/golden-upper-init-test.sh
+          # Customer-held keys (M1/M2): the upper's `hippius-keymode` LUKS2
+          # token — written right after the first-boot format, read back
+          # (mode + guardian fingerprint checked, share version passed on)
+          # before any KBS/guardian contact; M0 reads and writes none.
+          shellcheck -S error scripts/dev/golden-keymode-test.sh
+          bash scripts/dev/golden-keymode-test.sh
+          # Customer-held keys H5b: cloud-init user-data on the volume's
+          # FIRST boot only — stable instance-id, later boots get an empty
+          # user-data, undeterminable first-boot state ⇒ ignored, M0
+          # unchanged. Drives the real release core with a fake release
+          # binary. Then the REAL cloud-init (Ubuntu 24.04 golden base, in
+          # a throwaway container) proves a later boot with that iid and an
+          # empty user-data runs nothing and keeps the tenant's keys.
+          shellcheck -S error scripts/dev/golden-userdata-test.sh
+          bash scripts/dev/golden-userdata-test.sh
+          shellcheck -S error scripts/dev/cloud-init-first-boot-only-check.sh scripts/dev/cloud-init-first-boot-only-guest.sh
+          bash scripts/dev/cloud-init-first-boot-only-check.sh ubuntu:24.04
           # golden-bake PR4: the SHARED base per-instance scrub (no ssh
           # host keys / machine-id / cloud state / logs; swap fails closed).
           shellcheck -S error scripts/dev/golden-sanitize-test.sh
           bash scripts/dev/golden-sanitize-test.sh
+          # initrd-only rebuild of an existing golden bake: every refusal
+          # (source sha vs measurement.json, kernel mismatch, non-golden /
+          # rhel / non-hippius base, stale scripts in the output, output
+          # prefix nested or non-empty), the measurement shape and the
+          # two-runs-same-bytes property, on fixtures with the root-only
+          # chroot build swapped for a fixture builder.
+          sudo apt-get install -y -q --no-install-recommends squashfs-tools
+          shellcheck -S error scripts/tenant-initrd-rebuild.sh scripts/dev/tenant-initrd-rebuild-test.sh
+          bash scripts/dev/tenant-initrd-rebuild-test.sh
+          # Guest components release (docs/design/guest-component-rollout.md):
+          # the release record parser, the initramfs boot step (no record =
+          # no-op, unit links written even when the image does not mount,
+          # fail-closed link writes, strict SELinux labels) under bash, dash
+          # and busybox ash, and the release builder (reproducible, labelled
+          # image, leaf-only cpio members, refusals). The builder needs a
+          # STATIC busybox, extracted from the package without installing it
+          # (busybox-static conflicts with the busybox installed above).
+          sudo apt-get install -y -q --no-install-recommends squashfs-tools-ng cpio dash
+          (cd "${RUNNER_TEMP}" && apt-get download busybox-static && dpkg-deb -x busybox-static_*.deb bbs)
+          shellcheck -S error scripts/dev/guest-release-test.sh scripts/guest/build-guest-release.sh
+          GUEST_RELEASE_TEST_STATIC_BUSYBOX="$(find "${RUNNER_TEMP}/bbs" -name busybox -type f | head -n1)" \
+            bash scripts/dev/guest-release-test.sh
+          # guest-initrd-build.sh: the release appended to fixture base sets
+          # of both families, the output measurement vali_swap_vm_initrd
+          # reads, reproducibility and every refusal.
+          shellcheck -S error -x scripts/guest/guest-initrd-build.sh scripts/dev/guest-initrd-build-test.sh scripts/dev/guest-initrd-fixtures.sh scripts/dev/fake-aws.sh
+          GUEST_RELEASE_TEST_STATIC_BUSYBOX="$(find "${RUNNER_TEMP}/bbs" -name busybox -type f | head -n1)" \
+            bash scripts/dev/guest-initrd-build-test.sh
+          # The same boot step for real (root): the release's static busybox
+          # loop-mounts the built image under a noexec /run, the agents
+          # execute, and the mount follows `mount --move` of /run.
+          shellcheck -S error scripts/dev/guest-release-mount-test.sh
+          sudo env PATH="${PATH}" \
+            GUEST_RELEASE_TEST_STATIC_BUSYBOX="$(find "${RUNNER_TEMP}/bbs" -name busybox -type f | head -n1)" \
+            bash scripts/dev/guest-release-mount-test.sh
           # golden dracut module (CS10/Fedora): the cmdline rootok hook
           # both-tokens fail-closed logic (root-free) + shellcheck the
           # module scripts. The full container boot-asset gate runs in the
@@ -164,6 +275,36 @@ jobs:
           shellcheck -S error -s sh scripts/guest/hippius-keepalive-start
           shellcheck -S error scripts/dev/keepalive-unit-test.sh
           bash scripts/dev/keepalive-unit-test.sh
+      # SSH key-only on the four golden bases, with each distro's REAL sshd
+      # and cloud-init in a throwaway container: cloud-init's own
+      # `ssh_pwauth: true` writer reproduces password login (control), the
+      # bake's 00-hippius-harden.conf turns it off (`sshd -T`), the bake's
+      # own sshd -T check passes and cleans up, and the tenant can still
+      # override it (earlier drop-in, or a Match block).
+      - name: sshd key-only on every golden distro
+        run: |
+          shellcheck -S error scripts/dev/sshd-key-only-test.sh scripts/dev/sshd-key-only-guest.sh
+          bash scripts/dev/sshd-key-only-test.sh
+      # cloud-init writes no guest network config: with the bake's
+      # `network: {config: disabled}` each golden distro's REAL cloud-init
+      # stops at system_cfg and never generates the fallback config that
+      # raced udev's eth0 -> enp1s0 rename on Fedora 43 (control: without
+      # it, the fallback is generated). The DHCP profile that replaces it
+      # is boot-checked by guest-network-without-cloud-init-boot.sh.
+      - name: cloud-init network disabled on every golden distro
+        run: |
+          shellcheck -S error scripts/dev/cloud-init-network-disabled-test.sh scripts/dev/cloud-init-network-disabled-guest.sh scripts/dev/guest-network-without-cloud-init-boot.sh
+          bash scripts/dev/cloud-init-network-disabled-test.sh
+      # The initramfs DHCP client and the booted guest present the same
+      # client-id (#289): Ubuntu's stock initramfs dhcpcd config (`duid ll`)
+      # + the zz-hippius-dhcp-clientid hook, Debian's klibc ipconfig, each
+      # followed by the guest's 01:<MAC>, against a real dnsmasq. Control:
+      # without the hook, a second lease.
+      - name: initramfs DHCP client-id matches the booted guest
+        run: |
+          shellcheck -S error scripts/dev/initramfs-dhcp-clientid-test.sh
+          shellcheck -S error -s sh scripts/initramfs/hippius-dhcp-clientid-hook
+          bash scripts/dev/initramfs-dhcp-clientid-test.sh
       # Multi-OS unlock: shellcheck the shared release core + both
       # family wrappers, and pin the security-load-bearing step order
       # (#296 header gate before any network; userdata before KEK).
@@ -184,6 +325,20 @@ jobs:
         run: |
           shellcheck -S error scripts/dev/baker-assets-test.sh
           bash scripts/dev/baker-assets-test.sh
+      # Tenant-UKI input fetch: snapshot.debian.org answers 504
+      # intermittently, and ONE unretried curl per input kept
+      # `tenant-uki-build` red from 2026-09-10 on, across commits that
+      # never touched the UKI — so the pinned KAT went unverified. Runs
+      # the REAL fetch-inputs.sh against a PATH-shimmed curl: 5xx / 429 /
+      # transport failures retried with backoff (5 attempts), a 404 fails
+      # on the first attempt, a SHA-256 mismatch is never retried, every
+      # call carries connect/transfer timeouts. Needs an empty /build
+      # (the script's Docker mount path; created via passwordless sudo).
+      - name: tenant-UKI input fetch retry
+        run: |
+          bash -n packer/tenant-uki/uki/scripts/fetch-inputs.sh
+          shellcheck -S error packer/tenant-uki/uki/scripts/fetch-inputs.sh scripts/dev/uki-fetch-retry-test.sh
+          bash scripts/dev/uki-fetch-retry-test.sh
       # The same defect one layer up the supply chain: `kbs-image.yml`'s
       # `paths:` filter never listed `kbs-transport/`, where the ENTIRE KBS
       # `/v1/admin` router lives. A change confined to that crate produced a
@@ -201,6 +356,14 @@ jobs:
         run: |
           shellcheck -S error scripts/dev/image-build-inputs-test.sh
           bash scripts/dev/image-build-inputs-test.sh
+      # The operator staging script is executable code with a security
+      # contract (wrap the user-data; digest the AT-REST bytes the KBS
+      # will hash) and no test ran it — a digest taken over the wrong
+      # bytes surfaces as a KBS DigestMismatch two systems away.
+      - name: tenant-secrets staging contract
+        run: |
+          shellcheck -S error scripts/tenant-secrets-stage.sh scripts/dev/tenant-secrets-stage-test.sh
+          bash scripts/dev/tenant-secrets-stage-test.sh
       - name: epoch-closer refusal gates
         run: |
           shellcheck -S error scripts/dev/epoch-close-guard-test.sh
@@ -297,7 +460,7 @@ jobs:
   #   - the dm-verity rootfs reproducibility shell test, which needs
   #     mksquashfs + veritysetup.
   packer-f3:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_HEAVY || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
       # ubuntu-latest needs the `--features snp` build's openssl-sys
@@ -309,6 +472,11 @@ jobs:
             build-essential pkg-config libssl-dev squashfs-tools cryptsetup-bin
       - name: Install Rust toolchain (rust-toolchain.toml-pinned)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
+      # Tests compare st_dev of a tempdir against the files in it; on an
+      # overlayfs /tmp (Hippius runner root) files report the upper layer's
+      # device, not the overlay's. Keep temp files on a plain filesystem.
+      - name: Temp dir on the runner work disk
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
       - name: Toolchain show
         run: rustup show
       # Separate cache key from the `rust` job — `--features snp`
@@ -340,13 +508,19 @@ jobs:
         run: cargo clippy -p hippius-miner-agent --features snp --all-targets -- -D warnings
       - name: miner-agent test --features snp
         run: cargo test -p hippius-miner-agent --features snp
+      # The C2 recompute vali pins from — and the proof that the vCPU
+      # count moves the launch digest (`tests/vcpu_count.rs`).
+      - name: launch-digest clippy --features snp
+        run: cargo clippy -p hippius-launch-digest --features snp --all-targets -- -D warnings
+      - name: launch-digest test --features snp
+        run: cargo test -p hippius-launch-digest --features snp
       - name: Cargo.lock unchanged by the snp build
         run: git diff --exit-code -- Cargo.lock
       - name: dm-verity rootfs reproducibility
         run: bash packer/kbs-uki/uki/scripts/test-build-rootfs.sh
 
   sentinel:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -372,12 +546,49 @@ jobs:
   # integration tests skip gracefully when `target/release` is absent —
   # they do NOT need a Cargo build here (the `rust` job covers the binary).
   vali:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_HEAVY || 'ubuntu-latest' }}
+    # The §22 pin lock is a Postgres advisory lock; SQLite runs a stand-in.
+    # The lock tests re-run against this service (`settings_test_pg`).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
+      # The chart-render tests run `helm`; only ubuntu-latest preinstalls it.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+      # vali shells out to two Rust binaries (`hippius-ticket-validator`:
+      # ticket / heartbeat / stopped-ack / live-attestation verification;
+      # `hippius-kbs-allowlist-tool`: allowlist pinning). Without them the
+      # real-binary tests skip themselves and only the stubbed-subprocess
+      # tests run — so a Rust/Python wire drift went unnoticed here. Build
+      # both (debug: faster to compile, and the tests look in
+      # `target/debug`), cached separately from the `rust` job.
+      - name: Install system deps (Rust build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
+      - name: Install Rust toolchain (rust-toolchain.toml-pinned)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "ci-vali-bins"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the binaries vali shells out to
+        run: cargo build -p hippius-ticket-validator -p hippius-kbs-allowlist-tool -p hippius-order-ticket-mint
       - name: Install vali + dev deps
         working-directory: vali
         run: |
@@ -388,20 +599,38 @@ jobs:
         run: ruff check .
       - name: Pytest
         working-directory: vali
-        run: pytest -q
+        env:
+          VALI_TICKET_VALIDATOR_BIN: ${{ github.workspace }}/target/debug/hippius-ticket-validator
+          # The real mint: customer-keys tests read the signed `key_mode`
+          # back out of a real ticket (skipped when the binary is absent).
+          VALI_ORDER_TICKET_MINT_BIN: ${{ github.workspace }}/target/debug/hippius-order-ticket-mint
+        # `-rs` lists every skip, so a binary that stops being found shows
+        # up in the log instead of silently shrinking the run.
+        run: pytest -q -rs
+      - name: Pytest (pin lock on Postgres)
+        working-directory: vali
+        env:
+          VALI_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/vali
+        run: >-
+          pytest -q -rs --ds=vali.settings_test_pg
+          apps/orchestration/tests/test_allowlist_pin_concurrency.py
+          apps/orchestration/tests/test_allowlist_pin_busy.py
+          apps/orchestration/tests/test_allowlist_pin.py
+          apps/telemetry/tests/test_host_attestor_release.py
+          apps/images/tests/test_rebake_queue_lock.py
 
   audit:
     # RA-M-NEW-1 — dependency-vulnerability gate. `cargo audit` fails the
     # build on any RustSec advisory NOT allow-listed in `.cargo/audit.toml`
     # (only VULNERABILITIES block; unmaintained/yanked are non-fatal
     # warnings). A new CVE anywhere in the dependency graph blocks merges.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
       - name: Install Rust toolchain (rust-toolchain.toml-pinned)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

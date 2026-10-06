@@ -190,13 +190,13 @@ mod tests {
         // perfectly healthy. `pallet_live: false` is the ONLY thing in
         // the payload that says so — it must be carried, not defaulted.
         let snapshot = RegistrySnapshot {
-            current_epoch: 2702,
+            current_epoch: 5002,
             pallet_live: false,
             miners: vec![],
         };
         let json = serde_json::to_value(to_output(snapshot)).unwrap();
         assert_eq!(json["tag"], "ok");
-        assert_eq!(json["current_epoch"], 2702);
+        assert_eq!(json["current_epoch"], 5002);
         assert_eq!(json["pallet_live"], false);
     }
 }

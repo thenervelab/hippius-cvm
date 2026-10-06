@@ -1,0 +1,33 @@
+# Hippius guest components release — linked from /etc/systemd/system by the
+# measured initramfs (hippius_golden_mount_components); the agents run from
+# the release image mounted at /run/hippius/guest.
+# Same unit as the bake's (scripts/tenant-image-bake.sh, with the #1322
+# ordering fix) except for the paths; the ordering rationale is there.
+[Unit]
+Description=Hippius §24/§25 guest EOL stopped-ack sign + push (clean shutdown)
+DefaultDependencies=no
+After=network-online.target
+Wants=network-online.target
+# LEGACY guests only (inert on golden: empty crypttab).
+After=systemd-cryptsetup@cryptroot.service
+# The release image the ExecStop runs from: ordered after its mount at
+# boot, so it is stopped (ExecStop runs) before the image is unmounted.
+RequiresMountsFor=/run/hippius/guest
+Conflicts=shutdown.target
+# NOT Before=cryptsetup.target: an early-boot target paired with
+# After=network-online.target is an ordering cycle (#1322).
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No-op at boot — keeps the unit ACTIVE so the ExecStop fires at shutdown.
+ExecStart=/bin/true
+# Sign the StoppedAck from the measured cmdline + push it over the vsock
+# proxy to vali. NEVER luksClose / poweroff (systemd owns those).
+ExecStop=/run/hippius/guest/bin/hippius-agent-initramfs eol --sign-only
+TimeoutStopSec=20
+SuccessExitStatus=0 1 2
+
+[Install]
+WantedBy=multi-user.target

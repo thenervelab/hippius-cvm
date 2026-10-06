@@ -43,6 +43,7 @@
 pub mod audit_vm;
 pub mod audit_vm_cert;
 pub mod error;
+pub mod guardian;
 pub mod lifecycle;
 pub mod release;
 pub mod served_receipt;
@@ -52,8 +53,14 @@ pub mod telemetry_key;
 pub use audit_vm::{sign_aggregate, verify_aggregate};
 pub use audit_vm_cert::verify_cert;
 pub use error::{GuestError, Result};
+pub use guardian::{
+    open_guardian_reply, verify_stamp_ack, GuardianRelease, GuardianReply, GuardianStamp,
+};
 pub use lifecycle::{sign_stopped_ack, verify_stopped_ack};
-pub use release::{verify_and_unwrap_release, ExpectedRelease, UnwrappedSecrets};
+pub use release::{
+    verify_and_unwrap_release, verify_and_unwrap_release_attested,
+    verify_and_unwrap_release_for_mode, AttestedStampProtocol, ExpectedRelease, UnwrappedSecrets,
+};
 pub use served_receipt::{
     sign_served_receipt, verify_receipt_in_aggregate_window, verify_served_receipt,
 };

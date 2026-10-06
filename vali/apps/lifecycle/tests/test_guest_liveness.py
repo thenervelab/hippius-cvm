@@ -58,7 +58,7 @@ def test_signal_exactly_at_the_bound_is_still_alive() -> None:
 
 # ─── CLAIM 2 — a SILENT guest reads `wedged`, not `alive` ────────────
 #
-# This is the defect. Proved live on miner-2 2026-08-12: the VM's libvirt
+# This is the defect. Proved live in production 2026-08-12: the VM's libvirt
 # domain stayed `running` and `boot_phase` stayed `running` while the
 # guest sat wedged in its initramfs.
 
@@ -105,8 +105,8 @@ def test_a_non_positive_bound_is_floored_not_disabled() -> None:
 
 # ─── CLAIM 3 — NEVER-emitted is `unknown`, NOT `wedged` ──────────────
 #
-# The false positive that would be WORSE than the bug: `realtenant-
-# ubuntu-1` is a live tenant on a pre-keepalive image with 0 live
+# The false positive that would be WORSE than the bug: `tenant-vm-1`
+# is a live tenant on a pre-keepalive image with 0 live
 # attestations. A signal a VM has never produced is not evidence of
 # death, and must never drive an automated action.
 

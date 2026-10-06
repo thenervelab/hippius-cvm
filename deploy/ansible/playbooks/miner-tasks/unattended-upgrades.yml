@@ -1,0 +1,43 @@
+---
+# unattended-upgrades: keep security updates, but never touch the
+# hypervisor stack. Tasks file imported by 06-miner-bootstrap.yml
+# play "02".
+#
+# A QEMU, libvirt, kernel, linux-firmware, OVMF or AMD microcode update
+# is a fleet change, not a patch:
+#   - a libvirt postinst restarts libvirtd under running tenant domains
+#     (the agent itself only has a soft `Wants=` on it, so it keeps
+#     running — see miner-agent-install.yml);
+#   - a new kernel (or linux-firmware SEV blob) can change the reported
+#     TCB and the VMSA defaults that the launch digest is computed over;
+#   - a new microcode SVN is part of the SNP reported TCB, so it moves
+#     the TCB (and the VCEK) on the next reboot;
+#   - it applies to every miner at once, unattended.
+# Those go through the operator-driven release path (canary host first)
+# instead. Everything else keeps its unattended security updates.
+#
+# The list lives in its own apt.conf.d file: apt appends list entries
+# across files, and a release upgrade that replaces the distro's
+# 50unattended-upgrades conffile leaves this file alone.
+
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+
+- name: Blacklist the hypervisor stack from unattended-upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/51hippius-hypervisor-blacklist
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      // Managed by Ansible (miner-tasks/unattended-upgrades.yml). Do not edit by hand.
+      // Python regexes, matched from the start of the package name.
+      Unattended-Upgrade::Package-Blacklist {
+          "qemu";
+          "libvirt";
+          "linux-";
+          "ovmf";
+          "amd64-microcode";
+      };

@@ -409,8 +409,9 @@ spec:
           emptyDir: {}
         {{- if .Values.config.evidenceDir }}
         # §280 evidence bundles. emptyDir (pod lifetime) to match state /
-        # audit — bundles do NOT survive a restart; swap for a PVC when
-        # durable attestation proof is required.
+        # audit — bundles do NOT survive a restart, and a filesystem PVC
+        # would not change that under kata-qemu-snp (`shared_fs = "none"`:
+        # guest writes never reach a host volume). See `config.evidenceDir`.
         - name: evidence
           emptyDir: {}
         {{- end }}

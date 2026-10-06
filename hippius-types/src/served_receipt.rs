@@ -46,7 +46,7 @@ pub const DEGRADATION_MAX_BPS: u32 = 10_000;
 /// the bytes cannot re-use them for a different VM, lease, or window
 /// — every replay-domain piece is part of the signed body.
 ///
-/// `validator_id` is bound (codex round-1 review): with only
+/// `validator_id` is bound (review round-1 review): with only
 /// `validator_nonce` for validator scoping, two validators that reused
 /// the same fresh nonce could roll the same receipt into aggregates
 /// under different `validator_id`s. Including `validator_id` in the
@@ -61,7 +61,7 @@ pub const DEGRADATION_MAX_BPS: u32 = 10_000;
 /// `Debug` is implemented manually to print only field LENGTHS — the
 /// schema otherwise leaks identifiers (`vm_id`, `lease_id`, nonce)
 /// into operator logs by default. Use a redacted form intentionally
-/// (codex+gemini Low).
+/// (review Low).
 #[derive(Clone)]
 pub struct ServedDeliveryReceipt<'a> {
     pub validator_id: &'a [u8],

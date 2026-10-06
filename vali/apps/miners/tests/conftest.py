@@ -89,7 +89,7 @@ def plain_client() -> APIClient:
 def register_payload(**overrides: Any) -> dict[str, Any]:
     """Build a `POST /v1/admin/miner/register` JSON body — happy defaults."""
     payload: dict[str, Any] = {
-        "miner_id": "miner-1",
+        "miner_id": "miner-a",
         "pubkey_hex": "ab" * 32,
         "platform_id": "amd-chipid-0001",
     }

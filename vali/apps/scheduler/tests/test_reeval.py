@@ -12,11 +12,27 @@ from django.core.management import call_command
 
 from apps.lifecycle.models import VmState
 from apps.scheduler import chain, service
-from apps.scheduler.models import MinerCapacity, Placement, PlacementStatus
+from apps.scheduler.models import (
+    MinerCapacity,
+    Placement,
+    PlacementFailureSource,
+    PlacementStatus,
+)
 
 from .factories import make_miner, make_placement, make_snapshot, make_vm, node_id
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def _no_metrics_push(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The command's per-cycle disk survey pushes gauges to the configured
+    Pushgateway; capture them instead of reaching the network."""
+    from apps.synthetic import metrics
+
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    return pushed
 
 
 def _mock_chain(monkeypatch: pytest.MonkeyPatch, snapshot) -> None:
@@ -45,6 +61,9 @@ def test_reeval_drains_a_bound_placement_when_miner_quarantined(
     assert placement.status == PlacementStatus.FAILED
     assert placement.reason == "drain:miner-quarantined"
     assert placement.failed_at is not None
+    # provenance: the §13 re-eval is the writer — the operator readout
+    # selects refusals on this, not on the `drain:` text
+    assert placement.failure_source == PlacementFailureSource.SCHEDULER_DRAIN
     assert placement.version == 2
     assert report.drained == 1
 
@@ -141,6 +160,7 @@ def test_release_placements_for_vm_releases_active_placement() -> None:
     other.refresh_from_db()
     assert bound.status == PlacementStatus.FAILED
     assert bound.reason == "released:vm-destroyed"
+    assert bound.failure_source == PlacementFailureSource.RELEASE
     assert bound.version == 2
     # The already-FAILED row for the same VM is a no-op (its seed reason).
     assert stale_failed.reason == "seed"
@@ -269,3 +289,15 @@ def test_command_skips_cycle_when_chain_unavailable(
 
     placement.refresh_from_db()
     assert placement.status == PlacementStatus.BOUND
+
+
+def test_every_cycle_runs_the_disk_survey_even_when_the_chain_is_down(
+    monkeypatch: pytest.MonkeyPatch, _no_metrics_push: list[str]
+) -> None:
+    def _down():
+        raise chain.ChainReadUnavailable("test: chain down")
+
+    monkeypatch.setattr(chain, "read_miner_status", _down)
+    call_command("vali_scheduler_reeval", "--once")
+    # One disk push, one host-health push.
+    assert len(_no_metrics_push) == 2

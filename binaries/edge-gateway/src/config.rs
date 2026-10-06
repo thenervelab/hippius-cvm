@@ -127,7 +127,7 @@ pub struct EdgeGatewayConfig {
     #[serde(default = "default_idle_horizon_secs")]
     pub idle_horizon_secs: u64,
 
-    /// Hard upper bound on the per-source bucket map. Codex review
+    /// Hard upper bound on the per-source bucket map. Review
     /// of PR-H3 flagged the unbounded-growth window: GC removes
     /// dormant entries every 4096 calls, but a unique-IP flood
     /// within the idle horizon could fill memory linearly before
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn zero_queue_capacity_is_rejected() {
-        // Codex flag: `queue_capacity = 0` panics `tokio::mpsc::channel`
+        // Review flag: `queue_capacity = 0` panics `tokio::mpsc::channel`
         // at boot. Must fail config validation.
         let err = EdgeGatewayConfig::from_toml_str("queue_capacity = 0").unwrap_err();
         assert!(

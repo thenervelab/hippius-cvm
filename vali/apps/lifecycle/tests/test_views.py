@@ -425,6 +425,41 @@ def test_migrating_to_active_requires_signed_ack(
     assert body["new_generation"] is None
 
 
+def test_api_migrating_to_active_restarts_the_boot_stall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_binary: Path,
+    authed_client: APIClient,
+    active_vm: Vm,
+) -> None:
+    """The API §25 completion is a new boot on the destination: the VM must
+    be judged on it, not on its original launch time."""
+    from django.utils import timezone
+
+    week_ago = timezone.now() - timedelta(days=7)
+    Vm.objects.filter(pk=active_vm.pk).update(boot_started_at=week_ago)
+    url = reverse("vm_transition", kwargs={"vm_id": active_vm.vm_id})
+    r1 = authed_client.post(
+        url,
+        {"to_state": "migrating", "if_version": 1, "new_generation": 6,
+         "migration_dest": "host-b"},
+        format="json",
+    )
+    assert r1.status_code == status.HTTP_200_OK
+    assert Vm.objects.get(pk=active_vm.pk).boot_started_at == week_ago
+
+    _mock_ack_ok(monkeypatch)
+    r2 = authed_client.post(
+        url,
+        {"to_state": "active", "if_version": 2, "new_generation": 6,
+         "signed_stopped_ack_hex": "00" * 8},
+        format="json",
+    )
+    assert r2.status_code == status.HTTP_200_OK, r2.content
+    started = Vm.objects.get(pk=active_vm.pk).boot_started_at
+    assert started is not None
+    assert (timezone.now() - started).total_seconds() < 5
+
+
 def test_migrating_to_active_with_wrong_new_generation_rejected(
     monkeypatch: pytest.MonkeyPatch,
     fake_binary: Path,
@@ -875,3 +910,44 @@ def test_a_rejected_transition_re_scopes_nothing(
         before.attempts,
         before.version,
     )
+
+
+def test_active_to_migrating_refuses_a_zombie_quarantined_destination(
+    authed_client: APIClient, active_vm: Vm
+) -> None:
+    # The root transition primitive names the destination explicitly, so
+    # the scheduler's zombie gate never sees it — it must refuse itself.
+    from apps.lifecycle import zombie
+    from apps.miners.models import MinerIdentity, MinerStatus
+
+    MinerIdentity.objects.create(
+        miner_id="host-b",
+        pubkey_hex="ab" * 32,
+        platform_id="0123456789abcdef",
+        chain_node_id="bb" * 32,
+        status=MinerStatus.ACTIVE.value,
+    )
+    dead = Vm.objects.create(
+        vm_id="vm-dead",
+        lease_id="lease-dead",
+        state=VmState.DESTROYED,
+        generation=1,
+        host="",
+        lifecycle_vk=bytes(32),
+    )
+    zombie.observe(dead, kind="vm_live_attestation", relay_miner_id="host-b")
+
+    resp = authed_client.post(
+        reverse("vm_transition", kwargs={"vm_id": active_vm.vm_id}),
+        {
+            "to_state": "migrating",
+            "if_version": 1,
+            "new_generation": 6,
+            "migration_dest": "host-b",
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_409_CONFLICT, resp.content
+    assert resp.json()["category"] == "dest-zombie-quarantined"
+    active_vm.refresh_from_db()
+    assert active_vm.state == VmState.ACTIVE

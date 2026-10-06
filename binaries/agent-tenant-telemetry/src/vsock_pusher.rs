@@ -3,7 +3,8 @@
 //! PR-E2.2 fills a bounded [`ReceiptQueue`] with signed
 //! `ServedDeliveryReceipt`s. PR-E2.3 drains it: a dedicated thread
 //! dials the host miner-agent over `AF_VSOCK` and writes the buffered
-//! receipts as length-prefixed canonical-CBOR frames. The host
+//! receipts as length-prefixed canonical-CBOR frames — one connection
+//! per push, closed by the guest once the queue is dry. The host
 //! miner-agent (MA-4) reads those frames and HTTP-forwards them to the
 //! Edge gateway; the Edge relays them to vali's telemetry broker.
 //!
@@ -26,7 +27,7 @@
 //! The whole §E tenant-agent track is synchronous — no tokio. A CVM
 //! guest agent's TCB is measured into the launch digest (§22); every
 //! transitive crate is attack surface a ceremony reviewer must account
-//! for. This pusher needs exactly one connection to one endpoint with
+//! for. This pusher needs one short connection per push to one endpoint with
 //! a simple back-off — `std::thread` + a sync `vsock` socket cover it
 //! with a handful of transitive crates. It runs on its own thread and
 //! shares the [`ReceiptQueue`] with the receipt loop through an
@@ -54,8 +55,22 @@
 //! is a poison message (§9): dropped, never re-queued, so it cannot
 //! wedge the drain.
 //!
+//! ## One connection per push
+//!
+//! The pusher dials only when the queue holds receipts, writes them
+//! all, and closes the connection itself — the host relay reads the
+//! frames then a clean EOF. It never parks an idle connection: the
+//! host relay drops a connection that stays silent for its idle
+//! timeout, and with a receipt interval equal to that timeout a
+//! long-lived connection raced the host's close on every receipt. The
+//! pusher only learned of the close on its next write (a spurious
+//! `connection-lost` every other receipt), and a write landing in the
+//! instant before the host's reset reached the guest could be accepted
+//! locally and then discarded — a silently lost receipt. With the guest
+//! closing first, the host idle timer never runs out on a healthy guest.
+//!
 //! Nothing here logs a receipt body or any derivative — only static
-//! error classes (§20).
+//! error classes and counts (§20).
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -86,7 +101,7 @@ const MIN_BACKOFF: Duration = Duration::from_millis(500);
 /// Reconnect back-off ceiling — a long host outage settles here.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Idle poll when the connection is healthy but the queue is empty.
+/// Idle poll while the queue is empty (no connection is held open).
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Granularity at which a back-off / idle sleep re-checks the shutdown
@@ -173,11 +188,27 @@ fn log_pusher(event: &'static str, detail: &'static str) {
     eprintln!("hippius-agent-tenant-telemetry: vsock-pusher: {event} ({detail})");
 }
 
+/// Log a completed push: how many receipts reached the host relay and
+/// how many are still buffered. Counts only (§20).
+fn log_pushed(sent: usize, depth: usize) {
+    eprintln!(
+        "hippius-agent-tenant-telemetry: vsock-pusher: pushed {sent} receipt(s) (queue-depth {depth})"
+    );
+}
+
+/// Log a failed push: the static error class, how many receipts were
+/// put back for the next push, and the buffer depth after the requeue.
+fn log_push_failed(class: &'static str, requeued: usize, depth: usize) {
+    eprintln!(
+        "hippius-agent-tenant-telemetry: vsock-pusher: push-failed ({class}) requeued {requeued} receipt(s) (queue-depth {depth})"
+    );
+}
+
 /// Drains a shared [`ReceiptQueue`] to the host miner-agent over vsock.
 ///
 /// Generic over the shutdown latch so the production
 /// [`Shutdown`](crate::shutdown::Shutdown) and a test fake share one
-/// code path. The reconnect/drain/back-off loop ([`Self::run_with`])
+/// code path. The dial/push/back-off loop ([`Self::run_with`])
 /// is itself generic over the stream type — production wires it to a
 /// vsock dial, tests to a TCP loopback — so every line except the
 /// vsock syscall is exercised on any host.
@@ -207,15 +238,17 @@ impl<S: ShutdownWatch> VsockPusher<S> {
         }
     }
 
-    /// Run the reconnect → drain → back-off loop until shutdown.
+    /// Run the wait → dial → push → close loop until shutdown.
     ///
     /// `connect` obtains a fresh stream — the only platform-variant
-    /// seam (production: a vsock dial; tests: a TCP loopback). A
-    /// connect or write failure is logged by static class and retried
-    /// after an exponential back-off, capped at [`MAX_BACKOFF`]; a
-    /// healthy connect resets the back-off. Returns `Ok(())` once the
-    /// shutdown latch is observed — the drain flushes whatever is
-    /// still queued first whenever the connection allows.
+    /// seam (production: a vsock dial; tests: a TCP loopback). It is
+    /// called only when the queue holds receipts; the stream is dropped
+    /// (closed) as soon as the queue is dry, so no connection ever sits
+    /// idle against the host relay's idle timeout. A connect or write
+    /// failure is logged and retried after an exponential back-off,
+    /// capped at [`MAX_BACKOFF`]; a completed push resets the back-off.
+    /// Returns `Ok(())` once the shutdown latch is observed, after one
+    /// last best-effort push of whatever is still queued.
     pub fn run_with<W, C>(&self, connect: C) -> Result<()>
     where
         W: Write,
@@ -223,57 +256,55 @@ impl<S: ShutdownWatch> VsockPusher<S> {
     {
         let mut backoff = MIN_BACKOFF;
         while !self.shutdown.is_pending() {
-            match connect() {
-                Ok(mut stream) => {
-                    backoff = MIN_BACKOFF;
-                    match self.drain_connection(&mut stream) {
-                        // `drain_connection` returns `Ok` only once the
-                        // shutdown latch is set AND the queue is dry —
-                        // the graceful drain already completed.
-                        Ok(()) => return Ok(()),
-                        // A poisoned queue lock is unrecoverable —
-                        // reconnecting cannot help. End the pusher so
-                        // `join` surfaces it instead of retry-spinning.
-                        Err(e) if e.class() == "queue-poisoned" => return Err(e),
-                        Err(e) => log_pusher("connection-lost", e.class()),
-                    }
+            if self.queue_depth()? == 0 {
+                sleep_responsive(IDLE_POLL, &self.shutdown);
+                continue;
+            }
+            let pushed = match connect() {
+                Ok(mut stream) => self.push_queue(&mut stream)?,
+                Err(e) => {
+                    log_pusher("connect-failed", e.class());
+                    false
                 }
-                Err(e) => log_pusher("connect-failed", e.class()),
+            };
+            if pushed {
+                backoff = MIN_BACKOFF;
+                continue;
             }
             if sleep_responsive(backoff, &self.shutdown) {
                 break;
             }
             backoff = next_backoff(backoff);
         }
-        // Reached only when shutdown latched while the connection was
-        // down (never mid-drain). One last best-effort dial to flush
-        // what is still queued; `drain_connection` returns promptly
-        // because the shutdown latch is already set.
-        if let Ok(mut stream) = connect() {
-            if let Err(e) = self.drain_connection(&mut stream) {
-                log_pusher("final-drain-failed", e.class());
+        // Shutdown latched. One last best-effort dial to flush what is
+        // still queued — `push_queue` stops once the queue is dry.
+        if self.queue_depth()? > 0 {
+            match connect() {
+                Ok(mut stream) => {
+                    self.push_queue(&mut stream)?;
+                }
+                Err(e) => log_pusher("final-drain-failed", e.class()),
             }
         }
         Ok(())
     }
 
-    /// Drain the queue to one live `writer` until shutdown or an I/O
-    /// failure.
+    /// Push the whole queue down one freshly dialled `writer`, then
+    /// return so the caller drops (closes) it.
     ///
-    /// Returns `Ok(())` only when the queue is empty *and* shutdown is
-    /// pending — the caller then stops. Returns `Err` on a write/flush
-    /// failure, having re-queued the unsent receipts so the caller can
-    /// reconnect and resend (vali dedupes the resend).
-    fn drain_connection<W: Write>(&self, writer: &mut W) -> Result<()> {
+    /// Returns `Ok(true)` once the queue is dry and every frame was
+    /// written + flushed; `Ok(false)` on a write/flush failure, having
+    /// re-queued the unsent receipts at the front so the next push
+    /// resends them (vali dedupes the resend). `Err` only for a
+    /// poisoned queue lock — unrecoverable, so the pusher ends and
+    /// `join` surfaces it instead of retry-spinning.
+    fn push_queue<W: Write>(&self, writer: &mut W) -> Result<bool> {
+        let mut sent = 0usize;
         loop {
             let batch = self.take_batch()?;
             if batch.is_empty() {
-                // Nothing queued. Done iff shutting down; else idle.
-                if self.shutdown.is_pending() {
-                    return Ok(());
-                }
-                sleep_responsive(IDLE_POLL, &self.shutdown);
-                continue;
+                log_pushed(sent, self.queue_depth()?);
+                return Ok(true);
             }
             // Encode up front. A receipt that cannot be encoded is a
             // poison message (§9) — dropped here, never re-queued, so
@@ -292,13 +323,24 @@ impl<S: ShutdownWatch> VsockPusher<S> {
             }
             // Write every frame, then flush once. On any I/O error the
             // whole sendable batch is re-queued — vali's broker
-            // dedupes, so an at-least-once resend is safe — and the
-            // caller reconnects.
+            // dedupes, so an at-least-once resend is safe.
             if let Err(e) = write_all_frames(writer, &frames) {
+                let requeued = sendable.len();
                 self.requeue(sendable)?;
-                return Err(e);
+                log_push_failed(e.class(), requeued, self.queue_depth()?);
+                return Ok(false);
             }
+            sent += sendable.len();
         }
+    }
+
+    /// Number of receipts currently buffered.
+    fn queue_depth(&self) -> Result<usize> {
+        let q = self
+            .queue
+            .lock()
+            .map_err(|_| TelemetryError::Vsock("queue-poisoned"))?;
+        Ok(q.len())
     }
 
     /// Remove up to [`DRAIN_BATCH`] receipts from the front of the
@@ -372,7 +414,7 @@ impl<S: ShutdownWatch + Send + 'static> VsockPusher<S> {
     ///
     /// The returned handle joins once the shutdown latch is observed —
     /// `main` joins it after the receipt loop ends, so the buffered
-    /// receipts get their final drain before the process exits.
+    /// receipts get their final push before the process exits.
     pub fn spawn(self) -> Result<thread::JoinHandle<Result<()>>> {
         thread::Builder::new()
             .name("tenant-telemetry-vsock-pusher".to_string())

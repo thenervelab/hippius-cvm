@@ -12,13 +12,42 @@ from .factories import make_placement, make_vm
 pytestmark = pytest.mark.django_db
 
 
+
+def _small_units() -> int:
+    """`resource_units("small")` computed from the catalogue.
+
+    These assertions used to hardcode the number. It is a PRODUCT of the
+    flavor table, so every catalogue change broke tests that were not about
+    the catalogue — and the fix was always "update the constant", which
+    teaches nobody anything. Derive it, and the tests keep asserting what
+    they mean: that the weight of one small VM is what lands on chain.
+    """
+    from apps.scheduler import scoring
+
+    return scoring.resource_units("small")
+
 def test_resource_units_blends_cpu_ram_disk() -> None:
-    # small = 1 vCPU / 2048 MiB / (8 data + 10 rootfs) GB.
-    # (1*1 + 2*0.25 + 18*0.005) * 1000 = 1590.
-    assert scoring.resource_units("small") == 1590
-    # xlarge = 8 / 16384 / (64 + 10).
-    # (8 + 16*0.25 + 74*0.005) * 1000 = 12370.
-    assert scoring.resource_units("xlarge") == 12370
+    # DERIVE the expectation from the catalogue rather than restating it.
+    # The property under test is the BLEND — cpu + ram + disk, each at its
+    # documented weight — not the current size of any flavor. Hardcoding
+    # the products made this test fail every time the catalogue changed,
+    # which taught the reader to update the numbers rather than check the
+    # formula.
+    from apps.orchestration.services import flavors
+
+    def expected(name: str) -> int:
+        f = flavors.resolve_flavor(name)
+        total_disk_gb = f.data_disk_size_gb + f.luks_disk_size_gb
+        return int(
+            (f.cpu_count * 1.0 + (f.memory_mb / 1024) * 0.25 + total_disk_gb * 0.005)
+            * 1000
+        )
+
+    assert scoring.resource_units("small") == expected("small")
+    assert scoring.resource_units("xlarge") == expected("xlarge")
+    # And the blend must actually blend: a flavor that grows only in RAM
+    # still scores higher, so the term is not silently dropped.
+    assert expected("xlarge") > expected("large") > expected("small")
     # Strict ordering: a bigger flavor is worth strictly more.
     assert scoring.resource_units("4xlarge") > scoring.resource_units("xlarge")
 
@@ -72,8 +101,8 @@ def test_compute_epoch_weights_sums_only_bound_placements_per_miner() -> None:
     weights = scoring.compute_epoch_weights()
 
     assert weights == {
-        node_a: 2 * 1590,  # two bound smalls
-        node_b: 12370,  # one bound xlarge
+        node_a: 2 * _small_units(),  # two bound smalls
+        node_b: scoring.resource_units("xlarge"),  # one bound xlarge
     }
 
 
@@ -183,4 +212,4 @@ def test_epoch_close_command_submits_computed_weights(monkeypatch) -> None:
     submitted = []
     monkeypatch.setattr(chain, "submit_epoch_close", lambda w: submitted.append(w))
     call_command("vali_epoch_close", once=True)
-    assert submitted == [{"a" * 64: 1590}]
+    assert submitted == [{"a" * 64: _small_units()}]

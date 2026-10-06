@@ -26,7 +26,8 @@ permissions:
 jobs:
   # ── Generate + keyless-sign the SBOMs ──────────────────────────────
   sbom:
-    runs-on: mon-runner-k8s
+    # mon-runner-k8s has had no registered runners since ~2026-08.
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     permissions:
       contents: read # cargo-cyclonedx only reads the repo
       id-token: write # OIDC token for cosign keyless signing — nothing else
@@ -34,9 +35,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # The in-cluster `mon-runner-k8s` runner does not ship rustup
-      # pre-installed; dtolnay action curls + installs the toolchain
-      # pinned by `rust-toolchain.toml`. ~15 s overhead.
+      # The Hippius runners ship neither rustup nor a C linker; dtolnay
+      # installs the toolchain pinned by `rust-toolchain.toml`.
+      - name: Install build-essential (cc links cargo-cyclonedx)
+        run: command -v cc >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q build-essential; }
       - name: Install Rust toolchain (rust-toolchain.toml-pinned)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
       - name: Rust toolchain show
@@ -84,7 +86,7 @@ jobs:
 
           # The §E/§F trusted-computing-base binaries. `miner-uki-fetch`
           # (PR-F5) is not merged yet — add a line here when it lands.
-          sign_sbom kbs-server               kbs-server/kbs-server.cdx.json
+          sign_sbom kbs-server               binaries/kbs-server/hippius-kbs-server.cdx.json
           sign_sbom hippius-agent-initramfs  binaries/agent-initramfs/hippius-agent-initramfs.cdx.json
           sign_sbom hippius-uki-measure      binaries/uki-measure/hippius-uki-measure.cdx.json
           sign_sbom hippius-image-provenance binaries/image-provenance/hippius-image-provenance.cdx.json
@@ -100,7 +102,8 @@ jobs:
 
   # ── Attach the signed SBOMs to the GitHub Release (tags only) ──────
   release-attach:
-    runs-on: mon-runner-k8s
+    # mon-runner-k8s has had no registered runners since ~2026-08.
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     needs: sbom
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

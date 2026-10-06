@@ -67,7 +67,7 @@ def _spec(**overrides) -> launch.LaunchSpec:
 
 def _miner(seed: int = 1, *, netbird_ip: str | None = None) -> MinerIdentity:
     return MinerIdentity.objects.create(
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{chr(ord('a') + seed - 1)}",
         pubkey_hex=format(seed, "064x"),
         platform_id=f"{seed:02x}" + "cd" * 15,
         netbird_ip="100.64.0." + str(seed) if netbird_ip is None else netbird_ip,
@@ -223,7 +223,7 @@ def test_forced_launch_stamps_the_vm_host(monkeypatch) -> None:
         _miner(),
         decided_by=launch.resolve_forced_launch_principal(),
     )
-    assert Vm.objects.get(vm_id="vm-host-f1").host == "miner-1"
+    assert Vm.objects.get(vm_id="vm-host-f1").host == "miner-a"
 
 
 def test_a_rejected_forced_launch_fails_the_placement(monkeypatch) -> None:
@@ -386,7 +386,7 @@ def test_sweep_reports_zero_when_every_launch_has_a_row() -> None:
         lease_id="l",
         state=VmState.ACTIVE,
         generation=1,
-        host="miner-1",
+        host="miner-a",
         lifecycle_vk=bytes(32),
     )
     assert service.sweep_unbound_launches() == 0

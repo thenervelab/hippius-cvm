@@ -263,7 +263,7 @@ class _BadIntervalRule(Rule):
 
 @pytest.mark.asyncio
 async def test_bad_interval_seconds_does_not_spin_every_tick() -> None:
-    """Codex round-3 LOW: a rule with a raising interval is deferred."""
+    """Review round-3 LOW: a rule with a raising interval is deferred."""
 
     bad = _BadIntervalRule()
     good = _AlwaysFiresRule()

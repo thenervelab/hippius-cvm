@@ -19,12 +19,19 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use hippius_miner_agent::lifecycle::{MockLaunchDigest, MockLibvirtDriver};
+use hippius_miner_agent::backup::image_tool::QemuImg;
+use hippius_miner_agent::backup::qmp::VirshQmp;
+use hippius_miner_agent::backup::restore::{BackupChainRestorer, ChainPiece, RestoreChain};
+use hippius_miner_agent::backup::staged::{RestoreManager, RestoreOp};
+use hippius_miner_agent::backup::transfer::Transfer;
+use hippius_miner_agent::backup::transfer::{PartReceipt, PieceReceipt};
+use hippius_miner_agent::backup::{BackupKind, BackupManager};
+use hippius_miner_agent::lifecycle::{DomainId, DomainState, MockLaunchDigest, MockLibvirtDriver};
 use hippius_miner_agent::orders::{
-    Clock, DestroyOrder, IdempotencyStore, LaunchOrder, MigrateActivateOrder, MigrateOrder,
-    MigrateQuiesceOrder, MigrateSnapshotOrder, MigrationStore, OrderBody, OrderKind, OrderState,
-    OrderVerifier, OrdersServer, SignedOrder, SnapshotDownloader, SnapshotUploader, StopOrder,
-    ORDER_DOMAIN,
+    BackupOrder, Clock, DestroyOrder, IdempotencyStore, LaunchOrder, MigrateActivateOrder,
+    MigrateOrder, MigrateQuiesceOrder, MigrateSnapshotOrder, MigrationStore, OrderBody, OrderKind,
+    OrderState, OrderVerifier, OrdersServer, RestoreOrder, SignedOrder, SnapshotDownloader,
+    SnapshotUploader, StopOrder, ORDER_DOMAIN,
 };
 use hippius_miner_agent::snp_config::{install_for_tests, SnpCpuConfig};
 use hippius_miner_agent::{CvmLifecycle, HostResources, VmId};
@@ -73,13 +80,13 @@ fn seed_snp_probe() {
 
 /// Miner identity the test fleet pins. The signed-body
 /// `target_miner_id` and the `OrderState.self_miner_id` agree, so the
-/// gemini-r1 target-binding check passes on the happy path.
+/// review-r1 target-binding check passes on the happy path.
 const TEST_MINER_ID: &str = "cc-test-miner";
 
 /// Pinned "now" — every signed order in this test crate carries the
 /// same `issued_at_unix`, and the `FixedClock` below returns the same
 /// value, so age-check is deterministic regardless of wall time.
-/// Set well past `EARLIEST_VALID_ISSUED_AT_UNIX` (the gemini-r2 broken-
+/// Set well past `EARLIEST_VALID_ISSUED_AT_UNIX` (the review-r2 broken-
 /// clock bypass guard) so the stale-by-floor + stale-by-window
 /// branches are both exercisable from this base.
 const TEST_NOW_UNIX: u64 = 1_770_000_000;
@@ -122,6 +129,30 @@ impl SnapshotUploader for RecordingUploader {
             .unwrap()
             .push((disk_path.to_path_buf(), put_url.to_string()));
         Ok(())
+    }
+
+    async fn upload_parts(
+        &self,
+        disk_path: &std::path::Path,
+        part_size: u64,
+        part_urls: &[String],
+    ) -> hippius_miner_agent::Result<PieceReceipt> {
+        self.calls.lock().unwrap().push((
+            disk_path.to_path_buf(),
+            format!("parts:{part_size}:{}", part_urls.len()),
+        ));
+        Ok(PieceReceipt {
+            parts: (1..=part_urls.len() as u32)
+                .map(|n| PartReceipt {
+                    part_number: n,
+                    etag: format!("\"etag-{n}\""),
+                    sha256_hex: "00".repeat(32),
+                    size: part_size,
+                })
+                .collect(),
+            size: part_size * part_urls.len() as u64,
+            sha256_hex: "11".repeat(32),
+        })
     }
 }
 
@@ -210,12 +241,29 @@ async fn spawn_server_with_downloader(
     Arc<RecordingUploader>,
     Arc<RecordingDownloader>,
 ) {
+    spawn_server_inner(downloader, None, Arc::new(MockLibvirtDriver::new()), None).await
+}
+
+/// The shared server fixture; `backup` enables the backup routes.
+async fn spawn_server_inner(
+    downloader: Arc<RecordingDownloader>,
+    backup: Option<Arc<BackupManager>>,
+    driver: Arc<MockLibvirtDriver>,
+    restore_root: Option<&std::path::Path>,
+) -> (
+    SocketAddr,
+    SigningKey,
+    Arc<CvmLifecycle>,
+    Arc<MigrationStore>,
+    Arc<RecordingUploader>,
+    Arc<RecordingDownloader>,
+) {
     let sk = SigningKey::from_bytes(&[42u8; 32]);
     let verifier =
         Arc::new(OrderVerifier::from_hex(&hex::encode(sk.verifying_key().to_bytes())).unwrap());
     let lifecycle = Arc::new(
         CvmLifecycle::new(
-            Arc::new(MockLibvirtDriver::new()),
+            driver,
             Arc::new(MockLaunchDigest::fixed([0u8; 48])),
             HostResources {
                 total_cpus: 16,
@@ -223,7 +271,12 @@ async fn spawn_server_with_downloader(
                 total_disk_gb: 0,
             },
         )
-        .skip_state_disk_provision_for_tests(),
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(
+            restore_root
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| "/var/lib/hippius-miner".into()),
+        ),
     );
     // The integration tests use a fixed `miner_id` (`TEST_MINER_ID`)
     // and a clock pinned to `TEST_NOW_UNIX` — the same value
@@ -256,6 +309,23 @@ async fn spawn_server_with_downloader(
         ack_signer,
         TaskTracker::new(),
     );
+    let state = match backup {
+        Some(b) => {
+            let space = b.space_ledger();
+            state.with_backup(
+                b,
+                Arc::new(BackupChainRestorer::new(Transfer::new().unwrap(), space)),
+            )
+        }
+        None => state,
+    };
+    let state = match restore_root {
+        Some(_) => state.with_restore(Arc::new(RestoreManager::new(
+            Arc::new(Transfer::new().unwrap()),
+            Arc::default(),
+        ))),
+        None => state,
+    };
     let server = OrdersServer::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -294,6 +364,8 @@ fn launch_payload(vm: &str) -> LaunchOrder {
         // connect fails fast (returns `connect-timeout` AFTER both
         // the peek and the empty guard have already passed).
         cose_ticket: ByteBuf::from(ticket_medium()),
+        require_existing_disks: false,
+        guardian_ep: None,
     }
 }
 
@@ -417,7 +489,8 @@ async fn a_replayed_order_id_is_an_idempotent_no_op() {
     assert_eq!((s1, b1.as_str()), (200, "launched"));
     // The exact same signed wire bytes again — same order_id.
     let (s2, b2) = post(addr, "/v1/miner/order/launch", &wire).await;
-    assert_eq!((s2, b2.as_str()), (200, "idempotent-replay"));
+    // The replay echoes the original outcome class.
+    assert_eq!((s2, b2.as_str()), (200, "launched"));
     // ...and the CVM was launched exactly once.
     assert_eq!(lifecycle.list().await.unwrap().len(), 1);
 }
@@ -544,7 +617,7 @@ fn signed_wire_with_target<T: Serialize>(
 
 #[tokio::test]
 async fn an_order_addressed_to_another_miner_is_rejected() {
-    // gemini r1 High — cross-miner replay. A signed order whose
+    // review r1 High — cross-miner replay. A signed order whose
     // `target_miner_id` names a sibling miner must be rejected here
     // even though every miner pins the same Edge order-signing key
     // and the signature itself verifies.
@@ -566,8 +639,29 @@ async fn an_order_addressed_to_another_miner_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_replayed_stop_still_says_it_found_nothing_to_stop() {
+    // vali's §24 counts a stop as ITS stop only if the miner `stopped` a
+    // guest. A re-ask of the same order_id (the Edge lost the first answer)
+    // must not launder a `not-running` into a generic success.
+    let (addr, sk, _lc) = spawn_server().await;
+    let wire = signed_wire(
+        &sk,
+        "ord-stop-nothing",
+        OrderKind::Stop,
+        StopOrder {
+            vm_id: VmId::new("tenant-absent").unwrap(),
+            graceful: true,
+        },
+    );
+    let (s1, b1) = post(addr, "/v1/miner/order/stop", &wire).await;
+    assert_eq!((s1, b1.as_str()), (200, "not-running"));
+    let (s2, b2) = post(addr, "/v1/miner/order/stop", &wire).await;
+    assert_eq!((s2, b2.as_str()), (200, "not-running"));
+}
+
+#[tokio::test]
 async fn a_stale_order_is_rejected() {
-    // gemini r1 High — long-term replay. A signed order whose
+    // review r1 High — long-term replay. A signed order whose
     // `issued_at_unix` is past the ±MAX_ORDER_AGE_SECS window must be
     // rejected. The miner's clock is pinned by `FixedClock(TEST_NOW_UNIX)`
     // so we can directly construct a stale order.
@@ -591,7 +685,7 @@ async fn a_stale_order_is_rejected() {
 
 #[tokio::test]
 async fn an_order_dated_before_the_floor_is_rejected() {
-    // gemini r2 Medium — broken-clock bypass. A miner whose
+    // review r2 Medium — broken-clock bypass. A miner whose
     // `SystemClock` saturates to `0` would otherwise accept an
     // attacker-crafted order with `issued_at_unix == 0` because
     // `|0 - 0| <= MAX_ORDER_AGE_SECS`. The independent
@@ -617,7 +711,7 @@ async fn an_order_dated_before_the_floor_is_rejected() {
 
 #[tokio::test]
 async fn target_miner_id_match_is_case_insensitive() {
-    // gemini r2 Low — defense in depth against a manual config-vs-
+    // review r2 Low — defense in depth against a manual config-vs-
     // Ansible casing typo. Ansible enforces lowercase, but a hand-
     // edited config that uppercased the id should still match. The
     // signed body's `target_miner_id` differs from `TEST_MINER_ID`
@@ -779,6 +873,8 @@ async fn migrate_snapshot_streams_the_volume_and_marks_done() {
             node_id: TEST_MINER_ID.to_string(),
             put_url: put_url.to_string(),
             state_put_url: String::new(),
+            disk_part_urls: Vec::new(),
+            part_size: 0,
         },
     );
     let (status, body) = post(addr, "/v1/miner/order/migrate-snapshot", &snap).await;
@@ -816,6 +912,169 @@ async fn migrate_snapshot_streams_the_volume_and_marks_done() {
 }
 
 #[tokio::test]
+async fn destroying_a_migrated_source_clears_its_completed_leg() {
+    // Seen in production (A→B→A): the reclaim destroyed the source's copy but the
+    // store kept `Done`, so the later migration BACK here was refused
+    // (`activate-on-source`) while the status route reported `done`.
+    let (addr, sk, _lc, migration, _up, _dl) = spawn_server_with_migration().await;
+    let vm = VmId::new("tenant-back").unwrap();
+    let launch = signed_wire(
+        &sk,
+        "ord-b-launch",
+        OrderKind::Launch,
+        launch_payload("tenant-back"),
+    );
+    assert_eq!(post(addr, "/v1/miner/order/launch", &launch).await.0, 200);
+    let quiesce = signed_wire(
+        &sk,
+        "ord-b-quiesce",
+        OrderKind::MigrateQuiesce,
+        MigrateQuiesceOrder {
+            vm_id: vm.clone(),
+            node_id: TEST_MINER_ID.to_string(),
+            lease_id: "lease-back".to_string(),
+            source_gen: 5,
+            eol_nonce_hex: "ab".repeat(32),
+        },
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-quiesce", &quiesce)
+            .await
+            .0,
+        200
+    );
+    let snap = signed_wire(
+        &sk,
+        "ord-b-snapshot",
+        OrderKind::MigrateSnapshot,
+        MigrateSnapshotOrder {
+            vm_id: vm.clone(),
+            node_id: TEST_MINER_ID.to_string(),
+            put_url: "https://s3.example/snapshots/tenant-back?sig=abc".to_string(),
+            state_put_url: String::new(),
+            disk_part_urls: Vec::new(),
+            part_size: 0,
+        },
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-snapshot", &snap)
+            .await
+            .0,
+        200
+    );
+    for _ in 0..50 {
+        if migration.phase(&vm).map(|p| p.as_status_str()) == Some("done") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        migration.phase(&vm).map(|p| p.as_status_str()),
+        Some("done")
+    );
+
+    let destroy = signed_wire(
+        &sk,
+        "ord-b-reclaim",
+        OrderKind::Destroy,
+        DestroyOrder { vm_id: vm.clone() },
+    );
+    assert_eq!(post(addr, "/v1/miner/order/destroy", &destroy).await.0, 200);
+    assert_eq!(
+        migration.phase(&vm),
+        None,
+        "the source leg is gone with its copy"
+    );
+    assert!(
+        migration.begin_activate(&vm).unwrap(),
+        "a migration back here is accepted"
+    );
+}
+
+#[tokio::test]
+async fn a_multipart_migrate_snapshot_uploads_parts_and_reports_their_receipts() {
+    let (addr, sk, _lc, migration, uploader, _dl) = spawn_server_with_migration().await;
+    let launch = signed_wire(
+        &sk,
+        "ord-mp-launch",
+        OrderKind::Launch,
+        launch_payload("tenant-mp"),
+    );
+    assert_eq!(post(addr, "/v1/miner/order/launch", &launch).await.0, 200);
+    let quiesce = signed_wire(
+        &sk,
+        "ord-mp-quiesce",
+        OrderKind::MigrateQuiesce,
+        MigrateQuiesceOrder {
+            vm_id: VmId::new("tenant-mp").unwrap(),
+            node_id: TEST_MINER_ID.to_string(),
+            lease_id: "lease-mp".to_string(),
+            source_gen: 5,
+            eol_nonce_hex: "ab".repeat(32),
+        },
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-quiesce", &quiesce)
+            .await
+            .0,
+        200
+    );
+
+    // 200 presigned parts — over the 64 KiB cap the other order routes keep.
+    let part_urls: Vec<String> = (1..=200)
+        .map(|i| {
+            format!(
+                "https://s3.example/hippius-compute-images/migrations/tenant-mp/j.luks\
+                 ?partNumber={i}&uploadId=abcdefghijklmnopqrstuvwxyz0123456789\
+                 &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE\
+                 %2F20260925%2Fdecentralized%2Fs3%2Faws4_request&X-Amz-Date=20260925T000000Z\
+                 &X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature={}",
+                "a".repeat(64)
+            )
+        })
+        .collect();
+    let snap = signed_wire(
+        &sk,
+        "ord-mp-snapshot",
+        OrderKind::MigrateSnapshot,
+        MigrateSnapshotOrder {
+            vm_id: VmId::new("tenant-mp").unwrap(),
+            node_id: TEST_MINER_ID.to_string(),
+            put_url: String::new(),
+            state_put_url: String::new(),
+            disk_part_urls: part_urls,
+            part_size: 1 << 30,
+        },
+    );
+    assert!(snap.len() > 64 * 1024);
+    let (status, body) = post(addr, "/v1/miner/order/migrate-snapshot", &snap).await;
+    assert_eq!((status, body.as_str()), (200, "snapshot-accepted"));
+
+    let vm = VmId::new("tenant-mp").unwrap();
+    for _ in 0..50 {
+        if migration.phase(&vm).map(|p| p.as_status_str()) == Some("done") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        uploader.calls(),
+        vec![(
+            std::path::PathBuf::from("/var/lib/hippius-miner/tenant-mp.img"),
+            format!("parts:{}:200", 1u64 << 30)
+        )],
+        "the volume went up as parts, never as a single PUT"
+    );
+    let (status, body) = get(addr, "/v1/miner/migration/tenant-mp/status").await;
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "done");
+    assert_eq!(v["disk"]["parts"].as_array().unwrap().len(), 200);
+    assert_eq!(v["disk"]["parts"][0]["etag"], "\"etag-1\"");
+    assert_eq!(v["disk"]["size"], 200u64 << 30);
+}
+
+#[tokio::test]
 async fn migrate_snapshot_without_a_prior_quiesce_is_refused() {
     let (addr, sk, _lc, _mig, uploader, _dl) = spawn_server_with_migration().await;
     // No quiesce — the source guest may still be writing, so the
@@ -829,6 +1088,8 @@ async fn migrate_snapshot_without_a_prior_quiesce_is_refused() {
             node_id: TEST_MINER_ID.to_string(),
             put_url: "https://s3.example/put".to_string(),
             state_put_url: String::new(),
+            disk_part_urls: Vec::new(),
+            part_size: 0,
         },
     );
     let (status, body) = post(addr, "/v1/miner/order/migrate-snapshot", &snap).await;
@@ -883,6 +1144,8 @@ async fn migration_status_route_reports_running_done_and_404() {
             node_id: TEST_MINER_ID.to_string(),
             put_url: "https://s3.example/put".to_string(),
             state_put_url: String::new(),
+            disk_part_urls: Vec::new(),
+            part_size: 0,
         },
     );
     let (ss, _) = post(addr, "/v1/miner/order/migrate-snapshot", &snap).await;
@@ -923,6 +1186,8 @@ fn activate_payload(vm: &str, get_url: &str) -> MigrateActivateOrder {
         vm_id: VmId::new(vm).unwrap(),
         get_url: get_url.to_string(),
         state_get_url: String::new(),
+        snapshot_size: 0,
+        snapshot_sha256_hex: String::new(),
         new_gen: 6,
         // Deliberately non-existent on the test host (no M3 staging).
         ovmf_path: "/var/lib/hippius-miner/missing-ovmf.fd".into(),
@@ -939,6 +1204,10 @@ fn activate_payload(vm: &str, get_url: &str) -> MigrateActivateOrder {
         // No M3 staging in these M2 dest-activation tests — the artifacts
         // are deliberately absent so the fail-closed existence check fires.
         boot_artifacts: None,
+        backup_chain: None,
+        staged_restore_id: String::new(),
+        guardian_ep: None,
+        settle_by_unix: 0,
     }
 }
 
@@ -969,16 +1238,23 @@ async fn migrate_activate_route_acks_then_fails_async_without_staged_artifacts()
 
     // The background restore fails closed → the dest status becomes `failed`
     // (poll the SAME status surface vali reads).
-    let mut saw_failed = false;
+    let mut failed_body = None;
     for _ in 0..100 {
         let (_s, b) = get(addr, "/v1/miner/migration/tenant-act/status").await;
         if b.contains("failed") {
-            saw_failed = true;
+            failed_body = Some(b);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(saw_failed, "dest status never reached failed");
+    // The failure carries its class, so vali can tell a restore that never
+    // reached a boot from a CVM that could not start.
+    let body: serde_json::Value =
+        serde_json::from_str(&failed_body.expect("dest status never reached failed")).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"status": "failed", "class": "migration/dest-artifacts-missing"})
+    );
     // A mis-staged dest must NOT trigger a multi-GB download.
     assert!(dl.calls().is_empty());
 }
@@ -1039,4 +1315,390 @@ async fn ingest_source_ack_rejects_an_empty_body_and_a_bad_vm_id() {
     let (s_bad, b_bad) = post(addr, "/v1/miner/migration/Bad_Id/source-ack", b"x").await;
     assert_eq!(s_bad, 400, "body={b_bad}");
     assert_eq!(b_bad, "bad-vm-id");
+}
+
+// ── live backup order ───────────────────────────────────────────────
+
+/// A backup-enabled server. The QMP transport points at a virsh that
+/// does not exist: these tests cover the order + status plumbing, not
+/// QEMU (see `backup::live_tests` for that).
+async fn spawn_backup_server() -> (SocketAddr, SigningKey) {
+    // vm-a is defined here but shut off: the status route answers for it
+    // (no points — bitmaps die with QEMU), and a backup of it is refused.
+    let driver = Arc::new(MockLibvirtDriver::new());
+    driver.seed_domain(
+        DomainId::new("hippius-tenant-vm-a").unwrap(),
+        DomainState::ShutOff,
+    );
+    let backup = Arc::new(BackupManager::new(
+        Arc::new(VirshQmp::new("/nonexistent/virsh".into())),
+        Arc::new(QemuImg::default()),
+        Arc::new(Transfer::new().unwrap()),
+    ));
+    let (addr, sk, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        Some(backup),
+        driver,
+        None,
+    )
+    .await;
+    (addr, sk)
+}
+
+fn backup_payload(vm: &str, run: &str, parent: Option<&str>, parts: usize) -> BackupOrder {
+    BackupOrder {
+        vm_id: VmId::new(vm).unwrap(),
+        run_id: run.to_string(),
+        parent_run_id: parent.map(str::to_string),
+        kind: BackupKind::Full,
+        part_size: 256 << 20,
+        disk_part_urls: (1..=parts)
+            .map(|i| {
+                format!(
+                    "https://s3.example/hippius-vm-backups/backups/{vm}/{run}.full.raw\
+                     ?partNumber={i}&uploadId=abcdefghijklmnopqrstuvwxyz0123456789\
+                     &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE\
+                     %2F20260924%2Fdecentralized%2Fs3%2Faws4_request&X-Amz-Date=20260924T000000Z\
+                     &X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature={}",
+                    "a".repeat(64)
+                )
+            })
+            .collect(),
+        state_put_url: format!("https://s3.example/{vm}/state?X-Amz-Signature=b"),
+    }
+}
+
+#[tokio::test]
+async fn backup_routes_are_503_when_backups_are_not_wired() {
+    let (addr, sk, _lc) = spawn_server().await;
+    let wire = signed_wire(
+        &sk,
+        "bk-0",
+        OrderKind::Backup,
+        backup_payload("vm-a", "r1", None, 1),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/backup", &wire).await;
+    assert_eq!((status, body.as_str()), (503, "backup-disabled"));
+    let (status, _) = get(addr, "/v1/miner/backup/vm-a/status").await;
+    assert_eq!(status, 503);
+}
+
+#[tokio::test]
+async fn a_backup_order_with_many_part_urls_is_accepted_and_reports_status() {
+    let (addr, sk) = spawn_backup_server().await;
+    let (status, body) = get(addr, "/v1/miner/backup/vm-b/status").await;
+    assert_eq!((status, body.as_str()), (404, "no-domain"));
+    let (status, body) = get(addr, "/v1/miner/backup/vm-a/status").await;
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"vm_id": "vm-a",
+            "live": {"boot_counter": null, "point_run_ids": []},
+            "run": null}),
+        "domain here, no run since start"
+    );
+
+    // 200 presigned parts (50 GiB at 256 MiB) — far over the 64 KiB cap
+    // the other order routes keep.
+    let wire = signed_wire(
+        &sk,
+        "bk-1",
+        OrderKind::Backup,
+        backup_payload("vm-a", "r1", Some("r0"), 200),
+    );
+    assert!(wire.len() > 64 * 1024);
+    let (status, body) = post(addr, "/v1/miner/order/backup", &wire).await;
+    assert_eq!((status, body.as_str()), (200, "backup-started"));
+
+    // The VM is not running on this (mock) host: the async run fails
+    // with a static class, and the status says so.
+    let mut last = String::new();
+    for _ in 0..100 {
+        let (status, body) = get(addr, "/v1/miner/backup/vm-a/status").await;
+        assert_eq!(status, 200);
+        last = body;
+        if last.contains("\"status\":\"failed\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+    assert_eq!(v["vm_id"], "vm-a");
+    assert_eq!(v["live"]["point_run_ids"], serde_json::json!([]));
+    let v = &v["run"];
+    assert_eq!(v["run_id"], "r1");
+    assert_eq!(v["parent_run_id"], "r0");
+    assert_eq!(v["kind"], "full");
+    assert_eq!(v["status"], "failed");
+    assert_eq!(v["error"], "vm-not-running");
+    assert!(!last.contains("X-Amz"), "no URL ever leaks into the status");
+
+    // Same order again: the order-id dedup answers.
+    let (status, _) = post(addr, "/v1/miner/order/backup", &wire).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_backup_order_with_a_bad_parent_id_is_422() {
+    let (addr, sk) = spawn_backup_server().await;
+    let wire = signed_wire(
+        &sk,
+        "bk-2",
+        OrderKind::Backup,
+        backup_payload("vm-a", "r1", Some("Run/../x"), 1),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/backup", &wire).await;
+    assert_eq!((status, body.as_str()), (422, "backup-invalid"));
+}
+
+#[tokio::test]
+async fn a_multipart_snapshot_body_is_room_only_its_own_route_has() {
+    let (addr, _sk, _lc, _mig, _up, _dl) = spawn_server_with_migration().await;
+    // 1 MiB: past every other route's 64 KiB, within migrate-snapshot's
+    // 2 MiB — it reaches order decoding (400), not the body limit (413).
+    let body = vec![0u8; 1024 * 1024];
+    let (status, _) = post(addr, "/v1/miner/order/migrate-snapshot", &body).await;
+    assert_ne!(status, 413);
+    let (status, _) = post(addr, "/v1/miner/order/launch", &body).await;
+    assert_eq!(status, 413);
+    let huge = vec![0u8; 2 * 1024 * 1024 + 1];
+    let (status, _) = post(addr, "/v1/miner/order/migrate-snapshot", &huge).await;
+    assert_eq!(status, 413);
+}
+
+#[tokio::test]
+async fn a_backup_body_gets_the_multipart_room_and_no_more() {
+    let (addr, _sk) = spawn_backup_server().await;
+    // ~2,600 part URLs (the largest flavor at 512 MiB parts) is ~1.4 MB:
+    // it reaches order decoding (400), not the body limit (413).
+    let body = vec![0u8; 1_500_000];
+    let (status, _) = post(addr, "/v1/miner/order/backup", &body).await;
+    assert_ne!(status, 413);
+    let huge = vec![0u8; 2 * 1024 * 1024 + 1];
+    let (status, _) = post(addr, "/v1/miner/order/backup", &huge).await;
+    assert_eq!(status, 413);
+}
+
+// ── staged restore order ────────────────────────────────────────────
+
+const RID: &str = "0123456789abcdef0123456789abcdef";
+
+/// A presigned-GET stand-in serving `objects` at `/o/<key>`.
+async fn serve_objects(objects: std::collections::HashMap<String, Vec<u8>>) -> String {
+    use axum::extract::{Path, State};
+    async fn get_obj(
+        State(objs): State<Arc<std::collections::HashMap<String, Vec<u8>>>>,
+        Path(key): Path<String>,
+    ) -> (axum::http::StatusCode, Vec<u8>) {
+        match objs.get(&key) {
+            Some(b) => (axum::http::StatusCode::OK, b.clone()),
+            None => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+        }
+    }
+    let app = axum::Router::new()
+        .route("/o/:key", axum::routing::get(get_obj))
+        .with_state(Arc::new(objects));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/o")
+}
+
+fn chain_piece(url: String, body: &[u8]) -> ChainPiece {
+    use sha2::Digest;
+    ChainPiece {
+        url,
+        sha256_hex: hex::encode(sha2::Sha256::digest(body)),
+        size: body.len() as u64,
+        part_size: 0,
+        part_sha256_hex: Vec::new(),
+    }
+}
+
+fn restore_order(
+    vm: &str,
+    op: RestoreOp,
+    chain: Option<RestoreChain>,
+    disk_bytes: u64,
+) -> RestoreOrder {
+    RestoreOrder {
+        vm_id: VmId::new(vm).unwrap(),
+        restore_id: RID.to_string(),
+        op,
+        chain,
+        disk_bytes,
+        streams: 8,
+    }
+}
+
+async fn restore_status(addr: SocketAddr, vm: &str, want_state: &str) -> serde_json::Value {
+    let mut last = String::new();
+    for _ in 0..200 {
+        let (status, body) = get(addr, &format!("/v1/miner/restore/{vm}/status")).await;
+        assert_eq!(status, 200, "{body}");
+        last = body;
+        if last.contains(&format!("\"state\":\"{want_state}\"")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    serde_json::from_str(&last).unwrap()
+}
+
+#[tokio::test]
+async fn restore_routes_are_503_when_restores_are_not_wired() {
+    let (addr, sk, _lc) = spawn_server().await;
+    let wire = signed_wire(
+        &sk,
+        "rs-0",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Abort, None, 0),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (503, "restore-disabled"));
+    let (status, _) = get(addr, "/v1/miner/restore/vm-a/status").await;
+    assert_eq!(status, 503);
+}
+
+#[tokio::test]
+async fn a_restore_is_staged_reported_and_aborted_over_the_order_route() {
+    let root = tempfile::tempdir().unwrap();
+    let full = vec![3u8; 1 << 20];
+    let state = vec![4u8; 1 << 20];
+    let mut objs = std::collections::HashMap::new();
+    objs.insert("full".to_string(), full.clone());
+    objs.insert("state".to_string(), state.clone());
+    let base = serve_objects(objs).await;
+    let (addr, sk, lifecycle, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        None,
+        Arc::new(MockLibvirtDriver::new()),
+        Some(root.path()),
+    )
+    .await;
+    let vm = VmId::new("vm-a").unwrap();
+    // The live disks, which a stage never touches.
+    let overlay = lifecycle.golden_overlay_path(&vm);
+    std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+    std::fs::write(&overlay, b"live").unwrap();
+
+    let (status, body) = get(addr, "/v1/miner/restore/vm-a/status").await;
+    assert_eq!((status, body.as_str()), (404, "no-restore"));
+
+    let mut chain = RestoreChain {
+        restore_id: RID.to_string(),
+        full: chain_piece(format!("{base}/full?X-Amz-Signature=s"), &full),
+        incrementals: Vec::new(),
+        state: chain_piece(format!("{base}/state?X-Amz-Signature=s"), &state),
+    };
+    // A chain for another restore id is refused up front.
+    chain.restore_id = "fedcba9876543210fedcba9876543210".into();
+    let wire = signed_wire(
+        &sk,
+        "rs-bad",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Stage, Some(chain.clone()), 1 << 20),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (422, "restore-id-mismatch"));
+    chain.restore_id = RID.into();
+
+    let wire = signed_wire(
+        &sk,
+        "rs-1",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Stage, Some(chain.clone()), 1 << 20),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (200, "restore-staging"));
+    let v = restore_status(addr, "vm-a", "staged").await;
+    let total = 2u64 << 20;
+    assert_eq!(
+        v,
+        serde_json::json!({"vm_id": "vm-a", "restore_id": RID, "op": "stage",
+            "state": "staged", "bytes_done": total, "bytes_total": total, "reason": null,
+            "swapped": false, "pre_restore_present": false, "domain_live": false})
+    );
+    assert_eq!(std::fs::read(&overlay).unwrap(), b"live");
+
+    // A new order id for the same restore: already staged.
+    let wire = signed_wire(
+        &sk,
+        "rs-2",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Stage, Some(chain), 1 << 20),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (200, "restore-staged"));
+
+    // Not swapped: reclaim would delete the only copy.
+    let wire = signed_wire(
+        &sk,
+        "rs-3",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Reclaim, None, 0),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (409, "restore-reclaim-refused"));
+
+    // A staged-restore activation that also names a snapshot URL.
+    let mut act = activate_payload("vm-a", "https://s3.example/snap?sig=x");
+    act.staged_restore_id = RID.into();
+    let wire = signed_wire(&sk, "rs-act", OrderKind::MigrateActivate, act);
+    let (status, body) = post(addr, "/v1/miner/order/migrate-activate", &wire).await;
+    assert_eq!((status, body.as_str()), (422, "staged-restore-conflict"));
+
+    let wire = signed_wire(
+        &sk,
+        "rs-4",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Abort, None, 0),
+    );
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    assert_eq!((status, body.as_str()), (200, "restore-aborted"));
+    let v = restore_status(addr, "vm-a", "aborted").await;
+    assert_eq!(v["op"], "abort");
+    assert_eq!(std::fs::read(&overlay).unwrap(), b"live");
+
+    // Aborted: an activation of it is refused on the order response.
+    let mut act = activate_payload("vm-a", "");
+    act.staged_restore_id = RID.into();
+    let wire = signed_wire(&sk, "rs-act-2", OrderKind::MigrateActivate, act);
+    let (status, body) = post(addr, "/v1/miner/order/migrate-activate", &wire).await;
+    assert_eq!((status, body.as_str()), (409, "restore-not-staged"));
+}
+
+#[tokio::test]
+async fn a_stage_carrying_many_part_shas_fits_its_route() {
+    let root = tempfile::tempdir().unwrap();
+    let (addr, sk, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        None,
+        Arc::new(MockLibvirtDriver::new()),
+        Some(root.path()),
+    )
+    .await;
+    // 1280 GiB in 512 MiB parts: 2,560 part shas, far past 64 KiB.
+    let size = 1280u64 << 30;
+    let mut full = chain_piece("https://s3.example/full".into(), b"x");
+    full.size = size;
+    full.part_size = 512 << 20;
+    full.part_sha256_hex = vec!["a".repeat(64); 2560];
+    let chain = RestoreChain {
+        restore_id: RID.to_string(),
+        full,
+        incrementals: Vec::new(),
+        state: chain_piece("https://s3.example/state".into(), &[0u8; 1 << 20]),
+    };
+    let wire = signed_wire(
+        &sk,
+        "rs-big",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Stage, Some(chain), size),
+    );
+    assert!(wire.len() > 64 * 1024);
+    let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
+    // Decoded and validated (the body fit); the tempdir cannot hold it.
+    assert_eq!((status, body.as_str()), (507, "insufficient-space"));
 }

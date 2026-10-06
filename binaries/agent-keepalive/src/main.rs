@@ -106,7 +106,26 @@ struct Cli {
     /// operator is still on step 2 of the arming sequence.
     #[arg(long, default_value_t = 0)]
     relay_vsock_port: u32,
+
+    /// Attest the vCPU / RAM this guest was given (live-attestation
+    /// schema v3): read them each tick, fold them into `REPORT_DATA`,
+    /// send them to the KBS. Passed by the cmdline shim when the MEASURED
+    /// cmdline carries `hippius.attest_resources=1`. Off ⇒ the
+    /// resource-less keepalive, which an older KBS still accepts.
+    #[arg(long, default_value_t = false)]
+    attest_resources: bool,
+
+    /// Attest the guest components release this guest booted and the
+    /// health of its agents (live-attestation schema v4). Passed by the
+    /// shim when the release's measured `keepalive.env` sets
+    /// `HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1` — a release cut only once
+    /// the KBS accepts the field (an older KBS refuses the request).
+    #[arg(long, default_value_t = false)]
+    attest_components: bool,
 }
+
+/// How often the components checks run between keepalive ticks.
+const COMPONENTS_WATCH_SECS: u64 = 30;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -138,15 +157,34 @@ fn main() -> ExitCode {
     let sink = attestation_sink(cli.relay_vsock_port);
 
     eprintln!(
-        "hippius-agent-keepalive: ready: vm_id={} interval={}s expiry_offset={}s relay_port={}",
-        cli.vm_id, cli.interval_secs, cli.expiry_offset_secs, cli.relay_vsock_port
+        "hippius-agent-keepalive: ready: vm_id={} interval={}s expiry_offset={}s relay_port={} \
+         attest_resources={} attest_components={}",
+        cli.vm_id,
+        cli.interval_secs,
+        cli.expiry_offset_secs,
+        cli.relay_vsock_port,
+        cli.attest_resources,
+        cli.attest_components
     );
+    let components = cli.attest_components.then(|| {
+        let tracker = std::sync::Arc::new(
+            hippius_agent_keepalive::components::ComponentsTracker::start(
+                hippius_agent_keepalive::components::ComponentsProbe::production(),
+            ),
+        );
+        // The checks run on their own cadence too, so a host that stalls
+        // the KBS round trips cannot stop the failure count.
+        tracker.watch(Duration::from_secs(COMPONENTS_WATCH_SECS));
+        tracker
+    });
 
     let inputs = TickInputs {
         vm_id: &cli.vm_id,
         node_id: &node_id,
         epoch_file: &cli.epoch_file,
         expiry_offset_secs: cli.expiry_offset_secs,
+        resources_root: cli.attest_resources.then_some(std::path::Path::new("/")),
+        components: components.as_deref(),
     };
 
     // Run forever — systemd RestartSec=10s catches a panicking exit

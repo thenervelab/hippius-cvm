@@ -21,31 +21,50 @@
 # simply never referenced by `playbooks/06-miner-bootstrap.yml`.
 
 # ── Supported host OS ───────────────────────────────────────────────
-# A production miner runs Ubuntu 25.10 (6.17
-# kernel); 24.04 (Noble) is also supported. The NetBird apt repo
-# (pkgs.netbird.io/debian) + the agent source-build are codename-
-# independent, so both work. Add a version here once validated on it.
+# A release is listed here only if its DISTRO hypervisor can launch a
+# SEV-SNP guest: the miner-agent always renders
+# `<launchSecurity type='sev-snp'>`, which needs libvirt >= 10.5 and
+# QEMU >= 9.1 (`miner_min_libvirt_version` / `miner_min_qemu_version`
+# below, re-checked by play 00 against the apt candidate and by play 02
+# against what got installed).
+#
+#   25.10  libvirt 11.6 / QEMU 10.1 / kernel 6.17.
+#          End of life since 2026-07; do not provision new hosts on it.
+#   26.04  libvirt 12.0 / QEMU 10.2 / kernel 7.0 — validated on Genoa and
+#          Milan, including in-place upgrades from 24.04.
+#
+# 24.04 is NOT supported: it ships libvirt 10.0 / QEMU 8.2, which boot
+# no SNP guest at all. Its HWE kernel passes the kernel check, so the
+# host looks ready until the first launch. Upgrade it to 26.04
+# (`do-release-upgrade`, with `Prompt=normal` in
+# /etc/update-manager/release-upgrades until the LTS path opens).
 miner_supported_ubuntu_versions:
-  - "24.04"
   - "25.10"
+  - "26.04"
+
+# Minimum hypervisor versions for a SEV-SNP guest (see above).
+miner_min_libvirt_version: "10.5.0"
+miner_min_qemu_version: "9.1.0"
 
 # ── Pinned versions ─────────────────────────────────────────────────
 versions:
   # NetBird agent — keep in lockstep with `group_vars/all.yml`. Pinned
   # via apt against the NetBird package repo.
   netbird: "0.71.3"
-  # libvirt / qemu — the Ubuntu 24.04 distro versions. NOT apt-pinned
+  # libvirt / qemu — the Ubuntu 26.04 distro versions (25.10 hosts run
+  # 11.6 / 10.1). Reference only — the enforced floor is
+  # miner_min_libvirt_version / miner_min_qemu_version. NOT apt-pinned
   # (pinning a distro's own default is fragile against security point
   # releases); recorded here as the EXPECTED versions for reference.
-  libvirt: "10.0.0"
-  qemu: "8.2.2"
+  libvirt: "12.0.0"
+  qemu: "10.2.1"
   # miner-agent crate version (binaries/miner-agent/Cargo.toml).
   miner_agent: "0.0.1"
 
 # ── Network — NetBird mesh, no vRack ────────────────────────────────
 network:
   # The existing NetBird group for miners (dashboard id
-  # d85j0vr36cos73atf2mg). The setup key the operator creates must be
+  # <miner-group-id>). The setup key the operator creates must be
   # bound to this group; the agent inherits it on join.
   netbird_group: "miner"
   # Miners have a public IP only — they are NOT in the hippius-compute
@@ -160,10 +179,12 @@ miner_agent:
 # operator/CI-driven (deploy/scripts/publish-miner-agent.sh writes
 # ${miner_auto_update_s3_base}/latest.json + the per-tag binary).
 #
-# AUTO-LATEST ROLLOUT: every published build rolls to the whole fleet
-# within ~15 min — ONLY publish validated builds. Freeze a single miner
-# with `touch /var/lib/hippius-miner/.no-auto-update`, or the whole group
-# with `miner_auto_update_enabled: false`.
+# DISARMED BY DEFAULT (miner_auto_update_enabled: false). When armed, a
+# published build rolls to the whole fleet within ~15 min with no canary —
+# every armed agent restarts at roughly the same time. Agent rollouts are
+# manual, canary first (the SIGKILL swap in miner-tasks/AUTO_UPDATE.md).
+# Freeze a single armed miner with
+# `touch /var/lib/hippius-miner/.no-auto-update`.
 #
 # Change-detection is sha256 (the manifest sha256 vs the installed
 # binary's sha256), NOT --version: `hippius-miner-agent --version` prints
@@ -192,9 +213,12 @@ miner_auto_update_s3_base: "https://s3.hippius.com/hippius-compute-images/miner-
 # built with `--features snp`, which is load-bearing.
 miner_agent_source_repo: "https://github.com/thenervelab/hippius-compute-internal.git"
 
-# Master switch — set false to disable the timer on the whole group
-# (the playbook stops + disables it).
-miner_auto_update_enabled: true
+# Master switch. false (default): the script + units stay installed but
+# the playbook stops + disables hippius-miner-update.timer and renders
+# AUTO_UPDATE_DISABLED=true, so even a manual run of the updater skips.
+# hippius-miner-agent.service itself is never touched by this switch.
+# true: the timer is enabled + started (auto-latest rollout, see above).
+miner_auto_update_enabled: false
 
 # OPTIONAL pinned operator Ed25519 public key (64-hex or a PEM path on
 # the miner). When set, the updater REQUIRES the manifest to carry a
@@ -246,12 +270,68 @@ orders_bind_ip: "100.64.0.1"
 # `orderSigning.expectedPubkey`
 # Helm value and roll the Edge.
 edge_order_signing_pubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf8820d2b25ca9"
-# CPU / RAM the host allots to tenant CVMs — a RESERVATION, not the
-# whole machine (headroom is kept for the host OS + miner-agent).
-# Conservative group default; size it per box in host_vars.
+# CPU / RAM the host allots to tenant CVMs (`[host] cvm_*_budget`, the
+# miner's own #668 fit gate). DERIVED from the host's facts with the SAME
+# formula and constants vali's capacity v2 uses, so the two never
+# disagree about what fits:
+#
+#   cpu_budget    = (ansible_processor_vcpus − reserve_cpus) × cpu_ratio_pct / 100
+#   memory_budget =  ansible_memtotal_mb      − reserve_memory_mb
+#
+# Keep these in lockstep with vali: `cpu_ratio_pct` / 100 =
+# VALI_SCHEDULER_CPU_OVERCOMMIT, `reserve_cpus` =
+# VALI_SCHEDULER_HOST_RESERVE_CPUS, `reserve_memory_mb` =
+# VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB (vali's live ConfigMap still pins
+# 2048 — raise it to 8192 in the same rollout that runs this play). The
+# ratio is in integer hundredths so both sides compute the same floor.
+# RAM has no ratio: SEV-SNP memory is pinned. The install play ASSERTS
+# ratio 100..400, reserve_cpus >= 2 and reserve_memory_mb >= 8192 before
+# rendering, so a host_vars `host_cvm` cannot remove the reserve.
+#
+# DISK: `cvm_disk_gb_budget` = size of the filesystem holding
+# `miner_data_disk_root` (GiB, from `ansible_mounts`) − `reserve_disk_gb`.
+# Keep `reserve_disk_gb` = VALI_DISK_RESERVE_GB: vali computes the same
+# fs_total − reserve from the v4 heartbeat and takes the min of both, so a
+# larger reserve on either side simply wins. The reserve is the room the
+# agent needs on that filesystem beyond tenant disks — §25 migration
+# downloads, backup/restore staging, and (when the data root is the system
+# disk, the default) base-image staging + the image cache. The install play
+# refuses a filesystem not larger than the reserve.
+#
+# A host may only LOWER its derived budget, via `host_cvm_overrides:
+# {cpu_budget_max, memory_mb_budget_max, disk_gb_budget_max}` in host_vars (a separate var:
+# a host_vars `host_cvm` would REPLACE this whole dict). The template
+# takes min(derived, override), so a value above the derivation is
+# ignored — never an overcommit.
 host_cvm:
-  cpu_budget: 8
-  memory_mb_budget: 16384
+  # 2:1 vCPU:thread is the default; RAM 1:1.
+  cpu_ratio_pct: 200
+  reserve_cpus: 2
+  reserve_memory_mb: 8192
+  reserve_disk_gb: 100
+
+# Capacity v2 — v3 heartbeat (budgets + SEV-ES ASID pool as down-only
+# clamps for vali). vali accepts v3 since the sha-0816d762378c pin.
+miner_heartbeat_schema_capacity: true
+
+# Storage-aware placement — v4 heartbeat (v3 + the declared disk budget and
+# a statvfs of the data/staging filesystems, down-only clamps for vali).
+# vali accepts v4 since #1353; agents from #1344 on know the key. An agent older than
+# #1344 refuses the key (`deny_unknown_fields`) and will not start: set
+# this false in host_vars for such a host until its agent is upgraded.
+miner_heartbeat_schema_disk: true
+
+# SEV-SNP host health — v5 heartbeat (v4 + snp_enabled, cpus_offline,
+# snp_launches_since_boot, df_flush_failures), feeding the
+# MinerSnpCpusOffline / MinerSevDfFlushFailing alerts. vali accepts v5
+# since the sha-d97028137714 pin (#1406, #1408). Requires
+# miner_heartbeat_schema_disk. OFF until the fleet runs an agent built
+# with #1406: an older agent refuses the key (`deny_unknown_fields`) and
+# will not start, and this play does not rebuild an installed agent (its
+# `--version` is the never-bumped 0.0.1), so a re-render alone would
+# leave the old binary to fail at its next restart. Set it true in
+# host_vars for a host once its agent is upgraded, then here once all are.
+miner_heartbeat_schema_host_health: false
 
 # ── Edge auth model ─────────────────────────────────────────────────
 # `onchain` (default) — PERMISSIONLESS: the agent self-signs its Edge
@@ -304,10 +384,36 @@ mtls:
 # The NetBird setup key is read from the operator workstation at run
 # time; it is never written to the repo or copied to a managed host.
 operator_secret_dir: "{{ lookup('env', 'HOME') }}/.config/hippius"
-netbird_setup_key_file: "netbird-miner-1-setupkey"
+netbird_setup_key_file: "netbird-miner-setupkey"
 
 # ── EXPLICITLY NOT SET for miner_nodes (asserted absent at preflight) ─
 #   - vault_addr        miners never reach the hippius-compute Vault
 #   - vault_token       idem
 #   - k3s_install_args  miners are not cluster nodes
 #   - cc_node_labels    idem
+
+# ── Host attestor (blackbox SNP VM) ─────────────────────────────────
+# Every miner runs a measured SNP "host-attestor" guest; with vali's
+# GATE_ENFORCE on, a host without an attested one receives no tenant VM.
+# The three boot components are identical on every CPU generation, but
+# the launch measurement is not: the BSP VMSA carries the host's CPUID
+# signature, so each generation has its own measurement (computed with
+# `hippius-launch-digest --vcpus 1 --vcpu-type <EpycGenoa|EpycTurin|EpycMilan>`
+# over these exact files + `cmdline`). Each must be pinned in the §22
+# allowlist with class `host_attestor` AND carry an active
+# HostAttestorRelease row in vali before a host of that generation can
+# enroll. `snp_generation` (host_vars) selects the entry.
+#
+# The components are staged by the operator into `dir` (they are not
+# published at a public URL); play 05 refuses to render the section
+# unless all three files are on disk with exactly these digests.
+miner_host_attestor:
+  dir: "/var/lib/hippius-miner/host-attestor"
+  ovmf_sha256: "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c"
+  kernel_sha256: "6a6419fde155bc1be12f9d2555ad18876cdff111d80c2887c6aa2c5d6cb250ac"
+  initrd_sha256: "9b3fe08cbc9f6f0d5dd6ad733269840f6e2723cf4a9b9c24b4e1b4a0b2e8839d"
+  cmdline: "quiet panic=0 console=ttyS0 hippius.chain_genesis=6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e hippius.pallet_instance=c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+  measurements:
+    genoa: "107e7a10a5f783b8920a7fccbdcbfc41f9511dd32211b72c8ffa4d8fdd803da6ba276b5419f000a51f44b7337f03fbd3"
+    turin: "ce4d2921c9e767f78e70ba895e58f009bae4fe248034167e31c47cb99ab25ef3e08ac4ecc08d5f7408696a599eac550a"
+    milan: "51d83b4cdb3bff0558d43cacc539a4ca9a23f1dc7fa21eab5492868af3520491630b9f631dc99b9bd38bfa6e5ed0048c"

@@ -1,0 +1,26 @@
+# Hippius guest components release — linked from /etc/systemd/system by the
+# measured initramfs (hippius_golden_mount_components); the agents run from
+# the release image mounted at /run/hippius/guest.
+# Same unit as the bake's (scripts/tenant-image-bake.sh) except for the
+# paths.
+[Unit]
+Description=Hippius §23 served-receipt telemetry agent (uptime billing)
+After=local-fs.target
+DefaultDependencies=yes
+# The release image this unit runs from.
+RequiresMountsFor=/run/hippius/guest
+# The rate-limiter is disabled so a slow key release never trips systemd's
+# start-limit into a permanent failed state. It MUST sit in [Unit]: systemd
+# 255 rejects it in [Service].
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/run/hippius/guest/bin/hippius-agent-tenant-telemetry
+# Retry until the §7 lifecycle key (/run/hippius/lifecycle.key) + the host
+# vsock relay are both ready.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

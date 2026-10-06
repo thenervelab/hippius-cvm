@@ -35,6 +35,22 @@ every previously auto-pinned measurement. The same allowlist gates the
 unlock its LUKS overlay on its next boot. Every pin therefore rebuilds
 `base ∪ carry-forward ∪ {new}`.
 
+SERIALIZED, because it is a read-modify-write of one shared artifact:
+the carry-forward is read from `MeasurementLedger`, whose row for a pin
+used to be written by the caller AFTER the install. Three power-API
+starts landing within a second (#1340) each read the same carry-forward,
+each appended only its own measurement, and each install REPLACED the
+previous one — the last pin won, the other two VMs were denied their KEK
+(`measurement not in offline KBS allowlist`) and never booted. So the
+whole read → sign → install → ledger-row sequence runs under
+`pin_lock()` (a Postgres advisory lock, cluster-wide across gunicorn
+workers and tick pods), and the ledger row is written INSIDE it: the
+next pin cannot read the carry-forward until the previous measurement is
+recorded there. The lock is held for ONE attempt: a 409 retry releases
+it and re-reads the carry-forward under the next hold, so a burst of
+pins queues behind one sign + upload + reload each, not behind another
+pin's whole retry loop.
+
 §20 discipline:
 - The signing seed is fetched from Vault and materialized only into a
   0600 file inside a per-attempt tmpfs workdir, removed with the dir.
@@ -50,18 +66,33 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from django.conf import settings
+from django.db import OperationalError, connection, transaction
 
 from apps.orchestration.effects import EffectError, EffectUnavailable
+from apps.orchestration.services import s3_artifacts
 
 log = logging.getLogger("apps.orchestration.allowlist_pin")
 
 DEFAULT_SIGN_TIMEOUT_S = 30.0
 DEFAULT_S3_TIMEOUT_S = 60.0
+
+#: Pauses between attempts of the allowlist upload on a TRANSIENT S3 error
+#: (three attempts in all). The upload sits on the launch path: a single
+#: `SlowDown` used to fail the whole launch as `allowlist-pin-failure`.
+S3_UPLOAD_RETRY_PAUSES_S: tuple[float, ...] = s3_artifacts.RETRY_PAUSES_S
+
+#: What counts as a transient S3 error — shared with the launch-digest
+#: fetches (`s3_artifacts`).
+_S3_TRANSIENT = s3_artifacts.TRANSIENT_S3_ERROR
 DEFAULT_KBS_RELOAD_TIMEOUT_S = 30.0
 
 # `l1-order-ticket-v1` hex — the PRODUCTION L1 OrderTicket kid (#587
@@ -88,6 +119,98 @@ class AllowlistEpochConflict(EffectError):
 # so a fresh pin can start several epochs behind. 16 covers a long
 # run of un-resynced pins without masking a genuine sig/schema 409.
 _MAX_EPOCH_RETRIES = 16
+
+
+class AllowlistPinBusy(EffectUnavailable):
+    """Another pin held `pin_lock()` for longer than `PIN_LOCK_TIMEOUT_S`.
+    Nothing was signed or installed, so the caller may retry: a launch
+    maps it to `RETRIABLE` (pre-register — a re-place is safe), a
+    reboot-recovery relaunch retries on its backoff, a power start is
+    refused and can be re-asked."""
+
+
+#: How long a pin waits for the lock before giving up with the RETRIABLE
+#: `AllowlistPinBusy`. Sized from the live logs, not from the worst case:
+#: over 72 h of production launches (2026-09-26..29, n=43) the span from
+#: the carry-forward read to the KBS register that FOLLOWS the pin (so an
+#: upper bound on one lock hold) was p50 1.6 s, p90 1.8 s, max 2.3 s, with
+#: no 409 retry at all. 30 s therefore queues ~12+ normal pins. The worst
+#: case of ONE attempt (sign 30 s + three S3 tries at 60 s + reload 30 s,
+#: ~4 min) cannot fit any wait the power API's 60 s worker allows, so a
+#: slow pin is absorbed by the retry — the launch re-places, reboot-
+#: recovery retries on its backoff, a power start answers a re-askable
+#: `allowlist-pin-busy` — never by a longer wait.
+PIN_LOCK_TIMEOUT_S = 30.0
+
+#: `pg_advisory_xact_lock` key — any fixed int64 unique to this purpose
+#: ("allowlst" in ASCII).
+_PIN_LOCK_KEY = 0x616C6C6F776C7374
+
+#: The non-Postgres stand-in (tests run on SQLite, which has no advisory
+#: locks): serializes the pins of ONE process. Re-entrant, like the
+#: Postgres lock is within a session.
+_PROCESS_PIN_LOCK = threading.RLock()
+
+
+@contextmanager
+def pin_lock() -> Iterator[None]:
+    """Hold the §22 pin lock for the enclosed block, inside a transaction.
+
+    Postgres: a transaction-scoped advisory lock, so it is released by the
+    COMMIT that also publishes the ledger row written under it — and by
+    the server if the process dies holding it. Waiting longer than
+    `PIN_LOCK_TIMEOUT_S` raises `EffectUnavailable`.
+
+    `pin_measurement` takes it itself; a caller that also writes state the
+    carry-forward reads (the host-attestor release row) wraps both.
+
+    Nested use is re-entrant, but a NESTED hold is a savepoint: if the
+    inner block raises, the savepoint rollback releases the advisory lock
+    taken inside it (only the outer hold survives). Never take this lock
+    for the first time inside an `atomic()` block whose failure you catch
+    and continue from — the "locked" code after it would run unlocked.
+    """
+    if connection.vendor != "postgresql":
+        if not _PROCESS_PIN_LOCK.acquire(timeout=PIN_LOCK_TIMEOUT_S):
+            raise AllowlistPinBusy(
+                f"allowlist pin: another pin held the lock for over {PIN_LOCK_TIMEOUT_S:.0f}s"
+            )
+        try:
+            with transaction.atomic():
+                yield
+        finally:
+            _PROCESS_PIN_LOCK.release()
+        return
+    with transaction.atomic():
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    [f"{int(PIN_LOCK_TIMEOUT_S * 1000)}ms"],
+                )
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", [_PIN_LOCK_KEY])
+        except OperationalError as exc:
+            raise AllowlistPinBusy(
+                f"allowlist pin: another pin held the lock for over {PIN_LOCK_TIMEOUT_S:.0f}s"
+            ) from exc
+        yield
+
+
+@dataclass(frozen=True)
+class PinLedger:
+    """The `MeasurementLedger` row a pin records for its measurement —
+    written under `pin_lock()`, so the next pin's carry-forward sees it."""
+
+    vm_id: str
+    platform_id: str = ""
+    node_id: str = ""
+    # The launch the measurement is for — see `MeasurementLedger`.
+    flavor: str = ""
+    attests_resources: bool = False
+    accepts_memory_eagerly: bool = False
+    # See `MeasurementLedger.recomputed` / `.launch_ref`.
+    recomputed: bool = False
+    launch_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -271,15 +394,23 @@ def _installed_epoch_floor() -> int | None:
     the last success), not the full accumulated gap.
 
     Best-effort: a query failure returns `None` and the pin falls back
-    to the manifest-epoch behaviour + retry loop.
+    to the manifest-epoch behaviour + retry loop. The savepoint keeps that
+    failure from aborting the `pin_lock()` transaction it runs in (which
+    would silently drop the ledger row written later in it).
     """
     try:
         from django.db.models import Max
 
         from apps.orchestration.models import MeasurementLedger
 
-        mx = MeasurementLedger.objects.aggregate(mx=Max("allowlist_epoch"))["mx"]
-        return (int(mx) + 1) if mx else None
+        with transaction.atomic():
+            agg = MeasurementLedger.objects.aggregate(
+                pinned=Max("allowlist_epoch"), evicted=Max("evicted_epoch")
+            )
+        # A refresh (`evict_superseded_measurements`) installs an epoch no
+        # pin row records; the rows it evicted do.
+        mx = max((int(v) for v in agg.values() if v), default=None)
+        return (mx + 1) if mx else None
     except Exception:  # noqa: BLE001 — floor is an optimisation, never load-bearing
         return None
 
@@ -406,6 +537,51 @@ def _carry_forward_classes() -> dict[str, str]:
         ) from exc
 
 
+def _current_launch_pins(ledger_model: Any, vm_ids: set[str]) -> dict[str, tuple[str, Any]]:
+    """`vm_id → (measurement, launched_at)` of each VM's CURRENT launch: its
+    newest pin whose launch the miner ACCEPTED (`launched_at`, stamped by
+    `launch._mark_measurement_launched`, or when an `already-launched`
+    record settled on it, `launch_record.resolve_unverified_boot`). Absent
+    for a VM with no accepted pin on record (rows written before the stamp
+    existed) — such a VM keeps every measurement it ever pinned, as before.
+
+    `launched_at`, not `pinned_at`, is the line: a launch is stamped right
+    after its own pin, so only a relaunch pinned since is kept — and a
+    record settled late on an earlier dispatch drops the dispatches pinned
+    after that one, which never ran."""
+    out: dict[str, tuple[str, Any]] = {}
+    for vm_id, digest, launched_at in (
+        ledger_model.objects.filter(vm_id__in=vm_ids, launched_at__isnull=False)
+        .order_by("vm_id", "-launched_at", "-pinned_at")
+        .values_list("vm_id", "launch_digest_hex", "launched_at")
+    ):
+        measurement = _normalise_measurement(digest)
+        if vm_id not in out and measurement is not None:
+            out[vm_id] = (measurement, launched_at)
+    return out
+
+
+def _superseded(current: tuple[str, Any] | None, measurement: str, at: Any) -> bool:
+    """Is `measurement` (pinned / launched at `at`) a launch the VM's
+    current accepted launch replaced?
+
+    The KBS releases only to a measurement that is in BOTH the ticket's
+    `allowed_measurements` (exactly one: its own launch's) and this
+    allowlist. Dropping a superseded measurement here is therefore what
+    makes every ticket of an earlier launch unusable — a pre-resize ticket
+    can no longer boot the pre-resize size — and stops that guest's
+    keepalives. Kept: the current launch, and anything pinned AFTER it (a
+    relaunch in flight, or one that failed before the miner accepted it:
+    until a later launch is accepted, the current one must stay bootable —
+    the rollback case)."""
+    if current is None:
+        return False
+    current_measurement, current_launched_at = current
+    if measurement == current_measurement:
+        return False
+    return at is None or at <= current_launched_at
+
+
 def _query_carry_forward_classes() -> dict[str, str]:
     """The DB half of `_carry_forward_classes` (separated so the caller
     can map ANY failure to a fail-closed `EffectError`)."""
@@ -427,17 +603,31 @@ def _query_carry_forward_classes() -> dict[str, str]:
 
     tenant: set[str] = set()
     if live_vm_ids:
+        current = _current_launch_pins(ledger_model, live_vm_ids)
         rows = ledger_model.objects.filter(vm_id__in=live_vm_ids).values_list(
-            "launch_digest_hex", flat=True
+            "vm_id", "launch_digest_hex", "pinned_at"
         )
-        for digest in rows:
+        for vm_id, digest, pinned_at in rows:
             measurement = _normalise_measurement(digest)
-            if measurement is not None:
-                tenant.add(measurement)
+            if measurement is None:
+                continue
+            if _superseded(current.get(vm_id), measurement, pinned_at):
+                continue
+            tenant.add(measurement)
 
         # Latest launch job per vm_id that actually carries a measurement
         # (the ledger write is best-effort, so this is the belt to its
-        # braces). Ordered newest-first per vm_id; the first hit wins.
+        # braces). Ordered newest-first per vm_id; the first hit wins —
+        # unless the ledger knows that measurement as a superseded launch.
+        # A measurement the ledger does NOT know (its row was lost) is kept:
+        # it may be the launch running now. (The job's `started_at` says
+        # nothing here: a relaunch rewrites the job it came from in place.)
+        superseded = {
+            (vm_id, measurement)
+            for vm_id, digest, pinned_at in rows
+            if (measurement := _normalise_measurement(digest)) is not None
+            and _superseded(current.get(vm_id), measurement, pinned_at)
+        }
         seen_vm_ids: set[str] = set()
         job_rows = (
             launch_model.objects.filter(vm_id__in=live_vm_ids)
@@ -452,6 +642,8 @@ def _query_carry_forward_classes() -> dict[str, str]:
             if measurement is None:
                 continue
             seen_vm_ids.add(vm_id)
+            if (vm_id, measurement) in superseded:
+                continue
             tenant.add(measurement)
 
     # EVERY host-attestor release ever admitted, active or not. The
@@ -526,6 +718,7 @@ def pin_measurement(
     l1_kids_hex: Sequence[str] = (DEFAULT_L1_KID_HEX,),
     kbs_response_kids_hex: Sequence[str] = (DEFAULT_KBS_RESPONSE_KID_HEX,),
     measurement_class: str = ALLOWLIST_CLASS_TENANT,
+    ledger: PinLedger | None = None,
 ) -> PinResult:
     """Rebuild the allowlist as `base ∪ carry-forward ∪ {measurement}`,
     sign, upload, reload. Returns the new epoch + the sha256 of the
@@ -544,31 +737,142 @@ def pin_measurement(
     (`tenant` default / `host_attestor`). A `host_attestor` pin is
     class-namespaced so it can NEVER alias a tenant measurement — the
     blackbox host-attestor release path (PR-9) passes it; every existing
-    tenant launch keeps the default and its byte-identical output."""
+    tenant launch keeps the default and its byte-identical output.
+
+    SERIALIZED under `pin_lock()` from the carry-forward read to the
+    `ledger` row, which is recorded before the lock is released — pass it
+    for every measurement that must survive later pins (see the module
+    docstring, #1340)."""
     if measurement_class not in _VALID_CLASSES:
         raise EffectError(
             f"pin_measurement: unknown allowlist class {measurement_class!r}"
         )
 
+    return _install(
+        measurement_hex=measurement_hex,
+        measurement_class=measurement_class,
+        l1_kids_hex=l1_kids_hex,
+        kbs_response_kids_hex=kbs_response_kids_hex,
+        ledger=ledger,
+    )
+
+
+def pending_superseded_pins() -> list[Any]:
+    """Ledger rows of live VMs whose launch a later ACCEPTED launch
+    replaced, still waiting for an install that drops them."""
+    from django.apps import apps as django_apps
+
+    vm_model = django_apps.get_model("lifecycle", "Vm")
+    ledger_model = django_apps.get_model("orchestration", "MeasurementLedger")
+    live_vm_ids = {
+        vm_id
+        for vm_id, state in vm_model.objects.values_list("vm_id", "state")
+        if str(state or "").strip().lower() not in _DEAD_VM_STATES
+    }
+    if not live_vm_ids:
+        return []
+    current = _current_launch_pins(ledger_model, live_vm_ids)
+    pending = []
+    for row in ledger_model.objects.filter(
+        vm_id__in=set(current), evicted_at__isnull=True
+    ).order_by("pinned_at"):
+        measurement = _normalise_measurement(row.launch_digest_hex)
+        if measurement is not None and _superseded(current[row.vm_id], measurement, row.pinned_at):
+            pending.append(row)
+    return pending
+
+
+def evict_superseded_measurements() -> int:
+    """Drop every superseded launch from the KBS allowlist NOW: if any live
+    VM has a pin a later accepted launch replaced (a resize, a
+    reboot-recovery or power-start relaunch), install `base ∪
+    carry-forward` — which no longer carries it — and stamp those rows
+    `evicted_at` / `evicted_epoch`. Returns how many rows were evicted
+    (0 = nothing pending, no install).
+
+    Defence in depth: the KBS itself refuses a superseded launch's ticket
+    once the later launch registered or released
+    (`kbs_core::lifecycle::check_current_launch`). This keeps the trusted
+    set to the launches that may still boot, and stops a stale guest's
+    keepalives on a KBS that predates that gate.
+
+    Called right after a launch is accepted, and from the orchestration
+    tick (a busy lock, an S3 or KBS error there is retried next tick; any
+    other pin evicts them too, since every install rebuilds the same
+    carry-forward). The stamp is written under the same `pin_lock()` hold
+    as the install, from the carry-forward that install was built from."""
+    if not pending_superseded_pins():
+        return 0
+    stamped: list[int] = []
+
+    def _stamp(result: PinResult) -> None:
+        from django.utils import timezone
+
+        from apps.orchestration.models import MeasurementLedger
+
+        rows = pending_superseded_pins()
+        MeasurementLedger.objects.filter(pk__in=[r.pk for r in rows]).update(
+            evicted_at=timezone.now(), evicted_epoch=result.new_epoch
+        )
+        stamped.extend(r.pk for r in rows)
+        log.warning(
+            "allowlist: evicted %d superseded launch measurement(s) at epoch %d (vms=%s)",
+            len(rows),
+            result.new_epoch,
+            ",".join(sorted({r.vm_id for r in rows}))[:200],
+        )
+
+    _install(
+        measurement_hex=None,
+        measurement_class=ALLOWLIST_CLASS_TENANT,
+        l1_kids_hex=(DEFAULT_L1_KID_HEX,),
+        kbs_response_kids_hex=(DEFAULT_KBS_RESPONSE_KID_HEX,),
+        ledger=None,
+        on_installed=_stamp,
+    )
+    return len(stamped)
+
+
+def refresh_allowlist() -> PinResult:
+    """Re-sign and install `base ∪ carry-forward` with nothing new — what
+    evicts a measurement the carry-forward stopped carrying (a superseded
+    launch, `evict_superseded_measurements`). Same lock, same epoch
+    discipline as a pin."""
+    return _install(
+        measurement_hex=None,
+        measurement_class=ALLOWLIST_CLASS_TENANT,
+        l1_kids_hex=(DEFAULT_L1_KID_HEX,),
+        kbs_response_kids_hex=(DEFAULT_KBS_RESPONSE_KID_HEX,),
+        ledger=None,
+    )
+
+
+def _install(
+    *,
+    measurement_hex: str | None,
+    measurement_class: str,
+    l1_kids_hex: Sequence[str],
+    kbs_response_kids_hex: Sequence[str],
+    ledger: PinLedger | None,
+    on_installed: Callable[[PinResult], None] | None = None,
+) -> PinResult:
+    """The serialized sign → upload → reload loop shared by a pin and a
+    refresh (see `pin_measurement`). `on_installed` runs under the same
+    `pin_lock()` hold, right after a successful install (a savepoint keeps
+    a failure in it from poisoning the lock's transaction; it is logged,
+    the install stands)."""
     manifest_path = _required_setting("VALI_ALLOWLIST_MANIFEST_PATH")
     s3_url = _required_setting("VALI_KBS_ALLOWLIST_S3_URL")
     sign_bin = _required_setting("VALI_KBS_ALLOWLIST_TOOL_BIN")
-
-    # §22 signing seed (Vault in production; file in tests). Resolved once
-    # up front; materialized into a 0600 tmpfs file per attempt below.
     seed_hex = _resolve_seed_hex()
-
     if not os.path.isfile(manifest_path):
-        raise EffectUnavailable(
-            "VALI_ALLOWLIST_MANIFEST_PATH does not exist"
-        )
+        raise EffectUnavailable("VALI_ALLOWLIST_MANIFEST_PATH does not exist")
     if not (os.path.isabs(sign_bin) and os.access(sign_bin, os.X_OK)):
         raise EffectUnavailable(
             "VALI_KBS_ALLOWLIST_TOOL_BIN must be an absolute path to "
             "an executable file"
         )
-
-    if not re.fullmatch(r"[0-9a-f]{96}", measurement_hex):
+    if measurement_hex is not None and not re.fullmatch(r"[0-9a-f]{96}", measurement_hex):
         raise EffectError(
             "pin_measurement: measurement_hex must be exactly 96 lower-case "
             "hex chars (48 bytes)"
@@ -577,6 +881,101 @@ def pin_measurement(
     with open(manifest_path, encoding="utf-8") as fh:
         original = fh.read()
 
+    floor: int | None = None
+    last_conflict: AllowlistEpochConflict | None = None
+    for _attempt in range(_MAX_EPOCH_RETRIES):
+        # One attempt per lock hold (module docstring): a 409 leaves the
+        # lock, and the next attempt re-reads the carry-forward under it.
+        with pin_lock():
+            attempt = _pin_once(
+                original,
+                floor=floor,
+                measurement_hex=measurement_hex,
+                measurement_class=measurement_class,
+                l1_kids_hex=l1_kids_hex,
+                kbs_response_kids_hex=kbs_response_kids_hex,
+                seed_hex=seed_hex,
+                s3_url=s3_url,
+                sign_bin=sign_bin,
+            )
+            if isinstance(attempt, PinResult):
+                if ledger is not None and measurement_hex is not None:
+                    _record_ledger(ledger, measurement_hex, measurement_class, attempt)
+                if on_installed is not None:
+                    try:
+                        with transaction.atomic():
+                            on_installed(attempt)
+                    except Exception:  # noqa: BLE001 — the install already stands
+                        log.exception("allowlist: post-install bookkeeping failed")
+                return attempt
+        # The installed HWM is ≥ the epoch just tried: retry one past it.
+        last_conflict, floor = attempt
+
+    # Retries exhausted — surface the last 409. Either the installed
+    # HWM raced ahead faster than we could climb (operationally
+    # implausible) or the 409 was never about the epoch (signature /
+    # schema), in which case re-bumping could never have helped.
+    raise last_conflict or EffectError(
+        "kbs-admin-reload: epoch retries exhausted with no recorded conflict"
+    )
+
+
+def _record_ledger(
+    ledger: PinLedger, measurement_hex: str, measurement_class: str, result: PinResult
+) -> None:
+    """Record the pinned measurement in `MeasurementLedger` (#587 Phase 3,
+    `GET /v1/admin/audit/measurements`). The KBS install is the
+    authoritative record, so a failed write does not fail the pin — but the
+    carry-forward and the live-attestation ingest both read this table: a
+    lost row means the next pin evicts this measurement and the VM's uptime
+    is not credited. A savepoint keeps a failed INSERT from poisoning the
+    `pin_lock()` transaction."""
+    from apps.orchestration.models import MeasurementLedger
+
+    try:
+        with transaction.atomic():
+            MeasurementLedger.objects.create(
+                vm_id=ledger.vm_id,
+                launch_digest_hex=measurement_hex,
+                platform_id=ledger.platform_id,
+                node_id=ledger.node_id,
+                allowlist_epoch=result.new_epoch,
+                allowlist_sha256=result.new_cose_sha256_hex,
+                # Recorded so the carry-forward can veto a class flip.
+                measurement_class=measurement_class,
+                flavor=ledger.flavor,
+                attests_resources=ledger.attests_resources,
+                accepts_memory_eagerly=ledger.accepts_memory_eagerly,
+                recomputed=ledger.recomputed,
+                launch_ref=ledger.launch_ref,
+            )
+    except Exception as exc:  # noqa: BLE001 — must not fail an installed pin
+        log.error(
+            "measurement-ledger write failed vm=%s: %s — the pin is installed, "
+            "but the next pin will not carry it and its live attestations will "
+            "be refused (measurement-unpinned) until a ledger row is written",
+            ledger.vm_id,
+            exc,
+        )
+
+
+def _pin_once(
+    original: str,
+    *,
+    floor: int | None,
+    measurement_hex: str | None,
+    measurement_class: str,
+    l1_kids_hex: Sequence[str],
+    kbs_response_kids_hex: Sequence[str],
+    seed_hex: str,
+    s3_url: str,
+    sign_bin: str,
+) -> PinResult | tuple[AllowlistEpochConflict, int]:
+    """ONE read-modify-write attempt of `pin_measurement` — only ever run
+    under `pin_lock()`. Returns the installed `PinResult`, or on a KBS 409
+    the conflict and the epoch floor to retry at (`floor` is the previous
+    attempt's; `None` on the first). `measurement_hex=None` re-signs the
+    carry-forward alone (`refresh_allowlist`)."""
     # Build the FULL entry set this artifact must carry. `install`
     # replaces the active allowlist wholesale, so every measurement that
     # must remain releasable has to be in these bytes — see
@@ -585,13 +984,14 @@ def pin_measurement(
     base_classes = _manifest_entry_classes(original)
     to_pin = dict(_carry_forward_classes())
     carried_count = len(to_pin)
-    prior_class = to_pin.get(measurement_hex)
-    if prior_class is not None and prior_class != measurement_class:
-        raise EffectError(
-            f"pin_measurement: {measurement_hex[:16]}… is already carried as "
-            f"{prior_class!r}; refusing to re-pin it as {measurement_class!r}"
-        )
-    to_pin[measurement_hex] = measurement_class
+    if measurement_hex is not None:
+        prior_class = to_pin.get(measurement_hex)
+        if prior_class is not None and prior_class != measurement_class:
+            raise EffectError(
+                f"pin_measurement: {measurement_hex[:16]}… is already carried as "
+                f"{prior_class!r}; refusing to re-pin it as {measurement_class!r}"
+            )
+        to_pin[measurement_hex] = measurement_class
 
     # Dedup against the base manifest, whose entries survive the rewrite
     # verbatim. `hippius-kbs-allowlist-tool` ABORTS on a duplicate
@@ -616,117 +1016,106 @@ def pin_measurement(
         len(base_classes),
         carried_count,
         len(appended),
-        measurement_hex[:16],
+        measurement_hex[:16] if measurement_hex else "<refresh>",
         measurement_class,
     )
 
-    # Epoch-retry loop. The static manifest ConfigMap's `epoch = N`
-    # only ever advances in the SIGNED artifact, never on disk, so a
-    # fresh pin starts at `manifest_epoch + 1` even after several
-    # successful pins already pushed the KBS's installed HWM higher.
-    # On a 409 (install-rejected, almost always the HWM CAS) we re-bump
-    # the epoch one past the last attempt and retry the whole
-    # build+sign+upload+reload. A genuine signature/schema 409 exhausts
-    # the bounded retries and surfaces the same error.
+    # Epoch. The static manifest ConfigMap's `epoch = N` only ever
+    # advances in the SIGNED artifact, never on disk, so a fresh pin
+    # starts at `manifest_epoch + 1` even after several successful pins
+    # already pushed the KBS's installed HWM higher. On a 409
+    # (install-rejected, almost always the HWM CAS) the caller retries
+    # one past this attempt; a genuine signature/schema 409 exhausts the
+    # bounded retries and surfaces the same error.
     #
     # Seed the floor from the highest epoch vali has already installed
     # (`MeasurementLedger`) so a manifest whose frozen `epoch = N` has
     # drifted many pins behind the live HWM still lands its FIRST attempt
     # above the HWM instead of burning all `_MAX_EPOCH_RETRIES` at or
     # below it — see `_installed_epoch_floor`.
-    floor: int | None = _installed_epoch_floor()
-    last_conflict: AllowlistEpochConflict | None = None
-    for _attempt in range(_MAX_EPOCH_RETRIES):
-        # 1+2: read, bump epoch, append entry. Write to a tmpfs
-        # intermediary so we can sign without mutating the operator's
-        # source TOML on disk (the dev manifest may be a git checkout).
-        bumped, new_epoch = _bump_epoch_text(original, floor=floor)
-        new_manifest = bumped
-        for entry_measurement, entry_class in appended:
-            # Carried entries re-use the module DEFAULT kids: every pin
-            # this control plane has ever emitted (tenant launches and
-            # host-attestor releases alike) used them, so re-emitting the
-            # defaults reproduces what was installed. Explicit kids only
-            # ever apply to the measurement being pinned NOW.
-            is_new = entry_measurement == measurement_hex
-            new_manifest = _append_entry(
-                new_manifest,
-                measurement_hex=entry_measurement,
-                l1_kids=l1_kids_hex if is_new else (DEFAULT_L1_KID_HEX,),
-                kbs_kids=(
-                    kbs_response_kids_hex
-                    if is_new
-                    else (DEFAULT_KBS_RESPONSE_KID_HEX,)
-                ),
-                measurement_class=entry_class,
-            )
-
-        with tempfile.TemporaryDirectory(prefix="hippius-allowlist-") as workdir:
-            manifest_out = os.path.join(workdir, "manifest.toml")
-            cose_out = os.path.join(workdir, "dev.cose")
-            seed_out = os.path.join(workdir, "seed.hex")
-            with open(manifest_out, "w", encoding="utf-8") as fh:
-                fh.write(new_manifest)
-            # Materialize the seed 0600 inside the (tmpfs) workdir; removed
-            # with the TemporaryDirectory. §20: never logged, never on a
-            # persistent volume.
-            seed_fd = os.open(seed_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(seed_fd, "w", encoding="utf-8") as fh:
-                fh.write(seed_hex)
-
-            # 3: sign.
-            sign_proc = _run(
-                [sign_bin, "--manifest", manifest_out, "--seed", seed_out, "--out", cose_out],
-                label="kbs-allowlist-tool",
-                timeout_s=DEFAULT_SIGN_TIMEOUT_S,
-            )
-            if sign_proc.returncode != 0:
-                stderr_tail = sign_proc.stderr.decode("utf-8", errors="replace").strip()
-                raise EffectError(
-                    f"kbs-allowlist-tool: exit={sign_proc.returncode} stderr={stderr_tail!r}"
-                )
-            with open(cose_out, "rb") as fh:
-                cose_bytes = fh.read()
-            if not cose_bytes:
-                raise EffectError("kbs-allowlist-tool: empty COSE output")
-            new_sha = hashlib.sha256(cose_bytes).hexdigest()
-
-            # 4: upload to S3 so the KBS init container's startup-replay
-            #    path picks up the same bytes on the next pod restart.
-            #    The runtime swap below does not require this — kbs-admin's
-            #    `/v1/admin/allowlist/reload` accepts the bytes from the
-            #    request body directly — but the S3 mirror keeps the
-            #    startup path + the helm chart's `allowlist.url` reference
-            #    in sync with what the live KBS is serving.
-            _s3_upload(cose_out, s3_url)
-
-            # 5: in-memory swap via kbs-admin. The handler runs the SAME
-            #    `InstalledAllowlist::install` the file-fed startup path
-            #    uses — signature verify + epoch-HWM CAS + atomic active
-            #    swap. No kubectl, no RBAC concentration in vali, no pod
-            #    restart.
-            try:
-                _reload_kbs_allowlist(cose_bytes)
-            except AllowlistEpochConflict as conflict:
-                # The installed HWM is ≥ new_epoch. Re-bump one past
-                # this attempt and retry. The S3 object we just wrote
-                # is harmlessly overwritten on the next iteration.
-                last_conflict = conflict
-                floor = new_epoch + 1
-                continue
-
-        return PinResult(
-            new_epoch=new_epoch,
-            new_cose_sha256_hex=new_sha,
-            s3_url=s3_url,
+    installed_floor = _installed_epoch_floor()
+    if installed_floor is not None and (floor is None or installed_floor > floor):
+        floor = installed_floor
+    # 1+2: read, bump epoch, append entry. Write to a tmpfs
+    # intermediary so we can sign without mutating the operator's
+    # source TOML on disk (the dev manifest may be a git checkout).
+    bumped, new_epoch = _bump_epoch_text(original, floor=floor)
+    new_manifest = bumped
+    for entry_measurement, entry_class in appended:
+        # Carried entries re-use the module DEFAULT kids: every pin
+        # this control plane has ever emitted (tenant launches and
+        # host-attestor releases alike) used them, so re-emitting the
+        # defaults reproduces what was installed. Explicit kids only
+        # ever apply to the measurement being pinned NOW.
+        is_new = entry_measurement == measurement_hex
+        new_manifest = _append_entry(
+            new_manifest,
+            measurement_hex=entry_measurement,
+            l1_kids=l1_kids_hex if is_new else (DEFAULT_L1_KID_HEX,),
+            kbs_kids=(
+                kbs_response_kids_hex
+                if is_new
+                else (DEFAULT_KBS_RESPONSE_KID_HEX,)
+            ),
+            measurement_class=entry_class,
         )
 
-    # Retries exhausted — surface the last 409. Either the installed
-    # HWM raced ahead faster than we could climb (operationally
-    # implausible) or the 409 was never about the epoch (signature /
-    # schema), in which case re-bumping could never have helped.
-    raise last_conflict or EffectError(
-        "kbs-admin-reload: epoch retries exhausted with no recorded conflict"
+    with tempfile.TemporaryDirectory(prefix="hippius-allowlist-") as workdir:
+        manifest_out = os.path.join(workdir, "manifest.toml")
+        cose_out = os.path.join(workdir, "dev.cose")
+        seed_out = os.path.join(workdir, "seed.hex")
+        with open(manifest_out, "w", encoding="utf-8") as fh:
+            fh.write(new_manifest)
+        # Materialize the seed 0600 inside the (tmpfs) workdir; removed
+        # with the TemporaryDirectory. §20: never logged, never on a
+        # persistent volume.
+        seed_fd = os.open(seed_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(seed_fd, "w", encoding="utf-8") as fh:
+            fh.write(seed_hex)
+
+        # 3: sign.
+        sign_proc = _run(
+            [sign_bin, "--manifest", manifest_out, "--seed", seed_out, "--out", cose_out],
+            label="kbs-allowlist-tool",
+            timeout_s=DEFAULT_SIGN_TIMEOUT_S,
+        )
+        if sign_proc.returncode != 0:
+            stderr_tail = sign_proc.stderr.decode("utf-8", errors="replace").strip()
+            raise EffectError(
+                f"kbs-allowlist-tool: exit={sign_proc.returncode} stderr={stderr_tail!r}"
+            )
+        with open(cose_out, "rb") as fh:
+            cose_bytes = fh.read()
+        if not cose_bytes:
+            raise EffectError("kbs-allowlist-tool: empty COSE output")
+        new_sha = hashlib.sha256(cose_bytes).hexdigest()
+
+        # 4: upload to S3 so the KBS init container's startup-replay
+        #    path picks up the same bytes on the next pod restart.
+        #    The runtime swap below does not require this — kbs-admin's
+        #    `/v1/admin/allowlist/reload` accepts the bytes from the
+        #    request body directly — but the S3 mirror keeps the
+        #    startup path + the helm chart's `allowlist.url` reference
+        #    in sync with what the live KBS is serving.
+        _s3_upload(cose_out, s3_url)
+
+        # 5: in-memory swap via kbs-admin. The handler runs the SAME
+        #    `InstalledAllowlist::install` the file-fed startup path
+        #    uses — signature verify + epoch-HWM CAS + atomic active
+        #    swap. No kubectl, no RBAC concentration in vali, no pod
+        #    restart.
+        try:
+            _reload_kbs_allowlist(cose_bytes)
+        except AllowlistEpochConflict as conflict:
+            # The installed HWM is ≥ new_epoch: the caller retries one
+            # past this attempt. The S3 object we just wrote is harmlessly
+            # overwritten by the next one.
+            return conflict, new_epoch + 1
+
+    return PinResult(
+        new_epoch=new_epoch,
+        new_cose_sha256_hex=new_sha,
+        s3_url=s3_url,
     )
 
 
@@ -744,17 +1133,28 @@ def _s3_upload(local_path: str, s3_url: str) -> None:
     if endpoint:
         argv.extend(["--endpoint-url", endpoint])
     argv.extend(["s3", "cp", local_path, s3_uri])
-    proc = _run(
-        argv,
-        label="aws-s3-cp",
-        timeout_s=DEFAULT_S3_TIMEOUT_S,
-        env=os.environ.copy(),
-    )
-    if proc.returncode != 0:
-        stderr_tail = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise EffectError(
-            f"aws-s3-cp: exit={proc.returncode} stderr={stderr_tail!r}"
+    pauses = list(S3_UPLOAD_RETRY_PAUSES_S)
+    while True:
+        proc = _run(
+            argv,
+            label="aws-s3-cp",
+            timeout_s=DEFAULT_S3_TIMEOUT_S,
+            env=os.environ.copy(),
         )
+        if proc.returncode == 0:
+            return
+        stderr_tail = proc.stderr.decode("utf-8", errors="replace").strip()
+        if not pauses or not _S3_TRANSIENT.search(stderr_tail):
+            raise EffectError(
+                f"aws-s3-cp: exit={proc.returncode} stderr={stderr_tail!r}"
+            )
+        pause = pauses.pop(0)
+        log.warning(
+            "allowlist-pin: transient S3 error on upload (%s) — retrying in %.0f s",
+            stderr_tail[-160:],
+            pause,
+        )
+        time.sleep(pause)
 
 
 def _https_to_s3_uri(https_url: str, endpoint: str) -> str:

@@ -109,8 +109,12 @@ if [ ! -e "${EPOCH_FILE}" ]; then
     chmod 0644 "${EPOCH_FILE}"
 fi
 
-log "starting: vm_id=${VM_ID} interval=${INTERVAL_SECS}s relay_port=${RELAY_PORT}"
-exec "${AGENT_BIN}" \
+# Attest the vCPU / RAM this guest was given (live-attestation schema v3).
+# Only on the MEASURED `hippius.attest_resources=1`: vali writes it once the
+# KBS accepts the field (an older KBS refuses the request), and the host
+# cannot remove it without changing the launch measurement. Any other value
+# keeps the resource-less keepalive.
+set -- \
     --kbs-url "${KBS_URL}" \
     --vm-id "${VM_ID}" \
     --node-id-hex "${NODE_ID}" \
@@ -118,3 +122,20 @@ exec "${AGENT_BIN}" \
     --interval-secs "${INTERVAL_SECS}" \
     --expiry-offset-secs "${EXPIRY_OFFSET_SECS}" \
     --relay-vsock-port "${RELAY_PORT}"
+ATTEST_RESOURCES=no
+if [ "$(cmdline_get attest_resources)" = "1" ]; then
+    ATTEST_RESOURCES=yes
+    set -- "$@" --attest-resources
+fi
+
+# Attest the guest components release and its agents' health (schema v4).
+# Only on the RELEASE's own switch (its measured keepalive.env): a release
+# that sets it is cut only once the KBS accepts the leg.
+ATTEST_COMPONENTS=no
+if [ "${HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS:-}" = "1" ]; then
+    ATTEST_COMPONENTS=yes
+    set -- "$@" --attest-components
+fi
+
+log "starting: vm_id=${VM_ID} interval=${INTERVAL_SECS}s relay_port=${RELAY_PORT} attest_resources=${ATTEST_RESOURCES} attest_components=${ATTEST_COMPONENTS}"
+exec "${AGENT_BIN}" "$@"

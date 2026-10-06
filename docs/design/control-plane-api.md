@@ -1,6 +1,6 @@
 # Design: Unified vali control-plane API ("everything through the API")
 
-**Status:** ✅ Implemented + deployed + live-verified (2026-06-30) — see §12 · **Author:** Codex · **Date:** 2026-06-30
+**Status:** ✅ Implemented + deployed + live-verified (2026-06-30) — see §12 · **Date:** 2026-06-30
 
 ## 1. Goal & principles
 
@@ -401,8 +401,9 @@ the disk artefacts, in order of convenience:
 `bad-field`); an **unknown `image` is rejected** (fail closed — it never falls
 through to a launch). Supplying a resolved `image`/`bake_id` fills the artefact
 SHAs / LUKS-header MAC / KEK Vault path / S3 location (caller-supplied values
-win). Key fields: `userdata` (cloud-init plaintext, staged to Vault — carry the
-`{{NETBIRD_SETUP_KEY}}` placeholder when NetBird is on), `tenant_id`, `user_id`,
+win). Key fields: `userdata` (cloud-init plaintext in the request — carry the
+`{{NETBIRD_SETUP_KEY}}` placeholder when NetBird is on; vali Transit-wraps
+it before staging, so it is never at rest in the clear), `tenant_id`, `user_id`,
 `vm_id`, `lease_id`, `flavor`, `cmdline`, `image` **or** `bake_id`, and the
 resolved `s3_bucket` / `s3_key_prefix` / `*_sha256_hex` / `kek_vault_path`;
 optional `platform_id`, `auto_pin_allowlist` (default false), `enable_netbird`
@@ -466,6 +467,27 @@ revoking_netbird→done|failed`; terminal = `done|failed`), `eol_ack_verified,
 forced, quarantine_node_id, reason, decided_by, phase_started_at, started_at,
 finished_at, version`. Migration (`POST /v1/vm/<vm_id>/migrate` + poll/cancel)
 follows the same job shape (`MigrationJobSerializer`).
+
+### 13.4b Regions — `GET /v1/operator/regions` and `region` on launch / feasibility
+
+Where the fleet is, as MEASURED (`docs/design/miner-geolocation.md`): the
+public IP each miner's NetBird peer connects from, GeoIP/ASN of that IP, the
+round-trip time vali measures to it, and the egress IP its tenant CVMs
+report. Nothing is declared by a miner.
+
+- `GET /v1/operator/regions[?verified_only=true|false]` → 200
+  `{regions: [{region, country_code, miners_total, miners_verified,
+  miners_dispatchable, hosted_vm_count, capacity{total_units, committed_units,
+  free_units}|null, node_ids}], unlocated_miners, require_verified, vantage,
+  generated_at}`. `OPERATOR_ONLY`, read-only, published on `api.hippius.network`.
+- `GET /v1/operator/nodes` rows carry `location {country_code, region, city,
+  connection_ip, asn, as_holder, rtt_ms, verdict, verdict_reasons, observed_at}`.
+- `POST /v1/vm/launch` accepts an optional `region` (ISO 3166-1 alpha-2,
+  case-insensitive). Hard constraint: only miners whose detected location is
+  `verified` in that country are candidates; none ⇒ 409 `no-miner-in-region`.
+- `GET /v1/scheduler/feasibility?region=FR` answers for that region only:
+  `never/no-miner-in-region`, `not-now/region-unverified`,
+  `not-now/region-unknown` (probe never ran), else the usual ladder.
 
 ### 13.5 Worked example (Python SDK — the full tenant flow)
 

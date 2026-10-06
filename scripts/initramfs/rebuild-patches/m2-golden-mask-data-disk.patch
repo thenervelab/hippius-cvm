@@ -1,0 +1,33 @@
+#1350: mask the #365 hippius-data-disk unit from the measured initramfs,
+as a strict patch on top of the M0 guard (it adds one unit to
+`hippius_golden_write_masks`, exactly as on main). Golden bases baked
+before #1351 ship that unit enabled; on a golden VM (no data disk) it could
+only format + mount at /data a /dev/vde the miner attached on its own, with
+no anti-rollback. The mask is re-asserted into the overlay upper every
+boot, like the other M0 masks.
+Applies with no fuzz after m0-initramfs-guard.patch and
+m1-golden-data-bind.patch, on the M0-era and stamp-v2 bases alike.
+
+diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
+--- a/scripts/initramfs/hippius-golden-overlay.sh
++++ b/scripts/initramfs/hippius-golden-overlay.sh
+@@ -1442,7 +1442,10 @@
+     # virtio /dev/hvc0, and getty@ for /dev/tty1. systemd-imds-generator /
+     # systemd-imds-import (systemd >=261) fetch credentials from
+     # miner-controlled DMI/network — masked for a future Fedora bump
+-    # (no-op on today's systemd 258).
++    # (no-op on today's systemd 258). hippius-data-disk (#365, #1350): a
++    # golden VM has no data disk, so on a golden base that unit could only
++    # format + mount a /dev/vde the miner attached on its own, with no
++    # anti-rollback; bakes before #1351 still ship it in /etc.
+     _hgwm_sysd="${_hgwm_root}/etc/systemd/system"
+     _hgwm_gen="${_hgwm_root}/etc/systemd/system-generators"
+     mkdir -p "${_hgwm_sysd}" "${_hgwm_gen}" \
+@@ -1456,6 +1459,7 @@
+         open-vm-tools.service \
+         serial-getty@.service \
+         getty@.service \
++        hippius-data-disk.service \
+         systemd-imds-import.service; do
+         _hippius_golden_mask_path "${_hgwm_sysd}/${_hgwm_unit}" "${_hgwm_sysd}"
+     done

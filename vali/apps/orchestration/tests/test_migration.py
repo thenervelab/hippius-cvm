@@ -248,6 +248,60 @@ def test_cross_generation_migration_is_refused(fx: FakeEffects) -> None:
     assert exc.value.category == "cross-gen"
 
 
+def test_milan_to_genoa_migration_is_cross_generation(fx: FakeEffects) -> None:
+    # Milan and Genoa both report a 64-byte CHIP_ID, so the length alone
+    # calls them the same generation. They measure differently (EpycMilan vs
+    # EpycGenoa), so with the generation registered the move is refused.
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.filter(miner_id="node-src").update(snp_generation="milan")
+    vm = make_vm(generation=5, host="node-src")
+    with pytest.raises(service.StartError) as exc:
+        service.start_migration(
+            vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+        )
+    assert exc.value.category == "cross-gen"
+    assert "EpycMilan" in str(exc.value) and "EpycGenoa" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("src_gen", "dst_gen"),
+    [("milan", "milan"), ("genoa", "genoa"), ("genoa", ""), ("", "genoa")],
+)
+def test_same_generation_64_byte_migration_is_allowed(
+    fx: FakeEffects, src_gen: str, dst_gen: str
+) -> None:
+    # Milan↔Milan is same-gen; and an explicit `genoa` equals the legacy
+    # inference for a 64-byte chip, so backfilling one side of a Genoa pair
+    # does not split it.
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.filter(miner_id="node-src").update(snp_generation=src_gen)
+    MinerIdentity.objects.filter(miner_id="node-dst").update(snp_generation=dst_gen)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    assert job.state == MigrationState.DRAINING.value
+
+
+def test_migration_to_a_dest_with_an_inconsistent_generation_is_refused(
+    fx: FakeEffects,
+) -> None:
+    # A generation that contradicts the CHIP_ID length cannot be measured —
+    # fail closed at intake, same category as a malformed chip id.
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.filter(miner_id="node-dst").update(snp_generation="turin")
+    vm = make_vm(generation=5, host="node-src")
+    with pytest.raises(service.StartError) as exc:
+        service.start_migration(
+            vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+        )
+    assert exc.value.category == "platform-id-invalid"
+    assert "snp-generation-chip-id-mismatch" in str(exc.value)
+
+
 def test_migration_to_an_unregistered_dest_is_refused(fx: FakeEffects) -> None:
     # A dest with no MinerIdentity has no resolvable generation (and could
     # not be reached/attested anyway) — fail closed.
@@ -384,6 +438,48 @@ def test_cross_gen_chain_ids_excludes_only_the_other_generation() -> None:
     assert excluded == frozenset({"cc" * 32})  # only the cross-gen Turin
 
 
+def test_cross_gen_chain_ids_tells_milan_from_genoa() -> None:
+    # The auto-picker must not send a Milan guest to a Genoa host (same
+    # 64-byte CHIP_ID, different measurement) — nor a Genoa one to Milan.
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.create(
+        miner_id="src-milan",
+        pubkey_hex="a1" * 32,
+        platform_id="ab" * 64,
+        chain_node_id="aa" * 32,
+        snp_generation="milan",
+    )
+    MinerIdentity.objects.create(
+        miner_id="milan-2",
+        pubkey_hex="b2" * 32,
+        platform_id="cd" * 64,
+        chain_node_id="bb" * 32,
+        snp_generation="milan",  # kept
+    )
+    MinerIdentity.objects.create(
+        miner_id="genoa-legacy",
+        pubkey_hex="c3" * 32,
+        platform_id="ef" * 64,
+        chain_node_id="cc" * 32,  # unset ⇒ Genoa by length — excluded
+    )
+    MinerIdentity.objects.create(
+        miner_id="genoa-explicit",
+        pubkey_hex="d4" * 32,
+        platform_id="12" * 64,
+        chain_node_id="dd" * 32,
+        snp_generation="genoa",  # excluded
+    )
+    candidates = frozenset({"bb" * 32, "cc" * 32, "dd" * 32})
+    assert service._cross_gen_chain_ids("aa" * 32, candidates) == frozenset(
+        {"cc" * 32, "dd" * 32}
+    )
+    # And from the legacy Genoa side, the Milan hosts are the cross-gen ones.
+    assert service._cross_gen_chain_ids(
+        "cc" * 32, frozenset({"aa" * 32, "bb" * 32, "dd" * 32})
+    ) == frozenset({"aa" * 32, "bb" * 32})
+
+
 def test_quiesce_relays_the_nonce_and_source_gen_to_the_source(
     fx: FakeEffects,
 ) -> None:
@@ -471,6 +567,46 @@ def test_migration_fences_the_vm_before_awaiting_the_ack(fx: FakeEffects) -> Non
     assert vm.new_generation == 6
     assert vm.migration_dest == "node-dst"
     assert vm.eol_nonce is not None
+
+
+def test_the_fence_consumes_a_stopped_ack_left_over_from_a_previous_hop(
+    fx: FakeEffects,
+) -> None:
+    # REGRESSION (second §25): the guest signs every ack at its constant
+    # `signing_generation` with its per-launch `eol_nonce`, so the ack the
+    # FIRST hop ingested is a valid-looking ack for the second. Left in the
+    # store, `poll_source_ack` would return it and the second hop would
+    # activate its dest while the source still runs. The fence must consume
+    # it — and must not touch an ack ingested after the fence.
+    from apps.lifecycle.models import StoppedAckIngest
+
+    def stored_ack(v: Vm) -> bytes | None:
+        # The real store read behind `poll_source_ack` (which `fx` fakes).
+        return effects._poll_stored_ack(v.vm_id, v.signing_generation)
+
+    vm = make_vm(generation=6, host="node-src")
+    StoppedAckIngest.objects.create(
+        vm_id=vm.vm_id, generation=vm.signing_generation, signed_ack=b"hop-1"
+    )
+    assert stored_ack(vm) == b"hop-1"
+
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    _drive_until(job, MigrationState.SNAPSHOTTING.value)
+
+    vm.refresh_from_db()
+    assert vm.state == VmState.MIGRATING
+    assert stored_ack(vm) is None, "the hop-1 ack must be consumed"
+
+    # This hop's own ack lands after the fence; a re-driven fence (an
+    # idempotent no-op) must leave it alone.
+    StoppedAckIngest.objects.create(
+        vm_id=vm.vm_id, generation=vm.signing_generation, signed_ack=b"hop-2"
+    )
+    job.refresh_from_db()
+    service._fence_vm(job)
+    assert stored_ack(vm) == b"hop-2"
 
 
 # ─── split-brain: source-ack timeout ─────────────────────────────────

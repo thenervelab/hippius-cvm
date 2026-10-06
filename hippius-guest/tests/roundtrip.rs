@@ -9,8 +9,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ed25519_dalek::SigningKey;
-use hippius_guest::{verify_and_unwrap_release, ExpectedRelease, GuestError};
+use hippius_guest::{
+    verify_and_unwrap_release, verify_and_unwrap_release_for_mode, ExpectedRelease, GuestError,
+};
 use hippius_types::digest::userdata_digest;
+use hippius_types::guardian::KeyMode;
 use hippius_types::release::{KbsResponse, SignedResponse, HPKE_SUITE_ID, RELEASE_DOMAIN};
 use kbs_core::crypto::{hpke_wrap, sign_response, ReleaseContext};
 
@@ -81,12 +84,13 @@ fn make_signed_response(
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: digest.to_vec(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key: None,
         boot_counter: 0,
         expected_volume_stamp: 0,
         volume_stamp_token: None,
+        volume_stamp_transition: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -149,12 +153,13 @@ fn make_signed_response_with_lifecycle(
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: digest.to_vec(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key,
         boot_counter: 0,
         expected_volume_stamp: 0,
         volume_stamp_token: None,
+        volume_stamp_transition: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -245,12 +250,13 @@ fn make_signed_response_with_volume_stamp(
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: digest.to_vec(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key: None,
         boot_counter: 0,
         expected_volume_stamp,
         volume_stamp_token,
+        volume_stamp_transition: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -330,7 +336,7 @@ fn happy_path_unwraps_both_secrets() {
     );
     let exp = expected(&digest);
     let out = verify_and_unwrap_release(&signed, &kbs_sk.verifying_key(), &guest_sk, &exp).unwrap();
-    assert_eq!(out.luks.as_slice(), luks_plain);
+    assert_eq!(out.luks.as_deref().unwrap().as_slice(), luks_plain);
     assert_eq!(out.userdata.as_slice(), ud_plain);
     // §7: a response with no `lifecycle_key` (pre-§7 VM) unwraps to None.
     assert!(out.lifecycle_key.is_none());
@@ -447,12 +453,13 @@ fn lifecycle_key_wrong_context_fails_closed() {
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: digest.to_vec(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key: Some(bad),
         boot_counter: 0,
         expected_volume_stamp: 0,
         volume_stamp_token: None,
+        volume_stamp_transition: None,
     };
     let signed = sign_response(&kbs_sk, &resp).unwrap();
     let exp = expected(&digest);
@@ -612,12 +619,13 @@ fn ud_plaintext_does_not_match_digest_rejected() {
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: lying_digest.clone(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key: None,
         boot_counter: 0,
         expected_volume_stamp: 0,
         volume_stamp_token: None,
+        volume_stamp_transition: None,
     };
     let signed = sign_response(&kbs_sk, &resp).unwrap();
     let mut arr = [0u8; 32];
@@ -655,7 +663,8 @@ fn swapped_luks_and_userdata_rejected() {
     let mut signed = make_signed_response(&kbs_sk, &guest_pk, b"L", b"UD");
     // Decode → swap → re-sign so the signature still verifies.
     let mut resp: KbsResponse = ciborium::de::from_reader(signed.body.as_slice()).unwrap();
-    std::mem::swap(&mut resp.luks, &mut resp.userdata);
+    let luks = resp.luks.take().expect("an M0 release carries luks");
+    resp.luks = Some(std::mem::replace(&mut resp.userdata, luks));
     signed = sign_response(&kbs_sk, &resp).unwrap();
     let digest = userdata_digest(
         TENANT_ID, VM_ID, TICKET_ID, "userdata", UD_PATH, UD_VER, b"UD",
@@ -690,4 +699,324 @@ fn wrong_wrapped_path_rejected() {
         GuestError::Binding { field, .. } => assert_eq!(field, "luks_vault_ref"),
         other => panic!("expected Binding(luks_vault_ref), got {other:?}"),
     }
+}
+
+/// The same signed response with the KEK removed, re-signed — what a KBS
+/// answers for a `customer` (M2) ticket.
+fn without_luks(kbs_sk: &SigningKey, signed: &SignedResponse) -> SignedResponse {
+    let mut resp = kbs_core::crypto::verify_response(&kbs_sk.verifying_key(), signed).unwrap();
+    resp.luks = None;
+    sign_response(kbs_sk, &resp).unwrap()
+}
+
+/// Customer-held keys: the KEK's presence is pinned per mode. M0 and M1
+/// need it (in M1 it is `share_H`); M2 must not get one. Every other
+/// binding is the same in all three modes.
+#[test]
+fn the_kek_is_required_in_m0_and_m1_and_refused_in_m2() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let luks_plain = b"LUKSKEY-32B-XXXXXXXXXXXXXXXXXXXX";
+    let ud_plain = b"#cloud-config\nusers:\n  - default";
+    let with = make_signed_response(&kbs_sk, &guest_pk, luks_plain, ud_plain);
+    let without = without_luks(&kbs_sk, &with);
+    let digest = userdata_digest(
+        TENANT_ID, VM_ID, TICKET_ID, "userdata", UD_PATH, UD_VER, ud_plain,
+    );
+    let exp = expected(&digest);
+    let vk = kbs_sk.verifying_key();
+
+    for mode in [KeyMode::Hippius, KeyMode::Split] {
+        let out = verify_and_unwrap_release_for_mode(&with, &vk, &guest_sk, &exp, mode).unwrap();
+        assert_eq!(out.luks.as_deref().unwrap().as_slice(), luks_plain);
+        assert_eq!(out.userdata.as_slice(), ud_plain);
+        let err =
+            verify_and_unwrap_release_for_mode(&without, &vk, &guest_sk, &exp, mode).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GuestError::Binding {
+                    field: "luks_vault_ref",
+                    ..
+                }
+            ),
+            "{mode:?}: {err:?}"
+        );
+    }
+    // The M0 entry point is the `hippius` mode.
+    assert!(verify_and_unwrap_release(&without, &vk, &guest_sk, &exp).is_err());
+
+    let out = verify_and_unwrap_release_for_mode(&without, &vk, &guest_sk, &exp, KeyMode::Customer)
+        .unwrap();
+    assert!(out.luks.is_none());
+    assert_eq!(out.userdata.as_slice(), ud_plain);
+    let err = verify_and_unwrap_release_for_mode(&with, &vk, &guest_sk, &exp, KeyMode::Customer)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GuestError::Binding {
+                field: "luks_vault_ref",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// M2 skips only the KEK: a tampered binding still fails.
+#[test]
+fn m2_still_enforces_every_other_binding() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let ud_plain = b"#cloud-config";
+    let signed = without_luks(
+        &kbs_sk,
+        &make_signed_response(&kbs_sk, &guest_pk, b"L", ud_plain),
+    );
+    let digest = userdata_digest(
+        TENANT_ID, VM_ID, TICKET_ID, "userdata", UD_PATH, UD_VER, ud_plain,
+    );
+    let mut exp = expected(&digest);
+    exp.vm_id = "another-vm";
+    let err = verify_and_unwrap_release_for_mode(
+        &signed,
+        &kbs_sk.verifying_key(),
+        &guest_sk,
+        &exp,
+        KeyMode::Customer,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, GuestError::Binding { field: "vm_id", .. }),
+        "{err:?}"
+    );
+}
+
+// ── stamp protocol v2: the response shape is the ATTESTED protocol's ──
+
+use hippius_guest::{verify_and_unwrap_release_attested, AttestedStampProtocol};
+use hippius_types::release::{VolumeStampTransition, RELEASE_DOMAIN_V2};
+
+/// The volume-stamp release above, re-signed under `domain` with
+/// `transition`.
+fn stamp_release_as(
+    kbs_sk: &SigningKey,
+    guest_pk: &[u8; 32],
+    expected_volume_stamp: u64,
+    domain: &str,
+    transition: Option<VolumeStampTransition>,
+) -> SignedResponse {
+    let signed = make_signed_response_with_volume_stamp(
+        kbs_sk,
+        guest_pk,
+        b"LUKSKEY-32B-XXXXXXXXXXXXXXXXXXXX",
+        b"#cloud-config\nusers:\n  - default",
+        expected_volume_stamp,
+        &[0x42u8; 32],
+        VM_ID,
+    );
+    let mut resp: KbsResponse = ciborium::de::from_reader(signed.body.as_slice()).unwrap();
+    resp.domain = domain.into();
+    resp.volume_stamp_transition = transition;
+    sign_response(kbs_sk, &resp).unwrap()
+}
+
+fn transition(expected: u8, target: u8) -> Option<VolumeStampTransition> {
+    Some(VolumeStampTransition {
+        expected_timeline_id: vec![expected; 32],
+        target_timeline_id: vec![target; 32],
+    })
+}
+
+fn open_as(
+    signed: &SignedResponse,
+    kbs_sk: &SigningKey,
+    guest_sk: &[u8; 32],
+    attested: AttestedStampProtocol,
+) -> hippius_guest::Result<hippius_guest::UnwrappedSecrets> {
+    let digest = userdata_digest(
+        TENANT_ID,
+        VM_ID,
+        TICKET_ID,
+        "userdata",
+        UD_PATH,
+        UD_VER,
+        b"#cloud-config\nusers:\n  - default",
+    );
+    verify_and_unwrap_release_attested(
+        signed,
+        &kbs_sk.verifying_key(),
+        guest_sk,
+        &expected(&digest),
+        KeyMode::Hippius,
+        attested,
+    )
+}
+
+/// A guest that attested v2 accepts a V2 response with a well-formed
+/// transition and hands the caller exactly its (expected, target).
+#[test]
+fn a_v2_guest_accepts_a_v2_response_and_returns_its_transition() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let normal = stamp_release_as(&kbs_sk, &guest_pk, 4, RELEASE_DOMAIN_V2, transition(0, 0));
+    let out = open_as(&normal, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).unwrap();
+    assert_eq!(out.volume_stamp_transition, Some(([0; 32], [0; 32])));
+    assert_eq!(out.expected_volume_stamp, 4);
+    let rollback = stamp_release_as(
+        &kbs_sk,
+        &guest_pk,
+        4,
+        RELEASE_DOMAIN_V2,
+        transition(0xa1, 0xb2),
+    );
+    let out = open_as(&rollback, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).unwrap();
+    assert_eq!(out.volume_stamp_transition, Some(([0xa1; 32], [0xb2; 32])));
+}
+
+/// The domain is the ATTESTED protocol's, never "either": a v2 guest
+/// refuses a V1 response (and a V2 one without a transition), a v1 guest
+/// — every guest built before v2 goes through this exact check — refuses
+/// a V2 response and any transition.
+#[test]
+fn the_response_shape_must_match_the_attested_protocol() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    for (domain, t, attested, ok) in [
+        (
+            RELEASE_DOMAIN_V2,
+            transition(1, 1),
+            AttestedStampProtocol::V2,
+            true,
+        ),
+        (RELEASE_DOMAIN, None, AttestedStampProtocol::V2, false),
+        (RELEASE_DOMAIN_V2, None, AttestedStampProtocol::V2, false),
+        (
+            RELEASE_DOMAIN,
+            transition(1, 1),
+            AttestedStampProtocol::V2,
+            false,
+        ),
+        (RELEASE_DOMAIN, None, AttestedStampProtocol::V1, true),
+        (
+            RELEASE_DOMAIN_V2,
+            transition(1, 1),
+            AttestedStampProtocol::V1,
+            false,
+        ),
+        (
+            RELEASE_DOMAIN,
+            transition(1, 1),
+            AttestedStampProtocol::V1,
+            false,
+        ),
+        (RELEASE_DOMAIN_V2, None, AttestedStampProtocol::V1, false),
+    ] {
+        let signed = stamp_release_as(&kbs_sk, &guest_pk, 4, domain, t.clone());
+        let got = open_as(&signed, &kbs_sk, &guest_sk, attested);
+        assert_eq!(got.is_ok(), ok, "{domain} {t:?} {attested:?}");
+        if attested == AttestedStampProtocol::V1 {
+            // The pre-v2 entry point is the v1 attestation, byte for byte.
+            let digest = userdata_digest(
+                TENANT_ID,
+                VM_ID,
+                TICKET_ID,
+                "userdata",
+                UD_PATH,
+                UD_VER,
+                b"#cloud-config\nusers:\n  - default",
+            );
+            let legacy = verify_and_unwrap_release(
+                &signed,
+                &kbs_sk.verifying_key(),
+                &guest_sk,
+                &expected(&digest),
+            );
+            assert_eq!(legacy.is_ok(), ok, "legacy {domain} {t:?}");
+        }
+    }
+}
+
+/// A malformed transition is refused: a short id; a move to the ZERO
+/// timeline (at any E).
+#[test]
+fn a_malformed_transition_is_refused() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let short = Some(VolumeStampTransition {
+        expected_timeline_id: vec![1; 31],
+        target_timeline_id: vec![1; 32],
+    });
+    for (e, t) in [(4, short), (4, transition(1, 0)), (0, transition(1, 0))] {
+        let signed = stamp_release_as(&kbs_sk, &guest_pk, e, RELEASE_DOMAIN_V2, t.clone());
+        assert!(
+            open_as(&signed, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).is_err(),
+            "E={e} {t:?}"
+        );
+    }
+    // Staying on a timeline with E = 0 is accepted.
+    let fresh = stamp_release_as(&kbs_sk, &guest_pk, 0, RELEASE_DOMAIN_V2, transition(0, 0));
+    assert!(open_as(&fresh, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).is_ok());
+}
+
+/// S2 — the release of an unconfirmed VM (E = 0: fresh, or a KBS row a
+/// restart wiped) moves it from the zero timeline to a FRESH one, and the
+/// guest accepts that move and hands the caller the fresh target.
+#[test]
+fn a_move_to_a_fresh_timeline_at_e_zero_is_accepted() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let signed = stamp_release_as(
+        &kbs_sk,
+        &guest_pk,
+        0,
+        RELEASE_DOMAIN_V2,
+        transition(0, 0xf1),
+    );
+    let out = open_as(&signed, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).unwrap();
+    assert_eq!(out.expected_volume_stamp, 0);
+    assert_eq!(out.volume_stamp_transition, Some(([0; 32], [0xf1; 32])));
+}
+
+/// R2 — at E = 0 the ONLY move the guest accepts is zero → fresh (gate
+/// 5c'). A rollback-style move at E = 0 — from a NON-zero timeline to
+/// another one — is never issued by an honest KBS (an authorized rollback
+/// restores a confirmed point, E_T > 0) and is refused; the very same
+/// move at E > 0 (an authorized rollback) is accepted.
+#[test]
+fn a_rollback_style_move_at_e_zero_is_refused() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    for (from, to) in [(0xa1, 0xb2), (0xa1, 0x00), (0xb2, 0xa1)] {
+        let signed = stamp_release_as(
+            &kbs_sk,
+            &guest_pk,
+            0,
+            RELEASE_DOMAIN_V2,
+            transition(from, to),
+        );
+        assert!(
+            open_as(&signed, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).is_err(),
+            "E=0 move {from:#x} -> {to:#x} must be refused"
+        );
+    }
+    let rollback = stamp_release_as(
+        &kbs_sk,
+        &guest_pk,
+        1,
+        RELEASE_DOMAIN_V2,
+        transition(0xa1, 0xb2),
+    );
+    let out = open_as(&rollback, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).unwrap();
+    assert_eq!(out.volume_stamp_transition, Some(([0xa1; 32], [0xb2; 32])));
+    // Not a move: staying on a non-zero timeline at E = 0 is accepted.
+    let stay = stamp_release_as(
+        &kbs_sk,
+        &guest_pk,
+        0,
+        RELEASE_DOMAIN_V2,
+        transition(0xa1, 0xa1),
+    );
+    assert!(open_as(&stay, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).is_ok());
 }

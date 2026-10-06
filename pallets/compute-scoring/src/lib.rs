@@ -3318,7 +3318,7 @@ pub mod pallet {
 
             // Reject duplicate node_ids in the batch via an O(n log n)
             // `BTreeSet` insert — the previous O(n²) scan was honest
-            // but priced wrong in the weight table (codex/gemini
+            // but priced wrong in the weight table (review/review
             // CONVERGENT HIGH). `n` is still bounded by
             // `T::MaxMinerStatusUpdatesPerCall`.
             let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();

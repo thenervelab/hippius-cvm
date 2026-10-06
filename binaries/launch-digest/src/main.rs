@@ -42,7 +42,8 @@ struct Args {
     /// vCPU count of the measured launch (`flavor.cpu_count`).
     #[arg(long)]
     vcpus: u32,
-    /// vCPU model — `EpycGenoa` | `EpycTurin` (from the miner generation).
+    /// vCPU model — `EpycMilan` | `EpycGenoa` | `EpycTurin` (from the
+    /// miner generation).
     #[arg(long)]
     vcpu_type: String,
     /// SEV-SNP guest-features bitmap (hex `0x…` or decimal). Default
@@ -60,7 +61,7 @@ enum DigestError {
     Read(&'static str, std::io::Error),
     #[error("cmdline is not valid UTF-8")]
     CmdlineNotUtf8,
-    #[error("unknown --vcpu-type {0:?} (expected EpycGenoa | EpycTurin | …)")]
+    #[error("unknown --vcpu-type {0:?} (expected EpycMilan | EpycGenoa | EpycTurin | …)")]
     BadVcpuType(String),
     #[error("bad --guest-features {0:?}")]
     BadGuestFeatures(String),

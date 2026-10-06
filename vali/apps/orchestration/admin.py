@@ -56,6 +56,7 @@ class MigrationJobAdmin(admin.ModelAdmin):
     list_display = (
         "job_id",
         "vm",
+        "kind",
         "source_node_id",
         "dest_node_id",
         "source_gen",
@@ -68,6 +69,7 @@ class MigrationJobAdmin(admin.ModelAdmin):
         "finished_at",
     )
     list_filter = (
+        "kind",
         "state",
         "source_ack_verified",
         "source_reclaim_state",

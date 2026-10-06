@@ -231,3 +231,138 @@ def test_poll_source_ack_no_stored_ack_means_not_produced_yet_returns_none(
         vm_id="tenant-x", generation=4, signed_ack=b"stale"
     )
     assert effects.poll_source_ack(vm) is None
+
+
+# ── §25 multipart snapshot ───────────────────────────────────────────
+
+_REAL_TRIGGER_MULTIPART = effects.trigger_multipart_snapshot
+_REAL_POLL_SNAPSHOT_STATUS = effects.poll_snapshot_status
+
+
+@pytest.mark.django_db
+def test_a_multipart_snapshot_is_a_signed_migrate_snapshot_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatched through the Edge's generic order path (the relay route
+    rebuilds only the single-PUT shape), per job, to the SOURCE miner."""
+    import json
+
+    from apps.orchestration import order_dispatch
+
+    monkeypatch.setattr(effects, "trigger_multipart_snapshot", _REAL_TRIGGER_MULTIPART)
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        order_dispatch,
+        "dispatch_order",
+        lambda **kw: sent.append(kw)
+        or order_dispatch.DispatchResult(ok=True, status=200, classifier="snapshot-accepted"),
+    )
+    vm = _vm()
+    _miner()
+    effects.trigger_multipart_snapshot(
+        vm,
+        job_id="job1",
+        part_size=1 << 30,
+        part_urls=["https://s3/p1", "https://s3/p2"],
+        state_put_url="https://s3/state",
+    )
+    (kw,) = sent
+    assert kw["kind"] == "migrate-snapshot"
+    assert (kw["miner_id"], kw["netbird_ip"]) == ("miner-src", "100.64.0.7")
+    assert kw["order_id"] == "mig-snapshot-tenant-x-job1"
+    assert json.loads(kw["payload_json"]) == {
+        "vm_id": "tenant-x",
+        "node_id": "miner-src",
+        "part_size": 1 << 30,
+        "disk_part_urls": ["https://s3/p1", "https://s3/p2"],
+        "state_put_url": "https://s3/state",
+    }
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("status", "classifier", "raises"),
+    [(409, "order-in-flight", False), (409, "not-quiesced", True), (503, "", True)],
+)
+def test_a_multipart_snapshot_refused_by_the_miner_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, status: int, classifier: str, raises: bool
+) -> None:
+    from apps.orchestration import order_dispatch
+
+    monkeypatch.setattr(effects, "trigger_multipart_snapshot", _REAL_TRIGGER_MULTIPART)
+    monkeypatch.setattr(
+        order_dispatch,
+        "dispatch_order",
+        lambda **kw: order_dispatch.DispatchResult(ok=False, status=status, classifier=classifier),
+    )
+    vm = _vm()
+    _miner()
+    call = lambda: effects.trigger_multipart_snapshot(  # noqa: E731
+        vm, job_id="j", part_size=1 << 30, part_urls=["u"], state_put_url="s"
+    )
+    if raises:
+        with pytest.raises(effects.EffectError):
+            call()
+    else:
+        call()
+
+
+@pytest.mark.django_db
+def test_the_snapshot_status_carries_the_part_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(effects, "poll_snapshot_status", _REAL_POLL_SNAPSHOT_STATUS)
+    disk = {"parts": [{"part_number": 1, "etag": '"e"', "size": 5}], "size": 5}
+    replies = iter(
+        [
+            (200, b'{"status":"done","disk":' + __import__("json").dumps(disk).encode() + b"}"),
+            (200, b'{"status":"running"}'),
+        ]
+    )
+    monkeypatch.setattr(effects, "_edge_get", lambda vm, path: next(replies))
+    vm = _vm()
+    assert effects.poll_snapshot_status(vm) == ("done", disk)
+    assert effects.poll_snapshot_status(vm) == ("running", None)
+
+
+@pytest.mark.django_db
+def test_a_miner_with_no_record_of_the_migration_reports_it_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """404 after the quiesce: the agent restarted and lost its in-memory
+    upload task — nothing on that host will finish it."""
+    monkeypatch.setattr(effects, "poll_snapshot_status", _REAL_POLL_SNAPSHOT_STATUS)
+    monkeypatch.setattr(effects, "_edge_get", lambda vm, path: (404, b"no-migration"))
+    vm = _vm()
+    assert effects.poll_snapshot_status(vm) == ("failed", None)
+    monkeypatch.setattr(effects, "_edge_get", lambda vm, path: (502, b""))
+    with pytest.raises(effects.EffectError):
+        effects.poll_snapshot_status(vm)
+
+
+_REAL_POLL_DEST_ACTIVATION_STATUS = effects.poll_dest_activation_status
+
+
+@pytest.mark.django_db
+def test_the_dest_activation_status_carries_the_failure_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dest's class for a `failed` reaches the handler; a body without
+    one (an older agent) or a non-failed status carries none."""
+    monkeypatch.setattr(
+        effects, "poll_dest_activation_status", _REAL_POLL_DEST_ACTIVATION_STATUS
+    )
+    monkeypatch.setattr(effects, "_miner_identity", lambda n: (n, "100.64.0.9"))
+    replies = iter(
+        [
+            (200, b'{"status":"failed","class":"migration/dest-settle-by-passed"}'),
+            (200, b'{"status":"failed"}'),
+            (200, b'{"status":"running","class":"migration/x"}'),
+            (200, b'{"status":"failed","class":7}'),
+        ]
+    )
+    monkeypatch.setattr(effects, "_edge_get_addr", lambda vm, path, addr: next(replies))
+    vm = _vm()
+    poll = lambda: effects.poll_dest_activation_status(vm, dest_node_id="n")  # noqa: E731
+    assert poll() == ("failed", "migration/dest-settle-by-passed")
+    assert poll() == ("failed", "")
+    assert poll() == ("running", "")
+    assert poll() == ("failed", "")

@@ -4,8 +4,10 @@
 
 use crate::relay::AttestationSink;
 use hippius_agent_initramfs::stages::snp_report::{
-    live_attestation_report_data, SnpReportProvider,
+    live_attestation_components_report_data, live_attestation_report_data,
+    live_attestation_resources_report_data, SnpReportProvider,
 };
+use hippius_types::live_attestation::{GuestComponents, GuestResources};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -24,6 +26,8 @@ pub enum TickError {
     NonceFetch,
     #[error("keepalive-post")]
     KeepalivePost,
+    #[error("resources:{0}")]
+    Resources(crate::resources::ResourcesError),
 }
 
 /// Per-tick inputs.
@@ -42,6 +46,21 @@ pub struct TickInputs<'a> {
     /// the validator's batch latency, short enough that a stale
     /// signed body cannot be re-submitted weeks later.
     pub expiry_offset_secs: u64,
+    /// `Some(root)` ⇒ read the guest's vCPU / RAM figures under `root`
+    /// (`/` in production) and attest them: they go into `REPORT_DATA`
+    /// and the request, and the KBS signs them into a schema-v3 body.
+    /// `None` ⇒ the resource-less keepalive, byte-identical to before.
+    /// Switched on by the MEASURED `hippius.attest_resources=1` token, so
+    /// vali turns it on only once the KBS understands the field — and the
+    /// host cannot turn it off.
+    pub resources_root: Option<&'a std::path::Path>,
+    /// `Some(probe)` ⇒ attest the guest components release and its health
+    /// (schema v4): the values go into `REPORT_DATA` and the request.
+    /// Never fails the tick — a check that cannot run is a cleared bit.
+    /// Switched on by the RELEASE (`HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1`
+    /// in its measured `keepalive.env`), which is cut only once the KBS
+    /// understands the field.
+    pub components: Option<&'a crate::components::ComponentsTracker>,
 }
 
 /// Per-tick result: the canonical-CBOR-encoded
@@ -56,6 +75,7 @@ pub struct TickOutput {
 /// reqwest client.
 pub trait KbsTransport {
     fn fetch_nonce(&self) -> Result<[u8; 32], TickError>;
+    #[allow(clippy::too_many_arguments)]
     fn post_keepalive(
         &self,
         vm_id: &str,
@@ -64,6 +84,8 @@ pub trait KbsTransport {
         kbs_nonce: &[u8; 32],
         epoch: u64,
         expiry_unix: u64,
+        resources: Option<&GuestResources>,
+        components: Option<&GuestComponents>,
     ) -> Result<Vec<u8>, TickError>;
 }
 
@@ -72,6 +94,7 @@ impl KbsTransport for crate::client::KbsClient {
     fn fetch_nonce(&self) -> Result<[u8; 32], TickError> {
         crate::client::KbsClient::fetch_nonce(self).map_err(|_| TickError::NonceFetch)
     }
+    #[allow(clippy::too_many_arguments)]
     fn post_keepalive(
         &self,
         vm_id: &str,
@@ -80,6 +103,8 @@ impl KbsTransport for crate::client::KbsClient {
         kbs_nonce: &[u8; 32],
         epoch: u64,
         expiry_unix: u64,
+        resources: Option<&GuestResources>,
+        components: Option<&GuestComponents>,
     ) -> Result<Vec<u8>, TickError> {
         crate::client::KbsClient::post_keepalive(
             self,
@@ -89,6 +114,8 @@ impl KbsTransport for crate::client::KbsClient {
             kbs_nonce,
             epoch,
             expiry_unix,
+            resources,
+            components,
         )
         .map_err(|_| TickError::KeepalivePost)
     }
@@ -143,9 +170,24 @@ pub fn run_once(
     let now = now_unix()?;
     let expiry = now.saturating_add(inputs.expiry_offset_secs);
 
+    // Read the resources before the nonce: a guest that cannot say what
+    // it runs with does not spend a KBS nonce.
+    let resources = match inputs.resources_root {
+        Some(root) => Some(crate::resources::read(root).map_err(TickError::Resources)?),
+        None => None,
+    };
     let nonce = kbs.fetch_nonce()?;
-    let rd =
-        live_attestation_report_data(&nonce, inputs.vm_id).map_err(|_| TickError::SnpReportData)?;
+    // After the nonce: the KBS states the nonce's issuance as when these
+    // checks were made at the earliest, so they must not be older.
+    let components = inputs.components.map(|tracker| tracker.tick());
+    let rd = match (&components, &resources) {
+        (Some(c), r) => {
+            live_attestation_components_report_data(&nonce, inputs.vm_id, c, r.as_ref())
+        }
+        (None, Some(r)) => live_attestation_resources_report_data(&nonce, inputs.vm_id, r),
+        (None, None) => live_attestation_report_data(&nonce, inputs.vm_id),
+    }
+    .map_err(|_| TickError::SnpReportData)?;
     let report = provider.get_report(rd).map_err(|_| TickError::SnpReport)?;
     let signed = kbs.post_keepalive(
         inputs.vm_id,
@@ -154,6 +196,8 @@ pub fn run_once(
         &nonce,
         epoch,
         expiry,
+        resources.as_ref(),
+        components.as_ref(),
     )?;
     Ok(TickOutput {
         signed_live_attestation: signed,
@@ -167,7 +211,16 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::Mutex;
 
-    type PostRecord = (String, [u8; 32], Vec<u8>, [u8; 32], u64, u64);
+    type PostRecord = (
+        String,
+        [u8; 32],
+        Vec<u8>,
+        [u8; 32],
+        u64,
+        u64,
+        Option<GuestResources>,
+        Option<GuestComponents>,
+    );
     struct StubKbs {
         nonce: [u8; 32],
         last_post: Mutex<RefCell<Option<PostRecord>>>,
@@ -193,6 +246,7 @@ mod tests {
             }
             Ok(self.nonce)
         }
+        #[allow(clippy::too_many_arguments)]
         fn post_keepalive(
             &self,
             vm_id: &str,
@@ -201,6 +255,8 @@ mod tests {
             kbs_nonce: &[u8; 32],
             epoch: u64,
             expiry_unix: u64,
+            resources: Option<&GuestResources>,
+            components: Option<&GuestComponents>,
         ) -> Result<Vec<u8>, TickError> {
             if self.fail_post {
                 return Err(TickError::KeepalivePost);
@@ -212,6 +268,8 @@ mod tests {
                 *kbs_nonce,
                 epoch,
                 expiry_unix,
+                resources.copied(),
+                components.copied(),
             )));
             Ok(self.post_response.clone())
         }
@@ -232,6 +290,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let kbs = StubKbs::ok([0x42; 32]);
@@ -246,6 +306,10 @@ mod tests {
         // expiry is now + 600s; bounded by the test wall clock, so
         // just verify it's strictly after the file's epoch alone.
         assert!(post.5 > 1_700_000_000);
+        assert_eq!(
+            post.6, None,
+            "no resources unless the measured cmdline asks"
+        );
 
         // The mock provider captured the REPORT_DATA the keepalive
         // built — assert it matches the canonical helper, NOT the
@@ -255,6 +319,128 @@ mod tests {
         let expected =
             hippius_types::report_data::live_attestation(&[0x42; 32], "vm-test").unwrap();
         assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn run_once_attests_the_resources_it_read() {
+        let f = epoch_file_with("42");
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        std::fs::create_dir_all(p.join("sys/devices/system/cpu")).unwrap();
+        std::fs::write(p.join("sys/devices/system/cpu/online"), "0-1\n").unwrap();
+        std::fs::create_dir_all(p.join("proc")).unwrap();
+        std::fs::write(p.join("proc/meminfo"), "MemTotal:        7900000 kB\n").unwrap();
+        let inputs = TickInputs {
+            vm_id: "vm-test",
+            node_id: &[0xBB; 32],
+            epoch_file: f.path(),
+            expiry_offset_secs: 600,
+            resources_root: Some(p),
+            components: None,
+        };
+        let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
+        let kbs = StubKbs::ok([0x42; 32]);
+        run_once(&inputs, &provider, &kbs).expect("keepalive with resources");
+
+        let want = GuestResources {
+            vcpus_online: 2,
+            mem_firmware_kib: 0,
+            mem_total_kib: 7_900_000,
+            mem_unaccepted_kib: 0,
+        };
+        let post = kbs.last_post.lock().unwrap().borrow().clone().unwrap();
+        assert_eq!(post.6, Some(want), "the request carries what was read");
+        // …and the report binds the SAME values, so the KBS can check them.
+        let expected = hippius_types::report_data::live_attestation_with_resources(
+            &[0x42; 32],
+            "vm-test",
+            &want,
+        )
+        .unwrap();
+        assert_eq!(provider.captured_report_data().unwrap(), expected);
+    }
+
+    #[test]
+    fn run_once_attests_the_components_with_and_without_resources() {
+        use crate::components::{ComponentsProbe, ComponentsTracker};
+        let f = epoch_file_with("42");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("record"),
+            "version=2\nsecurity_epoch=1\ncommit=c\nmounted=yes\n",
+        )
+        .unwrap();
+        let probe = ComponentsProbe {
+            record: dir.path().join("record"),
+            release_bin: dir.path().join("no-bin"),
+            self_exe: dir.path().join("no-exe"),
+            systemctl: dir.path().join("no-systemctl"),
+            timeout: std::time::Duration::from_secs(1),
+        };
+        let tracker = ComponentsTracker::new(probe, 9);
+        let mut want = GuestComponents {
+            release_version: 2,
+            security_epoch: 1,
+            health: hippius_types::live_attestation::components_health::MOUNTED,
+            instance: 9,
+            unhealthy_ticks: 0,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        std::fs::create_dir_all(p.join("sys/devices/system/cpu")).unwrap();
+        std::fs::write(p.join("sys/devices/system/cpu/online"), "0-1\n").unwrap();
+        std::fs::create_dir_all(p.join("proc")).unwrap();
+        std::fs::write(p.join("proc/meminfo"), "MemTotal:        7900000 kB\n").unwrap();
+        let resources = GuestResources {
+            vcpus_online: 2,
+            mem_firmware_kib: 0,
+            mem_total_kib: 7_900_000,
+            mem_unaccepted_kib: 0,
+        };
+        for (root, expect_resources) in [(None, None), (Some(p), Some(resources))] {
+            let inputs = TickInputs {
+                vm_id: "vm-test",
+                node_id: &[0xBB; 32],
+                epoch_file: f.path(),
+                expiry_offset_secs: 600,
+                resources_root: root,
+                components: Some(&tracker),
+            };
+            let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
+            let kbs = StubKbs::ok([0x42; 32]);
+            run_once(&inputs, &provider, &kbs).expect("keepalive with components");
+            // Only MOUNTED passes: every tick latches a failure.
+            want.unhealthy_ticks += 1;
+            let post = kbs.last_post.lock().unwrap().borrow().clone().unwrap();
+            assert_eq!((post.6, post.7), (expect_resources, Some(want)));
+            let expected = hippius_types::report_data::live_attestation_with_components(
+                &[0x42; 32],
+                "vm-test",
+                &want,
+                expect_resources.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(provider.captured_report_data().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unreadable_resources_fail_the_tick_before_a_nonce_is_spent() {
+        let f = epoch_file_with("42");
+        let empty = tempfile::tempdir().unwrap();
+        let inputs = TickInputs {
+            vm_id: "vm-test",
+            node_id: &[0xBB; 32],
+            epoch_file: f.path(),
+            expiry_offset_secs: 600,
+            resources_root: Some(empty.path()),
+            components: None,
+        };
+        let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
+        let mut kbs = StubKbs::ok([0x42; 32]);
+        kbs.fail_nonce = true; // would surface as NonceFetch if reached
+        let err = run_once(&inputs, &provider, &kbs).unwrap_err();
+        assert!(matches!(err, TickError::Resources(_)), "{err:?}");
     }
 
     #[test]
@@ -268,6 +454,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let kbs = StubKbs::ok([0x42; 32]);
@@ -298,6 +486,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let kbs = StubKbs::ok([0x42; 32]);
@@ -318,6 +508,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let mut kbs = StubKbs::ok([0x42; 32]);
@@ -339,6 +531,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let mut kbs = StubKbs::ok([0x42; 32]);
@@ -355,6 +549,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let mut kbs = StubKbs::ok([0x42; 32]);
@@ -370,6 +566,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: std::path::Path::new("/dev/null/no-such-file"),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let kbs = StubKbs::ok([0x42; 32]);
@@ -385,6 +583,8 @@ mod tests {
             node_id: &[0xBB; 32],
             epoch_file: f.path(),
             expiry_offset_secs: 600,
+            resources_root: None,
+            components: None,
         };
         let provider = MockSnpReportProvider::new(vec![0xAA; SNP_REPORT_LEN]);
         let kbs = StubKbs::ok([0x42; 32]);

@@ -54,7 +54,7 @@ pub fn build_router(svc: Arc<kbs_transport::DefaultKbsService>) -> Router {
 /// failing the whole start on.
 async fn spawn_admin_listener(
     cfg: &Config,
-    wired: &crate::wiring::WiredKbs,
+    wired: &mut crate::wiring::WiredKbs,
 ) -> Result<Option<tokio::task::JoinHandle<std::io::Result<()>>>, Error> {
     let Some(admin_cfg) = cfg.admin.as_ref() else {
         eprintln!(
@@ -72,9 +72,9 @@ async fn spawn_admin_listener(
         }
         AdminListenerMode::PlaintextOptIn => {
             eprintln!(
-                "kbs-server: WARNING — admin.require_mtls=false and no admin TLS material: the \
-                 lifecycle admin API on {} is served UNAUTHENTICATED (network policy is the only \
-                 control). Issue the admin PKI and set require_mtls=true.",
+                "kbs-server: WARNING — admin.dev_allow_plaintext=true and no admin TLS material: \
+                 the lifecycle admin API on {} is served UNAUTHENTICATED (network policy is the \
+                 only control). DEV ONLY — never in production.",
                 admin_cfg.addr
             );
             None
@@ -82,7 +82,8 @@ async fn spawn_admin_listener(
         AdminListenerMode::Refuse(why) => {
             eprintln!(
                 "kbs-server: REFUSING to serve the admin listener on {} — {why}; the lifecycle \
-                 admin API stays CLOSED (set admin.require_mtls=false to serve it in plaintext \
+                 admin API stays CLOSED (DEV ONLY: admin.require_mtls=false AND \
+                 admin.dev_allow_plaintext=true, with no TLS material, serves it in plaintext \
                  behind network policy alone)",
                 admin_cfg.addr
             );
@@ -93,12 +94,53 @@ async fn spawn_admin_listener(
     let admin_state = build_admin_state(
         cfg,
         Arc::clone(&wired.l1_keyring),
+        Arc::clone(&wired.service.kbs_signing_key),
         Arc::clone(&wired.vm_states),
         Arc::clone(&wired.allowlist),
         Arc::clone(&wired.boot_counter),
         Arc::clone(&wired.volume_stamp),
+        wired.custody.clone(),
+        Arc::clone(&wired.keepalive_bindings),
+        Arc::clone(&wired.release_audit),
     )?;
+    // The release path records the authorized-rollback events it owns
+    // (consume / refused / cleared) in the SAME admin hash chain as the
+    // arm that authorised them.
+    wired
+        .service
+        .set_rollback_audit(Arc::clone(&admin_state.audit));
+    // A process restart INSIDE the pod (the state emptyDir survives it)
+    // can leave an authorized rollback whose stamp step was applied but
+    // never delivered. Revert every such record whose arm is gone before
+    // serving, audited in the admin chain. (Every release also reconciles
+    // its own VM first, so this is housekeeping, not the only guard.)
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::Serve(format!("clock: {e}")))?
+        .as_secs();
+    for (vm, outcome) in kbs_core::rollback::reconcile_all_pending(
+        wired.boot_counter.as_ref(),
+        wired.volume_stamp.as_ref(),
+        Some(admin_state.audit.as_ref()),
+        now_unix,
+    )
+    .map_err(|e| Error::Serve(format!("rollback reconcile: {e}")))?
+    {
+        eprintln!("kbs-server: pending rollback of vm_id={vm} at startup: {outcome:?}");
+    }
     let admin_app = build_admin_router(admin_state);
+    let allowed_identities = Arc::new(admin_cfg.allowed_client_identities.clone());
+    if tls.is_some() {
+        eprintln!(
+            "kbs-server: admin client identities allowed: {}",
+            admin_cfg
+                .allowed_client_identities
+                .iter()
+                .map(|i| i.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let admin_listener = tokio::net::TcpListener::bind(admin_cfg.addr)
         .await
         .map_err(|e| Error::Serve(format!("admin bind {}: {e}", admin_cfg.addr)))?;
@@ -112,8 +154,14 @@ async fn spawn_admin_listener(
     );
     Ok(Some(match tls {
         Some(acceptor) => tokio::spawn(async move {
-            admin_tls::serve_admin_mtls(admin_listener, acceptor, admin_app, shutdown_signal())
-                .await;
+            admin_tls::serve_admin_mtls(
+                admin_listener,
+                acceptor,
+                admin_app,
+                allowed_identities,
+                shutdown_signal(),
+            )
+            .await;
             Ok::<(), std::io::Error>(())
         }),
         None => tokio::spawn(async move {
@@ -128,7 +176,7 @@ async fn spawn_admin_listener(
 /// SIGINT.
 pub async fn run(cfg: Config, vault_token: Zeroizing<String>) -> Result<(), Error> {
     // Wiring (stores opened, audit log locked) happens before any bind.
-    let wired = build_service(&cfg, vault_token)?;
+    let mut wired = build_service(&cfg, vault_token)?;
 
     let listener = tokio::net::TcpListener::bind(cfg.listen.addr)
         .await
@@ -138,7 +186,7 @@ pub async fn run(cfg: Config, vault_token: Zeroizing<String>) -> Result<(), Erro
     // Optionally bind the admin listener on a SEPARATE port. The
     // admin path mutates lifecycle state; isolating it from the
     // public-Ingress release path is a §13 attack-surface gate.
-    let admin_handle = spawn_admin_listener(&cfg, &wired).await?;
+    let admin_handle = spawn_admin_listener(&cfg, &mut wired).await?;
 
     // Built last so `wired` is still whole for the admin wiring above
     // (`wired.service` moves here).

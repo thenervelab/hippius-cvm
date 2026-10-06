@@ -68,7 +68,7 @@ impl Ephemeral {
     ///
     /// The only intended call site is
     /// [`crate::stages::verify::verify_and_unwrap`].
-    pub(crate) fn into_secret(self) -> Box<Zeroizing<[u8; 32]>> {
+    pub fn into_secret(self) -> Box<Zeroizing<[u8; 32]>> {
         self.secret
     }
 }

@@ -8,12 +8,16 @@
 # no `grub_cmdline_forbidden` token (iommu=pt) remains. The reboot is
 # handler-gated on an actual change — a second run is a zero-diff
 # no-op. (No private-segment assumption here — a miner has a public IP only.)
+#
+# Last, with SEV-SNP confirmed on, it asserts no CPU is offline: an
+# offline CPU breaks SNP_DF_FLUSH (see smt-runtime-off-retire.yml).
 
 - name: Read the current GRUB_CMDLINE_LINUX
   ansible.builtin.shell:
     cmd: grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub | head -1
   register: miner_grub_line_raw
   changed_when: false
+  check_mode: false
 
 - name: Parse the current cmdline tokens
   ansible.builtin.set_fact:
@@ -86,3 +90,49 @@
         - BIOS: SEV Control + SNP Memory (RMP Table) Coverage Enabled
         - dmesg: 'kvm_amd: SEV-SNP enabled'
         - /proc/cmdline has kvm_amd.sev_snp=1 and NOT iommu=pt
+
+- name: List the present CPUs that are offline
+  # Not /sys/devices/system/cpu/offline: that is possible - online, so it
+  # also lists hotplug slots no CPU sits in. A cpuN directory exists for
+  # each PRESENT CPU; cpu0 often has no `online` file (not hot-pluggable).
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      for f in /sys/devices/system/cpu/cpu[0-9]*/online; do
+        [ -e "$f" ] || continue
+        if [ "$(cat "$f")" = 0 ]; then
+          d=${f%/online}
+          echo "${d##*/}"
+        fi
+      done
+    executable: /bin/bash
+  register: miner_cpus_offline
+  changed_when: false
+  check_mode: false
+
+- name: Read the SMT control state
+  ansible.builtin.slurp:
+    src: /sys/devices/system/cpu/smt/control
+  register: miner_smt_control
+  failed_when: false
+
+- name: Assert no CPU is offline on the SEV-SNP host
+  # The firmware refuses SNP_DF_FLUSH (WBINVD_REQUIRED, error 0xe) while a
+  # CPU it counted at SNP_INIT is offline, so ASIDs stop being recycled
+  # and every CVM launch fails with EBUSY after ~99 launches since boot.
+  # The v5 heartbeat reports it on a live host (`cpus_offline`, alert
+  # MinerSnpCpusOffline); this stops a host from being provisioned so.
+  ansible.builtin.assert:
+    that:
+      - miner_cpus_offline.stdout_lines | length == 0
+    fail_msg: |
+      {{ miner_cpus_offline.stdout_lines | length }} CPU(s) offline on an SEV-SNP host
+      ({{ miner_cpus_offline.stdout_lines | join(' ') }};
+      smt/control = {{ (miner_smt_control.content | default('') | b64decode | trim) or 'unreadable' }}).
+      Offlining CPUs breaks SNP DF_FLUSH: after one ASID pool of launches
+      the host refuses every new CVM until it reboots.
+      To run without SMT, disable it in the BIOS (AMD CBS > CPU Common
+      Options > CCD/Core/Thread Enablement > SMT Control = Disable) and
+      remove whatever offlines CPUs at runtime: a hippius-smt-off-like
+      unit, `nosmt` or `maxcpus=` on the kernel cmdline, or a write to
+      /sys/devices/system/cpu/smt/control. Then reboot.

@@ -21,14 +21,14 @@ A wrapper Helm chart, same convention as the PR-K3 / PR-K11 addons
 | --- | --- |
 | Prometheus + Operator | metric ingest + service discovery (CRD-driven) |
 | Alertmanager | route alerts → Slack (operators channel + deadmans channel) |
-| Grafana | dashboards UI, fronted by NetBird-only Ingress at `grafana.hippius.network` |
+| Grafana | dashboards UI, fronted by NetBird-only Ingress at `grafana.example.com` |
 | `kube-state-metrics`, `node-exporter`, `kubelet` ServiceMonitors | cluster-wide pod / node / volume metrics — the chart wires these out of the box |
 | `ServiceMonitor` for ingress-nginx | scrape the controller's built-in exporter (enabled in the sibling addon's values.yaml in this PR) |
 | `PrometheusRule/hippius-critical` | the first tier of Hippius-specific alerts (ingress 5xx spike, watchdog heartbeat) |
 | `ConfigMap/hippius-dashboard-stack-overview` | the "morning-coffee" panoramic dashboard, sidecar-imported |
 | `ExternalSecret/grafana-admin` | Grafana admin pw from Vault |
 | `ExternalSecret/alertmanager-config` | full Alertmanager config (Slack webhook URL) from Vault |
-| `Ingress/grafana` | `grafana.hippius.network` — NetBird CGNAT only, cert-manager TLS |
+| `Ingress/grafana` | `grafana.example.com` — NetBird CGNAT only, cert-manager TLS |
 
 ## What is NOT in this PR (deferred follow-ups, all tracked under #128)
 
@@ -111,7 +111,7 @@ curl -s 'http://localhost:9090/api/v1/query?query=up' | jq '.data.result[] | {jo
 curl -s 'http://localhost:9090/api/v1/query?query=ALERTS{alertname="HippiusObservabilityWatchdog"}' | jq '.data.result'
 
 # Grafana over NetBird
-open https://grafana.hippius.network  # log in with the Vault-provisioned admin pw
+open https://grafana.example.com  # log in with the Vault-provisioned admin pw
 ```
 
 A synthetic ingress-5xx alert can be triggered by `kubectl scale`-ing a

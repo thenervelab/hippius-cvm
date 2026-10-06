@@ -45,8 +45,13 @@ command() {           # shadow `command -v getfattr` → present
     if [ "${1:-}" = "-v" ] && [ "${2:-}" = "getfattr" ]; then echo getfattr; return 0; fi
     builtin command "$@"
 }
-getfattr() {          # report the lower "/" label
-    printf '%s' "${LOWER_ROOT_LABEL}"
+VAR_LIB_LABEL="system_u:object_r:var_lib_t:s0"
+getfattr() {          # report the lower "/" label, or /var/lib's
+    for _a in "$@"; do _path="${_a}"; done
+    case "${_path}" in
+        */var/lib) printf '%s' "${VAR_LIB_LABEL}" ;;
+        *)         printf '%s' "${LOWER_ROOT_LABEL}" ;;
+    esac
 }
 setfattr() {          # capture: name value target
     # args: -n security.selinux -v <label> <target>
@@ -77,15 +82,25 @@ hippius_die() { echo "hippius_die: $*" >&2; exit 1; }
 hippius_log() { :; }
 # Keep the anti-rollback gate inert here (its own gate is
 # scripts/dev/golden-stamp-test.sh): point both stamp paths at files that
-# cannot exist, so this SELinux-only test never reaches the gate or the
-# confirm binary even on a host where /run/hippius happens to be populated.
+# cannot exist, so this SELinux-only test never reaches the confirm binary
+# even on a host where /run/hippius happens to be populated. An M0 boot
+# REFUSES a release without a timeline transition, so hand it a
+# stay-on-zero transition and stub the v2 gate itself out.
 HIPPIUS_GOLDEN_STAMP_EXPECTED="${WORK}/no-such-expected"
 HIPPIUS_GOLDEN_STAMP_CTX="${WORK}/no-such-ctx"
+HIPPIUS_GOLDEN_STAMP_TRANSITION="${WORK}/transition"
+printf '%s %s\n' "${HIPPIUS_GOLDEN_ZERO_TIMELINE}" "${HIPPIUS_GOLDEN_ZERO_TIMELINE}" \
+    >"${HIPPIUS_GOLDEN_STAMP_TRANSITION}"
+hippius_golden_check_stamp_v2() { :; }
 
 run_case() {
     # $1 = "selinux" | "plain"
-    rm -rf "${HIPPIUS_GOLDEN_LOWER_MNT}" "${HIPPIUS_GOLDEN_UPPER_MNT}"
-    mkdir -p "${HIPPIUS_GOLDEN_LOWER_MNT}" "${HIPPIUS_GOLDEN_UPPER_MNT}"
+    # $2 = "keep" boots the volume + tenant root of the previous case again
+    if [ "${2:-}" != keep ]; then
+        rm -rf "${HIPPIUS_GOLDEN_LOWER_MNT}" "${HIPPIUS_GOLDEN_UPPER_MNT}" "${WORK}/sysroot"
+        # The mocked overlay leaves the tenant root empty: give it /var/lib.
+        mkdir -p "${HIPPIUS_GOLDEN_LOWER_MNT}/var/lib" "${HIPPIUS_GOLDEN_UPPER_MNT}" "${WORK}/sysroot/var/lib"
+    fi
     if [ "$1" = "selinux" ]; then
         mkdir -p "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux"
         : >"${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux/config"
@@ -110,6 +125,22 @@ case "${opts_selinux}" in
         ok "SELinux base overlay mount options unchanged (no rootcontext)" ;;
     *)  err "SELinux base overlay opts unexpected (opts='${opts_selinux}')" ;;
 esac
+
+# #1347: the new data/ directory and its mount point in the tenant root are
+# labelled like /var/lib (not left unlabeled_t under enforcing) …
+if grep -q "^${VAR_LIB_LABEL}	${HIPPIUS_GOLDEN_UPPER_MNT}/data$" "${SETFATTR_LOG}" \
+   && grep -q "^${VAR_LIB_LABEL}	${WORK}/sysroot/var/lib/hippius-data$" "${SETFATTR_LOG}"; then
+    ok "SELinux base labels data/ and ${HIPPIUS_GOLDEN_DATA_MOUNT} like /var/lib"
+else
+    err "SELinux base did not label the data path like /var/lib (log='$(cat "${SETFATTR_LOG}")')"
+fi
+# … once: a later boot never overwrites a label the tenant may have set.
+run_case selinux keep
+if grep -q -e "hippius-data$" -e "/data$" "${SETFATTR_LOG}"; then
+    err "a second boot relabelled the data path (log='$(cat "${SETFATTR_LOG}")')"
+else
+    ok "a second boot leaves the data path's label alone"
+fi
 
 # ── Case 2: no SELinux (Debian/Ubuntu) → NO setfattr, byte-identical ─────
 run_case plain

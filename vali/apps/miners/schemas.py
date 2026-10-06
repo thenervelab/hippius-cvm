@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from .models import SnpGeneration
+
 
 class MinerRegisterRequestSerializer(serializers.Serializer):
     """`POST /v1/admin/miner/register` body — one miner identity.
@@ -18,7 +20,7 @@ class MinerRegisterRequestSerializer(serializers.Serializer):
     """
 
     miner_id = serializers.CharField(
-        max_length=64, help_text="Human-readable primary key, e.g. `miner-1`."
+        max_length=64, help_text="Human-readable primary key, e.g. `miner-a`."
     )
     pubkey_hex = serializers.CharField(
         max_length=64,
@@ -48,6 +50,19 @@ class MinerRegisterRequestSerializer(serializers.Serializer):
             "the operator supplies it."
         ),
     )
+    snp_generation = serializers.ChoiceField(
+        choices=SnpGeneration.values,
+        required=False,
+        allow_null=True,
+        help_text=(
+            "SEV-SNP CPU generation — selects the launch-digest vCPU model. "
+            "Omit / null ⇒ inferred from the CHIP_ID length (8 bytes ⇒ "
+            "turin, 64 ⇒ genoa). REQUIRED for Milan (its 64-byte CHIP_ID "
+            "is indistinguishable from Genoa's). Must agree with the "
+            "platform_id length (400 otherwise). Backfillable from null; "
+            "a different stored value is a 409."
+        ),
+    )
 
 
 class TelemetrySourceRefSerializer(serializers.Serializer):
@@ -66,6 +81,10 @@ class MinerIdentitySerializer(serializers.Serializer):
     netbird_peer_id = serializers.CharField(allow_blank=True)
     netbird_ip = serializers.IPAddressField(allow_null=True)
     chain_node_id = serializers.CharField(allow_null=True)
+    snp_generation = serializers.CharField(
+        allow_null=True,
+        help_text="`milan` | `genoa` | `turin`, or null (inferred from the CHIP_ID length).",
+    )
     status = serializers.CharField(help_text="`active` | `quarantined`.")
     registered_at = serializers.DateTimeField()
     last_seen_at = serializers.DateTimeField(allow_null=True)

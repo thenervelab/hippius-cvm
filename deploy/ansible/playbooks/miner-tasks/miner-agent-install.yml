@@ -35,6 +35,7 @@
   register: miner_agent_version_check
   failed_when: false
   changed_when: false
+  check_mode: false
 
 - name: Set whether the miner-agent binary needs (re)building
   ansible.builtin.set_fact:
@@ -162,7 +163,122 @@
     mode: "0755"
   when: miner_agent_build_needed | bool
 
+# ── Host attestor components ────────────────────────────────────────
+# Rendered into [host_attestor] from `snp_generation` (host_vars). A
+# miner without it would render no attestor, never attest, and — with
+# vali's host-attestor gate enforced — never receive a VM, so it is
+# required. The files are staged by the operator (see
+# `miner_host_attestor` in group_vars); a missing or different file is a
+# hard stop here, because the agent would otherwise retry the launch
+# forever against a digest mismatch and the host would never attest.
+- name: Assert snp_generation names a known host-attestor measurement
+  ansible.builtin.assert:
+    that:
+      - snp_generation is defined
+      - snp_generation in miner_host_attestor.measurements
+    fail_msg: >-
+      Set `snp_generation` in host_vars to one of
+      {{ miner_host_attestor.measurements.keys() | list }} (the host's AMD
+      EPYC generation: 7003=milan, 9004=genoa, 9005=turin); got
+      {{ snp_generation | default('(unset)') }}.
+
+- name: Stat the staged host-attestor components
+  ansible.builtin.stat:
+    path: "{{ miner_host_attestor.dir }}/{{ item.file }}"
+    checksum_algorithm: sha256
+  loop:
+    - { file: ovmf.fd, sha256: "{{ miner_host_attestor.ovmf_sha256 }}" }
+    - { file: linux.bin, sha256: "{{ miner_host_attestor.kernel_sha256 }}" }
+    - { file: initrd.bin, sha256: "{{ miner_host_attestor.initrd_sha256 }}" }
+  loop_control:
+    label: "{{ item.file }}"
+  register: miner_ha_files
+  when: snp_generation is defined
+
+- name: Refuse host-attestor components that are missing or not the pinned ones
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.checksum == item.item.sha256
+    fail_msg: >-
+      {{ miner_host_attestor.dir }}/{{ item.item.file }} is missing or does
+      not match its pinned sha256 ({{ item.item.sha256 }}). Stage the
+      host-attestor components before this play.
+  loop: "{{ miner_ha_files.results }}"
+  loop_control:
+    label: "{{ item.item.file }}"
+  when: snp_generation is defined
+
 # ── Config ──────────────────────────────────────────────────────────
+- name: Assert the CVM budget inputs before deriving the budget
+  # Jinja's `int` turns a typo into 0 — which would REMOVE the reserve and
+  # raise the budget. Refuse anything that is not a plain integer in range,
+  # including a host_vars `host_cvm` that replaced the group policy.
+  ansible.builtin.assert:
+    that:
+      - (host_cvm.cpu_ratio_pct | string) is match('^[0-9]+$')
+      - (host_cvm.reserve_cpus | string) is match('^[0-9]+$')
+      - (host_cvm.reserve_memory_mb | string) is match('^[0-9]+$')
+      - host_cvm.cpu_ratio_pct | int >= 100
+      - host_cvm.cpu_ratio_pct | int <= 400
+      - host_cvm.reserve_cpus | int >= 2
+      - host_cvm.reserve_memory_mb | int >= 8192
+      - ansible_processor_vcpus | int > host_cvm.reserve_cpus | int
+      - ansible_memtotal_mb | int > host_cvm.reserve_memory_mb | int
+      - (host_cvm_overrides | default({})).values() | map('string') | select('match', '^[0-9]+$') | list | length == (host_cvm_overrides | default({})) | length
+    fail_msg: >-
+      host_cvm must be integers with cpu_ratio_pct 100..400, reserve_cpus >= 2,
+      reserve_memory_mb >= 8192 (got {{ host_cvm }}); host_cvm_overrides values
+      must be integers (got {{ host_cvm_overrides | default({}) }}).
+
+- name: Find the filesystem that holds the tenant data-disk root
+  # The longest `ansible_mounts` mount point that is a path prefix of
+  # `miner_data_disk_root` — the root itself is usually a directory, not a
+  # mount point. Play 05 has already created it under its real mount.
+  ansible.builtin.set_fact:
+    miner_data_fs_mount: >-
+      {%- set ns = namespace(mount='') -%}
+      {%- set root = miner_data_disk_root.rstrip('/') ~ '/' -%}
+      {%- for m in ansible_mounts -%}
+      {%-   if root.startswith(m.mount.rstrip('/') ~ '/') and m.mount | length > ns.mount | length -%}
+      {%-     set ns.mount = m.mount -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.mount }}
+
+- name: Derive the tenant disk budget from the data filesystem size
+  ansible.builtin.set_fact:
+    miner_data_fs_gb: >-
+      {{ (ansible_mounts | selectattr('mount', 'equalto', miner_data_fs_mount)
+          | map(attribute='size_total') | first | default(0) | int) // 1073741824 }}
+
+- name: Assert the disk budget inputs
+  # Same fail-loud rule as the CPU/RAM inputs: a typo'd reserve must never
+  # turn into 0 and hand the whole filesystem to tenants.
+  ansible.builtin.assert:
+    that:
+      - (host_cvm.reserve_disk_gb | string) is match('^[0-9]+$')
+      - host_cvm.reserve_disk_gb | int >= 50
+      - miner_data_fs_mount | length > 0
+      - miner_data_fs_gb | int > host_cvm.reserve_disk_gb | int
+    fail_msg: >-
+      host_cvm.reserve_disk_gb must be an integer >= 50 (got
+      {{ host_cvm.reserve_disk_gb | default('unset') }}), and the filesystem
+      holding {{ miner_data_disk_root }} ({{ miner_data_fs_mount | default('not found', true) }},
+      {{ miner_data_fs_gb }} GiB) must be larger than it.
+
+- name: Assert the v5 heartbeat is only asked for on top of v4
+  # The agent refuses `schema_host_health` without `schema_disk` and
+  # would not start; say so here instead.
+  ansible.builtin.assert:
+    that:
+      - not (miner_heartbeat_schema_host_health | default(false) | bool)
+        or (miner_heartbeat_schema_disk | default(false) | bool)
+    fail_msg: >-
+      miner_heartbeat_schema_host_health needs miner_heartbeat_schema_disk:
+      the v5 heartbeat is the v4 body plus the host-health fields, and the
+      agent refuses the config otherwise.
+
 - name: Render the miner-agent config
   ansible.builtin.template:
     # Explicit playbook-relative path — unambiguous regardless of the
@@ -205,13 +321,14 @@
   # (#510) rejects a miner whose platform_id is not real 128-hex.
   # Reading it from hardware (host /dev/sev GET_ID) instead of letting
   # the operator hand-type a label removes the placeholder-CHIP_ID bug
-  # that left cc-miner-2/3 un-schedulable.
+  # that once left hosts un-schedulable.
   ansible.builtin.command:
     argv:
       - "{{ miner_agent.install_path }}"
       - "platform-id"
   register: miner_platform_id
   changed_when: false
+  check_mode: false
 
 - name: "OPERATOR ACTION — register this miner with vali"
   # `--print-pubkey` prints ONLY the 64-hex public key to stdout (the
@@ -239,7 +356,49 @@
       VMs on it (the dispatchability gate requires a complete identity).
       ============================================================
 
+- name: "OPERATOR ACTION — the same block as ONE JSON (paste into the console)"
+  # The console's compute-miner onboarding (Dashboard → Compute miners →
+  # Continue setup) takes this object as-is, then the JSON printed by
+  # `hippius-miner-agent sign-registration --family 0x… --child 0x… --nonce N`
+  # (the family/child hex the console showed at preparation). Same values
+  # as above; a second rendering so nothing is re-typed by hand.
+  ansible.builtin.debug:
+    msg: "{{ {'miner_id': inventory_hostname,
+              'node_id': miner_identity_init.stdout,
+              'platform_id': miner_platform_id.stdout,
+              'netbird_ip': miner_netbird_ip | default('')} | to_json }}"
+
 # ── systemd unit ────────────────────────────────────────────────────
+# The [storage] roots must be writable to the agent: with
+# ProtectSystem=strict below, a root outside the state dir is read-only
+# and every launch fails (`overlay-disk/mkdir`, `data-disk/mkdir` or
+# `state-disk/mkdir`), so the unit lists them in ReadWritePaths. They are
+# NOT created here: a root meant to be a dedicated mount that is not
+# mounted yet would silently put VM disks on the system disk, hidden
+# later by the mount. Mount (or create) them before the play.
+- name: Stat the [storage] roots
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ miner_storage_roots }}"
+  register: miner_storage_root_stat
+  vars:
+    miner_storage_roots: "{{ [miner_data_disk_root, miner_state_disk_root] | unique(case_sensitive=True) }}"
+
+- name: Refuse a [storage] root that is missing, not a directory, or unusable in a unit
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - item.item is match('^/[^\s]*$')
+    fail_msg: >-
+      [storage] root {{ item.item }} must be an existing absolute directory
+      without whitespace (systemd ReadWritePaths is space-separated).
+      Mount or create it before running this play.
+    quiet: true
+  loop: "{{ miner_storage_root_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
 - name: Install the miner-agent systemd unit
   ansible.builtin.copy:
     dest: "/etc/systemd/system/{{ miner_agent.systemd_unit_name }}.service"
@@ -249,9 +408,18 @@
     content: |
       [Unit]
       Description=Hippius miner-agent
+      # Soft dependencies ONLY (Wants= + After=), never Requires= /
+      # BindsTo= / PartOf=: with a hard one, stopping or restarting
+      # netbird or libvirtd (a netbird apt upgrade, a libvirt postinst,
+      # an operator restart) STOPS the agent too — and a stopped agent
+      # is one config slip (skip_shutdown_teardown) away from tearing
+      # down every tenant domain. The agent tolerates both being down:
+      # libvirt is driven by one `virsh` process per operation (the
+      # reboot-watcher's `virsh event` respawns on exit), and a NetBird
+      # outage only fails the orders bind at START, which Restart=
+      # retries until the mesh address is back.
       After=network-online.target libvirtd.service netbird.service
-      Wants=network-online.target
-      Requires=libvirtd.service netbird.service
+      Wants=network-online.target libvirtd.service netbird.service
 
       [Service]
       Type=simple
@@ -266,7 +434,7 @@
       # network; it needs no raw devices and no kernel tunables.
       ProtectSystem=strict
       ProtectHome=true
-      ReadWritePaths={{ miner_agent.state_dir }}
+      ReadWritePaths={{ [miner_agent.state_dir, miner_data_disk_root, miner_state_disk_root] | unique(case_sensitive=True) | join(' ') }}
       NoNewPrivileges=true
       PrivateTmp=true
       PrivateDevices=true
@@ -300,12 +468,15 @@
 # ── Auto-update (S3 channel) ────────────────────────────────────────
 # A systemd timer pulls the latest published miner-agent build from
 # Hippius S3 every ~15 min, sha256-verifies it, atomically installs it,
-# and rolls back on an unhealthy restart. ADDITIVE + INERT until the
-# operator publishes the first manifest (deploy/scripts/publish-miner-
-# agent.sh writes ${S3_BASE}/latest.json). Change-detection is sha256,
+# and rolls back on an unhealthy restart. The files are always installed;
+# the timer only runs when miner_auto_update_enabled is true (default
+# false — rollouts are a manual canary). Change-detection is sha256,
 # NOT --version (the agent's --version is a static 0.0.1 that is never
-# bumped). See miner-tasks/AUTO_UPDATE.md.
+# bumped). See miner-tasks/AUTO_UPDATE.md. Tagged `miner_auto_update` so
+# the switch can be applied alone (`--tags miner_auto_update`) without
+# re-running the rest of the agent install.
 - name: Install the miner-agent auto-update script
+  tags: [miner_auto_update]
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/miner-tasks/files/hippius-miner-update.sh"
     dest: /usr/local/bin/hippius-miner-update
@@ -314,6 +485,7 @@
     mode: "0755"
 
 - name: Render the auto-update env file
+  tags: [miner_auto_update]
   ansible.builtin.template:
     src: "{{ playbook_dir }}/miner-tasks/templates/auto-update.env.j2"
     dest: /etc/hippius-miner/auto-update.env
@@ -322,6 +494,7 @@
     mode: "0644"
 
 - name: Render the auto-update systemd service + timer units
+  tags: [miner_auto_update]
   ansible.builtin.template:
     src: "{{ playbook_dir }}/miner-tasks/templates/{{ item }}.j2"
     dest: "/etc/systemd/system/{{ item }}"
@@ -333,11 +506,13 @@
     - hippius-miner-update.timer
 
 - name: Enable + start the auto-update timer (gated on miner_auto_update_enabled)
+  tags: [miner_auto_update]
   # `daemon_reload` picks up the rendered units. The timer is only
   # enabled when auto-update is on; when disabled we stop+disable it so a
-  # previously-enabled miner is cleanly frozen.
+  # previously-enabled miner is cleanly frozen. Only the timer: the agent
+  # service (hippius-miner-agent.service) is never stopped here.
   ansible.builtin.systemd:
     name: hippius-miner-update.timer
-    enabled: "{{ miner_auto_update_enabled | default(true) | bool }}"
-    state: "{{ 'started' if (miner_auto_update_enabled | default(true) | bool) else 'stopped' }}"
+    enabled: "{{ miner_auto_update_enabled | default(false) | bool }}"
+    state: "{{ 'started' if (miner_auto_update_enabled | default(false) | bool) else 'stopped' }}"
     daemon_reload: true

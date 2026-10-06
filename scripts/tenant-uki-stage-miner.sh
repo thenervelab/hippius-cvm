@@ -470,7 +470,7 @@ remote_staging="${out_dir}.staging.$$"
 # to absolute via the earlier `[[ "${out_dir}" == /* ]]` check).
 out_dir_parent="$(dirname "${out_dir}")"
 log "preparing ${miner_host}:${remote_staging}"
-# Auto-chown is bounded to the designated staging root only (codex r2
+# Auto-chown is bounded to the designated staging root only (review r2
 # P2). An operator who points --out-dir at /etc, /root, or any other
 # application path is responsible for the perms themselves — we
 # refuse to silently rewrite ownership on a path the bootstrap does
@@ -535,7 +535,7 @@ log "  → sha=${remote_sha} (matches)"
 # `--dump-section` invocation we're using, so we route it to a
 # throwaway tempfile.
 #
-# WHY NOT `/dev/null`: binutils 2.45 (Ubuntu 24.04 Noble, miner-1)
+# WHY NOT `/dev/null`: binutils 2.45 (Ubuntu 24.04 Noble, a miner host)
 # refuses to write to `/dev/null` with `objcopy: /dev/null: file
 # truncated` (exit 1) — even though the named section IS written
 # correctly first. Binutils 2.42 (Debian Trixie, what the Packer
@@ -557,7 +557,7 @@ ssh_run "
     # default \`mktemp -t\` location (/tmp, typically tmpfs on miner
     # hosts). The transformed-copy can run to a few hundred MiB on a
     # tenant UKI and would otherwise risk exhausting a small tmpfs
-    # (gemini r1 Medium). The file lives only for this one ssh_run;
+    # (review r1 Medium). The file lives only for this one ssh_run;
     # the trap removes it before the remote shell exits, and the
     # parent stage dir is itself renamed away on the happy path's
     # atomic flip below.

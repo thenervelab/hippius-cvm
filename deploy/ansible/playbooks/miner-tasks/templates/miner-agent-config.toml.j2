@@ -64,12 +64,54 @@ s3_bucket = "{{ image.s3_bucket }}"
 # only if discovery failed); the port is `orders.port` from group_vars.
 bind_addr = "{{ miner_netbird_ip | default(orders_bind_ip) }}:{{ orders.port }}"
 
+{# CVM budget, derived from facts (group_vars `host_cvm`); the
+   miner-agent-install play asserts the inputs before rendering. Integer
+   arithmetic (ratio in hundredths) so the result matches vali's Decimal
+   math exactly. #}
+{% set _cvm_cpu = ((ansible_processor_vcpus | int) - (host_cvm.reserve_cpus | int)) * (host_cvm.cpu_ratio_pct | int) // 100 %}
+{% set _cvm_mem = (ansible_memtotal_mb | int) - (host_cvm.reserve_memory_mb | int) %}
+{% set _cvm_disk = (miner_data_fs_gb | int) - (host_cvm.reserve_disk_gb | int) %}
+{% set _ov = host_cvm_overrides | default({}) %}
 [host]
 # CPU / RAM the host allots to tenant CVMs — a deliberate RESERVATION
 # (headroom is kept for the host OS + miner-agent), not the full
 # machine. The lifecycle refuses any launch that would overcommit it.
-cvm_cpu_budget = {{ host_cvm.cpu_budget }}
-cvm_memory_mb_budget = {{ host_cvm.memory_mb_budget }}
+# Derived: ({{ ansible_processor_vcpus }} threads − {{ host_cvm.reserve_cpus }}) × {{ host_cvm.cpu_ratio_pct }}%
+# and {{ ansible_memtotal_mb }} MiB − {{ host_cvm.reserve_memory_mb }} (group_vars `host_cvm`).
+cvm_cpu_budget = {{ [_cvm_cpu, _ov.cpu_budget_max | default(_cvm_cpu) | int] | min }}
+cvm_memory_mb_budget = {{ [_cvm_mem, _ov.memory_mb_budget_max | default(_cvm_mem) | int] | min }}
+# Tenant DATA disk (GiB) the host commits to: the data disks + golden
+# overlays under `[storage] data_disk_root`. The agent refuses a launch
+# past it (507 insufficient-disk) and declares it to vali, which may only
+# use it to LOWER its own disk ledger. Independently, the agent always
+# refuses a disk the filesystem cannot physically hold.
+# Derived: {{ miner_data_fs_mount }} is {{ miner_data_fs_gb }} GiB − {{ host_cvm.reserve_disk_gb }} (group_vars `host_cvm`).
+cvm_disk_gb_budget = {{ [_cvm_disk, _ov.disk_gb_budget_max | default(_cvm_disk) | int] | min }}
+# Leave the tenant CVMs RUNNING when the agent stops: a `systemctl
+# restart`/upgrade is then transparent to tenants and the new process
+# re-adopts them at startup. Without it a graceful stop force-stops
+# EVERY domain on the host (tenants + host-attestor). Read once at
+# startup — a running agent keeps the value it started with.
+skip_shutdown_teardown = true
+
+[heartbeat]
+# Capacity v2: emit the v3 heartbeat (the [host] budgets above + the
+# SEV-ES ASID pool), which vali uses only as down-only clamps. Flip to
+# true ONLY after the vali verifier that accepts v3 is live.
+schema_capacity = {{ miner_heartbeat_schema_capacity | default(false) | bool | lower }}
+{% if miner_heartbeat_schema_disk | default(false) | bool %}
+# Storage-aware placement: emit the v4 heartbeat (v3 + disk budget and a
+# statvfs of the data/staging filesystems). Rendered only when enabled — an
+# agent older than the key refuses it.
+schema_disk = true
+{% endif %}
+{% if miner_heartbeat_schema_host_health | default(false) | bool %}
+# SEV-SNP host health: emit the v5 heartbeat (v4 + snp_enabled,
+# cpus_offline, snp_launches_since_boot, df_flush_failures) behind the
+# MinerSnpCpusOffline / MinerSevDfFlushFailing alerts. Needs schema_disk.
+# Rendered only when enabled — an agent older than the key refuses it.
+schema_host_health = true
+{% endif %}
 
 {% if miner_kbs_endpoint is defined %}
 [kbs]
@@ -90,6 +132,15 @@ endpoint = "{{ miner_kbs_endpoint }}"
 # receives its KEK — sits in its initramfs burning a core while libvirt
 # reports the domain as running. Nothing in the launch says "certificate".
 ca_cert = "{{ miner_kbs_ca_cert_file }}"
+{% endif %}
+{% if miner_kbs_custody_relay | default(false) | bool %}
+# Relay the guest custody-lease paths (bind/renew/rekey) to the KBS, rate
+# limited per VM. Off (absent) ⇒ the agent answers them `503
+# custody-disabled` itself. Only set this once the KBS serves the custody
+# routes, and only on agents new enough to know the key — `[kbs]` refuses
+# unknown fields, so an older agent would not start. `| bool` so that
+# `-e miner_kbs_custody_relay=false` (a non-empty STRING) stays off.
+custody_relay = true
 {% endif %}
 {% endif %}
 {% if miner_vali_lifecycle_url is defined %}
@@ -129,3 +180,28 @@ data_disk_root = "{{ miner_data_disk_root }}"
 # the file whose LOSS permanently bricks a VM (no counter ⇒ the KBS
 # refuses the KEK), so put it somewhere durable rather than somewhere fast.
 state_disk_root = "{{ miner_state_disk_root }}"
+
+# [backup]
+# HOST budget for the QEMU copies of live backups, bytes/s (0 = uncapped).
+# Each job gets an equal share per run slot (budget / 2), so concurrent
+# runs never exceed it together. The default, 384 MiB/s (402653184), is
+# 192 MiB/s per job — a 160 GiB disk in ~14 min — and leaves the host
+# storage headroom for the tenants. Left commented: an agent older than
+# the key refuses unknown config (`deny_unknown_fields`). To set it,
+# uncomment BOTH the `[backup]` header and the key — the key alone lands
+# in `[storage]` above, and the agent refuses to start.
+# host_speed_bytes_per_sec = 402653184
+{% if snp_generation is defined %}
+
+[host_attestor]
+# The measured blackbox SNP guest (see `miner_host_attestor` in
+# group_vars/miner_nodes.yml). The agent recomputes the launch digest
+# from these files and refuses to launch unless it equals
+# `measurement_sha256` — the {{ snp_generation }} entry.
+enabled = true
+ovmf_path = "{{ miner_host_attestor.dir }}/ovmf.fd"
+kernel_path = "{{ miner_host_attestor.dir }}/linux.bin"
+initrd_path = "{{ miner_host_attestor.dir }}/initrd.bin"
+cmdline = "{{ miner_host_attestor.cmdline }}"
+measurement_sha256 = "{{ miner_host_attestor.measurements[snp_generation] }}"
+{% endif %}

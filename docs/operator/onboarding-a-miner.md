@@ -40,15 +40,43 @@ any of it will refuse to bootstrap rather than half-work.
 |---|---|
 | **AMD EPYC with SEV-SNP** (x86_64) | `06-miner-bootstrap.yml` play 00 asserts `ansible_architecture == x86_64` and `AMD` in `ansible_processor` |
 | **SEV-SNP enabled in firmware** — "SEV Control" **and** "SNP Memory (RMP Table) Coverage" | play 01 asserts `/sys/module/kvm_amd/parameters/sev_snp == Y` after reboot |
-| **Ubuntu**, a release in `miner_supported_ubuntu_versions` | play 00 |
+| **Ubuntu 26.04** (or 25.10, end of life) — a release whose distro libvirt >= 10.5 and QEMU >= 9.1 can boot an SNP guest. **Not 24.04** (libvirt 10.0 / QEMU 8.2): upgrade it in place first | play 00 asserts the release is in `miner_supported_ubuntu_versions` AND that the libvirt/QEMU apt resolves to meet the minimum; play 02 re-checks the installed versions |
+| **No CPU offlined at runtime.** SMT may stay on. To run without it, disable it in the BIOS (AMD CBS > CPU Common Options > CCD/Core/Thread Enablement > SMT Control = Disable), never with `nosmt`, `maxcpus=`, `smt/control` or a unit that offlines CPUs: the firmware then refuses `SNP_DF_FLUSH` (error `0xe`) and the host stops launching VMs after ~99 launches since boot | play 01 removes `hippius-smt-off.service` if present and asserts no present CPU is offline once SEV-SNP is on; with `miner_heartbeat_schema_host_health: true` (off by default until the fleet's agents know the key; renders `[heartbeat] schema_host_health = true`) the v5 heartbeat reports the same count as `cpus_offline` (alert `MinerSnpCpusOffline`) |
 | **Kernel ≥ 6.11** (`linux-generic-hwe-*` if the GA kernel is older) | play 00 |
-| **NVMe storage**, unpartitioned if you dedicate disks to tenant data | play 00 asserts every `nvme_data_devices` entry is a block device carrying no partition table and no signature other than `crypto_LUKS` |
+| **NVMe storage** recommended, unpartitioned if you dedicate disks to tenant data (a host with only a system disk works: leave `nvme_*` empty — but a rotational disk makes first boot slow, see the Milan row below) | play 00 asserts every `nvme_data_devices` entry is a block device carrying no partition table and no signature other than `crypto_LUKS` |
 | **Outbound internet** + inbound `22/tcp` and `51820/udp` | play 07 configures UFW to allow exactly those, plus everything on the mesh interface `wt0` |
 
 Get the firmware settings confirmed **in writing by the datacentre
 before you pay**. A machine with SEV-SNP fused off or firmware-disabled
 is not recoverable remotely and is the single most common way this goes
 wrong.
+
+If you do have in-band access to the management controller, you can set
+it yourself. On a Dell (racadm) it is `Sme`, `Snp`, `CpuMinSevAsid` and
+`Rmp` under `BIOS.ProcSettings`, in three BIOS jobs because each
+attribute unlocks only once its parent is applied — see "Enabling
+SEV-SNP on a Dell (racadm)" in
+[`deploy/ansible/README.md`](../../deploy/ansible/README.md). Other
+vendors name them "SEV Control", "SNP", "SEV-ES ASID space limit" and
+"SNP Memory (RMP Table) Coverage".
+
+On a rented server whose management controller you cannot reach and
+whose provider exposes no BIOS-settings API, a serial-over-LAN console
+(if the provider offers one) usually reaches the firmware setup screen.
+On AMI Aptio boards the settings are under Chipset → AMD CBS → CPU
+Common Options: set "SEV-ES ASID Space Limit" to `100` and "SNP Memory
+(RMP Table) Coverage" to `Enabled`, one reboot. A host delivered with
+SEV on but SEV-ES/SNP off logs `Memory for the RMP table has not been
+reserved by BIOS` in `dmesg`. Some provider images also put `iommu=pt`
+on the kernel command line; play 01 removes it.
+
+### AMD generations
+
+| Generation | SNP report | Notes |
+|---|---|---|
+| **Genoa** (EPYC 9004, Zen 4) | V2, 64-byte chip_id | supported |
+| **Turin** (EPYC 9005, Zen 5) | V3/V4, 8-byte HWID | supported |
+| **Milan** (EPYC 7003, Zen 3) | 64-byte chip_id, like Genoa | supported. Register it with `"snp_generation": "milan"` (§6) — its chip_id length equals Genoa's, so without it vali measures the guest as Genoa and refuses the launch. Its host-attestor measurement is `miner_host_attestor.measurements.milan`. A host on a rotational disk boots golden VMs noticeably slower than an NVMe host (minutes rather than a few minutes); keep tenant data on NVMe. |
 
 Kernel cmdline the bootstrap will set for you (play 01):
 `kvm_amd.sev=1 kvm_amd.sev_es=1 kvm_amd.sev_snp=1 mem_encrypt=on`, and
@@ -97,9 +125,15 @@ Per host, in `host_vars/<YOUR_HOST>.yml`:
 
 `ansible_host`, `ansible_user`, `ansible_ssh_private_key_file`,
 `cpu_model_expected`, `ram_gb_expected`, `nvme_system_devices`,
-`nvme_data_devices`, `host_cvm.cpu_budget`,
-`host_cvm.memory_mb_budget`, `netbird_setup_key_file`,
-`orders_bind_ip`.
+`nvme_data_devices`, `netbird_setup_key_file`, `orders_bind_ip`,
+`snp_generation` (`genoa` | `turin` | `milan` — selects the host-attestor
+measurement; play 05 refuses an unknown value).
+
+The tenant CPU / RAM budget (`[host] cvm_*_budget`) is NOT per-host input:
+the template derives it from the host's own facts, `(threads − 2) ×
+cpu_ratio` vCPU and `MemTotal − 8192` MiB (group_vars `host_cvm`). To run
+a box BELOW that, set `host_cvm_overrides: {cpu_budget_max: N,
+memory_mb_budget_max: M}`; a value above the derivation is ignored.
 
 That last one is this miner's **own** mesh address, and it is the one to
 watch: the agent's signed-order server binds it and only it. Omit it and
@@ -111,6 +145,30 @@ play 04.
 This list is the required minimum, not the whole surface — the
 `host_vars/` directory documents further optional keys (data RAID,
 private-network bonding) that only some hosts need.
+
+A complete minimal `host_vars/<YOUR_HOST>.yml`, values to replace in
+angle brackets (`host_vars/miner.example.yml` is the same file, commented):
+
+```yaml
+ansible_host: <PUBLIC_IP>
+ansible_user: ubuntu
+ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+cpu_model_expected: "<exact string from /proc/cpuinfo, e.g. AMD EPYC 7543 32-Core Processor>"
+ram_gb_expected: <GB, assert is ">=">
+orders_bind_ip: "<MESH_IP — fill in AFTER play 04; the group_vars placeholder never binds>"
+# Name disks by /dev/disk/by-id (`ls -l /dev/disk/by-id | grep nvme`):
+# the kernel's nvmeXn1 names move between boots.
+nvme_system_devices:
+  - /dev/disk/by-id/nvme-<MODEL>_<SERIAL-A>
+  - /dev/disk/by-id/nvme-<MODEL>_<SERIAL-B>
+nvme_data_devices: []                               # or the dedicated data NVMe(s), also by-id
+netbird_setup_key_file: "netbird-<host>-setupkey"   # on the operator workstation, never committed
+snp_generation: genoa                               # genoa | turin | milan
+```
+
+Then add `<YOUR_HOST>: {}` under `miner_nodes` in `inventory.yml`
+(start from `inventory.example.yml`; keep your real inventory out of
+version control).
 
 Fleet-wide, in `group_vars/miner_nodes.yml` — these all point at the
 fleet operator's infrastructure and must be **your fleet's** values, not
@@ -131,13 +189,15 @@ copied from an example:
 | `miner_kbs_ca_cert_file` / `_src` | CA the agent trusts when dialling the KBS to relay a guest's §21 release. The KBS serves a private certificate by default (internal service on the mesh, not a public ACME endpoint). Leave empty only for a publicly-trusted KBS certificate. |
 | `miner_agent_source_repo` | the git repository play 05 clones and **builds the agent from**. A code-delivery path, not a link — whatever is here is what runs on your confidential host. The play refuses to run on an unfilled placeholder. |
 
-> **Auto-update is on by default and unsigned.** With
-> `miner_auto_update_enabled: true` and `miner_auto_update_pubkey: ""`,
-> the host pulls a new agent binary from `miner_auto_update_s3_base`
-> and trusts it on a sha256-over-HTTPS check alone. That is a supply
-> chain you are accepting. Set a pubkey, point the base at storage you
-> control, or freeze the channel with
-> `touch /var/lib/hippius-miner/.no-auto-update`.
+> **Auto-update is off by default, and unsigned if you turn it on.**
+> `miner_auto_update_enabled: false` installs the updater but leaves its
+> timer stopped and disabled; agent upgrades are a manual swap (see
+> `deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md`). With it set to
+> `true` and `miner_auto_update_pubkey: ""`, the host pulls a new agent
+> binary from `miner_auto_update_s3_base` and trusts it on a
+> sha256-over-HTTPS check alone. That is a supply chain you are
+> accepting. Set a pubkey, point the base at storage you control, or
+> freeze the channel with `touch /var/lib/hippius-miner/.no-auto-update`.
 
 ---
 
@@ -186,13 +246,64 @@ presenting one identity is a fault, not a failover.
 
 ## 3. Register the node id on chain
 
-Registration is a raw extrinsic. There is no product UI for it today.
+Two ways. **From the console** (Dashboard → Compute miners): phase A,
+before §1, picks the family and child accounts, mints your NetBird setup
+key and gives you a prefilled `host_vars`; phase B, after §2, takes the
+JSON block play 05 prints plus the output of `hippius-miner-agent
+sign-registration`, has the FAMILY account sign one transaction in your
+wallet (`add_proxy` → `register_child` → `remove_proxy`, atomic), and
+declares the miner to vali for you (§6 becomes automatic). The family
+key never leaves your wallet; a Polkadot Vault account attached to the
+polkadot.js extension works the same way. What follows is the manual
+equivalent.
+
+Registration is a raw extrinsic.
 
 **You need a registered, funded `family` account.** The extrinsic is
 `ComputeScoring::register_child(family, child, node_id, node_sig)` and
 it requires `ensure_signed(origin) == family` and
 `is_registered_family(family)`. This is the one prerequisite you cannot
 generate yourself — see below.
+
+### What makes an account a family
+
+On mainnet `is_registered_family(family)` is
+`pallet_registration::is_owner_node_registered(family)`: the account
+must own a registered node in `pallet_registration` — i.e. it is already
+a storage-miner (arion) family. Any such account you control qualifies;
+there is no separate "register a compute family" extrinsic. A brand-new
+account cannot be a family until it registers a node there first. The
+account must also hold at least the existential deposit, or the
+extrinsic fails on funding before it fails on anything else.
+
+Slots and deposit: the first `FreeChildSlotsPerFamily` children of any
+family cost no deposit; the next one reserves `BaseChildDeposit` and
+each further one doubles. Both are chain parameters — read them from
+chain state (Developer → Chain state → `computeScoring`) before you plan. One family
+per purpose (production fleet, test bench) is a reasonable way to use
+the free slots; the scheduler never looks at families, so this is
+bookkeeping and dashboard scoping, not isolation.
+
+### The proxy step, concretely
+
+`register_child` is gated by `pallet_proxy`: the family must list the
+child account as a proxy at the moment of the call, and only then.
+`NonTransfer` with `delay = 0` is enough; remove it afterwards.
+
+1. From the **family** account: `proxy.addProxy(delegate = <CHILD>,
+   proxy_type = NonTransfer, delay = 0)`.
+2. Submit `register_child` (step 3 below, or via
+   `proxy.proxy(real = <FAMILY>, call = computeScoring.registerChild(…))`
+   signed by the child — the delegate dispatches AS the family, so the
+   family key need not leave cold storage).
+3. From the family account: `proxy.removeProxy(<CHILD>, NonTransfer, 0)`.
+
+`register_miner.py submit` signs as the family (`--family-suri`); it does
+not add or remove the proxy — do that in Polkadot-JS Apps
+(Developer → Extrinsics) or your own signer. Without step 1 the call
+fails `ProxyVerificationFailed` after you have already produced the
+`node_sig`; the signature is still valid, just add the proxy and resubmit
+with the same nonce.
 
 The flow deliberately splits across two boxes so the miner never holds
 funds and the operator workstation never holds the node key:
@@ -215,7 +326,9 @@ python deploy/register-miner/register_miner.py submit \
     --node-auth '{"node_id":"…","node_sig":"…","nonce":0}'
 ```
 
-Requires `pip install substrate-interface`. `--dry-run` composes the
+`<CHAIN_RPC_URL>` is the chain's RPC endpoint (Hippius mainnet: the public
+`rpc.hippius.network`, or your own node). Requires `pip install
+substrate-interface`. `--dry-run` composes the
 call without submitting; use it first.
 
 The signature is over a domain-separated message
@@ -232,6 +345,42 @@ Plan your family's slots accordingly.
 On success the node's status is `Active`. Status is stored sparsely —
 only non-default statuses are written — so *absent* means `Active`. The
 three states are `Active`, `Quarantined`, `Decommissioned`.
+
+### 3b. Announce your price
+
+A miner prices its own capacity on chain. Until it does, the scheduler
+treats it as price-neutral and no priced bill accrues to it, so announce
+a price once the node is registered:
+
+```
+ComputeScoring::announce_price_change(node_id, new_price)
+```
+
+- **Signed by the child account** the node id is registered under
+  (`NodeIdToChild[node_id] == signer`, else `NotNodeOperator`).
+- **Unit:** USD per resource-unit per billing period, fixed-point ×1e6
+  (USD-micros). A resource unit is the blend of vCPU, RAM and disk
+  defined in `vali/apps/scheduler/scoring.py::resource_units`; the
+  billing period is the validator's `VALI_BILLING_PRICE_PERIOD_S`
+  (default one hour).
+- **Bounds:** `new_price` must be `> 0` and inside
+  `[PriceFloor, PriceCeiling]`. Read both from chain state first; while
+  no ceiling is configured every announcement is refused
+  `PriceBoundsNotConfigured`, and a value outside the bounds fails
+  `PriceOutOfBounds`.
+- **Speed limits:** a change relative to your current effective price is
+  capped by the `MaxPriceChangeNumer / MaxPriceChangeDenom` ratio
+  (`PriceChangeTooLarge`), and successive changes must be at least
+  `MinPriceChangeIntervalBlocks` apart (`PriceChangeTooSoon`). A brand-new
+  node id sets its first price freely within the bounds.
+- **Notice:** the new price takes effect `PriceChangeNoticeBlocks` after
+  the announcement, which gives the validator time to migrate tenant VMs
+  whose price ceiling the new price would exceed. Anyone may call
+  `apply_price_change(node_id)` once it is due to write it to storage;
+  consumers already see it from the effective block on.
+
+Submit it from Polkadot-JS Apps (Developer → Extrinsics) or your own
+signer, as the child account — the family key is not needed.
 
 ---
 
@@ -363,6 +512,22 @@ dm-integrity wipe writes the entire volume. A miner that leaves this on its
 system disk while an NVMe sits idle is the most common self-inflicted
 slowness.
 
+A root outside `/var/lib/hippius-miner` (a dedicated mount, say) needs
+only `miner_data_disk_root` / `miner_state_disk_root` in your
+`host_vars`, **and it must exist before you run the play**: play 05
+refuses a missing root rather than create one, because a directory
+created under a mount point that is not mounted yet would put VM disks
+on the system disk, hidden later by the mount. Play 05 adds the roots
+to the agent unit's `ReadWritePaths`. The unit runs with
+`ProtectSystem=strict`, so a root it does not list is read-only to the
+agent and every launch fails with a `*-disk/mkdir` class
+(`overlay-disk/mkdir` for a golden launch, `data-disk/mkdir` or
+`state-disk/mkdir` otherwise). That shows only in the agent's journal
+(`dispatch-failed-detail`); vali reports
+`dispatch-failed-after-register`. A host with several data NVMe can,
+for instance, keep them in one mdadm RAID10 mounted at
+`/srv/hippius-data` and point `miner_data_disk_root` there.
+
 `state_disk_root` holds a 1 MiB anti-rollback counter per VM. It is not
 worth moving for speed — but **losing that file permanently bricks the VM**
 (no counter ⇒ the KBS refuses to release the key), so choose durable over
@@ -377,13 +542,65 @@ several GiB per distro — is a constant at `/var/lib/hippius-miner/staging`
 and is NOT configurable. Size the system disk for it even after pointing the
 roots above elsewhere.
 
+### Disk capacity
+
+Three things bound how much tenant disk your host takes. The tightest
+one wins:
+
+1. **`[host] cvm_disk_gb_budget`**, which the play derives: the size of
+   the filesystem holding `miner_data_disk_root`, minus
+   `host_cvm.reserve_disk_gb` (default 100 GiB). The reserve covers §25
+   migration downloads, backup/restore staging, and base-image staging
+   when the data root is on the system disk. You can lower the budget
+   per host with `host_cvm_overrides: {disk_gb_budget_max: N}`. You
+   can't raise it above the derivation. The agent refuses any launch
+   past the budget. Before a VM is registered, that's at preflight.
+2. **The agent's measured gate.** Free space on that filesystem minus
+   the unwritten tail of every data disk and overlay already there, so
+   every existing disk is counted as if full. It runs at preflight, and
+   again at disk creation under a process-wide lock, so two concurrent
+   launches can't both be promised the same bytes.
+3. **vali's own ledger.** For every VM it has placed on you, vali
+   counts the flavor's `disk_gb` plus the rootfs. It compares that
+   against the minimum of the operator-registered disk size (minus
+   `VALI_DISK_RESERVE_GB`), your declared budget, your reported
+   filesystem size (minus the same reserve) from the v4 heartbeat
+   (`miner_heartbeat_schema_disk`), and any ceiling you have earned.
+   A value you report can only lower that figure.
+
+Any disk refusal answers **507 `insufficient-disk`**. vali treats it as a
+capacity event and re-places the VM. It's never a SEV start failure,
+so a full disk doesn't mark your host SEV-incapable. It does cut the
+disk ceiling an *earned* host has built up.
+
+**Why vali doesn't take your word for it.** SNP attests what the guest
+runs, not the host's disks, so every disk figure a miner sends is a
+self-report. The design doesn't depend on those reports being honest:
+
+- vali's committed ledger is its own record.
+- Your declared figures only ever enter a `min()`.
+- The agent's gate measures the filesystem rather than trusting it.
+- A refusal is charged to the host that caused it.
+- vali raises an over-claim alarm when your reported free space falls
+  below what it has committed to you.
+
+A host that over-declares gains only launches it then fails, which
+costs its own earnings and reputation. Tenant data safety is unaffected
+either way: the guest's dm-integrity format fails closed on a disk that
+can't hold it. Nothing is silently truncated.
+
+What's still open: nothing proves a host's free space. An optional
+future probe would be a vali-issued challenge. The agent would answer
+it with a signed statvfs and reads of random blocks of a freshly
+written file. That would turn the over-claim alarm into evidence.
+
 ### Oversubscription
 
 | resource | oversubscribable | why |
 |---|---|---|
 | RAM | **no** | an SNP guest's memory is encrypted and pinned (`memfd` backing, required so KVM can map the GHCB). No ballooning, no swap, no page sharing — the hypervisor can neither move nor dedupe those pages. Not a policy choice. |
 | vCPU | not today | vCPUs are threads and time-sharing would work, but admission takes `min(slots_RAM, slots_CPU)` so neither dimension is oversubscribed. A policy knob, not a wall. |
-| disk | **already** | overlays and data disks are created *sparse*: a 256 GiB flavor consumes what it writes. A `statvfs` check runs before dispatch, so a full host is refused up front rather than hitting `ENOSPC` mid-format inside the guest. |
+| disk | **no** | overlays and data disks are created *sparse*, but every gate counts them at full size: vali's committed ledger, the agent's `cvm_disk_gb_budget`, and the agent's measured free-space gate, which subtracts the unwritten part of every disk already on the filesystem. A tenant can always fill the disk it bought, so a full host is refused up front (507 `insufficient-disk`) rather than hitting `ENOSPC` inside a running guest. See *Disk capacity* above. |
 
 The practical consequence: **RAM is what bounds how many VMs your host takes.**
 Buying cores without RAM will not raise your slot count.
@@ -393,13 +610,25 @@ Buying cores without RAM will not raise your slot count.
 Passing admission and heart-beating is **not** enough to receive
 tenant workloads.
 
-vali's auto-provision path records `platform_id = "onchain"` — a
-placeholder, not a chip id. The scheduler requires a **real** hex
+vali's auto-provision path records `platform_id = "onchain:<NODE_ID_64_HEX>"`
+— a per-node placeholder, not a chip id (so any number of new miners can
+heartbeat before any of them is registered). The scheduler requires a **real** hex
 `platform_id`, a non-null `chain_node_id`, a non-null mesh IP, local
 status `ACTIVE`, and a recent heartbeat. A node with the placeholder
 passes every other gate and silently never gets chosen.
 
-Close it with one call, using the values from §5 steps 2 and 3:
+Close it with one call, using the values from §5 steps 2 and 3. The
+call **upgrades the auto-provisioned row in place**: when the stored
+`platform_id` is still an `onchain:…` placeholder and `pubkey_hex`
+matches the row's key (your node id), vali replaces the placeholder with
+the real CHIP_ID and backfills the NetBird peer id / mesh IP (and
+`chain_node_id` / `snp_generation` if unset). It returns `200` with the
+upgraded row. `<MINER_ID>` must be the miner id the agent signs its
+heartbeats with (the row vali auto-provisioned), and `<AMD_CHIP_ID_HEX>`
+bare hex (no `0x`) — the placeholder is replaced once, so anything else
+is refused `400` rather than stored. Until this call
+`GET /v1/operator/nodes` shows the node with `identity.platform_id =
+onchain:<node id>` and `schedulable: false`:
 
 ```sh
 curl -sf -X POST "<VALI_URL>/v1/admin/miner/register" \
@@ -410,17 +639,74 @@ curl -sf -X POST "<VALI_URL>/v1/admin/miner/register" \
           "pubkey_hex":   "<NODE_ID_64_HEX>",
           "platform_id":  "<AMD_CHIP_ID_HEX>",
           "netbird_peer_id": "<PEER_ID>",
-          "netbird_ip":   "<MESH_IP>"
+          "netbird_ip":   "<MESH_IP>",
+          "chain_node_id": "<NODE_ID_64_HEX>",
+          "snp_generation": "milan"
         }' | jq
 ```
 
+`snp_generation` (`milan` | `genoa` | `turin`) is required for Milan
+because its chip_id is the same length as Genoa's (64 bytes): left
+unset, a Milan host is measured as Genoa and every launch is refused
+`launch-digest-mismatch`. Omit it (or send `genoa` / `turin`) on the
+other generations.
+
 Re-posting the same `(miner_id, pubkey_hex, platform_id)` triple is
-idempotent (`200`); a collision with a different miner is `409`. See
+idempotent (`200`). It is `409` (and nothing is written) when the
+`pubkey_hex` differs from the row's, when the row already carries a
+**real** CHIP_ID that differs from the one posted (only the placeholder
+is ever replaced), or when the CHIP_ID / `chain_node_id` belongs to a
+different miner. A NetBird field that already holds a different value is
+left as stored (the call still returns `200`) — fix a moved mesh IP from
+the Django admin. See
 [`vali/apps/miners/README.md`](../../vali/apps/miners/README.md) for the
 admin token and the quarantine/list endpoints.
 
 The bootstrap prints exactly this block at the end of play 05, filled
 in with the real values — keep that output.
+
+## 6b. Register the host's size (fleet operator)
+
+This step is done by **whoever runs vali**, not by the miner operator.
+
+Until vali knows how much hardware the host has, it admits on a flat
+`capacity_slots` count and answers every feasibility query for it with
+`not-now` / `host-size-unknown`. The size is an operator-registered
+**trusted anchor**: it is what bounds the miner's own untrusted
+heartbeat reports, so it must come from the fleet operator's own
+knowledge of the hardware (the machine they provisioned or can reach
+themselves, the SKU they bought), never from a figure the miner operator
+sends. An inflated anchor makes vali place VMs the host cannot run. It
+is set once the chain refresh has created the miner's `MinerCapacity`
+row, which happens when the node appears on chain.
+
+On a host you control, read the numbers directly:
+
+```sh
+nproc                                                   # → --cpus
+awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo  # → --memory-mb (MiB)
+```
+
+then, in a vali pod:
+
+```sh
+python manage.py vali_set_miner_capacity --miner-id <MINER_ID> \
+    --cpus 64 --memory-mb 256180 --dry-run
+python manage.py vali_set_miner_capacity --miner-id <MINER_ID> \
+    --cpus 64 --memory-mb 256180 --by <you>
+```
+
+(A 64-thread host with 256 GB of RAM reads 64 / ~256180.) `--miner-id` resolves
+through the `chain_node_id` set in §6; `--node-id <NODE_ID_64_HEX>` works
+too. The command prints the before/after and refuses out-of-range values
+or an anchor smaller than the VMs vali has already placed there. It
+warns, but still writes, when the anchor leaves no room for the host
+reserve or when a fresh heartbeat's free-memory report disagrees
+sharply with it. An identical re-run changes nothing. `--by` is
+mandatory for a real write; the audit record (who, node, before, after)
+is the last line of the output and is logged by the process you ran. With
+`kubectl exec` that output only exists in your session, so keep it.
+`--clear` puts the miner back on the flat fallback.
 
 ---
 
@@ -439,6 +725,8 @@ someone else's, you must be given them:
 | `edge_order_signing_pubkey` | Every lifecycle order is `verify_strict`ed against it; a wrong key means every order is rejected |
 | The **Edge endpoint**, **KBS endpoint** and **image object store** | Nothing resolves without them |
 | A **vali miner-admin token** | Only for the §6 call above |
+| The **host-attestor components** (`ovmf.fd`, `linux.bin`, `initrd.bin`) | Pinned by sha256 in `miner_host_attestor` (group_vars) and not published at a public URL; stage them into `/var/lib/hippius-miner/host-attestor/` before play 05, or it refuses to render `[host_attestor]`. Without an attested host attestor a host receives no tenant VM |
+| The host-size **anchor** (§6b) | Set by the fleet operator from hardware they know, never from your report — it caps what vali will ask of your host |
 
 Note that none of these lets the fleet operator read your tenants' data,
 and none of them is a certificate authority over your identity. They are
@@ -451,6 +739,22 @@ it hosts. Use the graceful-exit path so vali migrates tenants off first,
 and request unstake on chain. See
 [`stranded-migration-runbook.md`](./stranded-migration-runbook.md) for
 what to do if a migration gets stuck part-way.
+
+## Where vali thinks you are
+
+You declare nothing about location. Within one probe cycle (10 min) of your
+miner heartbeating, `vali_geo_probe` DETECTS it: the public IP your NetBird
+peer connects from, its GeoIP/ASN, the round-trip time vali measures to
+you, and the egress IP your tenant CVMs report. The result is on
+`GET /v1/operator/nodes` as `location` and rolls up into
+`GET /v1/operator/regions`. Only a `verified` verdict lets a
+`region`-constrained launch land on you; `verdict_reasons` says what is
+missing (`rtt-unavailable`, `latency-inconsistent`, `peer-stale`) or
+contradictory (`guest-egress-mismatch`, `geo-source-disagree`);
+`geo-rtt-arbitrated` next to `verified` is informational (the GeoIP
+databases disagreed about your IP and the RTT settled it). A VPN or
+tunnel in front of the host makes the RTT longer than the claimed location
+permits and will keep you `unverified`. See `docs/design/miner-geolocation.md`.
 
 ## See also
 

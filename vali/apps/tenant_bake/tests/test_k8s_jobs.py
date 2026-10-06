@@ -120,6 +120,20 @@ def test_render_job_env_carries_golden_disk_mode() -> None:
     assert env["BAKE_DISK_MODE"]["value"] == "golden_verity_overlay"
 
 
+def test_render_job_env_package_refresh_only_when_set() -> None:
+    """F6 — the stamp reaches the baker as BAKE_PACKAGE_REFRESH; an
+    unstamped bake renders no such var (byte-identical pre-F6 env)."""
+    import dataclasses
+
+    def env_of(spec: object) -> dict:
+        m = render_job(spec)
+        return {e["name"]: e for e in m["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+    assert "BAKE_PACKAGE_REFRESH" not in env_of(_sample_spec())
+    stamped = dataclasses.replace(_sample_spec(), package_refresh="20261101")
+    assert env_of(stamped)["BAKE_PACKAGE_REFRESH"]["value"] == "20261101"
+
+
 def test_render_job_aws_creds_keys_match_externalsecret() -> None:
     # The `vali-s3` ExternalSecret materialises `access-key` /
     # `secret-key` (external-secret-s3.yaml). Referencing any other
@@ -223,6 +237,14 @@ def _create_bake(vm_id: str = "myvm-1") -> TenantBake:
         s3_output_prefix=f"tenant/{vm_id}/",
         requested_by=sc,
     )
+
+
+def test_spec_from_settings_carries_package_refresh() -> None:
+    bake = _create_bake()
+    assert spec_from_settings(bake).package_refresh == ""
+    bake.package_refresh = "20261101"
+    bake.save()
+    assert spec_from_settings(bake).package_refresh == "20261101"
 
 
 def test_spec_from_settings_pulls_settings_defaults() -> None:

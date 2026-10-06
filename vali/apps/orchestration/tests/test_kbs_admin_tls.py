@@ -40,6 +40,8 @@ from apps.orchestration.services.kbs_admin_tls import (
     admin_transport,
 )
 
+from .conftest import FakeEffects
+
 HTTPS = "https://kbs-server-admin.kbs.svc.cluster.local:8001"
 HTTP = "http://kbs-server-admin.kbs.svc.cluster.local:8001"
 
@@ -427,11 +429,9 @@ def test_allowlist_reload_carries_the_context(
 
 
 def test_evidence_fetch_carries_the_context(
-    monkeypatch: pytest.MonkeyPatch, pki: _Pki, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, pki: _Pki, tmp_path: Path, fx: FakeEffects
 ) -> None:
     import urllib.request
-
-    from apps.orchestration.services import kbs_evidence
 
     monkeypatch.setattr(settings, "VALI_KBS_ADMIN_URL", HTTPS)
     _material(monkeypatch, str(pki.cert), str(pki.key), str(pki.ca))
@@ -455,7 +455,8 @@ def test_evidence_fetch_carries_the_context(
         return _Resp()
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    assert kbs_evidence.fetch_evidence("vm-1") == {}
+    # The autouse `fx` fakes the evidence read; this test is about the real one.
+    assert fx.real["fetch_evidence"]("vm-1") == {}
     assert isinstance(captured["context"], ssl.SSLContext)
 
 

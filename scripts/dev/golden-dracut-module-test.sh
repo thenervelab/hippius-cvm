@@ -89,6 +89,7 @@ need 'hippius-release-core.sh'
 need 'hippius-golden-overlay.sh'
 need '/hippius-guest-release'
 need '/hippius-vsock-ticket'
+need '/sed'
 # The golden overlay assembly needs the RO dm-verity lower + the
 # guest-keyed upper + the overlayfs root; assert the kernel stack made it
 # in (builtin would also satisfy boot).

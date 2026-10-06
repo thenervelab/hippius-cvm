@@ -12,7 +12,7 @@
 //! `compile_fail` doc-tests in `stages/envelope.rs`. Doc-tests run
 //! under `cargo test --doc`; this integration test does NOT try
 //! to assert the absence of traits (Rust has no stable way to do
-//! that from a regular test — see codex review of PR-H1 v1).
+//! that from a regular test — see review of PR-H1 v1).
 //!
 //! PR-H2 additions:
 //! * `relay_once_passes_each_kind_through_the_wire_gate` — one full

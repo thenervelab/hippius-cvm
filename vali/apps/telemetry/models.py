@@ -29,6 +29,8 @@ import uuid
 
 from django.db import models
 
+from apps.miners.models import SnpGeneration
+
 # The broker wire-format versions this build understands. An ingest
 # carrying any other `schema_version` is rejected fail-closed (§9
 # "schema versioning + validation"). Forward-compatible migration:
@@ -436,6 +438,15 @@ class HostAttestorRelease(models.Model):
     - `is_active`        — whether this release is the current desired
       measurement. Defaults `False` — a release is inert until the
       operator flow flips it (PR-9).
+    - `generation`       — the SEV-SNP CPU generation (`SnpGeneration`:
+      `genoa` | `turin` | `milan`) this measurement is FOR. The launch
+      measurement covers the VMSA, which carries the vCPU model's CPUID
+      signature, so the SAME blackbox UKI measures differently per
+      generation — the {current, previous} grace window is therefore kept
+      PER GENERATION (`release_service.desired_releases(generation)`).
+      "" = legacy/untagged: those rows form their own group, so a table
+      with no tagged row behaves exactly as the old single fleet-wide
+      window.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -445,6 +456,21 @@ class HostAttestorRelease(models.Model):
     cosign_identity = models.CharField(max_length=256, blank=True, default="")
     cosign_rekor_log_index = models.BigIntegerField(null=True, blank=True)
     is_active = models.BooleanField(default=False)
+    generation = models.CharField(
+        max_length=8,
+        choices=SnpGeneration.choices,
+        blank=True,
+        default="",
+        # DB-side default too: a pod still on the previous image INSERTs
+        # without this column during a rollout, and must not hit NOT NULL.
+        db_default="",
+        help_text=(
+            "SEV-SNP CPU generation this measurement is for (the VMSA carries "
+            "the vCPU CPUID signature, so one UKI measures differently per "
+            "generation). The {current, previous} grace window is kept per "
+            "generation. Empty = legacy/untagged group."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -455,7 +481,10 @@ class HostAttestorRelease(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"HostAttestorRelease {self.measurement[:16]}… (active={self.is_active})"
+        return (
+            f"HostAttestorRelease {self.measurement[:16]}… "
+            f"({self.generation or 'untagged'}, active={self.is_active})"
+        )
 
 
 # ─── tenant-CVM live attestation (§23 uptime-coverage meter) ─────────
@@ -534,7 +563,7 @@ class VmLiveAttestation(models.Model):
     restart reseeds `LiveAttestationChain::genesis()` and the guest's next
     attestation arrives at seq 1 again.
 
-    Live consequence, observed on `gateproof-a`: rows existed at seq 1..43;
+    Live consequence, observed in production: rows existed at seq 1..43;
     two KBS restarts later the guest was at seq 11; every attestation
     collided with a row from the OLD chain and was logged as a replay at
     INFO. With the liveness gate armed the VM kept running and earned
@@ -573,6 +602,36 @@ class VmLiveAttestation(models.Model):
     prev_attestation_hash = models.CharField(max_length=64, blank=True, default="")
     # vali-assigned lineage counter — see the class docstring.
     chain_epoch = models.BigIntegerField(default=0)
+    # The guest the KBS bound this `vm_id` to (schema v2 bodies; blank on
+    # v1): `release` = recorded at the §20 release, `first-use` = no
+    # release on record (e.g. after a KBS restart) — the guest that asked. Only `release` rows are
+    # capacity proof (`capacity_earn`). `chip_id` was checked against the
+    # node's registered platform at ingest. DB defaults so a pod on the
+    # previous image can still INSERT during a rollout.
+    binding_source = models.CharField(max_length=16, blank=True, default="", db_default="")
+    chip_id = models.CharField(max_length=128, blank=True, default="", db_default="")
+    report_id = models.CharField(max_length=64, blank=True, default="", db_default="")
+    # What the guest attested it runs with (schema v3 bodies; NULL before)
+    # and vali's verdict at ingest (`apps.telemetry.guest_resources`): `ok`,
+    # `short` (less than the launch's flavor), `superseded` (a guest of an
+    # earlier launch of this VM), `unattested` (the launch asked, the body
+    # has none), blank (not asked). The last three but `ok` and blank are
+    # not coverage once ENFORCE is armed. DB defaults so a pod on the
+    # previous image can still INSERT during a rollout.
+    vcpus_online = models.PositiveIntegerField(null=True, blank=True, default=None)
+    mem_firmware_kib = models.BigIntegerField(null=True, blank=True, default=None)
+    mem_total_kib = models.BigIntegerField(null=True, blank=True, default=None)
+    mem_unaccepted_kib = models.BigIntegerField(null=True, blank=True, default=None)
+    resource_verdict = models.CharField(max_length=16, blank=True, default="", db_default="")
+    # Schema v4 only (NULL before): the guest components release the guest
+    # attested it booted, its epoch, its agents' health bitmap, the
+    # keepalive process's instance and that process's failing-tick count
+    # (`apps.orchestration.guest_upgrade` judges them).
+    components_release_version = models.BigIntegerField(null=True, blank=True, default=None)
+    components_security_epoch = models.BigIntegerField(null=True, blank=True, default=None)
+    components_health = models.BigIntegerField(null=True, blank=True, default=None)
+    components_instance = models.BigIntegerField(null=True, blank=True, default=None)
+    components_unhealthy_ticks = models.BigIntegerField(null=True, blank=True, default=None)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -582,6 +641,14 @@ class VmLiveAttestation(models.Model):
             # The chain-resolution read path: "the newest lineage this VM
             # has" and "which row does this prev_attestation_hash name".
             models.Index(fields=["vm_id", "chain_epoch", "attestation_seq"]),
+            # The guest report's T4 read: superseded samples, fleet-wide, by
+            # time (`apps.orchestration.guest_report`). Partial: a handful
+            # of rows out of the whole liveness stream.
+            models.Index(
+                fields=["verified_at_unix"],
+                name="telemetry_vla_superseded_idx",
+                condition=models.Q(resource_verdict="superseded"),
+            ),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -594,4 +661,66 @@ class VmLiveAttestation(models.Model):
         return (
             f"VmLiveAttestation vm={self.vm_id} seq={self.attestation_seq} "
             f"at={self.verified_at_unix}"
+        )
+
+
+class GuestResourceShortfall(models.Model):
+    """Evidence that a miner runs a VM with less than its flavor — or runs
+    a stale launch of it.
+
+    SEV-SNP measures the vCPU count (one VMSA per vCPU) but not the RAM.
+    The guest therefore attests what it was given — vCPUs online, the
+    firmware map's `System RAM`, `MemTotal` — inside its live attestation
+    (schema v3), bound into the PSP-signed `REPORT_DATA` the KBS verified.
+    The relaying miner cannot change a value. A sample below the flavor is
+    recorded here, one row per `(vm_id, node_id_hex, flavor)`, refreshed
+    by every further short sample:
+
+    - `first_seen_at` / `last_seen_at` / `samples` — how long and how
+      often; a row whose `last_seen_at` is within
+      `VALI_GUEST_RESOURCES_FLAG_S` marks the VM degraded for the operator
+      (`/v1/operator/fleet`) and the synthetic monitor;
+    - `want_*` — the flavor; `vcpus_online` / `mem_*_kib` — the last
+      finding's attested figures (NULL for a `superseded-launch` finding
+      on a body without resources); `reason` — which dimension, or
+      `superseded-launch`;
+    - `last_body_digest` — the `VmLiveAttestation` that proves it.
+
+    What it is NOT: proof against the TENANT. Root inside the guest can
+    request a report over any figures it likes, so a tenant could make
+    its own VM look short (or, as the miner's accomplice, full). The
+    penalty is scoped accordingly: that VM's uptime is not credited (with
+    ENFORCE armed) and an operator looks at the row; nothing here excludes
+    the miner from placement.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    vm_id = models.CharField(max_length=128, db_index=True)
+    node_id_hex = models.CharField(max_length=64, db_index=True)
+    flavor = models.CharField(max_length=32)
+    want_vcpus = models.PositiveIntegerField()
+    want_memory_mb = models.PositiveIntegerField()
+    vcpus_online = models.PositiveIntegerField(null=True, blank=True)
+    mem_firmware_kib = models.BigIntegerField(null=True, blank=True)
+    mem_total_kib = models.BigIntegerField(null=True, blank=True)
+    mem_unaccepted_kib = models.BigIntegerField(null=True, blank=True)
+    reason = models.CharField(max_length=64)
+    samples = models.PositiveIntegerField(default=1)
+    first_seen_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField(db_index=True)
+    last_body_digest = models.CharField(max_length=64)
+
+    class Meta:
+        ordering = ["-last_seen_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vm_id", "node_id_hex", "flavor"],
+                name="telemetry_guest_resource_shortfall_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"GuestResourceShortfall vm={self.vm_id} node={self.node_id_hex[:12]} "
+            f"{self.flavor} ({self.reason})"
         )

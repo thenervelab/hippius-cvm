@@ -98,8 +98,10 @@ wire boundary.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 from django.db import models
+from django.utils import timezone
 
 
 class TenantBakeState(models.TextChoices):
@@ -144,6 +146,26 @@ IN_FLIGHT_STATES: frozenset[str] = frozenset(
 )
 
 
+def live_in_flight_q(orphan_running_after_s: float) -> models.Q:
+    """In-flight bakes that may hold (or are about to take) a baker pod.
+
+    - Every Queued row, whatever its age: `vali_bake_spawn` re-spawns a
+      Queued row each sweep (its Job name is deterministic, so a TTL-cleaned
+      Job comes back), so an old Queued row can start baking at any moment.
+    - A Running row whose `started_at` (the worker's claim) is younger than
+      `orphan_running_after_s`. An older Running row is an ORPHAN: its pod
+      died without finalizing (e.g. a bake left Running for weeks),
+      nothing will ever bake for it again, and counting it would block the
+      serial golden re-bake forever. A Running row without `started_at`
+      cannot be aged and counts as live.
+    """
+    horizon = timezone.now() - timedelta(seconds=orphan_running_after_s)
+    return models.Q(state=TenantBakeState.QUEUED) | (
+        models.Q(state=TenantBakeState.RUNNING)
+        & (models.Q(started_at__isnull=True) | models.Q(started_at__gte=horizon))
+    )
+
+
 class TenantBake(models.Model):
     """A single per-tenant encrypted-qcow2 bake request + outcome."""
 
@@ -176,6 +198,18 @@ class TenantBake(models.Model):
         choices=TenantBakeDiskMode.choices,
         default=TenantBakeDiskMode.LEGACY_LUKS,
     )
+    # F6 scheduled golden re-bake — a non-empty stamp makes the baker
+    # apply every pending distro update in the chroot and keys the stage-1
+    # cache on it (`tenant-image-bake.sh --package-refresh`). Set only by
+    # `vali_scheduled_golden_rebake`; "" (every other bake) = no upgrade,
+    # the pre-F6 bake unchanged. Not on the HTTP create surface.
+    package_refresh = models.CharField(
+        max_length=64, blank=True, default="", db_default=""
+    )
+    # F6 — the synthetic e2e verdict on this (unblessed) re-bake: True
+    # passed, False failed, None not run. A False bake is not a bless
+    # candidate (`apps.images.rebake.freshness`).
+    rebake_e2e_passed = models.BooleanField(null=True, blank=True, default=None)
 
     # ── Bake state ─────────────────────────────────────────────────
     state = models.CharField(
@@ -217,6 +251,13 @@ class TenantBake(models.Model):
     # measurement (the measured cmdline gains per-launch tokens — the
     # miner preflight computes the real digest); informational.
     measurement_hex = models.CharField(max_length=96, blank=True, default="")
+    # Customer-held keys (M1/M2): this golden bake's initramfs carries the
+    # guest's guardian leg, so a launch off it may take `key_mode=split` /
+    # `customer`. Operator-set ONLY (`vali_bake_customer_keys`), after the
+    # bake is known to include it — a bake without the guest leg would
+    # boot an M1/M2 cmdline it never reads, i.e. a plain M0 disk under a
+    # customer-keys label. Default False: every existing bake is incapable.
+    supports_customer_keys = models.BooleanField(default=False, db_default=False)
 
     failure_reason = models.CharField(max_length=256, blank=True, default="")
     version = models.PositiveBigIntegerField(default=1)

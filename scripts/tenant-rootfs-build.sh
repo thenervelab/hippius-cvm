@@ -69,7 +69,7 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-86400}"
 # overlay. Pre-installing removes the boot-time apt dependency and keeps
 # the holds intact. Override for a bump via HCC_BAKE_NETBIRD_VERSION.
 netbird_version="${HCC_BAKE_NETBIRD_VERSION:-0.71.3}"
-# Audit follow-up (Gemini #2 / Codex #1): the shared rootfs tarball
+# Audit follow-up (Review #2 / Review #1): the shared rootfs tarball
 # + manifest.json sit in S3 indefinitely as a shared artifact, and
 # Stage 2 trusts whatever it finds at `--rootfs-dir`. Without a
 # signature, a compromised S3 admin can atomically swap the tarball,
@@ -323,14 +323,62 @@ export LANG=C
 export LANGUAGE=C
 export TZ=UTC
 
+# The kernel META-package is per-distro: Ubuntu cloud images use
+# linux-image-virtual; Debian ships linux-image-cloud-amd64 (genericcloud)
+# or linux-image-amd64. The distro is resolved ONCE, here, BEFORE the
+# install: apt-get install of a package the distro does not have fails
+# under set -e, so a hard-coded Ubuntu name would abort the chroot on a
+# Debian base before any of the kernel logic below ran. Read with sed,
+# never sourced: os-release comes from the base image and must not run
+# code at bake time.
+#
+#   KERNEL_PKG  — the ONE meta-package this bake installs. Debian gets
+#                 the FULL linux-image-amd64 (not -cloud-): the cloud
+#                 kernel may omit sev-guest/tsm (same choice and reason
+#                 as resolve_distro_plan in tenant-image-bake.sh).
+#   KERNEL_META — every meta-package that MAY be present afterwards and
+#                 must be held if it is (Debian genericcloud pre-installs
+#                 the -cloud- one; installing the full one does not
+#                 remove it).
+#
+# An unknown ID is fatal: there is no kernel package to guess.
+DISTRO_ID=\$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -1)
+case "\${DISTRO_ID}" in
+    ubuntu)
+        KERNEL_PKG="linux-image-virtual"
+        KERNEL_META="linux-image-virtual" ;;
+    debian)
+        KERNEL_PKG="linux-image-amd64"
+        KERNEL_META="linux-image-cloud-amd64 linux-image-amd64" ;;
+    *)
+        echo "ERROR: unsupported distro ID='\${DISTRO_ID}' in /etc/os-release — no kernel meta-package known for it (supported: ubuntu, debian)" >&2
+        exit 1 ;;
+esac
+
 apt-get update
 apt-get install -y --no-install-recommends \
     cryptsetup cryptsetup-initramfs initramfs-tools \
-    linux-image-virtual \
+    "\${KERNEL_PKG}" \
     curl ca-certificates \
     udhcpc isc-dhcp-client iproute2
 
-KVER_PKG=\$(dpkg-query -W -f='\${Depends}' linux-image-virtual 2>/dev/null | tr ',' '\\n' | awk '{print \$1}' | grep -E '^linux-image-[0-9]' | sed 's/^linux-image-//' | sort -V | tail -1)
+# Everything kernel-related below (modules-extra install, the apt-mark
+# hold set, the KVER derivation) keys off the meta-package(s) ACTUALLY
+# installed, from the KERNEL_META set resolved above.
+KERNEL_META_INSTALLED=""
+for meta in \${KERNEL_META}; do
+    if dpkg-query -W -f='\${Status}\\n' "\${meta}" 2>/dev/null | grep -q '^install ok installed'; then
+        KERNEL_META_INSTALLED="\${KERNEL_META_INSTALLED}\${KERNEL_META_INSTALLED:+ }\${meta}"
+    fi
+done
+# KVER of the concrete kernel the meta-package pulled in (Ubuntu:
+# 6.8.0-NN-generic, Debian: 6.12.NN+deb13-cloud-amd64). Same derivation
+# as before, parameterised on the meta-package that is present.
+KVER_PKG=""
+for meta in \${KERNEL_META_INSTALLED}; do
+    KVER_PKG=\$(dpkg-query -W -f='\${Depends}' "\${meta}" 2>/dev/null | tr ',' '\\n' | awk '{print \$1}' | grep -E '^linux-image-[0-9]' | sed 's/^linux-image-//' | sort -V | tail -1)
+    if [ -n "\${KVER_PKG}" ]; then break; fi
+done
 if [ -n "\${KVER_PKG:-}" ]; then
     apt-get install -y --no-install-recommends \
         "linux-modules-extra-\${KVER_PKG}" || true
@@ -388,14 +436,63 @@ update-initramfs -u -k all
 
 apt-mark hold \\
     cryptsetup cryptsetup-initramfs initramfs-tools \\
-    linux-image-virtual \\
     curl ca-certificates \\
     udhcpc isc-dhcp-client iproute2 \\
     netbird \\
     || true
+
+# Kernel hold. WHY: the guest boots a platform-supplied, measured UKI
+# (kernel + initrd + cmdline in one PE, part of the launch digest); it
+# never boots from /boot and grub has no role. A tenant apt upgrade
+# that installs a new kernel runs postinst hooks that can only fail in
+# a CVM — update-grub / grub-probe cannot resolve the live dm-crypt
+# root (opened by the attested initramfs with a key released after
+# attestation) — which leaves dpkg half-configured and breaks every
+# later apt run. Kernel updates reach a tenant as a new attested image,
+# never through apt.
+#
+# Two traps the previous hold fell into:
+#   1. The meta-package name differs per distro (see KERNEL_META above).
+#      Holding linux-image-virtual on Debian holds nothing, and the
+#      trailing "|| true" hid that.
+#   2. Holding ONLY the meta-package does not stop apt from installing
+#      a new concrete linux-image-<ver> that some other package (or the
+#      meta-package's newer candidate) depends on. Every installed
+#      concrete linux-image / -headers / -modules(-extra) package is
+#      therefore held by name as well.
+KERNEL_PKGS=\$(dpkg-query -W -f='\${Package} \${Status}\\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \\
+    | awk '\$4 == "installed" {print \$1}' \\
+    | grep -E '^linux-(image|headers|modules)(-extra)?-[0-9]' || true)
+for pkg in \${KERNEL_META_INSTALLED} \${KERNEL_PKGS}; do
+    apt-mark hold "\${pkg}" || echo "WARNING: apt-mark hold \${pkg} failed" >&2
+done
 if [ -n "\${KVER_PKG:-}" ]; then
     apt-mark hold "linux-modules-extra-\${KVER_PKG}" || true
 fi
+# Explicit check instead of a swallowed error: at least one
+# linux-image-* package must be on hold, or a tenant apt upgrade will
+# replace the measured kernel.
+if ! apt-mark showhold 2>/dev/null | grep -qE '^linux-image-'; then
+    echo "WARNING: no linux-image-* package is on hold (distro ID='\${DISTRO_ID}', meta-package(s) looked for: \${KERNEL_META}, installed concrete kernel packages: \${KERNEL_PKGS:-none})" >&2
+fi
+
+# The grub kernel hooks are inert in a CVM (the guest never boots via
+# grub) and are the ones that return non-zero and wedge dpkg. run-parts
+# skips non-executable hooks, so drop the x bit instead of deleting the
+# conffiles. initramfs-tools hooks are left alone: the minimal change
+# is to disable the hook that fails, not every hook.
+for hook in /etc/kernel/postinst.d/zz-update-grub /etc/kernel/postrm.d/zz-update-grub; do
+    if [ -e "\${hook}" ]; then chmod -x "\${hook}"; fi
+done
+
+# A note the tenant can find next to the holds. apt ignores a file
+# that contains only comments.
+cat > /etc/apt/apt.conf.d/99-hippius-kernel-hold <<'NOTE'
+// The kernel packages on this system are held on purpose (apt-mark showhold).
+// This guest boots a platform-attested unified kernel image; the kernel in
+// /boot is not what runs, and kernel package upgrades cannot complete here.
+// Kernel updates arrive as a new attested image, not through apt.
+NOTE
 
 apt-get clean
 CHROOT_EOF
@@ -485,7 +582,7 @@ jq -n \
 cat "${manifest_json}"
 
 # ── 8. (Optional) Detached Ed25519 signature over manifest.json ────
-# Codex / Gemini audit finding #2 — the shared rootfs.tar.zst lives
+# Review / Review audit finding #2 — the shared rootfs.tar.zst lives
 # in S3 indefinitely as a SHARED artifact across tenants. Without a
 # manifest sig, an S3 admin can swap (tarball, kernel, initrd,
 # manifest) atomically; Stage 2's SHA check passes against the

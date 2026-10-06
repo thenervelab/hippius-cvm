@@ -81,6 +81,22 @@ class VmAdmin(admin.ModelAdmin):
         "launch_abandoned_at",
         "launch_abandoned_outcome",
         "launch_abandoned_registered",
+        # Customer-held keys pin — written ONCE by `launch._ensure_vm_row`
+        # and held immutable by every relaunch / re-mint path. Editing it
+        # would re-mint an M1/M2 VM as another mode (or adopt a guardian).
+        "key_mode",
+        "guardian_endpoint",
+        "guardian_pubkey",
+        # Power axis — written by the power operations (`power._set_power`,
+        # which stamps `power_state_at` on every transition) and the
+        # abandoned-marker settler. `power_stop_ordered_at` is valid only
+        # while it equals `power_state_at`; a hand edit that changes the
+        # state without the stamp would forge "stopped by a completed stop
+        # order", which `vali_swap_vm_initrd --revert` trusts.
+        "power_state",
+        "power_state_at",
+        "power_stop_ordered_at",
+        "power_stop_proof",
         "created_at",
         "updated_at",
     )

@@ -128,6 +128,43 @@ fn the_suppressed_confirm_bound_is_always_rendered_explicitly() {
     );
 }
 
+/// Rollout fuse. Arming `require_wrapped_userdata` refuses every VM whose
+/// cloud-init was staged before the wrapping landed — such a VM holds
+/// plaintext and would simply stop booting. It therefore ships OFF until
+/// the operator has enumerated and drained that population.
+///
+/// Like the suppressed-confirm fuse above, this test is EXPECTED to fire
+/// on the arming commit: flipping the value is a deliberate act that
+/// updates this test, in the same change, with the evidence that the
+/// drain is complete. What it prevents is the flip happening as a
+/// drive-by chart edit.
+#[test]
+fn the_wrapped_userdata_gate_ships_disabled_until_the_fleet_has_drained() {
+    let toml = render_config_toml();
+    let effective: String = toml
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let key = "require_wrapped_userdata";
+    assert!(
+        !effective.contains(&format!("{key} = true")),
+        "the chart renders `{key} = true`. That gate must stay OFF until the \
+         population it fences has drained: it refuses every VM whose cloud-init \
+         was staged in plaintext, which simply stops those VMs booting. Arm it \
+         in the same commit that records the drain evidence, and update this \
+         test there. Rendered TOML was:\n{toml}"
+    );
+
+    // The rendered config must still PARSE under the binary's own parser,
+    // so a renamed/retyped key fails here rather than at boot.
+    let f = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(f.path(), &toml).unwrap();
+    let cfg = Config::load(f.path()).expect("the rendered chart config.toml must parse");
+    assert!(!cfg.require_wrapped_userdata);
+}
+
 // ── admin mTLS: the chart cannot render a self-inflicted outage ──────
 
 /// Render `configmap-kbs.yaml` with extra `--set` overrides. Returns
@@ -390,5 +427,38 @@ fn the_shipped_values_render_a_listener_that_authenticates() {
         "the shipped values render an admin listener with NO client CA and \
          require_mtls=false — that is the unauthenticated plaintext arm, on the \
          API that decides which host may unlock a VM. Rendered TOML was:\n{toml}"
+    );
+}
+
+#[test]
+fn the_rollback_section_is_absent_by_default_and_parses_when_set() {
+    // Absent by default: the pinned KBS image predates `[rollback]` and
+    // `Config` is deny_unknown_fields, so rendering it would crashloop
+    // that image on its next restart.
+    let (ok, out, err) = try_render(&[]);
+    assert!(ok, "default render failed: {err}");
+    let toml = extract_toml(&out);
+    assert!(
+        !toml.contains("[rollback]"),
+        "default values must not render [rollback]"
+    );
+
+    let (ok, out, err) = try_render(&[
+        "config.rollback.minIntervalS=900",
+        "config.rollback.maxTtlS=1200",
+    ]);
+    assert!(ok, "render with rollback failed: {err}");
+    let toml = extract_toml(&out);
+    assert!(toml.contains("[rollback]"), "{toml}");
+    let f = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(f.path(), &toml).unwrap();
+    // `Config::load` also runs `validate`, like the pod at boot.
+    let cfg = Config::load(f.path()).unwrap_or_else(|e| panic!("{e}\n{toml}"));
+    assert_eq!(
+        cfg.rollback_policy(),
+        kbs_core::rollback::RollbackPolicy {
+            min_interval_s: 900,
+            max_ttl_s: 1200
+        }
     );
 }

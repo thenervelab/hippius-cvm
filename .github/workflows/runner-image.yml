@@ -47,10 +47,11 @@ env:
 
 jobs:
   runner-image:
-    # Build the runner image ITSELF on GitHub-hosted ubuntu-latest
-    # — never on `mon-runner-k8s`. A broken self-hosted runner
-    # image must not block its own rebuild.
-    runs-on: ubuntu-latest
+    # Build the runner image ITSELF never on `mon-runner-k8s`: a broken
+    # self-hosted runner image must not block its own rebuild. The Hippius
+    # runners (`CI_RUNS_ON_BUILD`) are a separate pool; unset the variable
+    # to fall back to GitHub-hosted ubuntu-latest.
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -33,6 +33,7 @@ use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::to_canonical_vec;
+use crate::guardian::GuardianDenyReason;
 
 /// Replay-domain separator — the first field (by sort order) of every
 /// signed vm-progress body. Distinct from every other signed-payload
@@ -53,12 +54,15 @@ pub const MAX_MINER_ID_LEN: usize = 64;
 /// column (`max_length=256`).
 pub const MAX_VM_ID_LEN: usize = 256;
 
-/// The three boot milestones the miner-agent can observe on the host,
+/// The boot milestones the miner-agent can observe on the host,
 /// in monotonic order. The wire value (kebab-case) is what the signed
 /// body carries; vali maps it to its `boot_phase` display field.
 ///
 /// - [`Booting`](VmProgressMilestone::Booting) — the domain has started
 ///   (libvirt `Started` lifecycle event).
+/// - [`AwaitingGuardian`](VmProgressMilestone::AwaitingGuardian) — a
+///   customer-keys guest is stuck on its guardian leg (the host guardian
+///   relay saw it fail); carries a [`GuardianWaitReason`].
 /// - [`KekReleased`](VmProgressMilestone::KekReleased) — the KBS released
 ///   the LUKS KEK to the attested guest (the host-side kbs-proxy saw a
 ///   `forwarded status=200` on the release path).
@@ -68,8 +72,60 @@ pub const MAX_VM_ID_LEN: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmProgressMilestone {
     Booting,
+    /// The guest is (as far as the host relay can tell) waiting for its
+    /// customer key guardian ([`crate::guardian`]) before it asks the
+    /// KBS. Sits between `booting` and `kek-released`. Carries a
+    /// closed-vocabulary [`GuardianWaitReason`], signed as the body's
+    /// `reason` field — the only milestone that has one.
+    ///
+    /// Display-only like every milestone, and weaker still: the miner
+    /// derives it from the traffic it relays, so it can suppress or
+    /// forge it. The customer's guardian audit log is the truth.
+    AwaitingGuardian(GuardianWaitReason),
     KekReleased,
     Running,
+}
+
+/// Why a guest is waiting on its guardian (design §6). Wire strings:
+/// `unreachable`, `timeout`, `refused:<`[`GuardianDenyReason`]` wire>`,
+/// `bad-response`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardianWaitReason {
+    /// The relay could not connect to the guardian endpoint.
+    Unreachable,
+    /// The guardian did not answer within the relay's timeout.
+    Timeout,
+    /// The guardian answered with a (signed) denial. The relay does not
+    /// verify the signature — this is display only.
+    Refused(GuardianDenyReason),
+    /// The guardian answered something that is neither a success nor a
+    /// denial.
+    BadResponse,
+}
+
+impl GuardianWaitReason {
+    /// The wire string carried in the signed body's `reason` field.
+    pub fn to_wire(self) -> String {
+        match self {
+            GuardianWaitReason::Unreachable => "unreachable".into(),
+            GuardianWaitReason::Timeout => "timeout".into(),
+            GuardianWaitReason::Refused(r) => alloc::format!("refused:{}", r.as_wire()),
+            GuardianWaitReason::BadResponse => "bad-response".into(),
+        }
+    }
+
+    /// Parse a wire string. Unknown ⇒ `None`.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "unreachable" => Some(GuardianWaitReason::Unreachable),
+            "timeout" => Some(GuardianWaitReason::Timeout),
+            "bad-response" => Some(GuardianWaitReason::BadResponse),
+            _ => s
+                .strip_prefix("refused:")
+                .and_then(GuardianDenyReason::from_wire)
+                .map(GuardianWaitReason::Refused),
+        }
+    }
 }
 
 impl VmProgressMilestone {
@@ -77,17 +133,39 @@ impl VmProgressMilestone {
     pub fn as_wire(self) -> &'static str {
         match self {
             VmProgressMilestone::Booting => "booting",
+            VmProgressMilestone::AwaitingGuardian(_) => "awaiting-guardian",
             VmProgressMilestone::KekReleased => "kek-released",
             VmProgressMilestone::Running => "running",
         }
     }
 
+    /// The `reason` wire string, for the one milestone that carries one.
+    pub fn reason_wire(self) -> Option<String> {
+        match self {
+            VmProgressMilestone::AwaitingGuardian(r) => Some(r.to_wire()),
+            _ => None,
+        }
+    }
+
     /// Parse a wire string back to a milestone. Unknown ⇒ `None`.
+    ///
+    /// `awaiting-guardian` needs its reason, so it is `None` here — use
+    /// [`from_wire_parts`](Self::from_wire_parts).
     pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "booting" => Some(VmProgressMilestone::Booting),
-            "kek-released" => Some(VmProgressMilestone::KekReleased),
-            "running" => Some(VmProgressMilestone::Running),
+        Self::from_wire_parts(s, None)
+    }
+
+    /// Parse a `(milestone, reason)` pair as the signed body carries it.
+    /// A reason is REQUIRED for `awaiting-guardian` and FORBIDDEN for
+    /// every other milestone; anything else ⇒ `None`.
+    pub fn from_wire_parts(milestone: &str, reason: Option<&str>) -> Option<Self> {
+        match (milestone, reason) {
+            ("booting", None) => Some(VmProgressMilestone::Booting),
+            ("kek-released", None) => Some(VmProgressMilestone::KekReleased),
+            ("running", None) => Some(VmProgressMilestone::Running),
+            ("awaiting-guardian", Some(r)) => {
+                GuardianWaitReason::from_wire(r).map(VmProgressMilestone::AwaitingGuardian)
+            }
             _ => None,
         }
     }
@@ -190,7 +268,10 @@ impl VmProgressReport {
         // `milestone` is a typed enum here, so it is always a valid wire
         // value on the encode path; the check exists for parity with the
         // decode path (a decoder builds this struct from wire text).
-        if VmProgressMilestone::from_wire(self.milestone.as_wire()).is_none() {
+        let reason = self.milestone.reason_wire();
+        if VmProgressMilestone::from_wire_parts(self.milestone.as_wire(), reason.as_deref())
+            != Some(self.milestone)
+        {
             return Err(VmProgressError::Milestone);
         }
         Ok(())
@@ -202,7 +283,7 @@ impl VmProgressReport {
     /// impossible body never reaches the signer.
     pub fn canonical(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let v = Value::Map(alloc::vec![
+        let mut entries = alloc::vec![
             (Value::Text("domain".into()), Value::Text(DOMAIN.into())),
             (
                 Value::Text("milestone".into()),
@@ -221,7 +302,15 @@ impl VmProgressReport {
                 Value::Integer(self.timestamp_unix.into()),
             ),
             (Value::Text("vm_id".into()), Value::Text(self.vm_id.clone())),
-        ]);
+        ];
+        // `reason` is emitted ONLY for `awaiting-guardian`, so the three
+        // older milestones stay byte-identical six-field bodies. A seventh
+        // field is refused by a verifier that predates it (vali answers
+        // 403 `body_decode_failed`, the sink logs + drops): harmless.
+        if let Some(reason) = self.milestone.reason_wire() {
+            entries.push((Value::Text("reason".into()), Value::Text(reason)));
+        }
+        let v = Value::Map(entries);
         to_canonical_vec(&v).map_err(|_| VmProgressError::Encode)
     }
 }
@@ -322,6 +411,87 @@ mod tests {
             assert_eq!(VmProgressMilestone::from_wire(m.as_wire()), Some(m));
         }
         assert_eq!(VmProgressMilestone::from_wire("nope"), None);
+        // `awaiting-guardian` is never reason-less.
+        assert_eq!(VmProgressMilestone::from_wire("awaiting-guardian"), None);
+    }
+
+    fn every_wait_reason() -> Vec<GuardianWaitReason> {
+        let mut all = alloc::vec![
+            GuardianWaitReason::Unreachable,
+            GuardianWaitReason::Timeout,
+            GuardianWaitReason::BadResponse,
+        ];
+        all.extend(
+            GuardianDenyReason::ALL
+                .into_iter()
+                .map(GuardianWaitReason::Refused),
+        );
+        all
+    }
+
+    #[test]
+    fn awaiting_guardian_reasons_round_trip_and_are_closed() {
+        for r in every_wait_reason() {
+            let m = VmProgressMilestone::AwaitingGuardian(r);
+            assert_eq!(m.as_wire(), "awaiting-guardian");
+            let wire = m.reason_wire().unwrap();
+            assert_eq!(
+                VmProgressMilestone::from_wire_parts(m.as_wire(), Some(&wire)),
+                Some(m)
+            );
+        }
+        assert_eq!(
+            GuardianWaitReason::Refused(GuardianDenyReason::Erased).to_wire(),
+            "refused:erased"
+        );
+        assert_eq!(GuardianWaitReason::Unreachable.to_wire(), "unreachable");
+        assert_eq!(GuardianWaitReason::Timeout.to_wire(), "timeout");
+        assert_eq!(GuardianWaitReason::BadResponse.to_wire(), "bad-response");
+        for bad in ["", "refused:", "refused:nope", "refused", "Timeout", "x"] {
+            assert_eq!(GuardianWaitReason::from_wire(bad), None, "{bad}");
+        }
+        // A reason on any other milestone, or none on this one: refused.
+        assert_eq!(
+            VmProgressMilestone::from_wire_parts("booting", Some("timeout")),
+            None
+        );
+        assert_eq!(
+            VmProgressMilestone::from_wire_parts("awaiting-guardian", None),
+            None
+        );
+    }
+
+    #[test]
+    fn only_awaiting_guardian_signs_a_reason_field() {
+        let field_count = |m: VmProgressMilestone| {
+            let mut r = sample();
+            r.milestone = m;
+            let body = r.canonical().unwrap();
+            assert_canonical(&body).unwrap();
+            let v: Value = ciborium::de::from_reader(body.as_slice()).unwrap();
+            match v {
+                Value::Map(e) => (
+                    e.len(),
+                    e.iter()
+                        .find(|(k, _)| k.as_text() == Some("reason"))
+                        .and_then(|(_, v)| v.as_text().map(String::from)),
+                ),
+                _ => panic!("not a map"),
+            }
+        };
+        for m in [
+            VmProgressMilestone::Booting,
+            VmProgressMilestone::KekReleased,
+            VmProgressMilestone::Running,
+        ] {
+            assert_eq!(field_count(m), (6, None));
+        }
+        assert_eq!(
+            field_count(VmProgressMilestone::AwaitingGuardian(
+                GuardianWaitReason::Refused(GuardianDenyReason::AwaitingApproval)
+            )),
+            (7, Some("refused:awaiting-approval".into()))
+        );
     }
 
     #[test]

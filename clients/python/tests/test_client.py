@@ -15,6 +15,7 @@ from hippius_validator_client import (
     Bake,
     BakeRequest,
     DecommissionJob,
+    Feasibility,
     HippiusApiError,
     HippiusTimeoutError,
     HippiusValidatorClient,
@@ -58,7 +59,7 @@ def _launch_body(state: str, **over: object) -> dict[str, object]:
         "tenant_id": "tenant-1",
         "flavor": "small",
         "state": state,
-        "miner_id": "miner-2" if state != "queued" else None,
+        "miner_id": "miner-b" if state != "queued" else None,
         "placement_id": None,
         "reason": None,
         "result": {"ok": True} if state == "succeeded" else None,
@@ -146,7 +147,7 @@ def test_launch_happy_path_polls_to_succeeded() -> None:
         final = c.wait_for_launch(job.job_id, interval=0, timeout=5)
 
     assert final.is_succeeded
-    assert final.miner_id == "miner-2"
+    assert final.miner_id == "miner-b"
     assert final.result == {"ok": True}
 
     # Auth + Host headers are sent on the launch POST.
@@ -626,7 +627,7 @@ def test_provision_vm_on_progress_emits_phases_in_order() -> None:
     assert [s.phase for s in steps] == _HAPPY_PHASES
     # PLACED carries the miner it landed on; SUCCEEDED is terminal.
     placed = next(s for s in steps if s.phase is ProvisionPhase.PLACED)
-    assert placed.miner_id == "miner-2"
+    assert placed.miner_id == "miner-b"
     assert steps[-1].terminal
     # pct is a monotonic non-decreasing estimate up to 100.
     pcts = [s.pct for s in steps]
@@ -1403,3 +1404,289 @@ async def test_async_wait_for_decommission_polls_to_done() -> None:
     async with AsyncHippiusValidatorClient(BASE, TOKEN) as c:
         job = await c.wait_for_decommission("vm-1", "dec-1", interval=0, timeout=5)
     assert job.is_done
+
+
+# ─── Pre-sale feasibility ───────────────────────────────────────────────
+
+
+def _feasibility_body() -> dict:
+    """The shape the validator returns for the real fleet: the small end
+    is sellable, `4xlarge` is not and never will be."""
+    return {
+        "flavors": [
+            {
+                "flavor": "small",
+                "verdict": "yes",
+                "placeable_now": True,
+                "fits_any_host": True,
+                "headroom": 66,
+                "cpu_count": 1,
+                "memory_mb": 4096,
+                "data_disk_size_gb": 40,
+                "reason": "",
+                "scheduler_error": "",
+                "disk_checked": False,
+                "hosts": [
+                    {
+                        "node_id": "n1",
+                        "big_enough": True,
+                        "fits": True,
+                        "free_memory_mb": 120904,
+                        "free_cpus": 22,
+                        "budget_memory_mb": 120904,
+                        "budget_cpus": 22,
+                        "shortfall": "",
+                    }
+                ],
+            },
+            {
+                "flavor": "4xlarge",
+                "verdict": "never",
+                "placeable_now": False,
+                "fits_any_host": False,
+                "headroom": 0,
+                "cpu_count": 32,
+                "memory_mb": 131072,
+                "data_disk_size_gb": 1280,
+                "reason": "flavor-exceeds-every-host",
+                "scheduler_error": "",
+                "disk_checked": False,
+                "hosts": [
+                    {
+                        "node_id": "n1",
+                        "big_enough": False,
+                        "fits": False,
+                        "free_memory_mb": 120904,
+                        "free_cpus": 22,
+                        "budget_memory_mb": 120904,
+                        "budget_cpus": 22,
+                        "shortfall": (
+                            "host memory budget 120904 < 131072 MiB; "
+                            "host cpu budget 22 < 32"
+                        ),
+                    }
+                ],
+            },
+        ]
+    }
+
+
+@responses.activate
+def test_feasibility_board() -> None:
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200
+    )
+    with _client() as c:
+        board = c.feasibility()
+    assert [f.flavor for f in board] == ["small", "4xlarge"]
+    assert isinstance(board[0], Feasibility)
+    assert board[0].sellable is True
+    assert board[1].sellable is False
+
+
+@responses.activate
+def test_can_place_never_is_distinct_from_full() -> None:
+    """The commercial point of the endpoint: `never` must be readable as
+    "do not take the money", separately from a retryable shortage."""
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200
+    )
+    with _client() as c:
+        answer = c.can_place("4xlarge")
+    assert answer.verdict == "never"
+    assert answer.reason == "flavor-exceeds-every-host"
+    assert answer.sellable is False
+    # And the caller can tell the operator WHICH dimension is short.
+    assert "memory budget" in answer.hosts[0].shortfall
+
+
+@responses.activate
+def test_can_place_forwards_the_scoping_params() -> None:
+    """`tenant_id` / `user_id` make the answer about THAT customer (they
+    feed anti-affinity and the per-owner budget), so they must reach the
+    wire rather than being silently dropped."""
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200
+    )
+    with _client() as c:
+        c.can_place("small", tenant_id="acme", user_id="u-1")
+    qs = responses.calls[0].request.url
+    assert "flavor=small" in qs
+    assert "tenant_id=acme" in qs
+    assert "user_id=u-1" in qs
+
+
+@responses.activate
+def test_feasibility_never_writes() -> None:
+    """It is a GET. A pre-sale check that could create a VM would be a
+    trap, so pin the method."""
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200
+    )
+    with _client() as c:
+        c.feasibility()
+    assert responses.calls[0].request.method == "GET"
+
+
+@responses.activate
+def test_can_place_refuses_a_body_missing_the_flavor_it_asked_for() -> None:
+    """A proxy that drops the query parameter must not make us price on
+    another flavor's verdict. Better to fail than to answer confidently
+    about the wrong thing."""
+    from hippius_validator_client import HippiusApiError
+
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json={"flavors": []}, status=200
+    )
+    with _client() as c, pytest.raises(HippiusApiError):
+        c.can_place("small")
+
+
+# ─── Regions ────────────────────────────────────────────────────────────
+
+
+def _regions_body() -> dict:
+    return {
+        "regions": [
+            {
+                "region": "FR",
+                "country_code": "FR",
+                "miners_total": 3,
+                "miners_verified": 3,
+                "miners_dispatchable": 2,
+                "hosted_vm_count": 1,
+                "capacity": {"total_units": 16, "committed_units": 1, "free_units": 15},
+                "node_ids": ["n1", "n2", "n3"],
+            },
+            {
+                "region": "DE",
+                "country_code": "DE",
+                "miners_total": 1,
+                "miners_verified": 0,
+                "miners_dispatchable": 0,
+                "hosted_vm_count": 0,
+                "capacity": None,
+                "node_ids": [],
+            },
+        ],
+        "unlocated_miners": 1,
+        "require_verified": True,
+        "vantage": {"name": "cp-1-eu", "latitude": 52.37, "longitude": 4.9},
+        "generated_at": "2026-09-21T00:00:00Z",
+    }
+
+
+def _feasibility_body_for(region: str) -> dict:
+    body = _feasibility_body()
+    for row in body["flavors"]:
+        row["region"] = region
+    return body
+
+
+@responses.activate
+def test_can_place_forwards_region() -> None:
+    """`region` makes the answer about ONE country; dropped on the way to
+    the wire it would return the fleet-wide verdict and oversell."""
+    responses.get(
+        f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body_for("FR"), status=200
+    )
+    with _client() as c:
+        answer = c.can_place("small", region="fr")
+    assert "region=fr" in responses.calls[0].request.url
+    assert answer.region == "FR"
+
+
+@responses.activate
+def test_can_place_refuses_an_answer_not_given_for_the_region_asked() -> None:
+    """A validator that pre-dates `?region=` ignores the parameter and
+    answers fleet-wide with no echo. Pricing an FR sale on that would
+    launch anywhere; the client must refuse rather than guess."""
+    responses.get(f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200)
+    with _client() as c, pytest.raises(HippiusApiError) as exc:
+        c.can_place("small", region="FR")
+    assert exc.value.category == "wire"
+    # Without a region asked, the same body is perfectly fine.
+    responses.get(f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200)
+    with _client() as c:
+        assert c.can_place("small").flavor == "small"
+
+
+@responses.activate
+def test_feasibility_omits_region_when_not_asked() -> None:
+    responses.get(f"{BASE}/v1/scheduler/feasibility", json=_feasibility_body(), status=200)
+    with _client() as c:
+        c.feasibility("small")
+    assert "region" not in responses.calls[0].request.url
+
+
+@responses.activate
+def test_feasibility_parses_the_region_echo_and_tolerates_its_absence() -> None:
+    body = _feasibility_body()
+    body["flavors"][0]["region"] = "FR"
+    body["flavors"][0]["reason"] = "region-unverified"
+    responses.get(f"{BASE}/v1/scheduler/feasibility", json=body, status=200)
+    with _client() as c:
+        board = c.feasibility()
+    assert board[0].region == "FR"
+    # An older validator sends no `region` key at all.
+    assert board[1].region == ""
+
+
+def test_launch_request_region_is_in_the_body_only_when_set() -> None:
+    from hippius_validator_client import LaunchRequest
+
+    assert "region" not in LaunchRequest(image="ubuntu").to_body("#cloud-config")
+    body = LaunchRequest(image="ubuntu", region="fr").to_body("#cloud-config")
+    assert body["region"] == "fr"
+
+
+@responses.activate
+def test_regions_report() -> None:
+    from hippius_validator_client import Region, RegionsReport
+
+    responses.get(f"{BASE}/v1/operator/regions", json=_regions_body(), status=200)
+    with _client() as c:
+        report = c.regions()
+    assert isinstance(report, RegionsReport)
+    assert [r.region for r in report.regions] == ["FR", "DE"]
+    fr = report.get("fr")
+    assert isinstance(fr, Region)
+    assert fr.capacity is not None and fr.capacity.free_units == 15
+    assert fr.node_ids == ["n1", "n2", "n3"]
+    assert fr.placeable is True
+    de = report.get("DE")
+    assert de is not None and de.capacity is None and de.placeable is False
+    assert report.get("JP") is None
+    # Dispatchable miners but UNKNOWN capacity is not a sales hint.
+    assert Region.from_dict({"region": "IT", "miners_dispatchable": 2}).placeable is False
+    assert report.unlocated_miners == 1
+    assert report.require_verified is True
+    assert report.vantage["name"] == "cp-1-eu"
+    # The default asks the validator's own rule: no parameter on the wire.
+    assert responses.calls[0].request.method == "GET"
+    assert "verified_only" not in responses.calls[0].request.url
+
+
+@responses.activate
+def test_regions_sends_verified_only_false_only_when_asked() -> None:
+    responses.get(f"{BASE}/v1/operator/regions", json=_regions_body(), status=200)
+    with _client() as c:
+        c.regions(verified_only=False)
+    assert "verified_only=false" in responses.calls[0].request.url
+
+
+@respx.mock
+async def test_async_regions_and_region_feasibility() -> None:
+    route = respx.get(f"{BASE}/v1/operator/regions").mock(
+        return_value=httpx.Response(200, json=_regions_body())
+    )
+    feas = respx.get(f"{BASE}/v1/scheduler/feasibility").mock(
+        return_value=httpx.Response(200, json=_feasibility_body_for("FR"))
+    )
+    async with AsyncHippiusValidatorClient(BASE, TOKEN) as c:
+        report = await c.regions(verified_only=False)
+        answer = await c.can_place("small", region="FR")
+    assert route.called and "verified_only=false" in str(route.calls[0].request.url)
+    assert [r.region for r in report.regions] == ["FR", "DE"]
+    assert feas.called and "region=FR" in str(feas.calls[0].request.url)
+    assert answer.flavor == "small"

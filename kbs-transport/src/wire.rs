@@ -38,7 +38,7 @@ pub struct ReleaseRequestBody {
     pub snp_report: ByteBuf,
     /// 32-byte KBS-minted nonce (must equal `REPORT_DATA[0..32]`, §7/§20).
     pub kbs_nonce: ByteBuf,
-    /// Phase 2A of audit follow-up Codex #2 — anti-rollback for
+    /// Phase 2A of audit follow-up Review #2 — anti-rollback for
     /// valid-old-ciphertext replay. The guest's reported value of
     /// "the boot counter I expect this release to advance to". On
     /// first boot, `Some(1)`. On subsequent boots, the guest reads
@@ -76,6 +76,11 @@ pub struct VolumeStampConfirmBody {
     /// The 32-byte single-use authenticator the guest unwrapped from
     /// `KbsResponse::volume_stamp_token`.
     pub token: ByteBuf,
+    /// Stamp protocol v2 only: the 32-byte TIMELINE the guest stamped
+    /// (the `target` of its release's `volume_stamp_transition`). ABSENT
+    /// from a v1 confirm, whose body is then byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_id: Option<ByteBuf>,
 }
 
 /// `POST /v1/kbs/volume-stamp/confirm` response body.
@@ -120,6 +125,92 @@ pub struct KeepaliveRequestBody {
     /// pick a value generous enough to absorb network + batch
     /// latency (e.g. `now + 600`).
     pub expiry_unix: u64,
+    /// The resources the guest read when it took the report — folded
+    /// into its `REPORT_DATA`
+    /// (`hippius_types::report_data::live_attestation_with_resources`),
+    /// so the KBS checks them against the PSP-signed report before it
+    /// signs them into a schema-v3 body. Absent for a guest that predates
+    /// them: the request is then byte-identical to before and gets the
+    /// resource-less `REPORT_DATA` check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<KeepaliveResources>,
+    /// The guest components release and health the guest read when it
+    /// took the report — folded into its `REPORT_DATA`
+    /// (`hippius_types::report_data::live_attestation_with_components`)
+    /// and signed into a schema-v4 body once the KBS checked them. Absent
+    /// for a guest that does not attest them (the request is then
+    /// byte-identical to before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<KeepaliveComponents>,
+}
+
+/// The `components` of a [`KeepaliveRequestBody`] — same five values as
+/// `hippius_types::live_attestation::GuestComponents`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepaliveComponents {
+    pub release_version: u32,
+    pub security_epoch: u32,
+    pub health: u32,
+    pub instance: u32,
+    pub unhealthy_ticks: u32,
+}
+
+impl From<KeepaliveComponents> for hippius_types::live_attestation::GuestComponents {
+    fn from(c: KeepaliveComponents) -> Self {
+        Self {
+            release_version: c.release_version,
+            security_epoch: c.security_epoch,
+            health: c.health,
+            instance: c.instance,
+            unhealthy_ticks: c.unhealthy_ticks,
+        }
+    }
+}
+
+impl From<hippius_types::live_attestation::GuestComponents> for KeepaliveComponents {
+    fn from(c: hippius_types::live_attestation::GuestComponents) -> Self {
+        Self {
+            release_version: c.release_version,
+            security_epoch: c.security_epoch,
+            health: c.health,
+            instance: c.instance,
+            unhealthy_ticks: c.unhealthy_ticks,
+        }
+    }
+}
+
+/// The `resources` of a [`KeepaliveRequestBody`] — same four values as
+/// `hippius_types::live_attestation::GuestResources`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepaliveResources {
+    pub vcpus_online: u32,
+    pub mem_firmware_kib: u64,
+    pub mem_total_kib: u64,
+    pub mem_unaccepted_kib: u64,
+}
+
+impl From<KeepaliveResources> for hippius_types::live_attestation::GuestResources {
+    fn from(r: KeepaliveResources) -> Self {
+        Self {
+            vcpus_online: r.vcpus_online,
+            mem_firmware_kib: r.mem_firmware_kib,
+            mem_total_kib: r.mem_total_kib,
+            mem_unaccepted_kib: r.mem_unaccepted_kib,
+        }
+    }
+}
+
+impl From<hippius_types::live_attestation::GuestResources> for KeepaliveResources {
+    fn from(r: hippius_types::live_attestation::GuestResources) -> Self {
+        Self {
+            vcpus_online: r.vcpus_online,
+            mem_firmware_kib: r.mem_firmware_kib,
+            mem_total_kib: r.mem_total_kib,
+            mem_unaccepted_kib: r.mem_unaccepted_kib,
+        }
+    }
 }
 
 /// `POST /v1/attest/keepalive` response body.
@@ -239,6 +330,132 @@ mod tests {
         assert_eq!(decoded.kbs_nonce.len(), 32);
     }
 
+    fn keepalive_body(resources: Option<KeepaliveResources>) -> KeepaliveRequestBody {
+        KeepaliveRequestBody {
+            vm_id: "vm-1".into(),
+            node_id: ByteBuf::from(vec![0xBB; 32]),
+            snp_report: ByteBuf::from(vec![0xAA; 8]),
+            kbs_nonce: ByteBuf::from(vec![7u8; 32]),
+            epoch: 3,
+            expiry_unix: 1_800_000_900,
+            resources,
+            components: None,
+        }
+    }
+
+    /// A guest that predates the resources sends exactly the six keys an
+    /// old KBS accepts — the field must never surface as `null`.
+    #[test]
+    fn a_keepalive_without_resources_encodes_the_legacy_keys() {
+        let bytes = encode_cbor(&keepalive_body(None)).unwrap();
+        let v: ciborium::value::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::value::Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        let keys: Vec<String> = entries
+            .into_iter()
+            .map(|(k, _)| k.into_text().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "epoch",
+                "vm_id",
+                "node_id",
+                "kbs_nonce",
+                "snp_report",
+                "expiry_unix"
+            ]
+        );
+        let decoded: KeepaliveRequestBody = decode_canonical(&bytes).unwrap();
+        assert!(decoded.resources.is_none());
+    }
+
+    #[test]
+    fn keepalive_components_round_trip_and_refuse_unknown_keys() {
+        let c = KeepaliveComponents {
+            release_version: 2,
+            security_epoch: 1,
+            health: 15,
+            instance: 0xDEAD_BEEF,
+            unhealthy_ticks: 1,
+        };
+        let mut body = keepalive_body(None);
+        body.components = Some(c);
+        let bytes = encode_cbor(&body).unwrap();
+        let decoded: KeepaliveRequestBody = decode_canonical(&bytes).unwrap();
+        assert_eq!(decoded.components, Some(c));
+        assert!(decoded.resources.is_none());
+
+        let v = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("health".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("instance".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("release_version".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("security_epoch".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("unhealthy_ticks".into()),
+                ciborium::value::Value::Integer(0.into()),
+            ),
+            (
+                ciborium::value::Value::Text("surprise".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+        ]);
+        let mut raw = Vec::new();
+        ciborium::ser::into_writer(&v, &mut raw).unwrap();
+        assert!(ciborium::de::from_reader::<KeepaliveComponents, _>(raw.as_slice()).is_err());
+    }
+
+    #[test]
+    fn keepalive_resources_round_trip_and_refuse_unknown_keys() {
+        let r = KeepaliveResources {
+            vcpus_online: 4,
+            mem_firmware_kib: 16_776_164,
+            mem_total_kib: 15_337_812,
+            mem_unaccepted_kib: 0,
+        };
+        let bytes = encode_cbor(&keepalive_body(Some(r))).unwrap();
+        let decoded: KeepaliveRequestBody = decode_canonical(&bytes).unwrap();
+        assert_eq!(decoded.resources, Some(r));
+
+        let v = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("mem_total_kib".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("vcpus_online".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("mem_firmware_kib".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("mem_unaccepted_kib".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Text("mem_hotplug_kib".into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+        ]);
+        let extra = to_canonical_vec(&v).unwrap();
+        assert!(decode_canonical::<KeepaliveResources>(&extra).is_err());
+    }
+
     #[test]
     fn unknown_fields_are_rejected() {
         let v = ciborium::value::Value::Map(vec![
@@ -287,7 +504,7 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// Phase 2A of audit follow-up Codex #2 — a pre-Phase-2A guest
+    /// Phase 2A of audit follow-up Review #2 — a pre-Phase-2A guest
     /// that omits `submitted_boot_counter` must still decode (the
     /// field is `Option<u64>` with `#[serde(default)]`, so absence
     /// → `None` short-circuits the KBS boot-counter CAS). A pre-

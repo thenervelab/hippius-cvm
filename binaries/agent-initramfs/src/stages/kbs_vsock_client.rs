@@ -17,6 +17,10 @@
 
 use std::io::{Read, Write};
 
+use hippius_types::guardian::{
+    is_guardian_allowed_path, GUARDIAN_MAX_REQUEST_BYTES, GUARDIAN_MAX_RESPONSE_BYTES,
+    GUARDIAN_RECIPE_PATH, GUARDIAN_VSOCK_PORT,
+};
 use hippius_types::kbs_vsock::{
     is_allowed_path, KbsProxyRequest, KbsProxyResponse, MAX_RESPONSE_BYTES,
 };
@@ -111,6 +115,71 @@ impl HttpClient for VsockHttpClient {
             body: resp.body.into_vec(),
         })
     }
+}
+
+/// Guest-side transport for the customer-held-keys **guardian relay**
+/// (`vsock://2:`[`GUARDIAN_VSOCK_PORT`]). Same framing and one-exchange-
+/// per-connection discipline as [`VsockHttpClient`]; the only difference
+/// is the closed path list — the guardian paths plus the relay-local
+/// recipe path, never a KBS path (and the KBS client never emits a
+/// guardian one), so neither relay can be asked to carry the other's
+/// traffic.
+pub struct GuardianVsockClient;
+
+impl GuardianVsockClient {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for GuardianVsockClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The guardian relay's base URL: the host CID on [`GUARDIAN_VSOCK_PORT`].
+pub fn guardian_relay_url() -> String {
+    format!(
+        "vsock://{}:{}",
+        hippius_types::kbs_vsock::HOST_CID,
+        GUARDIAN_VSOCK_PORT
+    )
+}
+
+impl HttpClient for GuardianVsockClient {
+    fn post_cbor(&self, url: &str, body: &[u8]) -> Result<HttpResponse, AgentError> {
+        let (target, path) = parse_vsock_url(url)?;
+        if !(is_guardian_allowed_path(&path) || path == GUARDIAN_RECIPE_PATH) {
+            return Err(AgentError::Guardian("vsock-path-forbidden"));
+        }
+        if body.len() > GUARDIAN_MAX_REQUEST_BYTES {
+            return Err(AgentError::Guardian("vsock-req-oversize"));
+        }
+        let req = KbsProxyRequest {
+            path,
+            body: ByteBuf::from(body.to_vec()),
+        };
+        let mut frame = Vec::new();
+        ciborium::ser::into_writer(&req, &mut frame)
+            .map_err(|_| AgentError::Guardian("vsock-encode"))?;
+        decode_guardian_reply(&vsock_exchange(target, &frame)?)
+    }
+}
+
+/// Decode the relay's `{status, body}` frame, refusing a body over the
+/// guardian response cap (the relay caps it too; the guest does not
+/// rely on that).
+fn decode_guardian_reply(frame: &[u8]) -> Result<HttpResponse, AgentError> {
+    let resp: KbsProxyResponse =
+        ciborium::de::from_reader(frame).map_err(|_| AgentError::Guardian("vsock-decode"))?;
+    if resp.body.len() > GUARDIAN_MAX_RESPONSE_BYTES {
+        return Err(AgentError::Guardian("vsock-resp-oversize"));
+    }
+    Ok(HttpResponse {
+        status: resp.status,
+        body: resp.body.into_vec(),
+    })
 }
 
 /// Frame a request, write it, read the framed response. The real
@@ -222,6 +291,106 @@ mod tests {
         let huge = (MAX_RESPONSE_BYTES as u32 + 1).to_be_bytes().to_vec();
         let mut cur = std::io::Cursor::new(huge);
         assert!(read_framed(&mut cur).is_err());
+    }
+
+    #[test]
+    fn guardian_client_refuses_every_non_guardian_path() {
+        let c = GuardianVsockClient::new();
+        for path in [
+            "/v1/kbs/nonce",
+            "/v1/kbs/release",
+            "/v1/guardian/nonce?x=1",
+            "/v1/guardian",
+            "/v1/admin/allowlist/reload",
+        ] {
+            let err = c.post_cbor(&format!("vsock://2:19271{path}"), &[]);
+            assert!(
+                matches!(err, Err(AgentError::Guardian("vsock-path-forbidden"))),
+                "{path}"
+            );
+        }
+        // And the KBS client never carries a guardian path.
+        let kbs = VsockHttpClient::new();
+        for path in ["/v1/guardian/nonce", GUARDIAN_RECIPE_PATH] {
+            let err = kbs.post_cbor(&format!("vsock://2:19266{path}"), &[]);
+            assert!(matches!(err, Err(AgentError::Kbs("vsock-path-forbidden"))));
+        }
+    }
+
+    #[test]
+    fn guardian_client_refuses_an_oversize_body_before_connecting() {
+        let c = GuardianVsockClient::new();
+        let err = c.post_cbor(
+            "vsock://2:19271/v1/guardian/release",
+            &vec![0; GUARDIAN_MAX_REQUEST_BYTES + 1],
+        );
+        assert!(matches!(
+            err,
+            Err(AgentError::Guardian("vsock-req-oversize"))
+        ));
+    }
+
+    #[test]
+    fn guardian_client_passes_every_guardian_path_and_a_full_size_body_to_the_socket() {
+        // No relay listens in a test, so getting as far as the connect
+        // (a transport error, not a refusal) is what "allowed" means.
+        let c = GuardianVsockClient::new();
+        for path in [
+            GUARDIAN_RECIPE_PATH,
+            "/v1/guardian/nonce",
+            "/v1/guardian/release",
+            "/v1/guardian/stamp/confirm",
+        ] {
+            let err = c.post_cbor(&format!("vsock://2:19271{path}"), &[1]);
+            assert!(
+                matches!(err, Err(AgentError::Kbs(_))),
+                "{path}: {:?}",
+                err.err()
+            );
+        }
+        let err = c.post_cbor(
+            "vsock://2:19271/v1/guardian/release",
+            &vec![0; GUARDIAN_MAX_REQUEST_BYTES],
+        );
+        assert!(matches!(err, Err(AgentError::Kbs(_))), "{:?}", err.err());
+    }
+
+    #[test]
+    fn guardian_reply_is_capped_at_the_guardian_response_limit() {
+        let frame = |len: usize| {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(
+                &KbsProxyResponse {
+                    status: 200,
+                    body: ByteBuf::from(vec![7u8; len]),
+                },
+                &mut out,
+            )
+            .unwrap();
+            out
+        };
+        let ok = decode_guardian_reply(&frame(GUARDIAN_MAX_RESPONSE_BYTES)).unwrap();
+        assert_eq!(
+            (ok.status, ok.body.len()),
+            (200, GUARDIAN_MAX_RESPONSE_BYTES)
+        );
+        assert!(matches!(
+            decode_guardian_reply(&frame(GUARDIAN_MAX_RESPONSE_BYTES + 1)),
+            Err(AgentError::Guardian("vsock-resp-oversize"))
+        ));
+        assert!(matches!(
+            decode_guardian_reply(b"not cbor"),
+            Err(AgentError::Guardian("vsock-decode"))
+        ));
+    }
+
+    #[test]
+    fn guardian_relay_url_is_the_host_on_the_guardian_port() {
+        assert_eq!(guardian_relay_url(), "vsock://2:19271");
+        let (t, _) =
+            parse_vsock_url(&format!("{}/v1/guardian/nonce", guardian_relay_url())).unwrap();
+        assert_eq!(t.cid, 2);
+        assert_eq!(t.port, GUARDIAN_VSOCK_PORT);
     }
 
     #[test]

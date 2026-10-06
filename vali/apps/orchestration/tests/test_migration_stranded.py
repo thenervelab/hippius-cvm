@@ -39,6 +39,7 @@ from django.utils import timezone
 from apps.lifecycle.models import Vm, VmState
 from apps.orchestration import effects, idempotency, service
 from apps.orchestration.models import (
+    LaunchJob,
     MigrationJob,
     MigrationState,
     SourceReclaimState,
@@ -792,7 +793,14 @@ def test_the_dest_order_id_is_scoped_to_the_job(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(order_dispatch, "dispatch_order", _dispatch)
 
     dispatch_migrate_activate = fx.real["dispatch_migrate_activate"]
-    for job_id in (job.job_id, job.job_id, "redrive-job"):
+    for job_id, attempt in (
+        (job.job_id, 0),
+        (job.job_id, 0),
+        ("redrive-job", 0),
+        (job.job_id, 1),
+        (job.job_id, 1),
+        (job.job_id, 2),
+    ):
         dispatch_migrate_activate(
             vm,
             dest_node_id="node-dst",
@@ -800,13 +808,84 @@ def test_the_dest_order_id_is_scoped_to_the_job(monkeypatch: pytest.MonkeyPatch,
             get_url="https://s3/x",
             boot_artifacts=None,
             job_id=job_id,
+            attempt=attempt,
         )
 
-    assert seen[0] == seen[1], "a job's own retries must reuse ONE order_id"
+    assert seen[0] == seen[1], "a tick re-run of one attempt must reuse ONE order_id"
     assert seen[2] != seen[0], (
         "a re-drive must present a DISTINCT order_id, or the destination "
         "answers `idempotent-replay` and restores nothing"
     )
+    # Attempt 0 keeps the job-scoped key: a job in flight across the deploy
+    # that introduced `attempt` is not re-dispatched under a new id.
+    assert seen[0] == f"mig-activate-{vm.vm_id}-{job.new_gen}-{job.job_id}"
+    # Live (a migrated VM): the bounded retry re-dispatched under a new attempt
+    # key, but the order_id did not change, so the destination replayed
+    # the first acceptance and never re-ran the restore.
+    assert seen[3] == seen[4]
+    assert len({seen[0], seen[3], seen[5]}) == 3, (
+        "each retry attempt within a job must be a NEW order at the "
+        "destination, or it replays `activate-accepted` and restores nothing"
+    )
+
+
+def test_dispatch_migrate_activate_passes_settle_by_to_the_payload(
+    monkeypatch: pytest.MonkeyPatch, fx
+):
+    """The handler's settle-by must reach the order body, not stop at the
+    effect's signature."""
+    from apps.orchestration import order_dispatch
+    from apps.orchestration.services import migration_ticket
+
+    vm, job = _stranded()
+    built: list[dict] = []
+    monkeypatch.setattr(effects, "_miner_identity", lambda n: (n, "100.0.0.2"))
+    monkeypatch.setattr(
+        effects,
+        "_launch_paths",
+        lambda vm: dict.fromkeys(
+            (
+                "ovmf_path",
+                "kernel_path",
+                "initrd_path",
+                "cmdline",
+                "luks_disk_path",
+                "luks_disk_size_gb",
+                "rootfs_data_path",
+                "rootfs_hash_path",
+                "cpu_count",
+                "memory_mb",
+            ),
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        migration_ticket, "remint_dest_ticket", lambda vm, **kw: b"cose"
+    )
+
+    def _build(**kw):
+        built.append(kw)
+        return {}
+
+    monkeypatch.setattr(order_dispatch, "build_migrate_activate_payload", _build)
+
+    class _Ok:
+        ok = True
+        status = 200
+        classifier = ""
+
+    monkeypatch.setattr(order_dispatch, "dispatch_order", lambda **kw: _Ok())
+
+    fx.real["dispatch_migrate_activate"](
+        vm,
+        dest_node_id="node-dst",
+        new_gen=job.new_gen,
+        get_url="https://s3/x",
+        boot_artifacts=None,
+        job_id=job.job_id,
+        settle_by_unix=1_790_000_000,
+    )
+    assert built[0]["settle_by_unix"] == 1_790_000_000
 
 
 # ─── the failure the recovery is FOR, end to end ─────────────────────
@@ -849,3 +928,73 @@ def test_a_quiesce_failure_no_longer_strands_the_vm(
     assert vm.state == VmState.ACTIVE.value
     assert vm.host == "node-src"
     assert vm.generation == 1
+
+
+def test_the_vms_own_launch_ticket_permits_the_restore(monkeypatch: pytest.MonkeyPatch):
+    """The common production case: a VM launched through the API, whose
+    only KBS grant is its launch ticket, fails a §25 before the fence. The
+    ticket `launch_on_miner` records (via the real `persist_intake`) is the
+    source's own grant, so the source is restored — not left down."""
+    from types import SimpleNamespace
+
+    from apps.orchestration.services import migration_ticket
+    from apps.orders import validator
+
+    vm, job = _stranded(failed_from=MigrationState.UPLOADING.value)
+    monkeypatch.setattr(
+        validator,
+        "validate_ticket",
+        lambda blob: SimpleNamespace(
+            ticket_id="tk-vm-1-launch",
+            vm_id=vm.vm_id,
+            tenant_id="t",
+            user_id="u",
+            lease_id=vm.lease_id,
+            vm_generation=job.source_gen,
+            issue_time=1,
+            expiry=2,
+            node_id=job.source_node_id,
+            platform_id="plat-src",
+            resource_class="small",
+            kid_hex="00",
+        ),
+    )
+    migration_ticket.persist_intake(
+        b"cose",
+        vm_id=vm.vm_id,
+        generation=job.source_gen,
+        ticket_id="tk-vm-1-launch",
+        received_from="system:launch",
+    )
+    _stub_evidence(monkeypatch, {"ticket_id": "tk-vm-1-launch"})
+
+    verdict = service.stranded_recovery_verdict(vm, job)
+
+    assert verdict.action == service.STRAND_RESTORE_SOURCE, verdict.reason
+
+
+@pytest.mark.parametrize(
+    ("state", "miner_id", "restorable"),
+    [
+        ("succeeded", "node-src", True),  # its own launch, on the source
+        ("succeeded", "node-dst", False),  # a launch ticket bound elsewhere
+        ("failed", "node-src", False),  # not a launch that ran
+    ],
+)
+def test_a_pre_intake_launch_ticket_is_known_from_its_launch_job(
+    monkeypatch: pytest.MonkeyPatch, state: str, miner_id: str, restorable: bool
+):
+    """VMs launched before `launch_on_miner` wrote an intake: the ticket is
+    on record only in the SUCCEEDED launch's result — still vali's own."""
+    from apps.orchestration.tests.factories import make_launch_record
+
+    vm, job = _stranded(failed_from=MigrationState.UPLOADING.value)
+    rec = make_launch_record(vm)
+    LaunchJob.objects.filter(pk=rec.pk).update(
+        state=state, result_json={"ticket_id": "tk-vm-1-old", "miner_id": miner_id}
+    )
+    _stub_evidence(monkeypatch, {"ticket_id": "tk-vm-1-old"})
+
+    verdict = service.stranded_recovery_verdict(vm, job)
+
+    assert (verdict.action == service.STRAND_RESTORE_SOURCE) is restorable, verdict.reason

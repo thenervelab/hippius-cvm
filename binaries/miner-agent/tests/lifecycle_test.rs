@@ -16,9 +16,13 @@ use ciborium::value::Value;
 use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder};
 use hippius_miner_agent::lifecycle::DomainState;
 use hippius_miner_agent::lifecycle::{
+    CidVerdict, TicketPushState, CID_VERIFY_BASE_BACKOFF, CID_VERIFY_MAX_BACKOFF,
+};
+use hippius_miner_agent::lifecycle::{
     DomainId, LibvirtDriver, MockLaunchDigest, MockLibvirtDriver,
 };
 use hippius_miner_agent::snp_config::{install_for_tests, SnpCpuConfig};
+use hippius_miner_agent::vsock::CidOwner;
 use hippius_miner_agent::vsock::VmProgressSink;
 use hippius_miner_agent::{
     CvmLifecycle, CvmPhase, DomainLiveness, HostResources, LaunchOrder, MinerAgentError, Result,
@@ -128,6 +132,8 @@ fn order(vm_id: &str) -> LaunchOrder {
         cpu_count: 2,
         memory_mb: 2048,
         cose_ticket: serde_bytes::ByteBuf::from(ticket_medium()),
+        require_existing_disks: false,
+        guardian_ep: None,
     }
 }
 
@@ -181,7 +187,7 @@ fn check_disk_budget_fail_fasts_over_the_declared_budget() {
     // 128 GiB against a 64 GiB budget → rejected at preflight.
     assert!(matches!(
         lc.check_disk_budget(128),
-        Err(MinerAgentError::InsufficientResources)
+        Err(MinerAgentError::InsufficientDisk)
     ));
     // Exactly at budget is admitted.
     assert!(lc.check_disk_budget(64).is_ok());
@@ -193,6 +199,98 @@ fn check_disk_budget_zero_disables_the_fail_fast() {
     // launch-time statvfs backstop still catches a genuinely full mount.
     let lc = lifecycle_with_disk_budget(0);
     assert!(lc.check_disk_budget(1_000_000).is_ok());
+}
+
+/// A lifecycle whose data-disk root is `root` — for the measured
+/// free-space preflight (`check_disk_space`).
+fn lifecycle_on_root(root: &std::path::Path) -> CvmLifecycle {
+    lifecycle_with_disk_budget(0).with_state_disk_root(root.to_path_buf())
+}
+
+/// A sparse file under `<root>/data/` that promises all but
+/// `leave_gib` GiB of the filesystem's current free space.
+fn promise_all_but(root: &std::path::Path, name: &str, leave_gib: u64) {
+    let free = nix::sys::statvfs::statvfs(root).unwrap();
+    #[allow(clippy::useless_conversion)]
+    let free = u64::from(free.blocks_available()) * u64::from(free.fragment_size());
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let f = std::fs::File::create(data.join(name)).unwrap();
+    f.set_len(free.saturating_sub(leave_gib << 30)).unwrap();
+}
+
+#[test]
+fn check_disk_space_refuses_what_the_filesystem_cannot_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle_on_root(tmp.path());
+    let vm = VmId::new("tenant-space").unwrap();
+    assert!(lc.check_disk_space(&vm, 1).is_ok());
+    assert!(matches!(
+        lc.check_disk_space(&vm, u32::MAX),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    // 0 GiB never refuses.
+    assert!(lc.check_disk_space(&vm, 0).is_ok());
+}
+
+/// Serialises the tests below whose margin a concurrent GiB-scale host
+/// reservation would eat (the host ledger is process-wide).
+static TIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn tight() -> std::sync::MutexGuard<'static, ()> {
+    TIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[test]
+fn check_disk_space_counts_the_unwritten_tail_of_existing_disks() {
+    // An existing sparse disk that has promised all but ~4 GiB: a bare
+    // statvfs would still admit 8 GiB, the net-of-tail gate must not.
+    let _tight = tight();
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle_on_root(tmp.path());
+    promise_all_but(tmp.path(), "tenant-other.img", 4);
+    let vm = VmId::new("tenant-new").unwrap();
+    assert!(matches!(
+        lc.check_disk_space(&vm, 8),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    assert!(lc.check_disk_space(&vm, 2).is_ok());
+}
+
+#[test]
+fn check_disk_space_counts_what_in_flight_writers_hold_reserved() {
+    // A backup / restore / §25 download holding 3 GiB of the 4 GiB left:
+    // the preflight must not promise a launch those bytes.
+    let _tight = tight();
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle_on_root(tmp.path());
+    promise_all_but(tmp.path(), "tenant-other.img", 4);
+    let vm = VmId::new("tenant-new").unwrap();
+    let ledger = lc.disk_space_ledger();
+    let held = ledger.reserve(tmp.path(), 3 << 30, 0).expect("fits");
+    assert!(matches!(
+        lc.check_disk_space(&vm, 2),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    drop(held);
+    assert!(lc.check_disk_space(&vm, 2).is_ok());
+}
+
+#[test]
+fn check_disk_space_never_refuses_a_vm_whose_disk_already_exists() {
+    // A relaunch reuses its disk: it needs no new space.
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle_on_root(tmp.path());
+    let vm = VmId::new("tenant-back").unwrap();
+    promise_all_but(tmp.path(), "tenant-back.img", 0);
+    assert!(lc.check_disk_space(&vm, 64).is_ok());
+    // …and the golden overlay counts as that disk too.
+    let vm2 = VmId::new("tenant-golden").unwrap();
+    std::fs::create_dir_all(tmp.path().join("overlay")).unwrap();
+    std::fs::write(tmp.path().join("overlay/tenant-golden.img"), b"").unwrap();
+    assert!(lc.check_disk_space(&vm2, 64).is_ok());
 }
 
 #[tokio::test]
@@ -886,6 +984,34 @@ async fn readopt_prunes_a_snapshot_whose_domain_is_gone() {
     assert!(lc2.list().await.unwrap().is_empty());
     // The stale snapshot was pruned → a second sweep still finds nothing.
     assert_eq!(lc2.readopt_running().await.unwrap(), 0);
+    // ...and its shut-off definition went with it, so the next launch of
+    // the same vm_id defines cleanly instead of colliding on the name.
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    lc2.launch(order("cvm-1")).await.unwrap();
+}
+
+#[tokio::test]
+async fn readopt_leaves_a_definition_that_started_since_the_liveness_read() {
+    // The stale-definition undefine re-reads the state right before it
+    // acts: a domain that is shut off at the liveness read but running by
+    // the time of the undefine is left alone.
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let lc1 = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    lc1.launch(order("cvm-1")).await.unwrap();
+    driver
+        .destroy_domain(&DomainId::new("hippius-tenant-cvm-1").unwrap(), false)
+        .await
+        .unwrap();
+    let undefines_before = driver.undefine_count();
+
+    // Liveness read: shut off. Undefine-time re-read: running.
+    driver.script_states(vec![DomainState::ShutOff, DomainState::Running]);
+    let lc2 = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(lc2.readopt_running().await.unwrap(), 0);
+
+    assert_eq!(driver.undefine_count(), undefines_before, "never undefined");
+    assert_eq!(driver.defined_count().unwrap(), 1);
 }
 
 #[tokio::test]
@@ -920,7 +1046,7 @@ async fn destroy_reclaims_a_golden_overlay_after_re_adoption() {
     );
 
     // §24 destroy → the overlay is unlinked (no leak).
-    lc2.destroy(&vm).await.unwrap();
+    lc2.destroy(&vm, None).await.unwrap();
     assert!(
         !overlay.exists(),
         "destroy must reclaim the golden overlay after re-adoption"
@@ -1348,7 +1474,7 @@ async fn an_orphans_writable_volume_is_charged_to_the_disk_budget() {
     assert!(
         matches!(
             lc.check_disk_budget(1),
-            Err(MinerAgentError::InsufficientResources)
+            Err(MinerAgentError::InsufficientDisk)
         ),
         "the orphan's overlay must consume the disk budget"
     );
@@ -1646,4 +1772,1064 @@ async fn tenant_domain_liveness_unreachable_libvirt_is_unknown() {
         lc.tenant_domain_liveness(&vm).await,
         DomainLiveness::Unknown
     );
+}
+
+/// A driver that records, at the instant libvirt is asked to destroy a
+/// domain, whether the reboot-watcher would be allowed to restart it.
+struct RestartProbeDriver {
+    inner: Arc<MockLibvirtDriver>,
+    lifecycle: std::sync::OnceLock<std::sync::Weak<CvmLifecycle>>,
+    vm: VmId,
+    seen: Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl LibvirtDriver for RestartProbeDriver {
+    async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+        self.inner.define_domain(xml).await
+    }
+    async fn create_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.create_domain(id).await
+    }
+    async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
+        if let Some(lc) = self.lifecycle.get().and_then(std::sync::Weak::upgrade) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(lc.restart_eligible(&self.vm));
+        }
+        self.inner.destroy_domain(id, graceful).await
+    }
+    async fn undefine_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.undefine_domain(id).await
+    }
+    async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+        self.inner.query_domain_state(id).await
+    }
+    async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+        self.inner.list_domains().await
+    }
+    async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+        self.inner.domain_xml(id).await
+    }
+}
+
+#[tokio::test]
+async fn the_reboot_watcher_may_not_restart_a_domain_the_agent_is_stopping() {
+    // RESURRECTION. `stop` (and so a §24 force-stop) produces a libvirt
+    // `Stopped` event while the handle still exists. The watcher used to
+    // gate a restart on "has a cached ticket" alone, so it could race the
+    // stop and `virsh start` the domain being torn down. It may restart
+    // only a CVM that is `Running` — one whose QEMU exited on its own.
+    seed_snp_probe();
+    let vm = VmId::new("resurrect-1").unwrap();
+    let driver = Arc::new(RestartProbeDriver {
+        inner: Arc::new(MockLibvirtDriver::new()),
+        lifecycle: std::sync::OnceLock::new(),
+        vm: vm.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let lc = Arc::new(
+        CvmLifecycle::new_with_poll(
+            driver.clone(),
+            ok_digest(),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+            Duration::from_millis(1),
+            5,
+        )
+        .skip_state_disk_provision_for_tests(),
+    );
+    driver.lifecycle.set(Arc::downgrade(&lc)).unwrap();
+
+    assert_eq!(lc.launch(order("resurrect-1")).await.unwrap(), vm);
+    assert!(
+        lc.restart_eligible(&vm),
+        "a running CVM rebooted by its guest must be restartable"
+    );
+
+    lc.stop(&vm, false).await.unwrap();
+
+    assert_eq!(
+        *driver.seen.lock().unwrap(),
+        vec![false],
+        "while the agent destroys the domain, the watcher must refuse to restart it"
+    );
+    assert!(!lc.restart_eligible(&vm), "a stopped VM is never restarted");
+}
+
+// ── Re-adoption with an unreadable domain XML: the CID is held UNVERIFIED ──
+//
+// The sidecar is miner-local and can be stale; the live XML is the only
+// ground truth for the vsock CID. When `dumpxml` fails at re-adoption the
+// recorded CID is held (nobody else gets it) but is NOT an identity: no
+// ticket push, no relay, until the live XML confirms, re-keys or drops it.
+
+const UNVERIFIED_TICKET: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+
+/// Restart onto a sidecar claiming `recorded_cid` for a Running domain
+/// whose XML cannot be read.
+async fn readopt_unverified(
+    vm: &str,
+    recorded_cid: u32,
+) -> (Arc<MockLibvirtDriver>, CvmLifecycle, tempfile::TempDir) {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        vm,
+        2,
+        2048,
+        recorded_cid,
+        "/var/lib/hippius-miner/x.img",
+    );
+    driver.seed_domain(
+        DomainId::new(&format!("hippius-tenant-{vm}")).unwrap(),
+        DomainState::Running,
+    );
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(
+        lc.readopt_running().await.unwrap(),
+        1,
+        "still re-adopted (capacity counts)"
+    );
+    (driver, lc, tmp)
+}
+
+fn far_future() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(24 * 3600)
+}
+
+#[tokio::test]
+async fn an_unreadable_xml_holds_the_recorded_cid_unverified() {
+    let (_driver, lc, _tmp) = readopt_unverified("uv-1", 7).await;
+    let vm = VmId::new("uv-1").unwrap();
+    let alloc = lc.cid_allocator();
+    assert_eq!(alloc.owner_of(7).unwrap(), CidOwner::Unverified(vm.clone()));
+    assert_eq!(
+        alloc.vm_id_for_cid(7).unwrap(),
+        None,
+        "the relay must not attribute frames on an unconfirmed record"
+    );
+    assert_eq!(
+        lc.ticket_push_target(&vm, &UNVERIFIED_TICKET),
+        (TicketPushState::Wait, 7),
+        "the ticket must wait — not be delivered, not be given up on"
+    );
+    assert!(
+        lc.restart_eligible(&vm),
+        "an in-guest reboot must still be restarted while the cid is unverified"
+    );
+    assert_eq!(lc.unverified_cid_count(), 1);
+}
+
+#[tokio::test]
+async fn the_live_xml_confirming_the_cid_verifies_it() {
+    let (driver, lc, _tmp) = readopt_unverified("uv-2", 7).await;
+    let vm = VmId::new("uv-2").unwrap();
+    // A failed retry keeps it pending.
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm.clone(), CidVerdict::Pending)]
+    );
+    assert_eq!(
+        lc.ticket_push_target(&vm, &UNVERIFIED_TICKET).0,
+        TicketPushState::Wait
+    );
+
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-2").unwrap(),
+        DomainState::Running,
+        &dumpxml("uv-2", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img"),
+    );
+    // Past the retry's backoff.
+    assert_eq!(
+        lc.verify_pending_cids(far_future() + CID_VERIFY_MAX_BACKOFF)
+            .await,
+        vec![(vm.clone(), CidVerdict::Verified)]
+    );
+    assert_eq!(
+        lc.cid_allocator().vm_id_for_cid(7).unwrap(),
+        Some(vm.clone())
+    );
+    assert_eq!(
+        lc.ticket_push_target(&vm, &UNVERIFIED_TICKET),
+        (TicketPushState::Deliver, 7)
+    );
+    assert_eq!(lc.unverified_cid_count(), 0);
+}
+
+#[tokio::test]
+async fn the_live_xml_showing_another_cid_rekeys_to_it() {
+    let (driver, lc, _tmp) = readopt_unverified("uv-3", 7).await;
+    let vm = VmId::new("uv-3").unwrap();
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-3").unwrap(),
+        DomainState::Running,
+        &dumpxml("uv-3", 2, 2048 * 1024, 9, "/var/lib/hippius-miner/x.img"),
+    );
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm.clone(), CidVerdict::Rekeyed)]
+    );
+    let alloc = lc.cid_allocator();
+    assert_eq!(alloc.vm_id_for_cid(9).unwrap(), Some(vm.clone()));
+    assert_eq!(
+        alloc.owner_of(7).unwrap(),
+        CidOwner::Unknown,
+        "the stale cid is freed"
+    );
+    assert_eq!(
+        lc.ticket_push_target(&vm, &UNVERIFIED_TICKET),
+        (TicketPushState::Deliver, 9),
+        "the ticket goes to the LIVE cid"
+    );
+}
+
+#[tokio::test]
+async fn a_gone_domain_drops_the_unverified_handle() {
+    let (driver, lc, _tmp) = readopt_unverified("uv-4", 7).await;
+    let vm = VmId::new("uv-4").unwrap();
+    driver
+        .undefine_domain(&DomainId::new("hippius-tenant-uv-4").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm.clone(), CidVerdict::Dropped)]
+    );
+    assert!(lc.list().await.unwrap().is_empty());
+    assert_eq!(lc.cid_allocator().owner_of(7).unwrap(), CidOwner::Unknown);
+    assert_eq!(
+        lc.ticket_push_target(&vm, &UNVERIFIED_TICKET).0,
+        TicketPushState::Abort
+    );
+    assert_eq!(
+        lc.readopt_running().await.unwrap(),
+        0,
+        "the sidecar went with it"
+    );
+}
+
+#[tokio::test]
+async fn a_shut_off_domain_is_not_gone() {
+    // A guest `reboot` passes through shut-off before the reboot-watcher
+    // restarts it. Dropping the handle there would strand that restart.
+    let (driver, lc, _tmp) = readopt_unverified("uv-5", 7).await;
+    let vm = VmId::new("uv-5").unwrap();
+    driver.force_all_to_state(DomainState::ShutOff).unwrap();
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm.clone(), CidVerdict::Pending)]
+    );
+    assert!(lc.restart_eligible(&vm));
+    assert_eq!(
+        lc.cid_allocator().owner_of(7).unwrap(),
+        CidOwner::Unverified(vm)
+    );
+}
+
+#[tokio::test]
+async fn a_pending_check_is_not_retried_before_its_backoff() {
+    let (_driver, lc, _tmp) = readopt_unverified("uv-6", 7).await;
+    let now = std::time::Instant::now() + Duration::from_secs(1);
+    assert_eq!(lc.verify_pending_cids(now).await.len(), 1);
+    assert!(
+        lc.verify_pending_cids(now).await.is_empty(),
+        "retried inside its backoff"
+    );
+    assert_eq!(
+        lc.verify_pending_cids(now + CID_VERIFY_BASE_BACKOFF)
+            .await
+            .len(),
+        1
+    );
+}
+
+/// A driver whose `domain_xml`, once armed, reads the XML at call time and
+/// then PARKS before returning it — so a test can stop and relaunch the
+/// same `vm_id` while a verification attempt holds a now-stale answer.
+struct ParkedXmlDriver {
+    inner: Arc<MockLibvirtDriver>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: Notify,
+    release: Notify,
+    /// Strip `<uuid>` from the parked answer — models a document the
+    /// UUID check cannot catch, so only the generation/handle check can.
+    strip_uuid: bool,
+}
+
+#[async_trait]
+impl LibvirtDriver for ParkedXmlDriver {
+    async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+        self.inner.define_domain(xml).await
+    }
+    async fn create_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.create_domain(id).await
+    }
+    async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
+        self.inner.destroy_domain(id, graceful).await
+    }
+    async fn undefine_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.undefine_domain(id).await
+    }
+    async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+        self.inner.query_domain_state(id).await
+    }
+    async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+        self.inner.list_domains().await
+    }
+    async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+        let answer = self.inner.domain_xml(id).await;
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        let xml = answer?;
+        Ok(if self.strip_uuid {
+            xml.lines()
+                .filter(|l| !l.contains("<uuid>"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            xml
+        })
+    }
+}
+
+/// Verification reads the OLD incarnation's XML (cid 9), parks; meanwhile
+/// the VM is stopped and relaunched under the same `vm_id`. The stale
+/// answer must not touch the new handle or its cid.
+async fn stale_verification_meets_a_relaunch(strip_uuid: bool) {
+    let inner = Arc::new(MockLibvirtDriver::new());
+    let driver = Arc::new(ParkedXmlDriver {
+        inner: inner.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        entered: Notify::new(),
+        release: Notify::new(),
+        strip_uuid,
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-r",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    let domain = DomainId::new("hippius-tenant-uv-r").unwrap();
+    inner.seed_domain(domain.clone(), DomainState::Running);
+    seed_snp_probe();
+    let lc = Arc::new(
+        CvmLifecycle::new_with_poll(
+            driver.clone(),
+            ok_digest(),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+            Duration::from_millis(1),
+            5,
+        )
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(tmp.path().to_path_buf()),
+    );
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+    let vm = VmId::new("uv-r").unwrap();
+
+    inner.seed_domain_xml(
+        domain,
+        DomainState::Running,
+        &dumpxml("uv-r", 2, 2048 * 1024, 9, "/var/lib/hippius-miner/x.img"),
+    );
+    driver
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let verifying = {
+        let lc = Arc::clone(&lc);
+        tokio::spawn(async move { lc.verify_pending_cids(far_future()).await })
+    };
+    driver.entered.notified().await;
+
+    lc.stop(&vm, false).await.unwrap();
+    lc.launch(order("uv-r")).await.unwrap();
+    let alloc = lc.cid_allocator();
+    let fresh = alloc.cid_for_vm(&vm).unwrap().unwrap();
+    assert_ne!(fresh, 9);
+
+    driver.release.notify_one();
+    let verdicts = verifying.await.unwrap();
+    assert_eq!(
+        verdicts,
+        vec![(vm.clone(), CidVerdict::Pending)],
+        "a stale answer must act on nothing"
+    );
+    assert_eq!(
+        alloc.cid_for_vm(&vm).unwrap(),
+        Some(fresh),
+        "the relaunch's cid was moved"
+    );
+    assert_eq!(alloc.vm_id_for_cid(fresh).unwrap(), Some(vm.clone()));
+    assert_eq!(alloc.owner_of(9).unwrap(), CidOwner::Unknown);
+    assert_eq!(
+        lc.list().await.unwrap().len(),
+        1,
+        "the relaunch's handle was dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_verification_never_touches_a_relaunch_of_the_same_vm() {
+    stale_verification_meets_a_relaunch(false).await;
+}
+
+#[tokio::test]
+async fn a_stale_verification_without_a_uuid_is_caught_by_the_check_generation() {
+    stale_verification_meets_a_relaunch(true).await;
+}
+
+#[tokio::test]
+async fn a_shut_off_domains_inactive_xml_proves_nothing() {
+    // `dumpxml` of a shut-off domain is its INACTIVE config: no QEMU holds
+    // that cid, so it confirms nothing — even when it names the held cid.
+    let (driver, lc, _tmp) = readopt_unverified("uv-7", 7).await;
+    let vm = VmId::new("uv-7").unwrap();
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-7").unwrap(),
+        DomainState::ShutOff,
+        &dumpxml("uv-7", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img"),
+    );
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm.clone(), CidVerdict::Pending)]
+    );
+    assert_eq!(
+        lc.cid_allocator().owner_of(7).unwrap(),
+        CidOwner::Unverified(vm)
+    );
+}
+
+/// Parks the Nth `list_domains` call after arming, handing back the answer
+/// it read BEFORE parking — a stale "not defined" verdict in flight.
+struct ParkedListDriver {
+    inner: Arc<MockLibvirtDriver>,
+    countdown: std::sync::atomic::AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl LibvirtDriver for ParkedListDriver {
+    async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+        self.inner.define_domain(xml).await
+    }
+    async fn create_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.create_domain(id).await
+    }
+    async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
+        self.inner.destroy_domain(id, graceful).await
+    }
+    async fn undefine_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.undefine_domain(id).await
+    }
+    async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+        self.inner.query_domain_state(id).await
+    }
+    async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+        let answer = self.inner.list_domains().await;
+        let park = self
+            .countdown
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok_and(|n| n == 1);
+        if park {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        answer
+    }
+    async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+        self.inner.domain_xml(id).await
+    }
+}
+
+#[tokio::test]
+async fn a_stale_gone_verdict_never_drops_a_relaunch_of_the_same_vm() {
+    // Verification learns "domain not defined" and parks before acting.
+    // Meanwhile the vm_id is relaunched (the launch reclaims the stale
+    // re-adopted handle). The stale verdict must not drop the new VM.
+    let inner = Arc::new(MockLibvirtDriver::new());
+    let driver = Arc::new(ParkedListDriver {
+        inner: inner.clone(),
+        countdown: std::sync::atomic::AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-d",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    let domain = DomainId::new("hippius-tenant-uv-d").unwrap();
+    inner.seed_domain(domain.clone(), DomainState::Running);
+    seed_snp_probe();
+    let lc = Arc::new(
+        CvmLifecycle::new_with_poll(
+            driver.clone(),
+            ok_digest(),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+            Duration::from_millis(1),
+            5,
+        )
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(tmp.path().to_path_buf()),
+    );
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+    let vm = VmId::new("uv-d").unwrap();
+    inner.undefine_domain(&domain).await.unwrap();
+
+    // domain_liveness lists once (#1), tenant_domain_defined lists (#2) → park.
+    driver
+        .countdown
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let verifying = {
+        let lc = Arc::clone(&lc);
+        tokio::spawn(async move { lc.verify_pending_cids(far_future()).await })
+    };
+    driver.entered.notified().await;
+
+    lc.launch(order("uv-d")).await.unwrap();
+    let cid = lc.cid_allocator().cid_for_vm(&vm).unwrap().unwrap();
+
+    driver.release.notify_one();
+    assert_eq!(
+        verifying.await.unwrap(),
+        vec![(vm.clone(), CidVerdict::Pending)],
+        "a stale verdict must act on nothing"
+    );
+    assert_eq!(
+        lc.list().await.unwrap().len(),
+        1,
+        "the relaunch was dropped"
+    );
+    assert_eq!(
+        lc.cid_allocator().vm_id_for_cid(cid).unwrap(),
+        Some(vm.clone())
+    );
+    assert_eq!(
+        lc.ticket_push_target(&vm, &ticket_medium()),
+        (TicketPushState::Deliver, cid)
+    );
+    assert_eq!(lc.unverified_cid_count(), 0);
+}
+
+#[tokio::test]
+async fn a_same_name_domain_with_another_uuid_does_not_verify_the_cid() {
+    // The XML must be the RECORDED incarnation's: a same-name domain with
+    // a different UUID is another guest, and its cid proves nothing.
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-u",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    let other = dumpxml("uv-u", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img").replace(
+        "11111111-2222-4333-8444-555555555555",
+        "99999999-2222-4333-8444-555555555555",
+    );
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-u").unwrap(),
+        DomainState::Running,
+        &other,
+    );
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+    let vm = VmId::new("uv-u").unwrap();
+    assert_eq!(
+        lc.cid_allocator().owner_of(7).unwrap(),
+        CidOwner::Unverified(vm.clone())
+    );
+    // …and the background check agrees.
+    assert_eq!(
+        lc.verify_pending_cids(far_future()).await,
+        vec![(vm, CidVerdict::Pending)]
+    );
+}
+
+#[tokio::test]
+async fn a_matching_live_xml_at_readoption_verifies_immediately() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-m",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-m").unwrap(),
+        DomainState::Running,
+        &dumpxml("uv-m", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img"),
+    );
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+    let vm = VmId::new("uv-m").unwrap();
+    assert_eq!(lc.cid_allocator().vm_id_for_cid(7).unwrap(), Some(vm));
+    assert_eq!(lc.unverified_cid_count(), 0);
+}
+
+#[tokio::test]
+async fn a_domain_that_stops_during_the_xml_read_does_not_verify_the_cid() {
+    // Live before the dump, shut off after it: the XML may be the inactive
+    // config, so it proves nothing about the kernel's cid.
+    let inner = Arc::new(MockLibvirtDriver::new());
+    let driver = Arc::new(ParkedXmlDriver {
+        inner: inner.clone(),
+        armed: std::sync::atomic::AtomicBool::new(true),
+        entered: Notify::new(),
+        release: Notify::new(),
+        strip_uuid: false,
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-s",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    inner.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-s").unwrap(),
+        DomainState::Running,
+        &dumpxml("uv-s", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img"),
+    );
+    seed_snp_probe();
+    let lc = Arc::new(
+        CvmLifecycle::new_with_poll(
+            driver.clone(),
+            ok_digest(),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+            Duration::from_millis(1),
+            5,
+        )
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(tmp.path().to_path_buf()),
+    );
+    let adopting = {
+        let lc = Arc::clone(&lc);
+        tokio::spawn(async move { lc.readopt_running().await.unwrap() })
+    };
+    driver.entered.notified().await;
+    inner.force_all_to_state(DomainState::ShutOff).unwrap();
+    driver.release.notify_one();
+    assert_eq!(adopting.await.unwrap(), 1);
+    assert_eq!(
+        lc.cid_allocator().owner_of(7).unwrap(),
+        CidOwner::Unverified(VmId::new("uv-s").unwrap())
+    );
+}
+
+/// After the first `domain_xml`, the domain is shut off AND `domstate`
+/// starts failing — the `list_domains` fallback still lists it.
+struct FlakyAfterXmlDriver {
+    inner: Arc<MockLibvirtDriver>,
+    tripped: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl LibvirtDriver for FlakyAfterXmlDriver {
+    async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+        self.inner.define_domain(xml).await
+    }
+    async fn create_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.create_domain(id).await
+    }
+    async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
+        self.inner.destroy_domain(id, graceful).await
+    }
+    async fn undefine_domain(&self, id: &DomainId) -> Result<()> {
+        self.inner.undefine_domain(id).await
+    }
+    async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+        if self.tripped.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MinerAgentError::LibvirtDriver("domstate"));
+        }
+        self.inner.query_domain_state(id).await
+    }
+    async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+        self.inner.list_domains().await
+    }
+    async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+        let xml = self.inner.domain_xml(id).await;
+        self.inner.force_all_to_state(DomainState::ShutOff)?;
+        self.tripped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        xml
+    }
+}
+
+#[tokio::test]
+async fn a_listed_but_unqueryable_domain_is_not_proof_the_xml_is_live() {
+    let inner = Arc::new(MockLibvirtDriver::new());
+    let driver = Arc::new(FlakyAfterXmlDriver {
+        inner: inner.clone(),
+        tripped: std::sync::atomic::AtomicBool::new(false),
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "uv-f",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/x.img",
+    );
+    inner.seed_domain_xml(
+        DomainId::new("hippius-tenant-uv-f").unwrap(),
+        DomainState::Running,
+        &dumpxml("uv-f", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/x.img"),
+    );
+    seed_snp_probe();
+    let lc = CvmLifecycle::new_with_poll(
+        driver,
+        ok_digest(),
+        HostResources {
+            total_cpus: 16,
+            total_memory_mb: 65536,
+            total_disk_gb: 0,
+        },
+        Duration::from_millis(1),
+        5,
+    )
+    .skip_state_disk_provision_for_tests()
+    .with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+    assert_eq!(
+        lc.cid_allocator().owner_of(7).unwrap(),
+        CidOwner::Unverified(VmId::new("uv-f").unwrap())
+    );
+}
+
+// ── a survivor blocked by a stale unverified claim is retried (#1149) ──
+
+/// A (stale sidecar, unreadable XML) holds cid 7 UNVERIFIED; B — a live
+/// survivor whose domain really runs on 7 — then collides and is left
+/// untracked. Returns the lifecycle and driver with both sidecars on disk.
+async fn stale_claim_blocks_a_survivor() -> (Arc<MockLibvirtDriver>, CvmLifecycle, tempfile::TempDir)
+{
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    write_sidecar(
+        tmp.path(),
+        "rc-stale",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/a.img",
+    );
+    driver.seed_domain(
+        DomainId::new("hippius-tenant-rc-stale").unwrap(),
+        DomainState::Running,
+    );
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(
+        lc.readopt_running().await.unwrap(),
+        1,
+        "A adopted, cid 7 unverified"
+    );
+
+    write_sidecar(
+        tmp.path(),
+        "rc-live",
+        2,
+        2048,
+        7,
+        "/var/lib/hippius-miner/b.img",
+    );
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-rc-live").unwrap(),
+        DomainState::Running,
+        &dumpxml("rc-live", 2, 2048 * 1024, 7, "/var/lib/hippius-miner/b.img"),
+    );
+    lc.readopt_running().await.unwrap();
+    let b = VmId::new("rc-live").unwrap();
+    assert!(
+        !lc.list().await.unwrap().iter().any(|(v, _)| *v == b),
+        "precondition: B collided with A's stale claim"
+    );
+    (driver, lc, tmp)
+}
+
+fn far_future_1149() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(24 * 3600)
+}
+
+#[tokio::test]
+async fn a_survivor_blocked_by_a_stale_claim_is_adopted_once_the_claim_is_rekeyed() {
+    let (driver, lc, _tmp) = stale_claim_blocks_a_survivor().await;
+    // A's live XML shows its real cid, 9 → re-key frees (burns) 7 for A…
+    driver.seed_domain_xml(
+        DomainId::new("hippius-tenant-rc-stale").unwrap(),
+        DomainState::Running,
+        &dumpxml(
+            "rc-stale",
+            2,
+            2048 * 1024,
+            9,
+            "/var/lib/hippius-miner/a.img",
+        ),
+    );
+    lc.verify_pending_cids(far_future_1149()).await;
+    // …and B, retried, now holds 7 — verified by its own live XML.
+    let b = VmId::new("rc-live").unwrap();
+    assert!(
+        lc.list().await.unwrap().iter().any(|(v, _)| *v == b),
+        "B re-adopted"
+    );
+    assert_eq!(lc.cid_allocator().vm_id_for_cid(7).unwrap(), Some(b));
+}
+
+#[tokio::test]
+async fn a_survivor_blocked_by_a_stale_claim_is_adopted_once_the_claim_is_dropped() {
+    let (driver, lc, _tmp) = stale_claim_blocks_a_survivor().await;
+    driver
+        .undefine_domain(&DomainId::new("hippius-tenant-rc-stale").unwrap())
+        .await
+        .unwrap();
+    lc.verify_pending_cids(far_future_1149()).await;
+    let b = VmId::new("rc-live").unwrap();
+    assert!(
+        lc.list().await.unwrap().iter().any(|(v, _)| *v == b),
+        "B re-adopted"
+    );
+    assert_eq!(lc.cid_allocator().vm_id_for_cid(7).unwrap(), Some(b));
+}
+
+#[tokio::test]
+async fn a_survivor_is_adopted_once_the_stale_claims_vm_is_stopped() {
+    // The commonest way a stale claim goes away is its VM being stopped or
+    // destroyed: `release_cid` frees the cid with no verification verdict,
+    // so the release itself must make the retry due.
+    let (_driver, lc, _tmp) = stale_claim_blocks_a_survivor().await;
+    lc.stop(&VmId::new("rc-stale").unwrap(), false)
+        .await
+        .unwrap();
+    assert_eq!(lc.unverified_cid_count(), 0);
+    assert!(
+        lc.readopt_retry_due(),
+        "the release must make the retry due"
+    );
+    lc.verify_pending_cids(far_future_1149()).await;
+    let b = VmId::new("rc-live").unwrap();
+    assert!(
+        lc.list().await.unwrap().iter().any(|(v, _)| *v == b),
+        "B re-adopted"
+    );
+    assert!(!lc.readopt_retry_due());
+}
+
+// ── Relaunch: existing disks REQUIRED, never blank-created ───────────
+//
+// Seen in production 2026-09-25: vali's reboot-recovery relaunched a golden VM
+// on a host that had never held its disks, and the launch path CREATED a
+// blank 40 GiB overlay + a blank boot-counter disk and booted. A relaunch
+// order (`require_existing_disks`) must refuse instead — before any domain
+// is defined and without creating a single file.
+
+/// A lifecycle whose provisioning is ON (unlike `lifecycle()`), rooted at
+/// `root` — so a guard that let the launch through would really create the
+/// blank disks these tests assert are never created.
+fn provisioning_lifecycle(driver: Arc<MockLibvirtDriver>, root: &std::path::Path) -> CvmLifecycle {
+    seed_snp_probe();
+    CvmLifecycle::new_with_poll(
+        driver,
+        ok_digest(),
+        HostResources {
+            total_cpus: 16,
+            total_memory_mb: 65536,
+            total_disk_gb: 0,
+        },
+        Duration::from_millis(1),
+        5,
+    )
+    .with_state_disk_root(root.to_path_buf())
+}
+
+fn touch(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, b"existing tenant bytes").unwrap();
+}
+
+fn state_path(root: &std::path::Path, vm: &str) -> PathBuf {
+    root.join("state").join(format!("{vm}.raw"))
+}
+
+fn overlay_path(root: &std::path::Path, vm: &str) -> PathBuf {
+    root.join("overlay").join(format!("{vm}.img"))
+}
+
+fn data_path(root: &std::path::Path, vm: &str) -> PathBuf {
+    root.join("data").join(format!("{vm}.img"))
+}
+
+fn relaunch(mut o: LaunchOrder) -> LaunchOrder {
+    o.require_existing_disks = true;
+    o
+}
+
+#[tokio::test]
+async fn golden_relaunch_without_its_overlay_is_refused_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-relaunch-no-overlay";
+    touch(&state_path(tmp.path(), vm));
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("overlay")),
+        "got {err:?}"
+    );
+    assert!(
+        !overlay_path(tmp.path(), vm).exists(),
+        "a relaunch must never create a blank golden overlay"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    // Nothing was reserved: the same vm_id launches once its disks exist.
+    touch(&overlay_path(tmp.path(), vm));
+    lc.launch(relaunch(golden_order(vm))).await.unwrap();
+}
+
+#[tokio::test]
+async fn golden_relaunch_without_its_state_disk_is_refused_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-relaunch-no-state";
+    touch(&overlay_path(tmp.path(), vm));
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("state-disk")),
+        "got {err:?}"
+    );
+    assert!(
+        !state_path(tmp.path(), vm).exists(),
+        "a relaunch must never format a blank boot-counter disk"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn legacy_relaunch_without_its_data_disk_is_refused_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-relaunch-no-data";
+    touch(&state_path(tmp.path(), vm));
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+    let mut o = order(vm);
+    o.data_disk_size_gb = 10;
+
+    let err = lc.launch(relaunch(o)).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("data-disk")),
+        "got {err:?}"
+    );
+    assert!(!data_path(tmp.path(), vm).exists());
+    assert_eq!(driver.defined_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn golden_relaunch_with_its_disks_reuses_them_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-relaunch-ok";
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(tmp.path(), vm));
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let id = lc.launch(relaunch(golden_order(vm))).await.unwrap();
+
+    assert_eq!(lc.query(&id).await.unwrap(), CvmPhase::Running);
+    for p in [state_path(tmp.path(), vm), overlay_path(tmp.path(), vm)] {
+        assert_eq!(std::fs::read(&p).unwrap(), b"existing tenant bytes");
+    }
+}
+
+#[tokio::test]
+async fn a_first_launch_still_creates_its_overlay() {
+    // The guard is scoped to relaunches: a first launch (the default)
+    // provisions its blank overlay exactly as before.
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-first-launch";
+    touch(&state_path(tmp.path(), vm)); // no mkfs.ext4 needed on the runner
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+    let mut o = golden_order(vm);
+    o.data_disk_size_gb = 1;
+
+    lc.launch(o).await.unwrap();
+
+    assert!(overlay_path(tmp.path(), vm).exists());
+}
+
+#[tokio::test]
+async fn a_relaunch_whose_disk_cannot_be_statted_is_unreadable_not_missing() {
+    // EACCES / EIO / a late storage mount proves nothing about presence:
+    // it must NOT surface as `missing` (which vali latches on for good).
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-relaunch-unreadable";
+    let state = state_path(tmp.path(), vm);
+    touch(&state);
+    touch(&overlay_path(tmp.path(), vm));
+    let state_dir = state.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if state.try_exists().is_ok() {
+        // Running as root: permissions do not bind, nothing to prove here.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksUnreadable("state-disk")),
+        "got {err:?}"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    assert_eq!(std::fs::read(&state).unwrap(), b"existing tenant bytes");
 }

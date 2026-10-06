@@ -113,6 +113,11 @@ const PREFLIGHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// directions can evolve separately.
 pub const MAX_MINER_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Response cap for a poll that reports a multipart upload's part receipts
+/// (`backup` and §25 snapshot status): ~170 bytes per part (ETag + sha256),
+/// up to `encode-order`'s 3,000 parts.
+pub const MAX_MULTIPART_STATUS_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Hard upper bound on the **outbound** envelope (`SignedOrder { body, sig }`
 /// CBOR) the Edge POSTs to a miner — matches the miner-agent's
 /// `MAX_ORDER_BODY` exactly (`binaries/miner-agent/src/orders/mod.rs`)
@@ -131,7 +136,7 @@ pub const MAX_MINER_REQUEST_BYTES: usize = 64 * 1024;
 /// - 64 bytes for the Ed25519 signature itself
 ///
 /// Total `≤ 79 bytes`. We round up to `256` for a generous safety
-/// margin — the alternative is the §H phase-2 review's codex r1
+/// margin — the alternative is the §H phase-2 review's review r1
 /// Medium: an inner body sized exactly at the miner-agent's
 /// `MAX_ORDER_BODY` becomes `body + sig + overhead` after signing and
 /// is GUARANTEED to be rejected by the miner-side `DefaultBodyLimit`.
@@ -144,6 +149,17 @@ const SIGNED_ORDER_OVERHEAD: usize = 256;
 /// request body before signing; the forwarder re-asserts it as a
 /// tripwire.
 pub const MAX_MINER_ORDER_BODY: usize = MAX_MINER_REQUEST_BYTES - SIGNED_ORDER_OVERHEAD;
+
+/// Request cap for an order carrying a presigned multipart part list
+/// (`migrate-snapshot`, `backup`): one ~530-byte URL per part, and the
+/// store takes parts of at most 512 MiB, so the largest flavor's overlay
+/// (1280 GiB) needs ~2,600 of them. Mirrors the miner-agent's
+/// `MAX_MULTIPART_ORDER_BODY` on those two routes.
+pub const MAX_MULTIPART_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+
+/// [`MAX_MINER_ORDER_BODY`] for a multipart order (see
+/// [`MAX_MULTIPART_REQUEST_BYTES`]).
+pub const MAX_MULTIPART_ORDER_BODY: usize = MAX_MULTIPART_REQUEST_BYTES - SIGNED_ORDER_OVERHEAD;
 
 /// The lifecycle command the order carries. Mirrors the miner-agent's
 /// `OrderKind` (`binaries/miner-agent/src/orders/types.rs`) but lives
@@ -178,6 +194,17 @@ pub enum OrderKind {
     /// compute on the miner. The miner returns a JSON envelope vali
     /// parses for the digest before minting the matching OrderTicket.
     TenantPreflight,
+    /// Live backup of a running golden CVM through presigned multipart
+    /// part URLs (ACK-then-async; status via `forward_backup_status`).
+    Backup,
+    /// Staged restore of a CVM from its backups (`stage` / `abort` /
+    /// `reclaim`; `stage` is ACK-then-async, status via
+    /// `forward_restore_status`).
+    Restore,
+    /// Host-wide guest network policy. Names no VM; the miner persists
+    /// it under a monotonic revision and answers
+    /// `applied:<revision>:<sha256>`.
+    NetPolicy,
 }
 
 impl OrderKind {
@@ -196,6 +223,23 @@ impl OrderKind {
             OrderKind::MigrateSnapshot => "migrate-snapshot",
             OrderKind::MigrateActivate => "migrate-activate",
             OrderKind::TenantPreflight => "tenant-preflight",
+            OrderKind::Backup => "backup",
+            OrderKind::Restore => "restore",
+            OrderKind::NetPolicy => "net-policy",
+        }
+    }
+
+    /// The inbound body cap for this kind: [`MAX_MULTIPART_ORDER_BODY`] for
+    /// an order carrying a multipart part list, [`MAX_MINER_ORDER_BODY`]
+    /// for every other.
+    pub fn max_order_body(self) -> usize {
+        match self {
+            // A restore `stage` carries a per-part sha256 for every 512 MiB
+            // of every piece of its chain.
+            OrderKind::MigrateSnapshot | OrderKind::Backup | OrderKind::Restore => {
+                MAX_MULTIPART_ORDER_BODY
+            }
+            _ => MAX_MINER_ORDER_BODY,
         }
     }
 
@@ -214,6 +258,18 @@ impl OrderKind {
             // kind in the `x-hippius-order-kind` header.
             "migrate-activate" => Some(OrderKind::MigrateActivate),
             "tenant-preflight" => Some(OrderKind::TenantPreflight),
+            // vali's backup tick dispatches through the same inner-router
+            // path; the status comes back via `GET /v1/relay/{vm}/backup`.
+            "backup" => Some(OrderKind::Backup),
+            // vali's restore job dispatches through the same path; the
+            // status comes back via `GET /v1/relay/{vm}/restore`.
+            "restore" => Some(OrderKind::Restore),
+            // vali dispatches the §25 snapshot through this path when it
+            // carries multipart part URLs (the relay route rebuilds only
+            // the single-PUT shape).
+            "migrate-snapshot" => Some(OrderKind::MigrateSnapshot),
+            // vali's net-policy reconcile pushes each miner's policy here.
+            "net-policy" => Some(OrderKind::NetPolicy),
             _ => None,
         }
     }
@@ -377,6 +433,28 @@ pub trait MinerForward: Send + Sync {
         target_addr: SocketAddr,
         vm_id: &str,
     ) -> Result<MinerForwardResponse, MinerForwardError>;
+
+    /// Live backup — relay an UNSIGNED `GET` to the miner's backup-status
+    /// route (`/v1/miner/backup/{vm_id}/status`). No side effect, no
+    /// secret: the miner reports its latest run for the VM (sizes,
+    /// sha256s, part ETags) plus the live bitmap/boot-counter probe, and
+    /// the Edge relays that JSON (or `404`) back to vali. `vm_id` is
+    /// charset-validated by the relay router upstream.
+    async fn forward_backup_status(
+        &self,
+        target_addr: SocketAddr,
+        vm_id: &str,
+    ) -> Result<MinerForwardResponse, MinerForwardError>;
+
+    /// Staged restore — relay an UNSIGNED `GET` to the miner's
+    /// restore-status route (`/v1/miner/restore/{vm_id}/status`). No side
+    /// effect, no secret (ids, states, byte counts). `vm_id` is
+    /// charset-validated by the relay router upstream.
+    async fn forward_restore_status(
+        &self,
+        target_addr: SocketAddr,
+        vm_id: &str,
+    ) -> Result<MinerForwardResponse, MinerForwardError>;
 }
 
 /// Production [`MinerForward`] — a `reqwest` client + the constants
@@ -452,7 +530,7 @@ impl MinerForward for ReqwestMinerForward {
         // `DefaultBodyLimit`. Re-assert here as a tripwire — a future
         // caller that bypasses the router would otherwise be able to
         // sign + relay an arbitrarily large body.
-        if body.len() > MAX_MINER_ORDER_BODY {
+        if body.len() > kind.max_order_body() {
             return Err(MinerForwardError::Encode);
         }
 
@@ -486,7 +564,7 @@ impl MinerForward for ReqwestMinerForward {
         // stopping the moment accumulated bytes exceed the cap. A
         // single `.bytes().await` would buffer the full upstream body
         // before the size check fires — a hostile or buggy peer could
-        // then drive unbounded allocation despite the cap. (codex r1
+        // then drive unbounded allocation despite the cap. (review r1
         // High.)
         if let Some(len) = response.content_length() {
             if len > MAX_MINER_RESPONSE_BYTES as u64 {
@@ -519,7 +597,8 @@ impl MinerForward for ReqwestMinerForward {
         // through the same `[a-z0-9-]` gate the miner enforces), so no
         // path traversal is possible.
         let url = format!("http://{}/v1/miner/migration/{}/status", target_addr, vm_id);
-        self.get_and_relay(&url).await
+        self.get_and_relay(&url, MAX_MULTIPART_STATUS_RESPONSE_BYTES)
+            .await
     }
 
     async fn forward_source_ack(
@@ -533,7 +612,7 @@ impl MinerForward for ReqwestMinerForward {
             "http://{}/v1/miner/migration/{}/source-ack",
             target_addr, vm_id
         );
-        self.get_and_relay(&url).await
+        self.get_and_relay(&url, MAX_MINER_RESPONSE_BYTES).await
     }
 
     async fn forward_domain_state(
@@ -545,16 +624,45 @@ impl MinerForward for ReqwestMinerForward {
         // unsigned poll GETs; `vm_id` charset-validated upstream — no
         // path traversal.
         let url = format!("http://{}/v1/miner/vm/{}/domain-state", target_addr, vm_id);
-        self.get_and_relay(&url).await
+        self.get_and_relay(&url, MAX_MINER_RESPONSE_BYTES).await
+    }
+
+    async fn forward_backup_status(
+        &self,
+        target_addr: SocketAddr,
+        vm_id: &str,
+    ) -> Result<MinerForwardResponse, MinerForwardError> {
+        // Same typed-Display + `&'static` path shape as the other
+        // unsigned poll GETs; `vm_id` charset-validated upstream — no
+        // path traversal.
+        let url = format!("http://{}/v1/miner/backup/{}/status", target_addr, vm_id);
+        self.get_and_relay(&url, MAX_MULTIPART_STATUS_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn forward_restore_status(
+        &self,
+        target_addr: SocketAddr,
+        vm_id: &str,
+    ) -> Result<MinerForwardResponse, MinerForwardError> {
+        // Same shape as the backup poll; `vm_id` charset-validated
+        // upstream — no path traversal.
+        let url = format!("http://{}/v1/miner/restore/{}/status", target_addr, vm_id);
+        self.get_and_relay(&url, MAX_MULTIPART_STATUS_RESPONSE_BYTES)
+            .await
     }
 }
 
 impl ReqwestMinerForward {
-    /// Shared streaming GET → bounded body relay for the two unsigned
-    /// §25 poll routes (snapshot status + source ack). Bounds the
-    /// response body the same way `forward_signed_order` does so a
-    /// hostile / buggy miner cannot drive unbounded allocation.
-    async fn get_and_relay(&self, url: &str) -> Result<MinerForwardResponse, MinerForwardError> {
+    /// Shared streaming GET → bounded body relay for the unsigned poll
+    /// routes. Bounds the response body at `cap` the same way
+    /// `forward_signed_order` does so a hostile / buggy miner cannot drive
+    /// unbounded allocation.
+    async fn get_and_relay(
+        &self,
+        url: &str,
+        cap: usize,
+    ) -> Result<MinerForwardResponse, MinerForwardError> {
         let mut response = self
             .client
             .get(url)
@@ -565,7 +673,7 @@ impl ReqwestMinerForward {
 
         let status = response.status().as_u16();
         if let Some(len) = response.content_length() {
-            if len > MAX_MINER_RESPONSE_BYTES as u64 {
+            if len > cap as u64 {
                 return Err(MinerForwardError::ResponseTooLarge);
             }
         }
@@ -575,7 +683,7 @@ impl ReqwestMinerForward {
             .await
             .map_err(|_| MinerForwardError::ResponseRead)?
         {
-            if body.len().saturating_add(chunk.len()) > MAX_MINER_RESPONSE_BYTES {
+            if body.len().saturating_add(chunk.len()) > cap {
                 return Err(MinerForwardError::ResponseTooLarge);
             }
             body.extend_from_slice(&chunk);
@@ -749,6 +857,56 @@ mod mock {
             }
         }
 
+        async fn forward_backup_status(
+            &self,
+            target_addr: SocketAddr,
+            vm_id: &str,
+        ) -> Result<MinerForwardResponse, MinerForwardError> {
+            // Recorded into the same `status_calls` vec as the other
+            // unsigned GET polls.
+            let record = RecordedStatusForward {
+                target_addr,
+                vm_id: vm_id.to_string(),
+            };
+            match self.status_calls.lock() {
+                Ok(mut g) => g.push(record),
+                Err(poisoned) => poisoned.into_inner().push(record),
+            }
+            let outcome = match self.outcome.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &*outcome {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(clone_err(e)),
+            }
+        }
+
+        async fn forward_restore_status(
+            &self,
+            target_addr: SocketAddr,
+            vm_id: &str,
+        ) -> Result<MinerForwardResponse, MinerForwardError> {
+            // Recorded into the same `status_calls` vec as the other
+            // unsigned GET polls.
+            let record = RecordedStatusForward {
+                target_addr,
+                vm_id: vm_id.to_string(),
+            };
+            match self.status_calls.lock() {
+                Ok(mut g) => g.push(record),
+                Err(poisoned) => poisoned.into_inner().push(record),
+            }
+            let outcome = match self.outcome.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &*outcome {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(clone_err(e)),
+            }
+        }
+
         async fn forward_domain_state(
             &self,
             target_addr: SocketAddr,
@@ -812,6 +970,17 @@ mod tests {
             OrderKind::MigrateActivate.route_segment(),
             "migrate-activate"
         );
+        // Must match the miner-agent's `/v1/miner/order/backup` route.
+        assert_eq!(OrderKind::Backup.route_segment(), "backup");
+        // Must match the miner-agent's `/v1/miner/order/restore` route.
+        assert_eq!(OrderKind::Restore.route_segment(), "restore");
+        assert_eq!(
+            OrderKind::Restore.max_order_body(),
+            MAX_MULTIPART_ORDER_BODY
+        );
+        // Must match the miner-agent's `/v1/miner/order/net-policy` route.
+        assert_eq!(OrderKind::NetPolicy.route_segment(), "net-policy");
+        assert_eq!(OrderKind::NetPolicy.max_order_body(), MAX_MINER_ORDER_BODY);
     }
 
     #[test]
@@ -823,6 +992,11 @@ mod tests {
             ("migrate", OrderKind::Migrate),
             // §25 M4 — vali sends this header value for the dest activation.
             ("migrate-activate", OrderKind::MigrateActivate),
+            ("backup", OrderKind::Backup),
+            ("restore", OrderKind::Restore),
+            // §25 snapshot with multipart part URLs.
+            ("migrate-snapshot", OrderKind::MigrateSnapshot),
+            ("net-policy", OrderKind::NetPolicy),
         ] {
             assert_eq!(OrderKind::from_header(text), Some(expected));
         }
@@ -957,6 +1131,74 @@ mod tests {
         use ed25519_dalek::Signature;
         let sig = Signature::from_bytes(&calls[0].sig);
         signer.verifying_key().verify_strict(body, &sig).unwrap();
+    }
+
+    /// A one-shot-per-connection HTTP/1.1 server answering every GET with
+    /// a `len`-byte 200 body, with a Content-Length or close-delimited.
+    async fn serve_body(len: usize, content_length: bool) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let cl = if content_length {
+                        format!("content-length: {len}\r\n")
+                    } else {
+                        String::new()
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\n{cl}connection: close\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&vec![b'x'; len]).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_part_receipt_status_gets_the_multipart_response_cap() {
+        // ~3,000 part receipts (~170 B each) is far past the 64 KiB cap
+        // every other miner response keeps.
+        let client = ReqwestMinerForward::new().unwrap();
+        let receipts = serve_body(3000 * 170, true).await;
+        let r = client
+            .forward_backup_status(receipts, "vm-1")
+            .await
+            .unwrap();
+        assert_eq!(r.body.len(), 3000 * 170);
+        let r = client
+            .forward_migration_status(receipts, "vm-1")
+            .await
+            .unwrap();
+        assert_eq!(r.body.len(), 3000 * 170);
+        let r = client
+            .forward_restore_status(receipts, "vm-1")
+            .await
+            .unwrap();
+        assert_eq!(r.body.len(), 3000 * 170);
+        // The small polls keep the 64 KiB cap ...
+        let err = client
+            .forward_domain_state(receipts, "vm-1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MinerForwardError::ResponseTooLarge));
+        // ... and the receipt polls are still bounded.
+        for content_length in [true, false] {
+            let huge = serve_body(MAX_MULTIPART_STATUS_RESPONSE_BYTES + 1, content_length).await;
+            let err = client
+                .forward_backup_status(huge, "vm-1")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MinerForwardError::ResponseTooLarge));
+            let err = client
+                .forward_restore_status(huge, "vm-1")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MinerForwardError::ResponseTooLarge));
+        }
     }
 
     #[tokio::test]

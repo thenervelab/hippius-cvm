@@ -1,0 +1,34 @@
+# Hippius guest components release — linked from /etc/systemd/system by the
+# measured initramfs (hippius_golden_mount_components); the agents run from
+# the release image mounted at /run/hippius/guest.
+# Same unit as the bake's (scripts/tenant-image-bake.sh,
+# keepalive-staging-block) except for the paths.
+[Unit]
+Description=Hippius §23 SEV-SNP live-attestation keepalive (uptime liveness)
+# local-fs.target only: the KBS is reached over AF_VSOCK through the host
+# miner-agent (hippius.kbs_url=vsock://2:19266), which needs no network.
+# network-online.target is ordered-after WITHOUT a Wants=, so this unit
+# never pulls it in and can never extend boot.
+After=local-fs.target network-online.target
+# NO Before= ANYTHING: a guest whose KBS path a hostile miner blocks must
+# still boot and serve its tenant normally.
+DefaultDependencies=yes
+# The release image this unit runs from.
+RequiresMountsFor=/run/hippius/guest
+# Never leave the unit permanently `failed` after a long KBS outage.
+# Declared in [Unit]: systemd 255 no longer accepts it in [Service].
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/run/hippius/guest/etc/keepalive.env
+Environment=HIPPIUS_KEEPALIVE_AGENT_BIN=/run/hippius/guest/bin/hippius-agent-keepalive
+ExecStart=/run/hippius/guest/bin/hippius-keepalive-start
+Restart=always
+RestartSec=15
+#   2  — /dev/sev-guest is unavailable: not a real SNP guest;
+#   78 — EX_CONFIG: the measured cmdline is not a Hippius tenant VM's.
+RestartPreventExitStatus=2 78
+
+[Install]
+WantedBy=multi-user.target

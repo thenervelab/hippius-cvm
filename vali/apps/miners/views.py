@@ -3,14 +3,20 @@
   POST /v1/admin/miner/register
       Auth: ServiceToken, the miner-admin principal.
       Body (JSON): {miner_id, pubkey_hex, platform_id,
-                    netbird_peer_id?, netbird_ip?}.
+                    netbird_peer_id?, netbird_ip?, chain_node_id?,
+                    snp_generation?}.
       Atomically creates a `MinerIdentity` AND its linked
       `telemetry.TelemetrySource` (so the §9 broker accepts the
       miner's signed envelopes). Idempotent: re-registering the
       identical (miner_id, pubkey_hex, platform_id) returns 200 with
       the stored row. A miner_id re-registered with different key
       material — or a pubkey_hex / platform_id that collides with a
-      DIFFERENT miner — returns 409.
+      DIFFERENT miner — returns 409. The one exception: a row vali
+      AUTO-PROVISIONED from a permissionless heartbeat carries the
+      per-node placeholder platform_id `onchain:<node_id>`
+      (`is_autoprovision_placeholder`); registering it
+      with the row's own pubkey_hex upgrades it to the posted platform_id
+      (+ NetBird backfill) → 200. See `_reregister`.
       → 201 created / 200 idempotent / 400 wire / 403 / 409 conflict.
 
   GET /v1/admin/miner/list?limit=<N>&offset=<M>
@@ -32,6 +38,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 from typing import Any
 
 from django.conf import settings
@@ -51,7 +58,13 @@ from apps.identity.authentication import ServiceTokenAuthentication
 from apps.telemetry import verifier
 from apps.telemetry.models import TelemetrySource
 
-from .models import TELEMETRY_SOURCE_KIND, MinerIdentity, MinerStatus
+from .models import (
+    TELEMETRY_SOURCE_KIND,
+    MinerIdentity,
+    MinerStatus,
+    SnpGeneration,
+    is_autoprovision_placeholder,
+)
 from .permissions import IsMinerAdmin
 from .schemas import (
     MinerGracefulExitResponseSerializer,
@@ -73,6 +86,12 @@ _MAX_LIMIT = 500
 
 # An Ed25519 public key is 32 bytes ⇒ 64 hex chars.
 _PUBKEY_HEX_LEN = 64
+
+# The shape of a real AMD CHIP_ID — whole bytes of hex, ≥ 8 bytes (Turin
+# is 8, Milan/Genoa 64). Same bar as the scheduler's dispatchability gate
+# (`apps.scheduler.service._is_real_chip_id`), minus its whitespace
+# tolerance: a stored value must be exact.
+_CHIP_ID_HEX_RE = re.compile(r"(?:[0-9a-fA-F]{2}){8,}")
 
 
 class _WireError(Exception):
@@ -105,7 +124,10 @@ class MinerRegisterView(APIView):
             "Miner-admin only. Atomically creates a `MinerIdentity` and its "
             "linked telemetry source. Idempotent: re-registering identical "
             "key material returns 200 with the stored row; a mismatched key / "
-            "platform / chain_node_id is a 409 conflict."
+            "platform / chain_node_id is a 409 conflict. A row auto-provisioned "
+            "from a permissionless heartbeat (placeholder platform_id "
+            "`onchain:<node_id>`) is upgraded to the posted platform_id when pubkey_hex "
+            "matches (200)."
         ),
         tags=["Miners"],
         request=MinerRegisterRequestSerializer,
@@ -138,6 +160,12 @@ class MinerRegisterView(APIView):
             # the 64-hex compute node_id the launch pipeline joins on to
             # recover this miner from a placement (see model docstring).
             chain_node_id = _optional_chain_node_id(body, "chain_node_id")
+            # Optional SEV-SNP generation (`milan` | `genoa` | `turin`) —
+            # selects the launch-digest vCPU model. Required for Milan,
+            # whose 64-byte CHIP_ID is indistinguishable from Genoa's.
+            snp_generation = _optional_snp_generation(
+                body, "snp_generation", platform_id=platform_id
+            )
         except _WireError as exc:
             return _error(exc.http_status, exc.message, exc.category)
 
@@ -150,52 +178,25 @@ class MinerRegisterView(APIView):
             with transaction.atomic():
                 existing = _lock_miner(miner_id)
                 if existing is not None:
-                    # Idempotency: matching key material ⇒ no-op 200;
-                    # mismatched ⇒ a conflict.
-                    if (
-                        existing.pubkey_hex != pubkey_hex
-                        or existing.platform_id != platform_id
-                    ):
-                        return _error(
-                            status.HTTP_409_CONFLICT,
-                            "miner_id already registered with different identity",
-                            "conflict",
-                        )
-                    # `chain_node_id` is a backfillable bridge field: an
-                    # operator registers the miner first, then learns its
-                    # on-chain node_id and re-registers to set it. A value
-                    # that DIFFERS from one already stored is a deliberate
-                    # mismatch (409); backfilling from NULL is allowed and
-                    # may itself collide with another miner's node (409 via
-                    # the savepoint).
-                    if chain_node_id is not None:
-                        if (
-                            existing.chain_node_id
-                            and existing.chain_node_id != chain_node_id
-                        ):
-                            return _error(
-                                status.HTTP_409_CONFLICT,
-                                "miner_id already registered with a different "
-                                "chain_node_id",
-                                "conflict",
-                            )
-                        if not existing.chain_node_id:
-                            existing.chain_node_id = chain_node_id
-                            try:
-                                with transaction.atomic():
-                                    existing.save(
-                                        update_fields=["chain_node_id"]
-                                    )
-                            except IntegrityError:
-                                return _error(
-                                    status.HTTP_409_CONFLICT,
-                                    "chain_node_id already registered to "
-                                    "another miner",
-                                    "conflict",
-                                )
-                    _ensure_telemetry_source(existing)
-                    return Response(
-                        _serialize(existing), status=status.HTTP_200_OK
+                    return _reregister(
+                        existing,
+                        pubkey_hex=pubkey_hex,
+                        platform_id=platform_id,
+                        netbird_peer_id=netbird_peer_id,
+                        netbird_ip=netbird_ip,
+                        chain_node_id=chain_node_id,
+                        snp_generation=snp_generation,
+                    )
+                # A placeholder is vali-written only: an operator-created
+                # row holding `onchain:<node>` would squat that node's
+                # auto-provision (unique `platform_id` ⇒ its first
+                # heartbeat collides).
+                if is_autoprovision_placeholder(platform_id):
+                    return _error(
+                        status.HTTP_400_BAD_REQUEST,
+                        "platform_id must be the AMD CHIP_ID, not an "
+                        "auto-provision placeholder",
+                        "wire",
                     )
                 # New miner — create the identity, then reconcile its
                 # linked `TelemetrySource` (one registry of record).
@@ -209,6 +210,7 @@ class MinerRegisterView(APIView):
                     netbird_peer_id=netbird_peer_id,
                     netbird_ip=netbird_ip,
                     chain_node_id=chain_node_id,
+                    snp_generation=snp_generation or "",
                 )
                 _ensure_telemetry_source(miner)
                 log.info("miner registered: miner_id=%s", miner_id)
@@ -218,20 +220,23 @@ class MinerRegisterView(APIView):
         except IntegrityError:
             # `MinerIdentity.create` collided — a pubkey_hex /
             # platform_id already held by ANOTHER miner, or a concurrent
-            # register of this miner_id. Re-read under a lock: an
-            # identical miner now present ⇒ idempotent 200; otherwise a
-            # genuine conflict.
+            # create of this miner_id (another register, or the
+            # permissionless heartbeat auto-provisioning it). Re-read
+            # under a lock: a row for this miner_id now present is
+            # handled exactly like the sequential re-register (idempotent
+            # 200 / placeholder upgrade / 409); none ⇒ a genuine conflict
+            # with another miner.
             with transaction.atomic():
                 dup = _lock_miner(miner_id)
-                if (
-                    dup is not None
-                    and dup.pubkey_hex == pubkey_hex
-                    and dup.platform_id == platform_id
-                    and (chain_node_id is None or dup.chain_node_id == chain_node_id)
-                ):
-                    _ensure_telemetry_source(dup)
-                    return Response(
-                        _serialize(dup), status=status.HTTP_200_OK
+                if dup is not None:
+                    return _reregister(
+                        dup,
+                        pubkey_hex=pubkey_hex,
+                        platform_id=platform_id,
+                        netbird_peer_id=netbird_peer_id,
+                        netbird_ip=netbird_ip,
+                        chain_node_id=chain_node_id,
+                        snp_generation=snp_generation,
                     )
             return _error(
                 status.HTTP_409_CONFLICT,
@@ -239,6 +244,122 @@ class MinerRegisterView(APIView):
                 "to another miner",
                 "conflict",
             )
+
+
+def _reregister(
+    existing: MinerIdentity,
+    *,
+    pubkey_hex: str,
+    platform_id: str,
+    netbird_peer_id: str,
+    netbird_ip: str | None,
+    chain_node_id: str | None,
+    snp_generation: str | None,
+) -> Response:
+    """Register over an EXISTING (row-locked) `MinerIdentity`.
+
+    Every 409 check runs BEFORE any write, and all changed fields are
+    saved in ONE savepointed `save` — a 409 (including a unique-index
+    collision on `platform_id` / `chain_node_id`) never leaves a partial
+    write behind.
+
+    Rules:
+    - `pubkey_hex` must match the stored key — always; a different key is
+      a different miner (409).
+    - `platform_id` must match the stored one, EXCEPT when the stored one
+      is an auto-provision placeholder (`is_autoprovision_placeholder`): a
+      permissionless miner vali provisioned from its heartbeat is then
+      upgraded to the operator-supplied CHIP_ID. A real stored CHIP_ID is
+      never rebound (409).
+    - `chain_node_id` / `snp_generation`: backfill from unset; a value
+      differing from a stored one is a 409.
+    - `netbird_peer_id` / `netbird_ip`: backfill from unset; a value
+      differing from a stored one is IGNORED (200, stored value kept) —
+      the mesh coordinates are informational to this endpoint and a real
+      value is never silently overwritten here.
+    """
+    upgrading_placeholder = (
+        is_autoprovision_placeholder(existing.platform_id)
+        and not is_autoprovision_placeholder(platform_id)
+    )
+    if existing.pubkey_hex != pubkey_hex or (
+        existing.platform_id != platform_id and not upgrading_placeholder
+    ):
+        return _error(
+            status.HTTP_409_CONFLICT,
+            "miner_id already registered with different identity",
+            "conflict",
+        )
+    # The placeholder is replaced ONCE and a real CHIP_ID is never
+    # rebound, so a typo here would be permanent: only a hex CHIP_ID
+    # (8-byte Turin / 64-byte Milan-Genoa shape the scheduler accepts)
+    # may replace it.
+    if upgrading_placeholder and not _CHIP_ID_HEX_RE.fullmatch(platform_id):
+        return _error(
+            status.HTTP_400_BAD_REQUEST,
+            "platform_id must be the AMD CHIP_ID as hex (≥ 8 bytes) to "
+            "replace the auto-provisioned placeholder",
+            "wire",
+        )
+    # A generation change re-measures every guest on the host.
+    if (
+        snp_generation is not None
+        and existing.snp_generation
+        and existing.snp_generation != snp_generation
+    ):
+        return _error(
+            status.HTTP_409_CONFLICT,
+            "miner_id already registered with a different snp_generation",
+            "conflict",
+        )
+    # `chain_node_id` is the scheduler bridge: an operator registers the
+    # miner first, then learns its on-chain node_id and re-registers to
+    # set it. Changing a stored value is a deliberate mismatch.
+    if (
+        chain_node_id is not None
+        and existing.chain_node_id
+        and existing.chain_node_id != chain_node_id
+    ):
+        return _error(
+            status.HTTP_409_CONFLICT,
+            "miner_id already registered with a different chain_node_id",
+            "conflict",
+        )
+
+    update_fields: list[str] = []
+    if upgrading_placeholder:
+        existing.platform_id = platform_id
+        update_fields.append("platform_id")
+    if chain_node_id is not None and not existing.chain_node_id:
+        existing.chain_node_id = chain_node_id
+        update_fields.append("chain_node_id")
+    if snp_generation is not None and not existing.snp_generation:
+        existing.snp_generation = snp_generation
+        update_fields.append("snp_generation")
+    if netbird_peer_id and not existing.netbird_peer_id:
+        existing.netbird_peer_id = netbird_peer_id
+        update_fields.append("netbird_peer_id")
+    if netbird_ip is not None and not existing.netbird_ip:
+        existing.netbird_ip = netbird_ip
+        update_fields.append("netbird_ip")
+    if update_fields:
+        try:
+            with transaction.atomic():
+                existing.save(update_fields=update_fields)
+        except IntegrityError:
+            return _error(
+                status.HTTP_409_CONFLICT,
+                "platform_id or chain_node_id already registered to "
+                "another miner",
+                "conflict",
+            )
+    if upgrading_placeholder:
+        log.info(
+            "miner auto-provisioned placeholder upgraded: miner_id=%s",
+            existing.miner_id,
+        )
+    _ensure_telemetry_source(existing)
+    return Response(_serialize(existing), status=status.HTTP_200_OK)
 
 
 # ─── GET /v1/admin/miner/list ────────────────────────────────────────
@@ -574,6 +695,7 @@ def _serialize(miner: MinerIdentity) -> dict[str, Any]:
         "netbird_peer_id": miner.netbird_peer_id,
         "netbird_ip": miner.netbird_ip,
         "chain_node_id": miner.chain_node_id,
+        "snp_generation": miner.snp_generation or None,
         "status": miner.status,
         "registered_at": miner.registered_at.isoformat(),
         "last_seen_at": (
@@ -651,6 +773,41 @@ def _optional_chain_node_id(body: dict[str, Any], field: str) -> str | None:
         bytes.fromhex(lowered)
     except ValueError as exc:
         raise _WireError(f"{field} is not valid hex") from exc
+    return lowered
+
+
+def _optional_snp_generation(
+    body: dict[str, Any], field: str, *, platform_id: str
+) -> str | None:
+    """An optional SEV-SNP generation — one of `SnpGeneration` (lowercased).
+
+    Absent / null / empty ⇒ `None` (unset: the generation is inferred from
+    the CHIP_ID length, 8 bytes ⇒ Turin, 64 ⇒ Genoa). When present it must
+    agree with `platform_id`'s CHIP_ID length (turin = 8 bytes, genoa /
+    milan = 64) — the same check the launch-digest recompute applies, run
+    here so an inconsistent pair is refused at registration instead of
+    failing every launch later.
+    """
+    if field not in body or body[field] in (None, ""):
+        return None
+    value = body[field]
+    if not isinstance(value, str):
+        raise _WireError(f"{field} must be a string")
+    lowered = value.strip().lower()
+    if lowered not in SnpGeneration.values:
+        raise _WireError(
+            f"{field} must be one of {sorted(SnpGeneration.values)}"
+        )
+    from apps.orchestration.effects import EffectError
+    from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
+
+    try:
+        _vcpu_type_for_platform(platform_id, lowered)
+    except EffectError as exc:
+        raise _WireError(
+            f"{field} {lowered!r} is inconsistent with platform_id: {exc}",
+            "snp-generation-mismatch",
+        ) from exc
     return lowered
 
 

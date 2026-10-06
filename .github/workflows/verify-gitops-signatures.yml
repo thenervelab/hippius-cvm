@@ -67,7 +67,7 @@ jobs:
   verify:
     # Stable status-check context name for branch-protection required checks.
     name: verify-gitops-signatures
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -147,6 +147,12 @@ jobs:
       # was invisible to grep precisely because we never overrode it.
       # Needs network for the upstream chart dependencies, which is why it
       # lives here beside the other network-dependent verifications.
+      # shellcheck + helm come preinstalled on ubuntu-latest only.
+      - name: Install shellcheck
+        run: command -v shellcheck >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q shellcheck; }
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
       - name: Every image addons/ renders is digest-pinned (P10)
         run: |
           shellcheck -S error scripts/dev/addons-digest-pin-test.sh

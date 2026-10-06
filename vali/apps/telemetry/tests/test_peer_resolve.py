@@ -16,8 +16,8 @@ pytestmark = pytest.mark.django_db
 
 def test_legacy_miner_scheme_strips_prefix() -> None:
     assert (
-        _resolve_peer_to_miner_id("hippius-miner:miner-1")
-        == "miner-1"
+        _resolve_peer_to_miner_id("hippius-miner:miner-a")
+        == "miner-a"
     )
 
 
@@ -25,10 +25,10 @@ def test_node_scheme_resolves_by_verifying_key() -> None:
     # node_id IS the Ed25519 pubkey == the registered source's vk.
     node_id = bytes([0xE0, 0x50, 0x5D]) + bytes(29)
     make_source(
-        source="miner", source_id="miner-1", verifying_key=node_id
+        source="miner", source_id="miner-a", verifying_key=node_id
     )
     peer = _NODE_PEER_ID_PREFIX + node_id.hex()
-    assert _resolve_peer_to_miner_id(peer) == "miner-1"
+    assert _resolve_peer_to_miner_id(peer) == "miner-a"
 
 
 def test_node_scheme_unknown_node_id_is_none() -> None:

@@ -36,6 +36,8 @@ fn a_released_cid_is_reused_and_resolves_correctly() {
     let alloc = CidAllocator::new();
     let vm = VmId::new("tenant-x").unwrap();
     let cid = alloc.allocate(&vm).unwrap();
+    // An identity once the launch's `create_domain` marks it verified.
+    assert!(alloc.mark_verified(&vm, cid).unwrap());
     assert_eq!(alloc.vm_id_for_cid(cid).unwrap(), Some(vm.clone()));
 
     alloc.release(&vm).unwrap();
@@ -105,6 +107,8 @@ async fn handle_guest_conn_relays_a_known_cid_session() {
     let allocator = Arc::new(CidAllocator::new());
     let vm = VmId::new("tenant-known").unwrap();
     let cid = allocator.allocate(&vm).unwrap();
+    // Known = created: a fresh allocation is not an identity until then.
+    assert!(allocator.mark_verified(&vm, cid).unwrap());
 
     let (mut writer, reader) = tokio::io::duplex(8192);
     write_frame(

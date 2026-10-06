@@ -1,0 +1,72 @@
+---
+# Retire `hippius-smt-off.service` — tasks file imported by
+# 06-miner-bootstrap.yml play "01", BEFORE the SEV-SNP cmdline tasks so
+# a reboot they trigger already comes up without it.
+#
+# The unit was installed by hand on some hosts (never by this repo). It
+# offlined the SMT sibling CPUs after boot, i.e. after SNP_INIT. The
+# kernel runs WBINVD only on ONLINE CPUs before SNP_DF_FLUSH, and the
+# firmware refuses the flush (WBINVD_REQUIRED, dmesg `DF_FLUSH failed
+# ... error=0xe`) while a CPU it counted at SNP_INIT is offline. ASIDs
+# then stop being recycled: the host refuses every new CVM with EBUSY
+# after one ASID pool (~99 launches) since boot, until it reboots.
+#
+# SMT off on an SNP host is a BIOS setting (AMD CBS > CPU Common Options
+# > CCD/Core/Thread Enablement > SMT Control = Disable), never a runtime
+# offline. snp-kernel.yml asserts no CPU is offline once SEV-SNP is on.
+#
+# Removed, not just disabled: a disabled unit can still be started or
+# re-enabled by hand, and an absent one documents that it must not
+# exist. Every step keys off what systemd reports, so the tasks are a
+# no-op on a host that never had the unit (new hosts) and on
+# a second run. A masked unit (symlink to /dev/null) is left as is: it
+# cannot run, and its "unit file" must not be deleted. Only paths named
+# after this exact unit are deleted: systemd also reports shared drop-ins
+# (`hippius-.service.d/`, `service.d/`) and an alias's target, which
+# other units use.
+
+- name: Ask systemd whether hippius-smt-off.service is known
+  # Name only, no state: the module just returns `systemctl show`.
+  ansible.builtin.systemd_service:
+    name: hippius-smt-off.service
+  register: miner_smt_off_unit
+  check_mode: false
+
+- name: Parse the hippius-smt-off.service state
+  ansible.builtin.set_fact:
+    # `Id` is the canonical name: an alias pointing at another unit must
+    # not get that unit stopped and its enablement links removed.
+    miner_smt_off_present: >-
+      {{
+        miner_smt_off_unit.status.LoadState | default('not-found') not in ['not-found', 'masked']
+        and miner_smt_off_unit.status.Id | default('') == 'hippius-smt-off.service'
+      }}
+    miner_smt_off_unit_files: >-
+      {{
+        ((miner_smt_off_unit.status.FragmentPath | default('')).split(' ')
+         + (miner_smt_off_unit.status.DropInPaths | default('')).split(' '))
+        | select('match', '^/(etc|run|usr/local/lib|usr/lib)/systemd/system/hippius-smt-off[.]service([.]d/[^/]+[.]conf)?$')
+        | list
+      }}
+
+- name: Stop and disable hippius-smt-off.service
+  # Stopping the unit does not by itself bring offlined CPUs back; a
+  # reboot does. The offline assert in snp-kernel.yml fails the run if
+  # they are still offline.
+  ansible.builtin.systemd_service:
+    name: hippius-smt-off.service
+    state: stopped
+    enabled: false
+  when: miner_smt_off_present | bool
+
+- name: Remove the hippius-smt-off.service unit file and drop-ins
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ miner_smt_off_unit_files }}"
+  when: miner_smt_off_present | bool
+
+- name: Reload systemd after removing hippius-smt-off.service
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: miner_smt_off_present | bool

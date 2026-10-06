@@ -103,7 +103,7 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from . import verifier
+from . import guest_resources, verifier
 from .models import VmLiveAttestation
 
 log = logging.getLogger("apps.telemetry.vm_liveness")
@@ -220,7 +220,7 @@ def _resolve_chain(*, vm_id: str, prev_hash_hex: str, attestation_seq: int) -> t
     replay. With the uptime-liveness gate armed that stops paying a
     running tenant until the fresh sequence climbs past the old maximum —
     silently, because every component involved reports success. Observed
-    live on `gateproof-a` 2026-08-13: 3.7 h at zero.
+    live on 2026-08-13: 3.7 h at zero.
 
     ## The discriminator, and why it needs no wire change
 
@@ -283,6 +283,200 @@ def _resolve_chain(*, vm_id: str, prev_hash_hex: str, attestation_seq: int) -> t
 # ─── ingest ──────────────────────────────────────────────────────────
 
 
+def pinned_measurements(vm_id: str) -> frozenset[str]:
+    """Every launch measurement vali pinned for `vm_id` (lower hex): one
+    per launch, relaunch or §25 re-pin (`MeasurementLedger`)."""
+    from apps.orchestration.models import MeasurementLedger
+
+    return frozenset(
+        m.lower()
+        for m in MeasurementLedger.objects.filter(vm_id=vm_id).values_list(
+            "launch_digest_hex", flat=True
+        )
+    )
+
+
+def _check_chip(
+    fields: verifier.LiveAttestationFields, *, chip_id_hex: str, fallback_node_id_hex: str
+) -> None:
+    """A v2 body's bound CHIP_ID must be the registered platform of the
+    miner vali credits for the VM at that instant — the DESTINATION after
+    a §25 cutover (the body's own `node_id` stays the launch node forever;
+    see `VmBillingBinding`)."""
+    from apps.scheduler.billing import credited_node_id
+
+    node = credited_node_id(
+        vm_id=fields.vm_id,
+        at_unix=fields.verified_at_unix,
+        fallback_node_id_hex=fallback_node_id_hex,
+    )
+    if not node:
+        # Unattributable custody: nobody is credited for this VM, so there
+        # is no platform to hold the chip to — and nothing to pay.
+        log.info("live-attestation chip unchecked: vm=%s is unattributable", fields.vm_id)
+        return
+    if chip_matches_node(chip_id_hex=chip_id_hex, node_id_hex=node):
+        return
+    log.warning(
+        "live-attestation chip mismatch: vm=%s node=%s chip=%s — refused",
+        fields.vm_id,
+        node[:16],
+        chip_id_hex[:16],
+    )
+    raise LiveAttestationRefused(
+        message="live attestation chip_id does not match the credited node's platform",
+        category="chip-mismatch",
+    )
+
+
+def _check_first_use_guest(fields: verifier.LiveAttestationFields, *, now: int) -> None:
+    """A `first-use` body (no binding on record at the KBS — e.g. inside
+    enforce's post-restart grace window) naming a guest OTHER than the one
+    the KBS last released this VM to, while that released guest is itself
+    still attesting, is two live instances of one VM: a duplicate the KBS
+    could not tell apart. Refused and flagged, whenever it arrives.
+
+    A different guest while the released one is SILENT is accepted — that
+    is also what an honest reboot looks like when the KBS was replaced
+    between the reboot's release and the new guest's first keepalive."""
+    released = (
+        VmLiveAttestation.objects.filter(vm_id=fields.vm_id, binding_source="release")
+        .order_by("-verified_at_unix")
+        .values_list("chip_id", "report_id", "verified_at_unix")
+        .first()
+    )
+    if released is None:
+        return
+    chip, report, released_at = released
+    same = chip == (fields.chip_id_hex or "") and report == (fields.report_id_hex or "")
+    if same:
+        return
+    # The release sample only IDENTIFIES the guest. Whether it is still
+    # alive is its newest sample of ANY source: after a KBS pod replacement
+    # the honest released guest attests as `first-use` too, and its last
+    # release-bound sample ages out while it is fully alive.
+    seen_at = (
+        VmLiveAttestation.objects.filter(
+            vm_id=fields.vm_id,
+            chip_id=chip,
+            report_id=report,
+            verified_at_unix__gte=released_at,
+        )
+        .order_by("-verified_at_unix")
+        .values_list("verified_at_unix", flat=True)
+        .first()
+    )
+    if seen_at is None or seen_at < now - coverage_span_seconds():
+        return
+    log.error(
+        "keepalive-binding ANOMALY vm=%s: first-use by guest report=%s while the released "
+        "guest report=%s is still attesting — a duplicate instance; refused",
+        fields.vm_id,
+        (fields.report_id_hex or "")[:16],
+        report[:16],
+    )
+    raise LiveAttestationRefused(
+        message="first-use by a guest other than the still-live released guest",
+        category="guest-conflict",
+    )
+
+
+def chip_matches_node(*, chip_id_hex: str, node_id_hex: str) -> bool:
+    """Does the KBS-attested CHIP_ID belong to the miner credited as
+    `node_id_hex`? Same prefix rule as `kbs_core::release` (Turin
+    registers an 8-byte id, Milan/Genoa the full 64). Fails closed: a
+    node vali holds no real chip for proves nothing."""
+    from apps.miners.models import MinerIdentity
+
+    platform_id = (
+        MinerIdentity.objects.filter(chain_node_id=node_id_hex.lower())
+        .values_list("platform_id", flat=True)
+        .first()
+    )
+    return platform_id is not None and chip_matches_platform(
+        chip_id_hex=chip_id_hex, platform_id=platform_id
+    )
+
+
+def chip_matches_platform(*, chip_id_hex: str, platform_id: str) -> bool:
+    """`chip_id_hex` is the registered `platform_id`'s chip (prefix rule,
+    as above). A placeholder or malformed platform matches nothing."""
+    from apps.scheduler.service import _is_real_chip_id
+
+    if not _is_real_chip_id(platform_id):
+        return False
+    return chip_id_hex.lower().startswith(platform_id.strip().lower())
+
+
+#: `current_released_guest` reason when a DIFFERENT guest has attested
+#: for the VM since its last release — after a KBS restart, a `first-use`
+#: served (e.g. inside `enforce`'s grace window) by a guest other than the
+#: one the KBS released to. An ANOMALY, not a routine skip.
+DIFFERENT_GUEST_SINCE_RELEASE = "a different guest attested since the release"
+
+
+@dataclass(frozen=True)
+class ReleasedGuest:
+    """The guest the KBS last released `vm_id`'s key to, as vali saw it."""
+
+    chip_id_hex: str
+    report_id_hex: str
+
+
+def current_released_guest(
+    vm_id: str, *, platform_id: str, measurement_hex: str, now_unix: int, max_age_s: int
+) -> ReleasedGuest | str:
+    """The guest to re-seed into a wiped KBS's keepalive-binding store for
+    `vm_id`, or a reason (str) why none can be vouched for.
+
+    Only a guest vali KNOWS is the one currently running and the one the
+    KBS released to:
+
+    - the newest `release`-bound sample names it (a `first-use` sample is
+      not proof — it is whoever asked);
+    - every sample since then names the SAME guest — after a KBS restart
+      the survivors attest as `first-use`, which is fine as long as it is
+      still that guest, and fatal if it is another (a relaunch);
+    - the newest sample is at most `max_age_s` old (the guest was alive
+      when the KBS went away — in `enforce` no sample can arrive after the
+      restart, so this is measured against the restart, not a sliding
+      coverage window);
+    - its chip is the VM's current host (`platform_id`), so a §25 move
+      that has not attested at its destination yet is not seeded with the
+      source's guest;
+    - its measurement is `measurement_hex`, the VM's CURRENT launch
+      measurement — the one the recovery re-mints the ticket for, read
+      from the launch record, not from the best-effort audit ledger. A
+      relaunch changes it (fresh measured nonce), so a guest from before a
+      relaunch — even one still attesting — never qualifies. `verified_at`
+      is a keepalive instant, not the release instant, so this is compared
+      by measurement, not by time.
+
+    Residual: a plain reboot keeps the measurement, so a KBS restart in the
+    minutes between a reboot's release and the new guest's first keepalive
+    re-seeds the dead previous guest. That refuses the live guest's
+    keepalives until its next release — a liveness gap, not a forgery: the
+    previous guest's context is gone.
+
+    Skipping is always safe: the VM stays `first-use` (record mode).
+    """
+    rows = VmLiveAttestation.objects.filter(vm_id=vm_id).order_by("-verified_at_unix")
+    release = rows.filter(binding_source="release").first()
+    if release is None:
+        return "no release-bound sample"
+    newest = rows.first()
+    if newest is None or newest.verified_at_unix < now_unix - max_age_s:
+        return f"no sample in the last {max_age_s}s"
+    since = rows.filter(verified_at_unix__gte=release.verified_at_unix)
+    if since.exclude(chip_id=release.chip_id, report_id=release.report_id).exists():
+        return DIFFERENT_GUEST_SINCE_RELEASE
+    if not chip_matches_platform(chip_id_hex=release.chip_id, platform_id=platform_id):
+        return "released guest is not on the VM's current host"
+    if not measurement_hex or release.measurement.lower() != measurement_hex.lower():
+        return "released guest is not the VM's current launch"
+    return ReleasedGuest(chip_id_hex=release.chip_id, report_id_hex=release.report_id)
+
+
 def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool]:
     """Verify + record one KBS-L0-signed `SignedLiveAttestation`.
 
@@ -306,7 +500,10 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
          both a pre-forged future sample and a hoarded stale one;
       6. the VM must have a launch `VmBillingBinding` and the KBS-signed
          `node_id` must match it — coverage is only meaningful for a VM
-         vali would actually credit, on the node it would credit;
+         vali would actually credit, on the node it would credit; the
+         attested measurement must be one vali pinned for this vm_id
+         (`pinned_measurements`); a v2 body's bound CHIP_ID must be the
+         platform of the node credited at that instant (`_check_chip`);
       7. resolve the KBS chain lineage from the SIGNED
          `prev_attestation_hash` (`_resolve_chain`), so an attestation
          minted after a KBS restart is not mistaken for a replay of the
@@ -348,6 +545,11 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
         ("observed_at_unix", fields.observed_at_unix),
         ("verified_at_unix", fields.verified_at_unix),
         ("expiry_unix", fields.expiry_unix),
+        ("mem_firmware_kib", fields.mem_firmware_kib or 0),
+        ("mem_total_kib", fields.mem_total_kib or 0),
+        ("mem_unaccepted_kib", fields.mem_unaccepted_kib or 0),
+        # `vcpus_online` is a u32 on the wire, a Postgres INTEGER here.
+        ("vcpus_online", (fields.vcpus_online or 0) << 32),
     ):
         if value > _I64_MAX:
             raise LiveAttestationRefused(
@@ -388,6 +590,88 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
             message="live attestation node_id does not match the launch binding",
             category="node-mismatch",
         )
+    pinned = pinned_measurements(fields.vm_id)
+    if not pinned:
+        # Fail closed: with nothing pinned, ANY allowlisted guest could be
+        # attesting for this vm_id. A launch that auto-pins always writes
+        # the ledger, so this is a vali-side gap — named, so it is fixed
+        # rather than silently billed.
+        log.error(
+            "live-attestation refused: vm=%s has NO pinned measurement in the "
+            "MeasurementLedger — its liveness cannot be attributed and its "
+            "uptime is NOT credited until a ledger row exists",
+            fields.vm_id,
+        )
+        raise LiveAttestationRefused(
+            message="no pinned launch measurement for this vm_id",
+            category="measurement-unpinned",
+        )
+    if fields.measurement_hex.lower() not in pinned:
+        # The measured cmdline carries hippius.vm_id, so every VM has its own
+        # launch measurement. A guest attesting for this vm_id with another
+        # measurement is ANOTHER VM's guest minting for it — whatever the
+        # KBS's keepalive binding state (it is wiped on a KBS restart).
+        log.warning(
+            "live-attestation measurement mismatch: vm=%s measurement=%s — "
+            "another guest attesting for this vm_id; refused",
+            fields.vm_id,
+            fields.measurement_hex[:16],
+        )
+        raise LiveAttestationRefused(
+            message="live attestation measurement is not one pinned for this vm_id",
+            category="measurement-mismatch",
+        )
+    if fields.chip_id_hex is not None:
+        _check_chip(
+            fields, chip_id_hex=fields.chip_id_hex, fallback_node_id_hex=binding.node_id_hex
+        )
+    if fields.binding_source == "first-use":
+        _check_first_use_guest(fields, now=now)
+
+    # Zombie gate — a NEW attestation for a VM past its §24 crypto-erase
+    # proves the guest is alive on some miner that was told to kill it.
+    # It must never become uptime coverage; record the observation and
+    # refuse. A replay of a sample recorded while the VM was live (same
+    # `body_digest`) is not new evidence and keeps its old idempotent path.
+    if not VmLiveAttestation.objects.filter(body_digest=fields.body_digest_hex).exists():
+        from apps.lifecycle import zombie
+
+        dead_vm = zombie.erased_vm(fields.vm_id)
+        if dead_vm is not None:
+            # No relay identity on this path by design (the Edge relays it
+            # unstamped — the KBS signature is the whole credential), so
+            # the observation is attributed to where vali aimed the
+            # destroy.
+            zombie.observe(dead_vm, kind="vm_live_attestation")
+            raise LiveAttestationRefused(
+                message=f"vm is past its {zombie.erase_phrase(dead_vm)}; attestation refused",
+                category="vm-not-live",
+                http_status=410,
+            )
+
+    # The resources the guest attested (schema v3), judged against the
+    # launch that produced this measurement — see `guest_resources`.
+    # Judged before the insert so the row carries its verdict; the
+    # evidence row is written in the SAME transaction as the row, so a
+    # replay (which collides on the row) is never a second finding and a
+    # failed evidence write never leaves an unjudged sample behind.
+    attested = (
+        guest_resources.Attested(
+            vcpus_online=fields.vcpus_online,
+            mem_firmware_kib=fields.mem_firmware_kib or 0,
+            mem_total_kib=fields.mem_total_kib or 0,
+            mem_unaccepted_kib=fields.mem_unaccepted_kib or 0,
+        )
+        if fields.vcpus_online is not None
+        else None
+    )
+    verdict = guest_resources.judge_sample(
+        vm_id=fields.vm_id,
+        measurement_hex=fields.measurement_hex,
+        verified_at_unix=fields.verified_at_unix,
+        binding_flavor=binding.resource_class,
+        attested=attested,
+    )
 
     chain_epoch, link = _resolve_chain(
         vm_id=fields.vm_id,
@@ -425,7 +709,39 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
                 body_digest=fields.body_digest_hex,
                 prev_attestation_hash=(fields.prev_attestation_hash_hex or "").lower(),
                 chain_epoch=chain_epoch,
+                binding_source=fields.binding_source or "",
+                chip_id=fields.chip_id_hex or "",
+                report_id=fields.report_id_hex or "",
+                vcpus_online=fields.vcpus_online,
+                mem_firmware_kib=fields.mem_firmware_kib,
+                mem_total_kib=fields.mem_total_kib,
+                mem_unaccepted_kib=fields.mem_unaccepted_kib,
+                resource_verdict=verdict.verdict,
+                components_release_version=fields.components_release_version,
+                components_security_epoch=fields.components_security_epoch,
+                components_health=fields.components_health,
+                components_instance=fields.components_instance,
+                components_unhealthy_ticks=fields.components_unhealthy_ticks,
             )
+            if verdict.verdict in guest_resources.EVIDENCE_VERDICTS:
+                from apps.scheduler.billing import credited_node_id
+
+                # Filed against the miner vali credits at that instant —
+                # the §25 destination after a cutover, not the launch node
+                # the body's `node_id` keeps naming. Blank when custody is
+                # unattributable: nobody is credited, nobody is blamed.
+                guest_resources.record_shortfall(
+                    vm_id=row.vm_id,
+                    node_id_hex=credited_node_id(
+                        vm_id=row.vm_id,
+                        at_unix=row.verified_at_unix,
+                        fallback_node_id_hex=binding.node_id_hex,
+                    ),
+                    flavor=verdict.flavor or binding.resource_class,
+                    attested=attested,
+                    verdict=verdict,
+                    body_digest=row.body_digest,
+                )
     except IntegrityError:
         # ⛔ THE anti-replay path. `body_digest` is the CONTENT identity of
         # a signed attestation: the same bytes resubmitted collide here,
@@ -464,10 +780,11 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
         ) from None
 
     log.info(
-        "live-attestation recorded: vm=%s seq=%d verified_at=%d",
+        "live-attestation recorded: vm=%s seq=%d verified_at=%d resources=%s",
         row.vm_id,
         row.attestation_seq,
         row.verified_at_unix,
+        verdict.verdict or "-",
     )
     # Feed the in-guest liveness watermark (`apps.lifecycle.guest_liveness`)
     # — the OTHER half of the "is anything alive inside this VM?" signal.
@@ -521,11 +838,21 @@ def covered_intervals(
             verified_at_unix__lte=end_unix + span,
         )
         .order_by("verified_at_unix")
-        .values_list("verified_at_unix", flat=True)
+        .values_list("verified_at_unix", "resource_verdict")
     )
+    # Attested guest resources (`guest_resources`): with ENFORCE armed only
+    # an `ok` sample vouches, and any other one is a BARRIER — a VM short
+    # of its flavor (or a stale launch) at `b` was not delivering at `b`,
+    # so no later sample may vouch back across it. Merely dropping the bad
+    # sample would let the next good one cover it.
+    enforce = guest_resources.enforce()
+    barrier = start_unix
     raw: list[Interval] = []
-    for t in samples:
-        lo = max(int(t) - span, floor_unix, start_unix)
+    for t, verdict in samples:
+        if enforce and verdict != guest_resources.VERDICT_OK:
+            barrier = max(barrier, int(t))
+            continue
+        lo = max(int(t) - span, floor_unix, start_unix, barrier)
         hi = min(int(t), end_unix)
         if hi > lo:
             raw.append(Interval(start=lo, end=hi))

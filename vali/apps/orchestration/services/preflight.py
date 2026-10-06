@@ -204,6 +204,18 @@ def build_preflight_payload(
     return payload
 
 
+class PreflightRejected(EffectError):
+    """The miner answered the preflight with a non-2xx static class.
+
+    `classifier` is that class (`insufficient-resources`, …) — the miner's
+    closed vocabulary, used only to classify vali's OWN reaction (never
+    persisted or trusted as a statement about another miner)."""
+
+    def __init__(self, message: str, *, classifier: str) -> None:
+        super().__init__(message)
+        self.classifier = classifier
+
+
 def dispatch_preflight(
     *,
     miner_id: str,
@@ -271,9 +283,10 @@ def dispatch_preflight(
         timeout_s=timeout,
     )
     if not result.ok:
-        raise EffectError(
+        raise PreflightRejected(
             f"preflight-dispatch: miner-rejected status={result.status} "
-            f"classifier={result.classifier!r}"
+            f"classifier={result.classifier!r}",
+            classifier=result.classifier,
         )
 
     return _parse_preflight_response(result.classifier)

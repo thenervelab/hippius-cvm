@@ -216,7 +216,18 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
         awscli \
         initramfs-tools-core \
         dracut-core \
+        patch \
+        cpio \
+        busybox-static \
+        squashfs-tools-ng \
     && rm -rf /var/lib/apt/lists/*
+# cpio, busybox-static and squashfs-tools-ng back
+# guest/build-guest-release.sh: the release cpio members, the STATIC
+# busybox the release ships for its boot step (/lib/hippius/guest/busybox:
+# sha256sum + loop mount, independent of the base initrd's tools), and
+# rdsquashfs, which reads every SELinux label back out of the built image.
+# patch backs tenant-initrd-rebuild.sh's strict (no-fuzz) application of
+# initramfs/rebuild-patches/ onto a golden base's own scripts.
 # initramfs-tools-core (lsinitramfs) + dracut-core (lsinitrd) back the
 # bake script's stage-5 fail-closed audit: the EXTRACTED initrd must
 # carry the hippius release core or the bake refuses to ship (the
@@ -238,8 +249,13 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 # The bake script + entrypoint live at canonical paths so the Job
 # spec can reference them without leaking the in-image layout.
 COPY scripts/tenant-image-bake.sh   /usr/local/bin/tenant-image-bake.sh
+# One-off initrd-only rebuild of an existing golden bake (same kernel, same
+# dm-verity base, new initramfs from this image's scripts/initramfs/). Run as
+# a k8s Job with `command: [/usr/local/bin/tenant-initrd-rebuild.sh]`; see
+# its header. Reads the scripts from /usr/local/bin/initramfs/ below.
+COPY scripts/tenant-initrd-rebuild.sh /usr/local/bin/tenant-initrd-rebuild.sh
 COPY binaries/tenant-baker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/tenant-image-bake.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/tenant-image-bake.sh /usr/local/bin/entrypoint.sh /usr/local/bin/tenant-initrd-rebuild.sh
 
 # initramfs assets: the bake script computes `SCRIPT_DIR` from its
 # own location (`/usr/local/bin`) and reads
@@ -249,15 +265,22 @@ RUN chmod 0755 /usr/local/bin/tenant-image-bake.sh /usr/local/bin/entrypoint.sh
 # plumbing.
 COPY scripts/initramfs/hippius-luks-keyscript \
      scripts/initramfs/hippius-luks-hook \
+     scripts/initramfs/hippius-host-state-hook \
+     scripts/initramfs/hippius-dhcp-clientid-hook \
      scripts/initramfs/hippius-net-teardown \
      scripts/initramfs/hippius-release-core.sh \
      scripts/initramfs/hippius-golden-overlay.sh \
      scripts/initramfs/hippius-golden-boot \
      scripts/initramfs/hippius-golden-hook \
      /usr/local/bin/initramfs/
+# Strict patches tenant-initrd-rebuild.sh applies on top of a golden
+# base's OWN initramfs scripts (its default, minimal-delta input).
+COPY scripts/initramfs/rebuild-patches/ /usr/local/bin/initramfs/rebuild-patches/
 RUN chmod 0755 \
         /usr/local/bin/initramfs/hippius-luks-keyscript \
         /usr/local/bin/initramfs/hippius-luks-hook \
+        /usr/local/bin/initramfs/hippius-host-state-hook \
+        /usr/local/bin/initramfs/hippius-dhcp-clientid-hook \
         /usr/local/bin/initramfs/hippius-net-teardown \
         /usr/local/bin/initramfs/hippius-release-core.sh \
         /usr/local/bin/initramfs/hippius-golden-overlay.sh \
@@ -290,8 +313,16 @@ COPY scripts/dracut/95hippius-golden/ /usr/local/bin/dracut/95hippius-golden/
 # invisible until a live bake ran. `scripts/dev/baker-assets-test.sh` now
 # pins every `${SCRIPT_DIR}/...` path the bake script reads against a COPY
 # in this file.
-COPY scripts/guest/hippius-keepalive-start /usr/local/bin/guest/hippius-keepalive-start
-RUN chmod 0755 /usr/local/bin/guest/hippius-keepalive-start
+#
+# The whole scripts/guest/ tree also carries the guest components release
+# (docs/design/guest-component-rollout.md): `build-guest-release.sh` and
+# its `components/` inputs (units, keepalive.env, release.conf, SELinux
+# labels). The builder reads the initramfs scripts and the dracut module
+# from the sibling /usr/local/bin/initramfs/ and /usr/local/bin/dracut/
+# trees above, and the agents from /usr/sbin below.
+COPY scripts/guest/ /usr/local/bin/guest/
+RUN chmod 0755 /usr/local/bin/guest/hippius-keepalive-start /usr/local/bin/guest/build-guest-release.sh \
+        /usr/local/bin/guest/guest-initrd-build.sh /usr/local/bin/guest/initrd-merge-check.py
 RUN chmod 0755 /usr/local/bin/dracut/95hippius-golden/*.sh
 
 # The two release-flow binaries the keyscript invokes inside the

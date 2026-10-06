@@ -110,7 +110,7 @@ fi
 FAILED=0
 ALLOWED_TOTAL=0
 # A hit is not always a disclosure. A credential-scanner ruleset has to
-# name the vendors it detects — the same way it names AWS and GCP — and a
+# name the vendors it detects — the same way it names the big clouds — and a
 # detection rule is not a map of our estate. This comment deliberately
 # does NOT write those vendor names itself: this script is published, so
 # anything it says is published too, and it should be clean on its own

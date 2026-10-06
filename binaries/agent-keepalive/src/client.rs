@@ -36,6 +36,7 @@ use hippius_agent_initramfs::stages::kbs_client::HttpClient;
 use hippius_agent_initramfs::stages::kbs_vsock_client::{is_vsock_url, VsockHttpClient};
 use hippius_types::cbor::{assert_canonical, to_canonical_vec};
 use hippius_types::kbs_vsock::{KBS_KEEPALIVE_PATH, KBS_NONCE_PATH};
+use hippius_types::live_attestation::{GuestComponents, GuestResources};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::time::Duration;
@@ -80,6 +81,31 @@ struct KeepaliveRequestBody<'a> {
     kbs_nonce: ByteBuf,
     epoch: u64,
     expiry_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<KeepaliveResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    components: Option<KeepaliveComponents>,
+}
+
+/// Mirror of `kbs_transport::wire::KeepaliveComponents`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeepaliveComponents {
+    release_version: u32,
+    security_epoch: u32,
+    health: u32,
+    instance: u32,
+    unhealthy_ticks: u32,
+}
+
+/// Mirror of `kbs_transport::wire::KeepaliveResources`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeepaliveResources {
+    vcpus_online: u32,
+    mem_firmware_kib: u64,
+    mem_total_kib: u64,
+    mem_unaccepted_kib: u64,
 }
 
 /// Mirror of `kbs_transport::wire::KeepaliveResponseBody`.
@@ -201,6 +227,7 @@ impl KbsClient {
     /// `POST /v1/attest/keepalive` — verify-and-sign one live
     /// attestation. Returns the `SignedLiveAttestation::encode`
     /// bytes the validator (or KBS sink) ships on-chain.
+    #[allow(clippy::too_many_arguments)]
     pub fn post_keepalive(
         &self,
         vm_id: &str,
@@ -209,6 +236,8 @@ impl KbsClient {
         kbs_nonce: &[u8; 32],
         epoch: u64,
         expiry_unix: u64,
+        resources: Option<&GuestResources>,
+        components: Option<&GuestComponents>,
     ) -> Result<Vec<u8>, ClientError> {
         let body = KeepaliveRequestBody {
             vm_id,
@@ -217,6 +246,19 @@ impl KbsClient {
             kbs_nonce: ByteBuf::from(kbs_nonce.to_vec()),
             epoch,
             expiry_unix,
+            resources: resources.map(|r| KeepaliveResources {
+                vcpus_online: r.vcpus_online,
+                mem_firmware_kib: r.mem_firmware_kib,
+                mem_total_kib: r.mem_total_kib,
+                mem_unaccepted_kib: r.mem_unaccepted_kib,
+            }),
+            components: components.map(|c| KeepaliveComponents {
+                release_version: c.release_version,
+                security_epoch: c.security_epoch,
+                health: c.health,
+                instance: c.instance,
+                unhealthy_ticks: c.unhealthy_ticks,
+            }),
         };
         let encoded = encode_canonical(&body)?;
         let bytes = self.post_cbor(KBS_KEEPALIVE_PATH, encoded)?;

@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{MinerAgentError, Result};
 use crate::lifecycle::cvm_handle::VmId;
+use crate::lifecycle::disk_space;
 
 /// One GiB in bytes — the unit `disk_gb` is expressed in.
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -77,9 +78,13 @@ pub fn is_golden_cmdline(cmdline: &str) -> bool {
 /// creating it. Used by config-rendering paths that need the path to
 /// interpolate into the libvirt XML (the golden `/dev/vda` source).
 pub fn overlay_disk_path(miner_root: &Path, vm_id: &VmId) -> PathBuf {
-    miner_root
-        .join(OVERLAY_DIR_NAME)
-        .join(format!("{vm_id}.img"))
+    overlay_dir(miner_root).join(format!("{vm_id}.img"))
+}
+
+/// The directory holding every per-VM golden overlay upper under
+/// `miner_root`.
+pub(crate) fn overlay_dir(miner_root: &Path) -> PathBuf {
+    miner_root.join(OVERLAY_DIR_NAME)
 }
 
 /// Idempotent creation: ensure a blank sparse `size_gb` GiB overlay
@@ -128,12 +133,19 @@ pub(crate) fn ensure_overlay_disk_bytes(
         .ok_or(MinerAgentError::OverlayDisk("no-parent"))?;
     std::fs::create_dir_all(parent).map_err(|_| MinerAgentError::OverlayDisk("mkdir"))?;
 
-    // Free-space pre-check on the backing mount (the physical free
-    // space cannot be faked, so this does not trust the miner). A
-    // sparse `set_len` would otherwise surface ENOSPC mid-format on the
-    // live guest instead of failing closed here at admission.
-    let free = free_bytes(parent)?;
-    if free < bytes {
+    // Free-space pre-check on the backing mount, net of every existing
+    // writable disk's unwritten tail and every in-flight writer's
+    // reservation, and serialised with every other create
+    // (`disk_space` — same gate as the data disk). A sparse `set_len` would
+    // otherwise surface ENOSPC mid-format on the live guest instead of
+    // failing closed here at admission.
+    let reserved = disk_space::create_lock();
+    if path.exists() {
+        return Ok(path);
+    }
+    let headroom = disk_space::headroom_bytes(*reserved, miner_root, parent)
+        .map_err(MinerAgentError::OverlayDisk)?;
+    if headroom < bytes {
         return Err(MinerAgentError::OverlayDisk("insufficient-space"));
     }
 
@@ -157,16 +169,13 @@ pub(crate) fn ensure_overlay_disk_bytes(
 }
 
 /// Bytes available to an unprivileged writer on the filesystem backing
-/// `dir` (`statvfs` `f_bavail * f_frsize`). Mirrors
-/// [`crate::lifecycle::data_disk`]'s `free_bytes`.
+/// `dir` (`statvfs` `f_bavail * f_frsize`) — the raw figure, before
+/// [`disk_space::headroom_bytes`] nets out the sparse tails.
+#[cfg(test)]
 fn free_bytes(dir: &Path) -> Result<u64> {
-    let st =
-        nix::sys::statvfs::statvfs(dir).map_err(|_| MinerAgentError::OverlayDisk("statvfs"))?;
-    #[allow(clippy::useless_conversion)]
-    let avail = u64::try_from(st.blocks_available()).unwrap_or(0);
-    #[allow(clippy::useless_conversion)]
-    let frsize = u64::try_from(st.fragment_size()).unwrap_or(0);
-    Ok(avail.saturating_mul(frsize))
+    disk_space::fs_bytes(dir)
+        .map(|(_, avail)| avail)
+        .ok_or(MinerAgentError::OverlayDisk("statvfs"))
 }
 
 #[cfg(test)]
@@ -347,5 +356,48 @@ mod tests {
             before, after,
             "ensure_overlay_disk re-touched an existing file"
         );
+    }
+
+    /// A sparse file under `<root>/overlay/` that promises all but
+    /// `leave_bytes` of the filesystem's current free space.
+    fn promise_all_but(root: &Path, name: &str, leave_bytes: u64) {
+        let free = free_bytes(root).expect("statvfs");
+        std::fs::create_dir_all(overlay_dir(root)).unwrap();
+        let f = std::fs::File::create(overlay_dir(root).join(name)).unwrap();
+        f.set_len(free.saturating_sub(leave_bytes)).unwrap();
+    }
+
+    #[test]
+    fn a_second_overlay_is_measured_against_the_first_ones_promise() {
+        let _tight = disk_space::tight_tests();
+        let tmp = TempDir::new().unwrap();
+        // 1.5 GiB of real headroom: one 1 GiB sparse disk fits, a second
+        // does not (the 512 MiB margin absorbs concurrent tests' writes).
+        promise_all_but(tmp.path(), "filler.img", 3 << 29);
+        ensure_overlay_disk_bytes(tmp.path(), &vm("tenant-o-first"), 1 << 30)
+            .expect("the first fits");
+        assert!(matches!(
+            ensure_overlay_disk_bytes(tmp.path(), &vm("tenant-o-second"), 1 << 30),
+            Err(MinerAgentError::OverlayDisk("insufficient-space"))
+        ));
+    }
+
+    #[test]
+    fn an_overlay_create_waits_for_the_create_lock_and_measures_after_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let held = disk_space::create_lock();
+        let waiter = {
+            let root = root.clone();
+            std::thread::spawn(move || ensure_overlay_disk(&root, &vm("tenant-o-waiter"), 1))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "the create ran past a held lock");
+        promise_all_but(&root, "holder.img", 0);
+        drop(held);
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(MinerAgentError::OverlayDisk("insufficient-space"))
+        ));
     }
 }

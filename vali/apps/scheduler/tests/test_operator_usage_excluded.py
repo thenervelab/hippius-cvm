@@ -1,10 +1,9 @@
 """Operator-owned VMs earn NO reward weight and NO bill.
 
 With `VALI_EPOCH_WEIGHT_SOURCE=usage` the `UsageAccrual` ledger IS the
-on-chain reward weight. Measured live on 2026-08-11 (chain epoch 2702),
-OUR OWN VMs held 30.6 % of the entire pot — 404,343,360 of 1,322,247,180
-unit_seconds — and a single synthetic-monitor probe that had not existed
-for five days (`synmon-debian-1785751760`) carried 30 % of it alone,
+on-chain reward weight. Without a filter an operator VM could hold a
+large share of the epoch's units — even a synthetic-monitor probe that
+had been destroyed days earlier can keep carrying a large slice alone,
 because a suspended closer never rolls the bucket over. Every unit we
 hold is diluted straight out of an honest miner's reward.
 
@@ -14,7 +13,7 @@ properties that make that safe:
 
   - an operator-owned VM contributes ZERO;
   - a tenant VM is untouched, to the unit;
-  - the three live operator shapes are ALL covered, not just `synmon-`;
+  - all operator lease shapes are covered, not just `synmon-`;
   - an empty excluded set is a strict no-op (the default can never
     silently zero a real fleet);
   - the set comes from SETTINGS, not from a hardcoded name or a lease
@@ -39,12 +38,12 @@ pytestmark = pytest.mark.django_db
 SETTINGS_PY = REPO_ROOT / "vali" / "vali" / "settings.py"
 
 
-# The two identities the live fleet actually uses. `synthetic-monitor` is
-# `VALI_SYNTHETIC_TENANT_ID`; `kbsrehearse` is a one-off operator harness.
+# Two operator identities. `synthetic-monitor` is
+# `VALI_SYNTHETIC_TENANT_ID`; `ops-harness` is a one-off operator harness.
 SYNTH = "synthetic-monitor"
-REHEARSE = "kbsrehearse"
+REHEARSE = "ops-harness"
 
-# The regime under test: usage-sourced weights, with the live excluded set.
+# The regime under test: usage-sourced weights, with an excluded set.
 _LIVE = override_settings(
     VALI_EPOCH_WEIGHT_SOURCE="usage",
     VALI_SYNTHETIC_TENANT_ID=SYNTH,
@@ -81,6 +80,20 @@ def _own(
 
 
 @_LIVE
+
+def _small_units() -> int:
+    """`resource_units("small")` computed from the catalogue.
+
+    These assertions used to hardcode the number. It is a PRODUCT of the
+    flavor table, so every catalogue change broke tests that were not about
+    the catalogue — and the fix was always "update the constant", which
+    teaches nobody anything. Derive it, and the tests keep asserting what
+    they mean: that the weight of one small VM is what lands on chain.
+    """
+    from apps.scheduler import scoring
+
+    return scoring.resource_units("small")
+
 def test_an_operator_owned_vm_contributes_zero_weight() -> None:
     """CLAIM: our own VM moves not one unit of the pot.
 
@@ -88,9 +101,9 @@ def test_an_operator_owned_vm_contributes_zero_weight() -> None:
     weights entirely (weight 0 ⇒ absent, matching the drop-zeros contract
     the rest of `compute_epoch_weights` already keeps).
     """
-    observe_chain_epoch(2702)
-    _own("synmon-debian-1785751760", node_id(1), owner=SYNTH, epoch=2702,
-         unit_seconds=400_974_150, lease_id="synmon-synmon-debian-1785751760")
+    observe_chain_epoch(5002)
+    _own("synmon-debian-1700000000", node_id(1), owner=SYNTH, epoch=5002,
+         unit_seconds=400_000_000, lease_id="synmon-synmon-debian-1700000000")
 
     assert scoring.compute_epoch_weights() == {}
 
@@ -99,63 +112,62 @@ def test_an_operator_owned_vm_contributes_zero_weight() -> None:
 def test_a_tenant_vm_is_unaffected_to_the_unit() -> None:
     """CLAIM: the filter takes nothing from a real tenant.
 
-    The live tenant row, verbatim: 917,329,830 unit_seconds on
-    `0123456789ab`, owner `<OPERATOR>`. It must survive byte-identical.
+    A tenant row of 900,000,000 unit_seconds must survive
+    byte-identical.
     """
-    observe_chain_epoch(2702)
-    _own("realtenant-ubuntu-1", node_id(7), owner="operator-1", epoch=2702,
-         unit_seconds=917_329_830, lease_id="realtenant-ubuntu-1-lease")
+    observe_chain_epoch(5002)
+    _own("tenant-vm-1", node_id(7), owner="operator-1", epoch=5002,
+         unit_seconds=900_000_000, lease_id="tenant-vm-1-lease")
 
-    assert scoring.compute_epoch_weights() == {node_id(7): 917_329_830}
+    assert scoring.compute_epoch_weights() == {node_id(7): 900_000_000}
 
 
 @_LIVE
-def test_all_three_live_operator_shapes_are_covered_not_just_synmon() -> None:
+def test_all_operator_lease_shapes_are_covered_not_just_synmon() -> None:
     """CLAIM: `synmon-` is not the whole of "ours".
 
-    The epoch-2702 ledger holds THREE operator lease shapes — `synmon-*`
-    (31 rows, owner `synthetic-monitor`), `kbsrehearse-1` (owner
-    `kbsrehearse`) and `stampproof-1-lease` (owner `synthetic-monitor`).
-    A `synmon-` prefix filter would have left 6,681,180 units of our own
-    usage in the pot AND kept the probe's host miner paid; owner-keying
-    zeroes all three.
+    Operator rows come in THREE lease shapes — `synmon-*` (owner
+    `synthetic-monitor`), `harness-lease-1` (owner `ops-harness`) and
+    `lease-x` (owner `synthetic-monitor`). A `synmon-` prefix filter
+    would leave 6,000,000 units of our own usage in the pot AND keep the
+    probe's host miner paid; owner-keying zeroes all three.
     """
-    observe_chain_epoch(2702)
+    observe_chain_epoch(5002)
     ours = node_id(2)
-    _own("synmon-debian-1785751760", ours, owner=SYNTH, epoch=2702,
-         unit_seconds=400_974_150, lease_id="synmon-synmon-debian-1785751760")
-    _own("kbsrehearse-vm", ours, owner=REHEARSE, epoch=2702,
-         unit_seconds=4_580_790, lease_id="kbsrehearse-1")
-    _own("stampproof-vm", ours, owner=SYNTH, epoch=2702,
-         unit_seconds=2_100_390, lease_id="stampproof-1-lease")
+    _own("synmon-debian-1700000000", ours, owner=SYNTH, epoch=5002,
+         unit_seconds=400_000_000, lease_id="synmon-synmon-debian-1700000000")
+    _own("harness-vm", ours, owner=REHEARSE, epoch=5002,
+         unit_seconds=4_000_000, lease_id="harness-lease-1")
+    _own("probe-vm-x", ours, owner=SYNTH, epoch=5002,
+         unit_seconds=2_000_000, lease_id="lease-x")
 
     assert scoring.compute_epoch_weights() == {}
 
 
 @_LIVE
 def test_the_live_pot_recomputed_leaves_only_the_tenant() -> None:
-    """CLAIM: end-to-end on the live numbers — the whole point of the fix.
+    """CLAIM: end-to-end on a realistic pot — the whole point of the fix.
 
-    Three miners, epoch 2702, as measured. Before: 1,322,247,180 total of
-    which 30.6 % is ours. After: the tenant's miner keeps its exact
-    weight and the two operator-only miners vanish.
+    Three miners, one epoch. Before: a large share of the total is ours.
+    After: the tenant's miner keeps its exact weight and the two
+    operator-only miners vanish.
     """
-    observe_chain_epoch(2702)
+    observe_chain_epoch(5002)
     tenant, mixed, probes = node_id(0x2826), node_id(0x3F6E), node_id(0xE050)
 
-    _own("realtenant-ubuntu-1", tenant, owner="operator-1", epoch=2702,
-         unit_seconds=911_222_640, lease_id="realtenant-ubuntu-1-lease")
-    _own("synmon-mixed", mixed, owner=SYNTH, epoch=2702,
-         unit_seconds=403_764_600, lease_id="synmon-synmon-debian-1785751760")
-    _own("kbsrehearse-vm", mixed, owner=REHEARSE, epoch=2702,
-         unit_seconds=4_580_790, lease_id="kbsrehearse-1")
-    _own("stampproof-vm", mixed, owner=SYNTH, epoch=2702,
-         unit_seconds=2_100_390, lease_id="stampproof-1-lease")
-    _own("synmon-fedora", probes, owner=SYNTH, epoch=2702, unit_seconds=578_760)
+    _own("tenant-vm-1", tenant, owner="operator-1", epoch=5002,
+         unit_seconds=900_000_000, lease_id="tenant-vm-1-lease")
+    _own("synmon-mixed", mixed, owner=SYNTH, epoch=5002,
+         unit_seconds=400_000_000, lease_id="synmon-synmon-debian-1700000000")
+    _own("harness-vm", mixed, owner=REHEARSE, epoch=5002,
+         unit_seconds=4_000_000, lease_id="harness-lease-1")
+    _own("probe-vm-x", mixed, owner=SYNTH, epoch=5002,
+         unit_seconds=2_000_000, lease_id="lease-x")
+    _own("synmon-fedora", probes, owner=SYNTH, epoch=5002, unit_seconds=500_000)
 
     weights = scoring.compute_epoch_weights()
-    assert weights == {tenant: 911_222_640}
-    assert sum(weights.values()) == 911_222_640
+    assert weights == {tenant: 900_000_000}
+    assert sum(weights.values()) == 900_000_000
 
 
 # ─── the default must never zero a real fleet ────────────────────────
@@ -175,15 +187,15 @@ def test_an_empty_excluded_set_changes_nothing() -> None:
     would zero an entire honest fleet at the first deploy. Every row
     below is one an unconfigured vali must still pay.
     """
-    observe_chain_epoch(2702)
-    _own("synmon-debian", node_id(1), owner=SYNTH, epoch=2702, unit_seconds=400_974_150)
-    _own("kbsrehearse-vm", node_id(1), owner=REHEARSE, epoch=2702, unit_seconds=4_580_790)
-    _own("tenant-vm", node_id(2), owner="operator-1", epoch=2702, unit_seconds=917_329_830)
-    _own("legacy-vm", node_id(3), owner="", epoch=2702, unit_seconds=1_234)
+    observe_chain_epoch(5002)
+    _own("synmon-debian", node_id(1), owner=SYNTH, epoch=5002, unit_seconds=400_000_000)
+    _own("harness-vm", node_id(1), owner=REHEARSE, epoch=5002, unit_seconds=4_000_000)
+    _own("tenant-vm", node_id(2), owner="operator-1", epoch=5002, unit_seconds=900_000_000)
+    _own("legacy-vm", node_id(3), owner="", epoch=5002, unit_seconds=1_234)
 
     assert scoring.compute_epoch_weights() == {
-        node_id(1): 405_554_940,
-        node_id(2): 917_329_830,
+        node_id(1): 404_000_000,
+        node_id(2): 900_000_000,
         node_id(3): 1_234,
     }
 
@@ -192,13 +204,13 @@ def test_an_empty_excluded_set_changes_nothing() -> None:
 def test_a_blank_owner_is_never_excluded() -> None:
     """CLAIM: legacy rows keep earning.
 
-    36 live placements carry `owner=""` (pre-#587 launches). An empty
+    Legacy placements carry `owner=""` (pre-#587 launches). An empty
     string reaching the excluded set — a stray `""` in the env list, or
     an unset `VALI_SYNTHETIC_TENANT_ID` being added blindly — would wipe
     every one of them.
     """
-    observe_chain_epoch(2702)
-    _own("legacy-vm", node_id(3), owner="", epoch=2702, unit_seconds=1_234)
+    observe_chain_epoch(5002)
+    _own("legacy-vm", node_id(3), owner="", epoch=5002, unit_seconds=1_234)
 
     assert "" not in scoring._excluded_owners()
     assert scoring.compute_epoch_weights() == {node_id(3): 1_234}
@@ -216,8 +228,8 @@ def test_whitespace_only_configuration_excludes_nobody() -> None:
     must not become an owner that matches nothing — or, worse, survive
     into a `__in` clause alongside a strip() that never ran.
     """
-    observe_chain_epoch(2702)
-    _own("tenant-vm", node_id(2), owner="operator-1", epoch=2702, unit_seconds=500)
+    observe_chain_epoch(5002)
+    _own("tenant-vm", node_id(2), owner="operator-1", epoch=5002, unit_seconds=500)
 
     assert scoring._excluded_owners() == frozenset()
     assert scoring.compute_epoch_weights() == {node_id(2): 500}
@@ -240,9 +252,9 @@ def test_the_excluded_set_comes_from_settings_not_a_literal() -> None:
     Kills every mutant that pattern-matches a baked-in "synmon" /
     "synthetic" string instead of reading the setting.
     """
-    observe_chain_epoch(2702)
-    _own("acme-vm", node_id(1), owner="acme-ops", epoch=2702, unit_seconds=999)
-    _own("synmon-vm", node_id(2), owner=SYNTH, epoch=2702,
+    observe_chain_epoch(5002)
+    _own("acme-vm", node_id(1), owner="acme-ops", epoch=5002, unit_seconds=999)
+    _own("synmon-vm", node_id(2), owner=SYNTH, epoch=5002,
          unit_seconds=400, lease_id="synmon-synmon-debian-1")
 
     assert scoring._excluded_owners() == frozenset({"acme-ops"})
@@ -255,9 +267,9 @@ def test_the_excluded_set_comes_from_settings_not_a_literal() -> None:
     VALI_REWARD_EXCLUDED_OWNERS=[REHEARSE],
 )
 def test_the_synthetic_tenant_is_excluded_even_when_absent_from_the_list() -> None:
-    """CLAIM: editing the list cannot re-open the 30 % skim.
+    """CLAIM: editing the list cannot re-open the operator skim.
 
-    The chart's `rewardExcludedOwners` holds only `kbsrehearse`. If the
+    The chart's `rewardExcludedOwners` names only OTHER identities. If the
     synthetic tenant were merely another list entry, an operator adding a
     one-off identity and rewriting the list would silently put the probe
     fleet back in the pot. It is unioned in from
@@ -266,8 +278,8 @@ def test_the_synthetic_tenant_is_excluded_even_when_absent_from_the_list() -> No
     """
     assert scoring._excluded_owners() == frozenset({SYNTH, REHEARSE})
 
-    observe_chain_epoch(2702)
-    _own("synmon-vm", node_id(1), owner=SYNTH, epoch=2702, unit_seconds=400)
+    observe_chain_epoch(5002)
+    _own("synmon-vm", node_id(1), owner=SYNTH, epoch=5002, unit_seconds=400)
     assert scoring.compute_epoch_weights() == {}
 
 
@@ -282,8 +294,8 @@ def test_a_tenant_lease_that_merely_looks_operator_owned_still_earns() -> None:
     miner's reward — and would fail OPEN (back to paying ourselves) the
     day someone renames that f-string.
     """
-    observe_chain_epoch(2702)
-    _own("tenant-vm", node_id(4), owner="operator-1", epoch=2702,
+    observe_chain_epoch(5002)
+    _own("tenant-vm", node_id(4), owner="operator-1", epoch=5002,
          unit_seconds=5_000, lease_id="synmon-prod-workload")
 
     assert scoring.compute_epoch_weights() == {node_id(4): 5_000}
@@ -292,11 +304,10 @@ def test_a_tenant_lease_that_merely_looks_operator_owned_still_earns() -> None:
 @_LIVE
 def test_an_operator_vm_is_excluded_whatever_its_lease_is_called() -> None:
     """CLAIM: the converse — ours is ours even with a tenant-shaped
-    lease. `stampproof-1-lease` is exactly this case live: an operator VM
-    with no `synmon` anywhere in its lease id."""
-    observe_chain_epoch(2702)
-    _own("stampproof-vm", node_id(5), owner=SYNTH, epoch=2702,
-         unit_seconds=2_100_390, lease_id="a-perfectly-ordinary-lease")
+    lease: an operator VM with no `synmon` anywhere in its lease id."""
+    observe_chain_epoch(5002)
+    _own("probe-vm-x", node_id(5), owner=SYNTH, epoch=5002,
+         unit_seconds=2_000_000, lease_id="a-perfectly-ordinary-lease")
 
     assert scoring.compute_epoch_weights() == {}
 
@@ -309,10 +320,10 @@ def test_only_the_operator_share_is_removed_from_a_mixed_miner() -> None:
     tenant share. Kills a mutant that drops the whole node once any of
     its rows is excluded.
     """
-    observe_chain_epoch(2702)
+    observe_chain_epoch(5002)
     mixed = node_id(6)
-    _own("tenant-vm", mixed, owner="operator-1", epoch=2702, unit_seconds=1_000_000)
-    _own("synmon-vm", mixed, owner=SYNTH, epoch=2702, unit_seconds=400_974_150)
+    _own("tenant-vm", mixed, owner="operator-1", epoch=5002, unit_seconds=1_000_000)
+    _own("synmon-vm", mixed, owner=SYNTH, epoch=5002, unit_seconds=400_000_000)
 
     assert scoring.compute_epoch_weights() == {mixed: 1_000_000}
 
@@ -323,11 +334,11 @@ def test_exclusion_holds_for_a_vm_whose_placement_failed() -> None:
 
     The live probes are all destroyed; their placements are Failed (§13
     drain) or superseded. A status-filtered join would have excluded
-    none of them — which is precisely the 30 % that is in the pot today.
+    none of them — which is precisely the operator share at stake.
     """
-    observe_chain_epoch(2702)
-    _own("synmon-dead", node_id(1), owner=SYNTH, epoch=2702,
-         unit_seconds=400_974_150, status=PlacementStatus.FAILED.value)
+    observe_chain_epoch(5002)
+    _own("synmon-dead", node_id(1), owner=SYNTH, epoch=5002,
+         unit_seconds=400_000_000, status=PlacementStatus.FAILED.value)
 
     assert scoring.compute_epoch_weights() == {}
 
@@ -346,9 +357,9 @@ def test_the_bill_excludes_operator_usage_too() -> None:
     read-only `EpochWeightsView`), so this is observational today and
     exactly the moment to fix it.
     """
-    observe_chain_epoch(2702)
-    _own("tenant-vm", node_id(1), owner="operator-1", epoch=2702, unit_seconds=3_600_000)
-    _own("synmon-vm", node_id(2), owner=SYNTH, epoch=2702, unit_seconds=3_600_000)
+    observe_chain_epoch(5002)
+    _own("tenant-vm", node_id(1), owner="operator-1", epoch=5002, unit_seconds=3_600_000)
+    _own("synmon-vm", node_id(2), owner=SYNTH, epoch=5002, unit_seconds=3_600_000)
 
     owed = scoring.compute_owed_micro_usd({node_id(1): 1_000_000, node_id(2): 1_000_000})
     assert owed == {node_id(1): 1_000_000}
@@ -377,7 +388,7 @@ def test_the_snapshot_source_excludes_operator_placements_too() -> None:
                    status=PlacementStatus.BOUND.value, owner=REHEARSE,
                    resource_class="small")
 
-    assert scoring.compute_epoch_weights() == {node_id(1): 1590}
+    assert scoring.compute_epoch_weights() == {node_id(1): _small_units()}
 
 
 @_LIVE
@@ -389,12 +400,12 @@ def test_the_ledger_rows_survive_the_exclusion() -> None:
     billing history) and the ledger stays a complete audit record of what
     actually ran, including what our own monitoring consumed.
     """
-    observe_chain_epoch(2702)
-    _own("synmon-vm", node_id(1), owner=SYNTH, epoch=2702, unit_seconds=400_974_150)
+    observe_chain_epoch(5002)
+    _own("synmon-vm", node_id(1), owner=SYNTH, epoch=5002, unit_seconds=400_000_000)
 
     assert scoring.compute_epoch_weights() == {}
     row = UsageAccrual.objects.get(vm_id="synmon-vm")
-    assert row.unit_seconds == 400_974_150
+    assert row.unit_seconds == 400_000_000
 
 
 @_LIVE
@@ -407,9 +418,9 @@ def test_a_usage_row_with_no_placement_still_earns() -> None:
     keep one of our own rows in the pot; the cost of failing closed
     would be an honest miner losing an epoch to a missing join row.
     """
-    observe_chain_epoch(2702)
+    observe_chain_epoch(5002)
     UsageAccrual.objects.create(
-        epoch=2702, miner_node_id=node_id(1), vm_id="orphan-vm",
+        epoch=5002, miner_node_id=node_id(1), vm_id="orphan-vm",
         resource_class="small", unit_seconds=4_242, billable_seconds=4_242,
     )
     assert scoring.compute_epoch_weights() == {node_id(1): 4_242}
@@ -422,11 +433,11 @@ def test_the_chart_ships_the_operator_owners_it_needs() -> None:
     """CLAIM: the deployed ConfigMap actually carries the excluded set.
 
     A settings default that the chart never renders is a fix that never
-    ships. `kbsrehearse` is the live operator identity that is NOT the
-    synthetic tenant, so the chart must name it.
+    ships. The chart exposes the list (empty by default — an operator adds
+    the identities that are NOT the synthetic tenant) and renders it.
     """
     values = yaml.safe_load(VALUES.read_text())
-    assert REHEARSE in values["rewardExcludedOwners"]
+    assert isinstance(values["rewardExcludedOwners"], list)
     assert CONFIGMAP_TPL.read_text().count("VALI_REWARD_EXCLUDED_OWNERS") == 1
     assert ".Values.rewardExcludedOwners" in CONFIGMAP_TPL.read_text()
 
@@ -437,7 +448,7 @@ def test_the_setting_exists_so_the_rendered_key_is_not_inert() -> None:
     Found by mutation: DELETING the `VALI_REWARD_EXCLUDED_OWNERS` line
     from `settings.py` left every behavioural test above green — they all
     `override_settings`, so none of them touches the real module — while
-    the deployed key became inert and `kbsrehearse` would have gone on
+    the deployed key became inert and `ops-harness` would have gone on
     earning. This is the only test that reads the unoverridden setting,
     and it also pins that the value comes from the ENVIRONMENT rather
     than being a module-level constant a chart could never change.
@@ -457,7 +468,7 @@ def test_the_chart_does_not_restate_the_synthetic_tenant() -> None:
 
     Listing `synthetic-monitor` here would make it look removable — and
     a future operator rewriting the list would then silently restore the
-    30 % skim.
+    operator skim.
     """
     values = yaml.safe_load(VALUES.read_text())
     assert SYNTH not in values["rewardExcludedOwners"]

@@ -1,0 +1,125 @@
+#1347 golden data path (/var/lib/hippius-data), as a strict patch for the
+hippius-golden-overlay.sh an existing golden base already carries: the
+header note, the two constants, `hippius_golden_bind_data` and its call at
+the end of `hippius_golden_mount_overlay`, exactly as they are on main.
+It calls `_hippius_golden_relabel_from` (gated off on Ubuntu/Debian, which
+ship no /etc/selinux/config), which the M0 guard provides: on a base that
+predates M0 it goes on top of m0-initramfs-guard.patch.
+Applies with no fuzz to the M0-era base (6ae9be74 / bake m0b) and to the
+stamp-v2 base (6004cfcc / bake b2). Nothing else from main comes along.
+CI (scripts/dev/tenant-initrd-rebuild-test.sh) reverse-applies the shipped
+patches, newest first, to the repo's hippius-golden-overlay.sh and requires
+that none of their code is left, so a stale patch fails the build.
+
+diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
+--- a/scripts/initramfs/hippius-golden-overlay.sh
++++ b/scripts/initramfs/hippius-golden-overlay.sh
+@@ -30,6 +30,13 @@
+ #   overlayfs root = lowerdir (RO dm-verity golden base, shared)
+ #                  + upperdir (per-VM guest-keyed LUKS2+integrity volume)
+ #
++# The guest-keyed volume's root holds (docs/design/golden-data-path.md):
++#   .hippius-volume-stamp / .hippius-volume-timeline   anti-rollback (against
++#                          the host); not exposed via the merged root or the bind
++#   upper/ work/   the overlayfs upperdir + workdir
++#   data/          plain ext4, bound at /var/lib/hippius-data (#1347) — the
++#                  one non-overlay path, for container runtimes & co.
++#
+ # ═══════════════════════════════════════════════════════════════════
+ # THE MAKE-OR-BREAK INVARIANT (fully untrusted miner)
+ # ═══════════════════════════════════════════════════════════════════
+@@ -104,6 +111,16 @@
+ HIPPIUS_GOLDEN_LOWER_MNT="/hippius-golden/lower"
+ HIPPIUS_GOLDEN_UPPER_MNT="/hippius-golden/upper"
+ 
++# Non-overlay data path (#1347). The kernel refuses an overlayfs whose
++# upperdir is itself on an overlay, so a container runtime (containerd /
++# Docker overlay2 snapshots) cannot keep its root anywhere in the merged
++# "/". The guest-keyed volume therefore carries a THIRD directory next to
++# `upper/` and `work/`, bound (the directory only — never the volume root,
++# which holds the anti-rollback stamp) at a FIXED path in the tenant root.# Both names are constants of this measured file: nothing the miner hands
++# the guest (cmdline, fw_cfg, cidata) can move them.
++HIPPIUS_GOLDEN_DATA_NAME="data"
++HIPPIUS_GOLDEN_DATA_MOUNT="/var/lib/hippius-data"
++
+ # ── Anti-rollback: bind a CONFIRMED stamp to the volume it protects ──
+ #
+ # THE HOLE THIS CLOSES (documented, and confirmed reproducible, at
+@@ -1184,6 +1201,77 @@
+         || hippius_die "golden: overlayfs mount at ${_hgmo_rootmnt} failed"
+ 
+     hippius_log "golden: overlay root ready at ${_hgmo_rootmnt} (lower=RO-verity, upper=per-VM guest-keyed)"
++
++    hippius_golden_bind_data "${_hgmo_rootmnt}"
++}
++
++# Bind the guest-keyed volume's `data/` at ${rootmnt}${HIPPIUS_GOLDEN_DATA_MOUNT}
++# (#1347): a plain ext4 directory, same LUKS2+integrity volume as the
++# upper, so the anti-rollback stamp, backups and §25 migration (which all
++# work on the whole volume) cover it unchanged.
++#
++# `data/` is created ONCE (an existing VM's volume has none), mode 0755
++# root, labelled like the lower's /var/lib on an SELinux base (best-effort,
++# like every other relabel here — a tenant who relabels it keeps their
++# label, it is never overwritten). Only `data/` itself is bound, never the
++# volume root: `..` at a bind root walks to the parent MOUNT (the tenant's
++# /var/lib), so neither the stamp nor `upper/`/`work/` is reachable through
++# it. If either end is not a plain directory at its expected place (a
++# symlink, a file, a missing /var/lib), the bind is SKIPPED with a warning:
++# following a symlink could bind the volume root itself or land the bind
++# outside the tenant root, and refusing to boot would brick a VM whose root
++# can only be repaired from inside. Skipping exposes nothing — the tenant
++# just boots without the data path. Only in-guest root can plant such an
++# entry (the volume is guest-keyed), so this is a robustness guard, not a
++# confidentiality one: in-guest root can mount the volume itself anyway.
++# A failed mkdir or mount on a healthy tree is a broken boot: fail-closed.
++hippius_golden_bind_data() {
++    _hgbd_rootmnt="$1"
++    _hgbd_src="${HIPPIUS_GOLDEN_UPPER_MNT}/${HIPPIUS_GOLDEN_DATA_NAME}"
++    _hgbd_dst="${_hgbd_rootmnt}${HIPPIUS_GOLDEN_DATA_MOUNT}"
++    # Same gate as the upper-root label: the Debian/Ubuntu path writes no xattr.
++    _hgbd_selinux=no
++    [ -e "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux/config" ] && _hgbd_selinux=yes
++
++    if [ ! -e "${_hgbd_src}" ] && [ ! -L "${_hgbd_src}" ]; then
++        mkdir -m 0755 "${_hgbd_src}" \
++            || hippius_die "golden: could not create the data directory on the guest-keyed volume"
++        [ "${_hgbd_selinux}" = yes ] \
++            && _hippius_golden_relabel_from "${HIPPIUS_GOLDEN_LOWER_MNT}/var/lib" "${_hgbd_src}"
++        hippius_log "golden: data directory created on the guest-keyed volume"
++    fi
++    if [ ! -d "${_hgbd_src}" ] || [ -L "${_hgbd_src}" ]; then
++        hippius_log "golden: WARN the volume's data entry is not a plain directory — booting WITHOUT ${HIPPIUS_GOLDEN_DATA_MOUNT}"
++        return 0
++    fi
++
++    # The mount point's parent (/var/lib, shipped by every lower) must
++    # resolve to itself inside the tenant root BEFORE anything is created
++    # there: a symlinked /var or /var/lib would otherwise make the mkdir and
++    # the bind land outside it. `cd` + `pwd -P` are shell builtins — no
++    # dependency on a `readlink -f` busybox/klibc/coreutils may not stage.
++    _hgbd_parent="${HIPPIUS_GOLDEN_DATA_MOUNT%/*}"
++    _hgbd_root_real="$(cd "${_hgbd_rootmnt}" 2>/dev/null && pwd -P)" || _hgbd_root_real=""
++    _hgbd_parent_real="$(cd "${_hgbd_rootmnt}${_hgbd_parent}" 2>/dev/null && pwd -P)" || _hgbd_parent_real=""
++    if [ -z "${_hgbd_root_real}" ] || [ "${_hgbd_parent_real}" != "${_hgbd_root_real}${_hgbd_parent}" ]; then
++        hippius_log "golden: WARN ${_hgbd_parent} is missing or not a plain directory in the overlay root — booting WITHOUT ${HIPPIUS_GOLDEN_DATA_MOUNT}"
++        return 0
++    fi
++
++    if [ ! -e "${_hgbd_dst}" ] && [ ! -L "${_hgbd_dst}" ]; then
++        mkdir -m 0755 "${_hgbd_dst}" \
++            || hippius_die "golden: could not create ${HIPPIUS_GOLDEN_DATA_MOUNT} in the overlay root"
++        [ "${_hgbd_selinux}" = yes ] \
++            && _hippius_golden_relabel_from "${_hgbd_rootmnt}${_hgbd_parent}" "${_hgbd_dst}"
++    fi
++    if [ ! -d "${_hgbd_dst}" ] || [ -L "${_hgbd_dst}" ]; then
++        hippius_log "golden: WARN ${HIPPIUS_GOLDEN_DATA_MOUNT} is not a plain directory in the overlay root — booting WITHOUT it"
++        return 0
++    fi
++
++    mount -o bind "${_hgbd_src}" "${_hgbd_dst}" \
++        || hippius_die "golden: bind of the data directory at ${HIPPIUS_GOLDEN_DATA_MOUNT} failed"
++    hippius_log "golden: data path ready at ${HIPPIUS_GOLDEN_DATA_MOUNT} (guest-keyed ext4, not overlay)"
+ }
+ 
+ # ── §20: shred the tmpfs KEK keyfile (idempotent, quiet) ────────────

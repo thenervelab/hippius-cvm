@@ -18,23 +18,31 @@ launch yields the miner's value and a mismatch is a real divergence.
 vali fetches the exact bytes it references (kernel/initrd from S3 by the
 launch SHAs, OVMF from the pinned S3 artifact SHA-verified against
 `VALI_SNP_OVMF_SHA256`) and shells out to the snp-featured
-`hippius-launch-digest` binary baked in the image.
+`hippius-launch-digest` binary baked in the image. The fetches go through
+`s3_artifacts`: a per-pod cache keyed by the pinned sha (re-verified on
+every load) and a retry of transient S3 errors.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from django.conf import settings
 
 from apps.orchestration.effects import EffectError, EffectUnavailable
+from apps.orchestration.services import s3_artifacts
 
 _FETCH_TIMEOUT_S = 120.0
+#: One budget for ALL of a recompute's fetches (OVMF + kernel + initrd,
+#: retries included), so transient S3 trouble cannot hold a launch — or
+#: the orchestration tick, which runs reboot-recovery launches inline —
+#: much longer than a single slow fetch used to.
+_FETCH_BUDGET_S = 240.0
 _DIGEST_TIMEOUT_S = 60.0
 _DIGEST_RE = re.compile(r"[0-9a-f]{96}")
 
@@ -65,62 +73,115 @@ def enforce() -> bool:
     return bool(getattr(settings, "VALI_LAUNCH_DIGEST_ENFORCE", False))
 
 
-def _s3_cp(s3_uri: str, dest: Path) -> None:
+def _s3_cp(s3_uri: str, dest: Path, *, deadline: float | None = None) -> None:
+    """`aws s3 cp` one object, retrying a transient S3 error (`SlowDown`,
+    5xx, throttling, a timeout) until `deadline` (`time.monotonic()`) —
+    see `s3_artifacts`."""
     aws = _aws_bin()
     endpoint = _endpoint()
     argv = [aws]
     if endpoint:
         argv.extend(["--endpoint-url", endpoint])
     argv.extend(["s3", "cp", s3_uri, str(dest)])
-    try:
-        proc = subprocess.run(  # noqa: S603 — argv list, no shell
-            argv,
-            capture_output=True,
-            timeout=_FETCH_TIMEOUT_S,
-            check=False,
-            env=os.environ.copy(),
-        )
-    except FileNotFoundError as exc:
-        raise EffectUnavailable("aws-s3-cp: binary not found") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise EffectError("aws-s3-cp: timeout") from exc
-    if proc.returncode != 0:
+
+    def attempt(timeout_s: float) -> str | None:
+        try:
+            proc = subprocess.run(  # noqa: S603 — argv list, no shell
+                argv,
+                capture_output=True,
+                timeout=timeout_s,
+                check=False,
+                env=os.environ.copy(),
+            )
+        except FileNotFoundError as exc:
+            raise EffectUnavailable("aws-s3-cp: binary not found") from exc
+        except subprocess.TimeoutExpired:
+            return f"aws-s3-cp: RequestTimeout — no answer within {timeout_s:.0f} s"
+        if proc.returncode == 0:
+            return None
         tail = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise EffectError(f"aws-s3-cp: exit={proc.returncode} stderr={tail!r}")
+        return f"aws-s3-cp: exit={proc.returncode} stderr={tail!r}"
+
+    s3_artifacts.retry_transient(
+        attempt,
+        what="launch-digest fetch",
+        deadline=deadline if deadline is not None else time.monotonic() + _FETCH_BUDGET_S,
+        attempt_timeout_s=_FETCH_TIMEOUT_S,
+    )
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _fetch_verify(
+    s3_uri: str, dest: Path, expected_sha256_hex: str, label: str, deadline: float
+) -> None:
+    """The pinned bytes at `dest`, from the per-pod sha-keyed cache or S3."""
+    s3_artifacts.fetch_verified(
+        s3_uri,
+        dest,
+        expected_sha256_hex,
+        label,
+        fetch=lambda uri, path: _s3_cp(uri, path, deadline=deadline),
+    )
 
 
-def _fetch_verify(s3_uri: str, dest: Path, expected_sha256_hex: str, label: str) -> None:
-    _s3_cp(s3_uri, dest)
-    got = _sha256_file(dest)
-    if got.lower() != expected_sha256_hex.lower():
+#: `MinerIdentity.snp_generation` value ⇒ (SNP vCPU model, CHIP_ID bytes).
+#: Milan and Genoa both report a 64-byte CHIP_ID, so the length alone cannot
+#: tell them apart: a Milan host must be registered with an explicit
+#: generation, or its guests are measured (and refused) as Genoa.
+SNP_GENERATION_VCPU: dict[str, tuple[str, int]] = {
+    "turin": ("EpycTurin", 8),
+    "genoa": ("EpycGenoa", 64),
+    "milan": ("EpycMilan", 64),
+}
+
+#: Legacy inference when no generation is registered (NULL): 8-byte chip_id
+#: ⇒ Turin, 64-byte ⇒ Genoa.
+_CHIP_ID_BYTES_TO_VCPU: dict[int, str] = {8: "EpycTurin", 64: "EpycGenoa"}
+
+
+def _vcpu_type_for_platform(
+    platform_id: str, snp_generation: str | None = None
+) -> str:
+    """Map a miner to the SNP vCPU model its guests are measured with.
+
+    `snp_generation` is the operator-registered `MinerIdentity.snp_generation`.
+    NULL / empty ⇒ infer from the CHIP_ID length (8-byte ⇒ `EpycTurin`,
+    64-byte ⇒ `EpycGenoa`). An explicit generation selects the model
+    (`milan` ⇒ `EpycMilan`) but must agree with the CHIP_ID length. An
+    inconsistent pair, an unknown generation, a non-hex id, an unknown
+    length or an auto-provision placeholder (`onchain:<node_id>` — no chip
+    registered yet) all fail closed (`EffectError`)."""
+    from apps.miners.models import is_autoprovision_placeholder
+
+    if is_autoprovision_placeholder(platform_id):
         raise EffectError(
-            f"{label}-sha-mismatch: fetched {got}, pinned {expected_sha256_hex.lower()}"
+            "platform-id-autoprovision-placeholder: the miner has no registered "
+            "CHIP_ID yet (POST /v1/admin/miner/register)"
         )
-
-
-def _vcpu_type_for_platform(platform_id: str) -> str:
-    """Map the miner CHIP_ID length to its SNP vCPU model. 8-byte chip_id
-    ⇒ Turin (EpycTurin); 64-byte ⇒ Genoa (EpycGenoa) — the fleet's two
-    generations. Anything else fails closed."""
     try:
         n = len(bytes.fromhex(platform_id))
     except ValueError as exc:
         raise EffectError("platform-id-not-hex") from exc
-    if n == 8:
-        return "EpycTurin"
-    if n == 64:
-        return "EpycGenoa"
-    raise EffectError(
-        f"platform-id-length-unknown: {n} bytes (want 8=Turin or 64=Genoa)"
-    )
+    if snp_generation:
+        known = SNP_GENERATION_VCPU.get(snp_generation)
+        if known is None:
+            raise EffectError(
+                f"snp-generation-unknown: {snp_generation!r} "
+                f"(want one of {sorted(SNP_GENERATION_VCPU)})"
+            )
+        vcpu_type, want_bytes = known
+        if n != want_bytes:
+            raise EffectError(
+                f"snp-generation-chip-id-mismatch: generation "
+                f"{snp_generation!r} has a {want_bytes}-byte CHIP_ID, the "
+                f"registered platform_id is {n} bytes"
+            )
+        return vcpu_type
+    vcpu_type = _CHIP_ID_BYTES_TO_VCPU.get(n)
+    if vcpu_type is None:
+        raise EffectError(
+            f"platform-id-length-unknown: {n} bytes (want 8=Turin or 64=Genoa)"
+        )
+    return vcpu_type
 
 
 def recompute_expected_digest(
@@ -132,15 +193,18 @@ def recompute_expected_digest(
     cmdline: str,
     cpu_count: int,
     platform_id: str,
+    snp_generation: str | None = None,
 ) -> str:
     """Return the 96-hex SNP launch digest a HONEST guest must produce for
-    THIS launch. Raises `LaunchDigestUnavailable` if the recompute is not
-    configured; `EffectError` on a fetch/SHA/computation failure."""
+    THIS launch. `snp_generation` is the host miner's registered generation
+    (NULL ⇒ inferred from the CHIP_ID length). Raises
+    `LaunchDigestUnavailable` if the recompute is not configured;
+    `EffectError` on a fetch/SHA/computation failure."""
     if not is_enabled():
         raise LaunchDigestUnavailable("launch-digest recompute not configured")
 
     prefix = s3_key_prefix.rstrip("/")
-    vcpu_type = _vcpu_type_for_platform(platform_id)
+    vcpu_type = _vcpu_type_for_platform(platform_id, snp_generation)
     guest_features = str(getattr(settings, "VALI_SNP_GUEST_FEATURES", "0x1"))
     ovmf_sha = str(settings.VALI_SNP_OVMF_SHA256)
     ovmf_uri = str(settings.VALI_SNP_OVMF_S3_URI)
@@ -157,18 +221,21 @@ def recompute_expected_digest(
         # Fetch + SHA-verify EXACTLY the bytes the guest boots. A miner
         # that swapped an artifact would fail its own SHA (bake-bound), so
         # the pinned SHAs are the trust anchor for the recompute inputs.
-        _fetch_verify(ovmf_uri, ovmf, ovmf_sha, "ovmf")
+        deadline = time.monotonic() + _FETCH_BUDGET_S
+        _fetch_verify(ovmf_uri, ovmf, ovmf_sha, "ovmf", deadline)
         _fetch_verify(
             f"s3://{s3_bucket}/{prefix}/tenant.vmlinuz",
             kernel,
             kernel_sha256_hex,
             "kernel",
+            deadline,
         )
         _fetch_verify(
             f"s3://{s3_bucket}/{prefix}/tenant.initrd.img",
             initrd,
             initrd_sha256_hex,
             "initrd",
+            deadline,
         )
         cmd.write_text(cmdline)
 

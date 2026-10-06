@@ -261,8 +261,8 @@ def check_epoch_close_advancing() -> CheckResult:
     `epoch > 0` and defer "is it advancing?" to a Prometheus rule on the
     `hippius_synthetic_current_epoch` gauge — **a rule that was never
     written**. So when a runtime upgrade dropped `pallet-compute-scoring`
-    on 2026-08-03 and left its storage prefix behind, the epoch froze at
-    2702 and this check reported OK every 15 minutes for a week.
+    on 2026-08-03 and left its storage prefix behind, the epoch froze
+    and this check reported OK every 15 minutes for a week.
 
     A frozen epoch is not cosmetic: it silently disarms the §23
     stale-epoch gate (`placement.py` / `service.py` compare
@@ -305,7 +305,7 @@ def check_uptime_liveness() -> CheckResult:
 
     ## The failure this exists to make visible
 
-    On 2026-08-13 `gateproof-a` ran continuously on miner-2 and stopped
+    On 2026-08-13 a VM ran continuously on one miner and stopped
     earning at 13:20. Everything reported success: the miner-agent logged
     `forward-VmLiveAttestation=ok`, vali logged
     `live-attestation replay ignored` at INFO, the VM stayed `active` and
@@ -341,17 +341,15 @@ def check_uptime_liveness() -> CheckResult:
 
     stall_s = max(1, int(getattr(settings, "VALI_UPTIME_LIVENESS_STALL_S", 1800)))
     now = int(timezone.now().timestamp())
-    armed = bool(
-        getattr(settings, "VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION", False)
-    )
+    armed = bool(getattr(settings, "VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION", False))
 
     # Billable + live: a launch binding exists (so the meter would credit
     # it) and the lifecycle row has not been torn down.
     billable = set(
         VmBillingBinding.objects.filter(
-            vm_id__in=Vm.objects.filter(
-                state__in=[VmState.ACTIVE, VmState.MIGRATING]
-            ).values_list("vm_id", flat=True)
+            vm_id__in=Vm.objects.filter(state__in=[VmState.ACTIVE, VmState.MIGRATING]).values_list(
+                "vm_id", flat=True
+            )
         ).values_list("vm_id", flat=True)
     )
     # Newest attestation per VM — VMs with none at all are absent here,
@@ -362,9 +360,7 @@ def check_uptime_liveness() -> CheckResult:
         .values("vm_id")
         .annotate(t=Max("verified_at_unix"))
     }
-    stalled = sorted(
-        (vm_id, now - t) for vm_id, t in newest.items() if now - t > stall_s
-    )
+    stalled = sorted((vm_id, now - t) for vm_id, t in newest.items() if now - t > stall_s)
     gauges = {
         "hippius_synthetic_uptime_attesting_vms": float(len(newest)),
         "hippius_synthetic_uptime_stalled_vms": float(len(stalled)),
@@ -614,12 +610,8 @@ def check_kbs_config_drift() -> CheckResult:
     observed, sources = _observe_running_posture()
     cmp = compare_posture(expected, observed)
     gauges["hippius_synthetic_kbs_config_drift"] = float(len(cmp.drifted))
-    gauges["hippius_synthetic_kbs_config_keys_compared"] = float(
-        len(cmp.drifted) + len(cmp.agreed)
-    )
-    gauges["hippius_synthetic_kbs_posture_endpoint"] = (
-        1.0 if sources.get("config") == "ok" else 0.0
-    )
+    gauges["hippius_synthetic_kbs_config_keys_compared"] = float(len(cmp.drifted) + len(cmp.agreed))
+    gauges["hippius_synthetic_kbs_posture_endpoint"] = 1.0 if sources.get("config") == "ok" else 0.0
     where = ", ".join(f"{k}={v}" for k, v in sorted(sources.items()))
 
     if cmp.verdict == POSTURE_DRIFT:
@@ -655,6 +647,113 @@ def check_kbs_config_drift() -> CheckResult:
 
 
 # Ordered light-tier check registry.
+def check_no_zombie_vms() -> CheckResult:
+    """No VM past its §24 crypto-erase is still talking.
+
+    A fresh guest frame for such a VM (`apps.lifecycle.zombie`) means a
+    miner is still running a VM it was told to kill — the guest keeps its
+    disk key in memory for as long as the domain lives. Fails while any
+    fresh observation exists; clears on its own once the frames stop or
+    the destroy is confirmed.
+    """
+    from apps.lifecycle import zombie
+
+    fresh = zombie.fresh_observations()
+    vms = sorted({row.vm_id for row in fresh})
+    miners = sorted({row.miner_id or "?" for row in fresh})
+    gauges = {
+        "hippius_synthetic_zombie_vms": float(len(vms)),
+        "hippius_synthetic_zombie_quarantined_miners": float(len(zombie.quarantined_node_ids())),
+    }
+    if not vms:
+        return CheckResult("zombie_vms", True, "no crypto-erased VM is still running", gauges)
+    return CheckResult(
+        "zombie_vms",
+        False,
+        f"{len(vms)} crypto-erased VM(s) still running: {', '.join(vms[:5])} "
+        f"on miner(s) {', '.join(miners[:5])}",
+        gauges,
+    )
+
+
+def check_guest_resources() -> CheckResult:
+    """No VM attested less than its flavor, or from a superseded launch,
+    within the flag window — and, once ENFORCE is armed, no live VM goes
+    unproven.
+
+    The guest's vCPU / RAM figures arrive inside a KBS-signed live
+    attestation (`apps.telemetry.guest_resources`) — the miner cannot
+    change them — so a short VM is a miner under-delivering (or a tenant
+    shrinking its own VM from inside, which the evidence row lets an
+    operator tell apart), and a superseded one a miner running a stale
+    launch. Fails while any VM is flagged; clears once nothing new is
+    found for `VALI_GUEST_RESOURCES_FLAG_S`.
+
+    `unproven` counts the live, billable VMs attesting right now whose
+    latest sample is not `ok` (launched before the attestation was switched
+    on, or on an image that cannot attest). It is the readiness gauge for
+    arming ENFORCE — under ENFORCE those VMs earn nothing, so it then fails
+    the check too. A VM attesting nothing at all is not counted: it earns
+    nothing under the uptime gate either way, and `uptime_liveness` owns it.
+    """
+    from django.db.models import OuterRef, Subquery
+
+    from apps.lifecycle.models import Vm, VmState
+    from apps.scheduler.models import VmBillingBinding
+    from apps.telemetry import guest_resources
+    from apps.telemetry.models import VmLiveAttestation
+
+    flagged = guest_resources.flagged()
+    stall_s = int(getattr(settings, "VALI_UPTIME_LIVENESS_STALL_S", 1800))
+    recent = int(timezone.now().timestamp()) - stall_s
+    latest = (
+        VmLiveAttestation.objects.filter(vm_id=OuterRef("vm_id"), verified_at_unix__gte=recent)
+        .order_by("-verified_at_unix")
+        .values("resource_verdict")[:1]
+    )
+    live = Vm.objects.filter(state__in=[VmState.ACTIVE, VmState.MIGRATING]).values_list(
+        "vm_id", flat=True
+    )
+    unproven = sorted(
+        VmBillingBinding.objects.filter(vm_id__in=live)
+        .annotate(verdict=Subquery(latest))
+        .exclude(verdict=None)
+        .exclude(verdict=guest_resources.VERDICT_OK)
+        .values_list("vm_id", flat=True)
+    )
+    enforce = guest_resources.enforce()
+    gauges = {
+        "hippius_synthetic_guest_resource_short_vms": float(len(flagged)),
+        "hippius_synthetic_guest_resources_unproven_vms": float(len(unproven)),
+        "hippius_synthetic_guest_resources_enforced": 1.0 if enforce else 0.0,
+    }
+    problems: list[str] = []
+    misconfigured = guest_resources.misconfigured()
+    if misconfigured:
+        problems.append(misconfigured)
+    if flagged:
+        shown = ", ".join(
+            f"{vm_id}@{v.node_id_hex[:12]}({v.flavor}:{v.reason})"
+            for vm_id, v in sorted(flagged.items())[:5]
+        )
+        problems.append(
+            f"{len(flagged)} VM(s) short of their flavor or on a stale launch: {shown}"
+        )
+    if enforce and unproven:
+        problems.append(
+            f"{len(unproven)} live VM(s) not proving their size, earning nothing under "
+            f"ENFORCE: {', '.join(unproven[:5])}"
+        )
+    if problems:
+        return CheckResult("guest_resources", False, "; ".join(problems), gauges)
+    return CheckResult(
+        "guest_resources",
+        True,
+        f"no VM attested less than its flavor ({len(unproven)} not yet proving it)",
+        gauges,
+    )
+
+
 def check_no_unapplied_migrations() -> CheckResult:
     """Every migration in the deployed image is applied to the database.
 
@@ -697,6 +796,48 @@ def check_no_unapplied_migrations() -> CheckResult:
     return CheckResult("migrations", True, "all migrations applied", gauges)
 
 
+def check_live_vms_placed() -> CheckResult:
+    """Every live VM holds an active placement on the host it runs on.
+
+    Admission counts only active placements, so a running VM without one
+    is RAM/CPU the scheduler will sell again. The orchestration tick
+    repairs any it finds within one cycle (`sweep_live_vm_placements`),
+    so this fails only when the repair itself is failing — or for a VM
+    with no placement ledger at all, which it cannot repair.
+    """
+    from apps.scheduler.service import live_vm_placement_drift, stale_pending_verdicts
+
+    drift = live_vm_placement_drift()
+    # Stale `Pending` rows the tick can resolve (`sweep_stale_pending_placements`)
+    # — one that survives here means that resolution is failing.
+    stale = stale_pending_verdicts()
+    gauges = {
+        "hippius_synthetic_unplaced_live_vms": float(len(drift)),
+        "hippius_synthetic_stale_pending_placements": float(len(stale)),
+    }
+    if not drift and not stale:
+        return CheckResult("live_vms_placed", True, "every live VM is placed on its host", gauges)
+    if not drift:
+        return CheckResult(
+            "live_vms_placed",
+            False,
+            f"{len(stale)} stale PENDING placement(s) unresolved: "
+            + ", ".join(f"{s.placement.vm.vm_id}({s.verdict}:{s.why})" for s in stale[:5]),
+            gauges,
+        )
+    shown = ", ".join(
+        f"{d.vm.vm_id}@{d.host_node_id[:12]}"
+        f"({'none' if not d.active_node_ids else ','.join(n[:12] for n in d.active_node_ids)})"
+        for d in drift[:5]
+    )
+    return CheckResult(
+        "live_vms_placed",
+        False,
+        f"{len(drift)} live VM(s) not placed on their host — admission under-counts them: {shown}",
+        gauges,
+    )
+
+
 LIGHT_CHECKS = (
     check_vali_api,
     check_kbs,
@@ -708,6 +849,9 @@ LIGHT_CHECKS = (
     check_no_unapplied_migrations,
     check_uptime_liveness,
     check_kbs_config_drift,
+    check_no_zombie_vms,
+    check_live_vms_placed,
+    check_guest_resources,
 )
 
 

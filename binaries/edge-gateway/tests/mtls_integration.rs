@@ -21,7 +21,7 @@
 //!    appears.
 //!
 //! 4. **CRL refresh propagates new revocations to the live config.**
-//!    The codex PR-H4 v1 review Blocker: the boot-time
+//!    The review PR-H4 v1 review Blocker: the boot-time
 //!    `WebPkiClientVerifier` baked the initial CRL set forever, so
 //!    a runtime-revoked cert would still complete handshakes. This
 //!    test mints a fresh CRL revoking a previously-valid cert,
@@ -207,7 +207,7 @@ async fn fail_closed_when_runtime_is_unhealthy_at_boot() {
 
 #[tokio::test]
 async fn crl_refresh_propagates_new_revocations_to_live_config() {
-    // Codex PR-H4 v1 Blocker fix: the boot-time `ServerConfig`
+    // Review PR-H4 v1 Blocker fix: the boot-time `ServerConfig`
     // baked the initial CRL snapshot into its `WebPkiClientVerifier`
     // forever, so a runtime-revoked cert would still complete
     // handshakes. The fix (live ArcSwap of `ServerConfig` rebuilt

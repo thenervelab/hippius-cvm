@@ -8,13 +8,20 @@
 # `<--vault-path-prefix>/<vm-id>/`:
 #
 #   <prefix>/<vm>/luks-kek    body = {"value": "<base64(vault:v1:… Transit ct)>"}
-#   <prefix>/<vm>/userdata    body = {"value": "<base64(userdata-bytes)>"}
+#   <prefix>/<vm>/userdata    body = {"value": "<base64(vault:v1:… Transit ct)>"}
 #
-# KEK-HSM (RA-08a/F1): the luks-kek value is now the KEK WRAPPED with its
-# per-VM Vault Transit key (ciphertext, never plaintext at rest). The attested
-# KBS `read_exact` → base64-decode → detects the `vault:` prefix →
-# `transit_decrypt` inside its CVM → HPKE-wraps the recovered KEK to the guest.
-# `--userdata-file` is still stored as raw bytes (base64), delivered verbatim.
+# KEK-HSM (RA-08a/F1): the luks-kek value is the KEK WRAPPED with its per-VM
+# Vault Transit key (ciphertext, never plaintext at rest). The attested KBS
+# `read_exact` → base64-decode → detects the `vault:` prefix →
+# `transit_decrypt` inside its CVM → HPKE-wraps the recovered secret to the
+# guest.
+#
+# The user-data goes through the SAME wrap, under the SAME per-VM key. It
+# used to be staged as raw bytes — and a tenant's cloud-init routinely
+# carries SSH keys, API tokens and the NetBird enrolment secret, so this
+# script was writing exactly the material the KEK wrapping exists to
+# protect in the clear, right next to the wrapped KEK. Wrapping it under
+# `kek-<vm>` also means §24's Transit destroy crypto-erases it.
 #
 # What this prints (stdout, JSON)
 # -------------------------------
@@ -150,7 +157,7 @@ Output (stdout, single-line JSON):
 
 Schema (matches binaries/kbs-server/src/vault_mvp.rs PR-V lock):
   <prefix>/<vm>/luks-kek   ← {"value": "<base64(vault:v1:… Transit ciphertext)>"}
-  <prefix>/<vm>/userdata   ← {"value": "<base64(userdata-bytes)>"}
+  <prefix>/<vm>/userdata   ← {"value": "<base64(vault:v1:… Transit ciphertext)>"}
 EOF
 }
 
@@ -180,13 +187,19 @@ reject_placeholder() {
 
 # Compute hippius_types::digest::userdata_digest in Python, matching
 # the framed-LE encoding in hippius-types/src/digest.rs::userdata_digest.
-# The plaintext file path is passed as the LAST argv so Python reads it
-# directly — heredoc-stdin is already taken by the Python source. Stdout:
-# 64-char lowercase hex (sha256).
+# The file path is passed as the LAST argv so Python reads it directly —
+# heredoc-stdin is already taken by the Python source. Stdout: 64-char
+# lowercase hex (sha256).
+#
+# The bytes digested are the PLAINTEXT, even though what is STAGED is the
+# ciphertext: the KBS unwraps before it recomputes, and the guest re-derives
+# the same digest a third time over the plaintext it receives
+# (hippius-guest/src/release.rs) and refuses the release on a mismatch.
+# Digesting the stored ciphertext would deny every launch.
 compute_userdata_digest_hex() {
-    local tenant="$1" vm="$2" ticket="$3" path="$4" version="$5" userdata_path="$6"
+    local tenant="$1" vm="$2" ticket="$3" path="$4" version="$5" plaintext_path="$6"
     python3 - \
-        "${tenant}" "${vm}" "${ticket}" "userdata" "${path}" "${version}" "${userdata_path}" \
+        "${tenant}" "${vm}" "${ticket}" "userdata" "${path}" "${version}" "${plaintext_path}" \
         <<'PY'
 import hashlib
 import sys
@@ -273,6 +286,15 @@ ud_size=$(wc -c < "${userdata_file}" | tr -d ' ')
 reject_placeholder "--luks-kek-file" "${luks_kek_file}"
 reject_placeholder "--userdata-file" "${userdata_file}"
 
+# `vault:` is the discriminator that says "this stored value is Transit
+# ciphertext". A cloud-config never starts with it, and staging one that
+# does produces a blob the KBS unwraps into something still prefixed
+# `vault:` — which it refuses as a double wrap, two systems away from the
+# typo. The launch API and `vali_create_vm` reject the same shape.
+if LC_ALL=C head -c 6 "${userdata_file}" | grep -q '^vault:'; then
+    die "--userdata-file starts with 'vault:', which is reserved for Transit ciphertext — pass cloud-init plaintext"
+fi
+
 if [[ -n "${vault_cacert}" && ! -r "${vault_cacert}" ]]; then
     die "--vault-cacert '${vault_cacert}' not readable"
 fi
@@ -291,10 +313,12 @@ fi
 
 luks_kv_path="${vault_path_prefix}/${vm_id}/luks-kek"
 ud_kv_path="${vault_path_prefix}/${vm_id}/userdata"
+ud_work_kv_path="${vault_path_prefix}/${vm_id}/userdata-pending"
 
 # `secret/<path>` is the KV-v2 mount-rooted address vault CLI expects.
 luks_full="secret/${luks_kv_path}"
 ud_full="secret/${ud_kv_path}"
+ud_work_full="secret/${ud_work_kv_path}"
 
 # Vault metadata read returns the current_version (or fails if the
 # path doesn't exist). We don't want stderr leaking 'no value found'
@@ -328,11 +352,13 @@ log "vm_id=${vm_id} tenant_id=${tenant_id} ticket_id=${ticket_id}"
 luks_b64=$(base64 -w0 < "${luks_kek_file}")
 ud_b64=$(base64 -w0 < "${userdata_file}")
 
-# Trace fingerprints (not the bytes themselves). sha256 of the user-
-# data is ALSO the input to the digest preimage, so leaking it here
-# is symmetric with the digest we print on stdout (no extra exposure).
+# Trace fingerprints, not the bytes. Deliberately NOT the sha256 of the
+# user-data PLAINTEXT: that is a fingerprint of the secret itself (it
+# confirms a guess), and now that the digest printed on stdout is taken
+# over the ciphertext, logging it would be a fresh exposure rather than a
+# restatement of something already emitted. Size only.
 log "luks-kek: 32 bytes (sha256=$(sha256sum "${luks_kek_file}" | cut -d' ' -f1))"
-log "userdata: ${ud_size} bytes (sha256=$(sha256sum "${userdata_file}" | cut -d' ' -f1))"
+log "userdata: ${ud_size} bytes"
 
 # KEK-HSM (RA-08a / F1): WRAP the KEK with its per-VM Vault Transit key so it is
 # CIPHERTEXT (`vault:v1:…`) at rest — never plaintext. Mirrors the baker
@@ -342,7 +368,8 @@ log "userdata: ${ud_size} bytes (sha256=$(sha256sum "${userdata_file}" | cut -d'
 # yields ciphertext, not a usable tenant KEK. The staging token needs
 # `transit/keys/kek-*` (create) + `transit/encrypt/kek-*` — NOT decrypt.
 log "wrapping luks-kek with Transit key kek-${vm_id}"
-vault write -f "transit/keys/kek-${vm_id}" >/dev/null 2>&1 || true   # ensure (idempotent)
+vault write -f "transit/keys/kek-${vm_id}" >/dev/null \
+    || die "could not create Transit key kek-${vm_id} (token needs transit/keys/kek-* create)"
 luks_ct=$(vault write -field=ciphertext "transit/encrypt/kek-${vm_id}" "plaintext=${luks_b64}") \
     || die "transit/encrypt of luks-kek failed (token needs transit/encrypt/kek-* + transit/keys/kek-* create)"
 unset luks_b64
@@ -359,12 +386,56 @@ luks_version=$(echo "${luks_put_out}" | jq -er '.data.version // empty') \
     || die "could not parse luks-kek version from vault put output"
 log "  → version=${luks_version}"
 
-log "staging ${ud_full}"
-ud_put_out=$(vault kv put "${ud_full}" "value=${ud_b64}")
+# Same wrap for the user-data, same per-VM key (so §24's Transit destroy
+# covers both). The KBS unwraps it on release exactly like the KEK.
+log "wrapping userdata with Transit key kek-${vm_id}"
+ud_ct=$(vault write -field=ciphertext "transit/encrypt/kek-${vm_id}" "plaintext=${ud_b64}") \
+    || die "transit/encrypt of userdata failed (token needs transit/encrypt/kek-* + transit/keys/kek-* create)"
 unset ud_b64
+[[ "${ud_ct}" == vault:* ]] || die "transit/encrypt did not return a vault: ciphertext"
+ud_store_b64=$(printf '%s' "${ud_ct}" | base64 -w0)
+unset ud_ct
+
+log "staging ${ud_full} (Transit ciphertext — never plaintext at rest)"
+ud_put_out=$(vault kv put "${ud_full}" "value=${ud_store_b64}")
+unset ud_store_b64
 ud_version=$(echo "${ud_put_out}" | jq -er '.data.version // empty') \
     || die "could not parse user-data version from vault put output"
 log "  → version=${ud_version}"
+
+# vali's WORKING COPY of the same bytes, wrapped under `ud-<vm>` — the
+# per-VM key vali may decrypt. Without it a hand-staged VM cannot be §25
+# migrated or KBS-state recovered: those re-mint under a fresh ticket_id,
+# the §6 digest binds it, and re-deriving the digest needs the cloud-init
+# plaintext — which the canonical copy above no longer yields (it is
+# wrapped under the KBS-only key). §24 destroys BOTH keys and deletes
+# both blobs, so this copy does not outlive the VM.
+#
+# STAMPED, inside the wrapped blob, with the canonical KV version it
+# corresponds to — the exact form `launch.stage_userdata_working_copy`
+# writes (`hippius-userdata-for-canonical-v<N>\n` + plaintext). The
+# reader (`launch.open_userdata_working_copy`) REFUSES an unstamped copy
+# and one stamped for another version, at §25 intake and at the re-mint:
+# the two KV writes are not atomic, so the stamp is what proves this copy
+# holds the bytes canonical version N holds. An unstamped copy here made
+# every hand-staged VM unmigratable and unrecoverable.
+log "wrapping userdata working copy with Transit key ud-${vm_id} (stamped for canonical v${ud_version})"
+ud_b64_for_work=$(
+    { printf 'hippius-userdata-for-canonical-v%s\n' "${ud_version}"; cat "${userdata_file}"; } \
+        | base64 -w0
+)
+vault write -f "transit/keys/ud-${vm_id}" >/dev/null \
+    || die "could not create Transit key ud-${vm_id} (token needs transit/keys/ud-* create)"
+ud_work_ct=$(vault write -field=ciphertext "transit/encrypt/ud-${vm_id}" "plaintext=${ud_b64_for_work}") \
+    || die "transit/encrypt of the userdata working copy failed (token needs transit/encrypt/ud-* + transit/keys/ud-* create)"
+unset ud_b64_for_work
+[[ "${ud_work_ct}" == vault:* ]] || die "transit/encrypt did not return a vault: ciphertext"
+ud_work_store_b64=$(printf '%s' "${ud_work_ct}" | base64 -w0)
+unset ud_work_ct
+log "staging ${ud_work_full} (vali working copy — Transit ciphertext)"
+vault kv put "${ud_work_full}" "value=${ud_work_store_b64}" >/dev/null \
+    || die "could not stage the userdata working copy"
+unset ud_work_store_b64
 
 # ── Compute digest + emit JSON ──────────────────────────────────────
 

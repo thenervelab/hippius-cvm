@@ -155,7 +155,7 @@ export AWS_SECRET_ACCESS_KEY=xxx
 
 # Pre-compute the launch digest ONCE on the miner with the cmdline
 # you intend to dispatch.
-ssh ubuntu@miner-1 "
+ssh <user>@<miner> "
   echo -n 'console=ttyS0,115200 console=tty0 earlyprintk=ttyS0 loglevel=7 \\
     ro root=/dev/mapper/cryptroot \\
     cryptopts=target=cryptroot,source=/dev/vda,luks,keyfile-size=32,keyscript=/sbin/hippius-luks-keyscript \\

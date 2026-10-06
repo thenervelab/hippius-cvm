@@ -13,7 +13,7 @@
 #     chroot apt repository) to `fetch-inputs.sh` alongside the
 #     kernel + stub + ovmf + netbird pins.
 #
-# Reproducibility discipline (codex+gemini convergent review pre-merge):
+# Reproducibility discipline (review convergent review pre-merge):
 #   - SOURCE_DATE_EPOCH derived from the path-scoped commit timestamp
 #     of `packer/tenant-uki-debian/` (NOT repo HEAD — same posture as
 #     `packer/tenant-uki/uki/Makefile`'s SDE pin: a KAT-only commit
@@ -104,8 +104,8 @@ OVMF_SHA256 := $(shell awk -F'= ' '/^OVMF_SHA256/{print $$2}' $(OVMF_LOCK))
 # count / VMM type across UKI flavours.
 #
 # SNP_VCPU_TYPE folds the host silicon's cpu_sig into the VMSA, so it is
-# PER-GENERATION: the default `EpycGenoa` measures a Genoa host (miner-1)
-# digest; for a Turin host (miner-2/miner-3, EPYC 9255) build with
+# PER-GENERATION: the default `EpycGenoa` measures a Genoa host
+# digest; for a Turin host (e.g. EPYC 9255) build with
 # `make SNP_VCPU_TYPE=EpycTurin`. The launch-time authority is the
 # miner-agent (host-CPUID-derived); this only pre-pins the matching §22
 # allowlist measurement (re-attest per generation).

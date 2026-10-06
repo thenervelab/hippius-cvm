@@ -112,8 +112,8 @@
     expected_san: "URI:hippius-miner:{{ inventory_hostname }}"
     # Strict match: anchored on BOTH sides — `URI:hippius-miner:<host>`
     # must be preceded by a SAN delimiter (start-of-string, whitespace,
-    # or comma) AND followed by one. Prevents `miner-1` from satisfying
-    # a `miner-12` host (right anchor) and a hypothetical future
+    # or comma) AND followed by one. Prevents `host-1` from satisfying
+    # a `host-12` host (right anchor) and a hypothetical future
     # openssl format that nested the URI mid-token (left anchor).
     san_regex: "(?:^|[\\s,])URI:hippius-miner:{{ inventory_hostname | regex_escape }}(?:[\\s,]|$)"
   ansible.builtin.assert:

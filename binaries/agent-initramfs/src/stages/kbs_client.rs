@@ -492,7 +492,7 @@ mod tests {
         assert!(keys.contains(&"snp_report"));
         assert!(keys.contains(&"kbs_nonce"));
         // `None` means the counter field is OMITTED — same wire as
-        // pre-Phase-2A guests, see Codex audit #2.
+        // pre-Phase-2A guests, see Review audit #2.
         assert!(!keys.contains(&"submitted_boot_counter"));
         assert_eq!(keys.len(), 3);
     }

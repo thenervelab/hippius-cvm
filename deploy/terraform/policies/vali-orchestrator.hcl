@@ -27,14 +27,31 @@ path "secret/data/hippius-compute/kbs/tenants/*" {
   capabilities = ["create", "update"]
 }
 
-# cloud-init userdata — read back by the §6 migration-ticket re-derivation.
+# cloud-init userdata, CANONICAL — the copy the minted ticket binds and
+# the attested KBS releases. Wrapped under `kek-<vm_id>`, which this
+# policy does NOT grant decrypt on, so a read returns ciphertext vali
+# cannot open. `read` stays for one legacy case: a VM staged before the
+# wrapping holds plaintext here and the §6 re-mint still hashes it.
 path "secret/data/hippius-compute/kbs/tenants/+/userdata" {
   capabilities = ["create", "update", "read"]
 }
 
-# userdata transport staging (§20) — read back by the async launch worker
-# to template NetBird keys + re-stage to the canonical `userdata`.
+# userdata WORKING COPY (§20) — vali's copy of the SUBSTITUTED bytes the
+# canonical path holds, wrapped under `ud-<vm_id>` (decrypt granted
+# below) and stamped with the canonical KV version it corresponds to.
+# Read by the §6 digest re-derivation on a §25 migration / KBS-state
+# recovery: that mint binds a fresh ticket_id, so it must hash the
+# plaintext again, and the canonical copy is not openable by vali.
 path "secret/data/hippius-compute/kbs/tenants/+/userdata-pending" {
+  capabilities = ["create", "update", "read"]
+}
+
+# userdata INTAKE copy — the TEMPLATE the caller POSTed, wrapped under the
+# same `ud-<vm_id>`. Read by the async launch worker and by
+# reboot-recovery, which each substitute a FRESH NetBird setup key into it
+# before staging. Without `read` here every async launch fails at
+# `secret-fetch` — the trailing-glob default above is create/update only.
+path "secret/data/hippius-compute/kbs/tenants/+/userdata-intake" {
   capabilities = ["create", "update", "read"]
 }
 
@@ -94,6 +111,51 @@ path "transit/keys/kek-*/config" {
   capabilities = ["update"]
 }
 path "transit/encrypt/kek-*" {
+  capabilities = ["update"]
+}
+
+# The userdata WORKING-COPY key. Separate from `kek-*` because the two
+# copies answer to different readers, and the separation is the whole
+# point: `kek-<vm_id>` wraps the disk KEK and the canonical userdata the
+# KBS releases, and vali is DENIED decrypt on it; `ud-<vm_id>` wraps only
+# vali's own working copy of the userdata, and vali MAY decrypt it —
+# because the NetBird substitution at launch and the §6 digest
+# re-derivation on a §25 migration / KBS-state recovery genuinely need the
+# cloud-init plaintext (the digest is over the plaintext and binds a fresh
+# ticket_id each time, so it cannot be precomputed once).
+#
+# What this grant does NOT do is give vali any path to a KEK or to the
+# canonical userdata: `transit/decrypt/kek-*` remains ungranted. What it
+# costs is stated plainly: an RCE holding vali's credentials can read a
+# tenant's cloud-init. Removing that would mean removing the ticket_id
+# from the digest preimage — which the GUEST also computes — i.e. a
+# fleet-wide image re-bake, tracked separately.
+#
+# `delete` + `…/config` update: §24 DESTROYS this key at decommission,
+# which is what makes the wrapped working copy cryptographically dead.
+path "transit/keys/ud-*" {
+  capabilities = ["create", "update", "delete"]
+}
+path "transit/keys/ud-*/config" {
+  capabilities = ["update"]
+}
+path "transit/encrypt/ud-*" {
+  capabilities = ["update"]
+}
+path "transit/decrypt/ud-*" {
+  capabilities = ["update"]
+}
+# The erase PROBE for `ud-*`, same route and same reason as `kek-*` below:
+# `transit/datakey/wrapped/<name>` is a stateless derive that answers 400
+# "encryption key not found" once the key is destroyed and 2xx while it is
+# alive, so it is the one call that can tell a dead key from a live one
+# without `read` on `transit/keys/*`. The full-tier synthetic monitor asserts
+# BOTH per-VM keys are dead after §24; without this grant its `ud-*` probe
+# 403s and the monitor fails closed on a decommission that actually erased
+# (first seen 2026-09-21, the run right after #1068 rolled). vali still
+# cannot unwrap what the route returns for `ud-*` any more than for
+# `kek-*` — the result is discarded inside `transit_key_gone`.
+path "transit/datakey/wrapped/ud-*" {
   capabilities = ["update"]
 }
 

@@ -49,7 +49,9 @@ pub use stages::hardening::{assert_hardened_cmdline, poweroff, suppress_kernel_c
 pub use stages::kbs_client::{
     resolve_kbs_url, HttpClient, HttpResponse, KbsNonce, ReqwestHttpClient,
 };
-pub use stages::kbs_vsock_client::{is_vsock_url, VsockHttpClient};
+pub use stages::kbs_vsock_client::{
+    guardian_relay_url, is_vsock_url, GuardianVsockClient, VsockHttpClient,
+};
 pub use stages::network::{bring_up_dhcp, teardown_for_switchroot};
 pub use stages::seed::{MockSeedWriter, RealSeedWriter, SeedWriter, NOCLOUD_SEED_DIR};
 pub use stages::snp_report::{

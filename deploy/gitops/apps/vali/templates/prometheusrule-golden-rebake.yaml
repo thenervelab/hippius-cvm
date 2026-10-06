@@ -1,0 +1,141 @@
+{{- if or (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") }}
+---
+# Golden re-bake / freshness alerts (F6, apps.images.rebake). Same routing
+# as hippius-synthetic-monitor: a `severity` label, no custom receiver ⇒
+# the Alertmanager default route (`slack-operators`).
+#
+# The age alert keys off the blessed bake's production TIMESTAMP, not the
+# pushed `hippius_golden_blessed_age_days` gauge: a gauge freezes at its
+# last push if the hourly report dies, a timestamp keeps ageing.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-golden-rebake
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-golden-rebake
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-golden-rebake
+      interval: 5m
+      rules:
+        {{- if eq (toString .Values.goldenRebake.freshness.enabled) "true" }}
+        - alert: GoldenImageStale
+          expr: time() - hippius_golden_blessed_bake_timestamp_seconds > {{ mul .Values.goldenRebake.freshness.maxAgeDays 86400 }}
+          for: 30m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "blessed golden {{`{{ $labels.distro }}`}} is older than {{ .Values.goldenRebake.freshness.maxAgeDays }} days"
+            description: |
+              The blessed golden bake for {{`{{ $labels.distro }}`}} was produced
+              more than {{ .Values.goldenRebake.freshness.maxAgeDays }} days ago, so new
+              VMs boot with a month or more of pending distro security updates.
+              Check the golden-rebake CronJob, then follow
+              docs/operator/golden-rebake-runbook.md to bless a fresh bake.
+        - alert: GoldenRebakeAwaitingBless
+          # A re-bake whose e2e failed never counts as awaiting a bless
+          # (`rebake_e2e_passed=False` is excluded at the source) — that is
+          # GoldenRebakeE2EFailed, not this.
+          expr: |
+            (hippius_golden_rebake_awaiting_bless == 1)
+              and on(distro)
+            (time() - hippius_golden_rebake_ready_timestamp_seconds > {{ mul .Values.goldenRebake.freshness.awaitingBlessDays 86400 }})
+          for: 30m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "golden re-bake for {{`{{ $labels.distro }}`}} awaits a bless"
+            description: |
+              A Succeeded re-bake newer than the blessed golden for
+              {{`{{ $labels.distro }}`}} has waited more than
+              {{ .Values.goldenRebake.freshness.awaitingBlessDays }} days. Run the real-boot checks
+              (docs/operator/golden-rebake-runbook.md), then
+              `vali_bless_golden_image` — or record why it is not blessed.
+        - alert: GoldenFreshnessReportStale
+          expr: time() - hippius_golden_freshness_report_timestamp > 21600
+          for: 10m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "golden freshness report has not run for 6h"
+            description: |
+              The hourly golden-freshness CronJob has not pushed for 6h, so
+              GoldenImageStale / GoldenRebakeAwaitingBless are blind.
+        {{- end }}
+        {{- if eq (toString .Values.goldenRebake.enabled) "true" }}
+        # The two failure alerts are bounded to the week after the run: the
+        # Pushgateway keeps a run's values until the next run replaces them
+        # (a month), and a failure nobody re-ran is GoldenImageStale's job
+        # after that. A manual re-run clears them at once.
+        - alert: GoldenRebakeFailed
+          expr: |
+            (hippius_golden_rebake_bake_success == 0)
+              and on(job)
+            (time() - hippius_golden_rebake_run_timestamp < 604800)
+          for: 10m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "golden re-bake FAILED for {{`{{ $labels.distro }}`}}"
+            description: |
+              The last scheduled re-bake for {{`{{ $labels.distro }}`}} did not
+              Succeed. Read the golden-rebake Job log and the TenantBake
+              failure_reason; re-run by hand (runbook) once fixed.
+        - alert: GoldenRebakeE2EFailed
+          expr: |
+            (hippius_golden_rebake_e2e_success == 0)
+              and on(job)
+            (time() - hippius_golden_rebake_run_timestamp < 604800)
+          for: 10m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "synthetic e2e FAILED on the new {{`{{ $labels.distro }}`}} re-bake"
+            description: |
+              The new, unblessed {{`{{ $labels.distro }}`}} bake did not pass the
+              launch→boot→decommission probe. Do NOT bless it; read the
+              golden-rebake Job log.
+        - alert: GoldenRebakeRunIncomplete
+          # Results are pushed after every image with run_completed=0 and a
+          # last push flips it to 1, so a 0 older than the Job's
+          # activeDeadline means the run was killed part-way (deadline,
+          # eviction, OOM): the images after the kill were never re-baked.
+          expr: |
+            (hippius_golden_rebake_run_completed == 0)
+              and on(job)
+            (time() - hippius_golden_rebake_run_timestamp > {{ add .Values.goldenRebake.activeDeadlineSeconds 3600 }})
+          for: 10m
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "golden re-bake run was killed before it finished"
+            description: |
+              The last golden-rebake run started more than its activeDeadline
+              ago and never reported completion. Read the Job's events/log,
+              then re-run it by hand (runbook) — the same stamp reuses the
+              bakes that already Succeeded.
+        - alert: GoldenRebakeRunStale
+          # Monthly schedule ⇒ >35 d since a run STARTED means the CronJob
+          # is not firing (suspended, broken schedule, image pull failure).
+          expr: time() - hippius_golden_rebake_run_timestamp > 3024000
+          for: 1h
+          labels:
+            severity: warning
+            component: golden-rebake
+          annotations:
+            summary: "golden re-bake has not run in 35 days"
+            description: |
+              No golden-rebake run has started for 35 days. Check the
+              CronJob (suspended? schedule? image pull?).
+        {{- end }}
+{{- end }}

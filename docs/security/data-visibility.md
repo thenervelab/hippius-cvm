@@ -34,7 +34,7 @@ code path; references are inlined.
 | Adversary | Capability assumed |
 |---|---|
 | **Miner operator** | Full root on the miner bare-metal host. Can run any process, read any host file, dump host RAM, snapshot the LUKS image file, intercept all host network traffic, suspend the QEMU process, attach a debugger to QEMU, replace QEMU itself. |
-| **Network-on-path attacker** | Reads every TCP packet between miner ↔ NetBird mesh ↔ cc-1 cluster ↔ Vault. Replays, drops, modifies in flight. |
+| **Network-on-path attacker** | Reads every TCP packet between miner ↔ NetBird mesh ↔ control-plane cluster ↔ Vault. Replays, drops, modifies in flight. |
 | **Compromised KBS pod (post-release)** | Has the static Vault token; can re-read any KV secret. Cannot retroactively decrypt past HPKE envelopes (forward secrecy by ephemeral X25519). |
 | **Compromised allowlist publisher** | Pushes a malformed `dev.cose` to S3. Caught by the SHA-256 fence in the chart (`allowlist.sha256` value in `deploy/gitops/apps/kbs/values.yaml`). |
 | **Cross-tenant attacker** | A second tenant on the same miner. Cannot read the first tenant's RAM (SEV-SNP separates ASIDs at the memory controller) nor disk (different LUKS KEKs in different Vault paths). |
@@ -64,7 +64,7 @@ code path; references are inlined.
                               │                  │                 │  NOT on host)
                               │                  │                 │
                               │           ┌──────┴──────┐    ┌─────┴──────┐
-                              │           │ ingress-nginx│    │  Miner-1   │
+                              │           │ ingress-nginx│    │  Miner-A   │
                               │           │  (TLS term.) │    │  host (HOSTILE) │
                               │           └─────────────┘    └────────────┘
                               │
@@ -98,7 +98,7 @@ N = the actor cannot see this in plaintext — the data is either encrypted or a
 
 Stages refer to the chronological flow in `docs/operator/byo-base-os-bake-runbook.md`.
 
-|                              | Operator | Vault | ingress-nginx | KBS pod | Miner-1 host (HOSTILE) | Tenant CVM |
+|                              | Operator | Vault | ingress-nginx | KBS pod | Miner-A host (HOSTILE) | Tenant CVM |
 |------------------------------|----------|-------|---------------|---------|------------------------|------------|
 | **STAGING (pre-launch)**     |          |       |               |         |                        |            |
 | LUKS KEK                     | Y        | Y     | N             | N       | N                      | N (not yet booted) |
@@ -121,7 +121,7 @@ Stages refer to the chronological flow in `docs/operator/byo-base-os-bake-runboo
 | QEMU process RAM             | N        | N     | N             | N       | **N** (SEV-SNP — dump returns ciphertext) | Y (own RAM) |
 | NetBird control plane peer record | Y (operator can list via the API token at `~/.config/hippius/netbird_pat`) | N | N | N | Y (peer ID + IP only, NOT the setup-key after use) | Y |
 
-The **Y in the Miner-1 column** for "LUKS volume bytes on host" is the key
+The **Y in the Miner-A column** for "LUKS volume bytes on host" is the key
 property: the operator has the encrypted bytes — the file is right
 there in their filesystem — but the bytes are ciphertext keyed to a
 KEK only the attested guest holds.

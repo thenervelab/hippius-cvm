@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`sign-manifest.py` — Ed25519 detached signature over a Stage 1
-`manifest.json` (audit follow-up: Gemini #2 / Codex #1).
+`manifest.json` (audit follow-up #2).
 
 Stage 1 (`tenant-rootfs-build.sh`) calls this in `sign` mode to emit
 `manifest.json.sig`. Stage 2 (`tenant-image-from-rootfs.sh`) calls it

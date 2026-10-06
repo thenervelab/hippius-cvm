@@ -123,3 +123,66 @@ def test_seed_defaults_rejects_positionals(make_golden_bake) -> None:
     make_golden_bake(bake_id="gb-1")
     with pytest.raises(CommandError):
         call_command("vali_bless_golden_image", "ubuntu", "gb-1", "--seed-defaults")
+
+
+# ── phase 7: the image's guest components release ───────────────────
+
+
+def _guest_build(release: int, **overrides):
+    from apps.orchestration.models import GuestComponentRelease, GuestInitrdBuild
+
+    rel, _ = GuestComponentRelease.objects.get_or_create(
+        version=release,
+        defaults={"commit": "c" * 40, "security_epoch": 1, "squashfs_sha256": "d" * 64},
+    )
+    fields = dict(
+        release=rel,
+        source_bake_id="gb-1",
+        family="initramfs-tools",
+        kernel_sha256="2" * 64,
+        rootfs_img_sha256="a1" * 32,
+        rootfs_verity_sha256="b2" * 32,
+        verity_root_hash="c3" * 32,
+        base_initrd_sha256="3" * 64,
+        release_cpio_sha256="e" * 64,
+        initrd_sha256=f"{release:02d}" * 32,
+        s3_bucket="hippius-compute-images",
+        s3_key_prefix=f"golden/gb-1-gr{release}/",
+        measurement={},
+    )
+    fields.update(overrides)
+    return GuestInitrdBuild.objects.create(**fields)
+
+
+def test_bless_guest_release_needs_a_build_of_the_images_bake(make_golden_bake) -> None:
+    make_golden_bake(bake_id="gb-1")
+    call_command("vali_bless_golden_image", "ubuntu", "gb-1")
+    with pytest.raises(CommandError, match="no usable build"):
+        call_command("vali_bless_guest_release", "ubuntu", "--release", "2", "--blessed-by", "ops")
+    _guest_build(2, kernel_sha256="9" * 64, initrd_sha256="29" * 32)  # another base
+    with pytest.raises(CommandError, match="no usable build"):
+        call_command("vali_bless_guest_release", "ubuntu", "--release", "2", "--blessed-by", "ops")
+    _guest_build(2, s3_key_prefix="golden/gb-1-gr2b/")
+    call_command("vali_bless_guest_release", "ubuntu", "--release", "2", "--blessed-by", "ops")
+    assert GoldenImage.objects.get(image_name="ubuntu").guest_release == 2
+    call_command("vali_bless_guest_release", "ubuntu", "--clear", "--blessed-by", "ops")
+    assert GoldenImage.objects.get(image_name="ubuntu").guest_release is None
+
+
+def test_reblessing_another_bake_clears_the_guest_release(make_golden_bake) -> None:
+    make_golden_bake(bake_id="gb-1")
+    make_golden_bake(bake_id="gb-2")
+    call_command("vali_bless_golden_image", "ubuntu", "gb-1")
+    _guest_build(2)
+    call_command("vali_bless_guest_release", "ubuntu", "--release", "2", "--blessed-by", "ops")
+    call_command("vali_bless_golden_image", "ubuntu", "gb-1")
+    assert GoldenImage.objects.get(image_name="ubuntu").guest_release == 2, "same bake"
+    call_command("vali_bless_golden_image", "ubuntu", "gb-2")
+    assert GoldenImage.objects.get(image_name="ubuntu").guest_release is None
+
+
+def test_release_zero_is_refused(make_golden_bake) -> None:
+    make_golden_bake(bake_id="gb-1")
+    call_command("vali_bless_golden_image", "ubuntu", "gb-1")
+    with pytest.raises(CommandError, match=">= 1"):
+        call_command("vali_bless_guest_release", "ubuntu", "--release", "0", "--blessed-by", "ops")

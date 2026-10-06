@@ -3,7 +3,7 @@
 #
 # Signs ONLY the `${ARTIFACT_PREFIX}-${IMAGE_VERSION}.uki` under
 # /build/output/ (ARTIFACT_PREFIX defaults to `kbs`; `make blackbox-uki`
-# passes `blackbox`). Codex review flagged that an earlier `*.uki` glob
+# passes `blackbox`). Review flagged that an earlier `*.uki` glob
 # signed stale artefacts from previous builds; the explicit
 # prefix+version eliminates that.
 #

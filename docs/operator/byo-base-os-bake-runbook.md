@@ -6,7 +6,7 @@ Stream 10, or Fedora 43** — suitable for launch in a SEV-SNP CVM
 under the existing miner-agent / ticket-validator chain.
 
 > **Multi-OS status (2026-06-12): all four families LIVE-VERIFIED on
-> miner-1.** Each bakes → SNP-attested boot → in-initramfs KBS release
+> a Genoa host.** Each bakes → SNP-attested boot → in-initramfs KBS release
 > → LUKS2+dm-integrity unlock → enforcing SELinux (RHEL) → encrypted
 > `/data` → reboot-persisting Phase 2B counter. The Debian family
 > (Ubuntu/Debian) unlocks via the `initramfs-tools` `keyscript=`; the
@@ -234,7 +234,7 @@ musl binaries + container tools, so the workstation CPU level is moot).
 `hippius-guest-release` + `hippius-vsock-ticket` must match the tenant cloud image's userland (glibc ABI, ld.so path). The `tenant-uki` Docker image pins Debian Trixie 6.12 + the same glibc the noble cloud image ships, so a cross-build inside that container produces bytes that the Ubuntu initramfs can `copy_exec` cleanly:
 
 ```bash
-cd ~/codex/hippius-compute
+cd <repo-root>
 make -C packer/tenant-uki/uki docker-build   # one-time
 docker run --rm --platform linux/amd64 \
     -e CARGO_TARGET_DIR=/build/target \
@@ -254,7 +254,7 @@ Output: `target-cross/x86_64-unknown-linux-gnu/release/hippius-{guest-release,vs
 `tenant-image-bake.sh` is the operator-facing tool. From the repo root:
 
 ```bash
-cd ~/codex/hippius-compute
+cd <repo-root>
 
 export VAULT_ADDR=https://<YOUR_VAULT_HOST>:8200
 export VAULT_TOKEN=$(cat ~/.vault-token)
@@ -380,7 +380,7 @@ stage.
 ### 4. Observe the boot
 
 ```bash
-ssh ubuntu@miner-1.internal 'sudo tail -f /tmp/serial.log'
+ssh <user>@<miner> 'sudo tail -f /tmp/serial.log'
 ```
 
 You should see (in order):

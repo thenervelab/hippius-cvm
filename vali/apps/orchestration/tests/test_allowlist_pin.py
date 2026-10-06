@@ -319,6 +319,7 @@ def test_reload_classifies_transport_failure_as_unavailable(
 # ── `_installed_epoch_floor` — track the live HWM, not the frozen manifest ──
 
 
+@pytest.mark.django_db()
 def test_installed_epoch_floor_none_when_no_pins() -> None:
     """With an empty ledger the floor is `None` so the pin falls back to
     the manifest's own `epoch` line + retry loop (first-ever pin)."""
@@ -331,6 +332,7 @@ def test_installed_epoch_floor_none_when_no_pins() -> None:
         assert allowlist_pin._installed_epoch_floor() is None
 
 
+@pytest.mark.django_db()
 def test_installed_epoch_floor_is_one_past_recorded_max() -> None:
     """The floor is one past the highest epoch vali has installed — so a
     manifest frozen many pins behind the HWM still lands the first
@@ -345,6 +347,7 @@ def test_installed_epoch_floor_is_one_past_recorded_max() -> None:
         assert allowlist_pin._installed_epoch_floor() == 2600000117
 
 
+@pytest.mark.django_db()
 def test_installed_epoch_floor_swallows_query_failure() -> None:
     """A DB error while reading the ledger must NOT fail the pin — the
     floor is an optimisation; `None` reverts to the manifest behaviour."""

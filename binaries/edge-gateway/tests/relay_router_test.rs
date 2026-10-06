@@ -532,3 +532,143 @@ async fn domain_state_without_a_target_addr_header_is_rejected() {
     assert_eq!(status, 400);
     assert!(mock.status_calls().is_empty());
 }
+
+// ─── backup status relay tests ─────────────────────────────────────
+
+#[tokio::test]
+async fn backup_status_get_proxies_the_miner_json_verbatim() {
+    let signer = test_signer();
+    let json = br#"{"vm_id":"tenant-x","bitmap_present":true,"boot_counter":4,"run":null}"#;
+    let mock = Arc::new(MockMinerForward::with_response(200, json.to_vec()));
+    let (status, body) = get_relay(
+        Arc::clone(&signer),
+        Arc::clone(&mock) as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/backup",
+        MINER_ADDR,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, json.to_vec());
+    let scalls = mock.status_calls();
+    assert_eq!(scalls.len(), 1);
+    assert_eq!(scalls[0].target_addr.to_string(), MINER_ADDR);
+    assert_eq!(scalls[0].vm_id, "tenant-x");
+}
+
+#[tokio::test]
+async fn backup_status_404_from_the_miner_is_relayed() {
+    let signer = test_signer();
+    let mock = Arc::new(MockMinerForward::with_response(404, b"no-domain".to_vec()));
+    let (status, _body) = get_relay(
+        signer,
+        mock as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/backup",
+        MINER_ADDR,
+    )
+    .await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn backup_status_without_a_target_addr_header_is_rejected() {
+    let signer = test_signer();
+    let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+    let (status, _body) = get_relay(
+        signer,
+        Arc::clone(&mock) as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/backup",
+        "",
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(mock.status_calls().is_empty());
+}
+
+#[tokio::test]
+async fn backup_status_rejects_a_bad_vm_id_before_dialing() {
+    let signer = test_signer();
+    let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+    let (status, _body) = get_relay(
+        signer,
+        Arc::clone(&mock) as Arc<dyn MinerForward>,
+        "/v1/relay/Tenant_X/backup",
+        MINER_ADDR,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(mock.status_calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_relay_body_past_its_own_cap_is_shed_before_signing() {
+    // The inner router's cap is sized for multipart orders (2 MiB); the
+    // relay routes keep their own `MAX_RELAY_BODY`.
+    use hippius_edge_gateway::listeners::relay_router::MAX_RELAY_BODY;
+    let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+    let pad = "x".repeat(MAX_RELAY_BODY);
+    let json = format!(r#"{{"node_id":"miner-a","miner_addr":"{MINER_ADDR}","pad":"{pad}"}}"#);
+    let (status, _) = post_relay(
+        test_signer(),
+        Arc::clone(&mock) as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/quiesce",
+        &json,
+    )
+    .await;
+    assert_eq!(status, 413);
+    assert!(mock.calls().is_empty());
+}
+
+// ─── restore status relay tests ────────────────────────────────────
+
+#[tokio::test]
+async fn restore_status_get_proxies_the_miner_json_verbatim() {
+    let signer = test_signer();
+    let json = br#"{"vm_id":"tenant-x","restore_id":"0123456789abcdef0123456789abcdef","op":"stage","state":"staging","bytes_done":1,"bytes_total":2,"reason":null,"swapped":false,"pre_restore_present":false,"domain_live":true}"#;
+    let mock = Arc::new(MockMinerForward::with_response(200, json.to_vec()));
+    let (status, body) = get_relay(
+        Arc::clone(&signer),
+        Arc::clone(&mock) as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/restore",
+        MINER_ADDR,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, json.to_vec());
+    let scalls = mock.status_calls();
+    assert_eq!(scalls.len(), 1);
+    assert_eq!(scalls[0].target_addr.to_string(), MINER_ADDR);
+    assert_eq!(scalls[0].vm_id, "tenant-x");
+}
+
+#[tokio::test]
+async fn restore_status_404_from_the_miner_is_relayed() {
+    let signer = test_signer();
+    let mock = Arc::new(MockMinerForward::with_response(404, b"no-restore".to_vec()));
+    let (status, _body) = get_relay(
+        signer,
+        mock as Arc<dyn MinerForward>,
+        "/v1/relay/tenant-x/restore",
+        MINER_ADDR,
+    )
+    .await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn restore_status_rejects_a_bad_vm_id_or_target_before_dialing() {
+    for (path, addr) in [
+        ("/v1/relay/Tenant_X/restore", MINER_ADDR),
+        ("/v1/relay/tenant-x/restore", ""),
+    ] {
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let (status, _body) = get_relay(
+            test_signer(),
+            Arc::clone(&mock) as Arc<dyn MinerForward>,
+            path,
+            addr,
+        )
+        .await;
+        assert_eq!(status, 400, "{path} {addr:?}");
+        assert!(mock.status_calls().is_empty());
+    }
+}

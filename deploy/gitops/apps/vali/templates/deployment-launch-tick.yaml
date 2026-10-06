@@ -137,6 +137,9 @@ spec:
             {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 12 }}
             - name: tmp
               mountPath: /tmp
+            # sha-keyed cache of the C2 recompute inputs (s3_artifacts).
+            - name: artifact-cache
+              mountPath: /var/cache/vali-artifacts
             - name: shm
               mountPath: /dev/shm
             - name: vault-ca
@@ -156,6 +159,11 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        # Holds VALI_ARTIFACT_CACHE_MAX_BYTES (300 MiB) plus a download
+        # in flight; /tmp (100 Mi) is far too small for it.
+        - name: artifact-cache
+          emptyDir:
+            sizeLimit: 512Mi
         # tmpfs for the §20 0600 seed files the L1 mint + §22 auto-pin
         # materialize from Vault (never on a persistent volume).
         - name: shm

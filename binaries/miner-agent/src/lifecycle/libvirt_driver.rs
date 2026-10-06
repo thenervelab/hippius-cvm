@@ -211,9 +211,13 @@ impl VirshDriver {
     }
 
     /// A `virsh` command pre-pointed at the system QEMU connection.
+    ///
+    /// `kill_on_drop`: a caller that times out or is cancelled drops the
+    /// future — without this the `virsh` child keeps running, so a hung
+    /// libvirtd would accumulate one stuck process per retry.
     fn virsh(&self) -> Command {
         let mut cmd = Command::new(&self.virsh_path);
-        cmd.arg("--connect").arg(LIBVIRT_URI);
+        cmd.arg("--connect").arg(LIBVIRT_URI).kill_on_drop(true);
         cmd
     }
 }
@@ -258,6 +262,7 @@ impl LibvirtDriver for VirshDriver {
         // ("create")`.
         let mut cmd = self.virsh();
         cmd.arg("start").arg(id.as_str());
+        crate::host_health::record_domain_start();
         let output = cmd
             .output()
             .await
@@ -294,7 +299,19 @@ impl LibvirtDriver for VirshDriver {
         // closed-vocabulary prefix that means "no such domain", never
         // surface the bytes to a log or error variant.
         let mut cmd = self.virsh();
-        cmd.arg("undefine").arg(id.as_str());
+        // The flags drop every piece of per-domain libvirt state along
+        // with the record, so nothing is left for a later `define` of the
+        // same vm_id to trip over. Each is a no-op on a domain that has no
+        // such state — a tenant domain boots a stateless `type='rom'`
+        // OVMF with no NVRAM, no snapshots and no checkpoints — which was
+        // verified against libvirt 11.6 on a miner (a ROM-loader domain
+        // undefines cleanly with all four).
+        cmd.arg("undefine")
+            .arg(id.as_str())
+            .arg("--managed-save")
+            .arg("--snapshots-metadata")
+            .arg("--checkpoints-metadata")
+            .arg("--nvram");
         let output = cmd
             .output()
             .await
@@ -380,6 +397,10 @@ pub struct MockLibvirtDriver {
     /// CID-collision error before one succeeds — exercises the
     /// `run_domain` burn-and-retry path (AUDIT-3). 0 = happy path.
     cid_conflicts_remaining: AtomicUsize,
+    /// States the next `query_domain_state` calls answer, in order, before
+    /// falling back to the real map — lets a test change a domain's state
+    /// between two reads (a start racing a check).
+    scripted_states: Mutex<std::collections::VecDeque<DomainState>>,
 }
 
 impl MockLibvirtDriver {
@@ -393,6 +414,7 @@ impl MockLibvirtDriver {
             destroy_calls: AtomicUsize::new(0),
             undefine_calls: AtomicUsize::new(0),
             cid_conflicts_remaining: AtomicUsize::new(0),
+            scripted_states: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -407,6 +429,14 @@ impl MockLibvirtDriver {
             destroy_calls: AtomicUsize::new(0),
             undefine_calls: AtomicUsize::new(0),
             cid_conflicts_remaining: AtomicUsize::new(0),
+            scripted_states: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Answer the next `query_domain_state` calls with `states`, in order.
+    pub fn script_states(&self, states: Vec<DomainState>) {
+        if let Ok(mut q) = self.scripted_states.lock() {
+            q.extend(states);
         }
     }
 
@@ -564,6 +594,14 @@ impl LibvirtDriver for MockLibvirtDriver {
     }
 
     async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+        if let Some(state) = self
+            .scripted_states
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .pop_front()
+        {
+            return Ok(state);
+        }
         self.domains
             .lock()
             .map_err(|_| MinerAgentError::LockPoisoned)?

@@ -14,6 +14,10 @@ ciborium = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
+# `guardian::combine_kek` (customer-held disk keys). Pure-Rust, no_std
+# with default features off, so the wasm32 runtime build is unaffected.
+hkdf = { version = "0.12", default-features = false }
+zeroize = { version = "1.8", default-features = false }
 subtle = { version = "2.6", default-features = false }
 # `thiserror` 2.x ships a no_std implementation by default; the `std`
 # feature only adds `std::error::Error` impl on the generated error
@@ -28,6 +32,10 @@ thiserror = { version = "2", default-features = false }
 # signer lives in the test only. `from_bytes` ⇒ no `rand_core`.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 hex = "0.4"
+# `tests/rollback_wire_fixture.rs` reads the shared C-4 JSON fixture
+# vali also loads.
+serde_json = "1"
+base64 = "0.22"
 
 [features]
 default = ["std"]
@@ -40,6 +48,8 @@ std = [
     "serde/std",
     "serde_bytes/std",
     "sha2/std",
+    "hkdf/std",
+    "zeroize/std",
     "subtle/std",
     "thiserror/std",
 ]

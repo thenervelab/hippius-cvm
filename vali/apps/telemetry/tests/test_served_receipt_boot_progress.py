@@ -279,3 +279,22 @@ def test_netbird_failure_does_not_break_ingest(
     vm = Vm.objects.get(vm_id="vm-nbfail")
     assert vm.boot_phase == VmBootPhase.RUNNING.value
     assert vm.netbird_ip == ""
+
+
+def test_netbird_resolve_never_overwrites_an_address_written_meanwhile(
+    ingest_client: APIClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tick's refresh may write a newer address while the resolve call
+    is out: the self-heal only fills an empty field."""
+    make_source(source="tenant_vm", source_id="vm-race")
+    _make_vm("vm-race")
+
+    def _resolve(vm_id: str) -> str:
+        Vm.objects.filter(vm_id=vm_id).update(netbird_ip="100.64.0.99")
+        return "100.64.0.20"
+
+    monkeypatch.setattr(effects, "resolve_netbird_peer_ip", _resolve)
+
+    _ingest_served_receipt(ingest_client, "vm-race", body=b"r1")
+
+    assert Vm.objects.get(vm_id="vm-race").netbird_ip == "100.64.0.99"

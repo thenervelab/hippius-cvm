@@ -26,8 +26,8 @@
 #   tenant-<vm_id>-<base12>.initrd.img      copy from manifest
 #   tenant-<vm_id>-<base12>.measurement.json   SHAs + LUKS header digest
 #
-# The `<vm_id>` infix is required (audit follow-up Gemini #5 /
-# Codex #3) so two operators baking different tenants in parallel
+# The `<vm_id>` infix is required (audit follow-up Review #5 /
+# Review #3) so two operators baking different tenants in parallel
 # can't overwrite each other's outputs.
 
 set -Eeuo pipefail
@@ -63,7 +63,7 @@ flavor=""
 kek_source="stdin"
 kek_file=""
 vm_id=""
-# Audit follow-up (Gemini #2 / Codex #1): pin the manifest's
+# Audit follow-up (Review #2 / Review #1): pin the manifest's
 # detached Ed25519 signature against an operator-supplied verifying
 # key BEFORE trusting any SHA in the manifest. Either flag is
 # accepted; supplying both is rejected. Production posture: required.
@@ -72,7 +72,7 @@ verify_pubkey_hex=""
 verify_pubkey_file=""
 # Unique mapper-device name suffix. Two operators running Stage 2 in
 # parallel on the same host collide on a hardcoded /dev/mapper/<name>
-# (Gemini audit finding #5), so the mapper name embeds a per-bake
+# (Review audit finding #5), so the mapper name embeds a per-bake
 # random suffix. `$$` is the PID, $(date +%s%N) is nanosecond epoch —
 # combined collision risk is astronomical.
 mapper_name="hippius-bake-$$-$(date +%s%N 2>/dev/null || echo $$)"
@@ -93,7 +93,7 @@ Required:
   --vm-id ID              Per-tenant identifier embedded into every
                           output filename so parallel bakes on the
                           same workstation do not overwrite each
-                          other (Gemini / Codex audit finding #5).
+                          other (audit finding #5).
                           Restricted to [a-z0-9_-]{1,64} to keep the
                           filename safe.
   --rootfs-dir DIR        Stage 1 output directory containing:
@@ -129,7 +129,7 @@ Optional:
                           \`manifest.json.sig\` from --rootfs-dir
                           and verifies the detached signature BEFORE
                           trusting any SHA from the manifest. Audit
-                          follow-up (Gemini #2 / Codex #1).
+                          follow-up (audit #2).
   --verify-pubkey-file P  Same as --verify-pubkey-hex but the hex is
                           read from a file (matches the
                           \`.pub\` shape next to the signing seed).
@@ -214,7 +214,7 @@ if (( ${#missing[@]} > 0 )); then
     exit 2
 fi
 
-# ── 1. Verify manifest signature (audit follow-up Gemini #2 / Codex #1) ─
+# ── 1. Verify manifest signature (audit follow-up Review #2 / Review #1) ─
 #
 # The manifest's SHAs only protect against silent S3 corruption — an
 # attacker who can write the bucket can swap the tarball AND the
@@ -252,7 +252,7 @@ if [[ -n "${verify_pubkey_hex}" || -n "${verify_pubkey_file}" ]]; then
     fi
     log "manifest signature verified"
 else
-    log "WARN: no --verify-pubkey-{hex,file} supplied — dev posture, manifest signature NOT verified (see audit Gemini #2 / Codex #1)"
+    log "WARN: no --verify-pubkey-{hex,file} supplied — dev posture, manifest signature NOT verified (see audit #2)"
 fi
 
 # ── 2. Verify manifest SHAs ─────────────────────────────────────────
@@ -292,7 +292,7 @@ WORK_DIR="$(mktemp -d -t hippius-bake-s2.XXXXXX)"
 # crash/oom-kill doesn't strand 32 bytes of LUKS-unlock material on
 # the operator workstation's persistent storage. The legacy script's
 # `mktemp -p /dev/shm ... || mktemp -t ...` silently fell back to /tmp
-# when /dev/shm was unmounted or noexec (Codex audit finding #6) —
+# when /dev/shm was unmounted or noexec (Review audit finding #6) —
 # fail-closed here is the right posture: no /dev/shm, no bake.
 if [[ ! -d /dev/shm ]]; then
     die "/dev/shm is unavailable; refusing to stage the KEK on persistent storage (exit 1)"
@@ -365,7 +365,7 @@ log "extracting rootfs.tar.zst into cryptroot"
 # `${rootfs_tar}` + `${MNT_ROOT}` into a SHELL STRING the privileged
 # bash interpreted — a path containing a single quote (or `$()`,
 # `;`, etc.) became privilege-escalated command injection on the
-# operator workstation (Codex audit finding #4). The new form passes
+# operator workstation (Review audit finding #4). The new form passes
 # the paths as ARGV entries to two separately-sudo'd binaries, so
 # the shell never sees them as code. `pipefail` is set at the script
 # top so a zstd error propagates and `||die` catches it.
@@ -382,7 +382,7 @@ MAPPER_OPEN=""
 # `qemu-img convert` WITHOUT `-c`: the LUKS ciphertext is high-entropy
 # so compression saves nothing while slowing the bake substantially,
 # and the on-disk size of compressed clusters is an oracle for the
-# plaintext's compressibility (Gemini audit finding #10). The legacy
+# plaintext's compressibility (Review audit finding #10). The legacy
 # bake had `-c`; this fix-up drops it.
 log "qemu-img convert raw → qcow2"
 qemu-img convert -O qcow2 "${out_raw}" "${out_qcow2}" \
