@@ -251,7 +251,9 @@ def test_malformed_node_id_fails() -> None:
 
 def test_node_id_and_miner_id_are_mutually_exclusive() -> None:
     with pytest.raises(CommandError):
-        _run("--node-id", node_id(4), "--miner-id", "miner-04", "--cpus", "1", "--memory-mb", "2048")
+        _run(
+            "--node-id", node_id(4), "--miner-id", "miner-04", "--cpus", "1", "--memory-mb", "2048"
+        )
 
 
 # ─── committed load ─────────────────────────────────────────────────

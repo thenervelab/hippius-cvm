@@ -101,7 +101,7 @@ class OperatorLocationSerializer(serializers.Serializer):
         ),
     )
     asn = serializers.IntegerField(allow_null=True, help_text="Announcing AS number of that IP.")
-    as_holder = serializers.CharField(allow_blank=True, help_text="AS holder name (e.g. `EXAMPLE-AS`).")
+    as_holder = serializers.CharField(allow_blank=True, help_text="AS holder name.")
     rtt_ms = serializers.FloatField(
         allow_null=True,
         help_text="Min TCP-connect round-trip vali→miner (ms) — the physical distance bound.",

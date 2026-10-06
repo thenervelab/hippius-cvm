@@ -737,7 +737,9 @@ def test_a_peer_record_gone_clears_an_active_vms_address_and_reads_lost(_fresh_c
     gone = make_vm("vm-gone")
     Vm.objects.filter(pk=gone.pk).update(netbird_ip="100.64.101.1")
     dead = make_vm("vm-dead")
-    Vm.objects.filter(pk=dead.pk).update(state=VmState.DESTROYED, host="", netbird_ip="100.64.102.2")
+    Vm.objects.filter(pk=dead.pk).update(
+        state=VmState.DESTROYED, host="", netbird_ip="100.64.102.2"
+    )
     peers = [_peer("p-x", "someone-else", "100.64.102.9")]
 
     # The first miss only records it: one listing may just be incomplete.
