@@ -23,6 +23,7 @@ tenant KEK.
 from __future__ import annotations
 
 import logging
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -49,6 +50,30 @@ _ROTATION_PERIOD_S = 6 * 3600
 # inline key left the peer un-joined → the netbird stage could never go
 # green even on a healthy system). `{{NETBIRD_SETUP_KEY}}` /
 # `{{NETBIRD_HOSTNAME}}` are substituted in-memory by the launch service.
+# Ordering-cycle canary. A systemd ordering cycle in a golden guest is
+# broken by deleting one job per boot, and WHICH job is graph-dependent:
+# hippius-eol-sign.service once closed a cycle that systemd broke by
+# deleting cloud-init-network.service on Fedora (#1322), while the blessed
+# image of the same distro happened to sacrifice a harmless target and
+# looked healthy. The monitor has no shell in its guest, but it already
+# fails when no NetBird IP appears — so the probe withholds the enrol when
+# the boot journal shows ANY ordering cycle. Both the fatal variant (the
+# enrol never runs) and the latent one (it runs, but a cycle exists) then
+# surface as a failed `netbird` stage instead of a silent green. Only
+# systemd's own messages (`_PID=1`) are read: a plain `journalctl -b` also
+# holds command lines that contain the phrase (this very guard, if the
+# runcmd is ever logged, or an operator's sudo), which would make the
+# probe trip on itself.
+_ORDERING_CYCLE_GUARD = (
+    "if journalctl -b _PID=1 2>/dev/null | grep -qi 'ordering cycle'; then "
+    "echo 'hippius-synthetic: systemd ordering cycle in this boot; "
+    "NetBird enrol withheld so the monitor alerts' > /dev/console; "
+    "else netbird up "
+    "--setup-key-file=/var/lib/cloud/seed/nocloud/netbird-setup-key "
+    "--management-url=https://vpn.hippius.network "
+    "--hostname={{NETBIRD_HOSTNAME}} --no-browser; fi"
+)
+
 _DEFAULT_USERDATA = (
     "#cloud-config\n"
     "# Synthetic-monitor throwaway VM — decommissioned within the run.\n"
@@ -61,12 +86,12 @@ _DEFAULT_USERDATA = (
     "    content: |\n"
     "      {{NETBIRD_SETUP_KEY}}\n"
     "runcmd:\n"
-    "  - [ netbird, up,\n"
-    "      --setup-key-file=/var/lib/cloud/seed/nocloud/netbird-setup-key,\n"
-    "      --management-url=https://vpn.hippius.network,\n"
-    "      --hostname={{NETBIRD_HOSTNAME}},\n"
-    "      --no-browser ]\n"
-    "  - [ shred, -u, /var/lib/cloud/seed/nocloud/netbird-setup-key ]\n"
+    "  - [ sh, -c, \"" + _ORDERING_CYCLE_GUARD + "\" ]\n"
+    # The template's last step: purge the key and cloud-init's copies.
+    "  - [ systemd-run, --no-block, -pAfter=cloud-final.service, sh, -c, "
+    "\"cd /var/lib/cloud/instances && rm -f */user-data.txt* */cloud-config.txt "
+    "*/obj.pkl ../seed/nocloud/netbird-setup-key /run/cloud-init/seed/user-data "
+    "/run/cloud-init/combined-cloud-config.json\" ]\n"
 )
 
 # Injection seams (tests monkeypatch these).
@@ -201,11 +226,15 @@ def _golden_bake_id(distro: str) -> str:
     return str(golden.bake_id)
 
 
-def build_launch_body(distro: str, vm_id: str) -> dict:
+def build_launch_body(distro: str, vm_id: str, bake_id: str | None = None) -> dict:
     """Assemble the `POST /v1/vm/launch` body for a throwaway golden VM.
     The golden `bake_id` resolves the artifact SHAs + verity trio, and
     the launch service provisions the per-VM overlay KEK server-side, so
-    the body stays small."""
+    the body stays small.
+
+    `bake_id` overrides the blessed catalog lookup — ONLY for the scheduled
+    re-bake (F6), which proves a new, not-yet-blessed bake boots before a
+    human blesses it. The periodic monitor never passes it."""
     tenant = settings.VALI_SYNTHETIC_TENANT_ID
     userdata = settings.VALI_SYNTHETIC_USERDATA or _DEFAULT_USERDATA
     return {
@@ -215,7 +244,7 @@ def build_launch_body(distro: str, vm_id: str) -> dict:
         "lease_id": f"synmon-{vm_id}",
         "flavor": settings.VALI_SYNTHETIC_FLAVOR,
         "cmdline": settings.VALI_SYNTHETIC_CMDLINE,
-        "bake_id": _golden_bake_id(distro),
+        "bake_id": bake_id or _golden_bake_id(distro),
         "disk_mode": "golden_verity_overlay",
         # Empty platform_id ⇒ the scheduler picks any dispatchable miner.
         "platform_id": "",
@@ -228,9 +257,13 @@ def build_launch_body(distro: str, vm_id: str) -> dict:
 # ── The state machine ────────────────────────────────────────────────
 
 
-def run_e2e(*, api: ApiClient, distro: str, budget_s: float) -> E2EOutcome:
+def run_e2e(
+    *, api: ApiClient, distro: str, budget_s: float, bake_id: str | None = None
+) -> E2EOutcome:
     """Drive the full launch→boot→decommission→erase probe for `distro`,
-    hard-capped at `budget_s`. ALWAYS tears the VM down before returning."""
+    hard-capped at `budget_s`. ALWAYS tears the VM down before returning.
+    `bake_id` targets a specific (possibly unblessed) bake — see
+    `build_launch_body`."""
     vm_id = _synthetic_vm_id(distro)
     outcome = E2EOutcome(distro=distro, vm_id=vm_id, success=False)
     deadline = _now() + budget_s
@@ -239,7 +272,7 @@ def run_e2e(*, api: ApiClient, distro: str, budget_s: float) -> E2EOutcome:
         # 1) LAUNCH via the real API. Once the POST is attempted, teardown
         #    is MANDATORY — the request may have created a Vm even if the
         #    response then errored, so we must always try to clean it up.
-        job = _stage(outcome, "launch", lambda: _do_launch(api, distro, vm_id))
+        job = _stage(outcome, "launch", lambda: _do_launch(api, distro, vm_id, bake_id))
         launched = True
         if job is None:
             return _finish(outcome)
@@ -353,8 +386,8 @@ def _synthetic_vm_id(distro: str) -> str:
 # ── Stage implementations ────────────────────────────────────────────
 
 
-def _do_launch(api: ApiClient, distro: str, vm_id: str) -> dict:
-    body = build_launch_body(distro, vm_id)
+def _do_launch(api: ApiClient, distro: str, vm_id: str, bake_id: str | None = None) -> dict:
+    body = build_launch_body(distro, vm_id, bake_id)
     job = api.launch(body)
     if not job.get("job_id"):
         raise ApiError(f"launch returned no job_id: {job}")
@@ -408,7 +441,11 @@ def _await_netbird(vm_id: str, deadline: float) -> bool:
         if vm and vm.netbird_ip:
             return True
         _sleep(interval)
-    raise ApiError("no NetBird IP assigned within timeout")
+    raise ApiError(
+        "no NetBird IP assigned within timeout (the probe withholds the enrol "
+        "when the guest's boot journal shows a systemd ordering cycle — check "
+        "the serial console for 'hippius-synthetic: systemd ordering cycle')"
+    )
 
 
 def _do_decommission(api: ApiClient, vm_id: str, deadline: float) -> bool:
@@ -529,13 +566,22 @@ def _verify_crypto_erase(vm_id: str, *, kek_was_alive: bool) -> bool:
             "from a KEK that was never provisioned at that name"
         )
 
-    # 1) THE cryptographic death: the Transit key `kek-<vm_id>` is gone.
-    transit_key = vault_kv.transit_key_name(vm_id)
-    if not vault_kv.transit_key_gone(transit_key):
-        raise ApiError(
-            f"transit key {transit_key!r} still present after decommission "
-            "(wrapped KEK still unwrappable — NOT crypto-erased)"
-        )
+    # 1) THE cryptographic death: BOTH per-VM Transit keys are gone.
+    #    `kek-<vm_id>` wraps the disk KEK and the canonical userdata the
+    #    KBS releases; `ud-<vm_id>` wraps vali's working copy of the same
+    #    cloud-init. A surviving `ud-*` leaves that copy decryptable from
+    #    any Vault backup or snapshot, so checking only the first would
+    #    certify an erase that did not happen.
+    for transit_key in (
+        vault_kv.transit_key_name(vm_id),
+        vault_kv.userdata_transit_key_name(vm_id),
+    ):
+        if not vault_kv.transit_key_gone(transit_key):
+            raise ApiError(
+                f"transit key {transit_key!r} still present after decommission "
+                "(the wrapped secret it opens is still recoverable — NOT "
+                "crypto-erased)"
+            )
 
     # 2) Defence-in-depth: the wrapped-KEK KV blob is not recoverable by
     #    vali. 404 (deleted) OR 403 (KEK-HSM read-denied) ⇒ gone; only a
@@ -557,6 +603,33 @@ def _verify_crypto_erase(vm_id: str, *, kek_was_alive: bool) -> bool:
             raise ApiError(f"KEK KV read errored (not 404/403): {exc}") from exc
     if kv_readable:
         raise ApiError("KEK KV still readable after decommission (NOT erased)")
+
+    # 2b) The userdata blobs are GONE — and unlike the KEK, vali is not
+    #     read-denied on these (the §6 re-mint reads them), so a 404 here
+    #     is an observation the token can actually make. That makes this
+    #     the half of the erase check with real discriminating power: a
+    #     clean read means the tenant's cloud-init survived its VM.
+    for leaf in ("userdata", "userdata-pending", "userdata-intake"):
+        path = f"{prefix}/{vm_id}/{leaf}"
+        try:
+            vault_kv.get_kv(mount, path)
+        except VaultNotFound:
+            continue  # 404 — deleted, gone. The ONLY accepted outcome.
+        except EffectError as exc:
+            # NOT the 403-means-gone acceptance the KEK read needs: vali is
+            # granted READ on these paths (the legacy re-mint fallback uses
+            # it), so a 403 here means the ACL changed under us, not that
+            # the secret was deleted. Accepting it would let an ACL
+            # regression certify an erase nobody performed.
+            raise ApiError(
+                f"{leaf} KV read did not 404 after decommission ({exc}) — only "
+                "an observed absence proves the erase on a path vali may read"
+            ) from exc
+        raise ApiError(
+            f"{leaf} KV still readable after decommission — a destroyed VM's "
+            "cloud-init (SSH keys, tokens, the NetBird enrolment secret) "
+            "outlived it"
+        )
 
     # 3) The Vm row is destroyed.
     vm = Vm.objects.filter(vm_id=vm_id).first()
@@ -693,13 +766,40 @@ def _await_vm_materialize(vm_id: str, deadline: float) -> bool:
 
 
 def _force_destroy(vm_id: str) -> str:
-    from apps.lifecycle.models import Vm, VmState
-    from apps.orchestration import effects
+    from apps.lifecycle.models import Vm, VmState, destroyed_power_fields
+    from apps.orchestration import effects, service
 
     vm = Vm.objects.filter(vm_id=vm_id).first()
     if vm is None:
         return "forced: vm row vanished"
+    if service._has_active_job(vm):
+        # A §24 job (the API teardown, or one handed off on an earlier reap)
+        # owns this VM; tearing it down underneath would tombstone a VM the
+        # job then cannot finish properly (placements, host, erase stamp).
+        return "forced teardown: left-to-in-flight-job"
     steps: list[str] = []
+    # Stop the domain FIRST. The order used to be erase → revoke → destroy
+    # → tombstone, with a failed destroy only logged: live (on two
+    # miners), this pod could not reach the Edge, so every forced teardown
+    # erased the KEK and tombstoned the row while the domain kept RUNNING —
+    # a zombie that then zombie-quarantined its miner for placement. The
+    # data was dead; the VM was not. Now nothing is erased or tombstoned
+    # here unless the destroy order went out; otherwise the teardown is
+    # handed to the orchestration tick, which owns the Edge path and
+    # retries the destroy (and re-drives a failed job) until it lands.
+    try:
+        effects.dispatch_destroy(vm)
+        steps.append("domain-destroyed")
+    except Exception as exc:
+        log.error(
+            "forced dispatch_destroy failed for %s: %s — NOT erasing or "
+            "tombstoning in-process; handing the teardown to the tick",
+            vm_id,
+            exc,
+        )
+        steps.append(f"destroy-failed({exc})")
+        steps.append(_hand_teardown_to_tick(vm))
+        return "forced teardown: " + ", ".join(steps)
     # Synthetic VMs are always golden — golden erase destroys the Vault
     # transit key (data-death) + deletes the KV. Idempotent.
     erased = False
@@ -717,12 +817,16 @@ def _force_destroy(vm_id: str) -> str:
             exc,
         )
         steps.append(f"crypto-erase-failed({exc})")
-    try:
-        effects.dispatch_destroy(vm)
-        steps.append("domain-destroyed")
-    except Exception as exc:
-        log.warning("forced dispatch_destroy failed for %s: %s", vm_id, exc)
-        steps.append(f"destroy-failed({exc})")
+    if erased:
+        # The §24 job this teardown bypasses revokes the NetBird peer after
+        # the erase; tenant peers are persistent, so do the same here
+        # (best-effort — the peer janitor collects it if this fails).
+        try:
+            effects.revoke_netbird(vm)
+            steps.append("netbird-revoked")
+        except Exception as exc:
+            log.warning("forced revoke_netbird failed for %s: %s", vm_id, exc)
+            steps.append(f"netbird-revoke-failed({exc})")
     # Mark Destroyed ONLY if the key is actually gone.
     #
     # This used to be unconditional "best-effort so it is not re-picked /
@@ -749,7 +853,7 @@ def _force_destroy(vm_id: str) -> str:
     # the noise is the point.
     if erased:
         Vm.objects.filter(vm_id=vm_id).exclude(state=VmState.DESTROYED).update(
-            state=VmState.DESTROYED
+            state=VmState.DESTROYED, **destroyed_power_fields()
         )
     else:
         Vm.objects.filter(vm_id=vm_id).exclude(
@@ -757,6 +861,81 @@ def _force_destroy(vm_id: str) -> str:
         ).update(state=VmState.DECOMMISSIONING)
         steps.append("NOT-tombstoned(kek-still-live)")
     return "forced teardown: " + ", ".join(steps)
+
+
+def _hand_teardown_to_tick(vm: Any) -> str:
+    """Open a forced §24 job for `vm` at `CryptoErasing`, for the
+    orchestration tick to drive: it erases the KEK, dispatches the destroy
+    over its own Edge path (retrying within the step window), tombstones
+    only after that, and `sweep_stranded_decommissions` re-drives a job
+    that fails. The same shape as that re-drive. A VM that already has a
+    job in flight is left to it. Returns the step note."""
+    from django.db import IntegrityError, transaction
+
+    from apps.lifecycle.models import Vm, VmState
+    from apps.orchestration import service
+    from apps.orchestration.models import (
+        DecommissionJob,
+        DecommissionState,
+        LaunchJob,
+    )
+
+    if service._has_active_job(vm):
+        return "left-to-in-flight-job"
+    last = DecommissionJob.objects.filter(vm=vm).order_by("-started_at").first()
+    if last is not None and last.state == DecommissionState.FAILED.value:
+        # `sweep_stranded_decommissions` re-drives it, under its own cap;
+        # opening another job here every reap would bypass that cap.
+        return "left-to-stranded-sweep"
+    decided_by = next(
+        (
+            j.decided_by
+            for j in (
+                DecommissionJob.objects.filter(vm=vm).order_by("-started_at").first(),
+                LaunchJob.objects.filter(vm_id=vm.vm_id).order_by("-started_at").first(),
+            )
+            if j is not None and j.decided_by_id is not None
+        ),
+        None,
+    )
+    if decided_by is None:
+        # Nothing to attribute a job to. Still kill the data: erase
+        # in-process and fence the row to Decommissioning — never
+        # Destroyed, since the domain may still run.
+        log.error(
+            "synthetic reaper: %s has no job to attribute a forced §24 to — "
+            "erasing in-process, NOT tombstoning (domain may still run)",
+            vm.vm_id,
+        )
+        from apps.orchestration import effects
+
+        try:
+            effects.crypto_erase_kek_transit(vm)
+            note = "erased-in-process"
+        except Exception as exc:
+            note = f"crypto-erase-failed({exc})"
+        Vm.objects.filter(pk=vm.pk).exclude(
+            state__in=(VmState.DESTROYED, VmState.DECOMMISSIONING)
+        ).update(state=VmState.DECOMMISSIONING)
+        return f"NOT-handed-off(no-decider), {note}"
+    now = timezone.now()
+    try:
+        with transaction.atomic():
+            Vm.objects.filter(pk=vm.pk).exclude(
+                state__in=(VmState.DESTROYED, VmState.DECOMMISSIONING)
+            ).update(state=VmState.DECOMMISSIONING)
+            job = DecommissionJob.objects.create(
+                job_id=secrets.token_hex(16),
+                vm=vm,
+                state=DecommissionState.CRYPTO_ERASING.value,
+                phase_started_at=now,
+                decided_by=decided_by,
+                forced=True,
+                reason="synthetic-reaper:destroy-undeliverable",
+            )
+    except IntegrityError:
+        return "left-to-in-flight-job"
+    return f"handed-to-tick(job={job.job_id})"
 
 
 # ── Reaper — SIGKILL/OOM/eviction backstop ───────────────────────────

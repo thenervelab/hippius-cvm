@@ -191,12 +191,12 @@ vault:
 snp:
   # `turin` matches the confidential k8s node (EPYC 9255 Turin) where
   # the KBS POD runs — its self-report is what the broker verifies.
-  # (NOT the tenant host miner-1, which is Genoa.)
+  # (NOT the tenant hosts, which may be a different generation.)
   generation: "turin"
   # Mounted-VEK fallback. OFF: the broker uses ONLY the report-carried
-  # VEK. The previously-staged VEK was miner-1's Genoa VEK — wrong host
-  # + generation for the k8s node's Turin self-report — so it must stay
-  # off here. Set true only with a correct Turin VEK for THAT node at
+  # VEK. A VEK staged for a Genoa tenant host is the wrong host +
+  # generation for the k8s node's Turin self-report, so it must stay off
+  # here. Set true only with a correct Turin VEK for THAT node at
   # vekVaultPath.
   mountedVekFallback: false
   # AMD KDS base URL. When the host doesn't inject certs into the

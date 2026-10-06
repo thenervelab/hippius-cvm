@@ -265,6 +265,49 @@ if grep -qxF -- '--relay-vsock-port' "${TMP}/argv" && grep -A1 -xF -- '--relay-v
     bad "the shim disabled the relay push (port 0) — attestations would never reach vali"
 fi
 [[ -n "${argv}" ]] || bad "the shim exec'd with no argv"
+if grep -qxF -- '--attest-resources' "${TMP}/argv"; then
+    bad "the shim attests resources without hippius.attest_resources=1 — an older KBS would refuse every keepalive"
+else
+    ok "no hippius.attest_resources=1 ⇒ the resource-less keepalive"
+fi
+
+# The MEASURED opt-in turns the resource attestation on; any other value
+# leaves it off.
+sed 's/console=ttyS0/hippius.attest_resources=1 console=ttyS0/' "${TMP}/cmdline.full" > "${TMP}/cmdline.res"
+run_shim "${TMP}/cmdline.res" "${TMP}/epoch.res"
+if (( SRC == 0 )) && grep -qxF -- '--attest-resources' "${TMP}/argv"; then
+    ok "hippius.attest_resources=1 ⇒ the shim passes --attest-resources"
+else
+    bad "hippius.attest_resources=1 did not pass --attest-resources (rc=${SRC}, argv: $(tr '\n' ' ' <"${TMP}/argv"))"
+fi
+expect_pair --vm-id vm-abc
+sed 's/console=ttyS0/hippius.attest_resources=yes console=ttyS0/' "${TMP}/cmdline.full" > "${TMP}/cmdline.res2"
+run_shim "${TMP}/cmdline.res2" "${TMP}/epoch.res2"
+if (( SRC == 0 )) && ! grep -qxF -- '--attest-resources' "${TMP}/argv"; then
+    ok "hippius.attest_resources=<not 1> leaves the resource attestation off"
+else
+    bad "hippius.attest_resources=yes changed the argv (rc=${SRC})"
+fi
+
+# The components health leg follows the RELEASE's own switch (its
+# keepalive.env, read by the unit's EnvironmentFile), never the cmdline.
+if grep -qxF -- '--attest-components' "${TMP}/argv"; then
+    bad "the shim attests components without HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1"
+else
+    ok "no HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1 ⇒ no components leg"
+fi
+HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1 run_shim "${TMP}/cmdline.full" "${TMP}/epoch.comp"
+if (( SRC == 0 )) && grep -qxF -- '--attest-components' "${TMP}/argv"; then
+    ok "HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1 ⇒ the shim passes --attest-components"
+else
+    bad "HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=1 did not pass --attest-components (rc=${SRC})"
+fi
+HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=yes run_shim "${TMP}/cmdline.full" "${TMP}/epoch.comp2"
+if (( SRC == 0 )) && ! grep -qxF -- '--attest-components' "${TMP}/argv"; then
+    ok "HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=<not 1> leaves the components leg off"
+else
+    bad "HIPPIUS_KEEPALIVE_ATTEST_COMPONENTS=yes changed the argv (rc=${SRC})"
+fi
 
 # The epoch file is seeded from the measured cmdline (the guest has no
 # chain access of its own).
@@ -336,6 +379,17 @@ if grep -qF -- '--hippius-keepalive-bin /usr/sbin/hippius-agent-keepalive' "${BA
     ok "the in-cluster baker passes --hippius-keepalive-bin"
 else
     bad "binaries/tenant-baker/entrypoint.sh does not pass --hippius-keepalive-bin — every in-cluster bake would produce an image with no keepalive"
+fi
+
+# vali's guest report grants a keepalive in flight at a hand-over the KBS
+# nonce lifetime before it calls a refusal T4: the two charts must agree.
+KBS_VALUES="${HERE}/../../deploy/gitops/apps/kbs/values.yaml"
+KBS_TTL="$(awk '/^[[:space:]]+nonceTtlSecs:/{print $2; exit}' "${KBS_VALUES}")"
+VALI_TTL="$(awk '/^[[:space:]]+kbsNonceTtlSecs:/{gsub(/"/, "", $2); print $2; exit}' "${VALUES}")"
+if [[ -n "${KBS_TTL}" && "${KBS_TTL}" == "${VALI_TTL}" ]]; then
+    ok "vali's guestReport.kbsNonceTtlSecs (${VALI_TTL}) tracks the KBS nonceTtlSecs (${KBS_TTL})"
+else
+    bad "guestReport.kbsNonceTtlSecs (${VALI_TTL:-?}) != the KBS nonceTtlSecs (${KBS_TTL:-?}) — align ${VALUES}"
 fi
 
 if [[ ${fail} -eq 0 ]]; then

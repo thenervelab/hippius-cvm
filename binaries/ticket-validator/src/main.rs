@@ -76,6 +76,7 @@ mod derive_telemetry_key;
 mod encode_order;
 mod gen_lifecycle_key;
 mod graceful_exit;
+mod guardian_binding;
 mod heartbeat;
 mod host_attestor_cert;
 mod host_beacon;
@@ -139,6 +140,12 @@ struct TicketJson {
     /// trusting it as authority — the KBS independently re-checks the
     /// kid against its §22 offline allowlist.
     kid_hex: String,
+    /// Customer-held keys: the signed `key_mode` (`split` / `customer`).
+    /// OMITTED for an M0 ticket (the field is absent on the wire), so an
+    /// M0 ticket's JSON is unchanged. vali reads it back to prove the
+    /// ticket it just minted carries the VM's pinned mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_mode: Option<&'static str>,
     /// Byte length of the COSE_Sign1 envelope as seen on stdin.
     /// Surfaces drift between Django's `Content-Length` and the
     /// validator's view of the bytes (defense against truncation
@@ -299,6 +306,10 @@ enum Command {
     /// /v1/edge/order` body; the Edge signs + forwards to the miner.
     /// See `mod encode_order`.
     EncodeOrder(encode_order::EncodeOrderArgs),
+    /// The content hash a miner acks for a `net-policy` order
+    /// (`applied:<revision>:<sha256>`), from the same JSON payload
+    /// `encode-order --kind net-policy` reads. See `mod encode_order`.
+    NetPolicyDigest,
     /// §7 — generate a per-VM guest lifecycle Ed25519 keypair. Reads no
     /// stdin; emits `{"seed_hex","vk_hex"}` on stdout. vali stages the
     /// seed (PRIVATE key) into Vault for the KBS to release to the
@@ -317,6 +328,12 @@ enum Command {
     /// reuses the version-1 seed — vali re-derives the matching vk instead
     /// of rotating the keypair. See `mod derive_lifecycle_vk`.
     DeriveLifecycleVk,
+    /// Customer-held keys — parse a kernel cmdline (stdin) with
+    /// `hippius_types::guardian::GuardianBinding::from_cmdline` and print
+    /// the binding (or the grammar error). Lets vali diff its Python
+    /// mirror of the grammar against the Rust source of truth. See
+    /// `mod guardian_binding`.
+    ParseGuardianBinding,
 }
 
 #[derive(Args)]
@@ -366,9 +383,11 @@ fn main() -> ExitCode {
         Command::VerifyHostBeacon(args) => host_beacon::run(args),
         Command::VerifyHostChallengeRequest => host_challenge_request::run(),
         Command::EncodeOrder(args) => encode_order::run(args),
+        Command::NetPolicyDigest => encode_order::run_net_policy_digest(),
         Command::GenLifecycleKey => gen_lifecycle_key::run(),
         Command::DeriveTelemetryKey => derive_telemetry_key::run(),
         Command::DeriveLifecycleVk => derive_lifecycle_vk::run(),
+        Command::ParseGuardianBinding => guardian_binding::run(),
     }
 }
 
@@ -661,6 +680,10 @@ fn validate(cose_bytes: &[u8]) -> Result<TicketJson, (&'static str, String)> {
     assert_canonical(payload)
         .map_err(|e| (category::NON_CANONICAL_CBOR, format!("payload: {e}")))?;
 
+    // The decode also enforces `key_mode`'s single-encoding rule exactly as
+    // the KBS does (it is the same `OrderTicket` type): absent ⇒ hippius,
+    // present ⇒ split|customer only; an explicit `hippius` or a CBOR
+    // `null` is a decode failure here too.
     let ticket: OrderTicket = ciborium::de::from_reader(payload.as_slice())
         .map_err(|e| (category::PAYLOAD_DECODE, format!("ticket decode: {e}")))?;
 
@@ -804,6 +827,7 @@ fn validate(cose_bytes: &[u8]) -> Result<TicketJson, (&'static str, String)> {
         flavor: ticket.flavor.as_str().into(),
         lifecycle_perms: ticket.lifecycle_perms,
         kid_hex: hex::encode(&kid),
+        key_mode: ticket.key_mode.map(|m| m.as_wire()),
         cose_len: cose_bytes.len(),
     })
 }
@@ -1128,6 +1152,41 @@ mod tests {
             }
         }
         to_canonical_vec(&Value::Map(fields)).unwrap()
+    }
+
+    /// The default payload with a `key_mode` entry appended (canonical).
+    fn payload_with_key_mode(value: Value) -> Vec<u8> {
+        let Value::Map(mut fields) =
+            ciborium::de::from_reader::<Value, _>(payload_with_overrides(&[]).as_slice()).unwrap()
+        else {
+            panic!("ticket payload is a map")
+        };
+        fields.push((Value::Text("key_mode".into()), value));
+        to_canonical_vec(&Value::Map(fields)).unwrap()
+    }
+
+    #[test]
+    fn key_mode_present_must_be_split_or_customer() {
+        for ok in ["split", "customer"] {
+            let cose = cose_envelope(payload_with_key_mode(Value::Text(ok.into())), b"k");
+            let json = serde_json::to_value(validate(&cose).unwrap()).unwrap();
+            // Echoed so vali can prove its own mint carries the pinned mode.
+            assert_eq!(json["key_mode"], ok, "{ok}");
+        }
+        // M0: the key is absent from the JSON too (output unchanged).
+        let m0 = serde_json::to_value(validate(&cose_envelope(ticket_payload(), b"k")).unwrap())
+            .unwrap();
+        assert!(m0.get("key_mode").is_none());
+        for bad in [
+            Value::Null,
+            Value::Text("hippius".into()),
+            Value::Text("Customer".into()),
+            Value::Text("".into()),
+        ] {
+            let cose = cose_envelope(payload_with_key_mode(bad.clone()), b"k");
+            let (cat, _) = validate(&cose).unwrap_err();
+            assert_eq!(cat, category::PAYLOAD_DECODE, "{bad:?}");
+        }
     }
 
     #[test]

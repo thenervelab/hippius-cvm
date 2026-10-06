@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
-from apps.lifecycle.models import Vm, VmBootPhase, VmState
+from apps.lifecycle.models import Vm, VmBootPhase, VmPowerState, VmState
 
 pytestmark = pytest.mark.django_db
 
@@ -131,3 +134,70 @@ def test_lifecycle_vk_hex_roundtrip() -> None:
     vm = _make_vm(lifecycle_vk=vk)
     # The helper hex-encodes; `bytes.fromhex` rehydrates losslessly.
     assert bytes.fromhex(vm.lifecycle_vk_hex()) == vk
+
+
+def _backdated(vm: Vm) -> datetime:
+    old = timezone.now() - timedelta(days=2)
+    Vm.objects.filter(pk=vm.pk).update(updated_at=old)
+    return old
+
+
+def test_a_queryset_update_stamps_updated_at() -> None:
+    """The §24/§25 CAS transitions are queryset updates, which skip
+    `auto_now`: without the stamp a destroyed row read its last save's date."""
+    vm = _make_vm()
+    old = _backdated(vm)
+    Vm.objects.filter(pk=vm.pk).update(state=VmState.DECOMMISSIONING)
+    vm.refresh_from_db()
+    assert vm.updated_at > old + timedelta(days=1)
+
+
+def test_an_explicit_updated_at_is_kept() -> None:
+    vm = _make_vm()
+    old = _backdated(vm)
+    vm.refresh_from_db()
+    assert vm.updated_at == old
+
+
+def test_a_partial_save_stamps_updated_at() -> None:
+    vm = _make_vm()
+    old = _backdated(vm)
+    vm.refresh_from_db()
+    vm.host = "host-b"
+    vm.save(update_fields=["host"])
+    vm.refresh_from_db()
+    assert vm.host == "host-b" and vm.updated_at > old + timedelta(days=1)
+
+
+def test_the_backfill_turns_destroyed_rows_off_and_leaves_their_date() -> None:
+    import importlib
+
+    from django.db import connection
+    from django.db.migrations.loader import MigrationLoader
+
+    # The models as the migration sees them (plain manager), not today's.
+    apps = MigrationLoader(connection).project_state(
+        ("lifecycle", "0017_vm_power_state_off")
+    ).apps
+    backfill = importlib.import_module("apps.lifecycle.migrations.0017_vm_power_state_off")
+    dead = _make_vm(vm_id="vm-dead", state=VmState.DESTROYED, power_stop_proof=b"\x01" * 32)
+    live = _make_vm(vm_id="vm-live")
+    old = _backdated(dead)
+
+    backfill.destroyed_rows_off(apps, None)
+
+    dead.refresh_from_db()
+    live.refresh_from_db()
+    assert dead.power_state == VmPowerState.OFF and dead.power_stop_proof is None
+    assert live.power_state == VmPowerState.RUNNING
+    # Dated by what zombie.py read until now; updated_at itself not moved.
+    assert dead.power_state_at == old and dead.updated_at == old
+
+
+def test_an_empty_partial_save_stays_a_no_op() -> None:
+    vm = _make_vm()
+    old = _backdated(vm)
+    vm.refresh_from_db()
+    vm.save(update_fields=[])
+    vm.refresh_from_db()
+    assert vm.updated_at == old

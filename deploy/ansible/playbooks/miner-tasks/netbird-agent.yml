@@ -67,17 +67,25 @@
     cmd: netbird status
   register: miner_netbird_status
   changed_when: false
+  check_mode: false
   failed_when: false
 
 - name: Join the NetBird mesh (miner group) via the setup key
   # `netbird up` registers this peer. Skipped when the agent is
   # already connected — a second run is then a no-op. `no_log` keeps
   # the setup key out of the Ansible output.
+  #
+  # `--management-url` is not optional: without it the client dials the
+  # PUBLIC api.netbird.io, which rejects our self-hosted setup key and
+  # leaves the daemon `LoginFailed`. The value lives under `network.`
+  # in group_vars; this task used to test a top-level
+  # `netbird_management_url` that nothing defines, so the flag was
+  # silently dropped on every run.
   ansible.builtin.command:
     cmd: >-
       netbird up
       --setup-key {{ miner_netbird_setup_key }}
-      {% if netbird_management_url is defined %}--management-url {{ netbird_management_url }}{% endif %}
+      --management-url {{ network.netbird_management_url }}
   no_log: true
   register: miner_netbird_up
   changed_when: miner_netbird_up.rc == 0
@@ -88,6 +96,7 @@
     cmd: netbird status
   register: miner_netbird_final
   changed_when: false
+  check_mode: false
   failed_when: false
 
 # The miner's own NetBird mesh address — assigned by NetBird at join,

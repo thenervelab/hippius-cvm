@@ -56,6 +56,15 @@ pub struct PersistedHandle {
     /// re-adopts exactly as before.
     #[serde(default)]
     pub is_infra: bool,
+    /// Customer-held keys: the guardian endpoint and the canonical-CBOR
+    /// launch recipe (hex) of a customer-keys VM — so a guest that
+    /// (re)boots after an agent restart can still reach its guardian.
+    /// Both absent for an M0 VM (and in every pre-H4 snapshot); an agent
+    /// that predates the fields ignores them (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_ep: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_recipe_cbor_hex: Option<String>,
 }
 
 impl From<&CvmHandle> for PersistedHandle {
@@ -72,6 +81,14 @@ impl From<&CvmHandle> for PersistedHandle {
             cid: h.cid,
             cose_ticket_hex: hex::encode(&h.cose_ticket),
             is_infra: h.is_infra(),
+            guardian_ep: h.guardian.as_ref().map(|g| g.endpoint.clone()),
+            // A recipe that was valid at launch always encodes; `None` here
+            // only drops the route (the relay then refuses), never the VM.
+            guardian_recipe_cbor_hex: h
+                .guardian
+                .as_ref()
+                .and_then(|g| hippius_types::guardian::encode_canonical(&g.recipe).ok())
+                .map(hex::encode),
         }
     }
 }
@@ -88,6 +105,7 @@ impl PersistedHandle {
             .map_err(|_| MinerAgentError::LaunchInput("adopt-digest-len"))?;
         let cose_ticket = hex::decode(&self.cose_ticket_hex)
             .map_err(|_| MinerAgentError::LaunchInput("adopt-ticket-hex"))?;
+        let guardian = self.guardian_route();
         Ok(CvmHandle {
             vm_id: VmId::new(&self.vm_id)?,
             profile: if self.is_infra {
@@ -105,8 +123,45 @@ impl PersistedHandle {
             luks_disk_path: PathBuf::from(self.luks_disk_path),
             cid: self.cid,
             cose_ticket,
+            guardian,
         })
     }
+
+    /// The persisted guardian route, re-validated. A damaged or partial
+    /// one is DROPPED (logged): the VM is still re-adopted — its capacity,
+    /// CID and ticket matter more — and the relay refuses its CID rather
+    /// than dial an endpoint it can no longer vouch for.
+    fn guardian_route(&self) -> Option<super::guardian::GuardianRoute> {
+        let (ep, recipe_hex) = match (&self.guardian_ep, &self.guardian_recipe_cbor_hex) {
+            (None, None) => return None,
+            (Some(ep), Some(recipe)) => (ep, recipe),
+            _ => {
+                log_guardian_drop(&self.vm_id, "partial");
+                return None;
+            }
+        };
+        let route = hex::decode(recipe_hex)
+            .ok()
+            .and_then(|b| hippius_types::guardian::decode_canonical(&b).ok())
+            .map(|recipe| super::guardian::GuardianRoute {
+                endpoint: ep.clone(),
+                recipe,
+            });
+        match route {
+            Some(r) if r.validate().is_ok() => Some(r),
+            _ => {
+                log_guardian_drop(&self.vm_id, "invalid");
+                None
+            }
+        }
+    }
+}
+
+fn log_guardian_drop(vm_id: &str, class: &str) {
+    eprintln!(
+        "hippius-miner-agent: re-adopt: vm={vm_id} guardian route {class} in snapshot — \
+         dropped; the guardian relay will refuse this VM until it is relaunched"
+    );
 }
 
 /// What libvirt says the host is ACTUALLY running for one domain —
@@ -139,6 +194,51 @@ pub struct DomainFacts {
     pub writable_disk: Option<PathBuf>,
     /// `<uuid>` — the libvirt domain UUID.
     pub domain_uuid: Option<DomainUuid>,
+    /// The `<os>` direct-boot block — what QEMU was started with and so
+    /// what was measured. `None` unless loader, kernel, initrd AND cmdline
+    /// are all present.
+    pub boot: Option<BootFacts>,
+}
+
+/// The measured boot inputs of a running domain, read back from its XML:
+/// `<loader>` (OVMF), `<kernel>`, `<initrd>` and the exact `<cmdline>`.
+/// Used to rebuild a customer-keys VM's guardian route when the adoption
+/// snapshot does not carry one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootFacts {
+    pub ovmf: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    /// Unescaped, NOT trimmed: the exact measured string.
+    pub cmdline: String,
+}
+
+/// Hand-written so the cmdline is never `Debug`-printed.
+impl std::fmt::Debug for BootFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootFacts")
+            .field("ovmf", &self.ovmf)
+            .field("kernel", &self.kernel)
+            .field("initrd", &self.initrd)
+            .field("cmdline", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The `<os>` block's boot inputs, if all four are there.
+fn boot_facts(xml: &str) -> Option<BootFacts> {
+    let os = section(xml, "os")?;
+    let path = |tag: &str| {
+        element(&os, tag)
+            .map(|(_, t)| PathBuf::from(xml_unescape(t.trim())))
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    Some(BootFacts {
+        ovmf: path("loader")?,
+        kernel: path("kernel")?,
+        initrd: path("initrd")?,
+        cmdline: element(&os, "cmdline").map(|(_, t)| xml_unescape(&t))?,
+    })
 }
 
 /// Parse the load-bearing facts out of a libvirt domain XML document.
@@ -205,6 +305,7 @@ pub fn parse_domain_facts(xml: &str) -> Result<DomainFacts> {
         cid,
         writable_disk: writable_disk_path(xml),
         domain_uuid,
+        boot: boot_facts(xml),
     })
 }
 
@@ -423,6 +524,7 @@ mod tests {
             luks_disk_path: PathBuf::from(format!("/var/lib/hippius-miner/data/{vm}.img")),
             cid,
             cose_ticket: vec![0xde, 0xad, 0xbe, 0xef],
+            guardian: None,
         }
     }
 
@@ -440,7 +542,100 @@ mod tests {
             luks_disk_path: PathBuf::new(),
             cid: 0,
             cose_ticket: Vec::new(),
+            guardian: None,
         }
+    }
+
+    const GUARDIAN_EP: &str = "100.64.3.4:7443";
+
+    fn sample_route() -> super::super::guardian::GuardianRoute {
+        let pk = "ab".repeat(32);
+        super::super::guardian::GuardianRoute {
+            endpoint: GUARDIAN_EP.into(),
+            recipe: hippius_types::guardian::LaunchRecipe {
+                ovmf_sha384: vec![1; 48],
+                kernel_sha256: vec![2; 32],
+                initrd_sha256: vec![3; 32],
+                cmdline: format!(
+                    "console=hvc0 hippius.key_mode=split hippius.guardian_pk={pk} \
+                     hippius.guardian_ep={}",
+                    hex::encode(GUARDIAN_EP)
+                ),
+                vcpus: 4,
+                vcpu_type: "EpycTurin".into(),
+                guest_features: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn boot_facts_read_the_exact_measured_inputs() {
+        let xml = "<domain><vcpu>2</vcpu><memory unit='MiB'>512</memory><os>\n    \
+                   <type>hvm</type>\n    <loader type='rom'> /x/ovmf.fd </loader>\n    \
+                   <kernel>/x/vmlinuz</kernel>\n    <initrd>/x/in&amp;itrd</initrd>\n    \
+                   <cmdline> a&lt;b hippius.key_mode=split </cmdline>\n  </os></domain>";
+        let b = parse_domain_facts(xml).unwrap().boot.unwrap();
+        assert_eq!(b.ovmf, PathBuf::from("/x/ovmf.fd"));
+        assert_eq!(b.kernel, PathBuf::from("/x/vmlinuz"));
+        assert_eq!(b.initrd, PathBuf::from("/x/in&itrd"));
+        // Unescaped but NOT trimmed: the exact string QEMU measured.
+        assert_eq!(b.cmdline, " a<b hippius.key_mode=split ");
+        assert!(!format!("{b:?}").contains("key_mode"));
+        for missing in ["loader", "kernel", "initrd", "cmdline"] {
+            let cut = xml.replace(&format!("<{missing}"), &format!("<x{missing}"));
+            assert!(
+                parse_domain_facts(&cut).unwrap().boot.is_none(),
+                "{missing}"
+            );
+        }
+        let empty = xml.replace("<kernel>/x/vmlinuz</kernel>", "<kernel> </kernel>");
+        assert!(parse_domain_facts(&empty).unwrap().boot.is_none());
+    }
+
+    #[test]
+    fn a_guardian_route_survives_persist_and_readopt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = sample_handle("guarded-1", 6);
+        h.guardian = Some(sample_route());
+        persist(dir.path(), &h).unwrap();
+        let rebuilt = list(dir.path()).pop().unwrap().into_handle().unwrap();
+        assert_eq!(rebuilt.guardian, Some(sample_route()));
+    }
+
+    #[test]
+    fn an_m0_snapshot_carries_no_guardian_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        persist(dir.path(), &sample_handle("m0-1", 5)).unwrap();
+        let raw = std::fs::read_to_string(snapshot_path(dir.path(), "m0-1")).unwrap();
+        assert!(!raw.contains("guardian"), "{raw}");
+        let rebuilt = list(dir.path()).pop().unwrap().into_handle().unwrap();
+        assert!(rebuilt.guardian.is_none());
+    }
+
+    #[test]
+    fn a_damaged_guardian_route_is_dropped_but_the_vm_is_readopted() {
+        let good = {
+            let mut h = sample_handle("guarded-2", 7);
+            h.guardian = Some(sample_route());
+            PersistedHandle::from(&h)
+        };
+        // Endpoint no longer the one the recipe's cmdline pins.
+        let mut other_ep = good.clone();
+        other_ep.guardian_ep = Some("100.64.3.5:7443".into());
+        // Only one of the two keys.
+        let mut partial = good.clone();
+        partial.guardian_recipe_cbor_hex = None;
+        // Recipe bytes not hex / not canonical CBOR.
+        let mut garbage = good.clone();
+        garbage.guardian_recipe_cbor_hex = Some("zz".into());
+        let mut not_cbor = good.clone();
+        not_cbor.guardian_recipe_cbor_hex = Some("00ff".into());
+        for ph in [other_ep, partial, garbage, not_cbor] {
+            let h = ph.into_handle().unwrap();
+            assert_eq!(h.vm_id.as_str(), "guarded-2");
+            assert!(h.guardian.is_none());
+        }
+        assert!(good.into_handle().unwrap().guardian.is_some());
     }
 
     #[test]

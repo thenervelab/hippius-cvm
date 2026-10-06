@@ -30,7 +30,7 @@ def _inp(**over: object) -> CapacityInputs:
     """A trusted-anchored miner with generous headroom; override per-case."""
     base: dict[str, object] = dict(
         operator_max=64,
-        total_memory_mb=125_000,  # miner-1 EPYC 9254 class
+        total_memory_mb=125_000,  # an EPYC 9254 class host
         total_cpus=24,
         committed_memory_mb=0,
         committed_cpus=0,
@@ -58,7 +58,7 @@ def test_no_anchor_falls_back_to_flat_operator_max() -> None:
 
 
 def test_seeded_miner_gets_dynamic_uplift() -> None:
-    """miner-1: 125 GB total, 4 GB reserve, nothing committed ⇒ RAM
+    """A 125 GB host: 125 GB total, 4 GB reserve, nothing committed ⇒ RAM
     bounds (125000-4096)/8192 = 14 slots; CPU bounds (24-2)/4 = 5 slots.
     min(14,5)=5 additional slots. (CPU-bound, as SMT-off silicon is.)"""
     r = effective_capacity(_inp())
@@ -88,21 +88,32 @@ def test_over_report_gains_zero_extra_capacity() -> None:
 
 
 def test_impossible_claim_is_clamped_and_flagged() -> None:
-    """reported_free > total-reserve (physically impossible) ⇒ clamp to
-    trusted, flag. Claims the WHOLE box free while VMs are committed."""
+    """reported_free > total (physically impossible) ⇒ clamp to trusted,
+    flag. Claims more free RAM than the machine has."""
     r = effective_capacity(
         _inp(
             total_cpus=256,
             total_memory_mb=32_768,
             committed_memory_mb=16_384,  # half already committed
             committed_slots=2,
-            reported_free_mib=32_768,  # claims full box free > total-reserve
+            reported_free_mib=32_769,  # more than the whole box
         )
     )
     # trusted_free = 32768-16384-4096 = 12288 ⇒ 1 slot. + committed 2 = 3.
     assert r.slots == 3
-    # 32768 > total-reserve (32768-4096=28672) ⇒ physically impossible.
     assert r.over_claim is True
+
+
+def test_an_idle_host_reporting_nearly_all_its_ram_is_not_flagged() -> None:
+    """The reserve is POLICY, not memory the host OS occupies: an idle
+    256 GB host reports ~253 GB available, far above `total − reserve`
+    with an 8 GiB reserve. That is honest and must not alarm (it did on
+    every scheduler call once the reserve went to 8192)."""
+    r = effective_capacity(
+        _inp(total_cpus=64, total_memory_mb=256_180, reserve_memory_mb=8192,
+             reported_free_mib=253_073)
+    )
+    assert r.over_claim is False
 
 
 def test_plausible_band_report_not_flagged_capacity_still_clamps() -> None:
@@ -133,9 +144,9 @@ def test_plausible_band_report_not_flagged_capacity_still_clamps() -> None:
 
 
 def test_report_at_physical_max_is_not_flagged() -> None:
-    """The alarm boundary: `reported == total-reserve` (whole tenant budget
-    free, zero VMs) is plausible — honoured, not flagged. One MiB more is."""
-    phys_max = 125_000 - 4096  # total - reserve = 120904
+    """The alarm boundary: `reported == total` (the whole machine free) is
+    plausible — not flagged. One MiB more is."""
+    phys_max = 125_000  # total
     ok = effective_capacity(_inp(total_cpus=256, reported_free_mib=phys_max))
     assert ok.over_claim is False
     liar = effective_capacity(_inp(total_cpus=256, reported_free_mib=phys_max + 1))
@@ -210,7 +221,13 @@ def test_decision_inputs_computes_committed_from_own_ledger() -> None:
     cap, _load, _fam = service.decision_inputs("")
     assert cap[node_id(1)] == 14
 
-    # vali places two `large` VMs (8192 MiB / 4 vCPU each) itself.
+    # vali places two `large` VMs itself. Their size is READ from the flavor
+    # catalogue rather than copied here: this test asserts the ARITHMETIC of
+    # `committed = Σ own placements × flavor`, and hardcoding the flavor made
+    # a catalogue change (the 2026-08-20 grid) look like a capacity bug.
+    from apps.orchestration.services import flavors
+
+    large_mb = flavors.resolve_flavor("large").memory_mb
     make_placement(
         make_vm("vm-a"),
         node_id(1),
@@ -225,11 +242,14 @@ def test_decision_inputs_computes_committed_from_own_ledger() -> None:
     )
     cap, load, _fam = service.decision_inputs("")
     assert load[node_id(1)] == 2
-    # committed 2*8192=16384 MiB ⇒ free_mem = (125000-16384-4096)/8192 = 12
-    # additional slots; + committed 2 = 14 total capacity.
-    assert cap[node_id(1)] == 14
-    # free_slots the scheduler sees = capacity - load = 12 (real headroom).
-    assert cap[node_id(1)] - load[node_id(1)] == 12
+    # committed = 2 × large ⇒ the free RAM left buys
+    # (125000 - 2*large_mb - 4096) // 8192 further slots, and the 2 already
+    # committed still count. 8192 is the SLOT REFERENCE (settings, not a
+    # flavor) — one admission slot's worth of RAM.
+    expected = (125_000 - 2 * large_mb - 4096) // 8192 + 2
+    assert cap[node_id(1)] == expected
+    # free_slots the scheduler sees = capacity - load (the real headroom).
+    assert cap[node_id(1)] - load[node_id(1)] == expected - 2
 
 
 @pytest.mark.django_db

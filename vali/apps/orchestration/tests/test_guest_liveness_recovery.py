@@ -2,7 +2,7 @@
 
 The defect these pin: `effects.poll_domain_running` reports whether a
 QEMU process exists, so a tenant VM hung in its initramfs (proved live on
-miner-2 2026-08-12 — allowlist eviction → KEK release 403 → the LUKS
+miner-b 2026-08-12 — allowlist eviction → KEK release 403 → the LUKS
 overlay never opened) reported `running:true` forever and the control
 plane called it healthy.
 
@@ -128,9 +128,22 @@ def test_sweep_ignores_a_healthy_vm(warnings_log) -> None:
 
 @override_settings(VALI_GUEST_LIVENESS_STALE_S=600)
 def test_sweep_ignores_a_vm_that_has_never_signalled() -> None:
-    """`realtenant-ubuntu-1` on a pre-keepalive image is the live case:
+    """`tenant-ubuntu-1` on a pre-keepalive image is the live case:
     a signal a VM has never produced is NOT evidence of death."""
     make_vm("vm-never")
+    assert service.sweep_guest_liveness() == 0
+
+
+@override_settings(VALI_GUEST_LIVENESS_STALE_S=600)
+def test_sweep_ignores_a_vm_the_tenant_stopped() -> None:
+    """A stopped guest emits nothing — its stale watermark is the stop, not
+    a wedge. Counting it would also help a miner's stopped VMs read as a
+    fleet-wide relay fault that masks one genuinely wedged VM."""
+    from apps.lifecycle.models import VmPowerState
+
+    vm = make_vm("vm-stopped")
+    _silence(vm, ago_s=3600)
+    Vm.objects.filter(vm_id=vm.vm_id).update(power_state=VmPowerState.STOPPED)
     assert service.sweep_guest_liveness() == 0
 
 
@@ -224,7 +237,7 @@ def test_a_healthy_vm_with_no_signal_history_is_never_relaunched(
     monkeypatch, stub_relaunch
 ) -> None:
     """THE false positive that would be worse than the bug. A live tenant
-    on a pre-keepalive image (`realtenant-ubuntu-1`) has NEVER emitted
+    on a pre-keepalive image (`tenant-ubuntu-1`) has NEVER emitted
     one of the signal classes — `unknown` must never act."""
     vm = make_vm()
     _make_alive_miner()

@@ -171,7 +171,7 @@
         # We need to (re)write if EITHER:
         #   - the desired line is non-empty and not yet present, OR
         #   - there are zero or more-than-one ARRAY lines for our array
-        #     (catches the "stale duplicate left behind" case codex round 2
+        #     (catches the "stale duplicate left behind" case review round 2
         #     flagged where the desired line is present but a stale line
         #     for the same array name also remains).
         mdadm_conf_needs_update: >-

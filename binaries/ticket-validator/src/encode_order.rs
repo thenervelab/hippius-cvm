@@ -50,6 +50,14 @@
 //! }
 //! ```
 //!
+//! ### `launch` / `migrate-activate` — optional `guardian_ep`
+//!
+//! Customer-held keys: the canonical `host:port` of the VM's key
+//! guardian. Must equal the measured `hippius.guardian_ep=` cmdline token
+//! once DECODED — the cmdline carries the lowercase hex of this string,
+//! the order the plain string (and is required when the cmdline carries
+//! one). Emitted only when set.
+//!
 //! ### `stop`
 //!
 //! `{"vm_id": "tenant-1", "graceful": true}`
@@ -57,6 +65,62 @@
 //! ### `destroy` / `migrate`
 //!
 //! `{"vm_id": "tenant-1"}`
+//!
+//! ### `backup`
+//!
+//! ```json
+//! {
+//!   "vm_id": "tenant-1", "run_id": "r2", "parent_run_id": "r1",
+//!   "kind": "full" | "incremental", "part_size": 268435456,
+//!   "disk_part_urls": ["https://…partNumber=1…", …], "state_put_url": "https://…"
+//! }
+//! ```
+//!
+//! ### `migrate-activate` — optional `backup_chain`
+//!
+//! `{"restore_id": "…", "full": {"url", "sha256_hex", "size",
+//! "part_size"?, "part_sha256_hex"?}, "incrementals": [{…}, …],
+//! "state": {…}}` — see `build_backup_chain`.
+//!
+//! ### `migrate-activate` — optional `staged_restore_id`
+//!
+//! 32 lower-case hex. With it, `get_url` / `state_get_url` /
+//! `backup_chain` must be absent or empty; `get_url` is emitted as `""`.
+//!
+//! ### `restore`
+//!
+//! ```json
+//! {
+//!   "vm_id": "tenant-1", "restore_id": "<32 lower hex>",
+//!   "op": "stage" | "abort" | "reclaim",
+//!   "chain": {…backup_chain, same restore_id…},   // stage only
+//!   "disk_bytes": 42949672960,                     // stage only
+//!   "streams": 8                                   // optional
+//! }
+//! ```
+//!
+//! ### `net-policy`
+//!
+//! Host-wide, no `vm_id`. Every key is required except `uplink_hint`
+//! (emitted only when a non-null string); an unknown key is refused
+//! (`net-policy-unknown-field`) rather than dropped:
+//!
+//! ```json
+//! {
+//!   "revision": 7, "not_after_unix": 1770086400, "region": "AU",
+//!   "mode": "local" | "edge", "enforce": false,
+//!   "local_action": "count" | "drop", "uplink_hint": "eth0",
+//!   "infra": [{"ip": "1.1.1.1", "proto": "udp", "port": 51820}],
+//!   "region_miners": ["8.8.4.4"],
+//!   "nb_control": [{"ip": "9.9.9.9", "proto": "tcp", "port": 443}],
+//!   "dns_limit_pps": 20, "smtp_allowed_vms": ["tenant-1"],
+//!   "vm_caps": {"tenant-1": 100}
+//! }
+//! ```
+//!
+//! The miner-agent checks the values (canonical IPv4, charsets, ranges)
+//! and acks `applied:<revision>:<content sha256>`; `net-policy-digest`
+//! computes that sha from the same JSON.
 
 use ciborium::value::Value;
 use clap::Args;
@@ -94,7 +158,7 @@ pub struct EncodeOrderArgs {
 
     /// The target miner's `miner_id`. The miner-agent verifies
     /// `OrderBody.target_miner_id == self.config.miner.miner_id`
-    /// AFTER the Edge signature checks (gemini r1 High —
+    /// AFTER the Edge signature checks (review r1 High —
     /// cross-miner replay). vali passes the same miner_id it
     /// addresses the dispatch HTTP call to.
     #[arg(long)]
@@ -102,7 +166,7 @@ pub struct EncodeOrderArgs {
 
     /// Unix-seconds-since-epoch the caller is issuing this order. The
     /// miner-agent enforces a ±`MAX_ORDER_AGE_SECS` window around its
-    /// own clock (gemini r1 High — long-term replay). vali passes
+    /// own clock (review r1 High — long-term replay). vali passes
     /// `int(time.time())` at call time; tests can pin a value for
     /// determinism.
     #[arg(long)]
@@ -146,6 +210,10 @@ fn build(args: &EncodeOrderArgs, payload_json: &[u8]) -> Result<Vec<u8>, &'stati
         "destroy" | "migrate" => build_vm_id_only(payload_obj)?,
         "migrate-activate" => build_migrate_activate(payload_obj)?,
         "tenant-preflight" => build_tenant_preflight(payload_obj)?,
+        "backup" => build_backup(payload_obj)?,
+        "restore" => build_restore(payload_obj)?,
+        "migrate-snapshot" => build_migrate_snapshot(payload_obj)?,
+        "net-policy" => build_net_policy(payload_obj)?,
         _ => return Err("bad-kind"),
     };
 
@@ -202,6 +270,7 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
     let kernel_path = string_field(obj, "kernel_path")?;
     let initrd_path = string_field(obj, "initrd_path")?;
     let cmdline = string_field(obj, "cmdline")?;
+    let guardian_ep = guardian_ep_field(obj, &cmdline)?;
     let luks_disk_path = string_field(obj, "luks_disk_path")?;
     let luks_disk_size_gb = u32_field(obj, "luks_disk_size_gb")?;
     // #365 — tenant data disk (/dev/vde) size. OPTIONAL in the JSON
@@ -285,7 +354,83 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
     if let Some(p) = optional_string_field(obj, "rootfs_hash_path")? {
         entries.push((Value::Text("rootfs_hash_path".into()), Value::Text(p)));
     }
+    // A RELAUNCH (vali reboot-recovery / power start): the miner must find
+    // the VM's disks already there and refuse rather than create blank ones.
+    // Emitted ONLY when true — a first launch stays byte-identical, and a
+    // miner-agent too old to know the key refuses the relaunch at decode
+    // (`deny_unknown_fields`) instead of silently blank-creating: the
+    // `data_disk_size_gb` lesson, applied up front. Present-but-not-bool
+    // is a loud error, never a silent `false`.
+    if optional_bool_field(obj, "require_existing_disks")? {
+        entries.push((
+            Value::Text("require_existing_disks".into()),
+            Value::Bool(true),
+        ));
+    }
+    push_guardian_ep(&mut entries, guardian_ep);
     Ok(Value::Map(entries))
+}
+
+/// Customer-held keys: the optional `guardian_ep` — the ONE destination
+/// the miner's guardian relay dials for this VM. Mirrors
+/// `LaunchOrder::guardian_ep` / `MigrateActivateOrder::guardian_ep`.
+///
+/// Absent / null ⇒ `None` (M0), and then NOT emitted: an M0 body stays
+/// byte-identical and an agent predating the key still decodes it. When
+/// present it must be the canonical `host:port` and equal the MEASURED
+/// `hippius.guardian_ep=` token of `cmdline` as `GuardianBinding` DECODES
+/// it (the token is hex; the comparison is endpoint to endpoint, never
+/// this string to the raw token); a customer-keys cmdline
+/// WITHOUT it is refused too. That last rule is the #365 lesson applied
+/// up front: this bridge re-serialises field by field, and a
+/// customer-keys launch whose endpoint vanished here would boot a guest
+/// that waits forever on a relay that refuses it. An agent too old to
+/// know the key refuses a body that carries it (`deny_unknown_fields`):
+/// miner-agents deploy before vali.
+fn guardian_ep_field(
+    obj: &serde_json::Map<String, Json>,
+    cmdline: &str,
+) -> Result<Option<String>, &'static str> {
+    use hippius_types::guardian::{GuardianBinding, GuardianEndpoint};
+    let ep = match obj.get("guardian_ep") {
+        None | Some(Json::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or("bad-guardian-ep")?;
+            let parsed = GuardianEndpoint::parse(s).map_err(|_| "bad-guardian-ep")?;
+            if parsed.to_wire() != s {
+                return Err("bad-guardian-ep");
+            }
+            Some(parsed)
+        }
+    };
+    let binding = GuardianBinding::from_cmdline(cmdline).map_err(|_| "bad-guardian-cmdline")?;
+    match (binding, ep) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("guardian-ep-orphan"),
+        (Some(_), None) => Err("guardian-ep-missing"),
+        (Some(b), Some(ep)) if b.endpoint == ep => Ok(Some(ep.to_wire())),
+        (Some(_), Some(_)) => Err("guardian-ep-mismatch"),
+    }
+}
+
+fn push_guardian_ep(entries: &mut Vec<(Value, Value)>, guardian_ep: Option<String>) {
+    if let Some(ep) = guardian_ep {
+        entries.push((Value::Text("guardian_ep".into()), Value::Text(ep)));
+    }
+}
+
+/// Optional bool: absent ⇒ `false`; present but not a JSON bool ⇒ error.
+fn optional_bool_field(
+    obj: &serde_json::Map<String, Json>,
+    name: &'static str,
+) -> Result<bool, &'static str> {
+    match obj.get(name) {
+        None => Ok(false),
+        Some(v) => v.as_bool().ok_or(match name {
+            "require_existing_disks" => "require-existing-disks-not-bool",
+            _ => "optional-bool-not-bool",
+        }),
+    }
 }
 
 /// Build the `payload` map for `kind=migrate-activate` (§25 M4). Mirrors
@@ -314,7 +459,31 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
     use base64::Engine;
 
     let vm_id = string_field(obj, "vm_id")?;
-    let get_url = string_field(obj, "get_url")?;
+    // A staged restore boots the disks the miner already staged: no
+    // snapshot, no state disk, no chain. `get_url` is then sent empty (the
+    // miner's field has no default, so the key stays).
+    let staged_restore_id = match obj.get("staged_restore_id") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|s| is_restore_id(s))
+                .ok_or("bad-staged-restore-id")?,
+        ),
+    };
+    let get_url = match staged_restore_id {
+        None => string_field(obj, "get_url")?,
+        Some(_) => {
+            let carries = |k: &str| match obj.get(k) {
+                None | Some(Json::Null) => false,
+                Some(Json::String(s)) => !s.is_empty(),
+                Some(_) => true,
+            };
+            if carries("get_url") || carries("state_get_url") || carries("backup_chain") {
+                return Err("staged-restore-conflict");
+            }
+            String::new()
+        }
+    };
     let new_gen = obj
         .get("new_gen")
         .and_then(Json::as_u64)
@@ -323,6 +492,9 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
     let kernel_path = string_field(obj, "kernel_path")?;
     let initrd_path = string_field(obj, "initrd_path")?;
     let cmdline = string_field(obj, "cmdline")?;
+    // The dest boots the same measured cmdline, so its relay must dial the
+    // same guardian — see `guardian_ep_field`.
+    let guardian_ep = guardian_ep_field(obj, &cmdline)?;
     let luks_disk_path = string_field(obj, "luks_disk_path")?;
     let luks_disk_size_gb = u32_field(obj, "luks_disk_size_gb")?;
     let cpu_count = u8_field(obj, "cpu_count")?;
@@ -396,6 +568,51 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
             Value::Text(u.to_string()),
         ));
     }
+    // The snapshot's length + sha256 as the source uploaded it — the dest
+    // verifies its download against them before attaching it. Emitted only
+    // when known (a multipart snapshot), like `state_get_url`.
+    match obj.get("snapshot_size") {
+        None | Some(Json::Null) => {}
+        Some(v) => {
+            let size = v.as_u64().filter(|n| *n > 0).ok_or("bad-snapshot-size")?;
+            entries.push((
+                Value::Text("snapshot_size".into()),
+                Value::Integer(size.into()),
+            ));
+        }
+    }
+    match obj.get("snapshot_sha256_hex") {
+        None | Some(Json::Null) => {}
+        Some(v) => {
+            let sha = v
+                .as_str()
+                .filter(|s| is_sha256_hex(s))
+                .ok_or("bad-snapshot-sha256-hex")?;
+            entries.push((
+                Value::Text("snapshot_sha256_hex".into()),
+                Value::Text(sha.to_string()),
+            ));
+        }
+    }
+    // vali's `DestActivating` deadline (unix seconds): the dest settles by
+    // then on every attempt. Emitted only when nonzero — absent, null and
+    // 0 all mean "not carried" and encode byte-identical to the pre-field
+    // wire, which a miner-agent predating the field still decodes. One
+    // that carries it is refused at decode by such an agent
+    // (`deny_unknown_fields`): agents deploy before vali. Present but not
+    // a non-negative integer is a loud error, never a silent absence.
+    match obj.get("settle_by_unix") {
+        None | Some(Json::Null) => {}
+        Some(v) => {
+            let settle_by = v.as_u64().ok_or("bad-settle-by-unix")?;
+            if settle_by != 0 {
+                entries.push((
+                    Value::Text("settle_by_unix".into()),
+                    Value::Integer(settle_by.into()),
+                ));
+            }
+        }
+    }
     // Optional path fields — emitted only when present so an absent one
     // falls to the miner-agent's `#[serde(default)]` canonical path.
     if let Some(p) = optional_string_field(obj, "rootfs_data_path")? {
@@ -403,6 +620,28 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
     }
     if let Some(p) = optional_string_field(obj, "rootfs_hash_path")? {
         entries.push((Value::Text("rootfs_hash_path".into()), Value::Text(p)));
+    }
+    push_guardian_ep(&mut entries, guardian_ep);
+    // Staged restore — emitted only when set, so every other activation
+    // stays byte-identical and an older agent is never sent the key.
+    if let Some(rid) = staged_restore_id {
+        entries.push((
+            Value::Text("staged_restore_id".into()),
+            Value::Text(rid.to_string()),
+        ));
+    }
+    // Optional backup-chain restore — emitted only when present, so every
+    // §25 activation stays byte-identical to today's wire and a miner-agent
+    // predating the field (`deny_unknown_fields`) still decodes it. When
+    // set, the dest ignores `get_url` / `state_get_url`.
+    if let Some(chain) = obj.get("backup_chain") {
+        if !chain.is_null() {
+            let chain_obj = chain.as_object().ok_or("backup-chain-not-object")?;
+            entries.push((
+                Value::Text("backup_chain".into()),
+                build_backup_chain(chain_obj)?,
+            ));
+        }
     }
     // Optional M3 staging bundle — emitted only when present (an absent
     // one is the M2 / out-of-band-staging shape the miner-agent accepts
@@ -417,6 +656,385 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
         }
     }
     Ok(Value::Map(entries))
+}
+
+/// Most incrementals one restore order carries. The miner accepts more
+/// (`backup::restore::MAX_CHAIN_INCREMENTALS`), but the whole activation
+/// must fit the Edge's 64 KiB order body; vali rebases chains well below
+/// this (`VALI_BACKUP_MAX_CHAIN`, capped at 63).
+const MAX_CHAIN_INCREMENTALS: usize = 63;
+
+/// Most part URLs one multipart order (`backup`, `migrate-snapshot`)
+/// carries: the largest flavor's overlay (1280 GiB) at the store's 512 MiB
+/// part ceiling needs ~2,600; 3,000 ~530-byte URLs stay within the 2 MiB
+/// multipart body the Edge and the miner give those kinds.
+pub const MAX_MULTIPART_PARTS: usize = 3000;
+
+/// Multipart part-size bounds (the miner-agent's `check_part_size`): S3's
+/// floor, and the store's ceiling — hippius-s3 answers `EntityTooLarge`
+/// for a part over 512 MiB.
+const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
+pub const MAX_MULTIPART_PART_SIZE: u64 = 512 << 20;
+
+/// Build the `backup_chain` map — mirrors
+/// `binaries/miner-agent/src/backup/restore.rs::RestoreChain`
+/// `{restore_id, full, incrementals, state}`, each piece a `ChainPiece`
+/// `{url, sha256_hex, size}`. A malformed chain fails the encode loudly —
+/// the dest must never receive half a chain.
+fn build_backup_chain(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    let restore_id = obj
+        .get("restore_id")
+        .and_then(Json::as_str)
+        .filter(|s| is_run_id(s))
+        .ok_or("backup-chain-bad-restore-id")?;
+    let full = build_chain_piece(obj.get("full"))?;
+    let state = build_chain_piece(obj.get("state"))?;
+    let incs = match obj.get("incrementals") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(v) => v.as_array().ok_or("backup-chain-bad-incrementals")?.clone(),
+    };
+    if incs.len() > MAX_CHAIN_INCREMENTALS {
+        return Err("backup-chain-too-long");
+    }
+    let incrementals = incs
+        .iter()
+        .map(|p| build_chain_piece(Some(p)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Map(vec![
+        (Value::Text("full".into()), full),
+        (
+            Value::Text("incrementals".into()),
+            Value::Array(incrementals),
+        ),
+        (
+            Value::Text("restore_id".into()),
+            Value::Text(restore_id.into()),
+        ),
+        (Value::Text("state".into()), state),
+    ]))
+}
+
+/// `{url, sha256_hex, size, part_size?, part_sha256_hex?}` — mirrors the
+/// miner-agent's `ChainPiece`. The part layout (the multipart part size
+/// the object was uploaded in, and each part's sha256) lets the miner
+/// fetch the object as parallel verified ranges; each field is emitted
+/// only when set, so a chain without it stays byte-identical. A layout
+/// that does not tile the object is refused here, as the miner would.
+fn build_chain_piece(v: Option<&Json>) -> Result<Value, &'static str> {
+    let p = v
+        .and_then(Json::as_object)
+        .ok_or("backup-chain-piece-not-object")?;
+    let url = p
+        .get("url")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("backup-chain-piece-missing-url")?;
+    let sha = p
+        .get("sha256_hex")
+        .and_then(Json::as_str)
+        .filter(|s| is_sha256_hex(s))
+        .ok_or("backup-chain-piece-bad-sha256-hex")?;
+    let size = p
+        .get("size")
+        .and_then(Json::as_u64)
+        .filter(|n| *n > 0)
+        .ok_or("backup-chain-piece-bad-size")?;
+    let part_size = match p.get("part_size") {
+        None | Some(Json::Null) => 0,
+        Some(v) => v.as_u64().ok_or("backup-chain-piece-bad-part-size")?,
+    };
+    let part_shas: Vec<String> = match p.get("part_sha256_hex") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("backup-chain-piece-bad-part-sha")?
+            .iter()
+            .map(|h| {
+                h.as_str()
+                    .filter(|s| is_sha256_hex(s))
+                    .map(str::to_string)
+                    .ok_or("backup-chain-piece-bad-part-sha")
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    if part_size != 0 {
+        if !(MIN_MULTIPART_PART_SIZE..=MAX_MULTIPART_PART_SIZE).contains(&part_size) {
+            return Err("backup-chain-piece-bad-part-size");
+        }
+        let parts = size.div_ceil(part_size);
+        if parts > MAX_PIECE_PARTS {
+            return Err("backup-chain-piece-bad-part-size");
+        }
+        if !part_shas.is_empty() && part_shas.len() as u64 != parts {
+            return Err("backup-chain-piece-part-sha-count");
+        }
+    } else if !part_shas.is_empty() {
+        return Err("backup-chain-piece-part-sha-count");
+    }
+    let mut entries = vec![
+        (
+            Value::Text("sha256_hex".into()),
+            Value::Text(sha.to_string()),
+        ),
+        (Value::Text("size".into()), Value::Integer(size.into())),
+        (Value::Text("url".into()), Value::Text(url.to_string())),
+    ];
+    if part_size != 0 {
+        entries.push((
+            Value::Text("part_size".into()),
+            Value::Integer(part_size.into()),
+        ));
+    }
+    if !part_shas.is_empty() {
+        entries.push((
+            Value::Text("part_sha256_hex".into()),
+            Value::Array(part_shas.into_iter().map(Value::Text).collect()),
+        ));
+    }
+    Ok(Value::Map(entries))
+}
+
+/// Most parts one piece may be split into (the miner-agent's
+/// `transfer::MAX_PARTS`, S3's ceiling).
+const MAX_PIECE_PARTS: u64 = 10_000;
+
+/// Build the `payload` map for `kind=restore`. Mirrors
+/// `binaries/miner-agent/src/orders/types.rs::RestoreOrder`
+/// `{vm_id, restore_id, op, chain?, disk_bytes?, streams?}`:
+///
+/// - `op: "stage"` needs `chain` (whose `restore_id` must be the order's)
+///   and `disk_bytes > 0`;
+/// - `op: "abort" | "reclaim"` must carry neither (absent / null / 0);
+/// - `streams` (1..=255; the miner clamps to 1..=16) is emitted only when
+///   given — the miner defaults it to 8.
+///
+/// `restore_id` is 32 lower-case hex, as the miner requires.
+fn build_restore(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    let vm_id = string_field(obj, "vm_id")?;
+    let restore_id = obj
+        .get("restore_id")
+        .and_then(Json::as_str)
+        .filter(|s| is_restore_id(s))
+        .ok_or("restore-bad-id")?;
+    let op = match obj.get("op").and_then(Json::as_str) {
+        Some("stage") => "stage",
+        Some("abort") => "abort",
+        Some("reclaim") => "reclaim",
+        _ => return Err("restore-bad-op"),
+    };
+    let chain = match obj.get("chain") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(v.as_object().ok_or("restore-chain-not-object")?),
+    };
+    let disk_bytes = match obj.get("disk_bytes") {
+        None | Some(Json::Null) => 0,
+        Some(v) => v.as_u64().ok_or("restore-bad-disk-bytes")?,
+    };
+    let mut entries = vec![
+        (Value::Text("op".into()), Value::Text(op.into())),
+        (
+            Value::Text("restore_id".into()),
+            Value::Text(restore_id.into()),
+        ),
+        (Value::Text("vm_id".into()), Value::Text(vm_id)),
+    ];
+    if op == "stage" {
+        let chain = chain.ok_or("restore-chain-missing")?;
+        if chain.get("restore_id").and_then(Json::as_str) != Some(restore_id) {
+            return Err("restore-id-mismatch");
+        }
+        if disk_bytes == 0 {
+            return Err("restore-bad-disk-bytes");
+        }
+        entries.push((Value::Text("chain".into()), build_backup_chain(chain)?));
+        entries.push((
+            Value::Text("disk_bytes".into()),
+            Value::Integer(disk_bytes.into()),
+        ));
+    } else if chain.is_some() || disk_bytes != 0 {
+        return Err("restore-stray-fields");
+    }
+    match obj.get("streams") {
+        None | Some(Json::Null) => {}
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .filter(|n| (1..=u64::from(u8::MAX)).contains(n))
+                .ok_or("restore-bad-streams")?;
+            entries.push((Value::Text("streams".into()), Value::Integer(n.into())));
+        }
+    }
+    Ok(Value::Map(entries))
+}
+
+/// 32 lower-case hex — the miner-agent's `check_restore_id`.
+fn is_restore_id(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Build the `payload` map for `kind=backup`. Mirrors
+/// `binaries/miner-agent/src/orders/types.rs::BackupOrder`
+/// `{vm_id, run_id, parent_run_id?, kind, part_size, disk_part_urls,
+/// state_put_url}`. The part list is bounded by `MAX_MULTIPART_PARTS` and the
+/// part size by the store's multipart limits, so a vali bug surfaces here rather
+/// than as an Edge 413 / a half-uploaded object. `parent_run_id` is emitted
+/// only when present (the miner's `#[serde(default)]`); an incremental
+/// without one is refused here.
+fn build_backup(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    let vm_id = string_field(obj, "vm_id")?;
+    let run_id = obj
+        .get("run_id")
+        .and_then(Json::as_str)
+        .filter(|s| is_run_id(s))
+        .ok_or("backup-bad-run-id")?;
+    let parent = match obj.get("parent_run_id") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|s| is_run_id(s))
+                .ok_or("backup-bad-parent-run-id")?,
+        ),
+    };
+    let kind = backup_kind_field(obj)?;
+    if kind == "incremental" && parent.is_none() {
+        return Err("backup-incremental-without-parent");
+    }
+    let part_size = obj
+        .get("part_size")
+        .and_then(Json::as_u64)
+        .ok_or("backup-missing-part-size")?;
+    if !(MIN_MULTIPART_PART_SIZE..=MAX_MULTIPART_PART_SIZE).contains(&part_size) {
+        return Err("backup-bad-part-size");
+    }
+    let urls = obj
+        .get("disk_part_urls")
+        .and_then(Json::as_array)
+        .ok_or("backup-missing-part-urls")?;
+    if urls.is_empty() {
+        return Err("backup-no-parts");
+    }
+    if urls.len() > MAX_MULTIPART_PARTS {
+        return Err("backup-too-many-parts");
+    }
+    let mut part_urls = Vec::with_capacity(urls.len());
+    for u in urls {
+        let u = u
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("backup-bad-part-url")?;
+        part_urls.push(Value::Text(u.to_string()));
+    }
+    let state_put_url = obj
+        .get("state_put_url")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("backup-missing-state-put-url")?;
+    let mut entries = vec![
+        (
+            Value::Text("disk_part_urls".into()),
+            Value::Array(part_urls),
+        ),
+        (Value::Text("kind".into()), Value::Text(kind.into())),
+        (
+            Value::Text("part_size".into()),
+            Value::Integer(part_size.into()),
+        ),
+        (Value::Text("run_id".into()), Value::Text(run_id.into())),
+        (
+            Value::Text("state_put_url".into()),
+            Value::Text(state_put_url.into()),
+        ),
+        (Value::Text("vm_id".into()), Value::Text(vm_id)),
+    ];
+    if let Some(parent) = parent {
+        entries.push((
+            Value::Text("parent_run_id".into()),
+            Value::Text(parent.into()),
+        ));
+    }
+    Ok(Value::Map(entries))
+}
+
+/// Build the `payload` map for `kind=migrate-snapshot` — the §25 snapshot
+/// as a MULTIPART upload. Mirrors the miner-agent's `MigrateSnapshotOrder`
+/// `{vm_id, node_id, part_size, disk_part_urls, state_put_url}` (`put_url`,
+/// the single-PUT URL, is left out: the miner defaults it). At most
+/// `MAX_MULTIPART_PARTS` parts — the Edge and the miner give this kind a
+/// 2 MiB body. The state disk URL is required: a destination without the
+/// boot counter can never unlock.
+fn build_migrate_snapshot(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    let vm_id = string_field(obj, "vm_id")?;
+    let node_id = string_field(obj, "node_id")?;
+    let part_size = obj
+        .get("part_size")
+        .and_then(Json::as_u64)
+        .ok_or("snapshot-missing-part-size")?;
+    if !(MIN_MULTIPART_PART_SIZE..=MAX_MULTIPART_PART_SIZE).contains(&part_size) {
+        return Err("snapshot-bad-part-size");
+    }
+    let urls = obj
+        .get("disk_part_urls")
+        .and_then(Json::as_array)
+        .ok_or("snapshot-missing-part-urls")?;
+    if urls.is_empty() {
+        return Err("snapshot-no-parts");
+    }
+    if urls.len() > MAX_MULTIPART_PARTS {
+        return Err("snapshot-too-many-parts");
+    }
+    let mut part_urls = Vec::with_capacity(urls.len());
+    for u in urls {
+        let u = u
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("snapshot-bad-part-url")?;
+        part_urls.push(Value::Text(u.to_string()));
+    }
+    let state_put_url = obj
+        .get("state_put_url")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("snapshot-missing-state-put-url")?;
+    Ok(Value::Map(vec![
+        (
+            Value::Text("disk_part_urls".into()),
+            Value::Array(part_urls),
+        ),
+        (Value::Text("node_id".into()), Value::Text(node_id)),
+        (
+            Value::Text("part_size".into()),
+            Value::Integer(part_size.into()),
+        ),
+        (
+            Value::Text("state_put_url".into()),
+            Value::Text(state_put_url.into()),
+        ),
+        (Value::Text("vm_id".into()), Value::Text(vm_id)),
+    ]))
+}
+
+/// The `kind` of a backup — closed vocabulary `full` / `incremental`
+/// (the miner-agent's kebab-case `BackupKind`).
+fn backup_kind_field(obj: &serde_json::Map<String, Json>) -> Result<&'static str, &'static str> {
+    match obj.get("kind").and_then(Json::as_str) {
+        Some("full") => Ok("full"),
+        Some("incremental") => Ok("incremental"),
+        _ => Err("backup-bad-kind"),
+    }
+}
+
+/// `[a-z0-9-]{1,64}` — the miner-agent's run-id rule.
+fn is_run_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Build the `boot_artifacts` map — mirrors
@@ -491,6 +1109,206 @@ fn optional_string_field(
 
 /// Build the `payload` map for `kind=stop`. Mirrors
 /// `binaries/miner-agent/src/orders/types.rs::StopOrder`.
+/// Keys of a `net-policy` payload. Mirrors
+/// `binaries/miner-agent/src/orders/types.rs::NetPolicyOrder`.
+const NET_POLICY_KEYS: [&str; 13] = [
+    "dns_limit_pps",
+    "enforce",
+    "infra",
+    "local_action",
+    "mode",
+    "nb_control",
+    "not_after_unix",
+    "region",
+    "region_miners",
+    "revision",
+    "smtp_allowed_vms",
+    "uplink_hint",
+    "vm_caps",
+];
+
+/// Build the `payload` map for `kind=net-policy`. Types and enum values
+/// are checked here; the values themselves on the miner, which owns them.
+fn build_net_policy(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    if obj.keys().any(|k| !NET_POLICY_KEYS.contains(&k.as_str())) {
+        return Err("net-policy-unknown-field");
+    }
+    let uint = |name: &'static str| {
+        obj.get(name)
+            .and_then(Json::as_u64)
+            .ok_or("net-policy-bad-uint")
+    };
+    let text = |name: &'static str| {
+        obj.get(name)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .ok_or("net-policy-bad-string")
+    };
+    let one_of = |name: &'static str, allowed: &[&str]| {
+        text(name).and_then(|v| {
+            if allowed.contains(&v.as_str()) {
+                Ok(v)
+            } else {
+                Err("net-policy-bad-enum")
+            }
+        })
+    };
+    let dns_limit_pps = u32::try_from(uint("dns_limit_pps")?).map_err(|_| "net-policy-bad-uint")?;
+    let enforce = obj
+        .get("enforce")
+        .and_then(Json::as_bool)
+        .ok_or("net-policy-bad-bool")?;
+    let mut entries = vec![
+        (
+            Value::Text("dns_limit_pps".into()),
+            Value::Integer(dns_limit_pps.into()),
+        ),
+        (Value::Text("enforce".into()), Value::Bool(enforce)),
+        (
+            Value::Text("infra".into()),
+            net_endpoints(obj.get("infra"))?,
+        ),
+        (
+            Value::Text("local_action".into()),
+            Value::Text(one_of("local_action", &["count", "drop"])?),
+        ),
+        (
+            Value::Text("mode".into()),
+            Value::Text(one_of("mode", &["local", "edge"])?),
+        ),
+        (
+            Value::Text("nb_control".into()),
+            net_endpoints(obj.get("nb_control"))?,
+        ),
+        (
+            Value::Text("not_after_unix".into()),
+            Value::Integer(uint("not_after_unix")?.into()),
+        ),
+        (Value::Text("region".into()), Value::Text(text("region")?)),
+        (
+            Value::Text("region_miners".into()),
+            string_list(obj.get("region_miners"))?,
+        ),
+        (
+            Value::Text("revision".into()),
+            Value::Integer(uint("revision")?.into()),
+        ),
+        (
+            Value::Text("smtp_allowed_vms".into()),
+            string_list(obj.get("smtp_allowed_vms"))?,
+        ),
+    ];
+    match obj.get("uplink_hint") {
+        None | Some(Json::Null) => {}
+        Some(v) => entries.push((
+            Value::Text("uplink_hint".into()),
+            Value::Text(v.as_str().ok_or("net-policy-bad-string")?.to_string()),
+        )),
+    }
+    let caps = obj
+        .get("vm_caps")
+        .and_then(Json::as_object)
+        .ok_or("net-policy-bad-vm-caps")?;
+    let mut cap_entries = Vec::with_capacity(caps.len());
+    for (vm_id, mbps) in caps {
+        let mbps = mbps
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or("net-policy-bad-vm-caps")?;
+        cap_entries.push((Value::Text(vm_id.clone()), Value::Integer(mbps.into())));
+    }
+    entries.push((Value::Text("vm_caps".into()), Value::Map(cap_entries)));
+    Ok(Value::Map(entries))
+}
+
+fn string_list(v: Option<&Json>) -> Result<Value, &'static str> {
+    let items = v.and_then(Json::as_array).ok_or("net-policy-bad-list")?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(|s| Value::Text(s.to_string()))
+                .ok_or("net-policy-bad-list")
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+/// `[{ip, proto, port}]` — the miner-agent's `NetEndpoint`.
+fn net_endpoints(v: Option<&Json>) -> Result<Value, &'static str> {
+    let items = v.and_then(Json::as_array).ok_or("net-policy-bad-list")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let ep = item.as_object().ok_or("net-policy-bad-endpoint")?;
+        if ep.len() != 3 {
+            return Err("net-policy-bad-endpoint");
+        }
+        let ip = ep
+            .get("ip")
+            .and_then(Json::as_str)
+            .ok_or("net-policy-bad-endpoint")?;
+        let proto = ep
+            .get("proto")
+            .and_then(Json::as_str)
+            .filter(|p| matches!(*p, "tcp" | "udp"))
+            .ok_or("net-policy-bad-endpoint")?;
+        let port = ep
+            .get("port")
+            .and_then(Json::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or("net-policy-bad-endpoint")?;
+        out.push(Value::Map(vec![
+            (Value::Text("ip".into()), Value::Text(ip.to_string())),
+            (Value::Text("port".into()), Value::Integer(port.into())),
+            (Value::Text("proto".into()), Value::Text(proto.to_string())),
+        ]));
+    }
+    Ok(Value::Array(out))
+}
+
+/// The `net-policy` content hash the miner acks: SHA-256 of the
+/// canonical payload map without `not_after_unix` (see the miner-agent
+/// `netpolicy` module docs), lower-case hex.
+pub fn net_policy_digest(payload_json: &[u8]) -> Result<String, &'static str> {
+    use sha2::{Digest, Sha256};
+    let payload: Json = serde_json::from_slice(payload_json).map_err(|_| "payload-json-parse")?;
+    let obj = payload.as_object().ok_or("payload-not-object")?;
+    let Value::Map(entries) = build_net_policy(obj)? else {
+        return Err("canonical-encode");
+    };
+    let content = Value::Map(
+        entries
+            .into_iter()
+            .filter(|(k, _)| k.as_text() != Some("not_after_unix"))
+            .collect(),
+    );
+    let bytes = to_canonical_vec(&content).map_err(|_| "canonical-encode")?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// `net-policy-digest` subcommand: JSON payload on stdin, the content
+/// hash hex on stdout. Same exit codes as `encode-order`.
+pub fn run_net_policy_digest() -> ExitCode {
+    let mut payload_bytes = Vec::new();
+    if let Err(e) = io::stdin().read_to_end(&mut payload_bytes) {
+        eprintln!("hippius-ticket-validator: stdin read failed: {e}");
+        return ExitCode::from(INTERNAL_FAIL);
+    }
+    match net_policy_digest(&payload_bytes) {
+        Ok(hex) => {
+            if let Err(e) = writeln!(io::stdout().lock(), "{hex}") {
+                eprintln!("hippius-ticket-validator: stdout write failed: {e}");
+                return ExitCode::from(INTERNAL_FAIL);
+            }
+            ExitCode::from(0)
+        }
+        Err(class) => {
+            eprintln!("hippius-ticket-validator: net-policy-digest: {class}");
+            ExitCode::from(SCHEMA_FAIL)
+        }
+    }
+}
+
 fn build_stop(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
     let vm_id = string_field(obj, "vm_id")?;
     let graceful = obj
@@ -814,6 +1632,47 @@ mod tests {
     }
 
     #[test]
+    fn launch_carries_require_existing_disks_only_when_true() {
+        // The relaunch guard rides this bridge; dropping it silently would
+        // let a relaunch blank-create the VM's disks again.
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct WireLaunch {
+            #[serde(default)]
+            require_existing_disks: bool,
+        }
+        #[derive(Deserialize)]
+        struct WireBody {
+            payload: WireLaunch,
+        }
+        let with = |v: &str| {
+            String::from_utf8(launch_payload().to_vec())
+                .unwrap()
+                .replace(
+                    "\"luks_disk_size_gb\": 10,",
+                    &format!("\"luks_disk_size_gb\": 10, \"require_existing_disks\": {v},"),
+                )
+                .into_bytes()
+        };
+        let bytes = build(&args("ord-rl", "launch"), &with("true")).unwrap();
+        assert_canonical(&bytes).expect("relaunch body must stay canonical");
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert!(back.payload.require_existing_disks);
+
+        // A first launch (absent or false) stays byte-identical to the
+        // pre-flag wire, so an older miner-agent still decodes it.
+        let absent = build(&args("ord-rl", "launch"), launch_payload()).unwrap();
+        let explicit_false = build(&args("ord-rl", "launch"), &with("false")).unwrap();
+        assert_eq!(absent, explicit_false);
+        assert!(!launch_payload_has_key(&absent, "require_existing_disks"));
+
+        assert_eq!(
+            build(&args("ord-rl", "launch"), &with("\"yes\"")).unwrap_err(),
+            "require-existing-disks-not-bool"
+        );
+    }
+
+    #[test]
     fn launch_rejects_non_numeric_data_disk_size() {
         // Present-but-garbage must error loudly, never silently 0.
         let payload = String::from_utf8(launch_payload().to_vec())
@@ -958,6 +1817,117 @@ mod tests {
     }
 
     #[test]
+    fn migrate_activate_carries_the_snapshot_digest_only_when_known() {
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        let sha = "ab".repeat(32);
+        let with = base.replacen(
+            "\"new_gen\"",
+            &format!(
+                "\"snapshot_size\": 42949672960, \"snapshot_sha256_hex\": \"{sha}\", \"new_gen\""
+            ),
+            1,
+        );
+        let bytes = build(&args("ord-act-d", "migrate-activate"), with.as_bytes()).unwrap();
+        assert_canonical(&bytes).expect("canonical");
+        let v: Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let payload = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("payload"))
+            .unwrap()
+            .1
+            .as_map()
+            .unwrap()
+            .clone();
+        let get = |key: &str| {
+            payload
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(key))
+                .map(|e| e.1.clone())
+        };
+        assert_eq!(
+            get("snapshot_size"),
+            Some(Value::Integer(42_949_672_960u64.into()))
+        );
+        assert_eq!(get("snapshot_sha256_hex"), Some(Value::Text(sha)));
+
+        let without = build(
+            &args("ord-act-d", "migrate-activate"),
+            migrate_activate_payload(),
+        )
+        .unwrap();
+        let hay = String::from_utf8_lossy(&without);
+        assert!(!hay.contains("snapshot_size") && !hay.contains("snapshot_sha256_hex"));
+
+        for (field, class) in [
+            ("\"snapshot_size\": 0, ", "bad-snapshot-size"),
+            (
+                "\"snapshot_sha256_hex\": \"XYZ\", ",
+                "bad-snapshot-sha256-hex",
+            ),
+        ] {
+            let bad = base.replacen("\"new_gen\"", &format!("{field}\"new_gen\""), 1);
+            let err = build(&args("ord-act-d", "migrate-activate"), bad.as_bytes()).unwrap_err();
+            assert_eq!(err, class);
+        }
+    }
+
+    #[test]
+    fn migrate_activate_carries_settle_by_only_when_nonzero() {
+        // The bridge is an allowlist re-serialiser: a settle-by it dropped
+        // would leave every retry on the per-attempt clock again, silently.
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        let with = |v: &str| {
+            base.replacen(
+                "\"new_gen\"",
+                &format!("\"settle_by_unix\": {v}, \"new_gen\""),
+                1,
+            )
+        };
+        let args = args("ord-act-s", "migrate-activate");
+        let bytes = build(&args, with("1790000000").as_bytes()).unwrap();
+        assert_canonical(&bytes).expect("canonical");
+        let v: Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let payload = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("payload"))
+            .unwrap()
+            .1
+            .as_map()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            payload
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("settle_by_unix"))
+                .map(|e| e.1.clone()),
+            Some(Value::Integer(1_790_000_000u64.into()))
+        );
+
+        // Absent, null and 0 all encode byte-identical to today's wire.
+        let absent = build(&args, migrate_activate_payload()).unwrap();
+        assert!(!String::from_utf8_lossy(&absent).contains("settle_by_unix"));
+        for v in ["0", "null"] {
+            assert_eq!(
+                build(&args, with(v).as_bytes()).unwrap(),
+                absent,
+                "settle_by_unix={v}"
+            );
+        }
+
+        for v in ["-1", "\"1790000000\"", "1.5"] {
+            assert_eq!(
+                build(&args, with(v).as_bytes()).unwrap_err(),
+                "bad-settle-by-unix",
+                "settle_by_unix={v}"
+            );
+        }
+    }
+
+    #[test]
     fn migrate_activate_round_trips_to_canonical_cbor() {
         // §25 M4 — the dest-activation body must be canonical (the wire
         // gate the miner-agent enforces) AND decode through a mirror of the
@@ -1016,6 +1986,8 @@ mod tests {
             cose_ticket: ByteBuf,
             #[serde(default)]
             boot_artifacts: Option<WireStaging>,
+            #[serde(default)]
+            settle_by_unix: u64,
         }
         #[derive(Deserialize)]
         struct WireBody {
@@ -1036,6 +2008,7 @@ mod tests {
         assert_eq!(p.cpu_count, 2);
         assert_eq!(p.memory_mb, 2048);
         assert_eq!(p.cose_ticket.as_ref(), b"fake-cose-ticket-bytes");
+        assert_eq!(p.settle_by_unix, 0, "not carried ⇒ not emitted");
         assert_eq!(
             p.rootfs_data_path.as_deref(),
             Some("/var/lib/hippius-miner/rootfs.img")
@@ -1136,7 +2109,7 @@ mod tests {
 
     #[test]
     fn empty_target_miner_id_is_rejected() {
-        // gemini r1 High — target binding is non-optional; an empty
+        // review r1 High — target binding is non-optional; an empty
         // value would let the miner's `target_miner_id == self.miner_id`
         // check default to vacuously equal on a misconfigured miner.
         let mut a = args("ord-x", "launch");
@@ -1374,5 +2347,1034 @@ mod tests {
         assert_canonical(&bytes).expect("launch body must be canonical");
         assert!(!launch_payload_has_key(&bytes, "rootfs_data_path"));
         assert!(!launch_payload_has_key(&bytes, "rootfs_hash_path"));
+    }
+
+    fn backup_payload(n_parts: usize) -> String {
+        let urls: Vec<String> = (1..=n_parts)
+            .map(|i| format!("\"https://s3/p?partNumber={i}\""))
+            .collect();
+        format!(
+            r#"{{"vm_id":"tenant-1","run_id":"r2","parent_run_id":"r1","kind":"incremental",
+               "part_size":268435456,"disk_part_urls":[{}],
+               "state_put_url":"https://s3/state"}}"#,
+            urls.join(",")
+        )
+    }
+
+    #[test]
+    fn backup_round_trips_through_a_mirror_of_the_miner_shape() {
+        use serde::Deserialize;
+
+        let bytes = build(&args("backup-r2", "backup"), backup_payload(3).as_bytes()).unwrap();
+        assert_canonical(&bytes).expect("canonical");
+
+        // Mirrors `orders::types::BackupOrder` on the miner side.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireBackup {
+            vm_id: String,
+            run_id: String,
+            #[serde(default)]
+            parent_run_id: Option<String>,
+            kind: String,
+            part_size: u64,
+            disk_part_urls: Vec<String>,
+            state_put_url: String,
+        }
+        #[derive(Deserialize)]
+        struct WireBody {
+            kind: String,
+            payload: WireBackup,
+        }
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.kind, "backup");
+        let p = back.payload;
+        assert_eq!(p.vm_id, "tenant-1");
+        assert_eq!(p.run_id, "r2");
+        assert_eq!(p.parent_run_id.as_deref(), Some("r1"));
+        assert_eq!(p.kind, "incremental");
+        assert_eq!(p.part_size, 268_435_456);
+        assert_eq!(p.disk_part_urls.len(), 3);
+        assert_eq!(p.disk_part_urls[2], "https://s3/p?partNumber=3");
+        assert_eq!(p.state_put_url, "https://s3/state");
+    }
+
+    fn snapshot_payload(n_parts: usize) -> String {
+        let urls: Vec<String> = (1..=n_parts)
+            .map(|i| format!("\"https://s3/p?partNumber={i}\""))
+            .collect();
+        format!(
+            r#"{{"vm_id":"tenant-1","node_id":"miner-a","part_size":536870912,
+               "disk_part_urls":[{}],"state_put_url":"https://s3/state"}}"#,
+            urls.join(",")
+        )
+    }
+
+    #[test]
+    fn migrate_snapshot_round_trips_through_a_mirror_of_the_miner_shape() {
+        use serde::Deserialize;
+
+        let bytes = build(
+            &args("mig-snap-1", "migrate-snapshot"),
+            snapshot_payload(40).as_bytes(),
+        )
+        .unwrap();
+        assert_canonical(&bytes).expect("canonical");
+
+        // Mirrors `orders::types::MigrateSnapshotOrder` on the miner side.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireSnapshot {
+            vm_id: String,
+            node_id: String,
+            #[serde(default)]
+            put_url: String,
+            #[serde(default)]
+            state_put_url: String,
+            #[serde(default)]
+            disk_part_urls: Vec<String>,
+            #[serde(default)]
+            part_size: u64,
+        }
+        #[derive(Deserialize)]
+        struct WireBody {
+            kind: String,
+            payload: WireSnapshot,
+        }
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.kind, "migrate-snapshot");
+        let p = back.payload;
+        assert_eq!(
+            (p.vm_id.as_str(), p.node_id.as_str()),
+            ("tenant-1", "miner-a")
+        );
+        assert_eq!(
+            p.put_url, "",
+            "a multipart snapshot carries no single-PUT URL"
+        );
+        assert_eq!(p.part_size, 512 << 20);
+        assert_eq!(p.disk_part_urls.len(), 40);
+        assert_eq!(p.disk_part_urls[39], "https://s3/p?partNumber=40");
+        assert_eq!(p.state_put_url, "https://s3/state");
+    }
+
+    #[test]
+    fn migrate_snapshot_refuses_what_the_miner_or_the_edge_would() {
+        let ok = snapshot_payload(2);
+        for (payload, class) in [
+            (snapshot_payload(0), "snapshot-no-parts"),
+            (
+                snapshot_payload(MAX_MULTIPART_PARTS + 1),
+                "snapshot-too-many-parts",
+            ),
+            (ok.replace("536870912", "1024"), "snapshot-bad-part-size"),
+            (
+                ok.replace("536870912", "536870913"),
+                "snapshot-bad-part-size",
+            ),
+            (
+                ok.replace(
+                    r#""state_put_url":"https://s3/state""#,
+                    r#""state_put_url":"""#,
+                ),
+                "snapshot-missing-state-put-url",
+            ),
+            (
+                ok.replace(r#""node_id":"miner-a","#, ""),
+                "missing-string-field",
+            ),
+        ] {
+            let got = build(&args("m", "migrate-snapshot"), payload.as_bytes()).unwrap_err();
+            assert_eq!(got, class);
+        }
+    }
+
+    #[test]
+    fn a_full_without_a_parent_omits_the_key() {
+        let payload = backup_payload(1)
+            .replace("\"parent_run_id\":\"r1\",", "")
+            .replace("\"incremental\"", "\"full\"");
+        let bytes = build(&args("b", "backup"), payload.as_bytes()).unwrap();
+        let needle = b"parent_run_id";
+        assert!(!bytes.windows(needle.len()).any(|w| w == needle.as_slice()));
+    }
+
+    #[test]
+    fn backup_with_the_maximum_part_list_fits_the_multipart_body_cap() {
+        // 3,000 realistic ~530-byte presigned URLs must fit the Edge's
+        // multipart order cap (`MAX_MULTIPART_ORDER_BODY` = 2 MiB - 256).
+        let url = format!("\"https://s3.hippius.com/{}\"", "x".repeat(505));
+        let urls = vec![url; MAX_MULTIPART_PARTS].join(",");
+        let payload = format!(
+            r#"{{"vm_id":"tenant-1","run_id":"r1","kind":"full",
+               "part_size":536870912,"disk_part_urls":[{urls}],
+               "state_put_url":"https://s3/state"}}"#
+        );
+        let bytes = build(&args("backup-r1", "backup"), payload.as_bytes()).unwrap();
+        // The largest flavor (1280 GiB, +1/64 incremental headroom) at
+        // 512 MiB parts needs 2,601.
+        build(
+            &args("backup-r1", "backup"),
+            backup_payload(2_601).as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            bytes.len() < 2 * 1024 * 1024 - 256,
+            "body {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn a_part_over_the_stores_512_mib_ceiling_is_refused() {
+        // hippius-s3 answers `EntityTooLarge` above 512 MiB: such an order
+        // could only half-upload.
+        let ok = backup_payload(1).replace("268435456", "536870912");
+        build(&args("b", "backup"), ok.as_bytes()).unwrap();
+        let over = backup_payload(1).replace("268435456", "536870913");
+        assert_eq!(
+            build(&args("b", "backup"), over.as_bytes()).unwrap_err(),
+            "backup-bad-part-size"
+        );
+    }
+
+    #[test]
+    fn migrate_snapshot_with_the_maximum_part_list_fits_the_multipart_body_cap() {
+        // 3,000 realistic ~530-byte presigned URLs (the largest flavor's
+        // overlay needs ~2,600) must fit the Edge's `migrate-snapshot` cap
+        // (`MAX_MULTIPART_ORDER_BODY` = 2 MiB - 256).
+        let url = format!("\"https://s3.hippius.com/{}\"", "x".repeat(505));
+        let urls = vec![url; MAX_MULTIPART_PARTS].join(",");
+        let payload = format!(
+            r#"{{"vm_id":"tenant-1","node_id":"miner-a","part_size":536870912,
+               "disk_part_urls":[{urls}],"state_put_url":"https://s3/state"}}"#
+        );
+        let bytes = build(&args("mig-snap", "migrate-snapshot"), payload.as_bytes()).unwrap();
+        assert!(
+            bytes.len() < 2 * 1024 * 1024 - 256,
+            "body {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn backup_rejects_malformed_payloads() {
+        let cases = [
+            (
+                backup_payload(MAX_MULTIPART_PARTS + 1),
+                "backup-too-many-parts",
+            ),
+            (backup_payload(0), "backup-no-parts"),
+            (
+                backup_payload(1).replace("268435456", "1024"),
+                "backup-bad-part-size",
+            ),
+            (
+                backup_payload(1).replace("\"incremental\"", "\"diff\""),
+                "backup-bad-kind",
+            ),
+            (
+                backup_payload(1).replace("\"https://s3/state\"", "\"\""),
+                "backup-missing-state-put-url",
+            ),
+            (
+                backup_payload(1).replace("\"parent_run_id\":\"r1\",", ""),
+                "backup-incremental-without-parent",
+            ),
+            (
+                backup_payload(1).replace("\"r2\"", "\"R_2\""),
+                "backup-bad-run-id",
+            ),
+        ];
+        for (payload, want) in cases {
+            assert_eq!(
+                build(&args("b", "backup"), payload.as_bytes()).unwrap_err(),
+                want
+            );
+        }
+    }
+
+    fn piece(url: &str, c: char, size: u64) -> String {
+        format!(
+            r#"{{"url":"{url}","sha256_hex":"{}","size":{size}}}"#,
+            c.to_string().repeat(64)
+        )
+    }
+
+    fn with_backup_chain(chain_json: &str) -> String {
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        base.replacen(
+            "\"vm_id\": \"tenant-1\",",
+            &format!("\"vm_id\": \"tenant-1\", \"backup_chain\": {chain_json},"),
+            1,
+        )
+    }
+
+    #[test]
+    fn migrate_activate_carries_a_backup_chain() {
+        use serde::Deserialize;
+
+        let chain = format!(
+            r#"{{"restore_id":"job-1","full":{},"incrementals":[{}],"state":{}}}"#,
+            piece("https://s3/full", 'a', 100),
+            piece("https://s3/inc1", 'b', 7),
+            piece("https://s3/state", 'c', 1_048_576),
+        );
+        let bytes = build(
+            &args("ord-act-c", "migrate-activate"),
+            with_backup_chain(&chain).as_bytes(),
+        )
+        .unwrap();
+        assert_canonical(&bytes).expect("canonical");
+
+        // Mirrors `backup::restore::{RestoreChain, ChainPiece}`.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WirePiece {
+            url: String,
+            sha256_hex: String,
+            size: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireChain {
+            restore_id: String,
+            full: WirePiece,
+            #[serde(default)]
+            incrementals: Vec<WirePiece>,
+            state: WirePiece,
+        }
+        #[derive(Deserialize)]
+        struct WireActivate {
+            backup_chain: WireChain,
+        }
+        #[derive(Deserialize)]
+        struct WireBody {
+            payload: WireActivate,
+        }
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let chain = back.payload.backup_chain;
+        assert_eq!(chain.restore_id, "job-1");
+        assert_eq!(chain.full.url, "https://s3/full");
+        assert_eq!(chain.full.size, 100);
+        assert_eq!(chain.full.sha256_hex, "a".repeat(64));
+        assert_eq!(chain.incrementals.len(), 1);
+        assert_eq!(chain.incrementals[0].sha256_hex, "b".repeat(64));
+        assert_eq!(chain.state.size, 1_048_576);
+    }
+
+    #[test]
+    fn migrate_activate_without_a_chain_omits_the_key() {
+        let bytes = build(
+            &args("ord-act-1", "migrate-activate"),
+            migrate_activate_payload(),
+        )
+        .unwrap();
+        let needle = b"backup_chain";
+        assert!(!bytes.windows(needle.len()).any(|w| w == needle.as_slice()));
+    }
+
+    #[test]
+    fn migrate_activate_rejects_a_malformed_chain() {
+        let ok = |c| piece("u", c, 1);
+        let cases = [
+            (
+                format!(
+                    r#"{{"restore_id":"j","full":{},"state":{}}}"#,
+                    piece("u", 'z', 1),
+                    ok('a')
+                ),
+                "backup-chain-piece-bad-sha256-hex",
+            ),
+            (
+                format!(
+                    r#"{{"restore_id":"j","full":{},"state":{}}}"#,
+                    piece("u", 'a', 0),
+                    ok('a')
+                ),
+                "backup-chain-piece-bad-size",
+            ),
+            (
+                format!(r#"{{"restore_id":"j","full":{}}}"#, ok('a')),
+                "backup-chain-piece-not-object",
+            ),
+            (
+                format!(
+                    r#"{{"restore_id":"","full":{},"state":{}}}"#,
+                    ok('a'),
+                    ok('a')
+                ),
+                "backup-chain-bad-restore-id",
+            ),
+            (
+                format!(
+                    r#"{{"restore_id":"j","full":{},"incrementals":[{}],"state":{}}}"#,
+                    ok('a'),
+                    vec![ok('b'); MAX_CHAIN_INCREMENTALS + 1].join(","),
+                    ok('a')
+                ),
+                "backup-chain-too-long",
+            ),
+        ];
+        for (chain, want) in cases {
+            assert_eq!(
+                build(
+                    &args("x", "migrate-activate"),
+                    with_backup_chain(&chain).as_bytes()
+                )
+                .unwrap_err(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn a_maximal_backup_chain_fits_the_order_body_cap() {
+        // MAX_CHAIN_INCREMENTALS realistic ~500-byte presigned GETs, plus
+        // the boot-artifact URLs + a 4 KiB ticket, must fit the signed-order
+        // cap (edge `MAX_MINER_ORDER_BODY` = 64 KiB - 256).
+        use base64::Engine as _;
+        let url = |i: usize| format!("https://s3.hippius.com/{i:04}{}", "x".repeat(470));
+        let sha = "a".repeat(64);
+        let p = |i: usize| {
+            format!(
+                r#"{{"url":"{}","sha256_hex":"{sha}","size":107374182400}}"#,
+                url(i)
+            )
+        };
+        let incs: Vec<String> = (1..=MAX_CHAIN_INCREMENTALS).map(p).collect();
+        let ticket = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 4096]);
+        let staged = |n: &str| format!(r#""{n}":{{"url":"{}","sha256_hex":"{sha}"}}"#, url(900));
+        let payload = format!(
+            r#"{{"vm_id":"tenant-1","get_url":"{}","state_get_url":"{}","new_gen":6,
+               "ovmf_path":"/var/lib/hippius-miner/ovmf.fd",
+               "kernel_path":"/var/lib/hippius-miner/staging/tenant-1/tenant.vmlinuz",
+               "initrd_path":"/var/lib/hippius-miner/staging/tenant-1/tenant.initrd.img",
+               "cmdline":"{}","luks_disk_path":"/var/lib/hippius-miner/overlay/tenant-1.img",
+               "luks_disk_size_gb":10,"cpu_count":32,"memory_mb":131072,
+               "cose_ticket":"{ticket}",
+               "boot_artifacts":{{{},{},{},{}}},
+               "backup_chain":{{"restore_id":"job-0123456789abcdef","full":{},
+                                "incrementals":[{}],"state":{}}}}}"#,
+            url(998),
+            url(999),
+            "c".repeat(1024),
+            staged("kernel"),
+            staged("initrd"),
+            staged("rootfs_data"),
+            staged("rootfs_hash"),
+            p(0),
+            incs.join(","),
+            p(997)
+        );
+        let bytes = build(&args("act", "migrate-activate"), payload.as_bytes()).unwrap();
+        assert!(bytes.len() < 64 * 1024 - 256, "body {} bytes", bytes.len());
+    }
+
+    // ── staged restore ──────────────────────────────────────────────
+
+    const RID: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A `restore` stage payload whose full carries a part layout.
+    fn restore_stage_payload() -> String {
+        let a = "a".repeat(64);
+        let full = format!(
+            r#"{{"url":"https://s3/full","sha256_hex":"{a}","size":{},
+                "part_size":536870912,"part_sha256_hex":["{a}","{b}"]}}"#,
+            (512u64 << 20) + 1,
+            b = "b".repeat(64)
+        );
+        format!(
+            r#"{{"vm_id":"tenant-1","restore_id":"{RID}","op":"stage","disk_bytes":{},
+               "streams":8,"chain":{{"restore_id":"{RID}","full":{full},
+               "incrementals":[{}],"state":{}}}}}"#,
+            (512u64 << 20) + 1,
+            piece("https://s3/inc", 'c', 7),
+            piece("https://s3/state", 'd', 1_048_576),
+        )
+    }
+
+    /// Mirrors `backup::restore::ChainPiece` (with the part layout).
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WirePiece {
+        url: String,
+        sha256_hex: String,
+        size: u64,
+        #[serde(default)]
+        part_size: u64,
+        #[serde(default)]
+        part_sha256_hex: Vec<String>,
+    }
+
+    /// Mirrors `backup::restore::RestoreChain`.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireChain {
+        restore_id: String,
+        full: WirePiece,
+        #[serde(default)]
+        incrementals: Vec<WirePiece>,
+        state: WirePiece,
+    }
+
+    /// Mirrors `orders::types::RestoreOrder`.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireRestore {
+        vm_id: String,
+        restore_id: String,
+        op: String,
+        #[serde(default)]
+        chain: Option<WireChain>,
+        #[serde(default)]
+        disk_bytes: u64,
+        #[serde(default)]
+        streams: Option<u8>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireRestoreBody {
+        kind: String,
+        payload: WireRestore,
+    }
+
+    #[test]
+    fn restore_stage_round_trips_through_a_mirror_of_the_miner_shape() {
+        let bytes = build(&args("r-1", "restore"), restore_stage_payload().as_bytes()).unwrap();
+        assert_canonical(&bytes).expect("canonical");
+        let back: WireRestoreBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.kind, "restore");
+        let p = back.payload;
+        assert_eq!(
+            (p.vm_id.as_str(), p.restore_id.as_str(), p.op.as_str()),
+            ("tenant-1", RID, "stage")
+        );
+        assert_eq!(p.disk_bytes, (512 << 20) + 1);
+        assert_eq!(p.streams, Some(8));
+        let chain = p.chain.unwrap();
+        assert_eq!(chain.restore_id, RID);
+        assert_eq!(chain.full.url, "https://s3/full");
+        assert_eq!(chain.full.sha256_hex, "a".repeat(64));
+        assert_eq!(chain.full.size, (512 << 20) + 1);
+        assert_eq!(chain.full.part_size, 512 << 20);
+        assert_eq!(chain.full.part_sha256_hex, ["a".repeat(64), "b".repeat(64)]);
+        assert_eq!(chain.incrementals.len(), 1);
+        assert_eq!(chain.incrementals[0].part_size, 0, "no layout ⇒ no key");
+        assert_eq!(chain.state.size, 1_048_576);
+        // A piece without a layout emits neither key.
+        for needle in [&b"part_size"[..], b"part_sha256_hex"] {
+            let n = bytes.windows(needle.len()).filter(|w| *w == needle).count();
+            assert_eq!(n, 1, "only the full carries a layout");
+        }
+    }
+
+    #[test]
+    fn restore_abort_and_reclaim_carry_only_the_id() {
+        for op in ["abort", "reclaim"] {
+            let json = format!(
+                r#"{{"vm_id":"tenant-1","restore_id":"{RID}","op":"{op}","disk_bytes":0,"chain":null}}"#
+            );
+            let bytes = build(&args("r-2", "restore"), json.as_bytes()).unwrap();
+            assert_canonical(&bytes).expect("canonical");
+            let back: WireRestoreBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            assert_eq!(back.payload.op, op);
+            assert!(back.payload.chain.is_none());
+            assert_eq!(back.payload.disk_bytes, 0);
+            assert!(back.payload.streams.is_none());
+        }
+    }
+
+    #[test]
+    fn restore_rejects_a_malformed_order() {
+        let stage = restore_stage_payload();
+        let other = "fedcba9876543210fedcba9876543210";
+        let cases = [
+            (stage.replacen(RID, other, 1), "restore-id-mismatch"),
+            (stage.replace(RID, &RID.to_uppercase()), "restore-bad-id"),
+            (
+                stage.replace(r#""op":"stage""#, r#""op":"swap""#),
+                "restore-bad-op",
+            ),
+            (
+                stage.replace(r#""op":"stage""#, r#""op":"abort""#),
+                "restore-stray-fields",
+            ),
+            (
+                stage.replace(r#""streams":8"#, r#""streams":0"#),
+                "restore-bad-streams",
+            ),
+            (
+                stage.replace(r#""disk_bytes":536870913,"#, ""),
+                "restore-bad-disk-bytes",
+            ),
+            (
+                stage.replace(r#","part_sha256_hex":["#, r#","part_sha256_hex":["00","#),
+                "backup-chain-piece-bad-part-sha",
+            ),
+            (
+                stage.replace(&format!(r#","{}"]"#, "b".repeat(64)), "]"),
+                "backup-chain-piece-part-sha-count",
+            ),
+            (
+                stage.replace(r#""part_size":536870912"#, r#""part_size":1024"#),
+                "backup-chain-piece-bad-part-size",
+            ),
+            (
+                format!(
+                    r#"{{"vm_id":"tenant-1","restore_id":"{RID}","op":"stage","disk_bytes":1}}"#
+                ),
+                "restore-chain-missing",
+            ),
+        ];
+        for (payload, want) in cases {
+            assert_ne!(payload, stage, "{want}: the case must change the payload");
+            assert_eq!(
+                build(&args("r", "restore"), payload.as_bytes()).unwrap_err(),
+                want
+            );
+        }
+    }
+
+    fn staged_activate(extra_edit: impl Fn(String) -> String) -> String {
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        let base = base
+            .replace(r#""get_url": "https://s3.example/snap?sig=x","#, "")
+            .replace(r#""state_get_url": "https://s3.example/state?sig=y","#, "")
+            .replacen(
+                "\"vm_id\": \"tenant-1\",",
+                &format!("\"vm_id\": \"tenant-1\", \"staged_restore_id\": \"{RID}\","),
+                1,
+            );
+        extra_edit(base)
+    }
+
+    #[test]
+    fn migrate_activate_carries_a_staged_restore_id_and_no_urls() {
+        #[derive(serde::Deserialize)]
+        struct WireActivate {
+            get_url: String,
+            staged_restore_id: String,
+            #[serde(default)]
+            state_get_url: Option<String>,
+            #[serde(default)]
+            backup_chain: Option<serde::de::IgnoredAny>,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireBody {
+            payload: WireActivate,
+        }
+        let payload = staged_activate(|s| s);
+        let bytes = build(&args("act-s", "migrate-activate"), payload.as_bytes()).unwrap();
+        assert_canonical(&bytes).expect("canonical");
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.payload.get_url, "", "the key stays, empty");
+        assert_eq!(back.payload.staged_restore_id, RID);
+        assert!(back.payload.state_get_url.is_none());
+        assert!(back.payload.backup_chain.is_none());
+        // Empty strings mean absent.
+        let payload = staged_activate(|s| {
+            s.replacen(
+                "\"new_gen\"",
+                "\"get_url\": \"\", \"state_get_url\": \"\", \"new_gen\"",
+                1,
+            )
+        });
+        build(&args("act-s", "migrate-activate"), payload.as_bytes()).unwrap();
+        // Without it, the key is not on the wire.
+        let plain = build(&args("act", "migrate-activate"), migrate_activate_payload()).unwrap();
+        let needle = b"staged_restore_id";
+        assert!(!plain.windows(needle.len()).any(|w| w == needle.as_slice()));
+    }
+
+    #[test]
+    fn a_staged_restore_refuses_anything_to_download() {
+        for (edit, want) in [
+            (
+                r#""get_url": "https://s3/x", "new_gen""#,
+                "staged-restore-conflict",
+            ),
+            (
+                r#""state_get_url": "https://s3/y", "new_gen""#,
+                "staged-restore-conflict",
+            ),
+            (
+                r#""backup_chain": {}, "new_gen""#,
+                "staged-restore-conflict",
+            ),
+        ] {
+            let payload = staged_activate(|s| s.replacen("\"new_gen\"", edit, 1));
+            assert_eq!(
+                build(&args("x", "migrate-activate"), payload.as_bytes()).unwrap_err(),
+                want
+            );
+        }
+        let payload = staged_activate(|s| s.replace(RID, "job-1"));
+        assert_eq!(
+            build(&args("x", "migrate-activate"), payload.as_bytes()).unwrap_err(),
+            "bad-staged-restore-id"
+        );
+    }
+
+    // ── customer-held keys: guardian_ep ────────────────────────────────
+
+    const GUARDIAN_PK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// A split cmdline measuring `ep` — hex-encoded, as vali mints it.
+    fn guardian_cmdline(ep: &str) -> String {
+        format!(
+            "console=hvc0 hippius.key_mode=split hippius.guardian_pk={GUARDIAN_PK} \
+             hippius.guardian_ep={}",
+            hex::encode(ep)
+        )
+    }
+
+    /// `launch_payload()` with its cmdline replaced and `extra` JSON
+    /// members appended.
+    fn launch_json_with(cmdline: &str, extra: &str) -> String {
+        let base = String::from_utf8(launch_payload().to_vec()).unwrap();
+        let base = base.replace(
+            "\"cmdline\": \"console=hvc0\"",
+            &format!("\"cmdline\": \"{cmdline}\""),
+        );
+        base.replacen('{', &format!("{{ {extra}"), 1)
+    }
+
+    /// The FULL miner-agent `LaunchOrder` wire shape, `deny_unknown_fields`
+    /// — the guardian key must decode into its own field, and no other key
+    /// may appear.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireLaunchFull {
+        #[allow(dead_code)]
+        vm_id: String,
+        #[allow(dead_code)]
+        ovmf_path: String,
+        #[allow(dead_code)]
+        kernel_path: String,
+        #[allow(dead_code)]
+        initrd_path: String,
+        cmdline: String,
+        #[allow(dead_code)]
+        luks_disk_path: String,
+        #[allow(dead_code)]
+        luks_disk_size_gb: u32,
+        #[serde(default)]
+        #[allow(dead_code)]
+        data_disk_size_gb: u32,
+        #[serde(default)]
+        #[allow(dead_code)]
+        rootfs_data_path: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        rootfs_hash_path: Option<String>,
+        #[allow(dead_code)]
+        cpu_count: u8,
+        #[allow(dead_code)]
+        memory_mb: u32,
+        #[allow(dead_code)]
+        cose_ticket: serde_bytes::ByteBuf,
+        #[serde(default)]
+        #[allow(dead_code)]
+        require_existing_disks: bool,
+        #[serde(default)]
+        guardian_ep: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireLaunchBody {
+        payload: WireLaunchFull,
+    }
+
+    #[test]
+    fn launch_carries_guardian_ep_into_the_miner_shape() {
+        let ep = "100.64.1.2:7443";
+        let json = launch_json_with(
+            &guardian_cmdline(ep),
+            &format!("\"guardian_ep\": \"{ep}\","),
+        );
+        let bytes = build(&args("g", "launch"), json.as_bytes()).unwrap();
+        assert_canonical(&bytes).unwrap();
+        let back: WireLaunchBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.payload.guardian_ep.as_deref(), Some(ep));
+        assert_eq!(back.payload.cmdline, guardian_cmdline(ep));
+    }
+
+    /// H1b: the order's plain endpoint is checked against the DECODED
+    /// token — including endpoints that spell cloud-init's `cc:` in the
+    /// clear — and never against the raw hex.
+    #[test]
+    fn the_order_endpoint_is_compared_with_the_decoded_token() {
+        for ep in ["guardian.example.cc:443", "[2001:db8::cc:1]:443"] {
+            let json = launch_json_with(
+                &guardian_cmdline(ep),
+                &format!("\"guardian_ep\": \"{ep}\","),
+            );
+            let bytes = build(&args("g", "launch"), json.as_bytes()).unwrap();
+            let back: WireLaunchBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            assert_eq!(back.payload.guardian_ep.as_deref(), Some(ep));
+            assert!(!back.payload.cmdline.contains("cc:"));
+        }
+        let ep = "100.64.1.2:7443";
+        let tok = hex::encode(ep);
+        let plain_cmdline = format!(
+            "console=hvc0 hippius.key_mode=split hippius.guardian_pk={GUARDIAN_PK} \
+             hippius.guardian_ep={ep}"
+        );
+        for (cmdline, order_ep, want) in [
+            // The order carrying the raw token is no endpoint.
+            (guardian_cmdline(ep), tok.clone(), "bad-guardian-ep"),
+            // A cmdline measuring the plain (pre-H1b) spelling.
+            (plain_cmdline, ep.to_string(), "bad-guardian-cmdline"),
+            // Uppercase hex: a second spelling of the token.
+            (
+                guardian_cmdline(ep).replace(&tok, &tok.to_ascii_uppercase()),
+                ep.to_string(),
+                "bad-guardian-cmdline",
+            ),
+        ] {
+            let json = launch_json_with(&cmdline, &format!("\"guardian_ep\": \"{order_ep}\","));
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                want,
+                "{order_ep}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_m0_launch_is_byte_identical_with_or_without_a_null_guardian_ep() {
+        let plain = build(&args("g", "launch"), launch_payload()).unwrap();
+        assert!(!launch_payload_has_key(&plain, "guardian_ep"));
+        let null = launch_json_with("console=hvc0", "\"guardian_ep\": null,");
+        assert_eq!(build(&args("g", "launch"), null.as_bytes()).unwrap(), plain);
+    }
+
+    #[test]
+    fn a_launch_guardian_ep_must_match_the_measured_token() {
+        let ep = "guardian.example.com:7443";
+        let cases: [(String, String, &str); 7] = [
+            // Non-canonical spellings.
+            (
+                guardian_cmdline(ep),
+                "\"guardian_ep\": \"GUARDIAN.example.com:7443\",".into(),
+                "bad-guardian-ep",
+            ),
+            (
+                guardian_cmdline(ep),
+                "\"guardian_ep\": \"guardian.example.com:07443\",".into(),
+                "bad-guardian-ep",
+            ),
+            (
+                guardian_cmdline(ep),
+                "\"guardian_ep\": 7443,".into(),
+                "bad-guardian-ep",
+            ),
+            // Another guardian than the measured one.
+            (
+                guardian_cmdline(ep),
+                "\"guardian_ep\": \"guardian.example.org:7443\",".into(),
+                "guardian-ep-mismatch",
+            ),
+            // A customer-keys cmdline whose endpoint the bridge would drop.
+            (guardian_cmdline(ep), String::new(), "guardian-ep-missing"),
+            // An endpoint for an M0 VM.
+            (
+                "console=hvc0".into(),
+                format!("\"guardian_ep\": \"{ep}\","),
+                "guardian-ep-orphan",
+            ),
+            // A cmdline the guardian grammar refuses.
+            (
+                format!("{} hippius.key_mode=split", guardian_cmdline(ep)),
+                format!("\"guardian_ep\": \"{ep}\","),
+                "bad-guardian-cmdline",
+            ),
+        ];
+        for (cmdline, extra, want) in cases {
+            let json = launch_json_with(&cmdline, &extra);
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                want,
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_activate_carries_guardian_ep_and_checks_it() {
+        let ep = "[2001:db8::1]:7443";
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        let cmd = format!("ro hippius.vm_generation=6 {}", guardian_cmdline(ep));
+        let with = base
+            .replace(
+                "\"cmdline\": \"ro hippius.vm_generation=6\"",
+                &format!("\"cmdline\": \"{cmd}\""),
+            )
+            .replacen('{', &format!("{{ \"guardian_ep\": \"{ep}\","), 1);
+        let bytes = build(&args("a", "migrate-activate"), with.as_bytes()).unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v: Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let Value::Map(top) = v else { panic!() };
+        let Some((_, Value::Map(payload))) =
+            top.iter().find(|(k, _)| k.as_text() == Some("payload"))
+        else {
+            panic!()
+        };
+        let got = payload
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("guardian_ep"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(got, Some(ep));
+        // Absent on an M0 activation (byte-stable), refused when dropped.
+        let plain = build(&args("a", "migrate-activate"), migrate_activate_payload()).unwrap();
+        assert!(!String::from_utf8_lossy(&plain).contains("guardian_ep"));
+        let dropped = base.replace(
+            "\"cmdline\": \"ro hippius.vm_generation=6\"",
+            &format!("\"cmdline\": \"{cmd}\""),
+        );
+        assert_eq!(
+            build(&args("a", "migrate-activate"), dropped.as_bytes()).unwrap_err(),
+            "guardian-ep-missing"
+        );
+    }
+
+    fn net_policy_vector() -> Json {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/net_policy_v1.json"
+        );
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn net_policy_args(v: &Json) -> EncodeOrderArgs {
+        EncodeOrderArgs {
+            order_id: v["order_id"].as_str().unwrap().to_string(),
+            kind: "net-policy".to_string(),
+            target_miner_id: v["target_miner_id"].as_str().unwrap().to_string(),
+            issued_at_unix: v["issued_at_unix"].as_u64().unwrap(),
+        }
+    }
+
+    fn net_policy_payload(mutate: impl FnOnce(&mut serde_json::Map<String, Json>)) -> Vec<u8> {
+        let mut payload = net_policy_vector()["cases"][0]["payload"]
+            .as_object()
+            .unwrap()
+            .clone();
+        mutate(&mut payload);
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    /// The shared vectors the edge-gateway and miner-agent tests consume:
+    /// a change here is a wire change on all three.
+    #[test]
+    fn net_policy_matches_the_shared_vectors() {
+        let v = net_policy_vector();
+        for case in v["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let payload = serde_json::to_vec(&case["payload"]).unwrap();
+            let body = build(&net_policy_args(&v), &payload).unwrap();
+            assert_canonical(&body).unwrap();
+            assert_eq!(
+                hex::encode(&body),
+                case["body_hex"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                net_policy_digest(&payload).unwrap(),
+                case["content_sha256"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn net_policy_digest_ignores_only_the_expiry() {
+        let base = net_policy_digest(&net_policy_payload(|_| {})).unwrap();
+        let renewed = net_policy_payload(|p| {
+            p.insert("not_after_unix".into(), Json::from(1_770_100_000u64));
+        });
+        assert_eq!(net_policy_digest(&renewed).unwrap(), base);
+        let other = net_policy_payload(|p| {
+            p.insert("enforce".into(), Json::Bool(true));
+        });
+        assert_ne!(net_policy_digest(&other).unwrap(), base);
+    }
+
+    #[test]
+    fn net_policy_omits_an_absent_or_null_uplink_hint() {
+        let v = net_policy_vector();
+        let absent = build(
+            &net_policy_args(&v),
+            &net_policy_payload(|p| {
+                p.remove("uplink_hint");
+            }),
+        )
+        .unwrap();
+        let null = build(
+            &net_policy_args(&v),
+            &net_policy_payload(|p| {
+                p.insert("uplink_hint".into(), Json::Null);
+            }),
+        )
+        .unwrap();
+        assert_eq!(absent, null);
+        assert!(!absent.windows(11).any(|w| w == b"uplink_hint"));
+    }
+
+    #[test]
+    fn net_policy_refuses_rather_than_drops() {
+        let v = net_policy_vector();
+        let refused = |mutate: &dyn Fn(&mut serde_json::Map<String, Json>)| {
+            build(&net_policy_args(&v), &net_policy_payload(mutate)).unwrap_err()
+        };
+        assert_eq!(
+            refused(&|p| {
+                p.insert("vm_id".into(), Json::from("tenant-1"));
+            }),
+            "net-policy-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.remove("revision");
+            }),
+            "net-policy-bad-uint"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.remove("vm_caps");
+            }),
+            "net-policy-bad-vm-caps"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("mode".into(), Json::from("open"));
+            }),
+            "net-policy-bad-enum"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert(
+                    "infra".into(),
+                    serde_json::json!([{"ip": "198.51.100.7", "proto": "udp", "port": 51820, "x": 1}]),
+                );
+            }),
+            "net-policy-bad-endpoint"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert(
+                    "nb_control".into(),
+                    serde_json::json!([{"ip": "192.0.2.10", "proto": "icmp", "port": 1}]),
+                );
+            }),
+            "net-policy-bad-endpoint"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("dns_limit_pps".into(), Json::from(u64::from(u32::MAX) + 1));
+            }),
+            "net-policy-bad-uint"
+        );
     }
 }

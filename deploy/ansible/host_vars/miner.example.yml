@@ -31,13 +31,21 @@ ram_gb_expected: <RAM_GB>                  # preflight asserts ">="
 # server will fail to bind.
 orders_bind_ip: "<THIS_MINER_NETBIRD_IP>"
 
-# ── Tenant CVM budget ───────────────────────────────────────────────
-# CPU threads / MiB this host offers to tenant CVMs. A RESERVATION, not
-# the whole machine: leave headroom for the host OS + miner-agent
-# (a useful starting point is ~4 threads and ~16-32 GB reserved).
-host_cvm:
-  cpu_budget: <CPU_THREADS_FOR_TENANTS>
-  memory_mb_budget: <MIB_FOR_TENANTS>
+# ── SEV-SNP generation ──────────────────────────────────────────────
+# Selects this host's host-attestor launch measurement
+# (`miner_host_attestor.measurements.<generation>` in group_vars):
+# genoa (EPYC 9004) | turin (EPYC 9005) | milan (EPYC 7003).
+snp_generation: <genoa|turin|milan>
+
+# ── Tenant CVM budget (optional) ────────────────────────────────────
+# The budget is DERIVED from the host's own facts (group_vars
+# `host_cvm`: threads x cpu_ratio, MemTotal - reserve, data filesystem -
+# reserve). Do NOT set `host_cvm` here — it would replace the whole
+# group dict. To offer LESS than the derivation, uncomment:
+# host_cvm_overrides:
+#   cpu_budget_max: <VCPUS>
+#   memory_mb_budget_max: <MIB>
+#   disk_gb_budget_max: <GIB>
 
 # ── Disk layout ─────────────────────────────────────────────────────
 # ⚠️  Re-verify with `lsblk` on the actual box before the first run.

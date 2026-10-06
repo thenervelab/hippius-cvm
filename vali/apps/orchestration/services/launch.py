@@ -44,14 +44,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from django.conf import settings
+from django.utils import timezone
 
 from apps.miners.models import MinerIdentity
 from apps.orchestration import effects, kbs_admin, order_dispatch
 from apps.orchestration.effects import EffectError, EffectUnavailable
-from apps.orchestration.models import MeasurementLedger
 from apps.orchestration.services import (
     allowlist_pin,
+    customer_keys,
+    launch_record,
     lifecycle_keygen,
+    register_gate,
     telemetry_keygen,
     ticket_mint,
     userdata_digest,
@@ -63,6 +66,7 @@ from apps.orchestration.services import (
 from apps.orchestration.services import (
     preflight as preflight_svc,
 )
+from apps.telemetry import guest_resources
 
 log = logging.getLogger("apps.orchestration.launch")
 
@@ -86,6 +90,10 @@ ACCEPTED = "accepted"  # miner took the launch order (2xx)
 RETRIABLE = "retriable"  # preflight reject OR miner 4xx → scheduler re-places
 TERMINAL = "terminal"  # vault / mint / kbs / edge-transport / config error
 
+#: The RETRIABLE outcome of a pin that waited out `PIN_LOCK_TIMEOUT_S`
+#: behind other pins — vali-side, so the miner is not excluded for it.
+ALLOWLIST_PIN_BUSY = "allowlist-pin-busy"
+
 # vm_id is interpolated into Vault KV paths — charset-lock it (no `../`).
 # Mirrors `apps.orchestration.launch_jobs._VM_ID_RE` + tenant_bake.
 _VM_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
@@ -94,6 +102,54 @@ _VM_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 _LUKS_HEADER_CMDLINE_KEY = "hippius.luks_header_sha256"
 _ROOTFS_SHA_CMDLINE_KEY = "hippius.rootfs_sha256"
 _DISK_GB_CMDLINE_KEY = "hippius.disk_gb"
+
+# ── M0 untrusted-miner guest hardening (measured) ────────────────────
+# The miner writes the libvirt domain XML, and only OVMF + kernel + initrd
+# + cmdline are in the SNP launch measurement. Everything else the miner
+# adds — SMBIOS type 11 OEM strings, `-fw_cfg opt/...` blobs — is fetched
+# by the guest AFTER launch and is NOT measured. systemd imports
+# credentials (`io.systemd.credential:*`: root ssh keys, `tmpfiles.extra`,
+# `fstab.extra`) from exactly those unmeasured surfaces by default, which
+# is a host->guest root channel independent of cloud-init and of any guest
+# agent. `systemd.import_credentials=no` on the MEASURED cmdline is the
+# only reliable kill switch (there is no config-file equivalent), so vali
+# bakes it into every launch. Purely a hardening flag; the guest keyscript
+# / initramfs parser ignores it, and it auto-pins into the §22 allowlist
+# like every other measured token. See scripts/tenant-image-bake.sh (the
+# cloud-init + guest-agent half of the same M0 hardening).
+_IMPORT_CREDENTIALS_CMDLINE_KEY = "systemd.import_credentials"
+_IMPORT_CREDENTIALS_VALUE = "no"
+
+# Attested guest resources (`apps.telemetry.guest_resources`): SNP measures
+# the vCPU count but not the RAM, so a keepalive image reads both and
+# attests them in its live attestation — only when this MEASURED token
+# says so (`scripts/guest/hippius-keepalive-start`). Gated on
+# `VALI_GUEST_ATTEST_RESOURCES`, which goes on once the KBS accepts the
+# field; measured, so the miner cannot strip it. An older image ignores it.
+_ATTEST_RESOURCES_CMDLINE_KEY = "hippius.attest_resources"
+
+# OrderTicket lifecycle perm (`kbs_core::lifecycle::SUPERSEDE_PERM`): the
+# KBS makes the registered launch the VM's current one at register. An
+# older KBS ignores unknown perms.
+_SUPERSEDE_PERM = "supersede"
+# `accept_memory=eager` (kernel >= 6.5; ignored before): the guest accepts —
+# PVALIDATEs — every page of its RAM at boot instead of on first use, so the
+# host must back the whole flavor before the guest runs: no lazily-promised
+# memory a miner could overcommit across VMs. Gated on
+# `VALI_GUEST_ACCEPT_MEMORY_EAGER` (boot time grows with the RAM size).
+_ACCEPT_MEMORY_CMDLINE_KEY = "accept_memory"
+
+# x86 COMMAND_LINE_SIZE is 2048 bytes INCLUDING the NUL; the kernel
+# SILENTLY truncates a longer cmdline while SEV measures the whole string.
+# And OVMF prepends `initrd=initrd ` (14 bytes) to the measured cmdline
+# before the kernel sees it, so a MEASURED cmdline past 2033 bytes would be
+# measured (and recomputed by vali / the KBS / the guardian) yet never
+# reach the guest's /proc/cmdline whole — the guest would boot a different
+# cmdline than was measured. Mirrors
+# `hippius_types::guardian::MAX_MEASURED_CMDLINE_LEN`. We validate the
+# FINAL augmented cmdline against this before preflight, fail-closed, in
+# every key mode.
+_MAX_CMDLINE_BYTES = customer_keys.MAX_MEASURED_CMDLINE_LEN
 
 # ── golden-bake disk modes + the dm-verity root-hash cmdline token ───
 # `disk_mode` selects how the boot disk's integrity is anchored into the
@@ -255,6 +311,33 @@ _LAUNCH_GENERATION = 1
 _DEFAULT_VALI_VSOCK_URL = "vsock://2:19266"
 
 
+def _cmdline_token_key(token: str) -> str:
+    """The key of a `key=value` (or bare `key`) cmdline token — the text
+    before the FIRST `=`. Exact, so `rd.systemd.import_credentials=no` and
+    `systemd.import_credentials=no` are distinct keys, not a substring
+    match."""
+    return token.split("=", 1)[0]
+
+
+def _force_cmdline_token(cmdline: str, key: str, value: str | None) -> str:
+    """The cmdline with exactly one `<key>=<value>` (or none at all when
+    `value` is `None`), whatever the base cmdline carried — the token is
+    vali's decision, never the base cmdline's. Matched on the exact key.
+    Unchanged bytes when there is nothing to remove or add; appended after
+    a single space otherwise, as `_augment_guest_hardening` does."""
+    tokens = cmdline.split()
+    if not any(_cmdline_token_key(tok) == key for tok in tokens):
+        return cmdline if value is None else f"{cmdline.rstrip()} {key}={value}"
+    kept = [tok for tok in tokens if _cmdline_token_key(tok) != key]
+    if value is not None:
+        kept.append(f"{key}={value}")
+    return " ".join(kept)
+
+
+def _cmdline_has_token(cmdline: str, key: str, value: str) -> bool:
+    return f"{key}={value}" in cmdline.split()
+
+
 def _augment_cmdline_with_token(cmdline: str, key: str, value: str) -> str:
     """Append `<key>=<value>` to `cmdline` iff `<key>=` is absent.
 
@@ -312,6 +395,59 @@ def _augment_disk_binding(cmdline: str, spec: LaunchSpec) -> str:
     return _augment_cmdline_with_token(
         cmdline, _LUKS_HEADER_CMDLINE_KEY, spec.luks_header_sha256_hex
     )
+
+
+def _augment_guest_hardening(cmdline: str) -> str:
+    """FORCE the M0 untrusted-miner guest-hardening token(s) on the
+    MEASURED cmdline.
+
+    Today that is `systemd.import_credentials=no`: it disables systemd's
+    native import of credentials (`io.systemd.credential:*` — root ssh
+    keys, `tmpfiles.extra`, `fstab.extra`) from the SMBIOS type 11 / fw_cfg
+    surfaces the untrusted miner controls and which are NOT in the SNP
+    launch measurement. The kernel cmdline is the only reliable kill
+    switch (no config-file equivalent), and it IS measured, so this is
+    trustworthy. Disk-mode-independent (every tenant gets it).
+
+    Unlike the plain `_augment_cmdline_with_token`, this FORCES the value:
+    a security kill switch must not be defeated by a base cmdline that
+    already carries `systemd.import_credentials=yes` (or a duplicate). Any
+    existing `systemd.import_credentials=` token is dropped and a single
+    canonical `=no` is appended. The match is on the EXACT key, so the
+    dracut/initramfs variant `rd.systemd.import_credentials=` and any other
+    lookalike are left untouched. Deterministic ⇒ byte-stable across
+    relaunch/§25 (the same base cmdline always yields the same output; the
+    production base cmdline never carries the token, so the common path is
+    a plain append that preserves spacing).
+    """
+    key = _IMPORT_CREDENTIALS_CMDLINE_KEY
+    canonical = f"{key}={_IMPORT_CREDENTIALS_VALUE}"
+    tokens = cmdline.split()
+    if not any(_cmdline_token_key(tok) == key for tok in tokens):
+        # Common case: nothing to override — append, preserving the base
+        # cmdline's original internal spacing.
+        return f"{cmdline.rstrip()} {canonical}"
+    kept = [tok for tok in tokens if _cmdline_token_key(tok) != key]
+    kept.append(canonical)
+    return " ".join(kept)
+
+
+def _spec_binding(spec: LaunchSpec) -> customer_keys.GuardianBinding | None:
+    """The spec's customer-keys binding (`None` ⇒ M0), validated by the
+    guardian cmdline grammar. M1/M2 are golden-only: a legacy rootfs is
+    `luksFormat`ted by the online baker, which holds that KEK, so no
+    customer key could ever protect it. Caller-fixable ⇒ `LaunchConfigError`.
+    """
+    try:
+        binding = customer_keys.binding_of(spec)
+    except customer_keys.CustomerKeysError as exc:
+        raise LaunchConfigError(str(exc)) from exc
+    if binding is not None and spec.disk_mode != _DISK_MODE_GOLDEN_VERITY:
+        raise LaunchConfigError(
+            f"customer-keys-golden-only: key_mode={binding.mode} requires "
+            f"disk_mode={_DISK_MODE_GOLDEN_VERITY}"
+        )
+    return binding
 
 
 def _select_preflight_artifacts(spec: LaunchSpec) -> Any:
@@ -520,6 +656,12 @@ class LaunchSpec:
     rootfs_img_sha256_hex: str = ""
     rootfs_verity_sha256_hex: str = ""
     measurement_hex: str = ""  # empty ⇒ preflight-computed
+    # The tenant DATA disk (GiB) when it is not `flavor`'s: a resized VM
+    # keeps the disk it was launched with — LUKS2 + dm-integrity cannot be
+    # resized — so its measured `hippius.disk_gb` and the LaunchOrder's
+    # `data_disk_size_gb` stay pinned while vCPU/RAM follow the flavor.
+    # 0 ⇒ the flavor's own `disk_gb` (every launch).
+    data_disk_size_gb: int = 0
     auto_pin_allowlist: bool = False
     enable_netbird: bool = True
     netbird_group: str = "vms"
@@ -544,6 +686,21 @@ class LaunchSpec:
     # (the VM is never migrated on a miner price change). Persisted on the
     # `Vm` row at creation; consumed by the §3.2 price-watch.
     max_price_per_unit: int | None = None
+    # Region constraint (ISO 3166-1 alpha-2, uppercased at intake). `""` ⇒
+    # unconstrained, and it MUST default: reboot-recovery rebuilds a spec
+    # from a `spec_json` written before this field existed, and a required
+    # field would make every such VM unrecoverable. Consumed by gate (f)
+    # in `decide_placement` via `service.placement_arguments`.
+    region: str = ""
+    # Customer-held disk keys (`services.customer_keys`). `hippius` (M0)
+    # with empty guardian fields is today's launch, byte for byte; `split`
+    # (M1) / `customer` (M2) need both guardian fields, validated by the
+    # guardian cmdline grammar. Defaulted for the same reason as `region`:
+    # reboot-recovery rebuilds specs from old `spec_json`s. Pinned on the
+    # `Vm` row at first launch and immutable after.
+    key_mode: str = "hippius"
+    guardian_endpoint: str = ""
+    guardian_pubkey: str = ""
 
 
 @dataclass
@@ -620,15 +777,468 @@ def check_netbird_userdata(
     return None
 
 
-def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
+def check_netbird_hostname(
+    *, enable: bool, hostname_template: str, vm_id: str
+) -> str | None:
+    """INTAKE-only rule: the NetBird hostname must render to exactly
+    `hippius-tenant-<vm_id>`. Returns an error message, or `None`.
+
+    Tenant peers are persistent, and the only way vali finds one to delete
+    (§24 `revoke_netbird`, the peer janitor) is that name. A custom
+    template would enrol a peer nothing ever revokes; one like
+    `hippius-tenant-{vm_id}-x` would also make the peer read, to the
+    janitor, as belonging to another vm_id. No caller sends one (the
+    backend and the synthetic monitor use the default).
+
+    Deliberately NOT applied by [`launch_on_miner`]: a relaunch rebuilds its
+    spec from the recorded launch, and a VM launched before this rule with
+    a custom template must still come back up.
+    """
+    if not enable:
+        return None
+    try:
+        rendered = hostname_template.format(vm_id=vm_id)
+    except (KeyError, IndexError, ValueError) as exc:
+        return f"netbird_hostname_template only supports {{vm_id}} ({exc})"
+    if rendered != effects.tenant_peer_name(vm_id):
+        return (
+            "netbird_hostname_template must render to "
+            f"{effects.tenant_peer_name('{vm_id}')!r} — the name the VM's "
+            "NetBird peer is revoked by"
+        )
+    return None
+
+
+def _netbird_key_is_persistent(vm_id: str) -> bool:
+    """Whether this launch's NetBird setup key may enrol a PERSISTENT peer.
+
+    Only a FIRST launch's may. A relaunch (power start, reboot-recovery —
+    both rebuild their spec from the VM's SUCCEEDED `LaunchJob`) boots the
+    same overlay, so the guest still holds its NetBird identity and LOGS IN
+    with it; the fresh key is never used. It is still a live credential in
+    a userdata the guest's root can read, and a persistent peer enrolled
+    with it — under any hostname — would outlive the VM, because revoke and
+    the janitor find peers by `hippius-tenant-<vm_id>` only. Minting it
+    ephemeral keeps such a peer to the old ~10-min-offline lifetime. (A
+    golden relaunch whose guest provably holds its identity gets no key at
+    all — `_netbird_relaunch_needs_no_key`.)
+
+    The discriminator is "a launch of this vm_id already SUCCEEDED" —
+    exactly the record both relaunch paths require, and read here so every
+    caller of `launch_on_miner` is covered without passing a flag. A first
+    launch's own job is still `running`; a first launch that failed and is
+    retried (as a new job, or a re-place / same-miner retry inside
+    `launch_vm`) has no succeeded job and stays persistent.
+
+    Trade-off: a VM whose FIRST boot never enrolled gets its peer from a
+    relaunch key, i.e. an ephemeral one — today's behaviour for that VM, no
+    worse. Making that case persistent would hand a tenant who withholds
+    enrolment a persistent spare key on every stop/start.
+    """
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+
+    return not LaunchJob.objects.filter(
+        vm_id=vm_id, state=LaunchJobState.SUCCEEDED.value
+    ).exists()
+
+
+#: What a relaunch that needs no NetBird key gets in place of one. A valid
+#: UUID (so `netbird up --setup-key-file` parses it) that NetBird never
+#: issued: the guest's `netbird up` LOGS IN with the identity it holds, and
+#: the client only sends a setup key when the management server says the
+#: peer is unknown — which is exactly the case this placeholder is never
+#: handed to.
+NO_NETBIRD_SETUP_KEY = "00000000-0000-0000-0000-000000000000"
+
+#: Upper bound on a relaunch key's lifetime (see `_netbird_key_ttl_s`).
+RELAUNCH_NETBIRD_KEY_TTL_S = 600
+
+
+def _netbird_relaunch_needs_no_key(spec: LaunchSpec, *, require_existing_disks: bool) -> bool:
+    """Whether this launch's guest provably already holds its NetBird
+    identity, so it is handed NO usable setup key.
+
+    The key rides the userdata, and the guest's root reads it back: from
+    the released seed and from cloud-init's own copies under
+    `/var/lib/cloud` (an M0 guest re-applies the userdata every boot). A
+    first launch's key is consumed by the enrolment (`usage_limit=1`), so
+    that copy is dead. A relaunch's key is NOT — the guest never uses it —
+    and stayed a live credential for its whole TTL: one more peer in the
+    tenant group, enrolled from any machine. This closes that window.
+
+    All three must hold, each for a reason:
+    - `require_existing_disks` — a relaunch (reboot-recovery, power start,
+      reboot) the miner refuses (`relaunch-disks-missing`) unless it boots
+      the VM's existing disks; a re-place or a retried first launch may
+      boot a blank overlay. (§25 mints nothing: it re-binds the userdata
+      already staged.)
+    - golden — the overlay upper is the guest's whole writable root, so
+      `/var/lib/netbird` (its WireGuard identity) is on what the miner
+      guarantees. A legacy VM's identity lives on the order-staged image.
+    - one of the VM's BOUND peers is persistent AND still exists at NetBird
+      — asked every time, never taken from vali's records alone: a peer
+      deleted at NetBird (an admin, a cleanup, a revoke) leaves the guest
+      an identity the management server rejects, and a guest handed no key
+      then is off the mesh for good. Persistent means NetBird's record says
+      `ephemeral: false` (a peer enrolled ephemeral and flipped since), or
+      it says nothing and vali minted the peer's key persistent; a record
+      saying `ephemeral: true` is never proof. Only bound peers count — a
+      peer's NAME is the hostname the guest sent, any tenant can send any
+      VM's. A NetBird failure proves nothing: a key is minted (fail-open
+      toward connectivity, at the relaunch TTL).
+    """
+    if not require_existing_disks or spec.disk_mode != _DISK_MODE_GOLDEN_VERITY:
+        return False
+    from apps.lifecycle.models import VmNetbirdKey
+
+    from ..netbird_binding import bindings_for
+
+    peer_ids = bindings_for([spec.vm_id])[spec.vm_id].ranked
+    if not peer_ids:
+        return False
+    minted_persistent = set(
+        VmNetbirdKey.objects.filter(vm__vm_id=spec.vm_id, persistent=True)
+        .exclude(peer_id="")
+        .values_list("peer_id", flat=True)
+    )
+    try:
+        peers = effects.list_netbird_peers()
+    except EffectError as exc:  # EffectUnavailable included
+        log.warning(
+            "launch: vm_id=%s NetBird peer listing failed (%s) — cannot prove the "
+            "guest's identity, minting a relaunch key",
+            spec.vm_id,
+            exc,
+        )
+        return False
+    for peer_id in peer_ids:
+        peer = effects.peer_by_id_from_listing(peers, peer_id)
+        if peer is None or peer.ephemeral is True:
+            continue
+        if peer.ephemeral is False or peer_id in minted_persistent:
+            return True
+    return False
+
+
+def _netbird_key_ttl_s(spec: LaunchSpec, *, persistent: bool) -> int:
+    """A first launch's key keeps the caller's TTL: a slow first boot must
+    still enrol. A relaunch's is capped at `RELAUNCH_NETBIRD_KEY_TTL_S` —
+    it is only ever needed by a guest re-enrolling during that boot, and it
+    sits readable in the guest's cloud-init state for as long as it lives
+    (`netbird_binding.revoke_unneeded_relaunch_keys` deletes it sooner once
+    the guest is back on its own identity)."""
+    ttl = int(spec.netbird_key_ttl_seconds)
+    return ttl if persistent else min(ttl, RELAUNCH_NETBIRD_KEY_TTL_S)
+
+
+def _record_netbird_key(
+    vm_row: Any, minted: effects.MintedSetupKey, *, persistent: bool, ttl_s: int
+) -> None:
+    """Record a minted setup key's id (never the key) against its VM."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.lifecycle.models import VmNetbirdKey
+
+    VmNetbirdKey.objects.create(
+        vm=vm_row,
+        setup_key_id=minted.id,
+        persistent=persistent,
+        expires_at=timezone.now() + timedelta(seconds=ttl_s),
+    )
+
+
+def data_disk_gb(spec: LaunchSpec) -> int:
+    """The VM's DATA disk (GiB): pinned on the spec (a resized VM), else
+    its flavor's."""
+    from apps.orchestration.services.flavors import resolve_flavor
+
+    return int(spec.data_disk_size_gb) or resolve_flavor(spec.flavor).data_disk_size_gb
+
+
+def _derive_measured_cmdline(
+    spec: LaunchSpec,
+    binding: customer_keys.GuardianBinding | None,
+    *,
+    disk_gb: int,
+    node_id_hex: str,
+    validator_nonce_hex: str,
+    telemetry_epoch: int,
+    eol_nonce_hex: str,
+) -> str:
+    """The MEASURED cmdline of a launch of `spec`, from its per-launch
+    inputs. Pure: no Vault, no DB write, no randomness. `launch_on_miner`
+    calls it with the real values; `_ensure_vm_row` calls it with
+    same-length stand-ins BEFORE it pins a new M1/M2 row (see
+    `_refuse_measured_cmdline_before_pin`), so a cmdline that would be
+    refused never burns the vm_id. Raises `LaunchConfigError` on a
+    malformed disk binding."""
+    # ── 4. cmdline augmentation (#296 / rootfs / #365 / golden-bake) ─
+    # Disk-integrity binding is mode-gated: legacy_luks → the LUKS-header
+    # MAC token (byte-identical to today); golden_verity_overlay → the
+    # dm-verity golden base's root hash (the luks token is dropped).
+    augmented_cmdline = _augment_disk_binding(spec.cmdline, spec)
+    # M0 untrusted-miner hardening: disable systemd credential import from
+    # the unmeasured SMBIOS/fw_cfg surfaces the miner controls. Applies to
+    # every disk_mode.
+    augmented_cmdline = _augment_guest_hardening(augmented_cmdline)
+    # Forced both ways: a base-cmdline `=1` must not turn the attestation on
+    # before the KBS accepts it, nor a `=0` keep it off once vali asks.
+    augmented_cmdline = _force_cmdline_token(
+        augmented_cmdline,
+        _ATTEST_RESOURCES_CMDLINE_KEY,
+        "1" if guest_resources.attest_on_launch() else None,
+    )
+    augmented_cmdline = _force_cmdline_token(
+        augmented_cmdline,
+        _ACCEPT_MEMORY_CMDLINE_KEY,
+        "eager" if guest_resources.accept_memory_eagerly() else None,
+    )
+    if spec.rootfs_sha256_hex:
+        augmented_cmdline = _augment_cmdline_with_token(
+            augmented_cmdline, _ROOTFS_SHA_CMDLINE_KEY, spec.rootfs_sha256_hex
+        )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _DISK_GB_CMDLINE_KEY, str(disk_gb)
+    )
+    # §7 — bake the lifecycle-key tmpfs path into the MEASURED cmdline so
+    # the guest's keyscript writes the released key there and the `eol`
+    # signer reads it. Measured ⇒ allowlist auto-pins (handled below).
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline,
+        _LIFECYCLE_KEY_PATH_CMDLINE_KEY,
+        _LIFECYCLE_KEY_TMPFS_PATH,
+    )
+
+    # §23 — bake the served-receipt telemetry inputs the guest agent needs
+    # to build each receipt (node_id / resource_class / family_id). Without
+    # these the guest's `Config::resolve` fails closed and no receipt is
+    # ever emitted, so uptime billing stays inert. `node_id` is the miner's
+    # 64-hex compute id (the guest hex-decodes it to the raw identity bytes
+    # vali keys the UsageAccrual ledger by); `resource_class` is the flavor
+    # tier; `family_id` is the tenant family as hex bytes.
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _NODE_ID_CMDLINE_KEY, node_id_hex
+    )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _RESOURCE_CLASS_CMDLINE_KEY, spec.flavor
+    )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _FAMILY_ID_CMDLINE_KEY, spec.tenant_id.encode().hex()
+    )
+
+    # §23 — bake the validator challenge so the guest's receipt loop
+    # actually BUILDS receipts (a `None` challenge idles the loop and emits
+    # nothing). vali verifies only the guest signature, so a launch-baked
+    # static challenge activates billing. validator_id is this validator's
+    # identity; the nonce is a fresh per-launch 32-byte anti-replay value;
+    # the epoch is the current billing epoch the receipts accrue to.
+    validator_id_hex = str(
+        getattr(settings, "VALI_TELEMETRY_VALIDATOR_ID_HEX", _DEFAULT_VALIDATOR_ID_HEX)
+    )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _VALIDATOR_ID_CMDLINE_KEY, validator_id_hex
+    )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline,
+        _VALIDATOR_NONCE_CMDLINE_KEY,
+        validator_nonce_hex,
+    )
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline,
+        _TELEMETRY_EPOCH_CMDLINE_KEY,
+        str(telemetry_epoch),
+    )
+
+    # ── 4a-bis. §24/§25 EOL identity + vali-reach — bake the inputs the
+    #            guest's `eol` signer needs to RESOLVE + DELIVER its
+    #            stopped-ack (vm_id / lease_id / vm_generation / vali_url).
+    #            Without these the guest logs `eol-inputs-unresolved` and
+    #            never produces an ack, so the §25 fence stalls at
+    #            `awaiting_source_ack`.
+    augmented_cmdline = _augment_eol_delivery_inputs(
+        augmented_cmdline, vm_id=spec.vm_id, lease_id=spec.lease_id
+    )
+
+    # ── 4b. §24/§25 EOL nonce — bake the SAME nonce into the measured
+    #        cmdline AND persist it on `Vm.eol_nonce` (GAP 3). The guest
+    #        signs THIS value into its StoppedAck on a clean shutdown;
+    #        `_verify_ack` checks the signature against the persisted
+    #        copy. Resolution order: an operator-baked `hippius.eol_nonce=`
+    #        token in the cmdline wins (already measured); else
+    #        `spec.eol_nonce_hex`; else a fresh per-launch mint. Whatever
+    #        ends up in the cmdline is reflected onto the Vm row so the
+    #        two can NEVER drift. Generation is the per-migration replay
+    #        guard (the KBS fence forever denies a migrated generation),
+    #        so a per-launch nonce — stable across reboots / the VM's
+    #        lifetime — is correct and is NOT re-minted at migration /
+    #        decommission (see `service.start_migration`).
+    augmented_cmdline = _augment_cmdline_with_token(
+        augmented_cmdline, _EOL_NONCE_CMDLINE_KEY, eol_nonce_hex
+    )
+
+    # ── 4c. Customer-held keys — the MEASURED guardian binding. Appended
+    #        here, BEFORE the length check, the preflight and the C2
+    #        recompute below, so the tokens are in the digest vali
+    #        recomputes, the miner reports and the allowlist pins — and in
+    #        what the guardian recomputes. M0 appends nothing
+    #        (byte-identical cmdline).
+    return customer_keys.augment_cmdline(augmented_cmdline, binding)
+
+
+def _measured_cmdline_refusal(
+    cmdline: str, binding: customer_keys.GuardianBinding | None
+) -> tuple[str, str] | None:
+    """`(outcome, message)` if the FINAL measured `cmdline` must not be
+    minted, else `None`."""
+    try:
+        # No cloud-init `cc:` / `end_cc` marker, whatever put it there (an
+        # input, or a config value an `_augment_*` step appended) — checked
+        # first so the refusal names it. Then the FINAL cmdline must carry
+        # exactly the spec's binding: an operator-baked token that disagrees
+        # (augmentation never overrides one), a guardian token on an M0
+        # cmdline, or anything else the guest's grammar refuses (incl. the
+        # other cloud-init directives) refuses here.
+        customer_keys.check_cloud_init_markers(binding, measured_cmdline=cmdline)
+        customer_keys.check_cmdline(cmdline, binding)
+    except customer_keys.CustomerKeysError as exc:
+        return "customer-keys-cmdline-refused", str(exc)
+    # Fail-closed on an over-long MEASURED cmdline: the guest's
+    # /proc/cmdline is OVMF's 14-byte `initrd=initrd ` + this, and the
+    # kernel keeps 2047 bytes of it while SEV measures the whole string, so
+    # a token past 2033 would boot a cmdline different from the one
+    # measured/pinned.
+    cmdline_len = len(cmdline.encode("utf-8"))
+    if cmdline_len > _MAX_CMDLINE_BYTES:
+        return (
+            "cmdline-too-long",
+            f"measured cmdline is {cmdline_len} bytes (> {_MAX_CMDLINE_BYTES}); "
+            "with OVMF's initrd= prefix the kernel would truncate it below the "
+            "measured length",
+        )
+    # H5b: the guest refuses to boot a /proc/cmdline of >= 2022 bytes
+    # (measured >= 2008) that has no `hippius.key_mode` token (it cannot
+    # tell an M0 launch from an M1/M2 one whose token the EFI stub cut
+    # off). M1/M2 always carry the token, so this band is only reachable by
+    # M0: refuse it here rather than dispatch a VM that can never boot.
+    if customer_keys.cmdline_may_hide_key_mode(cmdline):
+        return (
+            "cmdline-too-long",
+            f"measured cmdline is {cmdline_len} bytes (>= "
+            f"{customer_keys.KEY_MODE_TRUNCATION_FLOOR_MEASURED}) with no "
+            f"{customer_keys.KEY_MODE_TOKEN} token; the guest refuses to boot "
+            "such a cmdline (a key-mode token may have been truncated off)",
+        )
+    return None
+
+
+#: Same-length stand-ins for the per-launch cmdline values that are not
+#: known before the pin (the miner's 64-hex `chain_node_id`, the two
+#: 32-byte nonces). Hex, like the real values, so they add no marker.
+#: `launch_on_miner` refuses an M1/M2 launch on a miner whose
+#: `chain_node_id` is not 64 lowercase hex, so the stand-in is exact.
+_PRE_PIN_HEX64 = "0" * 64
+#: The billing epoch is an UPPER BOUND, not a sample: `launch_vm` refreshes
+#: the cached chain epoch between the pin and `launch_on_miner`, so a
+#: sample could gain digits. 20 digits = u64::MAX, so the pre-pin length is
+#: never shorter than the real one (at worst it refuses an M1/M2 cmdline
+#: within ~18 bytes of the 2033-byte measured limit that would have fitted:
+#: that margin is the epoch's growth room, and it moved down with the cap).
+_PRE_PIN_EPOCH_UPPER_BOUND = 2**64 - 1
+#: What a miner's `chain_node_id` must be for an M1/M2 launch.
+_CHAIN_NODE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _refuse_miner_for_customer_keys(
+    binding: customer_keys.GuardianBinding | None, miner: MinerIdentity
+) -> None:
+    """The miner's `chain_node_id` goes into the measured cmdline, and the
+    pre-pin check stands in for it with 64 hex (it is not known when
+    `launch_vm` pins; the scheduler only picks miners by their 64-hex
+    on-chain node id). An M1/M2 launch therefore requires exactly that
+    shape, so nothing the miner contributes can differ from what the pin
+    checked. Every caller that knows the miner runs this BEFORE it pins a
+    row or writes a placement. No-op for M0."""
+    if binding is not None and not _CHAIN_NODE_ID_RE.match(miner.chain_node_id or ""):
+        raise LaunchConfigError(
+            f"miner {miner.miner_id!r} has no 64-hex chain_node_id; "
+            f"key_mode={binding.mode} launches only on a registered compute node"
+        )
+
+
+def _refuse_measured_cmdline_before_pin(
+    spec: LaunchSpec, binding: customer_keys.GuardianBinding | None
+) -> None:
+    """Customer-held keys: run the measured-cmdline refusals BEFORE a new
+    M1/M2 `Vm` row pins the mode, so a cmdline that could never be minted
+    (a `cc:` / `end_cc` marker a config-derived `_augment_*` value put
+    there, a guardian binding the base cmdline contradicts, a length past
+    the limit) refuses the launch without burning the vm_id.
+
+    `launch_on_miner` runs the same refusals on the real cmdline; this is
+    the same derivation with same-length stand-ins for the values not known
+    yet, and an upper bound for the billing epoch. No-op for M0."""
+    if binding is None:
+        return
+
+    eol_nonce_hex = (
+        spec.eol_nonce_hex
+        or _extract_cmdline_token(spec.cmdline, _EOL_NONCE_CMDLINE_KEY)
+        or _PRE_PIN_HEX64
+    )
+    cmdline = _derive_measured_cmdline(
+        spec,
+        binding,
+        disk_gb=data_disk_gb(spec),
+        node_id_hex=_PRE_PIN_HEX64,
+        validator_nonce_hex=_PRE_PIN_HEX64,
+        telemetry_epoch=_PRE_PIN_EPOCH_UPPER_BOUND,
+        eol_nonce_hex=eol_nonce_hex,
+    )
+    refusal = _measured_cmdline_refusal(cmdline, binding)
+    if refusal is not None:
+        raise LaunchConfigError(f"{refusal[0]}: {refusal[1]}")
+
+
+def launch_on_miner(
+    spec: LaunchSpec,
+    miner: MinerIdentity,
+    *,
+    generation: int = _LAUNCH_GENERATION,
+    require_existing_disks: bool = False,
+    supersede: bool = False,
+    launch_ref: str = "",
+) -> LaunchOutcome:
     """Run the full launch choreography for ONE miner. Never raises for a
     step failure — returns a typed [`LaunchOutcome`]; raises
     [`LaunchConfigError`] only for caller-fixable misconfiguration.
+
+    `supersede` (a resize relaunch, after vali confirmed the VM stopped)
+    mints the ticket with the `supersede` lifecycle perm: the KBS makes
+    this launch the VM's current one at register, so every earlier launch's
+    ticket — the pre-resize one — is refused before this one is even
+    dispatched (`kbs_core::lifecycle::check_current_launch`). Every other
+    launch becomes current at its first release: a same-miner retry
+    answered `already-launched` must not strand the domain that runs.
+
+    `generation` is the KBS generation the ticket is minted at: the launch
+    generation for a fresh VM, the VM's CURRENT generation for a relaunch
+    of one that §25 moved (its KEK is releasable only there). The measured
+    cmdline keeps the launch generation either way — the guest signs its
+    acks at it for life, and a §25 destination boots the same measurement.
+
+    `require_existing_disks` — set by a RELAUNCH of a VM that already ran
+    on `miner`: the miner refuses (class `relaunch-disks-missing`) rather
+    than create blank per-VM disks. See `order_dispatch.build_launch_payload`.
+
+    `launch_ref` is written on this launch's `MeasurementLedger` row (a
+    guest upgrade links its attempt to its pin by it).
     """
     # vm_id is interpolated into Vault KV paths below — charset-lock it so
     # neither the CLI nor the API can path-traverse out of the per-VM
     # Vault namespace. (The API also rejects this earlier, at intake.)
-    if not _VM_ID_RE.match(spec.vm_id):
+    if not _VM_ID_RE.fullmatch(spec.vm_id):
         raise LaunchConfigError(
             "vm_id must match [a-z0-9-]{1,64} (no path separators)"
         )
@@ -637,6 +1247,15 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             f"miner {miner.miner_id!r} has no netbird_ip — register via "
             "PR #120 first"
         )
+    # Customer-held keys: the binding (None ⇒ M0) — grammar-validated and
+    # golden-only. M2 has NO Hippius-held KEK, so a caller handing one in
+    # is refused before anything is staged.
+    binding = _spec_binding(spec)
+    if not customer_keys.releases_kek(binding) and spec.kek_bytes is not None:
+        raise LaunchConfigError(
+            "key_mode=customer holds no Hippius disk KEK — refusing kek_bytes"
+        )
+    _refuse_miner_for_customer_keys(binding, miner)
 
     # ── 0. the control-plane row, BEFORE any effect that can leave a
     #        running domain behind (P9/#18) ─────────────────────────────
@@ -671,7 +1290,32 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     # misconfiguration still creates nothing, and BEFORE the Vault staging
     # so there is no window in which secrets/tickets/domains exist for a
     # vm_id with no row.
-    _ensure_vm_row(spec)
+    vm_row = _ensure_vm_row(spec)
+    # The register gate (step 8) decides this under the row lock at the
+    # end; asking the same question here first spares a launch that can
+    # never register — above all reboot-recovery of a §25-migrated VM
+    # (generation >= 2 vs the launch's `_LAUNCH_GENERATION`), or a row
+    # bound to another miner — all the Vault staging, preflight and bake
+    # work before it is refused anyway.
+    # The guest components floor (docs/design/guest-component-rollout.md,
+    # G3): never a launch of a set below the VM's required epoch, whoever
+    # asks for it (power start, reboot-recovery, a guest upgrade's own
+    # rollback), whatever disk mode the spec claims. Asked here before
+    # anything is staged, and again by the register gate under the row lock
+    # right before the KBS call (a floor raised meanwhile is seen there).
+    from . import guest_components
+
+    epoch_refusal = guest_components.launch_epoch_refusal(spec.vm_id, spec.initrd_sha256_hex)
+    if epoch_refusal:
+        return _terminal("guest-epoch-below-required", epoch_refusal, EXIT_KBS_ADMIN_FAILURE)
+    early_refusal = register_gate.register_refusal(
+        vm_row,
+        generation=generation,
+        miner_id=miner.miner_id,
+        initrd_sha256_hex=spec.initrd_sha256_hex,
+    )
+    if early_refusal is not None:
+        return _terminal("kbs-admin-vm-state-refused", early_refusal, EXIT_KBS_ADMIN_FAILURE)
 
     # ── C2 fail-closed posture ──────────────────────────────────────
     # If launch-digest ENFORCE is on, the independent recompute MUST be
@@ -700,6 +1344,22 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     # (`target_miner_id` ~= `[miner].miner_id`, case-insensitive). It is
     # the HUMAN miner_id, never a hex key.
     node_id = miner.miner_id
+    # A launch that names a `platform_id` must land on THAT chip: the ticket
+    # binds its VCEK and the C2 recompute uses its CPU family, so on any
+    # other host it fails late (`launch-digest-mismatch`) or boots a guest
+    # the KBS will never release to. Placement already honours the pin;
+    # this refuses the explicit-miner paths (CLI, tests) before anything
+    # is minted or registered.
+    if (
+        spec.platform_id
+        and spec.platform_id.strip().lower() != (miner.platform_id or "").strip().lower()
+    ):
+        return _terminal(
+            "platform-id-mismatch",
+            f"launch names platform_id {spec.platform_id[:16]}… but miner "
+            f"{miner.miner_id} is registered with a different one",
+            EXIT_CONFIG_ERROR,
+        )
     platform_id = spec.platform_id or miner.platform_id
 
     # mutable secret-bearing copies we own + zeroize here.
@@ -717,23 +1377,41 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         if nb_err is not None:
             return _terminal("netbird-bad-userdata", nb_err, EXIT_NETBIRD_FAILURE)
         nb_hostname = spec.netbird_hostname_template.format(vm_id=spec.vm_id)
-        try:
-            nb_key = effects.mint_netbird_setup_key(
-                vm_id=spec.vm_id,
-                tenant_id=spec.tenant_id,
-                auto_group_name=spec.netbird_group,
-                expires_in_seconds=int(spec.netbird_key_ttl_seconds),
-            )
-        except (EffectUnavailable, EffectError) as exc:
-            return _terminal(
-                "netbird-mint-failure", str(exc), EXIT_NETBIRD_FAILURE
-            )
+        if _netbird_relaunch_needs_no_key(spec, require_existing_disks=require_existing_disks):
+            # Nothing minted, nothing recorded: there is no key to trace.
+            nb_key = NO_NETBIRD_SETUP_KEY
+        else:
+            persistent = _netbird_key_is_persistent(spec.vm_id)
+            ttl_s = _netbird_key_ttl_s(spec, persistent=persistent)
+            try:
+                minted = effects.mint_netbird_setup_key(
+                    vm_id=spec.vm_id,
+                    tenant_id=spec.tenant_id,
+                    auto_group_name=spec.netbird_group,
+                    persistent=persistent,
+                    expires_in_seconds=ttl_s,
+                )
+            except (EffectUnavailable, EffectError) as exc:
+                return _terminal(
+                    "netbird-mint-failure", str(exc), EXIT_NETBIRD_FAILURE
+                )
+            # Recorded BEFORE the key leaves vali: whatever peer enrols with
+            # it, under whatever name, is then traceable to this VM
+            # (`netbird_binding`), so §24 and the janitor can delete it by id.
+            _record_netbird_key(vm_row, minted, persistent=persistent, ttl_s=ttl_s)
+            nb_key = minted.key
         userdata = userdata.replace(
             b"{{NETBIRD_SETUP_KEY}}", nb_key.encode("utf-8")
         )
         userdata = userdata.replace(
             b"{{NETBIRD_HOSTNAME}}", nb_hostname.encode("utf-8")
         )
+        # M1/M2: the overlay must not let Hippius' NetBird management
+        # plane steer the guest's DNS or routes. M0: unchanged bytes.
+        try:
+            userdata = customer_keys.harden_netbird_up(binding, userdata)
+        except customer_keys.CustomerKeysError as exc:
+            return _terminal("netbird-bad-userdata", str(exc), EXIT_NETBIRD_FAILURE)
         try:
             nb_key = "\x00" * len(nb_key)
         except Exception:
@@ -747,6 +1425,9 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
 
     luks_path = f"{prefix}/{spec.vm_id}/luks-kek"
     userdata_path = f"{prefix}/{spec.vm_id}/userdata"
+    # vali's own working copy of the same bytes — see
+    # `stage_userdata_working_copy`.
+    userdata_working_path = f"{prefix}/{spec.vm_id}/userdata-pending"
     # §7: the KBS DERIVES this path from the luks path (swaps the final
     # `luks-kek` segment for `lifecycle-key`) — keep the two in lockstep.
     lifecycle_path = f"{prefix}/{spec.vm_id}/lifecycle-key"
@@ -764,6 +1445,20 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             vault_kv.ensure_transit_key(transit_key)
             wrapped = vault_kv.transit_encrypt(transit_key, kek_bytes)
             luks_version = vault_kv.put_kv(mount, luks_path, wrapped).version
+        elif not customer_keys.releases_kek(binding):
+            # M2 (`customer`): NO disk KEK exists — nothing was generated
+            # or staged at `luks_path`, and nothing is read from it here.
+            # The ticket still names the canonical path (the schema needs
+            # a ref and the KBS derives the lifecycle-key path from it) at
+            # the constant M2 version; the KBS never reads it in M2.
+            # `kek-<vm_id>` is still created by `_stage_userdata` below —
+            # it wraps the userdata. A KEK some earlier attempt left at the
+            # path (metadata probe only) is refused, never launched beside.
+            try:
+                customer_keys.assert_no_provider_kek(mount, luks_path)
+            except customer_keys.CustomerKeysError as exc:
+                raise EffectError(str(exc)) from exc
+            luks_version = customer_keys.M2_LUKS_REF_VERSION
         else:
             # ASYNC launch path: the KEK is ALREADY staged at the canonical
             # `luks_path` by the caller (the launch API enforces
@@ -772,7 +1467,26 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             # C1 / KEK-HSM-Phase-1 win: vali (and thus a vali/node RCE) can
             # no longer read a tenant disk KEK back out of Vault.
             luks_version = vault_kv.latest_version(mount, luks_path)
-        ud_v = vault_kv.put_kv(mount, userdata_path, userdata)
+        ud_v = _stage_userdata(mount, userdata_path, spec.vm_id, userdata)
+        # Re-stage vali's working copy with the SUBSTITUTED bytes, so it
+        # holds what the canonical copy holds. Intake staged the template
+        # (it had no NetBird key yet); the §6 digest binds the substituted
+        # form, and the §25 / KBS-recovery re-mint re-derives that digest
+        # from this copy — it is the only one vali can open. A template
+        # here would digest bytes the guest never receives, i.e. a
+        # migration that reports Done and a VM that cannot unlock.
+        #
+        # After the canonical write on purpose: that is the copy the
+        # ticket binds, so a failure between the two aborts the launch
+        # rather than leaving a working copy that claims to describe a
+        # canonical version nobody staged.
+        stage_userdata_working_copy(
+            mount,
+            userdata_working_path,
+            spec.vm_id,
+            userdata,
+            canonical_version=ud_v.version,
+        )
     except (EffectUnavailable, EffectError) as exc:
         return _terminal("vault-failure", str(exc), EXIT_VAULT_FAILURE)
     finally:
@@ -864,102 +1578,33 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     except Exception:
         pass
 
-    # ── 4. cmdline augmentation (#296 / rootfs / #365 / golden-bake) ─
-    # Disk-integrity binding is mode-gated: legacy_luks → the LUKS-header
-    # MAC token (byte-identical to today); golden_verity_overlay → the
-    # dm-verity golden base's root hash (the luks token is dropped).
-    augmented_cmdline = _augment_disk_binding(spec.cmdline, spec)
-    if spec.rootfs_sha256_hex:
-        augmented_cmdline = _augment_cmdline_with_token(
-            augmented_cmdline, _ROOTFS_SHA_CMDLINE_KEY, spec.rootfs_sha256_hex
-        )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _DISK_GB_CMDLINE_KEY, str(flavor.data_disk_size_gb)
-    )
-    # §7 — bake the lifecycle-key tmpfs path into the MEASURED cmdline so
-    # the guest's keyscript writes the released key there and the `eol`
-    # signer reads it. Measured ⇒ allowlist auto-pins (handled below).
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline,
-        _LIFECYCLE_KEY_PATH_CMDLINE_KEY,
-        _LIFECYCLE_KEY_TMPFS_PATH,
-    )
-
-    # §23 — bake the served-receipt telemetry inputs the guest agent needs
-    # to build each receipt (node_id / resource_class / family_id). Without
-    # these the guest's `Config::resolve` fails closed and no receipt is
-    # ever emitted, so uptime billing stays inert. `node_id` is the miner's
-    # 64-hex compute id (the guest hex-decodes it to the raw identity bytes
-    # vali keys the UsageAccrual ledger by); `resource_class` is the flavor
-    # tier; `family_id` is the tenant family as hex bytes.
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _NODE_ID_CMDLINE_KEY, miner.chain_node_id
-    )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _RESOURCE_CLASS_CMDLINE_KEY, spec.flavor
-    )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _FAMILY_ID_CMDLINE_KEY, spec.tenant_id.encode().hex()
-    )
-
-    # §23 — bake the validator challenge so the guest's receipt loop
-    # actually BUILDS receipts (a `None` challenge idles the loop and emits
-    # nothing). vali verifies only the guest signature, so a launch-baked
-    # static challenge activates billing. validator_id is this validator's
-    # identity; the nonce is a fresh per-launch 32-byte anti-replay value;
-    # the epoch is the current billing epoch the receipts accrue to.
-    validator_id_hex = str(
-        getattr(settings, "VALI_TELEMETRY_VALIDATOR_ID_HEX", _DEFAULT_VALIDATOR_ID_HEX)
-    )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _VALIDATOR_ID_CMDLINE_KEY, validator_id_hex
-    )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline,
-        _VALIDATOR_NONCE_CMDLINE_KEY,
-        secrets.token_bytes(32).hex(),
-    )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline,
-        _TELEMETRY_EPOCH_CMDLINE_KEY,
-        str(_current_billing_epoch()),
-    )
-
-    # ── 4a-bis. §24/§25 EOL identity + vali-reach — bake the inputs the
-    #            guest's `eol` signer needs to RESOLVE + DELIVER its
-    #            stopped-ack (vm_id / lease_id / vm_generation / vali_url).
-    #            Without these the guest logs `eol-inputs-unresolved` and
-    #            never produces an ack, so the §25 fence stalls at
-    #            `awaiting_source_ack`.
-    augmented_cmdline = _augment_eol_delivery_inputs(
-        augmented_cmdline, vm_id=spec.vm_id, lease_id=spec.lease_id
-    )
-
-    # ── 4b. §24/§25 EOL nonce — bake the SAME nonce into the measured
-    #        cmdline AND persist it on `Vm.eol_nonce` (GAP 3). The guest
-    #        signs THIS value into its StoppedAck on a clean shutdown;
-    #        `_verify_ack` checks the signature against the persisted
-    #        copy. Resolution order: an operator-baked `hippius.eol_nonce=`
-    #        token in the cmdline wins (already measured); else
-    #        `spec.eol_nonce_hex`; else a fresh per-launch mint. Whatever
-    #        ends up in the cmdline is reflected onto the Vm row so the
-    #        two can NEVER drift. Generation is the per-migration replay
-    #        guard (the KBS fence forever denies a migrated generation),
-    #        so a per-launch nonce — stable across reboots / the VM's
-    #        lifetime — is correct and is NOT re-minted at migration /
-    #        decommission (see `service.start_migration`).
+    # ── 4. the MEASURED cmdline (`_derive_measured_cmdline`) ─────────
+    validator_nonce_hex = secrets.token_bytes(32).hex()
+    # §24/§25 EOL nonce: an operator-baked `hippius.eol_nonce=` token in
+    # the cmdline wins (already measured); else `spec.eol_nonce_hex`; else a
+    # fresh per-launch mint. Whatever ends up in the cmdline is reflected
+    # onto `Vm.eol_nonce` below so the two can NEVER drift.
     nonce_seed = (
         spec.eol_nonce_hex
         or _extract_cmdline_token(spec.cmdline, _EOL_NONCE_CMDLINE_KEY)
         or secrets.token_bytes(32).hex()
     )
-    augmented_cmdline = _augment_cmdline_with_token(
-        augmented_cmdline, _EOL_NONCE_CMDLINE_KEY, nonce_seed
+    augmented_cmdline = _derive_measured_cmdline(
+        spec,
+        binding,
+        disk_gb=data_disk_gb(spec),
+        node_id_hex=miner.chain_node_id,
+        validator_nonce_hex=validator_nonce_hex,
+        telemetry_epoch=_current_billing_epoch(),
+        eol_nonce_hex=nonce_seed,
     )
     effective_eol_nonce_hex = _extract_cmdline_token(
         augmented_cmdline, _EOL_NONCE_CMDLINE_KEY
     )
     _persist_eol_nonce(spec.vm_id, effective_eol_nonce_hex)
+    refusal = _measured_cmdline_refusal(augmented_cmdline, binding)
+    if refusal is not None:
+        return _terminal(refusal[0], refusal[1], EXIT_CONFIG_ERROR)
 
     # ── 5. Preflight (miner-side fetch + SNP launch_digest) ─────────
     #
@@ -984,6 +1629,21 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     except (EffectUnavailable, EffectError) as exc:
         # A preflight rejection means THIS miner could not stage/verify
         # the artefacts — retriable: the scheduler re-places elsewhere.
+        if _preflight_refusal_is_disk(exc):
+            # 507 `insufficient-disk` BEFORE the KBS register: no room for
+            # this VM's DATA disk (declared budget or measured free space).
+            # A CAPACITY refusal — nothing about SEV is recorded (the
+            # preflight never is) — and, since vali placed it within the
+            # disk budget the host let it compute, it cuts an `earned`
+            # miner's DISK ceiling. The RETRIABLE below re-places.
+            _record_capacity_event(miner, "disk-insufficient", incident=f"vm={spec.vm_id}")
+        elif _preflight_refusal_is_capacity(exc):
+            # The host told us it is full: an `earned` miner's ceiling
+            # drops to what it holds (capacity v2 §3). Keyed on the node
+            # vali dispatched to, never on anything the miner sent.
+            _record_capacity_event(
+                miner, "preflight-insufficient", incident=f"vm={spec.vm_id}"
+            )
         return LaunchOutcome(
             disposition=RETRIABLE,
             emit={
@@ -995,6 +1655,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         )
 
     measurement_hex = spec.measurement_hex or preflight_result.launch_digest_hex
+    recomputed = False
 
     # ── 5b. C2: independent launch-digest recompute ─────────────────
     # vali recomputes the digest a HONEST guest MUST produce from its OWN
@@ -1016,6 +1677,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
                 cmdline=augmented_cmdline,
                 cpu_count=flavor.cpu_count,
                 platform_id=platform_id or "",
+                snp_generation=miner.snp_generation,
             )
         except launch_digest_svc.LaunchDigestUnavailable:
             expected_digest = None
@@ -1033,6 +1695,22 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             expected_digest = None
 
         if expected_digest is not None:
+            # An explicitly supplied measurement is a caller override that is
+            # pinned + ticketed AS-IS while the guest boots `augmented_cmdline`.
+            # If it does not match vali's recompute of THAT cmdline, the pin
+            # and ticket carry a digest the guest can never produce →
+            # guaranteed KBS denial. Refuse loudly rather than launch a brick.
+            # Production never supplies measurement_hex (0/100 live launches),
+            # so this only guards an operator/dev override gone stale — e.g.
+            # after a measured-cmdline change like systemd.import_credentials=no.
+            if spec.measurement_hex and spec.measurement_hex.lower() != expected_digest:
+                return _terminal(
+                    "explicit-measurement-stale",
+                    f"supplied measurement_hex {spec.measurement_hex.lower()} != "
+                    f"vali recompute {expected_digest} of the measured cmdline; "
+                    "refusing to pin/ticket a digest the guest will not produce",
+                    EXIT_MEASUREMENT_MISMATCH,
+                )
             miner_digest = (preflight_result.launch_digest_hex or "").lower()
             if expected_digest != miner_digest:
                 if launch_digest_svc.enforce():
@@ -1065,72 +1743,149 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             # operator override was supplied).
             if launch_digest_svc.enforce() and not spec.measurement_hex:
                 measurement_hex = expected_digest
+                recomputed = True
 
     # ── 6. Allowlist re-pin (optional) ──────────────────────────────
+    # The pin also records the digest in the audit ledger (#587 Phase 3,
+    # GET /v1/admin/audit/measurements) under its lock: the next pin's
+    # carry-forward reads that row, and the live-attestation ingest
+    # refuses a VM with none (`vm_liveness.pinned_measurements`). A tenant
+    # launch always pins under the tenant class.
     pin_result = None
     if spec.auto_pin_allowlist:
         try:
             pin_result = allowlist_pin.pin_measurement(
-                measurement_hex=measurement_hex
+                measurement_hex=measurement_hex,
+                ledger=allowlist_pin.PinLedger(
+                    vm_id=spec.vm_id,
+                    platform_id=platform_id or "",
+                    node_id=node_id or "",
+                    flavor=spec.flavor,
+                    attests_resources=_cmdline_has_token(
+                        augmented_cmdline, _ATTEST_RESOURCES_CMDLINE_KEY, "1"
+                    ),
+                    accepts_memory_eagerly=_cmdline_has_token(
+                        augmented_cmdline, _ACCEPT_MEMORY_CMDLINE_KEY, "eager"
+                    ),
+                    recomputed=recomputed,
+                    launch_ref=launch_ref,
+                ),
+            )
+        except allowlist_pin.AllowlistPinBusy as exc:
+            # Other pins held the lock past its wait: nothing was signed and
+            # the KBS is not registered yet, so this is retriable — a
+            # re-place re-pins, a reboot-recovery relaunch retries on its
+            # backoff. Terminal would fail the tail of a burst of starts.
+            return LaunchOutcome(
+                disposition=RETRIABLE,
+                # The literal, not `ALLOWLIST_PIN_BUSY`: the outcome drift guard
+                # (`scheduler/tests/test_reasons.py`) reads literals.
+                emit={"ok": False, "outcome": "allowlist-pin-busy", "error": str(exc)},
+                exit_code=EXIT_ALLOWLIST_FAILURE,
             )
         except (EffectUnavailable, EffectError) as exc:
             return _terminal(
                 "allowlist-pin-failure", str(exc), EXIT_ALLOWLIST_FAILURE
             )
-        # #587 Phase 3 — append the pinned digest to the audit ledger
-        # (GET /v1/admin/audit/measurements). Best-effort: the KBS pin
-        # above is the authoritative record; a ledger write failure must
-        # never fail an otherwise-good launch.
-        try:
-            MeasurementLedger.objects.create(
-                vm_id=spec.vm_id,
-                launch_digest_hex=measurement_hex,
-                platform_id=platform_id or "",
-                node_id=node_id or "",
-                allowlist_epoch=pin_result.new_epoch,
-                allowlist_sha256=pin_result.new_cose_sha256_hex,
-                # A tenant launch always pins under the tenant class;
-                # recording it lets the carry-forward veto a class flip.
-                measurement_class=allowlist_pin.ALLOWLIST_CLASS_TENANT,
-            )
-        except Exception as exc:  # noqa: BLE001 — audit is non-load-bearing
-            log.warning(
-                "measurement-ledger write failed (non-fatal) vm=%s: %s",
-                spec.vm_id,
-                exc,
-            )
 
     # ── 7. Mint the L1 OrderTicket ──────────────────────────────────
     try:
-        cose_ticket = ticket_mint.mint(
-            ticket_mint.MintArgs(
-                kid=spec.kid,
-                ticket_id=ticket_id,
-                tenant_id=spec.tenant_id,
-                user_id=spec.user_id,
-                vm_id=spec.vm_id,
-                lease_id=spec.lease_id,
-                node_id=node_id,
-                platform_id=platform_id,
-                allowed_measurement_hex=measurement_hex,
-                userdata_vault_path=userdata_path,
-                userdata_vault_version=ud_v.version,
-                luks_vault_path=luks_path,
-                luks_vault_version=luks_version,
-                allowed_userdata_digest_hex=digest_hex,
-                flavor=spec.flavor,
-                lifecycle_perm=("launch",),
-                expiry_seconds=spec.expiry_seconds,
-            )
+        mint_args = ticket_mint.MintArgs(
+            kid=spec.kid,
+            ticket_id=ticket_id,
+            tenant_id=spec.tenant_id,
+            user_id=spec.user_id,
+            vm_id=spec.vm_id,
+            lease_id=spec.lease_id,
+            node_id=node_id,
+            platform_id=platform_id,
+            allowed_measurement_hex=measurement_hex,
+            userdata_vault_path=userdata_path,
+            userdata_vault_version=ud_v.version,
+            luks_vault_path=luks_path,
+            luks_vault_version=luks_version,
+            allowed_userdata_digest_hex=digest_hex,
+            flavor=spec.flavor,
+            lifecycle_perm=("launch", _SUPERSEDE_PERM) if supersede else ("launch",),
+            expiry_seconds=spec.expiry_seconds,
+            # The generation the KBS releases this VM's KEK at; the
+            # register gate and the entry check compare the Vm row against
+            # the same value.
+            vm_generation=generation,
+            # Customer-held keys: signed into the ticket for M1/M2 only
+            # (the KBS pins it at register and gates the KEK release on
+            # it); M0 passes no flag — byte-identical ticket.
+            key_mode=customer_keys.ticket_key_mode(binding),
+        )
+        cose_ticket = ticket_mint.mint(mint_args)
+        # Recorded BEFORE anything can release against it: the KBS evidence
+        # names only the ticket_id it granted, and a §25 stranded-VM restore
+        # refuses any grant vali has no record of — so an unrecorded launch
+        # ticket leaves the VM down after its first failed migration.
+        from .migration_ticket import persist_intake
+
+        persist_intake(
+            cose_ticket,
+            vm_id=spec.vm_id,
+            generation=mint_args.vm_generation,
+            ticket_id=ticket_id,
+            received_from="system:launch",
+            expected_key_mode=mint_args.key_mode,
         )
     except (EffectUnavailable, EffectError) as exc:
         return _terminal("mint-failure", str(exc), EXIT_MINT_FAILURE)
 
     # ── 8. kbs-admin register ───────────────────────────────────────
-    try:
-        admin_ok = kbs_admin.register_vm_active_with_vm_id(
+    #
+    # Re-checked under the Vm row lock, held across the KBS call: this
+    # function runs for many minutes after `_ensure_vm_row`'s entry check
+    # (Vault staging, preflight, bake), and reboot-recovery reaches it for
+    # a VM that has a live history. A §24 decommission or §25 migration
+    # that started meanwhile — or a placement that moved — must never be
+    # re-bound at the KBS by this late call. Refused BEFORE the register,
+    # so the outcome is a plain pre-register terminal.
+    def register() -> kbs_admin.KbsAdminRegisterOk | None:
+        if mint_args.vm_generation != _LAUNCH_GENERATION and supersede:
+            # A resize of a VM §25 moved: the KBS accepts a SUPERSEDING
+            # register against the `Migrating` row that admits this
+            # (generation, host, lease) without touching it, and makes
+            # this launch current — the pre-resize ticket is refused from
+            # here on. A KBS that predates that answers 409, and the
+            # relaunch fails like any refused register (KBS first, then
+            # vali): falling back to an unregistered launch would let a
+            # later retry, once the KBS has it, strand this one if it
+            # comes up.
+            return kbs_admin.register_vm_active_with_vm_id(
+                vm_id=spec.vm_id, cose_ticket=cose_ticket
+            )
+        if mint_args.vm_generation != _LAUNCH_GENERATION:
+            # A relaunch of a VM §25 moved: its KBS row is the
+            # `Migrating{new_gen, dest, lease}` the last activate wrote,
+            # which admits exactly this (generation, host, lease) — as it
+            # does for that hop's destination, whose re-minted ticket is
+            # never registered either. `register-vm` would 409 against it
+            # (it only writes `Active`). Nothing to bind; the KBS still
+            # checks the ticket against its own row at release.
+            return None
+        return kbs_admin.register_vm_active_with_vm_id(
             vm_id=spec.vm_id, cose_ticket=cose_ticket
         )
+
+    try:
+        admin_ok = register_gate.register_under_vm_lock(
+            spec.vm_id,
+            generation=mint_args.vm_generation,
+            miner_id=miner.miner_id,
+            register=register,
+            initrd_sha256_hex=spec.initrd_sha256_hex,
+        )
+    except register_gate.RegisterRefused as exc:
+        outcome = (
+            "guest-epoch-below-required"
+            if "guest-epoch-below-required" in str(exc)
+            else "kbs-admin-vm-state-refused"
+        )
+        return _terminal(outcome, str(exc), EXIT_KBS_ADMIN_FAILURE)
     except kbs_admin.KbsAdminConflict as exc:
         return _terminal(
             "kbs-admin-conflict", str(exc), EXIT_KBS_ADMIN_FAILURE
@@ -1146,12 +1901,20 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     except EffectError as exc:
         return _terminal("kbs-admin-error", str(exc), EXIT_KBS_ADMIN_FAILURE)
 
-    log.info(
-        "kbs-admin: registered vm_id=%s gen=%s cached=%s",
-        admin_ok.vm_id,
-        admin_ok.vm_generation,
-        admin_ok.cached,
-    )
+    if admin_ok is None:
+        log.info(
+            "kbs-admin: vm_id=%s relaunched at gen=%s — bound by its last §25 "
+            "activate, not re-registered",
+            spec.vm_id,
+            mint_args.vm_generation,
+        )
+    else:
+        log.info(
+            "kbs-admin: registered vm_id=%s gen=%s cached=%s",
+            admin_ok.vm_id,
+            admin_ok.vm_generation,
+            admin_ok.cached,
+        )
 
     # From HERE on, this vm_id is PERMANENTLY bound at the KBS to THIS
     # miner's host: the anti-migration CAS fence means no other host can
@@ -1171,6 +1934,22 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         out.registered = True
         return out
 
+    if (
+        admin_ok is not None
+        and supersede
+        and not _mark_superseded_at_register(spec.vm_id, measurement_hex)
+    ):
+        # Nothing is dispatched without the mark: a retry that does not know
+        # this register landed would supersede again, and strand this launch
+        # if it came up. Not dispatched ⇒ nothing can come up, so the retry
+        # superseding again is safe.
+        return _terminal_after_register(
+            "supersede-mark-failed",
+            "the KBS made this launch current but vali could not record it — "
+            "not dispatched; a retry supersedes again",
+            EXIT_KBS_ADMIN_FAILURE,
+        )
+
     # ── 9. Dispatch the launch order ────────────────────────────────
     #
     # GOLDEN (golden-bake PR4): vdb/vdc point at the miner-staged golden
@@ -1184,7 +1963,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     # path. `spec.rootfs_data_path` defaults to
     # `/var/lib/hippius-miner/rootfs.img`: fixed, shared and MUTABLE. On
     # 2026-08-13 that one path was a symlink into the shared legacy base
-    # on miner-2 and a real 709 MB 2026-07-29 file on miner-3 — the same
+    # on one host and a real 709 MB 2026-07-29 file on another — the same
     # spec resolving to two different operating systems. Falling back to
     # it made the divergence invisible AND aimed the launch at bytes some
     # other VM may be booting. There is nothing to fall back TO: the
@@ -1213,16 +1992,43 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         cmdline=augmented_cmdline,
         luks_disk_path=preflight_result.luks_disk_path,
         luks_disk_size_gb=flavor.luks_disk_size_gb,
-        data_disk_size_gb=flavor.data_disk_size_gb,
+        data_disk_size_gb=data_disk_gb(spec),
         rootfs_data_path=rootfs_data_path,
         rootfs_hash_path=rootfs_hash_path,
         cpu_count=flavor.cpu_count,
         memory_mb=flavor.memory_mb,
         cose_ticket=cose_ticket,
+        require_existing_disks=require_existing_disks,
     )
     import json as _json
 
     payload_json = _json.dumps(payload).encode("utf-8")
+    # What this order boots, carried on EVERY outcome from here on: a
+    # dispatch answered as failed may have booted all the same (an Edge
+    # timeout, a ticket push that failed), and a retry the miner answers
+    # `already-launched` then needs the boot that runs, not its own.
+    dispatched_boot: dict[str, Any] = {
+        "measurement_hex": measurement_hex,
+        "measurement_source": "operator-pinned" if spec.measurement_hex else "preflight-auto",
+        "measured_cmdline": augmented_cmdline,
+        "luks_disk_path": preflight_result.luks_disk_path,
+        "kernel_path": preflight_result.kernel_path,
+        "initrd_path": preflight_result.initrd_path,
+        "rootfs_data_path": rootfs_data_path,
+        "rootfs_hash_path": rootfs_hash_path,
+        **(
+            {
+                "allowlist_epoch": pin_result.new_epoch,
+                "allowlist_sha256": pin_result.new_cose_sha256_hex,
+            }
+            if pin_result is not None
+            else {}
+        ),
+    }
+
+    def _undelivered(out: LaunchOutcome) -> LaunchOutcome:
+        out.emit[DISPATCHED_BOOT_KEY] = dispatched_boot
+        return out
 
     try:
         result = order_dispatch.dispatch_order(
@@ -1233,6 +2039,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
             payload_json=payload_json,
         )
     except order_dispatch.OrderDispatchMisconfigured as exc:
+        # Refused before anything was sent: no boot to keep.
         return _terminal_after_register("misconfigured", str(exc), EXIT_EDGE_FAILURE)
     except order_dispatch.OrderDispatchUnavailable as exc:
         # ⚠️ THE AMBIGUOUS ONE. `OrderDispatchUnavailable` covers the vali→Edge
@@ -1244,7 +2051,9 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         # downstream may treat this outcome as proof that no guest exists —
         # see `service._abandoned_reap_veto`, which requires POSITIVE evidence
         # (a live domain-state probe of the miner) and never the error string.
-        return _terminal_after_register("edge-unreachable", str(exc), EXIT_EDGE_FAILURE)
+        return _undelivered(
+            _terminal_after_register("edge-unreachable", str(exc), EXIT_EDGE_FAILURE)
+        )
     except order_dispatch.OrderDispatchError as exc:
         return _terminal_after_register("edge-error", str(exc), EXIT_EDGE_FAILURE)
 
@@ -1286,6 +2095,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
         # as legacy (no `dm-verity.root=`) and never restores the overlay. So
         # persist it here for `effects._launch_paths` to carry verbatim.
         "measured_cmdline": augmented_cmdline,
+        DISPATCHED_BOOT_KEY: dispatched_boot,
     }
     if pin_result is not None:
         emit["allowlist_epoch"] = pin_result.new_epoch
@@ -1326,7 +2136,7 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     # fresh LaunchJob or CLI retry for the same `vm_id` on a different
     # miner, after an operator clears the KBS registration, which is the
     # documented recovery for exactly that outcome (and the path that
-    # produced `migproof-1`).
+    # produced `vm-migrate-1`).
     #
     # A rejected dispatch that nonetheless left a domain up is covered
     # instead by `effects.destroy_target_miner_id`, which reads the
@@ -1334,6 +2144,23 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     # leak into `_bound_miner_id`'s routing.
     if result.ok:
         _bind_vm_host(spec.vm_id, miner.miner_id)
+        if result.classifier == _ALREADY_LAUNCHED:
+            # The miner started nothing: the domain running is an EARLIER
+            # attempt's (a ticket push that failed, retried inside the
+            # re-push window). This launch's measurement is not what runs,
+            # so it must not become current nor evict the one that does.
+            log.warning(
+                "launch: vm_id=%s answered already-launched — measurement %s is NOT "
+                "the running domain's; not marked current%s",
+                spec.vm_id,
+                measurement_hex[:16],
+                " (the KBS already made it current at register: a superseding "
+                "relaunch over a domain still running)" if supersede else "",
+            )
+        else:
+            _mark_measurement_launched(spec.vm_id, measurement_hex)
+            if spec.auto_pin_allowlist:
+                _evict_superseded_launches(spec.vm_id)
         _record_base_image(
             spec,
             rootfs_data_path=rootfs_data_path,
@@ -1371,6 +2198,31 @@ def launch_on_miner(spec: LaunchSpec, miner: MinerIdentity) -> LaunchOutcome:
     _record_cvm_start_evidence(
         miner, accepted=result.ok, classifier=result.classifier
     )
+    if not result.ok and _launch_refusal_is_disk(result.status, result.classifier):
+        # 507 `insufficient-disk` AFTER the KBS register (the budget
+        # reservation or the statvfs check at disk-file create). A capacity
+        # event, NOT a SEV start failure (`is_start_capability_failure`
+        # excuses it, so the ledger above recorded nothing and no
+        # `start-failed` halving follows): it cuts the earned DISK ceiling.
+        #
+        # It cannot re-place: vali has no KBS deregister/rollback, and the
+        # vm_id is now bound to THIS host — a re-place would re-mint for a
+        # new host and hit the anti-migration fence (kbs-admin-conflict).
+        # `launch_vm` retries the same miner (space may have been freed by
+        # a concurrent teardown) and then gives up with
+        # `dispatch-failed-after-register`; the reapable-abandoned-launch
+        # path handles the rest. The disk gate (`VALI_SCHEDULER_DISK_GATE`)
+        # is what keeps this rare: it refuses the host before any register.
+        # A LEGACY agent answered the same condition as a bare 500
+        # `dispatch-failed` (the `data-disk/insufficient-space` detail only
+        # reached the host's log), which is indistinguishable from a real
+        # start failure and is still counted as one.
+        _record_capacity_event(miner, "disk-insufficient", incident=f"vm={spec.vm_id}")
+    elif not result.ok and _start_failure_is_miner_attributable(result.status, result.classifier):
+        # A start the MINER itself answered as failed, after the KBS
+        # register: halves an `earned` miner's ceiling (capacity v2 §3).
+        # Once per VM however often the launch retries this miner.
+        _record_capacity_event(miner, "start-failed", incident=f"vm={spec.vm_id}")
 
     # A miner 4xx/5xx ("miner-rejected") is retriable — but the vm is now
     # KBS-registered to THIS miner (step 8), so `registered=True` tells
@@ -1435,6 +2287,65 @@ def _record_cvm_start_evidence(
         log.warning("cvm-capability record skipped for %s: %s", miner.miner_id, exc)
 
 
+#: Edge statuses whose body is empty and whose outcome is UNKNOWN (the
+#: miner may never have been reached) — never evidence against a miner.
+_EDGE_UNKNOWN_STATUSES = frozenset({502, 504})
+
+
+def _start_failure_is_miner_attributable(status: int, classifier: str) -> bool:
+    """A launch rejection the MINER answered, about starting the guest.
+
+    Positive rules only: a real miner class (never empty — an Edge 502/504
+    has no body and an unknown outcome), not an in-flight replay, and a
+    class `cvm_capability` counts as start-capability evidence (so a bad
+    order or a full host is not charged here)."""
+    from apps.scheduler import cvm_capability
+
+    return (
+        status not in _EDGE_UNKNOWN_STATUSES
+        and bool(classifier)
+        and classifier != "order-in-flight"
+        and cvm_capability.is_start_capability_failure(classifier)
+    )
+
+
+def _preflight_refusal_is_capacity(exc: Exception) -> bool:
+    """The miner refused the preflight because it is FULL (#668 / ASID)."""
+    return (
+        isinstance(exc, preflight_svc.PreflightRejected)
+        and exc.classifier == "insufficient-resources"
+    )
+
+
+def _preflight_refusal_is_disk(exc: Exception) -> bool:
+    """The miner refused the preflight for lack of DATA-disk room (507
+    `insufficient-disk`, or any class naming `insufficient-space`)."""
+    from apps.scheduler import cvm_capability
+
+    return isinstance(exc, preflight_svc.PreflightRejected) and cvm_capability.is_disk_refusal(
+        exc.classifier
+    )
+
+
+def _launch_refusal_is_disk(status: int, classifier: str) -> bool:
+    """A launch rejection the MINER answered as a DATA-disk refusal (never
+    an Edge 502/504, whose body is empty and whose outcome is unknown)."""
+    from apps.scheduler import cvm_capability
+
+    return status not in _EDGE_UNKNOWN_STATUSES and cvm_capability.is_disk_refusal(classifier)
+
+
+def _record_capacity_event(miner: MinerIdentity, kind: str, *, incident: str = "") -> None:
+    """Hand a capacity event to `capacity_earn` for the node vali
+    dispatched to (`MinerIdentity.chain_node_id`, operator-curated).
+    `record_event` never raises into the launch path."""
+    from apps.scheduler import capacity_earn
+
+    node_id = getattr(miner, "chain_node_id", "") or ""
+    if node_id:
+        capacity_earn.record_event(node_id, kind, incident=incident)
+
+
 def _terminal(outcome: str, error: str, exit_code: int) -> LaunchOutcome:
     """Build a `TERMINAL` outcome carrying the CLI's `{ok,outcome,error}`
     emit shape — the scheduler stops re-placing on these.
@@ -1461,6 +2372,32 @@ def max_dispatch_retries() -> int:
     migration CAS fence), so a transient miner-side dispatch failure
     (e.g. a vsock CID collision) is retried in place."""
     return int(getattr(settings, "VALI_LAUNCH_MAX_DISPATCH_RETRIES", 2))
+
+
+def max_pin_busy_retries() -> int:
+    """How many times `launch_vm` re-places after `allowlist-pin-busy`
+    without spending a miner attempt. Each try has already waited
+    `allowlist_pin.PIN_LOCK_TIMEOUT_S` for the lock."""
+    return int(getattr(settings, "VALI_LAUNCH_MAX_PIN_BUSY_RETRIES", 4))
+
+
+def boot_wait_s() -> float:
+    """How long a launch may wait for a boot slot when every eligible miner
+    is at its concurrent-boot cap (`miners-booting`), counted from when the
+    request was QUEUED (`launch_vm(queued_for_s=)`), before it fails under
+    that outcome. The wait holds the (serial) launch tick, so a burst
+    drains at the fleet's boot rate instead of piling up on one host.
+    Counting queue time keeps every job's queue + wait inside this bound,
+    well under a caller's own launch timeout (the SDK's `wait_for_launch`
+    gives up after 30 min) — a job is never launched after its caller has
+    given up on it just because it waited behind others."""
+    return max(0.0, float(getattr(settings, "VALI_SCHEDULER_BOOT_WAIT_S", 900)))
+
+
+def boot_wait_poll_s() -> float:
+    """Seconds between placement re-asks while waiting for a boot slot
+    (each re-ask reads the chain and the DB; floored at 1 s)."""
+    return max(1.0, float(getattr(settings, "VALI_SCHEDULER_BOOT_WAIT_POLL_S", 15)))
 
 
 def dispatch_retry_backoff_s() -> float:
@@ -1503,6 +2440,7 @@ def launch_vm(
     *,
     max_attempts: int | None = None,
     on_phase: Callable[[str], None] | None = None,
+    queued_for_s: float = 0.0,
 ) -> LaunchResult:
     """Scheduler-driven launch — [`_place_and_launch`], plus the
     abandoned-launch marker on any non-`ok` terminal.
@@ -1515,7 +2453,7 @@ def launch_vm(
     host marks its row" a property of the function, not of its authors.
     """
     result = _place_and_launch(
-        spec, decided_by, max_attempts=max_attempts, on_phase=on_phase
+        spec, decided_by, max_attempts=max_attempts, on_phase=on_phase, queued_for_s=queued_for_s
     )
     if not result.ok:
         _mark_launch_abandoned(
@@ -1530,6 +2468,7 @@ def _place_and_launch(
     *,
     max_attempts: int | None = None,
     on_phase: Callable[[str], None] | None = None,
+    queued_for_s: float = 0.0,
 ) -> LaunchResult:
     """Scheduler-driven launch: pick a miner, launch, re-place on reject.
 
@@ -1556,6 +2495,9 @@ def _place_and_launch(
     launch to the chosen miner. It NEVER affects control flow — a raising
     callback is swallowed — and defaults to `None` (the CLI path passes
     none, so its behaviour is byte-identical).
+
+    `queued_for_s` is how long the request already waited in the launch
+    queue; it is spent from the boot-slot wait (`boot_wait_s`).
     """
     def _emit_phase(name: str) -> None:
         if on_phase is None:
@@ -1573,8 +2515,8 @@ def _place_and_launch(
         PlacementStatus,
     )
     from apps.scheduler.placement import (
+        MINERS_BOOTING,
         PlacementError,
-        SelectionWeights,
         decide_placement,
     )
 
@@ -1583,7 +2525,11 @@ def _place_and_launch(
     excluded: set[str] = set()
     audit: list[dict[str, str]] = []
 
-    for _ in range(cap_attempts):
+    attempts_used = 0
+    pin_busy_retries = 0
+    boot_wait_until: float | None = None
+    while attempts_used < cap_attempts:
+        attempts_used += 1
         # Progress: the scheduler is (re-)choosing a miner for this VM.
         _emit_phase("placing")
         try:
@@ -1602,32 +2548,40 @@ def _place_and_launch(
         try:
             node_id = decide_placement(
                 snapshot=snapshot,
-                capacity_by_node=cap,
-                load_by_node=load,
-                family_load_by_node=fam,
-                max_family_per_node=service.max_family_per_node(),
-                max_epoch_lag=service.max_epoch_lag(),
-                excluded=frozenset(excluded),
-                dispatchable=service.dispatchable_node_ids(),
-                weights=SelectionWeights.from_settings(),
-                max_host_share=service.max_host_share(),
-                # §23 marketplace — cheaper announced prices rank up.
-                price_by_node=service.price_by_node(snapshot),
-                # Circuit-breaker — route around a miner with too many
-                # recent launch failures (AUDIT-4).
-                recent_failures_by_node=service.recent_failures_by_node(),
-                max_recent_failures=service.max_recent_failures(),
-                # Per-owner sub-budget — spread one owner's VMs across the
-                # fleet instead of monopolising a miner (audit M-per-tenant-cap).
-                owner_load_by_node=service.owner_load_by_node(spec.user_id),
-                max_owner_placements_per_miner=service.max_owner_placements_per_miner(),
-                # Gate (e) — the OBSERVED SEV-SNP start-capability ledger.
-                # A host vali has watched fail to boot a confidential
-                # guest is not a candidate; one it has watched succeed
-                # outranks one it has never watched at all.
-                cvm_capability_by_node=service.cvm_capability_by_node(),
+                # Every gate, assembled in ONE place so the feasibility
+                # check (`apps.scheduler.feasibility`) asks the scheduler
+                # the identical question. A preflight built from its own
+                # copy of these arguments drifts, and a drifted preflight
+                # is worse than none: the caller sells on its answer.
+                **service.placement_arguments(
+                    snapshot=snapshot,
+                    tenant_id=spec.tenant_id,
+                    user_id=spec.user_id,
+                    flavor=spec.flavor,
+                    excluded=frozenset(excluded),
+                    region=spec.region,
+                    platform_id=spec.platform_id,
+                    boot_gate=True,
+                ),
             )
         except PlacementError as exc:
+            # Every eligible miner is busy booting: a boot slot frees up in
+            # minutes, so wait for it — without spending a miner attempt —
+            # rather than fail a launch the fleet can take.
+            if exc.category == MINERS_BOOTING:
+                now = time.monotonic()
+                if boot_wait_until is None:
+                    boot_wait_until = now + boot_wait_s() - max(0.0, queued_for_s)
+                if now < boot_wait_until:
+                    log.warning(
+                        "launch: vm_id=%s waiting for a boot slot (%.0fs left): %s",
+                        spec.vm_id,
+                        boot_wait_until - now,
+                        exc.message,
+                    )
+                    attempts_used -= 1
+                    time.sleep(min(boot_wait_poll_s(), boot_wait_until - now))
+                    continue
             return LaunchResult(
                 ok=False,
                 outcome=exc.category,
@@ -1697,6 +2651,7 @@ def _place_and_launch(
         # collision) clears on retry; `register-vm` is idempotent-cached
         # for the same host so the retry does not re-conflict.
         dispatch_retries = 0
+        dispatched: list[dict[str, Any]] = []
         while (
             out.disposition == RETRIABLE
             and out.registered
@@ -1713,7 +2668,18 @@ def _place_and_launch(
                 max_dispatch_retries(),
             )
             time.sleep(dispatch_retry_backoff_s())
+            dispatched.extend(_candidate_of(spec, out))
             out = launch_on_miner(spec, miner)
+        if answered_already_launched(out):
+            _await_the_attested_boot(
+                spec.vm_id, out, [*_earlier_dispatched_boots(spec.vm_id), *dispatched]
+            )
+        elif out.disposition != ACCEPTED and (sent := [*dispatched, *_candidate_of(spec, out)]):
+            # Failed for good — but any of these dispatches may be up: a
+            # re-POSTed launch answered `already-launched` settles on them
+            # (`_earlier_dispatched_boots`).
+            keep = launch_record.MAX_DISPATCHED_BOOTS
+            out.emit[launch_record.DISPATCHED_BOOTS_KEY] = sent[-keep:]
 
         audit.append(
             {
@@ -1802,6 +2768,29 @@ def _place_and_launch(
                 emit=out.emit,
                 attempts=audit,
                 registered=out.registered,
+            )
+
+        # A busy allowlist pin is vali's own queue, not a verdict on the
+        # miner: re-place WITHOUT excluding it or spending a miner attempt,
+        # up to its own cap — then fail under its own outcome, never as
+        # `no-capacity-after-replace`.
+        if out.emit.get("outcome") == ALLOWLIST_PIN_BUSY:
+            if pin_busy_retries < max_pin_busy_retries():
+                pin_busy_retries += 1
+                attempts_used -= 1
+                log.warning(
+                    "launch: vm_id=%s allowlist pin busy (retry %d/%d)",
+                    spec.vm_id,
+                    pin_busy_retries,
+                    max_pin_busy_retries(),
+                )
+                continue
+            return LaunchResult(
+                ok=False,
+                outcome=ALLOWLIST_PIN_BUSY,
+                vm_id=spec.vm_id,
+                emit=out.emit,
+                attempts=audit,
             )
 
         # RETRIABLE — this miner couldn't honour it; exclude + re-place.
@@ -1898,6 +2887,19 @@ def _forced_placement_epoch(node_id: str) -> int:
     return mirror_epoch(node_id)
 
 
+def _refuse_cordoned_miner(miner: MinerIdentity) -> None:
+    """A cordoned miner takes no new VM, even one an operator names: lift
+    the cordon first (`vali_set_miner_capacity --uncordon`)."""
+    from apps.scheduler import service as sched
+
+    reason = sched.miner_cordon_reason(miner.miner_id)
+    if reason is not None:
+        raise LaunchConfigError(
+            f"miner {miner.miner_id!r} is cordoned ({reason or 'no reason given'}) — "
+            "uncordon it to launch there"
+        )
+
+
 def launch_on_named_miner(
     spec: LaunchSpec, miner: MinerIdentity, *, decided_by: Any
 ) -> LaunchOutcome:
@@ -1940,6 +2942,10 @@ def launch_on_named_miner(
         PlacementStatus,
     )
 
+    # Before the row / placement: an M1/M2 launch refused for this miner's
+    # identity must leave nothing behind.
+    _refuse_miner_for_customer_keys(_spec_binding(spec), miner)
+    _refuse_cordoned_miner(miner)
     vm = _ensure_vm_row(spec)
     node_id = miner.chain_node_id
     try:
@@ -2086,6 +3092,161 @@ def _persist_billing_binding(
     )
 
 
+# The working copy's self-describing header: which canonical KV version
+# the bytes under it correspond to. Written inside the Transit-wrapped
+# blob, so it cannot be edited by anyone who cannot also re-wrap.
+_WORKING_STAMP = b"hippius-userdata-for-canonical-v"
+
+
+class UserdataPairingError(EffectError):
+    """The working copy does not demonstrably correspond to the canonical
+    version being bound — see [`open_userdata_working_copy`]."""
+
+
+def stage_userdata_intake_copy(mount: str, path: str, vm_id: str, userdata: bytes):
+    """Stage the cloud-init TEMPLATE the caller POSTed, wrapped under
+    `ud-<vm_id>` — the per-VM Transit key vali may decrypt.
+
+    This copy used to be written in the CLEAR, and is retained for the
+    life of the VM (the launch worker reads it, and so does
+    reboot-recovery, each substituting a FRESH NetBird setup key into it),
+    so a tenant's cloud-init — SSH keys, API tokens, the NetBird enrolment
+    secret — sat readable at rest in Vault KV for the VM's lifetime and
+    past its death: §24 destroyed `kek-<vm_id>` and deleted the luks-kek
+    blob, and nothing ever deleted this one.
+
+    Wrapped rather than removed because vali genuinely still needs the
+    plaintext after intake, and under a key vali can open rather than the
+    KBS-only `kek-<vm_id>` for the same reason. See
+    `vault_kv.userdata_transit_key_name` for exactly what that does and
+    does not protect against.
+
+    Deliberately UNSTAMPED: a template corresponds to no canonical
+    version. That is also what distinguishes it from a working copy, so a
+    template can never be mistaken for one (see below).
+    """
+    transit_key = vault_kv.userdata_transit_key_name(vm_id)
+    vault_kv.ensure_transit_key(transit_key)
+    return vault_kv.put_kv(mount, path, vault_kv.transit_encrypt(transit_key, userdata))
+
+
+def stage_userdata_working_copy(
+    mount: str, path: str, vm_id: str, userdata: bytes, *, canonical_version: int
+):
+    """Stage vali's working copy of the bytes it just wrote to the
+    CANONICAL path, wrapped under `ud-<vm_id>` and STAMPED with that
+    canonical version.
+
+    The stamp is what makes the correspondence provable rather than
+    assumed. The §25 / KBS-recovery re-mint has to digest the plaintext of
+    a specific canonical version (that is what its ticket binds) and can
+    only obtain it from here, so "is this copy the right one?" has to have
+    an answer. Two independent KV writes cannot be atomic: a canonical
+    success followed by a failure here would otherwise leave the two paths
+    at different contents with no way to tell — and the re-mint would hash
+    the older bytes and produce a ticket that denies at release, i.e. a
+    migration that reports Done and a VM that never unlocks.
+
+    Inside the wrapped blob, so only a party holding
+    `transit/encrypt/ud-<vm_id>` can write a stamp at all.
+    """
+    transit_key = vault_kv.userdata_transit_key_name(vm_id)
+    vault_kv.ensure_transit_key(transit_key)
+    stamped = _WORKING_STAMP + str(int(canonical_version)).encode("ascii") + b"\n" + userdata
+    return vault_kv.put_kv(mount, path, vault_kv.transit_encrypt(transit_key, stamped))
+
+
+def open_userdata_intake_copy(
+    mount: str, path: str, version: int | None, vm_id: str
+) -> bytes:
+    """Read the intake TEMPLATE back and unwrap it.
+
+    A value with no `vault:` prefix is a LEGACY plaintext copy (staged
+    before the wrapping) and is returned verbatim — those VMs must keep
+    launching and recovering.
+    """
+    stored = vault_kv.get_kv(mount, path, version=version or None)
+    if not stored.startswith(b"vault:"):
+        return stored
+    return vault_kv.transit_decrypt(vault_kv.userdata_transit_key_name(vm_id), stored)
+
+
+def open_userdata_working_copy(mount: str, path: str, vm_id: str, canonical_version: int) -> bytes:
+    """Read the working copy back, unwrap it, and RETURN IT ONLY IF it
+    stamps the canonical version asked for.
+
+    Three ways this refuses, all of them cases where the alternative is a
+    ticket bound to bytes the guest will never receive:
+
+    - not `vault:`-wrapped — a pre-substitution template an older intake
+      wrote to this path, not a copy of the canonical bytes;
+    - no stamp — written before the stamping, so its correspondence is
+      unknown;
+    - a DIFFERENT stamp — the canonical write succeeded and this one did
+      not (or a later attempt advanced only one of the two), so these are
+      some other version's bytes.
+    """
+    stored = vault_kv.get_kv(mount, path)
+    if not stored.startswith(b"vault:"):
+        raise UserdataPairingError(
+            f"{path}: not Transit-wrapped — a pre-substitution intake "
+            "template, not a working copy of the canonical bytes"
+        )
+    opened = vault_kv.transit_decrypt(vault_kv.userdata_transit_key_name(vm_id), stored)
+    if not opened.startswith(_WORKING_STAMP):
+        raise UserdataPairingError(
+            f"{path}: carries no canonical-version stamp — it predates the "
+            "pairing and cannot be shown to hold the bytes any particular "
+            "canonical version holds"
+        )
+    head, _, body = opened[len(_WORKING_STAMP) :].partition(b"\n")
+    try:
+        stamped = int(head.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise UserdataPairingError(f"{path}: malformed canonical-version stamp") from exc
+    if stamped != int(canonical_version):
+        raise UserdataPairingError(
+            f"{path}: stamped for canonical version {stamped}, but the ticket "
+            f"binds version {canonical_version} — the two staging writes are "
+            "not atomic and this one is stale. Re-stage the userdata (or "
+            "relaunch) so both paths describe the same bytes."
+        )
+    return body
+
+
+def _stage_userdata(mount: str, path: str, vm_id: str, userdata: bytes):
+    """Stage the CANONICAL cloud-init userdata at `path`, Transit-WRAPPED
+    under `kek-<vm_id>` — the key vali may encrypt with and never decrypt.
+    This is the copy the minted ticket binds and the attested KBS releases.
+
+    It used to be written in plaintext while the KEK four lines above was
+    enveloped — and a tenant's cloud-init routinely carries SSH keys, API
+    tokens and the NetBird enrolment secret. Vault enforces the asymmetry
+    that makes wrapping worth it: vali holds `transit/encrypt/kek-*`
+    (`update`) and is DENIED `transit/decrypt/kek-*`, so once wrapped,
+    vali — and a vali/node RCE — cannot read it back. Only the attested
+    SNP KBS unwraps it, per-VM scoped by the broker.
+
+    Wrapped under the SAME per-VM key as the KEK (`kek-<vm_id>`) rather
+    than a second one, for the bonus: §24's crypto-erase DESTROYS that
+    key, so decommission now makes the userdata cryptographically
+    unreadable. The erase path never deleted this KV entry, so a
+    destroyed VM's cloud-init outlived it indefinitely, KV version
+    history included.
+
+    ⚠️ The caller still digests the PLAINTEXT. The KBS unwraps before it
+    recomputes and constant-time-compares, so digesting the ciphertext
+    would fail every launch with DigestMismatch.
+
+    `ensure_transit_key` is idempotent and is needed on the ASYNC path
+    too: there the caller staged the KEK so the key already exists, but
+    this must not depend on that ordering.
+    """
+    transit_key = vault_kv.transit_key_name(vm_id)
+    vault_kv.ensure_transit_key(transit_key)
+    return vault_kv.put_kv(mount, path, vault_kv.transit_encrypt(transit_key, userdata))
+
+
 def _stage_lifecycle_key(mount: str, lifecycle_path: str) -> tuple[bytes, bytes]:
     """§7 — stage (or reuse) the per-VM lifecycle keypair, FIRST-WRITE-WINS.
 
@@ -2227,28 +3388,98 @@ def _ensure_vm_row(spec: LaunchSpec) -> Any:
     keypair + stages the private seed in Vault — so by the time a launch
     is dispatched the row carries the real vk that `_verify_ack` checks.
     """
+    from django.db import transaction
+
     from apps.lifecycle.models import Vm, VmState
 
-    vm, _created = Vm.objects.get_or_create(
-        vm_id=spec.vm_id,
-        defaults={
-            "lease_id": spec.lease_id,
-            # #587 Phase 2 — stamp the owning tenant for the GET /v1/vm
-            # display filter (getattr: older LaunchSpecs / smoke callers
-            # may omit it).
-            "tenant_id": getattr(spec, "tenant_id", "") or "",
-            "state": VmState.ACTIVE,
-            "generation": 1,
-            # The guest bakes `hippius.vm_generation=_LAUNCH_GENERATION` into
-            # its measured cmdline and signs EOL acks at it for life; a §25
-            # migration bumps `generation` but never re-bakes, so this stays
-            # put. vali verifies acks at `signing_generation`, not `generation`.
-            "signing_generation": _LAUNCH_GENERATION,
-            "host": "",
-            "lifecycle_vk": bytes(32),
-            "max_price_per_unit": spec.max_price_per_unit,
-        },
-    )
+    # Customer-held keys: validate the spec's binding BEFORE a row exists,
+    # then pin it on a NEW row and hold every later launch of the vm_id
+    # (relaunch, reboot-recovery, power start, re-place) to that pin.
+    binding = _spec_binding(spec)
+    # An address the miner relay refuses would fail the launch only after
+    # the row below pinned it, burning the vm_id. Intake refuses it too;
+    # this covers launch paths that skip intake (operator CLI).
+    try:
+        customer_keys.check_endpoint_allowed(binding)
+        customer_keys.check_cloud_init_markers(
+            binding, cmdline=spec.cmdline, vm_id=spec.vm_id, lease_id=spec.lease_id
+        )
+        customer_keys.check_lease_id(binding, spec.lease_id)
+        if spec.enable_netbird:
+            customer_keys.harden_netbird_up(binding, spec.userdata)
+    except customer_keys.CustomerKeysError as exc:
+        raise LaunchConfigError(str(exc)) from exc
+    if not Vm.objects.filter(vm_id=spec.vm_id).exists():
+        # About to PIN a new row: refuse a measured cmdline that could never
+        # be minted first (config-derived markers, length), not after.
+        _refuse_measured_cmdline_before_pin(spec, binding)
+    # The row and its birth floor commit together: a retry (or a concurrent
+    # launch) never sees a new VM without the floor of the release it boots.
+    with transaction.atomic():
+        vm, _created = Vm.objects.get_or_create(
+            vm_id=spec.vm_id,
+            defaults={
+                "lease_id": spec.lease_id,
+                # #587 Phase 2 — stamp the owning tenant for the GET /v1/vm
+                # display filter (getattr: older LaunchSpecs / smoke callers
+                # may omit it).
+                "tenant_id": getattr(spec, "tenant_id", "") or "",
+                "state": VmState.ACTIVE,
+                "generation": 1,
+                # The guest bakes `hippius.vm_generation=_LAUNCH_GENERATION` into
+                # its measured cmdline and signs EOL acks at it for life; a §25
+                # migration bumps `generation` but never re-bakes, so this stays
+                # put. vali verifies acks at `signing_generation`, not `generation`.
+                "signing_generation": _LAUNCH_GENERATION,
+                "host": "",
+                "lifecycle_vk": bytes(32),
+                "max_price_per_unit": spec.max_price_per_unit,
+                **customer_keys.spec_fields(binding),
+            },
+        )
+        if _created:
+            # G3 (docs/design/guest-component-rollout.md): a VM born on a
+            # guest release (a launch by image of a blessed release) never
+            # relaunches below it — its floor starts at that release's epoch.
+            from . import guest_components
+
+            epoch = guest_components.epoch_of_initrd(spec.initrd_sha256_hex)
+            if epoch > 0:
+                guest_components.raise_required_epoch(
+                    vm, epoch, by="launch", reason="the vm's first launch boots a guest release"
+                )
+    try:
+        customer_keys.check_pinned(vm, binding)
+    except customer_keys.CustomerKeysError as exc:
+        raise LaunchConfigError(str(exc)) from exc
+    # A DECOMMISSIONED vm_id must never be relaunched. §24 crypto-erased
+    # that VM — both per-VM Transit keys destroyed, all its KV blobs
+    # deleted — and a launch under the same id stages fresh secrets that
+    # nothing can reach again: a second decommission is refused for a VM
+    # that is already Destroyed. (The KBS has also spent that vm_id's
+    # lifecycle state, so the launch could not release a KEK anyway.)
+    #
+    # Checked HERE, in the one function every launch path goes through,
+    # rather than only at API intake: the operator CLI does not go through
+    # intake at all, and the async worker re-checks a state that may have
+    # changed since the POST.
+    # A MIGRATING vm_id belongs to a §25 move that owns its KBS state
+    # (`Migrating{old,new,source,dest}`); a launch here would either be
+    # refused by the KBS after staging and a bake, or — if the row were
+    # absent after a KBS wipe — re-bind the fenced-out source. Refused up
+    # front; the register step re-checks under the row lock regardless.
+    if vm.state == VmState.MIGRATING:
+        raise LaunchConfigError(
+            f"vm {spec.vm_id!r} is migrating — a §25 move owns it; finish or "
+            "recover the migration before relaunching it"
+        )
+    if vm.state in (VmState.DESTROYED, VmState.DECOMMISSIONING):
+        raise LaunchConfigError(
+            f"vm {spec.vm_id!r} is {vm.state} — a decommissioned vm_id cannot "
+            "be relaunched (its keys were crypto-erased; staging new secrets "
+            "under it would recreate material §24 can no longer reach). "
+            "Launch under a fresh vm_id."
+        )
     return vm
 
 
@@ -2323,6 +3554,158 @@ def _record_base_image(
         log.warning("launch: base-image record failed for vm_id=%s: %s", spec.vm_id, exc)
 
 
+def _mark_superseded_at_register(vm_id: str, measurement_hex: str) -> bool:
+    """Record that the KBS made this launch current at its register
+    (`MeasurementLedger.superseded_at_register`): a resize stops asking for
+    `supersede` from here on. `False` (loudly) when it could not be
+    recorded — no pin row, or the write failed; the caller then does not
+    dispatch."""
+    from django.utils import timezone
+
+    from apps.orchestration.models import MeasurementLedger
+
+    try:
+        # The register's own time, not the pin row's: the row may be an
+        # older pin of the same measurement (this launch's insert failed).
+        marked = MeasurementLedger.objects.filter(
+            vm_id=vm_id, launch_digest_hex__iexact=measurement_hex
+        ).update(superseded_at_register=timezone.now())
+    except Exception as exc:  # noqa: BLE001 — reported to the caller
+        log.error("measurement-ledger superseded_at_register mark failed vm=%s: %s", vm_id, exc)
+        return False
+    if not marked:
+        log.error(
+            "measurement-ledger: superseding launch vm=%s measurement=%s has NO pin row "
+            "to mark — not dispatching it",
+            vm_id,
+            measurement_hex[:16],
+        )
+    return bool(marked)
+
+
+#: The miner-agent's 2xx class for a launch of a domain already running
+#: (`orders::handler::handle_launch`).
+_ALREADY_LAUNCHED = "already-launched"
+
+#: The emit key naming what a dispatched order booted (`launch_record.BOOT_KEYS`).
+DISPATCHED_BOOT_KEY = "dispatched_boot"
+
+
+def _candidate_of(spec: LaunchSpec, out: LaunchOutcome) -> list[dict[str, Any]]:
+    """`out`'s dispatched boot as a candidate (`launch_record`), with the
+    artefacts and size `spec` booted it from; `[]` when nothing was sent."""
+    boot = (out.emit or {}).get(DISPATCHED_BOOT_KEY)
+    if not boot or not boot.get("measurement_hex"):
+        return []
+    return [
+        launch_record.dispatched_boot_candidate(
+            boot, booted=(spec.s3_key_prefix, spec.initrd_sha256_hex), flavor=spec.flavor
+        )
+    ]
+
+
+def _earlier_dispatched_boots(vm_id: str) -> list[dict[str, Any]]:
+    """What the FAILED launch jobs of `vm_id` dispatched, oldest first: a
+    re-POSTed launch answered `already-launched` meets one of them."""
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+
+    boots: list[dict[str, Any]] = []
+    for result in (
+        LaunchJob.objects.filter(vm_id=vm_id, state=LaunchJobState.FAILED.value)
+        .order_by("finished_at")
+        .values_list("result_json", flat=True)
+    ):
+        emit = (result or {}).get("emit") or {}
+        boots.extend(emit.get(launch_record.DISPATCHED_BOOTS_KEY) or [])
+    return boots
+
+
+def _await_the_attested_boot(
+    vm_id: str, out: LaunchOutcome, dispatched: list[dict[str, Any]]
+) -> None:
+    """A launch answered `already-launched`: the domain up is one of the
+    earlier dispatches, not this one. The record this emit becomes carries
+    them as candidates and waits for the guest's attestation to say which
+    (`launch_record` module docstring)."""
+    log.warning(
+        "launch: vm_id=%s answered already-launched after %d earlier dispatch(es) — "
+        "its record waits for the guest's attestation",
+        vm_id,
+        len(dispatched),
+    )
+    out.emit[launch_record.DISPATCHED_BOOTS_KEY] = dispatched[-launch_record.MAX_DISPATCHED_BOOTS :]
+    out.emit[launch_record.BOOT_UNVERIFIED_KEY] = timezone.now().isoformat()
+
+
+def answered_already_launched(out: LaunchOutcome) -> bool:
+    """An accepted launch the miner answered `already-launched`: it started
+    nothing, and its measurement is NOT the running domain's — an earlier
+    dispatch's is."""
+    return (
+        out.disposition == ACCEPTED
+        and (getattr(out, "emit", None) or {}).get("classifier") == _ALREADY_LAUNCHED
+    )
+
+
+def _mark_measurement_launched(vm_id: str, measurement_hex: str) -> None:
+    """Stamp `MeasurementLedger.launched_at` on this launch's pin: from now
+    on it is the VM's current launch, and a guest of an earlier one is
+    `superseded` (`apps.telemetry.guest_resources`). Best-effort like the
+    ledger write itself — a lost stamp only means the earlier launches are
+    not flagged — but never silent."""
+    from django.utils import timezone
+
+    from apps.orchestration.models import MeasurementLedger
+
+    try:
+        stamped = MeasurementLedger.objects.filter(
+            vm_id=vm_id, launch_digest_hex__iexact=measurement_hex, launched_at__isnull=True
+        ).update(launched_at=timezone.now())
+    except Exception as exc:  # noqa: BLE001 — must not fail an accepted launch
+        log.error(
+            "measurement-ledger launched_at stamp failed vm=%s: %s — a guest of an "
+            "earlier launch of this VM will not be flagged as superseded",
+            vm_id,
+            exc,
+        )
+        return
+    if not stamped and not MeasurementLedger.objects.filter(
+        vm_id=vm_id, launch_digest_hex__iexact=measurement_hex
+    ).exists():
+        # No pin row for this launch (no auto-pin, or its ledger write
+        # failed — logged there): nothing can mark it current.
+        log.error(
+            "measurement-ledger: accepted launch vm=%s measurement=%s has NO ledger "
+            "row — a guest of an earlier launch of this VM will not be flagged as "
+            "superseded",
+            vm_id,
+            measurement_hex[:16],
+        )
+
+
+def _evict_superseded_launches(vm_id: str) -> None:
+    """This launch is now the VM's current one: drop every earlier launch's
+    measurement from the §22 allowlist (defence in depth — the KBS already
+    refuses a superseded launch's ticket once this one registered, see
+    `kbs_core::lifecycle::check_current_launch`). Never fails an accepted
+    launch: a busy lock or an S3 / KBS error is retried by the
+    orchestration tick (`sweep_superseded_measurements`), loudly."""
+    try:
+        allowlist_pin.evict_superseded_measurements()
+    except (allowlist_pin.AllowlistPinBusy, EffectUnavailable, EffectError) as exc:
+        log.error(
+            "allowlist: could not evict the superseded launches after vm=%s was "
+            "relaunched (%s) — still allowlisted until the tick retries",
+            vm_id,
+            exc,
+        )
+    except Exception:  # noqa: BLE001 — never lose an accepted launch over this
+        log.exception(
+            "allowlist: unexpected error evicting the superseded launches after vm=%s",
+            vm_id,
+        )
+
+
 def _bind_vm_host(vm_id: str, node_id: str) -> None:
     """Stamp the placed miner's `node_id` onto the `Vm.host` on a
     successful launch.
@@ -2344,14 +3727,34 @@ def _bind_vm_host(vm_id: str, node_id: str) -> None:
     the KBS registration and re-launches onto miner B — B's bind wipes A's
     marker, so A's failure can never reap the KEK B's guest is using.
     """
-    from apps.lifecycle.models import Vm
+    from django.utils import timezone
 
-    Vm.objects.filter(vm_id=vm_id, host="").update(
+    from apps.lifecycle.models import Vm, VmState
+
+    # `state=ACTIVE` too: a §24 decommission that committed between the
+    # register and this dispatch owns the row now, and stamping a host
+    # there would re-point its destroy/EOL routing at a launch it is
+    # already tearing down. Losing that race is harmless — the teardown
+    # routes by `effects._bound_miner_id` — but it is logged.
+    updated = Vm.objects.filter(vm_id=vm_id, host="", state=VmState.ACTIVE).update(
         host=node_id,
+        # The boot-stall clock starts at the FIRST bind only: a same-miner
+        # retry answered `already-launched` finds the host set and must not
+        # push the verdict back.
+        boot_started_at=timezone.now(),
         launch_abandoned_at=None,
         launch_abandoned_outcome="",
         launch_abandoned_registered=False,
     )
+    if not updated:
+        state = Vm.objects.filter(vm_id=vm_id).values_list("state", flat=True).first()
+        if state is not None and state != VmState.ACTIVE:
+            log.warning(
+                "launch: vm=%s is %s — not stamping host=%s after the dispatch",
+                vm_id,
+                state,
+                node_id,
+            )
 
 
 def _mark_launch_abandoned(
@@ -2429,10 +3832,14 @@ def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
 
 
 def _fail_placement(placement: Any, *, reason: str) -> None:
-    """CAS Pending→Failed for a rejected / errored launch attempt."""
+    """CAS Pending→Failed for a rejected / errored launch attempt.
+
+    `reason` is `launch_on_miner`'s outcome string, stored verbatim;
+    `failure_source = launch` is the provenance the operator readout
+    selects on before it maps that string (`apps.scheduler.reasons`)."""
     from django.utils import timezone
 
-    from apps.scheduler.models import Placement, PlacementStatus
+    from apps.scheduler.models import Placement, PlacementFailureSource, PlacementStatus
 
     Placement.objects.filter(
         id=placement.id,
@@ -2443,4 +3850,5 @@ def _fail_placement(placement: Any, *, reason: str) -> None:
         version=placement.version + 1,
         failed_at=timezone.now(),
         reason=(reason or "launch-failed")[:256],
+        failure_source=PlacementFailureSource.LAUNCH,
     )

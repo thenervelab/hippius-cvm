@@ -38,7 +38,7 @@ def _burst(url: str, monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 def test_path_graceful_exit_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
-    url = reverse("miner_graceful_exit", args=["miner-1"])
+    url = reverse("miner_graceful_exit", args=["miner-a"])
     codes = _burst(url, monkeypatch)
     assert status.HTTP_429_TOO_MANY_REQUESTS not in codes[:2], codes
     assert codes[2] == status.HTTP_429_TOO_MANY_REQUESTS, codes

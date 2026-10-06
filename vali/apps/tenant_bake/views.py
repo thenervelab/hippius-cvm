@@ -52,6 +52,7 @@ from rest_framework.views import APIView
 from apps.common.schemas import ErrorSerializer
 from apps.identity import scoping
 
+from .locks import bake_queue_lock
 from .models import (
     IN_FLIGHT_STATES,
     TenantBake,
@@ -153,7 +154,9 @@ class TenantBakeCreateView(APIView):
         # pre-check is still useful: it surfaces 409 without paying
         # the wasted-INSERT cost on the common (cached) path.
         try:
-            with transaction.atomic():
+            # `bake_queue_lock` (a transaction of its own) orders this INSERT
+            # against the golden re-bake's check-then-insert (F6).
+            with bake_queue_lock():
                 conflict = TenantBake.objects.filter(
                     vm_id=parsed["vm_id"],
                     state__in=list(IN_FLIGHT_STATES),
@@ -522,7 +525,7 @@ def _parse_create(body: dict[str, Any]) -> dict[str, Any]:
             raise FinalizeError(f"{field} must be a non-empty string", "wire")
         out[field] = value
 
-    if not _VM_ID_RE.match(out["vm_id"]):
+    if not _VM_ID_RE.fullmatch(out["vm_id"]):
         raise FinalizeError(
             "vm_id must be 1-64 chars of [a-z0-9-]", CAT_BAD_FIELD
         )

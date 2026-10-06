@@ -26,6 +26,7 @@ pub mod handlers;
 pub mod rate_limit;
 pub mod router;
 pub mod service;
+pub mod spiffe_id;
 pub mod wire;
 
 pub use admin_handler::{build_admin_router, AdminState, PeerCertInfo};
@@ -33,4 +34,5 @@ pub use handlers::AppState;
 pub use rate_limit::{NonceRateLimiter, RateConfig};
 pub use router::build_router;
 pub use service::{DefaultKbsService, KbsService};
+pub use spiffe_id::{SpiffeId, SpiffeIdError};
 pub use wire::{CONTENT_TYPE_CBOR, MAX_REQUEST_BYTES, NONCE_LEN};

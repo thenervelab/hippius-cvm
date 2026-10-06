@@ -30,6 +30,7 @@ from typing import Any
 
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
@@ -45,8 +46,8 @@ from apps.orchestration.permissions import IsOrchestrationRoot
 from apps.orchestration.services import kbs_evidence
 from apps.orders.models import OrderTicketIntake
 
-from . import validator
-from .models import StoppedAckIngest, Vm, VmState
+from . import attestation, boot_stall, validator
+from .models import StoppedAckIngest, Vm, VmPowerState, VmState, destroyed_power_fields
 from .schemas import (
     StoppedAckAcceptedSerializer,
     VmAttestationSerializer,
@@ -189,7 +190,17 @@ class VmListView(APIView):
         rows = list(qs[offset : offset + limit])
         return Response(
             {
-                "vms": [_serialize_vm(vm) for vm in rows],
+                "vms": [
+                    _serialize_vm(
+                        vm, region_by_host, public_ips, backup_states, disks, data_deaths
+                    )
+                    for region_by_host in [_region_by_host({r.host for r in rows})]
+                    for public_ips in [_public_ip_by_vm(rows)]
+                    for backup_states in [_backup_state_by_vm(rows)]
+                    for disks in [boot_stall.disk_gb_by_vm_id(r.vm_id for r in rows)]
+                    for data_deaths in [_data_death_by_vm(rows)]
+                    for vm in rows
+                ],
                 "limit": limit,
                 "offset": offset,
                 "total": total,
@@ -234,7 +245,9 @@ class VmAttestationView(APIView):
     VCEK chain + boot counter) fetched from the KBS evidence endpoint
     (#280). The bundle is KBS-L0-signed, so the tenant can re-verify the
     SNP report against AMD's root + the pinned KBS key OFFLINE — vali only
-    relays it.
+    relays it. That bundle does not survive a KBS restart, so the verdict
+    (`attestation_state`) rests first on the VM's newest live attestation
+    — see `apps.lifecycle.attestation`.
 
     Auth: `IsAuthenticated` + P2 object scoping. An OPERATOR principal
     (the upstream product API) may fetch any VM's evidence and is
@@ -258,7 +271,9 @@ class VmAttestationView(APIView):
             "Composes vali's lifecycle facts with the KBS-signed evidence "
             "bundle (attested SNP measurement + raw report + VCEK chain + "
             "boot counter) so a tenant can re-verify the SNP report offline. "
-            "vali only relays the KBS-L0-signed bundle."
+            "vali only relays the KBS-L0-signed bundle. `attestation_state` "
+            "rests first on the newest KBS-verified live attestation of the "
+            "current launch, which survives a KBS restart; the bundle does not."
         ),
         tags=["VM lifecycle"],
         parameters=[_VM_ID_PARAM],
@@ -294,33 +309,29 @@ class VmAttestationView(APIView):
         except EffectError as exc:
             evidence_error = {"reason": "kbs-error", "detail": str(exc)}
 
-        # `attested` is a POSITIVE claim only. Absent evidence is NOT proof
-        # that the VM is unattested: the KBS records a bundle only when its
-        # §280 evidence sink is configured (`storage.evidence_dir`), and the
-        # archive does not survive a KBS restart. Reporting `false` there
-        # told tenants their genuinely-attested VM was not attested — vali
-        # cannot distinguish "never attested" from "attested but unrecorded",
-        # so it must say UNKNOWN (null) rather than assert a negative.
-        if evidence is not None:
-            attested: bool | None = True
-            attestation_status = "evidence-recorded"
-        elif evidence_error is not None:
-            attested = None
-            attestation_status = "evidence-unavailable"
-        else:
-            attested = None
-            attestation_status = "no-evidence-recorded"
+        # The live attestation is the primary proof, the release bundle the
+        # boot detail — see `apps.lifecycle.attestation`. `attested` stays a
+        # POSITIVE claim only: neither source being present is not proof the
+        # VM is unattested, so it is null there, never false.
+        result = attestation.evaluate(
+            vm,
+            evidence=evidence,
+            evidence_fetch_failed=evidence_error is not None,
+            now_unix=int(time.time()),
+        )
 
         vk = bytes(vm.lifecycle_vk) if vm.lifecycle_vk else b""
         out: dict[str, Any] = {
             "vm_id": vm.vm_id,
             "tenant_id": ticket.tenant_id if ticket else None,
             "user_id": ticket.user_id if ticket else None,
-            # True when the KBS holds a recorded signed release (an attested
-            # guest unlocked the disk at least once); NULL when unknown.
-            # Never false merely because no bundle came back.
-            "attested": attested,
-            "attestation_status": attestation_status,
+            # True when a live attestation or the release bundle proves the
+            # VM attested; NULL when unknown. Never false.
+            "attested": result.attested,
+            "attestation_status": result.legacy_status,
+            "attestation_state": result.state.value,
+            # The newest KBS-verified live attestation of the current launch.
+            "live_attestation": result.live,
             "lifecycle": {
                 "state": vm.state,
                 "generation": vm.generation,
@@ -428,6 +439,25 @@ class VmTransitionView(APIView):
                     f"(got {req.new_generation}, current {vm.generation})",
                     CAT_GENERATION,
                 )
+            # Never begin a move onto a miner that is still running a VM
+            # whose §24 crypto-erase already ran (`apps.lifecycle.zombie`).
+            from apps.lifecycle.zombie import miner_is_quarantined
+
+            if miner_is_quarantined(req.migration_dest or ""):
+                return _error(
+                    status.HTTP_409_CONFLICT,
+                    f"migration_dest {req.migration_dest!r} is zombie-quarantined",
+                    "dest-zombie-quarantined",
+                )
+            # Nor onto one the operator cordoned (no new work there).
+            from apps.scheduler.service import miner_cordon_reason
+
+            if miner_cordon_reason(req.migration_dest or "") is not None:
+                return _error(
+                    status.HTTP_409_CONFLICT,
+                    f"migration_dest {req.migration_dest!r} is cordoned",
+                    "dest-cordoned",
+                )
         if req.to_state == VmState.ACTIVE and from_state == VmState.MIGRATING:
             # Completing a migration MUST use the row's stored
             # `new_generation`. A caller that supplies a different
@@ -520,6 +550,10 @@ class VmTransitionView(APIView):
 
             release_placements_for_vm(vm, reason="released:vm-destroyed")
 
+            from apps.network.service import release_for_destroyed_vm
+
+            release_for_destroyed_vm(vm)
+
         # Re-read so the response carries the post-update row + the
         # bumped version.
         vm = Vm.objects.get(vm_id=vm_id)
@@ -545,6 +579,10 @@ class StoppedAckIngestView(APIView):
     forged / wrong / stale ack stored here is inert: it just fails that
     verification (fail-closed — the migration / decommission never
     advances).
+
+    One exception: the ack of an `Active` VM the power API is stopping is
+    verified HERE, while its signed time is fresh, and only the proof is
+    kept (`_prove_power_stop`, #1162).
 
     Auth: `AllowAny`. The guest has no vali ServiceToken — it is the
     measured CVM reaching vali over the public front door. Storing an
@@ -654,16 +692,19 @@ class StoppedAckIngestView(APIView):
         # ack for a non-existent / wrong-state / wrong-generation VM is
         # refused BEFORE any DB write. A single uniform 404 avoids leaking
         # which vm_ids / states / generations exist to an anon caller.
-        vm = (
-            Vm.objects.filter(vm_id=vm_id)
-            .only("state", "signing_generation")
-            .first()
-        )
+        vm = Vm.objects.filter(vm_id=vm_id).first()
         # The guest posts `?generation=<its BAKED hippius.vm_generation>` — the
         # launch (signing) generation, which a §25 migration does NOT re-bake.
         # Gate on `signing_generation`, NOT the live `generation` (bumped by
         # migration): a migrated VM's §24/re-migration guest still signs at its
         # launch generation, so gating on the bumped gen would 404 its ack.
+        if (
+            vm is not None
+            and vm.state == VmState.ACTIVE
+            and vm.power_state == VmPowerState.STOPPING
+            and generation == vm.signing_generation
+        ):
+            return _prove_power_stop(vm, raw)
         if (
             vm is None
             or vm.state not in (VmState.MIGRATING, VmState.DECOMMISSIONING)
@@ -693,6 +734,65 @@ class StoppedAckIngestView(APIView):
             {"ok": True, "vm_id": vm_id, "generation": generation},
             status=status.HTTP_202_ACCEPTED,
         )
+
+
+def _prove_power_stop(vm: Vm, raw: bytes) -> Response:
+    """The ack of a guest shutting down for a power-API stop (#1162).
+
+    Verified NOW, while its signed time is inside the skew window — a later
+    §24 of the stopped VM could never verify it (and the row store is GC'd).
+    Only the proof is kept: the `eol_nonce` of the boot that shut down, on
+    `Vm.power_stop_proof`, and only if nothing moved since it was read (a
+    start clears the proof; §24 honours it only while it matches the VM's
+    nonce). Without it, that §24 has no guest left to sign and forces a
+    reclaim that quarantines a healthy miner. The bytes are not stored, so
+    an anonymous junk POST cannot displace the genuine proof.
+    """
+    if not vm.eol_nonce:
+        return _error(
+            status.HTTP_404_NOT_FOUND,
+            "no VM awaiting a stopped-ack for this vm_id/generation",
+            "not-found",
+        )
+    skew = int(getattr(settings, "VALI_STOPPED_ACK_SKEW_SECS", 600))
+    now = int(time.time())
+    try:
+        validator.verify_stopped_ack(
+            signed_bytes=raw,
+            lifecycle_vk_hex=vm.lifecycle_vk_hex(),
+            vm_id=vm.vm_id,
+            lease_id=vm.lease_id,
+            vm_generation=vm.signing_generation,
+            nonce_hex=bytes(vm.eol_nonce).hex(),
+            now_unix_min=now - skew,
+            now_unix_max=now + skew,
+        )
+    except validator.ValidatorFailed as exc:
+        log.info(
+            "power-stop ack rejected: vm_id=%s category=%s", vm.vm_id, exc.category
+        )
+        return _error(status.HTTP_400_BAD_REQUEST, exc.message, exc.category)
+    except validator.ValidatorUnavailable as exc:
+        log.error("power-stop ack: validator unavailable: %s", exc)
+        return _error(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), "internal")
+    proven = Vm.objects.filter(
+        pk=vm.pk,
+        state=VmState.ACTIVE,
+        power_state=VmPowerState.STOPPING,
+        power_state_at=vm.power_state_at,
+        eol_nonce=vm.eol_nonce,
+    ).update(power_stop_proof=vm.eol_nonce)
+    if not proven:
+        return _error(
+            status.HTTP_404_NOT_FOUND,
+            "no VM awaiting a stopped-ack for this vm_id/generation",
+            "not-found",
+        )
+    log.info("power-stop ack verified: vm_id=%s", vm.vm_id)
+    return Response(
+        {"ok": True, "vm_id": vm.vm_id, "generation": vm.signing_generation},
+        status=status.HTTP_202_ACCEPTED,
+    )
 
 
 # ─── Helpers ────────────────────────────────────────────────────────
@@ -944,6 +1044,8 @@ def _patch_for_transition(
         patch["migration_dest"] = ""
         patch["new_generation"] = None
         patch["eol_nonce"] = None
+        # The destination's boot is the VM's current boot (boot-stall clock).
+        patch["boot_started_at"] = timezone.now()
     elif req.to_state == VmState.DESTROYED:
         # Decommissioning → Destroyed{gen}: keep generation, clear
         # the EOL nonce (consumed), clear host fields (tombstone).
@@ -951,15 +1053,90 @@ def _patch_for_transition(
         patch["migration_dest"] = ""
         patch["new_generation"] = None
         patch["eol_nonce"] = None
+        patch.update(destroyed_power_fields())
     return patch
 
 
-def _serialize_vm(vm: Vm) -> dict[str, Any]:
+def _region_by_host(hosts: set[str]) -> dict[str, str]:
+    """`{miner_id: ISO alpha-2}` for the hosts whose DETECTED location the
+    scheduler would honour (`geo.placeable_locations`: fresh, verified). One
+    query for any number of hosts, so a list page costs the same as one VM."""
+    hosts = {h for h in hosts if h}
+    if not hosts:
+        return {}
+    from apps.miners import geo
+
+    return {
+        miner_id: country.upper()
+        for miner_id, country in geo.placeable_locations()
+        .filter(miner__miner_id__in=hosts)
+        .values_list("miner__miner_id", "country_code")
+    }
+
+
+def _public_ip_by_vm(vms: list[Vm]) -> dict[Any, dict[str, str]]:
+    """`{vm pk: {address, edge, region}}` for the VMs holding a public IP —
+    one query for a whole page, like `_region_by_host`."""
+    from apps.network.service import public_ip_by_vm
+
+    return public_ip_by_vm([vm.pk for vm in vms])
+
+
+def _backup_state_by_vm(vms: list[Vm]) -> dict[Any, str]:
+    """`{vm pk: backup_state}` — one policy query for a whole page."""
+    from apps.backup.service import backup_state_by_vm
+
+    return backup_state_by_vm(vms)
+
+
+def _data_death_by_vm(vms: list[Vm]) -> dict[Any, str]:
+    """`{vm pk: data_death}` of the VMs' §24 erase, one query for a page.
+    Only VMs in `decommissioning` / `destroyed` can have one."""
+    from apps.orchestration.models import DecommissionJob
+
+    dead = [vm.pk for vm in vms if vm.state in (VmState.DECOMMISSIONING, VmState.DESTROYED)]
+    if not dead:
+        return {}
+    out: dict[Any, str] = {}
+    rows = (
+        DecommissionJob.objects.filter(vm_id__in=dead)
+        .exclude(data_death="")
+        .order_by("kek_erased_at")
+        .values_list("vm_id", "data_death")
+    )
+    for vm_pk, death in rows:
+        out.setdefault(vm_pk, death)
+    return out
+
+
+def _serialize_vm(
+    vm: Vm,
+    region_by_host: dict[str, str] | None = None,
+    public_ip_by_vm: dict[Any, dict[str, str]] | None = None,
+    backup_state_by_vm: dict[Any, str] | None = None,
+    disk_gb_by_vm_id: dict[str, int] | None = None,
+    data_death_by_vm: dict[Any, str] | None = None,
+) -> dict[str, Any]:
     """Render a `Vm` row as the wire response. `eol_nonce` is OMITTED
     on purpose — clients shouldn't see it; only the guest sees it via
     the EOL command channel, and only once.
+
+    `region_by_host` / `public_ip_by_vm` / `data_death_by_vm` let a list
+    render every row from one query each; a single-VM caller omits them
+    and pays its own.
     """
+    from . import guardian_wait
+
     liveness = vm.guest_liveness()
+    stall = vm.boot_stall(disk_gb_by_vm_id=disk_gb_by_vm_id)
+    if region_by_host is None:
+        region_by_host = _region_by_host({vm.host})
+    if public_ip_by_vm is None:
+        public_ip_by_vm = _public_ip_by_vm([vm])
+    if backup_state_by_vm is None:
+        backup_state_by_vm = _backup_state_by_vm([vm])
+    if data_death_by_vm is None:
+        data_death_by_vm = _data_death_by_vm([vm])
     return {
         "vm_id": vm.vm_id,
         "tenant_id": vm.tenant_id,
@@ -968,6 +1145,15 @@ def _serialize_vm(vm: Vm) -> dict[str, Any]:
         "generation": vm.generation,
         "new_generation": vm.new_generation,
         "host": vm.host,
+        # The country the VM actually RUNS in: its host's detected, verified
+        # location (never the region the launch asked for — that is the
+        # upstream's record). `null` when the host has no fresh verified
+        # location, which includes a VM not placed yet.
+        "region": region_by_host.get(vm.host) or None,
+        # The public IPv4 attached to the VM (`apps.network`), or `null`.
+        "public_ip": public_ip_by_vm.get(vm.pk),
+        # Live backups (`apps.backup`): disabled | pending | ok | stale.
+        "backup_state": backup_state_by_vm.get(vm.pk, "disabled"),
         "migration_dest": vm.migration_dest,
         "version": vm.version,
         # Guest-boot progress mirror. "" until the first signed milestone;
@@ -975,6 +1161,14 @@ def _serialize_vm(vm: Vm) -> dict[str, Any]:
         "boot_phase": vm.boot_phase,
         "boot_phase_at": (
             vm.boot_phase_at.isoformat() if vm.boot_phase_at is not None else None
+        ),
+        # Boot stall — true when no in-guest signal has landed since the
+        # current boot began (`boot_started_at`) for longer than the
+        # per-flavor deadline (`apps.lifecycle.boot_stall`). Covers first
+        # launches, relaunches and §25 activations alike.
+        "boot_stalled": stall.stalled,
+        "boot_started_at": (
+            stall.boot_started_at.isoformat() if stall.boot_started_at is not None else None
         ),
         # Tenant NetBird overlay IP. "" until resolved from a served
         # receipt after enrolment; a pure DB read (no outbound call here).
@@ -992,12 +1186,32 @@ def _serialize_vm(vm: Vm) -> dict[str, Any]:
         # and `boot_phase` both stay green for a wedged VM, because the
         # libvirt domain is still `running` and `boot_phase` is monotonic.
         # `unknown` means NEVER emitted a signal — not dead.
-        "guest_liveness": liveness.state,
+        #
+        # A boot-stalled VM reads `wedged` HERE, on the wire, so a consumer
+        # that already treats `wedged` as broken shows it as failed rather
+        # than `unknown`/`alive`. Only the readout changes: the model-level
+        # verdict (`Vm.guest_liveness()`, which drives the default-off
+        # reboot-recovery WEDGED trigger and the WEDGED sweep) is untouched.
+        "guest_liveness": "wedged" if stall.stalled else liveness.state,
         "guest_signal_at": (
             liveness.signal_at.isoformat() if liveness.signal_at is not None else None
         ),
         "guest_signal_age_s": liveness.age_s,
         "guest_signal_kind": liveness.kind,
+        # Customer-held keys: who holds the disk key (`hippius` M0, `split`
+        # M1, `customer` M2), pinned at launch.
+        "key_mode": vm.key_mode,
+        # An M1/M2 guest waiting in its initramfs on the customer's key
+        # guardian: `{boot: awaiting-guardian, reason, since,
+        # last_report_at, terminal}`, else null. DISPLAY-only (the miner can
+        # forge or suppress it; the guardian's own audit log is the truth).
+        "guardian_wait": guardian_wait.view(vm),
+        # What §24 achieved for the tenant's data, once its erase step ran:
+        # `crypto-erased` (Hippius destroyed the key the disk needs) or
+        # `customer-erase-required` (M2 — Hippius never held the disk key:
+        # it deleted what it stores, and only `guardian erase <vm>` makes
+        # the data cryptographically unrecoverable). Null before §24.
+        "data_death": data_death_by_vm.get(vm.pk) or None,
         "created_at": vm.created_at.isoformat(),
         "updated_at": vm.updated_at.isoformat(),
     }

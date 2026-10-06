@@ -418,7 +418,7 @@ def _record_to_jsonable(rec: AuditRecord) -> dict[str, Any]:
     # `redact_text` is prefix-anchored, so ordinary ids (vm-1234,
     # tk-99) and the domain constant pass through untouched. Imported
     # lazily: a module-level import would cycle via `analytics.base`.
-    # (PR-S6 review — codex HIGH.)
+    # (PR-S6 review — review HIGH.)
     from sentinel.output.redact import redact_text
 
     return {

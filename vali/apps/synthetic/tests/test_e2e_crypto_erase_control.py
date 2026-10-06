@@ -37,7 +37,7 @@ import pytest
 
 from apps.lifecycle.models import Vm, VmState
 from apps.orchestration.services import vault_kv
-from apps.orchestration.services.vault_kv import EffectError
+from apps.orchestration.services.vault_kv import EffectError, VaultNotFound
 from apps.orchestration.tests.factories import make_vm
 from apps.synthetic import e2e
 
@@ -67,9 +67,15 @@ class FakeVault:
 
 def _kv_403(mount, path):
     """The deployed vali identity is read-denied on `luks-kek` (KEK-HSM),
-    so the KV half 403s on success AND on failure — which is exactly why
-    the transit half is the one that needs a control."""
-    raise EffectError("vault-kv-get:secret: vault returned HTTP 403")
+    so that half of the KV check 403s on success AND on failure — which is
+    exactly why the transit half is the one that needs a control.
+
+    The USERDATA paths are different: vali may read them, so the verifier
+    requires an observed 404 there and this stand-in answers accordingly.
+    """
+    if path.endswith("/luks-kek"):
+        raise EffectError("vault-kv-get:secret: vault returned HTTP 403")
+    raise VaultNotFound("gone")
 
 
 # ── the control itself ────────────────────────────────────────────────

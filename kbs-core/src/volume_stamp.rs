@@ -164,7 +164,7 @@
 //!   report that collapsed them into one verdict could not tell an
 //!   operator which of those two problems they have.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -198,10 +198,86 @@ type HmacSha256 = Hmac<Sha256>;
 /// naive in-volume-vs-boot-counter design had).
 pub const MAX_UNCONFIRMED_RELEASES: u64 = 3;
 
+/// The guest volume-stamp protocol every guest speaks today: a stamp
+/// `S` in the encrypted volume, compared against `E` (see the module
+/// docs). It binds nothing to a TIMELINE: an older backup of the same
+/// VM carries a smaller `S` and is refused, but so is every rollback —
+/// and a lowered `E` admits any volume stamped `E` or `E + 1`, whichever
+/// boot epoch wrote it.
+///
+/// Recorded per VM ([`VolumeStampStore::guest_stamp_protocol`]); a VM
+/// with no record speaks this one.
+pub const GUEST_STAMP_PROTOCOL_V1: u8 = 1;
+
+/// "Stamp protocol v2": the in-volume stamp is the pair `(timeline_id,
+/// value)`. A guest ATTESTS it in its SNP `REPORT_DATA`
+/// (`hippius_types::report_data::tenant_stamp_v2`) — the only place the
+/// KBS reads it from — and receives a `HIPPIUS_KBS_RELEASE_V2` response
+/// carrying a `volume_stamp_transition {expected, target}`. It accepts its
+/// volume only on the expected timeline, writes `(target, E + 1)`, and
+/// confirms WITH the timeline ([`confirm_timeline`]).
+///
+/// # Why a timeline (blocker B1 of A2)
+///
+/// An authorized rollback sets `E := E_T`. The restored timeline then
+/// writes `E_T + 1, E_T + 2, …` — the very numbers the ABANDONED
+/// (pre-rollback) timeline's disks already carry, so with a bare number a
+/// miner could present an abandoned disk later and undo the rollback. The
+/// rollback release therefore moves the VM to a fresh random timeline no
+/// release ever issued before, and every later release expects it: an
+/// abandoned disk carries the old timeline and is refused WHATEVER its
+/// value.
+pub const GUEST_STAMP_PROTOCOL_V2: u8 = 2;
+
+/// The first guest stamp protocol whose stamp is TIMELINE-bound
+/// ([`GUEST_STAMP_PROTOCOL_V2`]). An authorized rollback
+/// (`crate::rollback`) re-establishes an OLD stamp, so it is only sound
+/// for a guest that can tell that old stamp's timeline apart from any
+/// other volume carrying the same number: `authorize-rollback` refuses
+/// (`guest-not-rollback-capable`) unless the VM's recorded protocol is at
+/// least this, and so does the release that would consume an arm.
+pub const GUEST_STAMP_PROTOCOL_ROLLBACK_MIN: u8 = GUEST_STAMP_PROTOCOL_V2;
+
+/// The timeline of every VM never rolled back under stamp protocol v2
+/// (and of every legacy, plain-integer in-volume stamp).
+pub const ZERO_TIMELINE: [u8; 32] = [0u8; 32];
+
+/// Whether the KBS owns the volume-stamp anti-rollback for a VM in `mode`.
+///
+/// In M2 (`customer`) the customer's key guardian owns it (it releases
+/// the only key share, so it is the only party whose stamp binds
+/// anything). The KBS then neither notes the release — so the
+/// suppressed-confirm counter, and with it `max_unconfirmed_releases`,
+/// never counts a release whose guest confirms to the guardian and never
+/// to the KBS — nor mints a stamp token, and an authorized rollback has
+/// no KBS stamp to restore.
+pub fn kbs_owns_volume_stamp(mode: hippius_types::guardian::KeyMode) -> bool {
+    use hippius_types::guardian::KeyMode;
+    match mode {
+        KeyMode::Hippius | KeyMode::Split => true,
+        KeyMode::Customer => false,
+    }
+}
+
+/// Whether a VM whose guest speaks `protocol` may be armed for an
+/// authorized rollback. The ONE place that decision is made.
+pub fn guest_stamp_protocol_is_rollback_capable(protocol: u8) -> bool {
+    protocol >= GUEST_STAMP_PROTOCOL_ROLLBACK_MIN
+}
+
 /// Domain separator for the MAC key derived from the KBS signing seed.
 const MAC_KEY_DOMAIN: &[u8] = b"HIPPIUS_KBS_VOLUME_STAMP_MAC_V1";
 /// Domain separator for the token message itself.
 const TOKEN_DOMAIN: &[u8] = b"HIPPIUS_KBS_VOLUME_STAMP_CONFIRM_V1";
+/// Domain separator for a token minted under a NON-ZERO per-VM token
+/// epoch (see [`stamp_token_epoch`]). A distinct tag rather than an
+/// epoch field appended to the V1 message, so no epoch-0 token can ever
+/// collide with an epoch-N one.
+const TOKEN_EPOCH_DOMAIN: &[u8] = b"HIPPIUS_KBS_VOLUME_STAMP_CONFIRM_V2";
+/// Domain separator for a stamp-protocol-v2 token: bound to the TARGET
+/// timeline as well ([`stamp_token_timeline`]). Never equal to a V1/V2
+/// token for any input.
+const TOKEN_TIMELINE_DOMAIN: &[u8] = b"HIPPIUS_KBS_VOLUME_STAMP_CONFIRM_V3";
 
 /// Derive the volume-stamp MAC key from the KBS Ed25519 signing seed.
 ///
@@ -237,6 +313,58 @@ pub fn stamp_token(mac_key: &[u8; 32], vm_id: &str, target: u64) -> [u8; 32] {
     mac.update(&(vm_id.len() as u64).to_be_bytes());
     mac.update(vm_id.as_bytes());
     mac.update(&target.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// The confirm token for `(vm_id, target)` under the VM's current token
+/// EPOCH.
+///
+/// The epoch exists for the authorized rollback (`crate::rollback`): a
+/// rollback LOWERS the confirmed stamp to `E_T`, so a token minted on the
+/// abandoned timeline for `(vm_id, E_T + 1)` — which the miner saw in
+/// clear when that guest confirmed — would otherwise confirm again and
+/// push the restored expectation past the restored volume. Every
+/// rollback bumps the VM's epoch, and a token only confirms under the
+/// epoch it was minted in.
+///
+/// Epoch `0` (every VM that was never rolled back) is BYTE-IDENTICAL to
+/// [`stamp_token`], so nothing changes for them. The guest treats the
+/// token as 32 opaque bytes it hands back to the confirm route, so the
+/// epoch needs no guest change.
+pub fn stamp_token_epoch(mac_key: &[u8; 32], vm_id: &str, target: u64, epoch: u64) -> [u8; 32] {
+    if epoch == 0 {
+        return stamp_token(mac_key, vm_id, target);
+    }
+    #[allow(clippy::expect_used)]
+    let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC accepts any key length");
+    mac.update(TOKEN_EPOCH_DOMAIN);
+    mac.update(&(vm_id.len() as u64).to_be_bytes());
+    mac.update(vm_id.as_bytes());
+    mac.update(&target.to_be_bytes());
+    mac.update(&epoch.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// The confirm token a stamp-protocol-v2 release mints: for advancing
+/// `vm_id` to `target` ON `timeline`, under token `epoch`. It only
+/// confirms through [`confirm_timeline`] naming the same timeline, and
+/// only while that is the VM's current timeline — so a token minted for
+/// one timeline can never advance another.
+pub fn stamp_token_timeline(
+    mac_key: &[u8; 32],
+    vm_id: &str,
+    target: u64,
+    epoch: u64,
+    timeline: &[u8; 32],
+) -> [u8; 32] {
+    #[allow(clippy::expect_used)]
+    let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC accepts any key length");
+    mac.update(TOKEN_TIMELINE_DOMAIN);
+    mac.update(&(vm_id.len() as u64).to_be_bytes());
+    mac.update(vm_id.as_bytes());
+    mac.update(&target.to_be_bytes());
+    mac.update(&epoch.to_be_bytes());
+    mac.update(timeline);
     mac.finalize().into_bytes().into()
 }
 
@@ -467,15 +595,593 @@ pub trait VolumeStampStore: Send + Sync {
     /// backing `HashMap` is not) — an operator diffing two readouts is
     /// looking for a counter that moved, not for a reordering.
     fn snapshot(&self) -> Result<Vec<VolumeStampStatus>>;
+
+    /// `(confirmed, unconfirmed_releases)` of one VM (`(0, 0)` when
+    /// absent). Pure read, like [`Self::snapshot`].
+    fn row(&self, vm_id: &str) -> Result<(u64, u64)> {
+        Ok(self
+            .snapshot()?
+            .into_iter()
+            .find(|r| r.vm_id == vm_id)
+            .map(|r| (r.confirmed, r.unconfirmed_releases))
+            .unwrap_or((0, 0)))
+    }
+
+    /// The VM's confirm-token epoch (see [`stamp_token_epoch`]); `0`
+    /// for a VM that was never rolled back.
+    fn token_epoch(&self, _vm_id: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// [`Self::confirm`], additionally refusing unless the VM's token
+    /// epoch is still `epoch` — checked under the SAME lock as the CAS,
+    /// so a token verified against one epoch can never land after a
+    /// rollback moved the VM to the next.
+    fn confirm_at_epoch(&self, vm_id: &str, value: u64, epoch: u64) -> Result<u64> {
+        if epoch != 0 {
+            return Err(KbsError::Policy(
+                "volume-stamp: this store has no token epochs — fail closed".into(),
+            ));
+        }
+        self.confirm(vm_id, value)
+    }
+
+    /// The VM's current volume-stamp TIMELINE ([`ZERO_TIMELINE`] when none
+    /// was ever set — every VM never rolled back under v2). Pure read.
+    fn timeline(&self, _vm_id: &str) -> Result<[u8; 32]> {
+        Ok(ZERO_TIMELINE)
+    }
+
+    /// STAMP PROTOCOL v2, a release at `E == 0` (a fresh VM, or a row a
+    /// KBS restart wiped): move `vm_id` to `new_timeline`, a timeline no
+    /// release ever issued, so every volume stamped on ANY earlier
+    /// timeline — the zero timeline every VM counts from after a wipe,
+    /// and every disk a pre-wipe rollback abandoned — is refused once the
+    /// VM confirms on the new one (the re-opened B1 hole of a KBS
+    /// restart, see `crate::rollback`).
+    ///
+    /// Refuses — touching nothing — unless, under the SAME locks as the
+    /// confirm CAS, the confirmed stamp is still `0` (a confirm that
+    /// landed since the release read it would otherwise be re-bound to a
+    /// timeline its volume was never moved to), no rollback is pending
+    /// (its undo record owns the timeline), and `new_timeline` is neither
+    /// zero nor the current one. `Ok` only once the move is DURABLE: the
+    /// release replies after this, and a response whose timeline a crash
+    /// could still undo would be a confirm that never lands — harmless at
+    /// `E == 0`, but never built on. A store without timelines refuses.
+    fn adopt_fresh_timeline(&self, _vm_id: &str, _new_timeline: &[u8; 32]) -> Result<()> {
+        Err(KbsError::Policy(
+            "volume-stamp: this store has no timelines — fail closed".into(),
+        ))
+    }
+
+    /// The confirm CAS of stamp protocol v2: refuse unless the VM's token
+    /// epoch is still `epoch`, its current timeline is `timeline`, and
+    /// `value == confirmed + 1` — all under ONE lock. [`Self::confirm_at_epoch`]
+    /// (the v1 confirm) is this with [`ZERO_TIMELINE`]: a v1 token can
+    /// never confirm a VM that moved to another timeline.
+    fn confirm_at(&self, vm_id: &str, value: u64, epoch: u64, timeline: &[u8; 32]) -> Result<u64> {
+        if *timeline != ZERO_TIMELINE {
+            return Err(KbsError::Policy(
+                "volume-stamp: this store has no timelines — fail closed".into(),
+            ));
+        }
+        self.confirm_at_epoch(vm_id, value, epoch)
+    }
+
+    /// Record the timeline of the checkpoint an authorized-rollback arm
+    /// `restore_id` was built from (the `expected` timeline of the one
+    /// release it admits). One entry per VM — one live arm per VM — and
+    /// only the entry naming the arm's `restore_id` counts
+    /// ([`Self::arm_timeline`]). A store without timelines refuses.
+    fn record_arm_timeline(&self, _vm_id: &str, _restore_id: &str, _t: &[u8; 32]) -> Result<()> {
+        Err(KbsError::Policy(
+            "volume-stamp: this store cannot record an arm timeline — fail closed".into(),
+        ))
+    }
+
+    /// The timeline [`Self::record_arm_timeline`] recorded for `restore_id`,
+    /// `None` when none (the arm then admits nothing — fail closed).
+    fn arm_timeline(&self, _vm_id: &str, _restore_id: &str) -> Result<Option<[u8; 32]>> {
+        Ok(None)
+    }
+
+    /// `(confirmed, unconfirmed_releases, pending, timeline)` read in ONE
+    /// critical section (the checkpoint signs them together).
+    fn checkpoint_read(
+        &self,
+        vm_id: &str,
+    ) -> Result<(u64, u64, Option<PendingRollback>, [u8; 32])> {
+        let (e, u, p) = self.row_and_pending(vm_id)?;
+        Ok((e, u, p, self.timeline(vm_id)?))
+    }
+
+    /// Authorized-rollback step (i): set `confirmed := confirmed`,
+    /// `unconfirmed_releases := 0`, move the token epoch to `new_epoch`
+    /// (which MUST exceed the current one — epochs never repeat, so a
+    /// dead token never comes back to life), and record a durable
+    /// [`PendingRollback`] holding the row as it was, keyed by
+    /// `restore_id`. A retry of the same `restore_id` keeps the FIRST
+    /// recorded row; a pending rollback of ANOTHER `restore_id` refuses.
+    ///
+    /// The pending record is the undo log: until the release that
+    /// applied it calls [`Self::finalize_rollback`] (after every other
+    /// gate passed), [`crate::rollback::reconcile_pending`] reverts the
+    /// row whenever the arm that authorised it is gone — so a failure or
+    /// a crash anywhere between here and the response can never leave a
+    /// lowered stamp without a delivered, audited rollback.
+    ///
+    /// The VM's TIMELINE moves to `new_timeline` (never a timeline it held
+    /// before: the caller draws it fresh), and the timeline it replaced is
+    /// kept as the undo record's `prev` (the FIRST one, for a retry).
+    ///
+    /// Persist order: the sidecar (epoch + undo record) FIRST, then the
+    /// timeline, then the row. A failure after the sidecar leaves old
+    /// tokens dead, a pending record that reconciliation reverts, and the
+    /// stamp unchanged. The reverse would briefly pair a lowered stamp
+    /// with the old epoch (the window in which a captured abandoned-
+    /// timeline token confirms) and with no undo record.
+    fn apply_rollback(
+        &self,
+        _vm_id: &str,
+        _confirmed: u64,
+        _new_epoch: u64,
+        _restore_id: &str,
+        _new_timeline: &[u8; 32],
+    ) -> Result<()> {
+        Err(KbsError::Policy(
+            "volume-stamp: this store cannot apply a rollback — fail closed".into(),
+        ))
+    }
+
+    /// The undo record of a rollback applied but not yet finalized.
+    fn pending_rollback(&self, _vm_id: &str) -> Result<Option<PendingRollback>> {
+        Ok(None)
+    }
+
+    /// `(confirmed, unconfirmed_releases, pending)` read in ONE critical
+    /// section (the checkpoint signs them together).
+    fn row_and_pending(&self, vm_id: &str) -> Result<(u64, u64, Option<PendingRollback>)> {
+        let (e, u) = self.row(vm_id)?;
+        Ok((e, u, self.pending_rollback(vm_id)?))
+    }
+
+    /// Every VM with a pending rollback (startup reconciliation).
+    fn pending_rollback_vms(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Drop the undo record of `restore_id`: the rollback is delivered.
+    /// Records [`RollbackResolution::Delivered`] for it in the SAME write
+    /// (see [`Self::rollback_resolution`]). `Ok(None)` when there was
+    /// none for that id (nothing written).
+    fn finalize_rollback(
+        &self,
+        _vm_id: &str,
+        _restore_id: &str,
+    ) -> Result<Option<PendingRollback>> {
+        Ok(None)
+    }
+
+    /// Undo the rollback `restore_id`: the row goes back to the recorded
+    /// `(prev_confirmed, prev_unconfirmed_releases)` — written FIRST, so
+    /// a crash before the record is dropped only repeats an idempotent
+    /// revert — then the timeline goes back to the one it replaced, and
+    /// the record is dropped. The token epoch is NOT moved back: tokens
+    /// minted for the rolled-back row stay dead; the abandoned target
+    /// timeline is never issued again. The record is replaced by
+    /// [`RollbackResolution::Reverted`] in the same write.
+    fn revert_rollback(&self, _vm_id: &str, _restore_id: &str) -> Result<Option<PendingRollback>> {
+        Ok(None)
+    }
+
+    /// How the VM's last applied rollback ended: finalized (its key went
+    /// out) or reverted. Written atomically with the undo record's
+    /// removal, so it can never claim a delivery the store did not
+    /// finalize. `None` while one is pending, or when none ever ended.
+    fn rollback_resolution(&self, _vm_id: &str) -> Result<Option<ResolvedRollback>> {
+        Ok(None)
+    }
+
+    /// The guest volume-stamp protocol last RECORDED for `vm_id` from an
+    /// attested release ([`GUEST_STAMP_PROTOCOL_V1`] when nothing was
+    /// ever recorded — every VM today). Pure read.
+    fn guest_stamp_protocol(&self, _vm_id: &str) -> Result<u8> {
+        Ok(GUEST_STAMP_PROTOCOL_V1)
+    }
+
+    /// Record the guest stamp protocol an ATTESTED release reported for
+    /// `vm_id` (`crate::release`'s `attested_guest_stamp_protocol`). The
+    /// latest release wins in both directions: a guest re-launched on an
+    /// older image that speaks v1 again moves the record back down, so a
+    /// rollback is never armed on the strength of a guest that is gone.
+    /// Writes nothing when the value is unchanged (the release hot path
+    /// records on every release). `0` is not a protocol — refused.
+    ///
+    /// A store without the sibling file can only hold the default: it
+    /// accepts [`GUEST_STAMP_PROTOCOL_V1`] (nothing to write) and refuses
+    /// anything else, fail closed.
+    fn record_guest_stamp_protocol(&self, vm_id: &str, protocol: u8) -> Result<()> {
+        validate_guest_stamp_protocol(vm_id, protocol)?;
+        if protocol == GUEST_STAMP_PROTOCOL_V1 {
+            return Ok(());
+        }
+        Err(KbsError::Policy(format!(
+            "volume-stamp: this store cannot record guest stamp protocol {protocol} for \
+             vm_id={vm_id} — fail closed"
+        )))
+    }
+}
+
+fn validate_guest_stamp_protocol(vm_id: &str, protocol: u8) -> Result<()> {
+    if protocol == 0 {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: guest stamp protocol 0 for vm_id={vm_id} is not a protocol"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply a record to the protocol map: an entry only for a non-default
+/// protocol (absent ⇒ [`GUEST_STAMP_PROTOCOL_V1`]). `true` when it changed.
+fn set_guest_stamp_protocol(map: &mut BTreeMap<String, u8>, vm_id: &str, protocol: u8) -> bool {
+    let current = map.get(vm_id).copied().unwrap_or(GUEST_STAMP_PROTOCOL_V1);
+    if current == protocol {
+        return false;
+    }
+    if protocol == GUEST_STAMP_PROTOCOL_V1 {
+        map.remove(vm_id);
+    } else {
+        map.insert(vm_id.to_string(), protocol);
+    }
+    true
+}
+
+/// How an applied rollback left the pending state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RollbackResolution {
+    /// [`VolumeStampStore::finalize_rollback`]: every release gate passed.
+    Delivered,
+    /// [`VolumeStampStore::revert_rollback`]: the stamp was put back.
+    Reverted,
+}
+
+/// The last resolved rollback of a VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedRollback {
+    pub restore_id: String,
+    pub resolution: RollbackResolution,
+}
+
+/// Undo record of an applied-but-not-finalized authorized rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingRollback {
+    pub restore_id: String,
+    pub prev_confirmed: u64,
+    pub prev_unconfirmed_releases: u64,
+    pub applied_epoch: u64,
+}
+
+/// The stamp store's SIBLING state (never in the row file — see
+/// [`FileVolumeStampStore`]): per-VM token epochs and pending-rollback
+/// undo records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StampSidecar {
+    #[serde(default)]
+    epochs: HashMap<String, u64>,
+    #[serde(default)]
+    pending: HashMap<String, PendingRollback>,
+    /// Per VM, how its last pending rollback ended.
+    #[serde(default)]
+    resolved: HashMap<String, ResolvedRollback>,
+}
+
+/// Move `vm_id`'s pending record of `restore_id` to `resolved`.
+fn resolve(side: &mut StampSidecar, vm_id: &str, restore_id: &str, how: RollbackResolution) {
+    side.pending.remove(vm_id);
+    side.resolved.insert(
+        vm_id.to_string(),
+        ResolvedRollback {
+            restore_id: restore_id.to_string(),
+            resolution: how,
+        },
+    );
+}
+
+/// Pure planning step of [`VolumeStampStore::apply_rollback`], shared by
+/// both impls: the new sidecar and row, or a refusal. Touches nothing.
+fn plan_apply(
+    rows: &HashMap<String, StampRow>,
+    side: &StampSidecar,
+    vm_id: &str,
+    confirmed: u64,
+    new_epoch: u64,
+    restore_id: &str,
+) -> Result<(StampSidecar, StampRow)> {
+    let current = side.epochs.get(vm_id).copied().unwrap_or(0);
+    if new_epoch <= current {
+        return Err(stale_epoch(vm_id, new_epoch, current));
+    }
+    let mut next = side.clone();
+    let record = match side.pending.get(vm_id) {
+        Some(p) if p.restore_id == restore_id => PendingRollback {
+            applied_epoch: new_epoch,
+            ..p.clone()
+        },
+        Some(p) => {
+            return Err(KbsError::Policy(format!(
+                "volume-stamp: vm_id={vm_id} already has a pending rollback ({}) — refusing \
+                 {restore_id}, fail closed",
+                p.restore_id
+            )))
+        }
+        None => {
+            let row = rows.get(vm_id).copied().unwrap_or_default();
+            PendingRollback {
+                restore_id: restore_id.to_string(),
+                prev_confirmed: row.confirmed,
+                prev_unconfirmed_releases: row.unconfirmed_releases,
+                applied_epoch: new_epoch,
+            }
+        }
+    };
+    next.epochs.insert(vm_id.to_string(), new_epoch);
+    next.pending.insert(vm_id.to_string(), record);
+    Ok((
+        next,
+        StampRow {
+            confirmed,
+            unconfirmed_releases: 0,
+        },
+    ))
+}
+
+/// The stamp store's THIRD sibling (`<stem>-timelines.json`): stamp
+/// protocol v2 timelines. Never in the row file or the token-epochs file,
+/// whose shapes an older binary decodes strictly (`deny_unknown_fields`):
+/// an older binary ignores this file, which only matters for a VM that was
+/// rolled back under v2 (see [`FileVolumeStampStore`]).
+///
+/// Ids are lowercase hex (64 chars). A VM absent from `current` is on
+/// [`ZERO_TIMELINE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelineSidecar {
+    /// Per VM, its current timeline (only non-zero ones are stored).
+    #[serde(default)]
+    current: BTreeMap<String, String>,
+    /// Per VM, the timeline an applied rollback replaced (its undo).
+    /// Meaningful only while the token-epochs sidecar holds a pending
+    /// record with the same `restore_id`; a stale one is replaced by the
+    /// next rollback.
+    #[serde(default)]
+    undo: BTreeMap<String, TimelineUndo>,
+    /// Per VM, the checkpoint timeline of its (one) live arm.
+    #[serde(default)]
+    arms: BTreeMap<String, ArmTimeline>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelineUndo {
+    restore_id: String,
+    prev: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArmTimeline {
+    restore_id: String,
+    timeline: String,
+}
+
+fn parse_timeline(hex_id: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_id)
+        .map_err(|e| KbsError::Vault(format!("volume-stamp timeline decode: {e}")))?;
+    if hex_id.len() != 64 || hex::encode(&bytes) != hex_id {
+        return Err(KbsError::Vault(
+            "volume-stamp timeline decode: not 64 lowercase hex chars".into(),
+        ));
+    }
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| KbsError::Vault("volume-stamp timeline decode: not 32 bytes".into()))
+}
+
+impl TimelineSidecar {
+    /// Every id well-formed; `current` never stores the zero timeline.
+    fn validate(&self) -> Result<()> {
+        for (vm, t) in &self.current {
+            if parse_timeline(t)? == ZERO_TIMELINE {
+                return Err(KbsError::Vault(format!(
+                    "volume-stamp timelines: vm_id={vm} stores the zero timeline"
+                )));
+            }
+        }
+        for u in self.undo.values() {
+            parse_timeline(&u.prev)?;
+        }
+        for a in self.arms.values() {
+            parse_timeline(&a.timeline)?;
+        }
+        Ok(())
+    }
+
+    fn current(&self, vm_id: &str) -> Result<[u8; 32]> {
+        match self.current.get(vm_id) {
+            Some(t) => parse_timeline(t),
+            None => Ok(ZERO_TIMELINE),
+        }
+    }
+
+    fn set_current(&mut self, vm_id: &str, t: &[u8; 32]) {
+        if *t == ZERO_TIMELINE {
+            self.current.remove(vm_id);
+        } else {
+            self.current.insert(vm_id.to_string(), hex::encode(t));
+        }
+    }
+
+    fn arm(&self, vm_id: &str, restore_id: &str) -> Result<Option<[u8; 32]>> {
+        match self.arms.get(vm_id) {
+            Some(a) if a.restore_id == restore_id => parse_timeline(&a.timeline).map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Pure planning step of the TIMELINE half of
+/// [`VolumeStampStore::apply_rollback`]: move `vm_id` to `new_timeline`
+/// and record the timeline it replaced — keeping the FIRST one recorded
+/// when this is a retry of the same pending `restore_id` (the current
+/// timeline is then the retry's own earlier target, not the VM's).
+fn plan_timeline_apply(
+    side: &StampSidecar,
+    tl: &TimelineSidecar,
+    vm_id: &str,
+    restore_id: &str,
+    new_timeline: &[u8; 32],
+) -> Result<TimelineSidecar> {
+    let current = tl.current(vm_id)?;
+    if *new_timeline == ZERO_TIMELINE || *new_timeline == current {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: vm_id={vm_id} a rollback must move to a NEW timeline — fail closed"
+        )));
+    }
+    let retry = side
+        .pending
+        .get(vm_id)
+        .is_some_and(|p| p.restore_id == restore_id);
+    let prev = match tl.undo.get(vm_id) {
+        Some(u) if retry && u.restore_id == restore_id => u.prev.clone(),
+        _ => hex::encode(current),
+    };
+    let mut next = tl.clone();
+    next.undo.insert(
+        vm_id.to_string(),
+        TimelineUndo {
+            restore_id: restore_id.to_string(),
+            prev,
+        },
+    );
+    next.set_current(vm_id, new_timeline);
+    Ok(next)
+}
+
+/// Pure planning step of [`VolumeStampStore::adopt_fresh_timeline`],
+/// shared by both impls: the new timelines sidecar, or a refusal.
+fn plan_fresh_timeline(
+    row: StampRow,
+    side: &StampSidecar,
+    tl: &TimelineSidecar,
+    vm_id: &str,
+    new_timeline: &[u8; 32],
+) -> Result<TimelineSidecar> {
+    if row.confirmed != 0 {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: vm_id={vm_id} confirmed stamp is {} — only an unconfirmed (E = 0) VM \
+             moves to a fresh timeline; fail closed",
+            row.confirmed
+        )));
+    }
+    if side.pending.contains_key(vm_id) {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: vm_id={vm_id} has a pending rollback — its timeline is not ours to \
+             move; fail closed"
+        )));
+    }
+    if *new_timeline == ZERO_TIMELINE || *new_timeline == tl.current(vm_id)? {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: vm_id={vm_id} a fresh timeline must be NEW and non-zero — fail closed"
+        )));
+    }
+    let mut next = tl.clone();
+    next.set_current(vm_id, new_timeline);
+    Ok(next)
+}
+
+/// Pure planning step of the TIMELINE half of
+/// [`VolumeStampStore::revert_rollback`]: back to the recorded timeline.
+/// `None` when there is nothing to revert for `restore_id` (the timeline
+/// step never ran).
+fn plan_timeline_revert(
+    tl: &TimelineSidecar,
+    vm_id: &str,
+    restore_id: &str,
+) -> Result<Option<TimelineSidecar>> {
+    let Some(u) = tl.undo.get(vm_id).filter(|u| u.restore_id == restore_id) else {
+        return Ok(None);
+    };
+    let prev = parse_timeline(&u.prev)?;
+    let mut next = tl.clone();
+    next.undo.remove(vm_id);
+    next.set_current(vm_id, &prev);
+    Ok(Some(next))
 }
 
 /// File-backed store: a JSON map `{vm_id: StampRow}` written atomically
 /// (tmp + fsync + rename) under a `Mutex`. Same atomicity contract and
 /// the same rollback-on-persist-failure discipline as
 /// [`crate::boot_counter::FileBootCounterStore`].
+///
+/// The per-VM confirm-token EPOCHS (see [`stamp_token_epoch`]) live in a
+/// SIBLING file, `<stem>-token-epochs.json` (`{epochs, pending}`), never in
+/// the row: the row file's shape is what an older KBS binary decodes
+/// strictly, and widening it would make a binary rollback fail to open
+/// the store. An older binary ignores the sibling and mints epoch-0
+/// tokens, which only makes confirms of rolled-back VMs fail (non-fatal
+/// in the guest) — fail closed.
+///
+/// Lock order: `cache` BEFORE `epochs`, everywhere both are held.
+///
+/// The per-VM guest stamp protocol
+/// ([`VolumeStampStore::guest_stamp_protocol`]) lives in a SECOND
+/// sibling, `<stem>-guest-stamp-protocol.json` (`{vm_id: protocol}`, only
+/// the VMs whose protocol is not [`GUEST_STAMP_PROTOCOL_V1`]), for the
+/// same reason: neither the row file nor the token-epochs file changes
+/// shape, and an older binary that ignores it reads every VM as v1 —
+/// which only makes `authorize-rollback` refuse (fail closed). Its lock
+/// is never held together with the other two.
+///
+/// The stamp-protocol-v2 TIMELINES live in a THIRD sibling,
+/// `<stem>-timelines.json` ([`TimelineSidecar`]), for the same reason.
+/// Lock order: `cache`, then `epochs`, then `timelines`. An older binary
+/// ignores it and would release a VM rolled back under v2 as if it were
+/// on the zero timeline (the stamp value alone) — the B1 hole this file
+/// closes reopens for such a VM until the binary is rolled forward, so a
+/// KBS binary rollback must not follow an authorized rollback.
 pub struct FileVolumeStampStore {
     path: PathBuf,
+    epochs_path: PathBuf,
+    protocols_path: PathBuf,
+    timelines_path: PathBuf,
     cache: Mutex<HashMap<String, StampRow>>,
+    epochs: Mutex<StampSidecar>,
+    protocols: Mutex<ProtocolRecords>,
+    timelines: Mutex<TimelineSidecar>,
+    /// Set (under the `timelines` lock) when a timelines rename landed but
+    /// its directory fsync failed, and at open (what was loaded may be such
+    /// a rename). Every later timeline mutation — and the finalize/revert
+    /// that would drop a pending record — first retries the fsync and fails
+    /// until it succeeds, so nothing is built on a rename a crash could
+    /// still undo.
+    timelines_unsynced: std::sync::atomic::AtomicBool,
+}
+
+/// The protocol sibling's cache, and whether its last rename is still
+/// waiting for a successful directory fsync.
+struct ProtocolRecords {
+    map: BTreeMap<String, u8>,
+    /// Set when a rename landed but its directory fsync failed. Every
+    /// later record call — including one that changes nothing — retries
+    /// the fsync first and fails until it succeeds, so a retried release
+    /// can never be admitted on a record a crash could still undo.
+    unsynced: bool,
 }
 
 impl FileVolumeStampStore {
@@ -487,10 +1193,137 @@ impl FileVolumeStampStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(KbsError::Vault(format!("volume-stamp read: {e}"))),
         };
+        let epochs_path = Self::epochs_path_for(&path);
+        let epochs = match fs::read(&epochs_path) {
+            Ok(bytes) => serde_json::from_slice::<StampSidecar>(&bytes)
+                .map_err(|e| KbsError::Vault(format!("volume-stamp epochs decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StampSidecar::default(),
+            Err(e) => return Err(KbsError::Vault(format!("volume-stamp epochs read: {e}"))),
+        };
+        let protocols_path = Self::sibling_path_for(&path, "guest-stamp-protocol");
+        let protocols = match fs::read(&protocols_path) {
+            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, u8>>(&bytes)
+                .map_err(|e| KbsError::Vault(format!("volume-stamp guest protocol decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => {
+                return Err(KbsError::Vault(format!(
+                    "volume-stamp guest protocol read: {e}"
+                )))
+            }
+        };
+        if let Some((vm, p)) = protocols.iter().find(|(_, p)| **p == 0) {
+            return Err(KbsError::Vault(format!(
+                "volume-stamp guest protocol: vm_id={vm} holds {p}, not a protocol"
+            )));
+        }
+        // Absent ⇒ every VM on the zero timeline; corrupt ⇒ refuse to open.
+        let timelines_path = Self::sibling_path_for(&path, "timelines");
+        let timelines = match fs::read(&timelines_path) {
+            Ok(bytes) => serde_json::from_slice::<TimelineSidecar>(&bytes)
+                .map_err(|e| KbsError::Vault(format!("volume-stamp timelines decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => TimelineSidecar::default(),
+            Err(e) => return Err(KbsError::Vault(format!("volume-stamp timelines read: {e}"))),
+        };
+        timelines.validate()?;
         Ok(Self {
             path,
+            epochs_path,
+            protocols_path,
+            timelines_path,
             cache: Mutex::new(cache),
+            epochs: Mutex::new(epochs),
+            timelines: Mutex::new(timelines),
+            timelines_unsynced: std::sync::atomic::AtomicBool::new(true),
+            // Whatever was loaded may be a rename a previous process
+            // could not make durable: the first record call of this
+            // process syncs the directory before it trusts the cache.
+            protocols: Mutex::new(ProtocolRecords {
+                map: protocols,
+                unsynced: true,
+            }),
         })
+    }
+
+    /// `volume-stamps.json` ⇒ `volume-stamps-<suffix>.json`.
+    fn sibling_path_for(path: &std::path::Path, suffix: &str) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("volume-stamp");
+        let sibling = format!("{stem}-{suffix}.json");
+        match path.parent() {
+            Some(dir) => dir.join(sibling),
+            None => PathBuf::from(sibling),
+        }
+    }
+
+    /// `volume-stamps.json` ⇒ `volume-stamps-token-epochs.json`.
+    fn epochs_path_for(path: &std::path::Path) -> PathBuf {
+        Self::sibling_path_for(path, "token-epochs")
+    }
+
+    /// Write the timelines sibling and make the rename DURABLE: a lost
+    /// timeline rename fails OPEN (a missing file reads as the zero
+    /// timeline), so unlike the row and epochs files a failed directory
+    /// fsync is an error here. `Err(Unrenamed)` ⇒ the file is unchanged;
+    /// `Err(Unsynced)` ⇒ it holds `tl` but may not survive a crash — the
+    /// caller makes memory follow the file and refuses its operation.
+    fn persist_timelines_locked(&self, tl: &TimelineSidecar) -> TimelineWrite {
+        const WHAT: &str = "volume-stamp timelines";
+        let bytes = match serde_json::to_vec(tl) {
+            Ok(b) => b,
+            Err(e) => {
+                return TimelineWrite::Unrenamed(KbsError::Vault(format!("{WHAT} encode: {e}")))
+            }
+        };
+        if let Err(e) = atomic_write(&self.timelines_path, &bytes, WHAT) {
+            return TimelineWrite::Unrenamed(e);
+        }
+        match sync_parent_dir(&self.timelines_path, WHAT) {
+            Ok(()) => TimelineWrite::Durable,
+            Err(e) => TimelineWrite::Unsynced(e),
+        }
+    }
+
+    /// Persist `next` and make `*tl` follow what the FILE now holds. An
+    /// unsynced rename is remembered ([`Self::ensure_timelines_synced`]).
+    /// Caller holds the `timelines` lock.
+    fn commit_timelines_locked(
+        &self,
+        tl: &mut TimelineSidecar,
+        next: TimelineSidecar,
+    ) -> Result<()> {
+        self.ensure_timelines_synced()?;
+        match self.persist_timelines_locked(&next) {
+            TimelineWrite::Durable => {
+                *tl = next;
+                Ok(())
+            }
+            TimelineWrite::Unsynced(e) => {
+                *tl = next;
+                self.timelines_unsynced
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(e)
+            }
+            TimelineWrite::Unrenamed(e) => Err(e),
+        }
+    }
+
+    /// Make an earlier unsynced timelines rename durable, or fail. Caller
+    /// holds the `timelines` lock.
+    fn ensure_timelines_synced(&self) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.timelines_unsynced.load(SeqCst) {
+            sync_parent_dir(&self.timelines_path, "volume-stamp timelines")?;
+            self.timelines_unsynced.store(false, SeqCst);
+        }
+        Ok(())
+    }
+
+    fn persist_epochs_locked(&self, epochs: &StampSidecar) -> Result<()> {
+        let bytes = serde_json::to_vec(epochs)
+            .map_err(|e| KbsError::Vault(format!("volume-stamp epochs encode: {e}")))?;
+        atomic_write(&self.epochs_path, &bytes, "volume-stamp epochs")
     }
 
     /// Write `vm_id -> row` through to disk, keeping the in-memory
@@ -526,38 +1359,68 @@ impl FileVolumeStampStore {
     }
 
     fn persist_locked(&self, cache: &HashMap<String, StampRow>) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| KbsError::Vault("volume-stamp: no parent dir".into()))?;
-        let tmp = parent.join(format!(
-            ".{}.tmp",
-            self.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("volume-stamp"),
-        ));
         let bytes = serde_json::to_vec(cache)
             .map_err(|e| KbsError::Vault(format!("volume-stamp encode: {e}")))?;
-        {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(|e| KbsError::Vault(format!("volume-stamp open tmp: {e}")))?;
-            f.write_all(&bytes)
-                .map_err(|e| KbsError::Vault(format!("volume-stamp write tmp: {e}")))?;
-            f.sync_all()
-                .map_err(|e| KbsError::Vault(format!("volume-stamp fsync tmp: {e}")))?;
-        }
-        fs::rename(&tmp, &self.path)
-            .map_err(|e| KbsError::Vault(format!("volume-stamp rename: {e}")))?;
-        if let Ok(parent) = OpenOptions::new().read(true).open(parent) {
-            let _ = parent.sync_all();
-        }
-        Ok(())
+        atomic_write(&self.path, &bytes, "volume-stamp")
     }
+}
+
+/// Outcome of a timelines write ([`FileVolumeStampStore::persist_timelines_locked`]).
+enum TimelineWrite {
+    Durable,
+    Unsynced(KbsError),
+    Unrenamed(KbsError),
+}
+
+/// fsync `path`'s directory, failing loudly (unlike [`atomic_write`]'s
+/// best-effort sync) — for a record whose loss after a crash would widen
+/// what the KBS admits.
+fn sync_parent_dir(path: &std::path::Path, what: &str) -> Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .open(dir_of(path))
+        .and_then(|d| d.sync_all())
+        .map_err(|e| KbsError::Vault(format!("{what} fsync dir: {e}")))
+}
+
+/// The directory holding `path`: `.` for a bare file name (whose
+/// `parent()` is the EMPTY path, which cannot be opened).
+fn dir_of(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    }
+}
+
+/// tmp + fsync + rename, so a crash between the write and the rename
+/// leaves the live file byte-identical to what it was.
+fn atomic_write(path: &std::path::Path, bytes: &[u8], what: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| KbsError::Vault(format!("{what}: no parent dir")))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("volume-stamp"),
+    ));
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| KbsError::Vault(format!("{what} open tmp: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| KbsError::Vault(format!("{what} write tmp: {e}")))?;
+        f.sync_all()
+            .map_err(|e| KbsError::Vault(format!("{what} fsync tmp: {e}")))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| KbsError::Vault(format!("{what} rename: {e}")))?;
+    if let Ok(parent) = OpenOptions::new().read(true).open(parent) {
+        let _ = parent.sync_all();
+    }
+    Ok(())
 }
 
 impl VolumeStampStore for FileVolumeStampStore {
@@ -638,6 +1501,280 @@ impl VolumeStampStore for FileVolumeStampStore {
             .map_err(|_| KbsError::Policy("volume-stamp lock poisoned".into()))?;
         Ok(rows_from(&cache))
     }
+
+    fn row(&self, vm_id: &str) -> Result<(u64, u64)> {
+        let cache = self.cache.lock().map_err(|_| poisoned())?;
+        let r = cache.get(vm_id).copied().unwrap_or_default();
+        Ok((r.confirmed, r.unconfirmed_releases))
+    }
+
+    fn token_epoch(&self, vm_id: &str) -> Result<u64> {
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(side.epochs.get(vm_id).copied().unwrap_or(0))
+    }
+
+    fn confirm_at_epoch(&self, vm_id: &str, value: u64, epoch: u64) -> Result<u64> {
+        self.confirm_at(vm_id, value, epoch, &ZERO_TIMELINE)
+    }
+
+    fn timeline(&self, vm_id: &str) -> Result<[u8; 32]> {
+        self.timelines
+            .lock()
+            .map_err(|_| poisoned())?
+            .current(vm_id)
+    }
+
+    fn confirm_at(&self, vm_id: &str, value: u64, epoch: u64, timeline: &[u8; 32]) -> Result<u64> {
+        // Lock order: cache, epochs, timelines. All held across the epoch
+        // and timeline checks AND the CAS write.
+        let mut cache = self.cache.lock().map_err(|_| poisoned())?;
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        let tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let current = side.epochs.get(vm_id).copied().unwrap_or(0);
+        if current != epoch {
+            return Err(stale_epoch(vm_id, epoch, current));
+        }
+        check_timeline(vm_id, &tl.current(vm_id)?, timeline)?;
+        let row = cache.get(vm_id).copied().unwrap_or_default();
+        let new_row = confirm_cas(vm_id, row, value)?;
+        self.insert_and_persist_locked(&mut cache, vm_id, new_row)?;
+        Ok(value)
+    }
+
+    fn adopt_fresh_timeline(&self, vm_id: &str, new_timeline: &[u8; 32]) -> Result<()> {
+        // Lock order: cache, epochs, timelines — the confirm CAS's, so a
+        // confirm can never land between the `E == 0` check and the move.
+        let cache = self.cache.lock().map_err(|_| poisoned())?;
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let row = cache.get(vm_id).copied().unwrap_or_default();
+        let next = plan_fresh_timeline(row, &side, &tl, vm_id, new_timeline)?;
+        // Durable (renamed AND directory-fsynced) before `Ok`.
+        self.commit_timelines_locked(&mut tl, next)
+    }
+
+    fn record_arm_timeline(&self, vm_id: &str, restore_id: &str, t: &[u8; 32]) -> Result<()> {
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        // A retry of an entry whose rename was never made durable must not
+        // succeed on the cache alone.
+        self.ensure_timelines_synced()?;
+        let entry = ArmTimeline {
+            restore_id: restore_id.to_string(),
+            timeline: hex::encode(t),
+        };
+        if tl.arms.get(vm_id) == Some(&entry) {
+            return Ok(());
+        }
+        let mut next = tl.clone();
+        next.arms.insert(vm_id.to_string(), entry);
+        self.commit_timelines_locked(&mut tl, next)
+    }
+
+    fn arm_timeline(&self, vm_id: &str, restore_id: &str) -> Result<Option<[u8; 32]>> {
+        self.timelines
+            .lock()
+            .map_err(|_| poisoned())?
+            .arm(vm_id, restore_id)
+    }
+
+    fn checkpoint_read(
+        &self,
+        vm_id: &str,
+    ) -> Result<(u64, u64, Option<PendingRollback>, [u8; 32])> {
+        let cache = self.cache.lock().map_err(|_| poisoned())?;
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        let tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let r = cache.get(vm_id).copied().unwrap_or_default();
+        Ok((
+            r.confirmed,
+            r.unconfirmed_releases,
+            side.pending.get(vm_id).cloned(),
+            tl.current(vm_id)?,
+        ))
+    }
+
+    fn apply_rollback(
+        &self,
+        vm_id: &str,
+        confirmed: u64,
+        new_epoch: u64,
+        restore_id: &str,
+        new_timeline: &[u8; 32],
+    ) -> Result<()> {
+        let mut cache = self.cache.lock().map_err(|_| poisoned())?;
+        let mut side = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let (next, row) = plan_apply(&cache, &side, vm_id, confirmed, new_epoch, restore_id)?;
+        let next_tl = plan_timeline_apply(&side, &tl, vm_id, restore_id, new_timeline)?;
+        // Sidecar FIRST, then the timeline, then the row (see the trait
+        // doc); memory follows each file.
+        self.persist_epochs_locked(&next)?;
+        *side = next;
+        self.commit_timelines_locked(&mut tl, next_tl)?;
+        self.insert_and_persist_locked(&mut cache, vm_id, row)
+    }
+
+    fn pending_rollback(&self, vm_id: &str) -> Result<Option<PendingRollback>> {
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(side.pending.get(vm_id).cloned())
+    }
+
+    fn row_and_pending(&self, vm_id: &str) -> Result<(u64, u64, Option<PendingRollback>)> {
+        let cache = self.cache.lock().map_err(|_| poisoned())?;
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        let r = cache.get(vm_id).copied().unwrap_or_default();
+        Ok((
+            r.confirmed,
+            r.unconfirmed_releases,
+            side.pending.get(vm_id).cloned(),
+        ))
+    }
+
+    fn pending_rollback_vms(&self) -> Result<Vec<String>> {
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut v: Vec<String> = side.pending.keys().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    fn finalize_rollback(&self, vm_id: &str, restore_id: &str) -> Result<Option<PendingRollback>> {
+        let _cache = self.cache.lock().map_err(|_| poisoned())?;
+        let mut side = self.epochs.lock().map_err(|_| poisoned())?;
+        match side.pending.get(vm_id) {
+            Some(p) if p.restore_id == restore_id => {}
+            _ => return Ok(None),
+        }
+        // Never drop the undo record over a timeline a crash could undo.
+        {
+            let _tl = self.timelines.lock().map_err(|_| poisoned())?;
+            self.ensure_timelines_synced()?;
+        }
+        let dropped = side.pending.get(vm_id).cloned();
+        let mut next = side.clone();
+        resolve(&mut next, vm_id, restore_id, RollbackResolution::Delivered);
+        self.persist_epochs_locked(&next)?;
+        *side = next;
+        Ok(dropped)
+    }
+
+    fn revert_rollback(&self, vm_id: &str, restore_id: &str) -> Result<Option<PendingRollback>> {
+        let mut cache = self.cache.lock().map_err(|_| poisoned())?;
+        let mut side = self.epochs.lock().map_err(|_| poisoned())?;
+        let record = match side.pending.get(vm_id) {
+            Some(p) if p.restore_id == restore_id => p.clone(),
+            _ => return Ok(None),
+        };
+        // Row FIRST, then the timeline: a crash before the record is
+        // dropped repeats this (idempotent) revert on the next
+        // reconciliation.
+        self.insert_and_persist_locked(
+            &mut cache,
+            vm_id,
+            StampRow {
+                confirmed: record.prev_confirmed,
+                unconfirmed_releases: record.prev_unconfirmed_releases,
+            },
+        )?;
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        // A retry after an unsynced timeline revert finds no undo left:
+        // the pending record is only dropped once that rename is durable.
+        self.ensure_timelines_synced()?;
+        if let Some(next_tl) = plan_timeline_revert(&tl, vm_id, restore_id)? {
+            self.commit_timelines_locked(&mut tl, next_tl)?;
+        }
+        let mut next = side.clone();
+        resolve(&mut next, vm_id, restore_id, RollbackResolution::Reverted);
+        self.persist_epochs_locked(&next)?;
+        *side = next;
+        Ok(Some(record))
+    }
+
+    fn rollback_resolution(&self, vm_id: &str) -> Result<Option<ResolvedRollback>> {
+        let side = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(side.resolved.get(vm_id).cloned())
+    }
+
+    fn guest_stamp_protocol(&self, vm_id: &str) -> Result<u8> {
+        let rec = self.protocols.lock().map_err(|_| poisoned())?;
+        Ok(rec
+            .map
+            .get(vm_id)
+            .copied()
+            .unwrap_or(GUEST_STAMP_PROTOCOL_V1))
+    }
+
+    fn record_guest_stamp_protocol(&self, vm_id: &str, protocol: u8) -> Result<()> {
+        const WHAT: &str = "volume-stamp guest protocol";
+        validate_guest_stamp_protocol(vm_id, protocol)?;
+        let mut rec = self.protocols.lock().map_err(|_| poisoned())?;
+        // An earlier rename not yet durable: make it so before anything
+        // is admitted on the strength of the cache.
+        if rec.unsynced {
+            sync_parent_dir(&self.protocols_path, WHAT)?;
+            rec.unsynced = false;
+        }
+        let mut next = rec.map.clone();
+        if !set_guest_stamp_protocol(&mut next, vm_id, protocol) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|e| KbsError::Vault(format!("{WHAT} encode: {e}")))?;
+        // A failure BEFORE the rename leaves file and cache as they were.
+        atomic_write(&self.protocols_path, &bytes, WHAT)?;
+        // Renamed: the file now says `next`, so the cache follows it —
+        // then the rename must be made DURABLE, or the caller is refused
+        // (now and on every retry until it is): a crash could otherwise
+        // bring back a v2 record the latest (v1) release replaced.
+        rec.map = next;
+        rec.unsynced = true;
+        sync_parent_dir(&self.protocols_path, WHAT)?;
+        rec.unsynced = false;
+        Ok(())
+    }
+}
+
+fn poisoned() -> KbsError {
+    KbsError::Policy("volume-stamp lock poisoned".into())
+}
+
+/// The confirm's timeline must be the VM's current one.
+fn check_timeline(vm_id: &str, current: &[u8; 32], presented: &[u8; 32]) -> Result<()> {
+    if current != presented {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp: vm_id={vm_id} confirm names timeline {} but the VM is on {} — a \
+             token of another timeline never confirms; fail closed (the expectation is \
+             UNCHANGED)",
+            hex::encode(presented),
+            hex::encode(current)
+        )));
+    }
+    Ok(())
+}
+
+fn stale_epoch(vm_id: &str, epoch: u64, current: u64) -> KbsError {
+    KbsError::Policy(format!(
+        "volume-stamp: vm_id={vm_id} token epoch {epoch} is not current ({current}) — a rollback \
+         moved this VM to a new timeline; fail closed (the expectation is UNCHANGED)"
+    ))
+}
+
+/// The confirm CAS on one row, shared by every confirm path.
+fn confirm_cas(vm_id: &str, row: StampRow, value: u64) -> Result<StampRow> {
+    let expected = row
+        .confirmed
+        .checked_add(1)
+        .ok_or_else(|| KbsError::Policy("volume-stamp overflow".into()))?;
+    if value != expected {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp confirm: vm_id={vm_id} value={value} expected={expected} \
+             (stored={}) — rewind or skip, fail closed",
+            row.confirmed
+        )));
+    }
+    Ok(StampRow {
+        confirmed: value,
+        unconfirmed_releases: 0,
+    })
 }
 
 /// Shared read-only projection used by both store impls, so the file
@@ -661,6 +1798,9 @@ fn rows_from(map: &HashMap<String, StampRow>) -> Vec<VolumeStampStatus> {
 #[derive(Default)]
 pub struct InMemoryVolumeStampStore {
     inner: Mutex<HashMap<String, StampRow>>,
+    epochs: Mutex<StampSidecar>,
+    protocols: Mutex<BTreeMap<String, u8>>,
+    timelines: Mutex<TimelineSidecar>,
 }
 
 impl VolumeStampStore for InMemoryVolumeStampStore {
@@ -736,6 +1876,171 @@ impl VolumeStampStore for InMemoryVolumeStampStore {
             .map_err(|_| KbsError::Policy("volume-stamp lock poisoned".into()))?;
         Ok(rows_from(&m))
     }
+
+    fn token_epoch(&self, vm_id: &str) -> Result<u64> {
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(e.epochs.get(vm_id).copied().unwrap_or(0))
+    }
+
+    fn confirm_at_epoch(&self, vm_id: &str, value: u64, epoch: u64) -> Result<u64> {
+        self.confirm_at(vm_id, value, epoch, &ZERO_TIMELINE)
+    }
+
+    fn timeline(&self, vm_id: &str) -> Result<[u8; 32]> {
+        self.timelines
+            .lock()
+            .map_err(|_| poisoned())?
+            .current(vm_id)
+    }
+
+    fn confirm_at(&self, vm_id: &str, value: u64, epoch: u64, timeline: &[u8; 32]) -> Result<u64> {
+        let mut m = self.inner.lock().map_err(|_| poisoned())?;
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        let tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let current = e.epochs.get(vm_id).copied().unwrap_or(0);
+        if current != epoch {
+            return Err(stale_epoch(vm_id, epoch, current));
+        }
+        check_timeline(vm_id, &tl.current(vm_id)?, timeline)?;
+        let row = m.get(vm_id).copied().unwrap_or_default();
+        let new_row = confirm_cas(vm_id, row, value)?;
+        m.insert(vm_id.to_string(), new_row);
+        Ok(value)
+    }
+
+    fn adopt_fresh_timeline(&self, vm_id: &str, new_timeline: &[u8; 32]) -> Result<()> {
+        let m = self.inner.lock().map_err(|_| poisoned())?;
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let row = m.get(vm_id).copied().unwrap_or_default();
+        *tl = plan_fresh_timeline(row, &e, &tl, vm_id, new_timeline)?;
+        Ok(())
+    }
+
+    fn record_arm_timeline(&self, vm_id: &str, restore_id: &str, t: &[u8; 32]) -> Result<()> {
+        self.timelines.lock().map_err(|_| poisoned())?.arms.insert(
+            vm_id.to_string(),
+            ArmTimeline {
+                restore_id: restore_id.to_string(),
+                timeline: hex::encode(t),
+            },
+        );
+        Ok(())
+    }
+
+    fn arm_timeline(&self, vm_id: &str, restore_id: &str) -> Result<Option<[u8; 32]>> {
+        self.timelines
+            .lock()
+            .map_err(|_| poisoned())?
+            .arm(vm_id, restore_id)
+    }
+
+    fn checkpoint_read(
+        &self,
+        vm_id: &str,
+    ) -> Result<(u64, u64, Option<PendingRollback>, [u8; 32])> {
+        let m = self.inner.lock().map_err(|_| poisoned())?;
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        let tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let r = m.get(vm_id).copied().unwrap_or_default();
+        Ok((
+            r.confirmed,
+            r.unconfirmed_releases,
+            e.pending.get(vm_id).cloned(),
+            tl.current(vm_id)?,
+        ))
+    }
+
+    fn apply_rollback(
+        &self,
+        vm_id: &str,
+        confirmed: u64,
+        new_epoch: u64,
+        restore_id: &str,
+        new_timeline: &[u8; 32],
+    ) -> Result<()> {
+        let mut m = self.inner.lock().map_err(|_| poisoned())?;
+        let mut e = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        let (next, row) = plan_apply(&m, &e, vm_id, confirmed, new_epoch, restore_id)?;
+        let next_tl = plan_timeline_apply(&e, &tl, vm_id, restore_id, new_timeline)?;
+        *e = next;
+        *tl = next_tl;
+        m.insert(vm_id.to_string(), row);
+        Ok(())
+    }
+
+    fn pending_rollback(&self, vm_id: &str) -> Result<Option<PendingRollback>> {
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(e.pending.get(vm_id).cloned())
+    }
+
+    fn row_and_pending(&self, vm_id: &str) -> Result<(u64, u64, Option<PendingRollback>)> {
+        let m = self.inner.lock().map_err(|_| poisoned())?;
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        let r = m.get(vm_id).copied().unwrap_or_default();
+        Ok((
+            r.confirmed,
+            r.unconfirmed_releases,
+            e.pending.get(vm_id).cloned(),
+        ))
+    }
+
+    fn pending_rollback_vms(&self) -> Result<Vec<String>> {
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        let mut v: Vec<String> = e.pending.keys().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    fn finalize_rollback(&self, vm_id: &str, restore_id: &str) -> Result<Option<PendingRollback>> {
+        let mut e = self.epochs.lock().map_err(|_| poisoned())?;
+        let dropped = match e.pending.get(vm_id) {
+            Some(p) if p.restore_id == restore_id => p.clone(),
+            _ => return Ok(None),
+        };
+        resolve(&mut e, vm_id, restore_id, RollbackResolution::Delivered);
+        Ok(Some(dropped))
+    }
+
+    fn revert_rollback(&self, vm_id: &str, restore_id: &str) -> Result<Option<PendingRollback>> {
+        let mut m = self.inner.lock().map_err(|_| poisoned())?;
+        let mut e = self.epochs.lock().map_err(|_| poisoned())?;
+        let record = match e.pending.get(vm_id) {
+            Some(p) if p.restore_id == restore_id => p.clone(),
+            _ => return Ok(None),
+        };
+        m.insert(
+            vm_id.to_string(),
+            StampRow {
+                confirmed: record.prev_confirmed,
+                unconfirmed_releases: record.prev_unconfirmed_releases,
+            },
+        );
+        let mut tl = self.timelines.lock().map_err(|_| poisoned())?;
+        if let Some(next_tl) = plan_timeline_revert(&tl, vm_id, restore_id)? {
+            *tl = next_tl;
+        }
+        resolve(&mut e, vm_id, restore_id, RollbackResolution::Reverted);
+        Ok(Some(record))
+    }
+
+    fn rollback_resolution(&self, vm_id: &str) -> Result<Option<ResolvedRollback>> {
+        let e = self.epochs.lock().map_err(|_| poisoned())?;
+        Ok(e.resolved.get(vm_id).cloned())
+    }
+
+    fn guest_stamp_protocol(&self, vm_id: &str) -> Result<u8> {
+        let map = self.protocols.lock().map_err(|_| poisoned())?;
+        Ok(map.get(vm_id).copied().unwrap_or(GUEST_STAMP_PROTOCOL_V1))
+    }
+
+    fn record_guest_stamp_protocol(&self, vm_id: &str, protocol: u8) -> Result<()> {
+        validate_guest_stamp_protocol(vm_id, protocol)?;
+        let mut map = self.protocols.lock().map_err(|_| poisoned())?;
+        set_guest_stamp_protocol(&mut map, vm_id, protocol);
+        Ok(())
+    }
 }
 
 /// The `/v1/kbs/volume-stamp/confirm` operation.
@@ -756,7 +2061,11 @@ pub fn confirm(
     value: u64,
     presented_token: &[u8],
 ) -> Result<u64> {
-    let want = stamp_token(mac_key, vm_id, value);
+    // The token is only valid under the epoch it was minted in; the
+    // store re-checks that epoch under the CAS lock, so a rollback
+    // landing between this read and the write refuses the confirm.
+    let epoch = store.token_epoch(vm_id)?;
+    let want = stamp_token_epoch(mac_key, vm_id, value, epoch);
     // ct_eq over equal-length slices; a length mismatch short-circuits
     // (the length of the expected token is public).
     let ok = presented_token.len() == want.len() && bool::from(presented_token.ct_eq(&want[..]));
@@ -766,7 +2075,34 @@ pub fn confirm(
              fail closed (the expectation is UNCHANGED)"
         )));
     }
-    store.confirm(vm_id, value)
+    store.confirm_at_epoch(vm_id, value, epoch)
+}
+
+/// The stamp-protocol-v2 `/v1/kbs/volume-stamp/confirm` operation: the
+/// confirm names the TIMELINE it stamped, the token must be the one minted
+/// for exactly that `(vm_id, value, epoch, timeline)` (constant-time), and
+/// the store's CAS ([`VolumeStampStore::confirm_at`]) re-checks, under one
+/// lock, that the timeline and epoch are still current and `value` is
+/// exactly `confirmed + 1`. A bad token or a refused CAS leaves the store
+/// untouched.
+pub fn confirm_timeline(
+    store: &dyn VolumeStampStore,
+    mac_key: &[u8; 32],
+    vm_id: &str,
+    value: u64,
+    presented_token: &[u8],
+    timeline: &[u8; 32],
+) -> Result<u64> {
+    let epoch = store.token_epoch(vm_id)?;
+    let want = stamp_token_timeline(mac_key, vm_id, value, epoch, timeline);
+    let ok = presented_token.len() == want.len() && bool::from(presented_token.ct_eq(&want[..]));
+    if !ok {
+        return Err(KbsError::Policy(format!(
+            "volume-stamp confirm: vm_id={vm_id} value={value} — bad or absent timeline-bound \
+             token, fail closed (the expectation is UNCHANGED)"
+        )));
+    }
+    store.confirm_at(vm_id, value, epoch, timeline)
 }
 
 #[cfg(test)]
@@ -775,6 +2111,11 @@ mod tests {
 
     fn seed() -> [u8; 32] {
         [7u8; 32]
+    }
+
+    /// A distinct non-zero timeline per `n`.
+    fn tl(n: u8) -> [u8; 32] {
+        [n; 32]
     }
 
     #[test]
@@ -908,6 +2249,232 @@ mod tests {
             0,
             "a failed persist left the cache advanced — the tenant is now locked out"
         );
+    }
+
+    // ── guest stamp protocol (rollback capability) ─────────────────────
+
+    #[test]
+    fn guest_stamp_protocol_defaults_to_v1_and_latest_record_wins() {
+        for_each_store(|s| {
+            assert_eq!(
+                s.guest_stamp_protocol("abc").unwrap(),
+                GUEST_STAMP_PROTOCOL_V1
+            );
+            s.record_guest_stamp_protocol("abc", 2).unwrap();
+            assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 2);
+            assert_eq!(s.guest_stamp_protocol("other").unwrap(), 1);
+            // A guest re-launched on a v1 image moves it back down.
+            s.record_guest_stamp_protocol("abc", 1).unwrap();
+            assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 1);
+            assert!(s.record_guest_stamp_protocol("abc", 0).is_err());
+            assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn only_protocol_two_and_up_is_rollback_capable() {
+        assert!(!guest_stamp_protocol_is_rollback_capable(0));
+        assert!(!guest_stamp_protocol_is_rollback_capable(1));
+        assert!(guest_stamp_protocol_is_rollback_capable(2));
+        assert!(guest_stamp_protocol_is_rollback_capable(3));
+    }
+
+    /// The protocol lives in its OWN sibling: recording it never touches
+    /// the row file or the token-epochs file, a v1 record on a VM with no
+    /// entry writes nothing at all (the release hot path), and the value
+    /// survives a reopen.
+    #[test]
+    fn guest_stamp_protocol_is_a_sibling_that_never_widens_the_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let sib = dir.path().join("volume-stamps-guest-stamp-protocol.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        s.confirm("abc", 1).unwrap();
+        let rows_before = fs::read(&path).unwrap();
+        s.record_guest_stamp_protocol("abc", 1).unwrap();
+        assert!(!sib.exists(), "a v1 record on an absent VM wrote a file");
+        s.record_guest_stamp_protocol("abc", 2).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), rows_before);
+        assert!(!dir.path().join("volume-stamps-token-epochs.json").exists());
+        assert_eq!(fs::read(&sib).unwrap(), br#"{"abc":2}"#);
+        let reopened = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(reopened.guest_stamp_protocol("abc").unwrap(), 2);
+        assert_eq!(reopened.get("abc").unwrap(), 1);
+        reopened.record_guest_stamp_protocol("abc", 1).unwrap();
+        assert_eq!(fs::read(&sib).unwrap(), b"{}");
+        // The row file an older binary decodes strictly is still exactly
+        // `{vm_id: row}`.
+        let rows: HashMap<String, StampRow> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_protocol_write_leaves_the_record_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        fs::create_dir(
+            dir.path()
+                .join(".volume-stamps-guest-stamp-protocol.json.tmp"),
+        )
+        .unwrap();
+        assert!(s.record_guest_stamp_protocol("abc", 2).is_err());
+        assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 1);
+    }
+
+    /// The rename landed but the directory cannot be synced: the caller
+    /// is refused (a crash could bring the old record back), while the
+    /// cache follows the file it can no longer un-rename.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsyncable_protocol_rename_refuses_the_caller_until_it_is_durable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        // A fresh process syncs once on its first record.
+        s.record_guest_stamp_protocol("abc", 1).unwrap();
+        // write+search but no read: tmp create and rename work, opening
+        // the directory to fsync it does not.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::File::open(dir.path()).is_ok() {
+            // Privileged runner: permissions are not enforced.
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let out = s.record_guest_stamp_protocol("abc", 2);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(out.is_err());
+        assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 2);
+        assert_eq!(
+            fs::read(dir.path().join("volume-stamps-guest-stamp-protocol.json")).unwrap(),
+            br#"{"abc":2}"#
+        );
+        s.record_guest_stamp_protocol("abc", 2).unwrap();
+
+        // The security-relevant direction: a durable v2 replaced by v1,
+        // the fsync fails — and a RETRY of the same v1 record (which
+        // changes nothing in the cache) must keep failing until the
+        // rename is durable, never succeed on the cache alone.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(s.record_guest_stamp_protocol("abc", 1).is_err());
+        assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 1);
+        assert!(
+            s.record_guest_stamp_protocol("abc", 1).is_err(),
+            "a retry succeeded on a rename that is not yet durable"
+        );
+        // Nor after a process restart that reopens the visible v1 file.
+        drop(s);
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.guest_stamp_protocol("abc").unwrap(), 1);
+        assert!(
+            s.record_guest_stamp_protocol("abc", 1).is_err(),
+            "a reopened store trusted a rename that is not yet durable"
+        );
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        s.record_guest_stamp_protocol("abc", 1).unwrap();
+    }
+
+    /// The timelines rename must be DURABLE (a lost one fails open): when
+    /// the directory cannot be fsynced the rollback's stamp step is
+    /// refused BEFORE the row is lowered, memory follows the renamed file
+    /// (so the pending record's revert restores the replaced timeline),
+    /// and nothing is lowered under the old timeline.
+    #[test]
+    fn an_unsyncable_timeline_rename_refuses_the_rollback_before_the_row_moves() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        s.confirm("abc", 1).unwrap();
+        s.confirm("abc", 2).unwrap();
+        // A fresh process syncs once on its first timeline write.
+        s.record_arm_timeline("other", "warm", &tl(1)).unwrap();
+        // write+search but no read: tmp create and rename work, opening
+        // the directory to fsync it does not.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::File::open(dir.path()).is_ok() {
+            // Privileged runner: permissions are not enforced.
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let out = s.apply_rollback("abc", 1, 1, "r", &tl(0x79));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            out.is_err(),
+            "an unsynced timeline rename must refuse the stamp step"
+        );
+        assert_eq!(s.row("abc").unwrap(), (2, 0), "the row was not lowered");
+        assert_eq!(
+            s.timeline("abc").unwrap(),
+            tl(0x79),
+            "memory follows the renamed file"
+        );
+        assert!(s.pending_rollback("abc").unwrap().is_some());
+        s.revert_rollback("abc", "r").unwrap().unwrap();
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+        assert_eq!(s.row("abc").unwrap(), (2, 0));
+    }
+
+    /// An unsynced timeline REVERT keeps the pending record, and the retry
+    /// (which finds no undo left) still refuses until the rename is
+    /// durable — never dropping the record over a timeline a crash could
+    /// undo. Likewise a retried arm timeline.
+    #[test]
+    fn an_unsynced_timeline_revert_keeps_refusing_until_it_is_durable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        s.confirm("abc", 1).unwrap();
+        s.apply_rollback("abc", 0, 1, "r", &tl(0x7a)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::File::open(dir.path()).is_ok() {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        assert!(s.revert_rollback("abc", "r").is_err());
+        assert!(s.pending_rollback("abc").unwrap().is_some());
+        assert!(
+            s.revert_rollback("abc", "r").is_err(),
+            "a retry must not drop the record over an unsynced timeline"
+        );
+        assert!(s.finalize_rollback("abc", "r").is_err());
+        assert!(s.record_arm_timeline("abc", "x", &tl(1)).is_err());
+        assert!(s.pending_rollback("abc").unwrap().is_some());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        s.revert_rollback("abc", "r").unwrap();
+        assert!(s.pending_rollback("abc").unwrap().is_none());
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+        assert_eq!(s.row("abc").unwrap(), (1, 0));
+    }
+
+    /// A bare relative store path (`volume-stamps.json`) has an EMPTY
+    /// parent; the strict dir sync must use `.` or every release would
+    /// be refused.
+    #[test]
+    fn a_bare_file_name_syncs_the_current_directory() {
+        use std::path::Path;
+        assert_eq!(dir_of(Path::new("volume-stamps.json")), Path::new("."));
+        assert_eq!(
+            dir_of(Path::new("/var/lib/kbs/x.json")),
+            Path::new("/var/lib/kbs")
+        );
+        assert_eq!(dir_of(Path::new("state/x.json")), Path::new("state"));
+        sync_parent_dir(Path::new("volume-stamps.json"), "t").unwrap();
+    }
+
+    #[test]
+    fn a_zero_protocol_on_disk_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        fs::write(
+            dir.path().join("volume-stamps-guest-stamp-protocol.json"),
+            br#"{"abc":0}"#,
+        )
+        .unwrap();
+        assert!(FileVolumeStampStore::open(&path).is_err());
     }
 
     // ── suppressed-confirm detection (note_release / admin_reset) ──────
@@ -1306,5 +2873,405 @@ mod tests {
         }];
         assert!(!arming_readiness(&rows, 3).ready_to_arm);
         assert!(arming_readiness(&rows, 4).ready_to_arm);
+    }
+
+    // ── token epochs (authorized rollback) ───────────────────────────
+
+    #[test]
+    fn epoch_zero_is_byte_identical_to_the_legacy_token_and_epochs_never_collide() {
+        let k = stamp_mac_key(&seed());
+        assert_eq!(
+            stamp_token_epoch(&k, "abc", 5, 0),
+            stamp_token(&k, "abc", 5)
+        );
+        let e1 = stamp_token_epoch(&k, "abc", 5, 1);
+        let e2 = stamp_token_epoch(&k, "abc", 5, 2);
+        assert_ne!(e1, stamp_token(&k, "abc", 5));
+        assert_ne!(e1, e2);
+        assert_ne!(e1, stamp_token_epoch(&k, "abc", 6, 1));
+        assert_ne!(e1, stamp_token_epoch(&k, "abd", 5, 1));
+    }
+
+    #[test]
+    fn apply_rollback_lowers_the_stamp_resets_the_count_and_kills_old_tokens() {
+        for_each_store(|s| {
+            let k = stamp_mac_key(&seed());
+            for v in 1..=7 {
+                s.confirm("abc", v).unwrap();
+            }
+            s.note_release("abc").unwrap();
+            // A token of the CURRENT timeline for a target the rollback
+            // will make legal again (6 = E_T + 1 below).
+            let old = stamp_token(&k, "abc", 6);
+            s.apply_rollback("abc", 5, 1, "r", &tl(65)).unwrap();
+            assert_eq!(s.row("abc").unwrap(), (5, 0));
+            assert_eq!(s.token_epoch("abc").unwrap(), 1);
+            assert!(
+                confirm(s, &k, "abc", 6, &old).is_err(),
+                "old-epoch token must be dead"
+            );
+            assert_eq!(s.get("abc").unwrap(), 5);
+            // The rollback moved the VM to a new timeline: even the
+            // new-epoch v1 token is dead; only the token bound to that
+            // timeline confirms, and only naming it.
+            let v1_new_epoch = stamp_token_epoch(&k, "abc", 6, 1);
+            assert!(confirm(s, &k, "abc", 6, &v1_new_epoch).is_err());
+            let new = stamp_token_timeline(&k, "abc", 6, 1, &tl(65));
+            assert!(confirm_timeline(s, &k, "abc", 6, &new, &tl(66)).is_err());
+            assert_eq!(s.get("abc").unwrap(), 5);
+            assert_eq!(confirm_timeline(s, &k, "abc", 6, &new, &tl(65)).unwrap(), 6);
+        });
+    }
+
+    #[test]
+    fn apply_rollback_requires_a_strictly_higher_epoch_and_writes_nothing_otherwise() {
+        for_each_store(|s| {
+            s.confirm("abc", 1).unwrap();
+            s.apply_rollback("abc", 0, 2, "r", &tl(66)).unwrap();
+            s.confirm("abc", 1).unwrap();
+            for stale in [0, 1, 2] {
+                assert!(s.apply_rollback("abc", 0, stale, "r", &tl(67)).is_err());
+            }
+            assert_eq!(s.row("abc").unwrap(), (1, 0));
+            assert_eq!(s.token_epoch("abc").unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn revert_restores_the_first_recorded_row_keeps_the_epoch_and_finalize_forgets_it() {
+        for_each_store(|s| {
+            for v in 1..=7 {
+                s.confirm("abc", v).unwrap();
+            }
+            s.note_release("abc").unwrap();
+            s.apply_rollback("abc", 5, 1, "r", &tl(68)).unwrap();
+            // A retry of the same rollback keeps the FIRST undo row.
+            s.apply_rollback("abc", 5, 2, "r", &tl(69)).unwrap();
+            assert!(s.apply_rollback("abc", 5, 3, "other", &tl(70)).is_err());
+            assert_eq!(s.pending_rollback_vms().unwrap(), vec!["abc".to_string()]);
+            assert!(s.revert_rollback("abc", "other").unwrap().is_none());
+            let r = s.revert_rollback("abc", "r").unwrap().unwrap();
+            assert_eq!((r.prev_confirmed, r.prev_unconfirmed_releases), (7, 1));
+            assert_eq!(s.row("abc").unwrap(), (7, 1));
+            assert_eq!(s.token_epoch("abc").unwrap(), 2);
+            assert!(s.pending_rollback("abc").unwrap().is_none());
+            assert_eq!(
+                s.rollback_resolution("abc").unwrap(),
+                Some(ResolvedRollback {
+                    restore_id: "r".into(),
+                    resolution: RollbackResolution::Reverted
+                })
+            );
+            // Finalize: the undo record goes, the row stays.
+            s.apply_rollback("abc", 4, 3, "r2", &tl(71)).unwrap();
+            assert!(s.finalize_rollback("abc", "nope").unwrap().is_none());
+            // A miss resolves nothing: the last resolution is still `r`'s.
+            assert_eq!(
+                s.rollback_resolution("abc").unwrap().unwrap().restore_id,
+                "r"
+            );
+            assert!(s.finalize_rollback("abc", "r2").unwrap().is_some());
+            assert!(s.pending_rollback("abc").unwrap().is_none());
+            assert_eq!(s.row("abc").unwrap(), (4, 0));
+            assert_eq!(
+                s.rollback_resolution("abc").unwrap(),
+                Some(ResolvedRollback {
+                    restore_id: "r2".into(),
+                    resolution: RollbackResolution::Delivered
+                })
+            );
+            assert!(s.rollback_resolution("other-vm").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn a_resolution_survives_a_reopen_of_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        {
+            let s = FileVolumeStampStore::open(&path).unwrap();
+            s.apply_rollback("abc", 2, 1, "r", &tl(72)).unwrap();
+            s.finalize_rollback("abc", "r").unwrap().unwrap();
+        }
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(
+            s.rollback_resolution("abc").unwrap(),
+            Some(ResolvedRollback {
+                restore_id: "r".into(),
+                resolution: RollbackResolution::Delivered
+            })
+        );
+    }
+
+    #[test]
+    fn confirm_at_a_stale_epoch_is_refused_and_leaves_the_row() {
+        for_each_store(|s| {
+            s.apply_rollback("abc", 3, 1, "r", &tl(73)).unwrap();
+            assert!(s.confirm_at("abc", 4, 0, &tl(73)).is_err());
+            assert_eq!(s.row("abc").unwrap(), (3, 0));
+            // Right epoch, but the v1 (zero-timeline) CAS: refused.
+            assert!(s.confirm_at_epoch("abc", 4, 1).is_err());
+            assert_eq!(s.row("abc").unwrap(), (3, 0));
+            assert_eq!(s.confirm_at("abc", 4, 1, &tl(73)).unwrap(), 4);
+        });
+    }
+
+    #[test]
+    fn epochs_live_in_a_sibling_file_the_row_file_keeps_its_shape_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        {
+            let s = FileVolumeStampStore::open(&path).unwrap();
+            s.apply_rollback("abc", 4, 3, "r", &tl(74)).unwrap();
+        }
+        // The row file is exactly what an older binary decodes.
+        let rows: HashMap<String, StampRow> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rows["abc"].confirmed, 4);
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["abc"].as_object().unwrap().len(), 2, "row not widened");
+        assert!(dir.path().join("volume-stamps-token-epochs.json").exists());
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.token_epoch("abc").unwrap(), 3);
+        assert_eq!(s.row("abc").unwrap(), (4, 0));
+    }
+
+    /// Timelines live in a THIRD sibling; the row file and the
+    /// token-epochs file keep exactly the shapes an older binary decodes
+    /// (`deny_unknown_fields`), and the timelines survive a restart.
+    #[test]
+    fn timelines_live_in_a_third_sibling_and_never_widen_the_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        {
+            let s = FileVolumeStampStore::open(&path).unwrap();
+            s.confirm("abc", 1).unwrap();
+            s.apply_rollback("abc", 1, 1, "r", &tl(0x71)).unwrap();
+            s.record_arm_timeline("abc", "r-next", &tl(0x72)).unwrap();
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["abc"].as_object().unwrap().len(), 2, "row not widened");
+        let side: StampSidecar = serde_json::from_slice(
+            &fs::read(dir.path().join("volume-stamps-token-epochs.json")).unwrap(),
+        )
+        .expect("the epochs file still decodes with its strict pre-v2 type");
+        assert_eq!(side.epochs["abc"], 1);
+        assert!(dir.path().join("volume-stamps-timelines.json").exists());
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.timeline("abc").unwrap(), tl(0x71));
+        assert_eq!(s.arm_timeline("abc", "r-next").unwrap(), Some(tl(0x72)));
+        assert_eq!(s.arm_timeline("abc", "r-other").unwrap(), None);
+        assert_eq!(s.timeline("never").unwrap(), ZERO_TIMELINE);
+    }
+
+    /// A corrupt timelines file refuses to open (never "every VM on the
+    /// zero timeline", which would re-admit abandoned disks), and so does
+    /// one that stores the zero timeline explicitly.
+    #[test]
+    fn a_corrupt_timelines_file_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let tpath = dir.path().join("volume-stamps-timelines.json");
+        for bad in [
+            "{".to_string(),
+            r#"{"current":{"abc":"zz"}}"#.to_string(),
+            format!(r#"{{"current":{{"abc":"{}"}}}}"#, "AB".repeat(32)),
+            format!(r#"{{"current":{{"abc":"{}"}}}}"#, "00".repeat(32)),
+            r#"{"current":{},"extra":1}"#.to_string(),
+        ] {
+            fs::write(&tpath, &bad).unwrap();
+            assert!(FileVolumeStampStore::open(&path).is_err(), "{bad}");
+        }
+    }
+
+    /// The v2 confirm CAS: the token AND the timeline must be the VM's
+    /// current ones; a refusal leaves the row untouched.
+    #[test]
+    fn a_confirm_naming_another_timeline_is_refused_and_leaves_the_row() {
+        for_each_store(|s| {
+            let k = stamp_mac_key(&seed());
+            s.apply_rollback("abc", 3, 1, "r", &tl(0x73)).unwrap();
+            let tok = stamp_token_timeline(&k, "abc", 4, 1, &tl(0x73));
+            // Right token, wrong timeline named.
+            assert!(confirm_timeline(s, &k, "abc", 4, &tok, &tl(0x74)).is_err());
+            // A token minted for another timeline, naming the current one.
+            let other = stamp_token_timeline(&k, "abc", 4, 1, &tl(0x74));
+            assert!(confirm_timeline(s, &k, "abc", 4, &other, &tl(0x73)).is_err());
+            // The store-level CAS alone refuses the wrong timeline too.
+            assert!(s.confirm_at("abc", 4, 1, &tl(0x74)).is_err());
+            assert_eq!(s.row("abc").unwrap(), (3, 0));
+            assert_eq!(
+                confirm_timeline(s, &k, "abc", 4, &tok, &tl(0x73)).unwrap(),
+                4
+            );
+            // …and exactly value + 1.
+            let skip = stamp_token_timeline(&k, "abc", 6, 1, &tl(0x73));
+            assert!(confirm_timeline(s, &k, "abc", 6, &skip, &tl(0x73)).is_err());
+            assert_eq!(s.get("abc").unwrap(), 4);
+        });
+    }
+
+    /// Revert puts the REPLACED timeline back (the first one recorded,
+    /// across a retry of the same restore id); the abandoned target is
+    /// never current again. A rollback can never "move" to the zero or
+    /// the current timeline.
+    #[test]
+    fn revert_restores_the_first_replaced_timeline_and_a_move_must_be_new() {
+        for_each_store(|s| {
+            s.apply_rollback("abc", 5, 1, "r", &tl(0x75)).unwrap();
+            s.finalize_rollback("abc", "r").unwrap();
+            assert_eq!(s.timeline("abc").unwrap(), tl(0x75));
+            // A second rollback, applied twice (a retry), then reverted.
+            s.apply_rollback("abc", 2, 2, "r2", &tl(0x76)).unwrap();
+            s.apply_rollback("abc", 2, 3, "r2", &tl(0x77)).unwrap();
+            assert_eq!(s.timeline("abc").unwrap(), tl(0x77));
+            s.revert_rollback("abc", "r2").unwrap().unwrap();
+            assert_eq!(
+                s.timeline("abc").unwrap(),
+                tl(0x75),
+                "the FIRST replaced one"
+            );
+            assert_eq!(s.row("abc").unwrap(), (5, 0));
+            // Moves that are not moves.
+            assert!(s.apply_rollback("abc", 1, 4, "r3", &ZERO_TIMELINE).is_err());
+            assert!(s.apply_rollback("abc", 1, 5, "r4", &tl(0x75)).is_err());
+            assert_eq!(s.timeline("abc").unwrap(), tl(0x75));
+            assert_eq!(s.row("abc").unwrap(), (5, 0));
+        });
+    }
+
+    /// The checkpoint read takes the timeline in the same critical section.
+    #[test]
+    fn the_checkpoint_read_carries_the_timeline() {
+        for_each_store(|s| {
+            assert_eq!(s.checkpoint_read("abc").unwrap().3, ZERO_TIMELINE);
+            s.apply_rollback("abc", 5, 1, "r", &tl(0x78)).unwrap();
+            let (e, u, p, t) = s.checkpoint_read("abc").unwrap();
+            assert_eq!((e, u, p.is_some(), t), (5, 0, true, tl(0x78)));
+        });
+    }
+
+    /// Persist order is epoch FIRST: if the row write then fails, old
+    /// tokens are already dead and the stamp is unchanged — never a
+    /// lowered stamp under the old epoch.
+    #[test]
+    fn a_failed_row_write_after_the_epoch_leaves_the_stamp_unchanged_and_old_tokens_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        for v in 1..=7 {
+            s.confirm("abc", v).unwrap();
+        }
+        let blocker = dir.path().join(".volume-stamps.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(s.apply_rollback("abc", 5, 1, "r", &tl(75)).is_err());
+        assert_eq!(s.get("abc").unwrap(), 7, "stamp NOT lowered");
+        assert_eq!(s.token_epoch("abc").unwrap(), 1, "epoch already moved");
+        fs::remove_dir(&blocker).unwrap();
+        let k = stamp_mac_key(&seed());
+        assert!(confirm(&s, &k, "abc", 8, &stamp_token(&k, "abc", 8)).is_err());
+        let reopened = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(reopened.token_epoch("abc").unwrap(), 1);
+        assert_eq!(reopened.get("abc").unwrap(), 7);
+    }
+
+    #[test]
+    fn a_failed_epoch_write_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        s.confirm("abc", 1).unwrap();
+        let blocker = dir.path().join(".volume-stamps-token-epochs.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(s.apply_rollback("abc", 0, 1, "r", &tl(76)).is_err());
+        assert_eq!(s.token_epoch("abc").unwrap(), 0);
+        assert_eq!(s.row("abc").unwrap(), (1, 0));
+        // The timeline is written AFTER the epochs sidecar: it has not moved.
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+        drop(s);
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+    }
+
+    /// S2 — `adopt_fresh_timeline`: only an UNCONFIRMED (`E = 0`) VM with
+    /// no pending rollback moves, only to a new non-zero timeline; every
+    /// refusal leaves the timeline as it was. After the move a confirm on
+    /// the timeline it replaced is refused (the token of a lost response
+    /// never lands), and one on the new timeline advances `E`.
+    #[test]
+    fn only_an_unconfirmed_vm_adopts_a_fresh_timeline() {
+        for_each_store(|s| {
+            let k = stamp_mac_key(&seed());
+            // Refused: the zero timeline, and the current one.
+            assert!(s.adopt_fresh_timeline("abc", &ZERO_TIMELINE).is_err());
+            s.adopt_fresh_timeline("abc", &tl(0x81)).unwrap();
+            assert_eq!(s.timeline("abc").unwrap(), tl(0x81));
+            assert!(s.adopt_fresh_timeline("abc", &tl(0x81)).is_err());
+            // A second E = 0 move (the first response was lost).
+            s.adopt_fresh_timeline("abc", &tl(0x82)).unwrap();
+            let lost = stamp_token_timeline(&k, "abc", 1, 0, &tl(0x81));
+            assert!(confirm_timeline(s, &k, "abc", 1, &lost, &tl(0x81)).is_err());
+            assert_eq!(
+                s.row("abc").unwrap(),
+                (0, 0),
+                "the lost token moved nothing"
+            );
+            let live = stamp_token_timeline(&k, "abc", 1, 0, &tl(0x82));
+            assert_eq!(
+                confirm_timeline(s, &k, "abc", 1, &live, &tl(0x82)).unwrap(),
+                1
+            );
+            // E = 1: a confirm landed — no fresh timeline any more.
+            assert!(s.adopt_fresh_timeline("abc", &tl(0x83)).is_err());
+            assert_eq!(s.timeline("abc").unwrap(), tl(0x82));
+            // A pending rollback owns the timeline, even at E = 0.
+            s.apply_rollback("rb", 0, 1, "r", &tl(0x84)).unwrap();
+            assert!(s.adopt_fresh_timeline("rb", &tl(0x85)).is_err());
+            assert_eq!(s.timeline("rb").unwrap(), tl(0x84));
+        });
+    }
+
+    /// The fresh timeline is DURABLE when `adopt_fresh_timeline` returns:
+    /// it survives a restart. A failed write refuses and changes nothing.
+    #[test]
+    fn a_fresh_timeline_survives_a_restart_and_a_failed_write_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        {
+            let s = FileVolumeStampStore::open(&path).unwrap();
+            s.adopt_fresh_timeline("abc", &tl(0x91)).unwrap();
+        }
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.timeline("abc").unwrap(), tl(0x91));
+        let blocker = dir.path().join(".volume-stamps-timelines.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(s.adopt_fresh_timeline("abc", &tl(0x92)).is_err());
+        assert_eq!(s.timeline("abc").unwrap(), tl(0x91));
+        fs::remove_dir(&blocker).unwrap();
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        assert_eq!(s.timeline("abc").unwrap(), tl(0x91));
+    }
+
+    /// A failed TIMELINE write (after the epochs sidecar landed) leaves the
+    /// stamp unchanged and a pending record whose revert is a no-op for the
+    /// timeline — never a lowered stamp on the old timeline, never a moved
+    /// timeline without its undo record.
+    #[test]
+    fn a_failed_timeline_write_leaves_the_stamp_and_the_timeline_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume-stamps.json");
+        let s = FileVolumeStampStore::open(&path).unwrap();
+        s.confirm("abc", 1).unwrap();
+        let blocker = dir.path().join(".volume-stamps-timelines.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(s.apply_rollback("abc", 0, 1, "r", &tl(77)).is_err());
+        assert_eq!(s.row("abc").unwrap(), (1, 0), "stamp unchanged");
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+        assert!(s.pending_rollback("abc").unwrap().is_some());
+        fs::remove_dir(&blocker).unwrap();
+        s.revert_rollback("abc", "r").unwrap().unwrap();
+        assert_eq!(s.row("abc").unwrap(), (1, 0));
+        assert_eq!(s.timeline("abc").unwrap(), ZERO_TIMELINE);
+        assert!(s.pending_rollback("abc").unwrap().is_none());
     }
 }

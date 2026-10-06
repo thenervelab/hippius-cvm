@@ -1,7 +1,7 @@
 """In-guest liveness watermark — the signal that a running libvirt
 domain is NOT.
 
-Proved live on miner-2 (2026-08-12): a golden VM whose §22 measurement
+Proved live in production (2026-08-12): a golden VM whose §22 measurement
 had been evicted from the allowlist rebooted, its KEK release was
 refused (403), and it never left its initramfs — while `state=active`,
 `boot_phase=running` and the libvirt domain stayed `running`. Every

@@ -42,8 +42,8 @@
 # org-emails	(ops|admin|security)@example\.invalid
 #
 # Cover the name a machine gives ITSELF, not only the name your inventory
-# gives it. Ours differ: ansible and k8s say `hippius-cc-miner-3`, the box's
-# own hostname is `confidential-compute-miner-3`. The second is what lands in
+# gives it. They often differ: ansible and k8s say `node-3`, the box's
+# own hostname is `vendor-default-name-3`. The second is what lands in
 # kernel logs, serial captures and pasted terminal output — the things that
 # actually get committed by accident — and a class written from the inventory
 # alone is blind to all of it.

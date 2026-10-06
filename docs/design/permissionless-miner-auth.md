@@ -77,7 +77,7 @@ a separately-distributed list.
 - Add the identity verifier behind a config flag
   (`EDGE_MINER_AUTH = ca | onchain`); ship `onchain` once the registry
   sync is validated. Keep the bootstrap CA path for the transition.
-- Existing operator miners (miner-1) re-mint a self-signed identity cert
+- Existing operator miners re-mint a self-signed identity cert
   and register on-chain; no more hand-issued certs.
 
 ## Implementation (proposed PRs)

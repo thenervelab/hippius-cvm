@@ -23,9 +23,18 @@
 //!   - accept → `{"ok":true,"body":{schema_version,domain,miner_id,
 //!     timestamp_unix,sequence,vm_count_running,vm_count_total,
 //!     cpu_load_1m_centi,memory_total_mib,memory_available_mib,
-//!     graceful_exit_requested}}` — `graceful_exit_requested` is the
-//!     `v2` flag (always emitted; `false` for a `v1` body, which never
-//!     carries the key).
+//!     graceful_exit_requested[,cvm_cpu_budget,cvm_memory_mb_budget,
+//!     asid_capacity,asid_used[,cvm_disk_gb_budget,data_disk_total_gb,
+//!     data_disk_available_gb,staging_disk_available_gb[,snp_enabled,
+//!     cpus_offline,snp_launches_since_boot,df_flush_failures]]]}}` —
+//!     `graceful_exit_requested` is the `v2`..`v5` flag (always
+//!     emitted; `false` for a `v1` body, which never carries the key).
+//!     The four capacity keys are emitted ONLY for a `v3`+ body (raw
+//!     values, `0` = the miner could not read it); a `v1`/`v2` output
+//!     never carries them, so the consumer can tell "no declaration" from
+//!     "declared unknown". The four disk keys (GiB) are emitted ONLY for a
+//!     `v4`/`v5` body, with the same `0` = unknown convention, and the four
+//!     host-health keys ONLY for a `v5` body (raw signed values).
 //!   - reject → `{"ok":false,"error_class":"<class>"}`
 //! - On a reject the body fields are **never** echoed — even a body
 //!   that decoded cleanly but failed a later gate yields only the
@@ -58,8 +67,8 @@ use ciborium::value::Value;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hippius_types::cbor::assert_canonical;
 use hippius_types::heartbeat::{
-    SignedMinerHeartbeat, DOMAIN, MAX_MINER_ID_LEN, SCHEMA_VERSION, SCHEMA_VERSION_GRACEFUL_EXIT,
-    SIGNATURE_LEN,
+    SignedMinerHeartbeat, DOMAIN, MAX_MINER_ID_LEN, SCHEMA_VERSION, SCHEMA_VERSION_CAPACITY,
+    SCHEMA_VERSION_DISK, SCHEMA_VERSION_GRACEFUL_EXIT, SCHEMA_VERSION_HOST_HEALTH, SIGNATURE_LEN,
 };
 use serde::Serialize;
 
@@ -86,12 +95,33 @@ const HEARTBEAT_FIELD_COUNT: usize = 10;
 /// The version drives the count: see [`expected_field_count`].
 const HEARTBEAT_FIELD_COUNT_V2: usize = HEARTBEAT_FIELD_COUNT + 1;
 
+/// A canonical `v3` body is the `v2` body plus the four capacity
+/// declarations (`cvm_cpu_budget`, `cvm_memory_mb_budget`,
+/// `asid_capacity`, `asid_used`).
+const HEARTBEAT_FIELD_COUNT_V3: usize = HEARTBEAT_FIELD_COUNT_V2 + 4;
+
+/// A canonical `v4` body is the `v3` body plus the four disk declarations
+/// (`cvm_disk_gb_budget`, `data_disk_total_gb`, `data_disk_available_gb`,
+/// `staging_disk_available_gb`).
+const HEARTBEAT_FIELD_COUNT_V4: usize = HEARTBEAT_FIELD_COUNT_V3 + 4;
+
+/// A canonical `v5` body is the `v4` body plus the four host-health fields
+/// (`snp_enabled`, `cpus_offline`, `snp_launches_since_boot`,
+/// `df_flush_failures`).
+const HEARTBEAT_FIELD_COUNT_V5: usize = HEARTBEAT_FIELD_COUNT_V4 + 4;
+
 /// The exact CBOR-map field count a body of `schema_version` must carry
-/// — 11 for `v2`, 10 for every other (incl. `v1`). The caller has
-/// already decoded `schema_version` and gated it to {1, 2}, so a value
-/// of 2 yields the `v2` count and anything else the `v1` count.
+/// — 23 for `v5`, 19 for `v4`, 15 for `v3`, 11 for `v2`, 10 for every
+/// other (incl. `v1`). An unknown version gets the `v1` count here and
+/// fails closed at the schema gate after decode.
 fn expected_field_count(schema_version: i128) -> usize {
-    if schema_version == i128::from(SCHEMA_VERSION_GRACEFUL_EXIT) {
+    if schema_version == i128::from(SCHEMA_VERSION_HOST_HEALTH) {
+        HEARTBEAT_FIELD_COUNT_V5
+    } else if schema_version == i128::from(SCHEMA_VERSION_DISK) {
+        HEARTBEAT_FIELD_COUNT_V4
+    } else if schema_version == i128::from(SCHEMA_VERSION_CAPACITY) {
+        HEARTBEAT_FIELD_COUNT_V3
+    } else if schema_version == i128::from(SCHEMA_VERSION_GRACEFUL_EXIT) {
         HEARTBEAT_FIELD_COUNT_V2
     } else {
         HEARTBEAT_FIELD_COUNT
@@ -119,6 +149,11 @@ mod error_class {
     pub const WRONG_DOMAIN: &str = "wrong_domain";
     /// `body.miner_id` was empty or longer than the registry cap.
     pub const MINER_ID_INVALID: &str = "miner_id_invalid";
+    /// A `v3`/`v4` body declared `asid_used > asid_capacity` with a known
+    /// (non-zero) capacity, or a `v4` body declared
+    /// `data_disk_available_gb > data_disk_total_gb` with a known total —
+    /// a self-contradictory declaration.
+    pub const CAPACITY_INVALID: &str = "capacity_invalid";
 }
 
 #[derive(clap::Args)]
@@ -155,6 +190,37 @@ struct HeartbeatBody {
     /// one stable shape across both versions (it defaults the key to
     /// `false` if absent, so this is backward-compatible regardless).
     graceful_exit_requested: bool,
+    /// `v3`-only capacity declarations. `None` (and so ABSENT from the
+    /// JSON) for `v1`/`v2`; for `v3` the raw signed value, `0` = the
+    /// miner could not read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cvm_cpu_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cvm_memory_mb_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asid_capacity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asid_used: Option<u32>,
+    /// `v4`/`v5` disk declarations (GiB). `None` (ABSENT from the JSON)
+    /// for `v1`/`v2`/`v3`; otherwise the raw signed value, `0` = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cvm_disk_gb_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_disk_total_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_disk_available_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staging_disk_available_gb: Option<u32>,
+    /// `v5`-only host-health report. `None` (ABSENT from the JSON) for
+    /// every earlier version; for `v5` the raw signed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snp_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpus_offline: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snp_launches_since_boot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    df_flush_failures: Option<u32>,
 }
 
 /// `verify-heartbeat` entry point.
@@ -271,8 +337,13 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
     //    graceful-exit flag). `decode_body` has already enforced the
     //    version-correct field count, so a `v2`-versioned body with the
     //    `v1` field count (or vice-versa) was rejected `body_decode_failed`
-    //    before this point. Any version outside {1, 2} fails closed here.
-    if body.schema_version != SCHEMA_VERSION && body.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
+    //    before this point. `v3` (15 fields), `v4` (19) and `v5` (23)
+    //    likewise. Any version outside {1, 2, 3, 4, 5} fails closed here.
+    if body.schema_version != SCHEMA_VERSION
+        && body.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
+        && body.schema_version != SCHEMA_VERSION_CAPACITY
+        && body.schema_version != SCHEMA_VERSION_DISK
+        && body.schema_version != SCHEMA_VERSION_HOST_HEALTH
     {
         return Err(error_class::WRONG_SCHEMA_VERSION);
     }
@@ -281,6 +352,19 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
     }
     if body.miner_id.is_empty() || body.miner_id.len() > MAX_MINER_ID_LEN {
         return Err(error_class::MINER_ID_INVALID);
+    }
+    // 9. `v3` capacity coherence — mirrors `MinerHeartbeat::validate`:
+    //    a known ASID capacity bounds the in-use count.
+    if let (Some(capacity), Some(used)) = (body.asid_capacity, body.asid_used) {
+        if capacity != 0 && used > capacity {
+            return Err(error_class::CAPACITY_INVALID);
+        }
+    }
+    // 10. `v4` disk coherence — a known data-fs size bounds its free space.
+    if let (Some(total), Some(available)) = (body.data_disk_total_gb, body.data_disk_available_gb) {
+        if total != 0 && available > total {
+            return Err(error_class::CAPACITY_INVALID);
+        }
     }
     Ok(body)
 }
@@ -327,13 +411,46 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
     }
     let schema_version =
         u8::try_from(schema_version_raw).map_err(|_| error_class::BODY_DECODE_FAILED)?;
-    // The flag is a `v2`-only field. For `v1` it is absent ⇒ `false`;
-    // for `v2` it MUST be present (the count gate above guarantees the
-    // 11th key is there) and a CBOR bool.
-    let graceful_exit_requested = if schema_version == SCHEMA_VERSION_GRACEFUL_EXIT {
+    // The flag is a `v2`+ field. For `v1` it is absent ⇒ `false`; for the
+    // others it MUST be present and a CBOR bool.
+    let is_v5 = schema_version == SCHEMA_VERSION_HOST_HEALTH;
+    let is_v4 = schema_version == SCHEMA_VERSION_DISK || is_v5;
+    let is_v3 = schema_version == SCHEMA_VERSION_CAPACITY || is_v4;
+    let graceful_exit_requested = if schema_version == SCHEMA_VERSION_GRACEFUL_EXIT || is_v3 {
         bool_field(&entries, "graceful_exit_requested")?
     } else {
         false
+    };
+    // The four capacity declarations are `v3`+ only: required there
+    // (the count gate + a required read reject a renamed/missing key),
+    // never read — and so never echoed — for `v1`/`v2`.
+    let capacity = |key: &str| -> Result<Option<u32>, &'static str> {
+        if is_v3 {
+            u32_field(&entries, key).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    // The four disk declarations are `v4`/`v5`-only, same discipline.
+    let disk = |key: &str| -> Result<Option<u32>, &'static str> {
+        if is_v4 {
+            u32_field(&entries, key).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    // The four host-health fields are `v5`-only, same discipline.
+    let host_health = |key: &str| -> Result<Option<u32>, &'static str> {
+        if is_v5 {
+            u32_field(&entries, key).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let snp_enabled = if is_v5 {
+        Some(bool_field(&entries, "snp_enabled")?)
+    } else {
+        None
     };
     Ok(HeartbeatBody {
         schema_version,
@@ -349,6 +466,18 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
         memory_total_mib: u32_field(&entries, "memory_total_mib")?,
         memory_available_mib: u32_field(&entries, "memory_available_mib")?,
         graceful_exit_requested,
+        cvm_cpu_budget: capacity("cvm_cpu_budget")?,
+        cvm_memory_mb_budget: capacity("cvm_memory_mb_budget")?,
+        asid_capacity: capacity("asid_capacity")?,
+        asid_used: capacity("asid_used")?,
+        cvm_disk_gb_budget: disk("cvm_disk_gb_budget")?,
+        data_disk_total_gb: disk("data_disk_total_gb")?,
+        data_disk_available_gb: disk("data_disk_available_gb")?,
+        staging_disk_available_gb: disk("staging_disk_available_gb")?,
+        snp_enabled,
+        cpus_offline: host_health("cpus_offline")?,
+        snp_launches_since_boot: host_health("snp_launches_since_boot")?,
+        df_flush_failures: host_health("df_flush_failures")?,
     })
 }
 
@@ -414,6 +543,12 @@ mod tests {
             memory_available_mib: 131_072,
             domain: DOMAIN.into(),
             graceful_exit_requested: false,
+            cvm_cpu_budget: 0,
+            cvm_memory_mb_budget: 0,
+            asid_capacity: 0,
+            asid_used: 0,
+            disk: hippius_types::heartbeat::DiskDeclaration::default(),
+            host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
         }
     }
 
@@ -453,6 +588,420 @@ mod tests {
         assert_eq!(body.memory_available_mib, 131_072);
         // A v1 body never carries the flag — it defaults to false.
         assert!(!body.graceful_exit_requested);
+        // ... nor any v3 capacity declaration.
+        assert_eq!(body.cvm_cpu_budget, None);
+        assert_eq!(body.asid_used, None);
+    }
+
+    fn kat_v3() -> MinerHeartbeat {
+        kat_heartbeat().with_capacity(hippius_types::heartbeat::CapacityDeclaration {
+            cvm_cpu_budget: 44,
+            cvm_memory_mb_budget: 120_000,
+            asid_capacity: 99,
+            asid_used: 2,
+        })
+    }
+
+    #[test]
+    fn v3_heartbeat_verifies_and_carries_the_capacity_declarations() {
+        let sk = SigningKey::from_bytes(&[0x31u8; 32]);
+        let envelope = signed_envelope(kat_v3().canonical().unwrap(), &sk);
+        let body = verify(&envelope, &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, 3);
+        assert!(!body.graceful_exit_requested);
+        assert_eq!(body.cvm_cpu_budget, Some(44));
+        assert_eq!(body.cvm_memory_mb_budget, Some(120_000));
+        assert_eq!(body.asid_capacity, Some(99));
+        assert_eq!(body.asid_used, Some(2));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["asid_capacity"], 99);
+    }
+
+    #[test]
+    fn v1_and_v2_json_never_carries_the_capacity_keys() {
+        let sk = SigningKey::from_bytes(&[0x32u8; 32]);
+        for hb in [kat_heartbeat(), kat_graceful_exit()] {
+            let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+            let json =
+                serde_json::to_value(verify(&envelope, &sk.verifying_key()).unwrap()).unwrap();
+            let obj = json.as_object().unwrap();
+            for key in [
+                "cvm_cpu_budget",
+                "cvm_memory_mb_budget",
+                "asid_capacity",
+                "asid_used",
+            ] {
+                assert!(!obj.contains_key(key), "{key} leaked into a v1/v2 output");
+            }
+        }
+    }
+
+    fn kat_v4() -> MinerHeartbeat {
+        kat_heartbeat().with_disk(
+            hippius_types::heartbeat::CapacityDeclaration {
+                cvm_cpu_budget: 44,
+                cvm_memory_mb_budget: 120_000,
+                asid_capacity: 99,
+                asid_used: 2,
+            },
+            hippius_types::heartbeat::DiskDeclaration {
+                cvm_disk_gb_budget: 3_000,
+                data_disk_total_gb: 3_500,
+                data_disk_available_gb: 2_900,
+                staging_disk_available_gb: 400,
+            },
+        )
+    }
+
+    const DISK_KEYS: [&str; 4] = [
+        "cvm_disk_gb_budget",
+        "data_disk_total_gb",
+        "data_disk_available_gb",
+        "staging_disk_available_gb",
+    ];
+
+    #[test]
+    fn v4_heartbeat_verifies_and_carries_capacity_and_disk_declarations() {
+        let sk = SigningKey::from_bytes(&[0x41u8; 32]);
+        let envelope = signed_envelope(kat_v4().canonical().unwrap(), &sk);
+        let body = verify(&envelope, &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, 4);
+        assert_eq!(body.cvm_cpu_budget, Some(44));
+        assert_eq!(body.asid_used, Some(2));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["cvm_disk_gb_budget"], 3_000);
+        assert_eq!(json["data_disk_total_gb"], 3_500);
+        assert_eq!(json["data_disk_available_gb"], 2_900);
+        assert_eq!(json["staging_disk_available_gb"], 400);
+    }
+
+    #[test]
+    fn v1_v2_v3_json_never_carries_the_disk_keys() {
+        let sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        for hb in [kat_heartbeat(), kat_graceful_exit(), kat_v3()] {
+            let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+            let json =
+                serde_json::to_value(verify(&envelope, &sk.verifying_key()).unwrap()).unwrap();
+            let obj = json.as_object().unwrap();
+            for key in DISK_KEYS {
+                assert!(!obj.contains_key(key), "{key} leaked into a pre-v4 output");
+            }
+        }
+    }
+
+    fn v4_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
+        let v: Value = ciborium::de::from_reader(kat_v4().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        entries
+            .into_iter()
+            .filter_map(|(k, v)| match &k {
+                Value::Text(t) if t == key => value.clone().map(|nv| (k, nv)),
+                _ => Some((k, v)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v4_body_missing_or_renaming_a_disk_key_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x43u8; 32]);
+        for key in DISK_KEYS {
+            let missing = forged_body(v4_entries_with(key, None));
+            assert_eq!(
+                verify(&signed_envelope(missing, &sk), &sk.verifying_key()).unwrap_err(),
+                error_class::BODY_DECODE_FAILED,
+                "{key} missing"
+            );
+            let mut renamed = v4_entries_with(key, None);
+            renamed.push((Value::Text(format!("{key}X")), Value::Integer(1.into())));
+            assert_eq!(
+                verify(
+                    &signed_envelope(forged_body(renamed), &sk),
+                    &sk.verifying_key()
+                )
+                .unwrap_err(),
+                error_class::BODY_DECODE_FAILED,
+                "{key} renamed"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_body_carrying_disk_keys_is_rejected() {
+        // A schema_version 3 body with the four v4 keys (19 fields)
+        // exceeds the v3 count — never read as a v3 heartbeat.
+        let sk = SigningKey::from_bytes(&[0x44u8; 32]);
+        let body = forged_body(v4_entries_with(
+            "schema_version",
+            Some(Value::Integer(3.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v4_data_available_above_total_is_rejected_at_the_boundary() {
+        let sk = SigningKey::from_bytes(&[0x45u8; 32]);
+        let at_total = forged_body(v4_entries_with(
+            "data_disk_available_gb",
+            Some(Value::Integer(3_500.into())),
+        ));
+        assert!(verify(&signed_envelope(at_total, &sk), &sk.verifying_key()).is_ok());
+        let over = forged_body(v4_entries_with(
+            "data_disk_available_gb",
+            Some(Value::Integer(3_501.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(over, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::CAPACITY_INVALID,
+        );
+        // Unknown total (0) leaves `available` unconstrained.
+        let mut unknown =
+            v4_entries_with("data_disk_available_gb", Some(Value::Integer(9_999.into())));
+        for (k, v) in unknown.iter_mut() {
+            if matches!(k, Value::Text(t) if t == "data_disk_total_gb") {
+                *v = Value::Integer(0.into());
+            }
+        }
+        assert!(verify(
+            &signed_envelope(forged_body(unknown), &sk),
+            &sk.verifying_key()
+        )
+        .is_ok());
+    }
+
+    fn kat_v5() -> MinerHeartbeat {
+        let v4 = kat_v4();
+        kat_heartbeat().with_host_health(
+            hippius_types::heartbeat::CapacityDeclaration {
+                cvm_cpu_budget: v4.cvm_cpu_budget,
+                cvm_memory_mb_budget: v4.cvm_memory_mb_budget,
+                asid_capacity: v4.asid_capacity,
+                asid_used: v4.asid_used,
+            },
+            v4.disk,
+            hippius_types::heartbeat::HostHealthDeclaration {
+                snp_enabled: true,
+                cpus_offline: 24,
+                snp_launches_since_boot: 97,
+                df_flush_failures: 3,
+            },
+        )
+    }
+
+    const HOST_HEALTH_KEYS: [&str; 4] = [
+        "snp_enabled",
+        "cpus_offline",
+        "snp_launches_since_boot",
+        "df_flush_failures",
+    ];
+
+    fn v5_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
+        let v: Value = ciborium::de::from_reader(kat_v5().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        entries
+            .into_iter()
+            .filter_map(|(k, v)| match &k {
+                Value::Text(t) if t == key => value.clone().map(|nv| (k, nv)),
+                _ => Some((k, v)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v5_heartbeat_verifies_and_carries_every_declaration() {
+        let sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let envelope = signed_envelope(kat_v5().canonical().unwrap(), &sk);
+        let body = verify(&envelope, &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, 5);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["asid_capacity"], 99);
+        assert_eq!(json["data_disk_total_gb"], 3_500);
+        assert_eq!(json["snp_enabled"], true);
+        assert_eq!(json["cpus_offline"], 24);
+        assert_eq!(json["snp_launches_since_boot"], 97);
+        assert_eq!(json["df_flush_failures"], 3);
+    }
+
+    #[test]
+    fn pre_v5_json_never_carries_the_host_health_keys() {
+        let sk = SigningKey::from_bytes(&[0x52u8; 32]);
+        for hb in [kat_heartbeat(), kat_graceful_exit(), kat_v3(), kat_v4()] {
+            let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+            let json =
+                serde_json::to_value(verify(&envelope, &sk.verifying_key()).unwrap()).unwrap();
+            let obj = json.as_object().unwrap();
+            for key in HOST_HEALTH_KEYS {
+                assert!(!obj.contains_key(key), "{key} leaked into a pre-v5 output");
+            }
+        }
+    }
+
+    #[test]
+    fn v5_body_missing_or_renaming_a_host_health_key_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x53u8; 32]);
+        for key in HOST_HEALTH_KEYS {
+            let missing = forged_body(v5_entries_with(key, None));
+            assert_eq!(
+                verify(&signed_envelope(missing, &sk), &sk.verifying_key()).unwrap_err(),
+                error_class::BODY_DECODE_FAILED,
+                "{key} missing"
+            );
+            let mut renamed = v5_entries_with(key, None);
+            renamed.push((Value::Text(format!("{key}X")), Value::Integer(1.into())));
+            assert_eq!(
+                verify(
+                    &signed_envelope(forged_body(renamed), &sk),
+                    &sk.verifying_key()
+                )
+                .unwrap_err(),
+                error_class::BODY_DECODE_FAILED,
+                "{key} renamed"
+            );
+        }
+    }
+
+    #[test]
+    fn v5_snp_enabled_must_be_a_cbor_bool() {
+        let sk = SigningKey::from_bytes(&[0x54u8; 32]);
+        let body = forged_body(v5_entries_with(
+            "snp_enabled",
+            Some(Value::Integer(1.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v4_body_carrying_host_health_keys_is_rejected() {
+        // A schema_version 4 body with the four v5 keys (23 fields)
+        // exceeds the v4 count — never read as a v4 heartbeat.
+        let sk = SigningKey::from_bytes(&[0x55u8; 32]);
+        let body = forged_body(v5_entries_with(
+            "schema_version",
+            Some(Value::Integer(4.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v5_keeps_the_v4_disk_coherence_gate() {
+        let sk = SigningKey::from_bytes(&[0x56u8; 32]);
+        let over = forged_body(v5_entries_with(
+            "data_disk_available_gb",
+            Some(Value::Integer(3_501.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(over, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::CAPACITY_INVALID,
+        );
+    }
+
+    /// The canonical `v3` body of [`kat_v3`] as raw map entries, with
+    /// one key replaced/overridden — for forging bodies
+    /// `MinerHeartbeat::canonical()` refuses to produce.
+    fn v3_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
+        let v: Value = ciborium::de::from_reader(kat_v3().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        entries
+            .into_iter()
+            .filter_map(|(k, v)| match &k {
+                Value::Text(t) if t == key => value.clone().map(|nv| (k, nv)),
+                _ => Some((k, v)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v3_asid_used_above_capacity_is_rejected_at_the_boundary() {
+        let sk = SigningKey::from_bytes(&[0x33u8; 32]);
+        let at_cap = forged_body(v3_entries_with(
+            "asid_used",
+            Some(Value::Integer(99.into())),
+        ));
+        assert!(verify(&signed_envelope(at_cap, &sk), &sk.verifying_key()).is_ok());
+        let over = forged_body(v3_entries_with(
+            "asid_used",
+            Some(Value::Integer(100.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(over, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::CAPACITY_INVALID,
+        );
+        // Unknown capacity (0) leaves `asid_used` unconstrained.
+        let mut unknown = v3_entries_with("asid_used", Some(Value::Integer(100.into())));
+        for (k, v) in unknown.iter_mut() {
+            if matches!(k, Value::Text(t) if t == "asid_capacity") {
+                *v = Value::Integer(0.into());
+            }
+        }
+        assert!(verify(
+            &signed_envelope(forged_body(unknown), &sk),
+            &sk.verifying_key()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn v3_body_missing_a_capacity_key_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x34u8; 32]);
+        // 14 fields: fails the version-aware count gate.
+        let missing = forged_body(v3_entries_with("asid_used", None));
+        assert_eq!(
+            verify(&signed_envelope(missing, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+        // 15 fields but a capacity key renamed: the required read fails.
+        let mut renamed = v3_entries_with("asid_used", None);
+        renamed.push((Value::Text("asid_usedX".into()), Value::Integer(2.into())));
+        assert_eq!(
+            verify(
+                &signed_envelope(forged_body(renamed), &sk),
+                &sk.verifying_key()
+            )
+            .unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v2_body_carrying_capacity_keys_is_rejected() {
+        // A schema_version 2 body with the four v3 keys (15 fields)
+        // exceeds the v2 count — never read as a v2 heartbeat.
+        let sk = SigningKey::from_bytes(&[0x35u8; 32]);
+        let body = forged_body(v3_entries_with(
+            "schema_version",
+            Some(Value::Integer(2.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v3_body_with_a_negative_capacity_value_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x36u8; 32]);
+        let body = forged_body(v3_entries_with(
+            "cvm_cpu_budget",
+            Some(Value::Integer((-1).into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
     }
 
     /// A v2 graceful-exit heartbeat tuple (11 fields, flag true).
@@ -743,8 +1292,8 @@ mod tests {
 
     #[test]
     fn wrong_schema_version_is_rejected() {
-        // A validly-signed 10-field body whose `schema_version` is 3 —
-        // an UNKNOWN version (neither v1 nor v2). 10 fields matches the
+        // A validly-signed 10-field body whose `schema_version` is 6 —
+        // an UNKNOWN version (not v1 through v5). 10 fields matches the
         // v1-count branch, so the body decodes cleanly and the failure
         // lands on the schema-version gate (not the count gate).
         let sk = SigningKey::from_bytes(&[6u8; 32]);
@@ -765,7 +1314,7 @@ mod tests {
             (Value::Text("miner_id".into()), Value::Text("m".into())),
             (
                 Value::Text("schema_version".into()),
-                Value::Integer(3.into()),
+                Value::Integer(6.into()),
             ),
             (Value::Text("sequence".into()), Value::Integer(1.into())),
             (

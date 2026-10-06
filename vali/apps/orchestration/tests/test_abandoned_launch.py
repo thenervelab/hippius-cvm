@@ -10,9 +10,9 @@ single-shot, so a VM registered against one node and then re-placed hits
 the anti-migration CAS fence (#668 `kbs-admin-conflict`). When the
 dispatch then failed, three consecutive launches left:
 
-    p1final-1: state=active  host=''  kek_destroyed=False
-    p1final-2: state=active  host=''  kek_destroyed=False
-    p1final-3: state=active  host=''  kek_destroyed=False
+    vm-probe-1: state=active  host=''  kek_destroyed=False
+    vm-probe-2: state=active  host=''  kek_destroyed=False
+    vm-probe-3: state=active  host=''  kek_destroyed=False
 
 A live KEK with no VM — the same data-death invariant leak as the 37-VM
 sweep, by a route no sweep watched. Every sweep that filters
@@ -27,6 +27,7 @@ that asserts a VETO is protecting a tenant's disk.
 
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -45,7 +46,7 @@ from apps.orchestration.models import (
 )
 from apps.orchestration.services import launch
 from apps.scheduler import chain
-from apps.scheduler.models import Placement, PlacementStatus
+from apps.scheduler.models import Placement, PlacementFailureSource, PlacementStatus
 
 from apps.scheduler.tests.factories import (  # isort: skip
     make_miner,
@@ -55,7 +56,7 @@ from apps.scheduler.tests.factories import (  # isort: skip
 
 pytestmark = pytest.mark.django_db
 
-VM_ID = "p1final-1"
+VM_ID = "vm-probe-1"
 
 
 # ── builders ─────────────────────────────────────────────────────────
@@ -85,7 +86,7 @@ def _spec(**overrides) -> launch.LaunchSpec:
 
 def _register_miner(seed: int = 1) -> MinerIdentity:
     return MinerIdentity.objects.create(
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{chr(ord('a') + seed - 1)}",
         pubkey_hex=format(seed, "064x"),
         platform_id=f"{seed:02x}" + "cd" * 15,
         netbird_ip=f"100.64.0.{seed}",
@@ -138,7 +139,7 @@ def _phantom(
     )
 
 
-def _failed_launch_job(vm_id: str = VM_ID, *, miner_id: str = "miner-1") -> LaunchJob:
+def _failed_launch_job(vm_id: str = VM_ID, *, miner_id: str = "miner-a") -> LaunchJob:
     """The `LaunchJob` the async worker finishes FAILED — it records the
     miner the order was sent to, which is the phantom's probe/destroy
     target."""
@@ -259,10 +260,10 @@ def test_a_successful_launch_clears_the_marker() -> None:
     later erase the KEK B's guest is running on."""
     vm = _phantom()
 
-    launch._bind_vm_host(VM_ID, "miner-2")
+    launch._bind_vm_host(VM_ID, "miner-b")
 
     vm.refresh_from_db()
-    assert vm.host == "miner-2"
+    assert vm.host == "miner-b"
     assert vm.launch_abandoned_at is None
     assert vm.launch_abandoned_outcome == ""
     assert vm.launch_abandoned_registered is False
@@ -280,7 +281,7 @@ def test_marker_never_touches_a_BOUND_vm() -> None:
         state=VmState.ACTIVE.value,
         generation=1,
         signing_generation=1,
-        host="miner-1",  # BOUND — a real running tenant
+        host="miner-a",  # BOUND — a real running tenant
         lifecycle_vk=bytes(32),
         eol_nonce=b"\x11" * 32,
     )
@@ -321,7 +322,7 @@ def test_forced_cli_launch_marks_its_own_phantom(monkeypatch) -> None:
     monkeypatch.setattr(
         launch,
         "launch_on_miner",
-        lambda spec, m: _outcome(
+        lambda spec, m, **_kw: _outcome(
             launch.RETRIABLE, registered=True, outcome="miner-rejected"
         ),
     )
@@ -371,7 +372,15 @@ def _fake_choreography(monkeypatch, *, dispatch) -> None:
         launch.telemetry_keygen, "derive_telemetry_vk", lambda *a, **k: b"\x03" * 32
     )
     monkeypatch.setattr(ticket_mint, "mint", lambda *a, **k: b"cose")
-    monkeypatch.setattr(eff, "mint_netbird_setup_key", lambda *a, **k: "key")
+    monkeypatch.setattr(
+        "apps.orchestration.services.migration_ticket.persist_intake",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        eff,
+        "mint_netbird_setup_key",
+        lambda *a, **k: eff.MintedSetupKey(id=uuid.uuid4().hex, key="key"),
+    )
 
     class _Admin:
         def __init__(self, vm_id: str) -> None:
@@ -439,7 +448,7 @@ def test_sweep_reaps_a_proven_phantom(domain_down) -> None:
     assert job.decided_by.name == service._ABANDONED_REAP_ACTOR
     # It probed the miner the FAILED LaunchJob names — the same host §24's
     # destroy will be aimed at.
-    assert domain_down == ["miner-1"]
+    assert domain_down == ["miner-a"]
 
 
 def test_reap_erases_the_kek_and_tombstones_the_hostless_row(fx, domain_down) -> None:
@@ -490,7 +499,7 @@ def test_a_post_register_dispatch_failure_leaves_no_ACTIVE_vm_with_a_live_KEK(
     row, the sweep reaps it — and a seam between them would leave the leak
     open with every individual test still green. So this one starts at a
     real `launch_vm` whose dispatch fails after the KBS register (the
-    `stamp-fed-1` shape, live 2026-08-13) and ends at the only property
+    `vm-fed-1` shape, live 2026-08-13) and ends at the only property
     that actually matters: no `Vm` row is left `active` holding a live
     per-VM Vault-Transit KEK.
 
@@ -765,9 +774,9 @@ def test_probe_target_prefers_the_launch_record(domain_down) -> None:
     """Same resolver §24's destroy uses — so the host we ask about
     liveness is the host we would send the destroy to."""
     vm = _phantom()
-    _failed_launch_job(miner_id="miner-1")
+    _failed_launch_job(miner_id="miner-a")
 
-    assert service._abandoned_probe_target(vm) == "miner-1"
+    assert service._abandoned_probe_target(vm) == "miner-a"
 
 
 def test_probe_target_falls_back_to_the_placement(domain_down) -> None:
@@ -784,12 +793,13 @@ def test_probe_target_falls_back_to_the_placement(domain_down) -> None:
         status=PlacementStatus.FAILED.value,
         failed_at=timezone.now(),
         reason="dispatch-failed-after-register",
+        failure_source=PlacementFailureSource.LAUNCH.value,
         chain_epoch=1,
         decided_by=_actor("cli"),
     )
     _register_miner(1)
 
-    assert service._abandoned_probe_target(vm) == "miner-1"
+    assert service._abandoned_probe_target(vm) == "miner-a"
 
 
 def test_an_unresolvable_probe_target_is_a_veto_not_a_licence(monkeypatch) -> None:
@@ -811,6 +821,7 @@ def test_an_unresolvable_probe_target_is_a_veto_not_a_licence(monkeypatch) -> No
         status=PlacementStatus.FAILED.value,
         failed_at=timezone.now(),
         reason="dispatch-failed-after-register",
+        failure_source=PlacementFailureSource.LAUNCH.value,
         chain_epoch=1,
         decided_by=_actor("cli"),
     )

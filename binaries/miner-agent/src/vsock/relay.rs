@@ -237,6 +237,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_cut_mid_body_is_dropped_not_forwarded() {
+        // A guest write interrupted mid-frame: the length prefix
+        // promises 64 bytes, only 10 arrive before the connection
+        // closes. The truncated frame must never be decoded or reach
+        // `forward` — only the complete frame before it counts.
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        write_frame(
+            &mut writer,
+            &GuestFrame::new(EnvelopeKind::ServedReceipt, vec![9u8; 4]),
+        )
+        .await
+        .unwrap();
+        writer.write_all(&64u32.to_be_bytes()).await.unwrap();
+        writer.write_all(&[0xa2; 10]).await.unwrap();
+        drop(writer);
+
+        let cancel = CancellationToken::new();
+        let report = relay_guest_frames(
+            &mut reader,
+            &peer(),
+            &edge(),
+            MAX_VSOCK_FRAME,
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .await;
+        assert_eq!(report.frames_read, 1, "the truncated frame is not read");
+        assert_eq!(report.outcome, RelayOutcome::FrameError("vsock-frame/io"));
+    }
+
+    #[tokio::test]
     async fn idle_connection_times_out() {
         // A peer that connects but never sends — the reader half is
         // held open, no frame ever arrives.

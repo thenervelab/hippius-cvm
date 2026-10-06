@@ -26,7 +26,10 @@
 //! with [`MockLaunchDigest`]; only the digest known-answer test needs
 //! the Linux `--features snp` lane.
 
+use hippius_types::guardian::LaunchRecipe;
+
 use super::cvm_handle::LAUNCH_DIGEST_LEN;
+use super::guardian::RecipeInputs;
 use super::qemu_config::QemuConfig;
 use crate::error::{MinerAgentError, Result};
 
@@ -38,6 +41,12 @@ use crate::error::{MinerAgentError, Result};
 pub trait LaunchDigestComputer: Send + Sync {
     /// Compute the 48-byte launch digest, or fail closed.
     fn compute(&self, config: &QemuConfig) -> Result<[u8; LAUNCH_DIGEST_LEN]>;
+
+    /// The [`LaunchRecipe`] [`Self::compute`] measures `config` with — the
+    /// same files, cmdline, vCPU count, vCPU model and guest features.
+    /// Only customer-keys launches ask for it (the guardian relay serves
+    /// it to the guest). Fail closed.
+    fn recipe(&self, inputs: &RecipeInputs) -> Result<LaunchRecipe>;
 }
 
 /// Production computer — the real AMD SEV-SNP launch digest.
@@ -46,6 +55,10 @@ pub struct SevLaunchDigest;
 impl LaunchDigestComputer for SevLaunchDigest {
     fn compute(&self, config: &QemuConfig) -> Result<[u8; LAUNCH_DIGEST_LEN]> {
         compute_launch_digest(config)
+    }
+
+    fn recipe(&self, inputs: &RecipeInputs) -> Result<LaunchRecipe> {
+        compute_launch_recipe(inputs)
     }
 }
 
@@ -75,7 +88,31 @@ impl LaunchDigestComputer for MockLaunchDigest {
         self.digest
             .ok_or(MinerAgentError::LaunchDigest("sev-compute"))
     }
+
+    /// The config's real cmdline + vCPU count with FIXED image digests
+    /// (the mock never reads the artifact files, which tests do not
+    /// create). Fails when the digest does.
+    fn recipe(&self, inputs: &RecipeInputs) -> Result<LaunchRecipe> {
+        self.digest
+            .ok_or(MinerAgentError::LaunchDigest("sev-compute"))?;
+        let recipe = LaunchRecipe {
+            ovmf_sha384: vec![0x0f; 48],
+            kernel_sha256: vec![0x0a; 32],
+            initrd_sha256: vec![0x0b; 32],
+            cmdline: inputs.cmdline.clone(),
+            vcpus: inputs.vcpus,
+            vcpu_type: MOCK_VCPU_TYPE.to_string(),
+            guest_features: super::guardian::SNP_GUEST_FEATURES,
+        };
+        recipe
+            .validate()
+            .map_err(|_| MinerAgentError::LaunchInput("guardian-recipe-invalid"))?;
+        Ok(recipe)
+    }
 }
+
+/// The vCPU model [`MockLaunchDigest::recipe`] reports.
+pub const MOCK_VCPU_TYPE: &str = "EpycGenoa";
 
 /// Compute the SEV-SNP launch digest for `config`.
 ///
@@ -97,6 +134,47 @@ pub fn compute_launch_digest(config: &QemuConfig) -> Result<[u8; LAUNCH_DIGEST_L
 #[cfg(not(feature = "snp"))]
 pub fn compute_launch_digest(_config: &QemuConfig) -> Result<[u8; LAUNCH_DIGEST_LEN]> {
     Err(MinerAgentError::LaunchDigest("feature-disabled"))
+}
+
+/// The [`LaunchRecipe`] for `config` on THIS host: the vCPU model comes
+/// from the host's CPUID exactly as in [`compute_launch_digest`], so the
+/// recipe and the digest can never name different models.
+#[cfg(feature = "snp")]
+pub fn compute_launch_recipe(inputs: &RecipeInputs) -> Result<LaunchRecipe> {
+    snp_impl::recipe(inputs)
+}
+
+/// Fail-closed stub for builds without `--features snp`.
+#[cfg(not(feature = "snp"))]
+pub fn compute_launch_recipe(_inputs: &RecipeInputs) -> Result<LaunchRecipe> {
+    Err(MinerAgentError::LaunchDigest("feature-disabled"))
+}
+
+/// Test hook: [`compute_launch_recipe`] for an explicit generation — the
+/// recipe twin of [`compute_launch_digest_for_generation`].
+#[cfg(feature = "snp")]
+#[doc(hidden)]
+pub fn compute_launch_recipe_for_generation(
+    config: &QemuConfig,
+    gen: sev::Generation,
+) -> Result<LaunchRecipe> {
+    let vcpu_type = snp_impl::vcpu_type_for_generation(gen)?;
+    snp_impl::recipe_with_vcpu_type(&RecipeInputs::from_config(config), vcpu_type)
+}
+
+/// Recompute a launch digest from a [`LaunchRecipe`] and the artifact
+/// files it names — what a guardian does after resolving the recipe's
+/// digests against its pinned release set. Each file must hash to the
+/// recipe's digest (`recipe-artifact-mismatch`), and the vCPU model must
+/// be one the miner measures with (`recipe-vcpu-type`).
+#[cfg(feature = "snp")]
+pub fn compute_launch_digest_from_recipe(
+    recipe: &LaunchRecipe,
+    ovmf: &std::path::Path,
+    kernel: &std::path::Path,
+    initrd: &std::path::Path,
+) -> Result<[u8; LAUNCH_DIGEST_LEN]> {
+    snp_impl::digest_from_recipe(recipe, ovmf, kernel, initrd)
 }
 
 /// Test-only: compute the launch digest for an **explicit** host
@@ -128,6 +206,8 @@ mod snp_impl {
     use super::QemuConfig;
     use crate::error::{MinerAgentError, Result};
     use crate::lifecycle::cvm_handle::LAUNCH_DIGEST_LEN;
+    use crate::lifecycle::guardian::RecipeInputs;
+    use hippius_types::guardian::LaunchRecipe;
 
     use sev::measurement::snp::{snp_calc_launch_digest, SnpMeasurementArgs};
     use sev::measurement::vcpu_types::CpuType;
@@ -135,8 +215,9 @@ mod snp_impl {
     use sev::Generation;
 
     /// SEV-SNP guest-features bitmap. MUST equal `SNP_GUEST_FEATURES`
-    /// in `packer/kbs-uki/uki/Makefile` (`0x1` = SNPActive).
-    const SNP_GUEST_FEATURES: u64 = 0x1;
+    /// in `packer/kbs-uki/uki/Makefile` (`0x1` = SNPActive). One constant
+    /// for the digest and the guardian recipe.
+    use crate::lifecycle::guardian::SNP_GUEST_FEATURES;
 
     /// The vCPU model folded into the BSP VMSA — and so into the launch
     /// digest — **must** match the real silicon QEMU `-cpu host` writes
@@ -151,9 +232,11 @@ mod snp_impl {
     /// yields the byte-identical Genoa digest as before; a
     /// Turin host (EPYC 9255) yields the Turin digest
     /// (`CpuType::EpycTurin`, the genuine `cpu_sig(26, 2, 1)` =
-    /// `0x00B00F21` read off the silicon — see `vendor/sev`). Any other
-    /// / unknown generation fails closed rather than guessing a wrong
-    /// (silently-rejected, or worse) measurement.
+    /// `0x00B00F21` read off the silicon — see `vendor/sev`); a Milan
+    /// host (EPYC 7543) yields the Milan digest (`CpuType::EpycMilan`,
+    /// `cpu_sig(25, 1, 1)` = `0x00A00F11`, also read off the silicon).
+    /// Any other / unknown generation fails closed rather than guessing a
+    /// wrong (silently-rejected, or worse) measurement.
     ///
     /// MUST equal the `SNP_VCPU_TYPE` the matching-generation UKI build
     /// (`packer/*/uki/Makefile`) measured for its allowlist entry — vali
@@ -170,15 +253,21 @@ mod snp_impl {
     /// it is unit-testable off a real SNP host; `host_vcpu_type` supplies
     /// the genuine host generation from CPUID.
     ///
-    /// Fail-closed default: only the two generations in the SNP fleet
-    /// (Genoa, Turin) map; anything else is rejected rather than measured
+    /// Fail-closed default: only the SEV-SNP generations whose vCPU
+    /// signature has been checked against real silicon (Milan, Genoa,
+    /// Turin) map; anything else is rejected rather than measured
     /// against the wrong allowlist entry.
     pub(super) fn vcpu_type_for_generation(gen: Generation) -> Result<CpuType> {
         match gen {
+            Generation::Milan => Ok(CpuType::EpycMilan),
             Generation::Genoa => Ok(CpuType::EpycGenoa),
             Generation::Turin => Ok(CpuType::EpycTurin),
-            // Milan (the only other snp-visible variant) and any future
-            // unrecognised generation fail closed.
+            // Any other generation fails closed. Under the `snp`-only
+            // feature set the three arms above are exhaustive, so this arm
+            // is unreachable today; it is kept so a vendor bump that adds a
+            // generation (or a feature unification that enables `sev`'s
+            // Naples/Rome) fails closed instead of guessing a vCPU model.
+            #[allow(unreachable_patterns)]
             _ => Err(MinerAgentError::LaunchDigest("vcpu-generation")),
         }
     }
@@ -188,6 +277,77 @@ mod snp_impl {
     /// host CPUID (`host_vcpu_type`), never an input.
     pub(super) fn compute(config: &QemuConfig) -> Result<[u8; LAUNCH_DIGEST_LEN]> {
         compute_with_vcpu_type(config, host_vcpu_type()?)
+    }
+
+    /// The recipe for the **host's own** generation — the production path.
+    pub(super) fn recipe(inputs: &RecipeInputs) -> Result<LaunchRecipe> {
+        recipe_with_vcpu_type(inputs, host_vcpu_type()?)
+    }
+
+    /// The `hippius-launch-digest --vcpu-type` spelling of a model the
+    /// miner measures with. Only the three mapped generations exist here.
+    pub(super) fn vcpu_type_wire(cpu: CpuType) -> Result<&'static str> {
+        match cpu {
+            CpuType::EpycMilan => Ok("EpycMilan"),
+            CpuType::EpycGenoa => Ok("EpycGenoa"),
+            CpuType::EpycTurin => Ok("EpycTurin"),
+            _ => Err(MinerAgentError::LaunchDigest("vcpu-generation")),
+        }
+    }
+
+    /// Inverse of [`vcpu_type_wire`] (exact spelling only).
+    fn vcpu_type_from_wire(s: &str) -> Result<CpuType> {
+        [CpuType::EpycMilan, CpuType::EpycGenoa, CpuType::EpycTurin]
+            .into_iter()
+            .find(|c| vcpu_type_wire(*c).ok() == Some(s))
+            .ok_or(MinerAgentError::LaunchDigest("recipe-vcpu-type"))
+    }
+
+    pub(super) fn recipe_with_vcpu_type(
+        inputs: &RecipeInputs,
+        vcpu_type: CpuType,
+    ) -> Result<LaunchRecipe> {
+        crate::lifecycle::guardian::build_launch_recipe(
+            inputs,
+            vcpu_type_wire(vcpu_type)?,
+            SNP_GUEST_FEATURES,
+        )
+    }
+
+    pub(super) fn digest_from_recipe(
+        recipe: &LaunchRecipe,
+        ovmf: &std::path::Path,
+        kernel: &std::path::Path,
+        initrd: &std::path::Path,
+    ) -> Result<[u8; LAUNCH_DIGEST_LEN]> {
+        use sha2::{Digest, Sha256, Sha384};
+        let read = |p: &std::path::Path| {
+            std::fs::read(p).map_err(|_| MinerAgentError::LaunchDigest("recipe-artifact-read"))
+        };
+        if Sha384::digest(read(ovmf)?).as_slice() != recipe.ovmf_sha384.as_slice()
+            || Sha256::digest(read(kernel)?).as_slice() != recipe.kernel_sha256.as_slice()
+            || Sha256::digest(read(initrd)?).as_slice() != recipe.initrd_sha256.as_slice()
+        {
+            return Err(MinerAgentError::LaunchDigest("recipe-artifact-mismatch"));
+        }
+        let args = SnpMeasurementArgs {
+            vcpus: recipe.vcpus,
+            vcpu_type: vcpu_type_from_wire(&recipe.vcpu_type)?,
+            ovmf_file: ovmf.to_path_buf(),
+            guest_features: GuestFeatures(recipe.guest_features),
+            kernel_file: Some(kernel.to_path_buf()),
+            initrd_file: Some(initrd.to_path_buf()),
+            append: Some(recipe.cmdline.as_str()),
+            ovmf_hash_str: None,
+            vmm_type: None,
+        };
+        let digest = snp_calc_launch_digest(args)
+            .map_err(|_| MinerAgentError::LaunchDigest("sev-compute"))?;
+        let bytes = hex::decode(digest.get_hex_ld())
+            .map_err(|_| MinerAgentError::LaunchDigest("digest-shape"))?;
+        bytes
+            .try_into()
+            .map_err(|_| MinerAgentError::LaunchDigest("digest-shape"))
     }
 
     /// Compute the 48-byte launch digest for an explicitly-supplied vCPU
@@ -226,7 +386,6 @@ mod snp_impl {
     #[cfg(test)]
     mod tests {
         use super::vcpu_type_for_generation;
-        use crate::error::MinerAgentError;
         use sev::measurement::vcpu_types::CpuType;
         use sev::Generation;
 
@@ -253,15 +412,31 @@ mod snp_impl {
             assert_eq!(cpu.sig(), 0x00A1_0F11);
         }
 
-        /// A Milan host is not part of the SNP fleet — fail closed rather
-        /// than measure against a Genoa/Turin allowlist entry.
+        /// Real EPYC 7543 (Milan) silicon: family=25 (0x19), model=1.
+        /// `Generation::identify_cpu` classifies this as Milan, and the
+        /// mapping must fold the genuine `cpu_sig(25, 1, 1)` = 0x00A00F11
+        /// via `CpuType::EpycMilan`.
         #[test]
-        fn milan_host_fails_closed() {
+        fn milan_host_selects_epyc_milan() {
             let gen = Generation::identify_cpu(0x19, 0x01).unwrap();
-            assert!(matches!(
-                vcpu_type_for_generation(gen),
-                Err(MinerAgentError::LaunchDigest("vcpu-generation"))
-            ));
+            let cpu = vcpu_type_for_generation(gen).unwrap();
+            assert_eq!(cpu, CpuType::EpycMilan);
+            assert_eq!(cpu.sig(), 0x00A0_0F11);
+        }
+
+        /// SECURITY ANCHOR: the Milan vCPU signature folded into the VMSA
+        /// MUST be the genuine EPYC 7543 silicon value `0x00A00F11`
+        /// (family=25, model=1, stepping=1) — CPUID leaf 1 EAX read off a
+        /// Milan host. Upstream sev ships this value unpatched; this test
+        /// guards it against a future vendor bump moving it (the same
+        /// class of bug as the Genoa stepping / Turin placeholder).
+        #[test]
+        fn milan_cpu_sig_is_the_genuine_silicon_value() {
+            use sev::measurement::vcpu_types::cpu_sig;
+            assert_eq!(CpuType::EpycMilan.sig(), 0x00A0_0F11);
+            assert_eq!(CpuType::EpycMilan.sig(), cpu_sig(25, 1, 1));
+            // Must NOT be a stepping-0 placeholder.
+            assert_ne!(CpuType::EpycMilan.sig(), cpu_sig(25, 1, 0));
         }
 
         /// SECURITY ANCHOR: the Turin vCPU signature folded into the VMSA

@@ -176,14 +176,29 @@ class Command(BaseCommand):
             )
             sys.exit(EXIT_BAKE_NOT_BLESSABLE)
 
+        previous = GoldenImage.objects.filter(image_name=image_name).first()
+        defaults: dict[str, Any] = {
+            "distro": distro,
+            "bake_id": bake_id,
+            "blessed_at": timezone.now(),
+            "blessed_by": blessed_by,
+        }
+        if (
+            previous is not None
+            and previous.bake_id != bake_id
+            and previous.guest_release is not None
+        ):
+            # The release was blessed for the OLD bake's base: re-bless it for
+            # this one explicitly (`vali_bless_guest_release`).
+            defaults["guest_release"] = None
+            self.stderr.write(
+                self.style.WARNING(
+                    f"image={image_name}: guest release {previous.guest_release} cleared — it was "
+                    "blessed for the previous bake; run vali_bless_guest_release for this one"
+                )
+            )
         obj, created = GoldenImage.objects.update_or_create(
-            image_name=image_name,
-            defaults={
-                "distro": distro,
-                "bake_id": bake_id,
-                "blessed_at": timezone.now(),
-                "blessed_by": blessed_by,
-            },
+            image_name=image_name, defaults=defaults
         )
         self.stderr.write(
             self.style.SUCCESS(

@@ -490,8 +490,94 @@ def test_no_public_path_swallows_the_admin_surface() -> None:
         for rule in doc["spec"]["rules"]
         for p in rule["http"]["paths"]
     ]
-    admin = [p for p in paths if p.rstrip("/").startswith("/v1/admin")]
-    assert admin == ["/v1/admin/audit/measurements"], (
-        "only the exact measurement-ledger path may be public; "
+    admin = sorted(p for p in paths if p.rstrip("/").startswith("/v1/admin"))
+    # Each entry is an EXACT route and carries its own reason in values.yaml:
+    #   - the measurement ledger, root-only, needed by the SDK;
+    #   - the miner declaration, behind the single `IsMinerAdmin` principal,
+    #     needed by the console-driven onboarding (hippius-backend makes it).
+    # `/v1/admin/miner` (a prefix) would also publish `/{id}/quarantine`.
+    assert admin == ["/v1/admin/audit/measurements", "/v1/admin/miner/register"], (
+        "only these two exact admin paths may be public; "
         f"a broader admin prefix publishes the control plane: {admin}"
     )
+
+
+@_needs_helm
+def test_public_ingress_publishes_the_network_prefix() -> None:
+    """The layer above sells public IPs and feeds the ingress edges their
+    desired state through the public hostname — `/v1/network` must be
+    served, and documented by the filtered public schema. Safe as a prefix
+    only because every route under it is root-only, which
+    `apps/network/tests/test_views.py` pins."""
+    paths = {
+        p.get("path")
+        for doc in _docs()
+        if (doc or {}).get("kind") == "Ingress"
+        for rule in doc["spec"]["rules"]
+        for p in rule["http"]["paths"]
+    }
+    assert "/v1/network" in paths
+    public = _configmap_data(_docs()).get("VALI_PUBLIC_API_PATHS", "").split(",")
+    assert "/v1/network" in public
+
+
+@_needs_helm
+def test_public_ingress_publishes_the_operator_paths_exactly() -> None:
+    """The backend's support views reach vali through the public hostname,
+    so each operator read is published — one EXACT path at a time, never
+    the `/v1/operator` prefix (it would publish every future route there)."""
+    paths = {
+        p.get("path")
+        for doc in _docs()
+        if (doc or {}).get("kind") == "Ingress"
+        for rule in doc["spec"]["rules"]
+        for p in rule["http"]["paths"]
+    }
+    operator = sorted(p for p in paths if p.rstrip("/").startswith("/v1/operator"))
+    assert operator == ["/v1/operator/fleet", "/v1/operator/nodes", "/v1/operator/regions"]
+    public = _configmap_data(_docs()).get("VALI_PUBLIC_API_PATHS", "").split(",")
+    assert "/v1/operator/fleet" in public
+
+
+@_needs_helm
+def test_orchestration_tick_gets_netbird_without_reboot_recovery() -> None:
+    """The public-IP reconcile and the post-§25 overlay check run on every
+    tick; they must not lose the NetBird credentials when reboot-recovery
+    is switched off."""
+    docs = _docs("--set", "orchestrationTick.rebootRecovery.enabled=false")
+    [tick] = [
+        d for d in docs
+        if (d or {}).get("kind") == "Deployment"
+        and d["metadata"]["name"] == "vali-orchestration-tick"
+    ]
+    env = {e["name"] for c in tick["spec"]["template"]["spec"]["containers"] for e in c["env"]}
+    assert {"VALI_NETBIRD_API_BASE", "VALI_NETBIRD_API_TOKEN"} <= env
+    assert "VALI_REBOOT_RECOVERY_ENABLED" not in env
+
+
+@_needs_helm
+def test_the_launch_path_pods_mount_a_cache_volume_big_enough_for_the_cap() -> None:
+    """The C2 recompute caches its sha-pinned inputs under
+    VALI_ARTIFACT_CACHE_DIR. Every pod that runs launches must mount that
+    path on its own emptyDir, sized above the cache cap: the 100 Mi /tmp
+    would get the pod evicted mid-launch."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    path = data["VALI_ARTIFACT_CACHE_DIR"]
+    cap = int(data["VALI_ARTIFACT_CACHE_MAX_BYTES"])
+    units = {"Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30}
+    pods = dict(_pod_specs(docs))
+    launch_path = ("vali", "vali-launch-tick", "vali-orchestration-tick")
+    for name in (f"Deployment/{d}" for d in launch_path):
+        pod = pods[name]
+        mounts = [
+            m
+            for c in pod["containers"]
+            for m in c.get("volumeMounts", [])
+            if m["mountPath"] == path
+        ]
+        assert len(mounts) == 1, f"{name}: nothing mounted at {path}"
+        vol = next(v for v in pod["volumes"] if v["name"] == mounts[0]["name"])
+        limit = vol["emptyDir"]["sizeLimit"]
+        size = int(limit[:-2]) * units[limit[-2:]]
+        assert size >= cap + (100 << 20), f"{name}: {limit} leaves no room over the {cap}-byte cap"

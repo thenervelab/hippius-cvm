@@ -338,6 +338,79 @@ cluster it is protecting.
 `emptyDir` inside the CVM. Read the restart-cost table in the runbook and
 have the boot-counter recovery ready **before** you start.
 
+## Audit log refused at start
+
+The release and admin audit chains (`/var/lib/kbs/audit/audit.log` and
+`…/audit/admin/admin.log`, each with its `*.head.sha256`) live on the `audit`
+emptyDir, which **survives a container restart inside the same pod** (OOM
+kill, liveness restart). The KBS opens them with journal semantics
+(`kbs-core/src/audit_journal.rs`):
+
+- **A crash mid-append never stops the KBS.** A torn trailing record (a
+  partial last line, a last line whose hash does not verify) is truncated at
+  open and the KBS starts; a head one record behind the log, or one ahead
+  naming the torn record, is rewritten to the log's tail. The pod log
+  says `ERROR kbs-core::audit: TORN TRAILING RECORD truncated at open: … seq=…
+  offset=… len=… sha256=…`, and an `audit-truncated` record is chained at that
+  seq. vali ingests it as a `KbsAuditAnomaly` of kind `torn-tail-truncated`
+  (a WARNING, not a break — `manage.py vali_kbs_audit --breaks` lists it with
+  the breaks). Nothing to do
+  beyond reading the log line; a whole last record missing only its newline
+  is kept, not dropped.
+- **Only a state no crash produces refuses.** A chain break in the middle
+  (a bad record with records after it, a verified record whose `prev_hash`
+  or `seq` does not follow), a rewritten earlier record, a seq gap, a
+  self-consistent record that does not chain even at the tail, a head that
+  names no record of the log (more than one torn append missing, or a
+  rewritten tail), a missing/emptied log under a live head, a malformed head.
+
+A refusal is one line, and the container exits non-zero (CrashLoopBackOff):
+
+```
+kbs-server: FATAL: wiring: audit sink: vault: audit: REFUSING TO START — audit.log in
+/var/lib/kbs/audit is inconsistent in a way no crash produces: <reason>. Nothing
+was modified. Preserve the directory as evidence and follow
+deploy/gitops/apps/kbs/README.md § "Audit log refused at start"; never hand-edit the log.
+```
+
+(`wiring: admin audit sink: vault: admin-audit: REFUSING TO START — admin.log in
+/var/lib/kbs/audit/admin …` for the admin chain.)
+The whole fleet has lost key release from that moment; the procedure is:
+
+1. **Preserve the evidence — BEFORE touching the pod.** The directory is
+   inside the CVM: the host cannot read it, and the refusing container never
+   runs long enough to `kubectl exec`. What survives outside is:
+   - the refusal and every earlier line: `kubectl -n kbs logs deploy/kbs-server
+     -c kbs-server --previous > kbs-refusal-$(date +%s).log` (and without
+     `--previous`), plus `kubectl -n kbs describe pod -l app.kubernetes.io/name=kbs-server`;
+   - vali's verified copy of both chains up to its last poll, which the refusal
+     does not touch: `manage.py vali_kbs_audit --log release --json --limit
+     100000000`, the same with `--log admin`, and `--breaks --json --limit
+     100000000`, into files kept with the log above (`--limit` defaults to 200
+     — without it you keep only the oldest 200 records).
+   The refusal modified nothing, so as long as the POD is not deleted the
+   directory is intact for whoever investigates.
+2. **Decide it is tamper, not a KBS bug** (the reason names the seq; compare it
+   with vali's copy). Either way the only way back to service is step 3.
+3. **Delete the pod.** A new pod gets a FRESH emptyDir: this is a KBS restart
+   with every consequence in `docs/operator/kbs-admin-mtls-cutover-runbook.md`
+   ("What the KBS restart … costs") — all VM state, boot counters and both
+   audit chains are gone. Run the full recovery ceremony at once: read each
+   live VM's boot counter off its miner, then `vali_kbs_recover` (SEED the
+   counter, THEN register — the command enforces the order) and
+   `vali_kbs_recover --reinstall-tombstones` for the dead VMs the restart forgot.
+   vali opens a new audit epoch on the new genesis.
+
+An open that fails with an I/O error (`… truncate: …`, `… terminator: …`,
+`… head …: No space left on device`) instead of `REFUSING TO START` is not a
+refusal: the recovery could not write (the emptyDir is full or failing). It is
+retried at every container restart and loses nothing; if it persists, preserve
+the evidence (step 1) and delete the pod (step 3).
+
+**Never hand-edit the log or the head** to get the old pod to start: an edit
+that the walker accepts destroys the evidence and launders the break into a
+chain vali will verify; one it does not accept just moves the refusal.
+
 ## A config change here is INERT until the pod restarts
 
 `Config::load` runs exactly once, at process start
@@ -379,6 +452,86 @@ So:
   when they diverge. **Changing a posture key here means changing it in
   the vali chart too**, or CI fails; that is the mechanism, not an
   inconvenience.
+
+## Never roll the KBS image below stamp protocol v2 once v2 guests exist
+
+Stamp protocol v2 (#1320) binds a golden guest's in-volume stamp to a
+TIMELINE. Only a guest RUNNING AN R6 INITRAMFS attests v2 (a new launch
+from the R6 golden bake, or an existing VM deliberately swapped onto an R6
+initrd). **A VM whose guest runs a pre-R6 initramfs attests v1, stays on the
+zero timeline, and releases exactly as before, forever**: its protocol is
+read only from the SNP-signed REPORT_DATA (`attested_guest_stamp_protocol`),
+gate 5c' moves only v2 guests, a rollback arm needs a v2 guest, and a KBS
+restart resets every timeline to zero. The byte-identical v1 KAT
+(`a_v1_guest_release_is_byte_identical_to_the_pre_v2_kat`) pins that.
+
+**After its first v2 release, a VM running an R6 guest is on a non-zero
+timeline and is v2-only**: that release moves it to a fresh timeline (at
+`E = 0`, including after every KBS restart), and from then on
+
+- the KBS refuses any v1 release of it (gate 5a-t), and
+- the guest refuses v1 too: `hippius-guest-release` never retries a denied
+  v2 release as v1 (a denial is a denial: every KBS refusal is the same
+  403, so a miner could forge one and, after a store wipe, get a v1 adopt
+  of an old zero-timeline disk), and the golden initramfs refuses an
+  M0/M1 release that carried no timeline transition.
+
+A KBS image from before v2 refuses every v2-attested release with a 403, so
+the boot simply fails. M2 (`customer`) is unchanged: it attests v1 only
+(its stamp is the guardian's).
+
+Consequences:
+
+- **Never roll the KBS below v2 once the R6 bake is live.** A pre-v2 KBS
+  boots none of those VMs until it is rolled forward again, and it also
+  ignores the timelines file, which re-opens B1 for rolled-back VMs. A
+  rollback KBS image that predates v2 (e.g. the ceremony-2 rollback image)
+  is only a valid target BEFORE the R6 golden bake is blessed. After that
+  it is not a rollback target: roll forward.
+- **Deploy order is vali → KBS → bake.** vali first (it must read what a v2
+  KBS emits: the v2 rollback wire, full-length audit reasons), then the
+  KBS at v2, and only then bless the R6 golden bake. A v2 guest booted
+  against a pre-v2 KBS does not boot.
+- **Never remove a live v1 VM's measurement.** Measurements are pinned PER
+  VM (every launch auto-pins its own), so there is no fleet-wide "v1
+  measurement" to retire, and removing a running pre-R6 VM's pin bricks it.
+  A VM's old pin becomes dead weight only AFTER that same VM has been
+  swapped onto an R6 initrd (and released as v2); only then may that one
+  pin be dropped.
+- **Legacy (non-golden) guests running an R6 guest that never confirm pay a
+  durable write per release.** They attest v2 but never confirm a stamp, so they stay at
+  `E = 0` and every release is a gate 5c' fresh-timeline move: the KBS
+  rewrites and fsyncs its timelines file (tmp + rename + directory fsync,
+  a whole-file rewrite under the stamp-store locks) before replying. The
+  move buys such a VM nothing (it has no in-volume stamp), and the VM is
+  v2-only from its first release. Cheap at today's fleet size and release
+  rate; watch it if release volume grows.
+
+## KBS roll ceremony checklist
+
+Every KBS roll is the full restart ceremony (`emptyDir` — see above and the
+restart-cost table in `docs/operator/kbs-admin-mtls-cutover-runbook.md`).
+Before the roll, on top of that runbook:
+
+- [ ] **#1326: the admin listener admits only URI-SAN `spiffe://` client
+      leaves.** Any admin client with a DNS/IP/email SAN or no SAN is dropped.
+      Check every admin client leaf before the roll
+      (`openssl x509 -noout -ext subjectAltName -in <leaf>.pem` must print only
+      `URI:spiffe://…`).
+- [ ] **Stamp protocol v2: the target image is at v2 or later** whenever
+      any v2 guest (the R6 golden bake) has booted. A pre-v2 image —
+      including the ceremony-2 rollback image — is only a valid target
+      BEFORE the R6 bake is blessed; the deploy order is vali → KBS → bake
+      (see "Never roll the KBS image below stamp protocol v2" above).
+- [ ] Each live VM's boot counter read off its miner, ready for
+      `vali_kbs_recover` (SEED, then register), plus
+      `vali_kbs_recover --reinstall-tombstones`.
+- [ ] vali's audit ingest caught up: for each log, `KbsAuditCursor.last_seq`
+      equals the `head_seq` the KBS reports (`GET /v1/admin/audit?log=<log>&limit=1`)
+      — whatever the old life appended after vali's last read is gone with the
+      old emptyDir. Review `manage.py vali_kbs_audit --breaks --limit 100000000`:
+      `torn-tail-truncated` rows are crashes (expected after an OOM kill);
+      anything else is investigated BEFORE the roll destroys the chain.
 
 ## Follow-ups
 

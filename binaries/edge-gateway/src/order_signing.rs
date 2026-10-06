@@ -195,7 +195,7 @@ impl OrderSigner {
         expected_pubkey_hex: Option<&str>,
     ) -> Result<Arc<Self>, OrderSigningError> {
         // Every transient buffer that holds the seed bytes is wrapped
-        // in `Zeroizing` so it wipes on drop — codex+gemini r1: the
+        // in `Zeroizing` so it wipes on drop — review r1: the
         // priv seed must not linger in heap/stack after boot. The
         // long-lived `SigningKey` itself zeroizes via the
         // `ed25519-dalek` `zeroize` feature.
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn load_rejects_leading_whitespace() {
-        // r1 follow-up (gemini Low): `trim_end` — NOT `trim` — means
+        // r1 follow-up (review Low): `trim_end` — NOT `trim` — means
         // a leading whitespace byte is surfaced as a length mismatch
         // rather than silently stripped. A file with leading
         // whitespace is far more likely corrupt than the operator

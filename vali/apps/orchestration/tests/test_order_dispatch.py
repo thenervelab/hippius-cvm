@@ -66,7 +66,7 @@ def test_dispatch_order_posts_to_edge_with_correct_headers() -> None:
         ) as url_mock,
     ):
         result = order_dispatch.dispatch_order(
-            miner_id="miner-1",
+            miner_id="miner-a",
             netbird_ip="100.64.0.10",
             order_id="ord-1",
             kind="launch",
@@ -77,7 +77,7 @@ def test_dispatch_order_posts_to_edge_with_correct_headers() -> None:
     # never composed from caller text without escape. The
     # `--target-miner-id` value MUST equal `miner_id` (the trusted
     # routing source) and `--issued-at-unix` MUST be a decimal-encoded
-    # unix-seconds value (gemini r1 High — cross-miner + long-term
+    # unix-seconds value (review r1 High — cross-miner + long-term
     # replay closures).
     args, kwargs = run_mock.call_args
     cli = args[0]
@@ -89,7 +89,7 @@ def test_dispatch_order_posts_to_edge_with_correct_headers() -> None:
         "--kind",
         "launch",
         "--target-miner-id",
-        "miner-1",
+        "miner-a",
     ]
     # Last two args: --issued-at-unix <decimal-seconds>. The actual
     # value is `int(time.time())` at call time, so just shape-check it.
@@ -139,7 +139,7 @@ def test_dispatch_returns_classifier_on_miner_rejection() -> None:
         ),
     ):
         result = order_dispatch.dispatch_order(
-            miner_id="miner-1",
+            miner_id="miner-a",
             netbird_ip="100.64.0.10",
             order_id="ord-2",
             kind="launch",
@@ -168,13 +168,13 @@ def test_dispatch_raises_on_transport_failure() -> None:
     ):
         with pytest.raises(order_dispatch.OrderDispatchUnavailable) as ei:
             order_dispatch.dispatch_order(
-                miner_id="miner-1",
+                miner_id="miner-a",
                 netbird_ip="100.64.0.10",
                 order_id="ord-3",
                 kind="launch",
                 payload_json=b'{}',
             )
-    # The URL must NEVER appear in the exception text. Codex r1 Low —
+    # The URL must NEVER appear in the exception text. Review r1 Low —
     # the message is now a fully STATIC classifier (the underlying
     # exception lives on `__cause__` for traceback debugging, never in
     # the message). Pin the exact string so a future regression that
@@ -388,7 +388,7 @@ def test_build_launch_payload_rejects_non_bytes_cose_ticket() -> None:
         )
 
 
-# ── URL-shape validation (codex r2 Low) ──────────────────────────
+# ── URL-shape validation (review r2 Low) ──────────────────────────
 
 
 @override_settings(
@@ -487,3 +487,62 @@ def test_migrate_activate_payload_omits_an_empty_state_get_url() -> None:
     assert carried["state_get_url"] == "https://s3/state?sig=y"
     # Nothing else moves — the only difference is the one key.
     assert {k: v for k, v in carried.items() if k != "state_get_url"} == absent
+
+
+def test_migrate_activate_payload_carries_the_snapshot_digest_only_when_known() -> None:
+    """A multipart snapshot's length + sha256 go to the dest, which verifies
+    its download against them; a single-PUT one has none to carry."""
+    common = {
+        "vm_id": "tenant-x",
+        "get_url": "https://s3/snap",
+        "new_gen": 6,
+        "ovmf_path": "/o",
+        "kernel_path": "/k",
+        "initrd_path": "/i",
+        "cmdline": "ro",
+        "luks_disk_path": "/d",
+        "luks_disk_size_gb": 10,
+        "rootfs_data_path": "/r",
+        "rootfs_hash_path": "/h",
+        "cpu_count": 2,
+        "memory_mb": 2048,
+        "cose_ticket": b"fake-cose-ticket",
+        "boot_artifacts": None,
+    }
+    absent = order_dispatch.build_migrate_activate_payload(**common)
+    assert "snapshot_size" not in absent and "snapshot_sha256_hex" not in absent
+    carried = order_dispatch.build_migrate_activate_payload(
+        **common, snapshot_size=40 * 1024**3, snapshot_sha256_hex="ab" * 32
+    )
+    assert carried["snapshot_size"] == 40 * 1024**3
+    assert carried["snapshot_sha256_hex"] == "ab" * 32
+
+
+def test_migrate_activate_payload_carries_settle_by_only_when_set() -> None:
+    """vali's phase deadline goes to the dest so a retry cannot outlive it;
+    not carried (0) leaves the body exactly as before."""
+    common = {
+        "vm_id": "tenant-x",
+        "get_url": "https://s3/snap",
+        "new_gen": 6,
+        "ovmf_path": "/o",
+        "kernel_path": "/k",
+        "initrd_path": "/i",
+        "cmdline": "ro",
+        "luks_disk_path": "/d",
+        "luks_disk_size_gb": 10,
+        "rootfs_data_path": "/r",
+        "rootfs_hash_path": "/h",
+        "cpu_count": 2,
+        "memory_mb": 2048,
+        "cose_ticket": b"fake-cose-ticket",
+        "boot_artifacts": None,
+    }
+    absent = order_dispatch.build_migrate_activate_payload(**common)
+    assert "settle_by_unix" not in absent
+    assert order_dispatch.build_migrate_activate_payload(**common, settle_by_unix=0) == absent
+    carried = order_dispatch.build_migrate_activate_payload(
+        **common, settle_by_unix=1_790_000_000
+    )
+    assert carried["settle_by_unix"] == 1_790_000_000
+    assert {k: v for k, v in carried.items() if k != "settle_by_unix"} == absent

@@ -140,6 +140,9 @@ class Command(BaseCommand):
         # RA-M3 — the owner of each bound VM, so the dest suggestion honours
         # the per-owner spread (same as the real migration path).
         owner_by_vm = {p.vm.vm_id: p.owner for p in rows}
+        resource_class_by_vm = {p.vm.vm_id: p.resource_class for p in rows}
+        # A resized VM's real disk (it keeps its launch disk).
+        disk_by_vm = {p.vm.vm_id: p.data_disk_gb for p in rows}
         ceilings = _ceiling_by_vm([b.vm_id for b in bound])
 
         lead = int(getattr(settings, "VALI_PRICE_WATCH_LEAD_BLOCKS", 1_000_000))
@@ -182,6 +185,8 @@ class Command(BaseCommand):
                 snapshot=snapshot,
                 family=family_by_vm[intent.vm_id],
                 owner=owner_by_vm.get(intent.vm_id, ""),
+                resource_class=resource_class_by_vm.get(intent.vm_id, ""),
+                data_disk_gb=disk_by_vm.get(intent.vm_id),
             )
             if self._upsert_recommendation(intent, suggested_dest=dest):
                 raised += 1
@@ -195,7 +200,14 @@ class Command(BaseCommand):
             )
 
     def _suggest_dest(
-        self, intent: MigrationIntent, *, snapshot: Any, family: str, owner: str = ""
+        self,
+        intent: MigrationIntent,
+        *,
+        snapshot: Any,
+        family: str,
+        owner: str = "",
+        resource_class: str = "",
+        data_disk_gb: int | None = None,
     ) -> str:
         """Best within-budget destination off the repricing miner, or `""`
         if the watcher cannot find one (the alert still surfaces — the
@@ -211,6 +223,11 @@ class Command(BaseCommand):
                 family_load_by_node=fam,
                 max_epoch_lag=service.max_epoch_lag(),
                 excluded=frozenset({intent.node_id}),
+                # Gate (f) — the suggestion is the ONLY region guard on this
+                # path: an operator's approve → `start_migration` has no
+                # region check, so a dest suggested out of region would be
+                # acted on as-is.
+                **service.region_arguments(service.launch_region_for_vm(intent.vm_id)),
                 weights=SelectionWeights.from_settings(),
                 max_host_share=service.max_host_share(),
                 # Price-aware suggestion: don't point at an equally-pricey miner.
@@ -227,6 +244,16 @@ class Command(BaseCommand):
                 # observed fail to start a confidential guest; the
                 # operator would act on it and strand the VM.
                 cvm_capability_by_node=service.cvm_capability_by_node(),
+                # Never recommend a miner still running a crypto-erased VM.
+                zombie_quarantined=service.zombie_quarantined_node_ids(),
+                cordoned=service.cordoned_node_ids(),
+                # Capacity v2 — recommend only a miner the VM's flavor fits
+                # (an unknown class counts as the reference slot).
+                resource_fit=service.resource_fit(
+                    resource_class,
+                    shadow_log=False,
+                    disk_gb=service.placement_disk_gb(resource_class, data_disk_gb),
+                ),
             )
         except PlacementError as exc:
             log.info(

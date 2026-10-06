@@ -58,6 +58,10 @@ bind_addr = "<THIS_MINER_MESH_IP>:9700"
 # would overcommit a budget.
 cvm_cpu_budget = 8
 cvm_memory_mb_budget = 16384
+# Leave tenant CVMs running across an agent restart/upgrade (they are
+# re-adopted at startup). Without it a graceful stop tears down every
+# domain on the host.
+skip_shutdown_teardown = true
 # Total GiB of tenant DATA disk the host commits to. Set it to the real
 # free capacity of `[storage].data_disk_root` (e.g. the NVMe RAID below).
 # The agent RESERVES against it so concurrent launches can't over-commit
@@ -76,3 +80,13 @@ cvm_disk_gb_budget = 0
 # [storage]
 # data_disk_root = "/mnt/hippius-data"   # → <root>/data/<vm_id>.img
 # state_disk_root = "/var/lib/hippius-miner"  # → <root>/state/<vm_id>.raw
+
+# [backup] — OPTIONAL. Live VM backup tuning. `host_speed_bytes_per_sec` is
+# the HOST budget for the QEMU copies of backups (0 = uncapped): each job
+# gets budget / 2 (one share per run slot), so concurrent runs never exceed
+# it together. The default, 384 MiB/s, is 192 MiB/s per job — a 160 GiB
+# disk in ~14 min — and leaves the host storage headroom for the tenants.
+# Uncomment BOTH the `[backup]` header and the key — the key alone lands in
+# the table above it, and the agent refuses to start (unknown key).
+# [backup]
+# host_speed_bytes_per_sec = 402653184

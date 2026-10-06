@@ -98,7 +98,7 @@ install() {
     # overlay upperdir; blockdev enforces the measured size anchor + the
     # RO assert; overlay/mount assemble the root.
     inst_multiple ip sha256sum awk wc cat mktemp modprobe mount umount sync \
-        grep head tr ls blockdev veritysetup cryptsetup mkfs.ext4
+        grep head sed tr ls blockdev veritysetup cryptsetup mkfs.ext4 udevadm
     inst_multiple -o shred curl getent ping
     # setfattr/getfattr (attr) — the overlay lib stamps the RO lower's "/"
     # SELinux label onto the per-VM upper's overlay-root dir so the enforcing

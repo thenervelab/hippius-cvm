@@ -12,7 +12,7 @@
 # Multi-stage layout matches the placeholder tenant factory:
 #   - Stage 1 (`agent-builder`): `rust:1.93-slim-trixie` builds
 #     `hippius-agent-initramfs` + `hippius-agent-tenant-telemetry`
-#     for x86_64-unknown-linux-gnu. PR-F2 review (codex) flagged that
+#     for x86_64-unknown-linux-gnu. PR-F2 review (review) flagged that
 #     a host-built binary may be Mach-O/arm64 on macOS — building
 #     inside the pinned Linux/amd64 image is the only way to keep the
 #     binary bytes inside the reproducibility boundary.

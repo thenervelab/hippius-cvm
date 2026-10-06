@@ -7,5 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod client;
+pub mod components;
 pub mod relay;
+pub mod resources;
 pub mod tick;

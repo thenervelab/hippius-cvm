@@ -32,6 +32,13 @@ pub struct Config {
     /// plaintext KEK is in use.
     #[serde(default)]
     pub require_wrapped_kek: bool,
+    /// §6 — when `true`, the KBS REFUSES a userdata that is not
+    /// Transit-wrapped at rest (the userdata counterpart of
+    /// `require_wrapped_kek`). `#[serde(default)]` = `false`: a VM whose
+    /// cloud-init was staged before the wrapping landed still holds
+    /// plaintext and must keep booting. Flip on once none can.
+    #[serde(default)]
+    pub require_wrapped_userdata: bool,
     /// L1 OrderTicket-signing keys, keyed by `kid`. May be empty — with
     /// no keys every ticket fails signature verification (fail closed).
     #[serde(default)]
@@ -61,6 +68,97 @@ pub struct Config {
     /// here would silently produce attestations the on-chain pallet
     /// rejects.
     pub live_attestation: LiveAttestationConfig,
+    /// `[custody]` — the guest custody lease (`kbs_core::custody`).
+    /// Absent, or `enabled = false` (the default), ⇒ the three
+    /// `/v1/kbs/custody/*` routes answer 404 `custody-disabled` and
+    /// nothing custody-related is stored.
+    #[serde(default)]
+    pub custody: Option<CustodyConfig>,
+    /// `[rollback]` — the authorized rollback (A2, `kbs_core::rollback`).
+    /// Absent ⇒ the compiled defaults (`min_interval_s = 1800`,
+    /// `max_ttl_s = 3600`). The feature itself has no on/off switch here:
+    /// with no arm nothing changes, and only vali (behind its own flag)
+    /// creates arms.
+    #[serde(default)]
+    pub rollback: Option<RollbackConfig>,
+}
+
+/// `[rollback]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackConfig {
+    /// One rollback per VM per this many seconds (arm or consume).
+    #[serde(default = "rollback_default_min_interval_s")]
+    pub min_interval_s: u64,
+    /// Longest arm TTL accepted; at most 3600.
+    #[serde(default = "rollback_default_max_ttl_s")]
+    pub max_ttl_s: u64,
+}
+
+fn rollback_default_min_interval_s() -> u64 {
+    kbs_core::rollback::DEFAULT_MIN_INTERVAL_S
+}
+fn rollback_default_max_ttl_s() -> u64 {
+    kbs_core::rollback::DEFAULT_MAX_TTL_S
+}
+
+/// `[custody]`. Every field but `enabled` has the production default; the
+/// lease values are validated by `kbs_core::custody::CustodyPolicy`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustodyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "custody_default_ttl_s")]
+    pub ttl_s: u32,
+    #[serde(default = "custody_default_stage2_s")]
+    pub stage2_s: u32,
+    #[serde(default = "custody_default_renew_s")]
+    pub renew_s: u32,
+    /// Allowed slowness of a guest's clock before `skew_suspected`, ppm.
+    #[serde(default = "custody_default_skew_tolerance_ppm")]
+    pub skew_tolerance_ppm: u64,
+    #[serde(default = "custody_default_skew_min_window_s")]
+    pub skew_min_window_s: u64,
+    #[serde(default = "custody_default_skew_slack_s")]
+    pub skew_slack_s: u64,
+}
+
+impl CustodyConfig {
+    pub fn policy(&self) -> kbs_core::custody::CustodyPolicy {
+        kbs_core::custody::CustodyPolicy {
+            ttl_s: self.ttl_s,
+            stage2_s: self.stage2_s,
+            renew_s: self.renew_s,
+        }
+    }
+
+    pub fn skew(&self) -> kbs_core::custody::SkewConfig {
+        kbs_core::custody::SkewConfig {
+            tolerance_ppm: self.skew_tolerance_ppm,
+            min_window_s: self.skew_min_window_s,
+            slack_s: self.skew_slack_s,
+        }
+    }
+}
+
+fn custody_default_ttl_s() -> u32 {
+    kbs_core::custody::CustodyPolicy::default().ttl_s
+}
+fn custody_default_stage2_s() -> u32 {
+    kbs_core::custody::CustodyPolicy::default().stage2_s
+}
+fn custody_default_renew_s() -> u32 {
+    kbs_core::custody::CustodyPolicy::default().renew_s
+}
+fn custody_default_skew_tolerance_ppm() -> u64 {
+    kbs_core::custody::SkewConfig::default().tolerance_ppm
+}
+fn custody_default_skew_min_window_s() -> u64 {
+    kbs_core::custody::SkewConfig::default().min_window_s
+}
+fn custody_default_skew_slack_s() -> u64 {
+    kbs_core::custody::SkewConfig::default().slack_s
 }
 
 /// HTTP transport bind settings.
@@ -104,7 +202,7 @@ pub struct Storage {
     #[serde(default)]
     pub live_attestation_dir: Option<PathBuf>,
     /// Per-`vm_id` monotonic boot counter file (Phase 1 of audit
-    /// follow-up Codex #2 — anti-rollback for valid-old-ciphertext
+    /// follow-up Review #2 — anti-rollback for valid-old-ciphertext
     /// replay). Default `{state_dir}/boot-counters.json`. Mirrors
     /// the `vm-states.json` discipline: atomic tmp+rename, parent-
     /// dir fsync, in-memory `Mutex<HashMap<String, u64>>` cache.
@@ -299,6 +397,38 @@ pub struct LiveAttestationConfig {
     pub compute_chain_genesis_hex: String,
     /// 32-byte compute-pallet instance discriminator, hex.
     pub compute_pallet_instance_hex: String,
+    /// How keepalives are bound to the guest the KBS released to
+    /// (`kbs_core::keepalive_binding`): `off` (default — legacy v1
+    /// bodies, no binding), `record` (v2 bodies; a release-time binding is
+    /// enforced, a VM with none is pinned on first use and flagged so), or
+    /// `enforce` (v2; no release-time binding ⇒ refused). Consumers of v2
+    /// (vali's verifier) must be deployed before this leaves `off`.
+    #[serde(default = "default_keepalive_binding")]
+    pub keepalive_binding: String,
+    /// `enforce` only: seconds after the KBS state EPOCH (the first start
+    /// on a fresh state dir, i.e. a pod replacement — see
+    /// `kbs_core::keepalive_binding::grace_epoch_start`) during which a VM
+    /// with NO binding record is served as `first-use` instead of
+    /// refused, until `vali_kbs_recover` re-seeds it. Bound VMs are
+    /// enforced strictly throughout. `0` (default) ⇒ strict enforce.
+    /// Capped at [`MAX_KEEPALIVE_GRACE_SECS`].
+    #[serde(default)]
+    pub keepalive_binding_grace_secs: u64,
+}
+
+/// Upper bound on [`LiveAttestationConfig::keepalive_binding_grace_secs`]:
+/// the window only has to cover a restart→recovery gap (minutes).
+pub const MAX_KEEPALIVE_GRACE_SECS: u64 = 3_600;
+
+fn default_keepalive_binding() -> String {
+    "off".into()
+}
+
+impl LiveAttestationConfig {
+    /// The parsed mode; `validate` has already refused anything else.
+    pub fn keepalive_binding_mode(&self) -> kbs_core::keepalive_binding::BindingMode {
+        kbs_core::keepalive_binding::BindingMode::parse(&self.keepalive_binding).unwrap_or_default()
+    }
 }
 
 /// SNP launch-policy floor (`kbs_core::snp::LaunchPolicy`).
@@ -436,15 +566,32 @@ pub struct AdminConfig {
     /// unlock a tenant disk and there is no per-request credential
     /// behind them.
     ///
-    /// Setting it to `false` is the ONE way to serve them in plaintext
-    /// (network policy as the sole control). It exists so a fleet whose
-    /// admin PKI has not been issued yet can take this binary in one
-    /// step and cut over in another; the insecure state is then visible
-    /// in the rendered config and logged loudly at every start. It does
-    /// NOT downgrade a listener whose material IS present — certs, once
-    /// configured, are always enforced.
+    /// Setting it to `false` NO LONGER serves the routes in plaintext on
+    /// its own: without material the listener is refused unless
+    /// [`Self::dev_allow_plaintext`] is also set. It does NOT downgrade a
+    /// listener whose material IS present — certs, once configured, are
+    /// always enforced.
     #[serde(default = "default_admin_require_mtls")]
     pub require_mtls: bool,
+    /// DEV ONLY: serve the admin routes in PLAINTEXT when no mTLS
+    /// material is configured (and `require_mtls = false`). Network
+    /// policy is then the only control over the API that decides which
+    /// host may unlock a tenant disk, so it is logged at every start as
+    /// UNAUTHENTICATED. Default `false`; production never sets it.
+    #[serde(default)]
+    pub dev_allow_plaintext: bool,
+    /// SPIFFE IDs allowed on the admin listener. A CA-verified leaf is
+    /// admitted only if it carries ≥1 URI SAN, EVERY URI SAN is listed
+    /// here, and it carries no other SAN type (see
+    /// `admin_tls::authorize_admin_peer`); DNS SANs and the Subject CN
+    /// are never identities. Each entry must be a canonical
+    /// `spiffe://` ID — anything else fails the config load. Chaining to
+    /// the admin CA is necessary but NOT sufficient: a leaf minted for
+    /// any other purpose is dropped before a request is read. Default:
+    /// vali's identity, the only client leaf issued
+    /// (`spiffe://hippius.network/vali`).
+    #[serde(default = "default_admin_allowed_client_identities")]
+    pub allowed_client_identities: Vec<kbs_transport::SpiffeId>,
     /// PEM server cert chain the admin listener presents (leaf first).
     #[serde(default)]
     pub tls_cert_path: Option<PathBuf>,
@@ -478,6 +625,17 @@ fn default_admin_burst() -> u32 {
     20
 }
 
+/// The one admin client identity issued (vali's client leaf).
+pub const VALI_ADMIN_IDENTITY: &str = "spiffe://hippius.network/vali";
+
+pub(crate) fn default_admin_allowed_client_identities() -> Vec<kbs_transport::SpiffeId> {
+    // A compile-time constant that the parser tests pin as valid.
+    #[allow(clippy::expect_used)]
+    let vali = kbs_transport::SpiffeId::parse(VALI_ADMIN_IDENTITY)
+        .expect("VALI_ADMIN_IDENTITY is a valid SPIFFE ID");
+    vec![vali]
+}
+
 /// Fail-closed default: an `[admin]` block that says nothing about TLS
 /// requires TLS.
 fn default_admin_require_mtls() -> bool {
@@ -485,6 +643,17 @@ fn default_admin_require_mtls() -> bool {
 }
 
 impl Config {
+    /// The resolved `[rollback]` policy (compiled defaults when absent).
+    pub fn rollback_policy(&self) -> kbs_core::rollback::RollbackPolicy {
+        match &self.rollback {
+            Some(r) => kbs_core::rollback::RollbackPolicy {
+                min_interval_s: r.min_interval_s,
+                max_ttl_s: r.max_ttl_s,
+            },
+            None => kbs_core::rollback::RollbackPolicy::default(),
+        }
+    }
+
     /// Read, parse, and validate. Any failure is fatal (fail closed).
     pub fn load(path: &Path) -> Result<Config, Error> {
         let raw = std::fs::read_to_string(path)
@@ -558,9 +727,57 @@ impl Config {
     /// key-byte validation happens in `wiring` (it needs the decoded
     /// values); both paths fail closed.
     fn validate(&self) -> Result<(), Error> {
+        if let Some(admin) = &self.admin {
+            // Each entry is already a parsed `SpiffeId` (a non-`spiffe://`
+            // entry fails deserialization); only emptiness is left.
+            if admin.allowed_client_identities.is_empty() {
+                return Err(Error::Config(
+                    "admin.allowed_client_identities must list at least one spiffe:// identity \
+                     — an empty allowlist would admit no one"
+                        .into(),
+                ));
+            }
+        }
+        if kbs_core::keepalive_binding::BindingMode::parse(&self.live_attestation.keepalive_binding)
+            .is_none()
+        {
+            return Err(Error::Config(format!(
+                "live_attestation.keepalive_binding = {:?}: expected off, record or enforce",
+                self.live_attestation.keepalive_binding
+            )));
+        }
+        let grace = self.live_attestation.keepalive_binding_grace_secs;
+        if grace > MAX_KEEPALIVE_GRACE_SECS {
+            return Err(Error::Config(format!(
+                "live_attestation.keepalive_binding_grace_secs = {grace}: above the \
+                 {MAX_KEEPALIVE_GRACE_SECS} s cap"
+            )));
+        }
+        if grace > 0
+            && self.live_attestation.keepalive_binding_mode()
+                != kbs_core::keepalive_binding::BindingMode::Enforce
+        {
+            return Err(Error::Config(
+                "live_attestation.keepalive_binding_grace_secs is only meaningful with \
+                 keepalive_binding = \"enforce\""
+                    .into(),
+            ));
+        }
         if self.storage.nonce_ttl_secs == 0 {
             return Err(Error::Config("storage.nonce_ttl_secs must be > 0".into()));
         }
+        // A bad lease policy is fatal at load, whether or not custody is
+        // enabled yet — flipping `enabled` later must never be the moment
+        // an invalid TTL is discovered.
+        if let Some(custody) = &self.custody {
+            custody
+                .policy()
+                .validate()
+                .map_err(|e| Error::Config(format!("[custody]: {e}")))?;
+        }
+        self.rollback_policy()
+            .validate()
+            .map_err(|e| Error::Config(format!("[rollback]: {e}")))?;
         // Admin mTLS material is all-or-nothing. A server cert with no
         // pinned client CA is TLS *without authentication* — it would
         // look encrypted while accepting any caller — and a client CA
@@ -781,6 +998,88 @@ compute_pallet_instance_hex = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
     }
 
     #[test]
+    fn custody_is_off_unless_explicitly_enabled() {
+        let cfg = Config::load(write_tmp(MINIMAL).path()).unwrap();
+        assert!(cfg.custody.is_none());
+        assert!(crate::wiring::build_custody(&cfg).unwrap().is_none());
+        let with_section = format!("{MINIMAL}\n[custody]\n");
+        let cfg = Config::load(write_tmp(&with_section).path()).unwrap();
+        let c = cfg.custody.as_ref().unwrap();
+        assert!(!c.enabled, "an empty [custody] section stays off");
+        assert_eq!(c.policy(), kbs_core::custody::CustodyPolicy::default());
+        assert!(crate::wiring::build_custody(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn enabled_custody_builds_a_runtime_under_the_state_dir() {
+        let td = tempfile::TempDir::new().unwrap();
+        let body = MINIMAL.replace("/var/lib/kbs/state", td.path().to_str().unwrap())
+            + "\n[custody]\nenabled = true\nttl_s = 7200\nrenew_s = 300\n";
+        let cfg = Config::load(write_tmp(&body).path()).unwrap();
+        let rt = crate::wiring::build_custody(&cfg).unwrap().unwrap();
+        assert_eq!(rt.policy().ttl_s, 7200);
+        assert_eq!(rt.policy().renew_s, 300);
+    }
+
+    #[test]
+    fn an_out_of_bounds_custody_policy_is_fatal_even_while_disabled() {
+        for bad in [
+            "ttl_s = 604801",
+            "ttl_s = 60",
+            "renew_s = 1",
+            "stage2_s = 0",
+        ] {
+            let body = format!("{MINIMAL}\n[custody]\n{bad}\n");
+            assert!(Config::load(write_tmp(&body).path()).is_err(), "{bad}");
+        }
+        let body = format!("{MINIMAL}\n[custody]\ngrant_all = true\n");
+        assert!(
+            Config::load(write_tmp(&body).path()).is_err(),
+            "unknown key"
+        );
+    }
+
+    #[test]
+    fn rollback_defaults_apply_when_the_section_is_absent_or_empty() {
+        let cfg = Config::load(write_tmp(MINIMAL).path()).unwrap();
+        assert!(cfg.rollback.is_none());
+        assert_eq!(
+            cfg.rollback_policy(),
+            kbs_core::rollback::RollbackPolicy {
+                min_interval_s: 1800,
+                max_ttl_s: 3600
+            }
+        );
+        let cfg = Config::load(write_tmp(&format!("{MINIMAL}\n[rollback]\n")).path()).unwrap();
+        assert_eq!(
+            cfg.rollback_policy(),
+            kbs_core::rollback::RollbackPolicy::default()
+        );
+        let body = format!("{MINIMAL}\n[rollback]\nmin_interval_s = 600\nmax_ttl_s = 900\n");
+        let cfg = Config::load(write_tmp(&body).path()).unwrap();
+        assert_eq!(
+            cfg.rollback_policy(),
+            kbs_core::rollback::RollbackPolicy {
+                min_interval_s: 600,
+                max_ttl_s: 900
+            }
+        );
+    }
+
+    #[test]
+    fn a_rollback_policy_past_the_one_hour_ttl_ceiling_is_fatal() {
+        for bad in [
+            "max_ttl_s = 3601",
+            "max_ttl_s = 59",
+            "min_interval_s = 0",
+            "enabled = true",
+        ] {
+            let body = format!("{MINIMAL}\n[rollback]\n{bad}\n");
+            assert!(Config::load(write_tmp(&body).path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn max_unconfirmed_releases_parses_an_explicit_value() {
         let body = MINIMAL.replace(
             "nonce_ttl_secs = 300",
@@ -839,6 +1138,59 @@ compute_pallet_instance_hex = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
         assert!(admin.require_mtls);
         assert!(admin.tls_cert_path.is_none());
         assert!(admin.client_ca_path.is_none());
+    }
+
+    #[test]
+    fn admin_identities_default_to_vali_and_a_bad_list_refuses_to_load() {
+        let body = format!("{MINIMAL}\n\n[admin]\naddr = \"0.0.0.0:8001\"\n");
+        let f = write_tmp(&body);
+        let admin = Config::load(f.path()).unwrap().admin.unwrap();
+        assert_eq!(
+            admin
+                .allowed_client_identities
+                .iter()
+                .map(|i| i.as_str())
+                .collect::<Vec<_>>(),
+            vec![VALI_ADMIN_IDENTITY]
+        );
+        assert!(!admin.dev_allow_plaintext);
+        // A listed identity may only be a canonical spiffe:// URI: a DNS
+        // name, a CN, another scheme, a padded or non-canonical spelling,
+        // or one bad entry among good ones all refuse the whole config.
+        for list in [
+            "[]",
+            "[\"\"]",
+            "[\" spiffe://hippius.network/vali\"]",
+            "[\"vali\"]",
+            "[\"vali.hippius.svc\"]",
+            "[\"https://hippius.network/vali\"]",
+            "[\"SPIFFE://hippius.network/vali\"]",
+            "[\"spiffe://hippius.network/vali/\"]",
+            "[\"spiffe://hippius.network/vali\", \"vali.hippius.svc\"]",
+        ] {
+            let body = format!(
+                "{MINIMAL}\n\n[admin]\naddr = \"0.0.0.0:8001\"\nallowed_client_identities = {list}\n"
+            );
+            let f = write_tmp(&body);
+            assert!(
+                Config::load(f.path()).is_err(),
+                "{list} must refuse to load"
+            );
+        }
+        let body = format!(
+            "{MINIMAL}\n\n[admin]\naddr = \"0.0.0.0:8001\"\nallowed_client_identities = \
+             [\"spiffe://hippius.network/vali\", \"spiffe://hippius.network/operator\"]\n"
+        );
+        let f = write_tmp(&body);
+        assert_eq!(
+            Config::load(f.path())
+                .unwrap()
+                .admin
+                .unwrap()
+                .allowed_client_identities
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1086,7 +1438,7 @@ compute_pallet_instance_hex = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
             // Vault addressed by bare IP:port (no prod-marker substring).
             "https://203.0.113.10:8200",
             "https://vault:8200", // bare DNS name (not *.local)
-            "https://vault.hippius.network:8200",
+            "https://vault.example.com:8200",
             "https://[2606:4700::1111]:8200", // public IPv6
             "https://vault.internal:8200",    // RA-KBS-VL4: .internal now public
         ] {

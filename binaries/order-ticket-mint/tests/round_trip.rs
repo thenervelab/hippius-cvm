@@ -87,7 +87,13 @@ fn dev_keyring() -> OneKey {
 /// Mint with a fixed argv. Output is the raw COSE_Sign1 bytes the
 /// binary wrote to `--out`.
 fn mint_fixture(key_path: &Path, out: &Path) {
+    mint_fixture_with(key_path, out, &[]);
+}
+
+/// [`mint_fixture`] plus `extra` argv (e.g. `--key-mode split`).
+fn mint_fixture_with(key_path: &Path, out: &Path, extra: &[&str]) {
     let status = Command::new(binary_path())
+        .args(extra)
         .args([
             "--signing-key",
             key_path.to_str().unwrap(),
@@ -584,4 +590,87 @@ fn ticket_validator_subcommand_accepts_mint() {
         stdout.contains("\"tag\":\"ok\""),
         "validator stdout missing ok tag: {stdout}"
     );
+}
+
+// ─── Customer-held keys: `--key-mode` ───────────────────────────────
+
+/// SHA-256 of the fixture envelope as minted BEFORE `--key-mode` existed.
+/// An M0 mint (no `--key-mode`) must stay byte-identical to it: every M0
+/// ticket vali mints goes through this binary, and the KBS / guest decode
+/// an unchanged body.
+const M0_FIXTURE_SHA256: &str = "486c710a747cd258aff1d135f391bf34cce3075c05302938eccfbd8609f2a2c8";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[test]
+fn m0_mint_is_byte_identical_to_the_pre_key_mode_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = write_signing_key(&dir);
+    let out = dir.path().join("m0.cose");
+    mint_fixture(&key, &out);
+    assert_eq!(sha256_hex(&std::fs::read(&out).unwrap()), M0_FIXTURE_SHA256);
+}
+
+#[test]
+fn key_mode_split_and_customer_are_signed_into_the_ticket() {
+    use hippius_types::guardian::KeyMode;
+    let dir = tempfile::tempdir().unwrap();
+    let key = write_signing_key(&dir);
+    for (wire, mode) in [("split", KeyMode::Split), ("customer", KeyMode::Customer)] {
+        let out = dir.path().join(format!("{wire}.cose"));
+        mint_fixture_with(&key, &out, &["--key-mode", wire]);
+        let cose_bytes = std::fs::read(&out).unwrap();
+        // The production verifier accepts it and reads the mode back.
+        let (ticket, _) = verify_order_ticket(&cose_bytes, &dev_keyring(), 1500)
+            .expect("kbs-core must accept a key_mode mint");
+        assert_eq!(ticket.key_mode, Some(mode));
+        assert_eq!(ticket.key_mode(), mode);
+        assert_ne!(sha256_hex(&cose_bytes), M0_FIXTURE_SHA256);
+        let payload = coset::CoseSign1::from_slice(&cose_bytes)
+            .unwrap()
+            .payload
+            .unwrap();
+        assert_canonical(&payload).expect("payload must be canonical CBOR");
+    }
+}
+
+#[test]
+fn m0_mint_carries_no_key_mode_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = write_signing_key(&dir);
+    let out = dir.path().join("m0.cose");
+    mint_fixture(&key, &out);
+    let cose_bytes = std::fs::read(&out).unwrap();
+    let payload = coset::CoseSign1::from_slice(&cose_bytes)
+        .unwrap()
+        .payload
+        .unwrap();
+    let Value::Map(entries) = ciborium::de::from_reader::<Value, _>(payload.as_slice()).unwrap()
+    else {
+        panic!("ticket body is not a map");
+    };
+    assert!(!entries
+        .iter()
+        .any(|(k, _)| k == &Value::Text("key_mode".into())));
+}
+
+#[test]
+fn key_mode_hippius_and_unknown_modes_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = write_signing_key(&dir);
+    for bad in ["hippius", "Split", "", "m1"] {
+        let out = run_with_overrides(
+            [
+                "--allowed-measurement-hex",
+                MEASUREMENT_HEX,
+                "--key-mode",
+                bad,
+            ],
+            &key,
+        );
+        assert!(!out.status.success(), "--key-mode {bad:?} must be refused");
+    }
 }

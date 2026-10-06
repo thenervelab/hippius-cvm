@@ -18,9 +18,10 @@ human happened to query the database.
 `kbs_core::lifecycle::check_releasable` releases the tenant KEK to
 `(new_gen, dest-chip)` and to NOTHING else. That is not a fence vali can
 lift: the KBS admin surface has three lifecycle writes (`register-vm`,
-`activate`, `seed-boot-counter`); `activate` is forward-only AND refuses
-every non-`Active` current state, and `register-vm` on a divergent state
-is a 409-with-no-write. **There is no route from `Migrating` back to
+`activate`, `seed-boot-counter`); `activate` is forward-only (it only
+ever moves the fence to a strictly higher generation, never back to
+`source_gen`), and `register-vm` on a divergent state is a
+409-with-no-write. **There is no route from `Migrating` back to
 `Active{source}`.** So:
 
 * **before** `DestActivating` — the KBS never moved. The source is still
@@ -93,6 +94,7 @@ from apps.lifecycle.models import Vm
 from apps.orchestration import effects, service
 from apps.orchestration.models import (
     MigrationJob,
+    MigrationKind,
     MigrationState,
     StrandRecoveryState,
 )
@@ -293,6 +295,11 @@ class Command(BaseCommand):
 
     def _redrive_blocker(self, vm: Vm, job: MigrationJob) -> str | None:
         """`None` iff a forward re-drive is safe to open; else why not."""
+        if job.kind != MigrationKind.MIGRATE.value:
+            # A restore / failover has no snapshot to re-drive and is never
+            # activated on a source ack; the stranded verdict already blocks
+            # it — restated here so this path can never open one.
+            return f"a {job.kind} job is not re-driven — an operator must look"
         if not job.source_ack_verified:
             # The §25 split-brain gate, restated at the intake: a job that
             # never verified the source's signed `stopped{}` ack cannot be

@@ -37,14 +37,18 @@
 // denies these in library code, so opt in only under `cfg(test)`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod backup;
 pub mod config;
 pub mod edge_client;
 pub mod error;
 pub mod heartbeat;
+pub mod host_health;
 pub mod identity;
 pub mod image_cache;
 pub mod lifecycle;
+pub mod netpolicy;
 pub mod orders;
+pub mod sev_asid;
 pub mod snp_config;
 pub mod vsock;
 

@@ -311,7 +311,7 @@ mod tests {
             // Vault addressed by bare IP:port.
             "https://203.0.113.10:8200",
             "https://vault:8200", // bare DNS name (not *.local)
-            "https://vault.hippius.network:8200",
+            "https://vault.example.com:8200",
         ] {
             let mut v = base_vault();
             v.dev_skip_tls_verify = true;
@@ -341,7 +341,7 @@ mod tests {
     fn endpoint_classifier_matches_expected() {
         for (addr, is_public) in [
             ("https://203.0.113.10:8200", true),
-            ("https://vault.hippius.network:8200", true),
+            ("https://vault.example.com:8200", true),
             ("https://vault:8200", true),
             ("https://127.0.0.1:8200", false),
             ("http://10.0.0.5:8200", false),

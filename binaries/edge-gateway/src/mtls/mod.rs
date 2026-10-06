@@ -7,7 +7,7 @@
 //!   handshake's leaf cert (replaces the NAT-collapsed `IpAddr`
 //!   PR-H3 used as the rate-limit key).
 //! - [`revocation`] — CRL distribution + 60 s polling + fail-closed
-//!   health gate. Codex review of PR-H4 v1 specced this surface:
+//!   health gate. Review of PR-H4 v1 specced this surface:
 //!   missing / corrupt CRL ⇒ drop every connection until the file
 //!   comes back.
 //! - [`cert_store`] — load PEMs (CA / chain / key), build the rustls
@@ -20,9 +20,9 @@
 //! a real `tokio::net::TcpListener` accept loop; PR-H4 ships the
 //! handshake mechanics + integration tests over loopback.
 //!
-//! ## Live CRL rotation (Blocker fix, codex PR-H4 v1 review)
+//! ## Live CRL rotation (Blocker fix, review PR-H4 v1 review)
 //!
-//! Codex flagged: the boot-time `ServerConfig` bakes the initial CRL
+//! Review flagged: the boot-time `ServerConfig` bakes the initial CRL
 //! snapshot into its `WebPkiClientVerifier`; refreshing the CRL
 //! store later does NOT propagate new revocations to live
 //! connections. Fix: [`MtlsRuntime`] holds the active `ServerConfig`
@@ -33,7 +33,7 @@
 //! handshake start, so the next connection uses the rebuilt
 //! verifier — within 60 s + handshake of an operator's CRL push.
 //!
-//! Codex also flagged a TOCTOU on the health gate: `accept` checks
+//! Review also flagged a TOCTOU on the health gate: `accept` checks
 //! `is_healthy()` BEFORE the handshake; the poller could flip
 //! unhealthy mid-handshake and the connection would still be
 //! accepted. Fix: re-check `is_healthy()` AFTER the handshake
@@ -313,7 +313,7 @@ impl MtlsAcceptor {
     /// - Handshake succeeded but the peer cert lacks any identity
     ///   carrier (no SAN, no CN) → drop.
     ///
-    /// **Post-handshake re-check** (codex PR-H4 v1 Blocker fix):
+    /// **Post-handshake re-check** (review PR-H4 v1 Blocker fix):
     /// the gate is consulted both BEFORE the handshake (cheap
     /// fail-closed) AND AFTER (closes the TOCTOU window where the
     /// poller flips unhealthy mid-handshake — a connection that

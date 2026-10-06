@@ -161,7 +161,9 @@ def test_teardown_forces_destroy_when_api_fails(monkeypatch) -> None:
     assert destroy_calls == ["synmon-z"]  # domain was destroyed
     from apps.lifecycle.models import Vm
 
-    assert Vm.objects.get(vm_id="synmon-z").state == VmState.DESTROYED  # no leak
+    row = Vm.objects.get(vm_id="synmon-z")
+    assert row.state == VmState.DESTROYED  # no leak
+    assert row.power_state == "off" and row.power_state_at is not None
 
 
 # ── the whole state machine ALWAYS tears down ─────────────────────────
@@ -434,3 +436,158 @@ def test_force_destroy_tombstones_once_the_kek_is_gone(
 
     assert "crypto-erased" in detail
     assert Vm.objects.get(vm_id="synmon-y").state == VmState.DESTROYED
+
+
+def _synmon_vm(vm_id: str) -> None:
+    from apps.lifecycle.models import Vm, VmState
+
+    Vm.objects.filter(vm_id=vm_id).delete()
+    Vm.objects.create(vm_id=vm_id, tenant_id="t", state=VmState.ACTIVE, host="m1", generation=1)
+
+
+@pytest.mark.django_db
+def test_force_destroy_revokes_the_netbird_peer_after_the_erase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tenant peers are persistent: the forced teardown bypasses the §24 job
+    (which revokes), so it must revoke itself — after the erase."""
+    from apps.orchestration import effects
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_vm("synmon-nb")
+    order: list[str] = []
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", lambda _vm: order.append("erase"))
+    monkeypatch.setattr(effects, "revoke_netbird", lambda vm: order.append(f"revoke:{vm.vm_id}"))
+    monkeypatch.setattr(effects, "dispatch_destroy", lambda _vm: None)
+
+    detail = e2e_mod._force_destroy("synmon-nb")
+
+    assert order == ["erase", "revoke:synmon-nb"]
+    assert "netbird-revoked" in detail
+
+
+@pytest.mark.django_db
+def test_force_destroy_keeps_the_peer_when_the_erase_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.orchestration import effects
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_vm("synmon-nb2")
+
+    def boom(_vm: object) -> None:
+        raise RuntimeError("vault unreachable")
+
+    revoked: list[str] = []
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", boom)
+    monkeypatch.setattr(effects, "revoke_netbird", lambda vm: revoked.append(vm.vm_id))
+    monkeypatch.setattr(effects, "dispatch_destroy", lambda _vm: None)
+
+    e2e_mod._force_destroy("synmon-nb2")
+
+    assert revoked == []
+
+
+@pytest.mark.django_db
+def test_a_failed_forced_revoke_still_tombstones(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Best-effort: data death is the erase; the janitor collects the peer."""
+    from apps.lifecycle.models import Vm, VmState
+    from apps.orchestration import effects
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_vm("synmon-nb3")
+
+    def nb_down(_vm: object) -> None:
+        raise effects.EffectUnavailable("netbird down")
+
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", lambda _vm: None)
+    monkeypatch.setattr(effects, "revoke_netbird", nb_down)
+    monkeypatch.setattr(effects, "dispatch_destroy", lambda _vm: None)
+
+    detail = e2e_mod._force_destroy("synmon-nb3")
+
+    assert "netbird-revoke-failed" in detail
+    assert Vm.objects.get(vm_id="synmon-nb3").state == VmState.DESTROYED
+
+
+# ── a forced teardown never leaves a running zombie ──────────────────
+
+
+def _synmon_with_launch(vm_id: str):
+    from apps.lifecycle.models import Vm, VmState
+
+    Vm.objects.filter(vm_id=vm_id).delete()
+    vm = Vm.objects.create(
+        vm_id=vm_id, tenant_id="t", state=VmState.ACTIVE, host="m1", generation=1
+    )
+    _make_synth_launch_job(vm_id, state="queued")
+    return vm
+
+
+@pytest.mark.django_db
+def test_an_undeliverable_destroy_erases_nothing_and_hands_off_to_the_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seen live on two miners: the reaper pod could not reach the Edge;
+    the KEK was erased and the row tombstoned while the domain ran on — a
+    zombie. Now nothing is erased or tombstoned in-process; the tick gets a
+    forced §24 job, which destroys over its own path first."""
+    from apps.lifecycle.models import Vm, VmState
+    from apps.orchestration import effects
+    from apps.orchestration.models import DecommissionJob, DecommissionState
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_with_launch("synmon-z")
+    erased: list[str] = []
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", lambda vm: erased.append(vm.vm_id))
+
+    def unreachable(_vm: object) -> None:
+        raise effects.EffectUnavailable("edge-order: peer unreachable")
+
+    monkeypatch.setattr(effects, "dispatch_destroy", unreachable)
+
+    detail = e2e_mod._force_destroy("synmon-z")
+
+    assert erased == [], "no erase before the domain is proven stopped"
+    assert "handed-to-tick" in detail
+    assert Vm.objects.get(vm_id="synmon-z").state == VmState.DECOMMISSIONING
+    job = DecommissionJob.objects.get(vm__vm_id="synmon-z")
+    assert job.state == DecommissionState.CRYPTO_ERASING.value
+    assert job.forced is True
+
+
+@pytest.mark.django_db
+def test_the_next_reap_leaves_the_handed_off_job_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.orchestration import effects
+    from apps.orchestration.models import DecommissionJob
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_with_launch("synmon-z2")
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", lambda vm: None)
+
+    def unreachable(_vm: object) -> None:
+        raise effects.EffectUnavailable("edge-order: peer unreachable")
+
+    monkeypatch.setattr(effects, "dispatch_destroy", unreachable)
+    e2e_mod._force_destroy("synmon-z2")
+    detail = e2e_mod._force_destroy("synmon-z2")
+
+    assert "left-to-in-flight-job" in detail
+    assert DecommissionJob.objects.filter(vm__vm_id="synmon-z2").count() == 1
+
+
+@pytest.mark.django_db
+def test_the_destroy_goes_out_before_the_erase(monkeypatch: pytest.MonkeyPatch) -> None:
+    from apps.orchestration import effects
+    from apps.synthetic import e2e as e2e_mod
+
+    _synmon_with_launch("synmon-z3")
+    order: list[str] = []
+    monkeypatch.setattr(effects, "dispatch_destroy", lambda vm: order.append("destroy"))
+    monkeypatch.setattr(effects, "crypto_erase_kek_transit", lambda vm: order.append("erase"))
+    monkeypatch.setattr(effects, "revoke_netbird", lambda vm: order.append("revoke"))
+
+    e2e_mod._force_destroy("synmon-z3")
+    assert order[0] == "destroy"

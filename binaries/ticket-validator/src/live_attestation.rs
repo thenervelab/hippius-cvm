@@ -107,6 +107,35 @@ struct LiveAttestationBody {
     signer_pubkey_hex: String,
     chain_genesis_hex: String,
     pallet_instance_hex: String,
+    /// v2 only (`null` on v1): the guest the KBS bound this `vm_id` to —
+    /// `"release"` (recorded at the §20 release) or `"first-use"` (no
+    /// release on record, e.g. after a KBS restart; never proof).
+    binding_source: Option<&'static str>,
+    /// v2 only: the bound guest's SNP `CHIP_ID` (64 bytes, hex).
+    chip_id_hex: Option<String>,
+    /// v2 only: the bound guest's SNP `REPORT_ID` (32 bytes, hex) —
+    /// PSP-assigned per guest launch.
+    report_id_hex: Option<String>,
+    /// v3 only (`null` on v1/v2): the vCPUs the guest attested online.
+    vcpus_online: Option<u32>,
+    /// v3 only: the `System RAM` of the guest's firmware memory map, KiB
+    /// (`0` when its kernel exposes no firmware map).
+    mem_firmware_kib: Option<u64>,
+    /// v3 only: the guest's `MemTotal`, KiB.
+    mem_total_kib: Option<u64>,
+    /// v3 only: the guest's `Unaccepted` (not yet PVALIDATEd) RAM, KiB.
+    mem_unaccepted_kib: Option<u64>,
+    /// v4 only (`null` on v1–v3): the guest components release the guest
+    /// attested it booted.
+    components_release_version: Option<u32>,
+    /// v4 only: that release's security epoch.
+    components_security_epoch: Option<u32>,
+    /// v4 only: the `components_health` bitmap of its agents' checks.
+    components_health: Option<u32>,
+    /// v4 only: the keepalive process's random instance id.
+    components_instance: Option<u32>,
+    /// v4 only: that process's ticks that found a check failing.
+    components_unhealthy_ticks: Option<u32>,
     /// SHA-256 of the signed canonical body — the same value the KBS
     /// puts in the NEXT attestation's `prev_attestation_hash`. vali
     /// stores it as a second (byte-exact) replay-dedupe axis.
@@ -213,6 +242,18 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<LiveAttestationBody, &'static
         signer_pubkey_hex: hex::encode(att.signer_pubkey),
         chain_genesis_hex: hex::encode(att.chain_genesis),
         pallet_instance_hex: hex::encode(att.pallet_instance),
+        binding_source: att.guest.map(|g| g.source.as_str()),
+        chip_id_hex: att.guest.map(|g| hex::encode(g.chip_id)),
+        report_id_hex: att.guest.map(|g| hex::encode(g.report_id)),
+        vcpus_online: att.resources.map(|r| r.vcpus_online),
+        mem_firmware_kib: att.resources.map(|r| r.mem_firmware_kib),
+        mem_total_kib: att.resources.map(|r| r.mem_total_kib),
+        mem_unaccepted_kib: att.resources.map(|r| r.mem_unaccepted_kib),
+        components_release_version: att.components.map(|c| c.release_version),
+        components_security_epoch: att.components.map(|c| c.security_epoch),
+        components_health: att.components.map(|c| c.health),
+        components_instance: att.components.map(|c| c.instance),
+        components_unhealthy_ticks: att.components.map(|c| c.unhealthy_ticks),
     })
 }
 
@@ -237,11 +278,15 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use hippius_types::live_attestation::{
-        DIGEST_LEN, LIVE_ATTESTATION_SCHEMA_VERSION, MEASUREMENT_LEN, PUBKEY_LEN,
+        BindingSource, GuestBinding, GuestComponents, GuestResources, CHIP_ID_LEN, DIGEST_LEN,
+        LIVE_ATTESTATION_SCHEMA_VERSION, LIVE_ATTESTATION_SCHEMA_VERSION_BOUND,
+        LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS, LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES,
+        MEASUREMENT_LEN, PUBKEY_LEN, REPORT_ID_LEN,
     };
 
     fn kat(signer: &SigningKey) -> LiveAttestation {
         LiveAttestation {
+            components: None,
             schema_version: LIVE_ATTESTATION_SCHEMA_VERSION,
             chain_genesis: [0xAA; DIGEST_LEN],
             pallet_instance: [0xDD; DIGEST_LEN],
@@ -257,6 +302,8 @@ mod tests {
             prev_attestation_hash: [0x44; DIGEST_LEN],
             expiry_unix: 1_800_000_900,
             signer_pubkey: signer.verifying_key().to_bytes(),
+            guest: None,
+            resources: None,
         }
     }
 
@@ -293,6 +340,110 @@ mod tests {
         // `prev_attestation_hash`. vali dedupes on it.
         let expected: [u8; 32] = Sha256::digest(kat(&sk).canonical().unwrap()).into();
         assert_eq!(body.body_digest_hex, hex::encode(expected));
+    }
+
+    #[test]
+    fn v1_has_no_guest_binding() {
+        let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let body = verify(
+            &signed(kat(&sk).canonical().unwrap(), &sk),
+            &sk.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(body.schema_version, LIVE_ATTESTATION_SCHEMA_VERSION);
+        assert!(body.binding_source.is_none());
+        assert!(body.chip_id_hex.is_none());
+        assert!(body.report_id_hex.is_none());
+    }
+
+    #[test]
+    fn v2_surfaces_the_bound_guest() {
+        let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let mut att = kat(&sk);
+        att.schema_version = LIVE_ATTESTATION_SCHEMA_VERSION_BOUND;
+        att.guest = Some(GuestBinding {
+            chip_id: [0x66; CHIP_ID_LEN],
+            report_id: [0x77; REPORT_ID_LEN],
+            source: BindingSource::Release,
+        });
+        let body = verify(&signed(att.canonical().unwrap(), &sk), &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, LIVE_ATTESTATION_SCHEMA_VERSION_BOUND);
+        assert_eq!(body.binding_source, Some("release"));
+        assert_eq!(
+            body.chip_id_hex.as_deref(),
+            Some("66".repeat(CHIP_ID_LEN).as_str())
+        );
+        assert_eq!(
+            body.report_id_hex.as_deref(),
+            Some("77".repeat(REPORT_ID_LEN).as_str())
+        );
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["binding_source"], "release");
+    }
+
+    #[test]
+    fn v3_surfaces_the_attested_resources() {
+        let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let mut att = kat(&sk);
+        att.schema_version = LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES;
+        att.resources = Some(GuestResources {
+            vcpus_online: 4,
+            mem_firmware_kib: 16_776_164,
+            mem_total_kib: 15_337_812,
+            mem_unaccepted_kib: 0,
+        });
+        let body = verify(&signed(att.canonical().unwrap(), &sk), &sk.verifying_key()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["vcpus_online"], 4);
+        assert_eq!(json["mem_firmware_kib"], 16_776_164);
+        assert_eq!(json["mem_total_kib"], 15_337_812);
+        assert_eq!(json["mem_unaccepted_kib"], 0);
+        // Unbound (binding mode off): the binding stays null.
+        assert!(json["binding_source"].is_null());
+    }
+
+    #[test]
+    fn v4_surfaces_the_attested_components() {
+        let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let mut att = kat(&sk);
+        att.schema_version = LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS;
+        att.components = Some(GuestComponents {
+            release_version: 2,
+            security_epoch: 1,
+            health: 0b1111,
+            instance: 7,
+            unhealthy_ticks: 1,
+        });
+        let body = verify(&signed(att.canonical().unwrap(), &sk), &sk.verifying_key()).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["components_release_version"], 2);
+        assert_eq!(json["components_security_epoch"], 1);
+        assert_eq!(json["components_health"], 15);
+        assert_eq!(json["components_instance"], 7);
+        assert_eq!(json["components_unhealthy_ticks"], 1);
+        // Without resources in it, the v3 keys stay null.
+        assert!(json["vcpus_online"].is_null());
+    }
+
+    #[test]
+    fn v1_has_null_resources() {
+        let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let body = verify(
+            &signed(kat(&sk).canonical().unwrap(), &sk),
+            &sk.verifying_key(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        for key in [
+            "vcpus_online",
+            "mem_firmware_kib",
+            "mem_total_kib",
+            "mem_unaccepted_kib",
+        ] {
+            assert!(json[key].is_null(), "{key}");
+        }
     }
 
     #[test]

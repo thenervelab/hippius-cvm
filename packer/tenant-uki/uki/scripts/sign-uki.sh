@@ -2,7 +2,7 @@
 # `sign-uki.sh KEY_PATH CRT_PATH IMAGE_VERSION`
 #
 # Signs ONLY the `tenant-${IMAGE_VERSION}.uki` under /build/output/.
-# Codex review flagged that an earlier `*.uki` glob signed stale
+# Review flagged that an earlier `*.uki` glob signed stale
 # artefacts from previous builds; the explicit version eliminates
 # that.
 #

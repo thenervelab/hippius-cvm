@@ -157,7 +157,7 @@ Usage:
 
 Required:
   --miner-host HOST   SSH destination (ssh(1) form, e.g.
-                      'ubuntu@miner-1.internal' or a Host alias).
+                      'ubuntu@miner-a.internal' or a Host alias).
                       The script SSH'es here with stdin piping a
                       raw-bytes KEK into cryptsetup — sudo without
                       password is required for the target dir.

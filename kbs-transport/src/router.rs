@@ -13,6 +13,9 @@
 //!   anti-rollback reference for the overlay. Guest-facing (NOT the
 //!   admin listener): the caller authenticates with the single-use
 //!   token from a prior release, not a network-ACL identity.
+//! - `POST /v1/kbs/custody/{bind,renew,rekey}` — the guest custody lease
+//!   (`kbs_core::custody`); 404 `custody-disabled` unless the service was
+//!   built with a custody runtime.
 //!
 //! Cross-cutting: a hard request-body cap ([`crate::MAX_REQUEST_BYTES`])
 //! installed as a `tower-http` `RequestBodyLimitLayer` so an attacker
@@ -20,7 +23,8 @@
 //! nonce-issuance rate-limit is enforced inside the handler.
 
 use crate::handlers::{
-    health, host_enroll, issue_nonce, keepalive, release, volume_stamp_confirm, AppState,
+    custody_bind, custody_rekey, custody_renew, health, host_enroll, issue_nonce, keepalive,
+    release, volume_stamp_confirm, AppState,
 };
 use crate::rate_limit::{NonceRateLimiter, RateConfig};
 use crate::service::KbsService;
@@ -68,6 +72,26 @@ const DEFAULT_HOST_ENROLL_RATE: RateConfig = RateConfig {
 const DEFAULT_VOLUME_STAMP_CONFIRM_RATE: RateConfig = RateConfig {
     refill_per_sec: 1_000.0,
     burst: 2_000,
+};
+
+/// Default per-process custody renew + rekey rate. Same ceiling as
+/// release: one renew per custody VM per renew interval (10 min) is far
+/// below it. It sheds a flood before any signature check; the per-VM
+/// budget inside `kbs_core::custody` is charged only after the lease
+/// signature verifies, so junk never drains a guest's own budget. A flood
+/// ABOVE this ceiling starves renews exactly as it would starve releases —
+/// the answer to that is the per-source limit at the edge, with the lease
+/// TTL (24 h) as the time to apply it.
+const DEFAULT_CUSTODY_RATE: RateConfig = RateConfig {
+    refill_per_sec: 1_000.0,
+    burst: 2_000,
+};
+
+/// Default per-process custody BIND rate — rare, and the one custody call
+/// that can reach AMD KDS. Mirrors the host-attestor enroll bucket.
+const DEFAULT_CUSTODY_BIND_RATE: RateConfig = RateConfig {
+    refill_per_sec: 50.0,
+    burst: 100,
 };
 
 /// Build the KBS axum [`Router`] over a shared service. The handler
@@ -128,6 +152,8 @@ where
         volume_stamp_confirm_limiter: Arc::new(NonceRateLimiter::new(
             DEFAULT_VOLUME_STAMP_CONFIRM_RATE,
         )),
+        custody_limiter: Arc::new(NonceRateLimiter::new(DEFAULT_CUSTODY_RATE)),
+        custody_bind_limiter: Arc::new(NonceRateLimiter::new(DEFAULT_CUSTODY_BIND_RATE)),
     };
     // `SetResponseHeaderLayer::overriding` ensures `Cache-Control:
     // no-store` lands on EVERY response — including the built-in 413
@@ -144,6 +170,9 @@ where
             "/v1/kbs/volume-stamp/confirm",
             post(volume_stamp_confirm::<S>),
         )
+        .route("/v1/kbs/custody/bind", post(custody_bind::<S>))
+        .route("/v1/kbs/custody/renew", post(custody_renew::<S>))
+        .route("/v1/kbs/custody/rekey", post(custody_rekey::<S>))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,

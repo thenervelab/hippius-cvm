@@ -144,7 +144,7 @@ spec:
           # A VM that HAS produced SNP live attestations has stopped, while
           # still bound + billable. That is "running and earning nothing".
           #
-          # This is the signal the 2026-08-13 gateproof-a incident did not
+          # This is the signal a 2026-08-13 production incident did not
           # have: a KBS restart reseeded the per-VM attestation sequence,
           # vali mistook every post-restart attestation for a replay of the
           # old sequence, and dropped 3.7h of a live tenant's uptime while
@@ -171,6 +171,47 @@ spec:
               accruing ZERO right now. Check the vali logs for
               `live-attestation chain RESET/FORK` and `chain conflict`, the
               miner-agent vsock relay, and the KBS keepalive path.
+    # ── a VM running with less than its flavor ─────────────────────────
+    # SEV-SNP measures the vCPU count but not the RAM. A guest launched
+    # with hippius.attest_resources=1 attests both inside its KBS-signed
+    # live attestation; vali flags a VM whose figures fall below its
+    # flavor (apps/telemetry/guest_resources.py). Own CRITICAL alert, like
+    # the uptime stall: an ack on the light tier must not hide it.
+    - name: hippius-guest-resources
+      interval: 30s
+      rules:
+        - alert: GuestResourceShortfall
+          expr: hippius_synthetic_guest_resource_short_vms > 0
+          for: 15m
+          labels:
+            severity: critical
+            component: guest-resources
+          annotations:
+            summary: "{{`{{ $value }}`}} VM(s) running with less than their flavor"
+            description: |
+              One or more tenant VMs attested fewer vCPUs online or less RAM
+              than their flavor. The figures are bound into the guest's
+              PSP-signed SNP report, so the miner cannot have altered them.
+              Read GuestResourceShortfall (vali admin) and the `alerts` of
+              /v1/operator/fleet: the node, the flavor, the attested
+              figures. With hippius_synthetic_guest_resources_enforced == 1
+              the miner is earning nothing for those VMs.
+        - alert: GuestResourcesUnprovenUnderEnforce
+          # ENFORCE pays only VMs whose latest sample proves their size. A
+          # live VM that does not (launched before the attestation was on,
+          # or on an image that cannot attest) runs and earns NOTHING.
+          expr: hippius_synthetic_guest_resources_unproven_vms > 0 and on() hippius_synthetic_guest_resources_enforced == 1
+          for: 30m
+          labels:
+            severity: critical
+            component: guest-resources
+          annotations:
+            summary: "{{`{{ $value }}`}} live VM(s) not proving their size under ENFORCE"
+            description: |
+              VALI_GUEST_RESOURCES_ENFORCE is armed and live VMs attest no
+              `ok` resources: their uptime is credited ZERO. Relaunch them on
+              a current golden image (the measured cmdline then carries
+              hippius.attest_resources=1), or disarm ENFORCE.
     # ── the KBS ConfigMap is not the KBS config ───────────────────────
     # `Config::load` runs ONCE at kbs-server start and the KBS Deployment
     # carries no `checksum/config` annotation — correctly, since rolling
@@ -178,7 +219,7 @@ spec:
     # The cost is that an edited ConfigMap can sit next to a process that
     # never read it, indefinitely, while ArgoCD reports Synced + Healthy.
     # On 2026-08-13 the suppressed-confirm anti-rollback gate was armed
-    # (0 → 3), merged and synced, and the 152-minute-old process was still
+    # (0 → 3), merged and synced, and the already-running process was still
     # running with the gate DISABLED. `check_kbs_config_drift` asks the
     # RUNNING process every ~15 min; these two rules split its answer.
     - name: hippius-kbs-config-drift

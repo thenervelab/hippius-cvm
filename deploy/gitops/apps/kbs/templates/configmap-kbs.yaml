@@ -46,6 +46,14 @@ data:
     # deny_unknown_fields structs reject at startup (pod crashloop).
     require_wrapped_kek = true
     {{- end }}
+    {{- if .Values.config.requireWrappedUserdata }}
+    # §6 — refuse to release a userdata that is not Transit-wrapped at rest
+    # (the userdata counterpart of `require_wrapped_kek`). Leave OFF until
+    # no VM whose cloud-init was staged before the wrapping landed can
+    # still boot — such a VM holds plaintext and would be refused. Same
+    # top-level-key placement rule as above.
+    require_wrapped_userdata = true
+    {{- end }}
     [listen]
     addr = "0.0.0.0:{{ .Values.config.listenPort }}"
 
@@ -153,6 +161,22 @@ data:
     [live_attestation]
     compute_chain_genesis_hex = "{{ required "config.liveAttestation.computeChainGenesisHex must be set" .Values.config.liveAttestation.computeChainGenesisHex }}"
     compute_pallet_instance_hex = "{{ required "config.liveAttestation.computePalletInstanceHex must be set" .Values.config.liveAttestation.computePalletInstanceHex }}"
+    {{- /* Rendered only when enabled: the KBS image before #1281 refuses the
+         key (deny_unknown_fields), and `off` is the binary default. */}}
+    {{- $binding := .Values.config.liveAttestation.keepaliveBinding | default "off" }}
+    {{- if ne $binding "off" }}
+    keepalive_binding = "{{ $binding }}"
+    {{- end }}
+    {{- /* [rollback] — the authorized rollback (A2). Rendered ONLY when
+         config.rollback is set: a KBS image that predates the section
+         refuses it (deny_unknown_fields), and absent means the compiled
+         defaults (min_interval_s 1800, max_ttl_s 3600). */}}
+    {{- with .Values.config.rollback }}
+
+    [rollback]
+    min_interval_s = {{ required "config.rollback.minIntervalS must be set when config.rollback is" .minIntervalS }}
+    max_ttl_s = {{ required "config.rollback.maxTtlS must be set when config.rollback is" .maxTtlS }}
+    {{- end }}
     {{- range $k := .Values.l1Keys }}
 
     [[l1_keys]]

@@ -99,6 +99,10 @@ class JobSpec:
     # --disk-mode` + the golden upload/finalize branch. Defaults to
     # `legacy_luks` so a pre-golden JobSpec renders a byte-identical env.
     disk_mode: str = "legacy_luks"
+    # F6 package-refresh stamp (`TenantBake.package_refresh`). Rendered as
+    # BAKE_PACKAGE_REFRESH only when non-empty, so every other bake renders
+    # a byte-identical env.
+    package_refresh: str = ""
 
     # Vault `jwt` auth (M-k8sauth, #94). Defaulted so an empty role keeps
     # the pre-migration static-token behaviour and no existing caller has
@@ -229,6 +233,10 @@ def render_job(spec: JobSpec) -> dict[str, Any]:
         {"name": "AWS_ENDPOINT_URL", "value": spec.s3_endpoint_url},
         {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
     ]
+    if spec.package_refresh:
+        container_env.append(
+            {"name": "BAKE_PACKAGE_REFRESH", "value": spec.package_refresh}
+        )
 
     # Vault `jwt` auth (M-k8sauth, #94) — the Job exchanges its projected
     # ServiceAccount token for a short Vault token on the `tenant-baker`
@@ -412,6 +420,7 @@ def spec_from_settings(bake: TenantBake) -> JobSpec:
         s3_output_bucket=bake.s3_output_bucket,
         s3_output_prefix=bake.s3_output_prefix,
         disk_mode=bake.disk_mode,
+        package_refresh=bake.package_refresh,
         namespace=getattr(settings, "VALI_TENANT_BAKE_NAMESPACE", "vali"),
         image=getattr(
             settings,

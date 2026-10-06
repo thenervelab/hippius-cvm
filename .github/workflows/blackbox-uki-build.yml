@@ -44,6 +44,9 @@ permissions:
 
 jobs:
   blackbox-uki-build:
+    # Stays GitHub-hosted: a measured-boot artifact whose main-branch publish
+    # leans on ubuntu-latest's preinstalled rustup/AWS CLI, a path a PR run
+    # cannot exercise on another runner.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

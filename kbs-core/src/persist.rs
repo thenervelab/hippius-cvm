@@ -9,7 +9,7 @@
 //! Tier-0 storage backend — §22 high-water principle: anything safety-
 //! critical lives in tamper-safe Tier-0, never on the vali FS).
 //!
-//! Atomicity contract: every write goes through [`atomic_write`] — a
+//! Atomicity contract: every write goes through [`atomic_write_published`] — a
 //! `temp file in the same dir → fsync → rename` sequence. POSIX
 //! guarantees that `rename` is atomic on the same filesystem (the
 //! kernel publishes the new inode at the destination path in one step;
@@ -21,8 +21,9 @@
 use crate::error::{KbsError, Result};
 use crate::lifecycle::{VmState, VmStateStore};
 use crate::replay::{ReleaseKey, ReleaseStore};
+use hippius_types::guardian::KeyMode;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -65,6 +66,10 @@ fn fresh_temp_name(target: &Path) -> String {
 /// `fsync` of a directory is required after rename/link to guarantee
 /// the new entry survives a crash.
 fn fsync_dir(parent: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_FSYNC.with(|f| f.get()) {
+        return Err(KbsError::Vault("dir fsync: injected failure".into()));
+    }
     let dir =
         File::open(parent).map_err(|e| KbsError::Vault(format!("open dir for fsync: {e}")))?;
     dir.sync_all()
@@ -76,7 +81,25 @@ fn fsync_dir(parent: &Path) -> Result<()> {
 /// NOT safe for fail-on-exists markers (see [`atomic_create_new`]).
 /// The temp file is removed via a drop guard if any step before rename
 /// fails. Same-filesystem `rename` is atomic on POSIX.
+#[cfg(test)]
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_published(path, bytes)?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: make [`fsync_dir`] fail on this thread,
+    /// i.e. AFTER a rename has already published the new file.
+    static FAIL_DIR_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Atomic overwrite of `path`, telling the two failure classes apart. The outer
+/// `Err` means nothing was published — `path` still holds the previous
+/// bytes. `Ok(Err(_))` means the rename DID publish the new bytes and only
+/// the directory fsync that makes the rename crash-durable failed: the
+/// file on disk is already the new one, so an in-memory cache of it must
+/// follow (see [`FileVmStateStore::cas`]).
+pub(crate) fn atomic_write_published(path: &Path, bytes: &[u8]) -> Result<Result<()>> {
     let parent = path
         .parent()
         .ok_or_else(|| KbsError::Vault("path has no parent".into()))?;
@@ -96,8 +119,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     fs::rename(&tmp, path).map_err(|e| KbsError::Vault(format!("rename: {e}")))?;
     guard.disarm();
-    fsync_dir(parent)?;
-    Ok(())
+    Ok(fsync_dir(parent))
 }
 
 /// Atomic *exclusive create* of `path` (`O_CREAT|O_EXCL`) followed by
@@ -212,9 +234,64 @@ impl ReleaseStore for FileReleaseStore {
 /// expected per KBS instance). The KBS reads (`get`); production
 /// writers (vali orchestration) use [`put`] / [`cas`] for state
 /// transitions (§24/§25). The trait `VmStateStore` exposes only `get`.
+///
+/// ## Key modes live in a sibling file
+///
+/// The customer-held-keys mode pinned at register (`split`/`customer`)
+/// is kept in `<stem>-keymode.json` next to the snapshot, NOT as a new
+/// field of the rows above. Same reasoning as the boot-counter resync
+/// arms (`crate::boot_counter`): widening the persisted row would give a
+/// KBS binary ROLLBACK a file it may not open, or — worse, since
+/// `VmStateWire` tolerates unknown keys — one it opens and then rewrites
+/// WITHOUT the mode on its next write, silently turning an M2 VM back
+/// into M0 once the rollback is itself rolled forward. With a sibling
+/// file the snapshot stays byte-identical to what every earlier binary
+/// writes, an older binary never touches the modes, and an M0-only store
+/// has no sibling file at all. Only non-`hippius` modes are written:
+/// absent ⇒ `hippius`, so every VM that predates the feature is M0 with
+/// no migration.
+///
+/// The current-launch bindings (`crate::lifecycle::LaunchBinding`) live in
+/// `<stem>-launch.json`, a sibling for the same reason: an older binary
+/// never reads or rewrites them.
+///
+/// Lock order: `cache` before `key_modes` before `launches`, everywhere.
 pub struct FileVmStateStore {
     path: PathBuf,
     cache: Mutex<HashMap<String, VmState>>,
+    key_mode_path: PathBuf,
+    key_modes: Mutex<BTreeMap<String, KeyMode>>,
+    launch_path: PathBuf,
+    launches: Mutex<BTreeMap<String, LaunchBindingWire>>,
+}
+
+/// On-disk form of a [`crate::lifecycle::LaunchBinding`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchBindingWire {
+    measurement_hex: String,
+    issue_time: u64,
+}
+
+impl LaunchBindingWire {
+    fn from_binding(b: crate::lifecycle::LaunchBinding) -> Self {
+        Self {
+            measurement_hex: hex::encode(b.measurement),
+            issue_time: b.issue_time,
+        }
+    }
+
+    fn to_binding(&self) -> Result<crate::lifecycle::LaunchBinding> {
+        let bytes = hex::decode(&self.measurement_hex)
+            .map_err(|e| KbsError::Vault(format!("vm-states launch measurement: {e}")))?;
+        let measurement: [u8; 48] = bytes
+            .try_into()
+            .map_err(|_| KbsError::Vault("vm-states launch measurement is not 48 bytes".into()))?;
+        Ok(crate::lifecycle::LaunchBinding {
+            measurement,
+            issue_time: self.issue_time,
+        })
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -311,20 +388,188 @@ impl FileVmStateStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(KbsError::Vault(format!("vm-states read: {e}"))),
         };
+        let key_mode_path = Self::key_mode_path_for(&path);
+        let key_modes = match fs::read(&key_mode_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| KbsError::Vault(format!("vm-states key-mode decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(KbsError::Vault(format!("vm-states key-mode read: {e}"))),
+        };
+        let launch_path = Self::sibling_path(&path, "launch");
+        let launches = match fs::read(&launch_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| KbsError::Vault(format!("vm-states launch decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(KbsError::Vault(format!("vm-states launch read: {e}"))),
+        };
         Ok(Self {
             path,
             cache: Mutex::new(cache),
+            key_mode_path,
+            key_modes: Mutex::new(key_modes),
+            launch_path,
+            launches: Mutex::new(launches),
         })
     }
 
-    fn persist(&self, map: &HashMap<String, VmState>) -> Result<()> {
+    fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vm-states".into());
+        let sibling = format!("{stem}-{suffix}.json");
+        match path.parent() {
+            Some(dir) => dir.join(sibling),
+            None => PathBuf::from(sibling),
+        }
+    }
+
+    /// Record `binding` as `vm_id`'s current launch (durable before it
+    /// returns). With `only_if_later`, a binding of another measurement is
+    /// moved only by a strictly newer ticket — what a register applies
+    /// (a register of an older ticket never rewinds the VM's launch).
+    pub fn write_launch_binding(
+        &self,
+        vm_id: &str,
+        binding: crate::lifecycle::LaunchBinding,
+        only_if_later: bool,
+    ) -> Result<()> {
+        let mut g = self
+            .launches
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states launch lock poisoned".into()))?;
+        let wire = LaunchBindingWire::from_binding(binding);
+        if let Some(cur) = g.get(vm_id) {
+            if *cur == wire {
+                return Ok(());
+            }
+            if only_if_later
+                && (cur.measurement_hex == wire.measurement_hex
+                    || wire.issue_time <= cur.issue_time)
+            {
+                return Ok(());
+            }
+        }
+        let mut staged = g.clone();
+        staged.insert(vm_id.to_string(), wire);
+        let bytes = serde_json::to_vec(&staged)
+            .map_err(|e| KbsError::Vault(format!("vm-states launch encode: {e}")))?;
+        let synced = atomic_write_published(&self.launch_path, &bytes)?;
+        *g = staged;
+        synced
+    }
+
+    /// Sibling path holding the key modes: `vm-states.json` ⇒
+    /// `vm-states-keymode.json`, in the same directory (so the same
+    /// encrypted state volume and the same wipe-on-restart lifetime).
+    fn key_mode_path_for(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vm-states".into());
+        let sibling = format!("{stem}-keymode.json");
+        match path.parent() {
+            Some(dir) => dir.join(sibling),
+            None => PathBuf::from(sibling),
+        }
+    }
+
+    /// Atomically register `vm_id` under `key_mode` (the write behind
+    /// `crate::admin::VmStateRegister::register`).
+    ///
+    /// Decided under ONE hold of the store lock, in this order:
+    /// 1. a key mode already pinned for `vm_id` that differs from
+    ///    `key_mode` ⇒ [`RegisterOutcome::KeyModeConflict`], nothing
+    ///    written. A VM with a row but no pinned mode is `hippius`; a
+    ///    vm_id with neither has nothing pinned yet. Checked FIRST, so a
+    ///    re-register whose row would otherwise match is still refused
+    ///    when only its mode differs;
+    /// 2. the row already equals `new_state` ⇒ `AlreadyMatching`;
+    /// 3. any other row ⇒ `Conflict(current)`;
+    /// 4. no row ⇒ pin the mode (sibling file, skipped for `hippius`),
+    ///    THEN publish the row ⇒ `Inserted`.
+    ///
+    /// Mode before row, never the reverse: a crash between the two leaves
+    /// a pinned mode with no row, which a retry of the same ticket
+    /// completes. Row-first would leave an M2 VM whose row reads as
+    /// `hippius` — every release denied as a mode mismatch AND every
+    /// re-register refused as a mode change, with no way out.
+    pub fn register_keyed(
+        &self,
+        vm_id: &str,
+        new_state: VmState,
+        key_mode: KeyMode,
+    ) -> Result<crate::admin::RegisterOutcome> {
+        use crate::admin::RegisterOutcome;
+        let mut g = self
+            .cache
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states lock poisoned".into()))?;
+        let mut modes = self
+            .key_modes
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states key-mode lock poisoned".into()))?;
+        let current = g.get(vm_id);
+        let recorded = modes
+            .get(vm_id)
+            .copied()
+            .or_else(|| current.map(|_| KeyMode::Hippius));
+        if let Some(recorded) = recorded {
+            if recorded != key_mode {
+                return Ok(RegisterOutcome::KeyModeConflict { recorded });
+            }
+        }
+        match current {
+            Some(cur) if *cur == new_state => return Ok(RegisterOutcome::AlreadyMatching),
+            Some(cur) => return Ok(RegisterOutcome::Conflict(cur.clone())),
+            None => {}
+        }
+        if key_mode != KeyMode::Hippius && !modes.contains_key(vm_id) {
+            let mut staged = modes.clone();
+            staged.insert(vm_id.to_string(), key_mode);
+            let bytes = serde_json::to_vec(&staged)
+                .map_err(|e| KbsError::Vault(format!("vm-states key-mode encode: {e}")))?;
+            let synced = atomic_write_published(&self.key_mode_path, &bytes)?;
+            // Published ⇒ the in-memory view follows the file even when
+            // only the dir fsync failed (same rule as `publish`).
+            *modes = staged;
+            synced?;
+        }
+        let mut staged = g.clone();
+        staged.insert(vm_id.to_string(), new_state);
+        self.publish(&mut g, staged)?;
+        Ok(RegisterOutcome::Inserted)
+    }
+
+    /// Outer `Err` = nothing published; `Ok(Err)` = published, dir fsync
+    /// failed (see [`atomic_write_published`]).
+    fn persist(&self, map: &HashMap<String, VmState>) -> Result<Result<()>> {
         let wire: HashMap<String, VmStateWire> = map
             .iter()
             .map(|(k, v)| (k.clone(), v.clone().into()))
             .collect();
         let bytes = serde_json::to_vec(&wire)
             .map_err(|e| KbsError::Vault(format!("vm-states encode: {e}")))?;
-        atomic_write(&self.path, &bytes)
+        atomic_write_published(&self.path, &bytes)
+    }
+
+    /// Publish `staged` and make the cache follow what is ON DISK.
+    ///
+    /// Nothing published ⇒ the cache is untouched and the error returns.
+    /// Published but the directory fsync failed ⇒ the file already holds
+    /// `staged`, so the cache takes it too before the error returns.
+    /// Leaving the cache behind the file there was the dangerous case: a
+    /// §24 fence that reached the disk kept releasing from a cached
+    /// `Active`, and the next CAS rewrote the whole snapshot from that
+    /// stale cache — silently dropping the fence.
+    fn publish(
+        &self,
+        cache: &mut HashMap<String, VmState>,
+        staged: HashMap<String, VmState>,
+    ) -> Result<()> {
+        let synced = self.persist(&staged)?;
+        *cache = staged;
+        synced
     }
 
     /// Writer-side: set `vm_id`'s state unconditionally. Use only when
@@ -335,15 +580,13 @@ impl FileVmStateStore {
             .cache
             .lock()
             .map_err(|_| KbsError::Lifecycle("vm-states lock poisoned".into()))?;
-        // Stage-then-swap: persist the candidate FIRST. If persist fails,
-        // the in-memory cache is left untouched so `get` cannot observe an
-        // uncommitted state — `process_release` must never accept a
-        // lifecycle transition that wasn't durably written.
+        // Stage-then-swap: persist the candidate FIRST. If nothing was
+        // published, the in-memory cache is left untouched so `get` cannot
+        // observe a state that is not on disk; once the rename published
+        // it, the cache follows the file (see `publish`).
         let mut staged = g.clone();
         staged.insert(vm_id.to_string(), state);
-        self.persist(&staged)?;
-        *g = staged;
-        Ok(())
+        self.publish(&mut g, staged)
     }
 
     /// Atomic compare-and-set on `vm_id`'s state (the only safe primitive
@@ -367,9 +610,19 @@ impl FileVmStateStore {
         }
         let mut staged = g.clone();
         staged.insert(vm_id.to_string(), new_state);
-        self.persist(&staged)?;
-        *g = staged;
-        Ok(())
+        self.publish(&mut g, staged)
+    }
+}
+
+impl FileVmStateStore {
+    /// The current row for `vm_id`, `None` when absent (unlike
+    /// [`VmStateStore::get`], which reports absence as an error).
+    pub fn lookup(&self, vm_id: &str) -> Result<Option<VmState>> {
+        let g = self
+            .cache
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states lock poisoned".into()))?;
+        Ok(g.get(vm_id).cloned())
     }
 }
 
@@ -382,6 +635,54 @@ impl VmStateStore for FileVmStateStore {
         g.get(vm_id)
             .cloned()
             .ok_or_else(|| KbsError::Lifecycle(format!("no state for vm_id={vm_id}")))
+    }
+
+    fn key_mode(&self, vm_id: &str) -> Result<KeyMode> {
+        let modes = self
+            .key_modes
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states key-mode lock poisoned".into()))?;
+        Ok(modes.get(vm_id).copied().unwrap_or(KeyMode::Hippius))
+    }
+
+    fn launch_binding(&self, vm_id: &str) -> Result<Option<crate::lifecycle::LaunchBinding>> {
+        let g = self
+            .launches
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states launch lock poisoned".into()))?;
+        g.get(vm_id).map(LaunchBindingWire::to_binding).transpose()
+    }
+
+    fn bind_launch(&self, vm_id: &str, binding: crate::lifecycle::LaunchBinding) -> Result<()> {
+        self.write_launch_binding(vm_id, binding, false)
+    }
+
+    fn admit_launch(
+        &self,
+        vm_id: &str,
+        measurement: &[u8; 48],
+        ticket_issue_time: u64,
+    ) -> Result<()> {
+        let mut g = self
+            .launches
+            .lock()
+            .map_err(|_| KbsError::Lifecycle("vm-states launch lock poisoned".into()))?;
+        let recorded = g
+            .get(vm_id)
+            .map(LaunchBindingWire::to_binding)
+            .transpose()?;
+        let Some(binding) =
+            crate::lifecycle::check_current_launch(recorded, measurement, ticket_issue_time)?
+        else {
+            return Ok(());
+        };
+        let mut staged = g.clone();
+        staged.insert(vm_id.to_string(), LaunchBindingWire::from_binding(binding));
+        let bytes = serde_json::to_vec(&staged)
+            .map_err(|e| KbsError::Vault(format!("vm-states launch encode: {e}")))?;
+        let synced = atomic_write_published(&self.launch_path, &bytes)?;
+        *g = staged;
+        synced
     }
 }
 
@@ -406,6 +707,13 @@ pub trait KbsNonceStore {
     /// FIRST so a racing verifier sees "unknown nonce" → Replay.
     fn gc_expired(&self, _now_unix: u64) -> Result<usize> {
         Ok(0)
+    }
+    /// When `nonce` was issued (unix seconds), `None` when the store does
+    /// not know. A schema-v4 live attestation states it as its
+    /// `observed_at_unix`: the report that folds the nonce was taken after
+    /// it, whatever the relay delayed.
+    fn issued_at_unix(&self, _nonce: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 
@@ -577,6 +885,10 @@ impl KbsNonceStore for FileKbsNonceStore {
     fn gc_expired(&self, now_unix: u64) -> Result<usize> {
         FileKbsNonceStore::gc_expired(self, now_unix)
     }
+
+    fn issued_at_unix(&self, nonce: &[u8; 32]) -> Result<Option<u64>> {
+        self.issued_at(nonce)
+    }
 }
 
 // =================== Idempotency-key store (§14) ====================
@@ -736,6 +1048,240 @@ mod tests {
             ticket_id: ticket.into(),
             nonce: vec![nonce; 32],
         }
+    }
+
+    #[test]
+    fn a_published_vm_state_whose_dir_fsync_fails_is_what_the_cache_serves() {
+        // CLAIM: once the rename published a transition, `get` serves it
+        // even though the write reports an error — the cache never lags
+        // the file (a lagging cache kept releasing a fenced VM and the
+        // next CAS rewrote the snapshot without the fence).
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        let s = FileVmStateStore::open(&path).unwrap();
+        s.put(
+            "vm-1",
+            VmState::Active {
+                gen: 1,
+                host: "n".into(),
+                lease_id: "l".into(),
+            },
+        )
+        .unwrap();
+        FAIL_DIR_FSYNC.with(|f| f.set(true));
+        let r = s.cas("vm-1", |_| true, VmState::Decommissioning);
+        FAIL_DIR_FSYNC.with(|f| f.set(false));
+        assert!(r.is_err(), "the unconfirmed durability is still reported");
+        assert_eq!(s.get("vm-1").unwrap(), VmState::Decommissioning);
+        assert_eq!(
+            FileVmStateStore::open(&path).unwrap().get("vm-1").unwrap(),
+            VmState::Decommissioning,
+            "…and it is what the file holds"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_vm_state_leaves_the_cache_untouched() {
+        // The other half: a write that never reached the rename changes
+        // nothing a release can see.
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("sub").join("vm-states.json");
+        let s = FileVmStateStore::open(&path).unwrap();
+        // A regular FILE where the parent directory should be ⇒ the temp
+        // file cannot be created ⇒ nothing is published.
+        std::fs::write(td.path().join("sub"), b"x").unwrap();
+        assert!(s.put("vm-1", VmState::Decommissioning).is_err());
+        assert!(s.get("vm-1").is_err());
+    }
+
+    // ── customer-held keys: the key-mode sibling file ────────────────
+
+    fn active(gen: u64) -> VmState {
+        VmState::Active {
+            gen,
+            host: "chip".into(),
+            lease_id: "lease".into(),
+        }
+    }
+
+    /// The vm-states snapshot as a binary built BEFORE key modes decodes
+    /// it: `VmStateWire` is that schema, unchanged by this feature.
+    fn decode_as_pre_key_mode_binary(path: &Path) -> HashMap<String, VmState> {
+        let wire: HashMap<String, VmStateWire> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        wire.into_iter().map(|(k, v)| (k, v.into())).collect()
+    }
+
+    #[test]
+    fn an_m0_only_store_is_byte_identical_and_has_no_sibling_file() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        let s = FileVmStateStore::open(&path).unwrap();
+        s.register_keyed("vm-0", active(1), KeyMode::Hippius)
+            .unwrap();
+        assert!(!td.path().join("vm-states-keymode.json").exists());
+        // Exactly the bytes `put` (the pre-key-mode writer) produces.
+        let reference = TempDir::new().unwrap();
+        let rpath = reference.path().join("vm-states.json");
+        FileVmStateStore::open(&rpath)
+            .unwrap()
+            .put("vm-0", active(1))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&rpath).unwrap()
+        );
+        assert_eq!(s.key_mode("vm-0").unwrap(), KeyMode::Hippius);
+    }
+
+    #[test]
+    fn a_key_mode_lives_only_in_the_sibling_and_survives_a_reopen() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        {
+            let s = FileVmStateStore::open(&path).unwrap();
+            s.register_keyed("vm-2", active(1), KeyMode::Customer)
+                .unwrap();
+            s.register_keyed("vm-1", active(1), KeyMode::Split).unwrap();
+            s.register_keyed("vm-0", active(1), KeyMode::Hippius)
+                .unwrap();
+        }
+        // The snapshot carries no trace of the modes.
+        let main = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !main.contains("customer") && !main.contains("split"),
+            "{main}"
+        );
+        assert!(!main.contains("key_mode"), "{main}");
+        // The sibling carries exactly the non-M0 modes.
+        let sib = std::fs::read_to_string(td.path().join("vm-states-keymode.json")).unwrap();
+        assert_eq!(sib, r#"{"vm-1":"split","vm-2":"customer"}"#);
+        let s = FileVmStateStore::open(&path).unwrap();
+        assert_eq!(s.key_mode("vm-2").unwrap(), KeyMode::Customer);
+        assert_eq!(s.key_mode("vm-1").unwrap(), KeyMode::Split);
+        assert_eq!(s.key_mode("vm-0").unwrap(), KeyMode::Hippius);
+        assert_eq!(s.key_mode("never-seen").unwrap(), KeyMode::Hippius);
+    }
+
+    /// Rollback-safety: a KBS binary from before key modes opens the store
+    /// (its schema is untouched), keeps writing it, and never touches the
+    /// sibling — so rolling forward again finds every mode still pinned.
+    #[test]
+    fn a_binary_rollback_opens_the_store_and_a_roll_forward_keeps_the_modes() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        {
+            let s = FileVmStateStore::open(&path).unwrap();
+            s.register_keyed("vm-2", active(1), KeyMode::Customer)
+                .unwrap();
+        }
+        // Rolled back: the old decoder reads the snapshot fine…
+        let old_view = decode_as_pre_key_mode_binary(&path);
+        assert_eq!(old_view.get("vm-2"), Some(&active(1)));
+        // …and the old writer rewrites it (a §24 fence, say) — the only
+        // file an old binary knows.
+        let mut rewritten: HashMap<String, VmStateWire> = HashMap::new();
+        rewritten.insert("vm-2".into(), VmState::Decommissioning.into());
+        std::fs::write(&path, serde_json::to_vec(&rewritten).unwrap()).unwrap();
+        // Rolled forward: the fence the old binary wrote AND the mode.
+        let s = FileVmStateStore::open(&path).unwrap();
+        assert_eq!(s.get("vm-2").unwrap(), VmState::Decommissioning);
+        assert_eq!(s.key_mode("vm-2").unwrap(), KeyMode::Customer);
+    }
+
+    #[test]
+    fn register_keyed_pins_the_mode_first_and_refuses_a_change() {
+        use crate::admin::RegisterOutcome;
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        let s = FileVmStateStore::open(&path).unwrap();
+        assert_eq!(
+            s.register_keyed("vm", active(1), KeyMode::Customer)
+                .unwrap(),
+            RegisterOutcome::Inserted
+        );
+        assert_eq!(
+            s.register_keyed("vm", active(1), KeyMode::Customer)
+                .unwrap(),
+            RegisterOutcome::AlreadyMatching
+        );
+        assert_eq!(
+            s.register_keyed("vm", active(2), KeyMode::Customer)
+                .unwrap(),
+            RegisterOutcome::Conflict(active(1))
+        );
+        // A matching row does not excuse a mode change.
+        for other in [KeyMode::Hippius, KeyMode::Split] {
+            assert_eq!(
+                s.register_keyed("vm", active(1), other).unwrap(),
+                RegisterOutcome::KeyModeConflict {
+                    recorded: KeyMode::Customer
+                }
+            );
+        }
+        assert_eq!(s.key_mode("vm").unwrap(), KeyMode::Customer);
+        // A row written without a mode (every pre-feature VM; a fence on
+        // an absent row) is M0 for this purpose.
+        s.put("legacy", active(1)).unwrap();
+        assert_eq!(
+            s.register_keyed("legacy", active(1), KeyMode::Split)
+                .unwrap(),
+            RegisterOutcome::KeyModeConflict {
+                recorded: KeyMode::Hippius
+            }
+        );
+        assert!(
+            !std::fs::read_to_string(td.path().join("vm-states-keymode.json"))
+                .unwrap()
+                .contains("legacy")
+        );
+    }
+
+    #[test]
+    fn a_pinned_mode_whose_row_never_landed_is_completed_by_a_same_mode_retry() {
+        // Mode is written before the row. If the row publish fails, the
+        // pin stays; the SAME ticket completes the register, and a
+        // different mode is refused (never silently re-pinned).
+        use crate::admin::RegisterOutcome;
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        let s = FileVmStateStore::open(&path).unwrap();
+        // The snapshot's target is a DIRECTORY ⇒ its rename fails, while
+        // the sibling (a different name) publishes.
+        std::fs::create_dir(&path).unwrap();
+        assert!(s
+            .register_keyed("vm", active(1), KeyMode::Customer)
+            .is_err());
+        assert!(s.get("vm").is_err(), "no row was published");
+        assert_eq!(s.key_mode("vm").unwrap(), KeyMode::Customer);
+        assert_eq!(
+            s.register_keyed("vm", active(1), KeyMode::Hippius).unwrap(),
+            RegisterOutcome::KeyModeConflict {
+                recorded: KeyMode::Customer
+            }
+        );
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            s.register_keyed("vm", active(1), KeyMode::Customer)
+                .unwrap(),
+            RegisterOutcome::Inserted
+        );
+        assert_eq!(s.get("vm").unwrap(), active(1));
+    }
+
+    #[test]
+    fn a_corrupt_key_mode_sibling_fails_the_open_loudly() {
+        // Fail closed, like a corrupt snapshot: silently reading it as
+        // "no modes" would turn every M2 VM into M0.
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("vm-states.json");
+        std::fs::write(td.path().join("vm-states-keymode.json"), b"{\"vm\":\"m2\"}").unwrap();
+        assert!(FileVmStateStore::open(&path).is_err());
+        // An unreadable sibling (here: a directory in its place) is not
+        // "absent" either — only NotFound means "no modes pinned".
+        let td2 = TempDir::new().unwrap();
+        std::fs::create_dir(td2.path().join("vm-states-keymode.json")).unwrap();
+        assert!(FileVmStateStore::open(td2.path().join("vm-states.json")).is_err());
     }
 
     #[test]

@@ -18,6 +18,12 @@ so a fixed key + fixed body yields a byte-exact signed envelope.
 |---|---|
 | `heartbeat_body.cbor` | **Frozen output** — `MinerHeartbeat::canonical()` for the pinned tuple (the signature preimage). |
 | `signed_heartbeat.cbor` | **Frozen output** — `SignedMinerHeartbeat::canonical()`: the `{body, sig}` envelope, `sig` = Ed25519 over `body` by the pinned test key. |
+| `heartbeat_body_v3.cbor` | **Frozen output** — the `v3` (capacity-declaration) body: the pinned tuple + `kat_heartbeat_v3()`'s four capacity fields. |
+| `signed_heartbeat_v3.cbor` | **Frozen output** — the signed `v3` envelope, same test key. |
+| `heartbeat_body_v4.cbor` | **Frozen output** — the `v4` (disk-declaration) body: the `v3` tuple + `kat_heartbeat_v4()`'s four disk fields. |
+| `signed_heartbeat_v4.cbor` | **Frozen output** — the signed `v4` envelope, same test key. |
+| `heartbeat_body_v5.cbor` | **Frozen output** — the `v5` (host-health) body: the `v4` tuple + `kat_heartbeat_v5()`'s four host-health fields. |
+| `signed_heartbeat_v5.cbor` | **Frozen output** — the signed `v5` envelope, same test key. |
 
 ## Pinned input tuple
 
@@ -50,3 +56,24 @@ cargo test -p hippius-types --test heartbeat_kat \
 ```
 
 Then review the diff to both `.cbor` files.
+
+The `v3` pair has its own helper, which never touches the `v1` files:
+
+```bash
+cargo test -p hippius-types --test heartbeat_kat \
+    regenerate_v3_vectors -- --ignored --exact
+```
+
+The `v4` pair likewise:
+
+```bash
+cargo test -p hippius-types --test heartbeat_kat \
+    regenerate_v4_vectors -- --ignored --exact
+```
+
+The `v5` pair likewise:
+
+```bash
+cargo test -p hippius-types --test heartbeat_kat \
+    regenerate_v5_vectors -- --ignored --exact
+```

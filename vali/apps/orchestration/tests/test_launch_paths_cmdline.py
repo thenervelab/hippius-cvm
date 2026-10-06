@@ -89,3 +89,76 @@ def test_measured_cmdline_preferred_for_legacy_too() -> None:
     _record(vm.vm_id, disk_mode=_LEGACY, emit={"measured_cmdline": measured})
     paths = effects._launch_paths(vm)
     assert paths["cmdline"] == measured
+
+
+
+def test_migration_of_a_pre_token_vm_pairs_its_own_initrd_with_its_stored_cmdline(
+    monkeypatch, fx
+) -> None:
+    # #1305 puts a guard in the NEW golden initramfs that refuses switch_root
+    # when /proc/cmdline lacks `systemd.import_credentials=no`. §25 replays
+    # the STORED measured cmdline (`_launch_paths`), which a VM launched
+    # before #1304 does not carry. That is safe only because the initrd the
+    # dest STAGES (`resolve_boot_artifacts`) is the VM's own bake — keyed by
+    # `spec_json`, never by whatever golden is currently blessed.
+    from apps.storage import s3
+
+    class _Presigned:
+        def __init__(self, key: str) -> None:
+            self.url = f"https://s3.invalid/{key}"
+
+    class _Client:
+        def presign_get(self, *, bucket: str, key: str, ttl_seconds: int) -> _Presigned:
+            return _Presigned(key)
+
+    monkeypatch.setattr(s3, "get_s3_client", lambda: _Client())
+    vm = make_vm()
+    own_initrd = "1d" * 32
+    now = timezone.now()
+    # Production shape: `launch_on_miner` records paths + the measured
+    # cmdline under `result_json["emit"]` (services/launch.py, emit dict).
+    LaunchJob.objects.create(
+        job_id=secrets.token_hex(16),
+        vm_id=vm.vm_id,
+        tenant_id="t",
+        flavor="small",
+        spec_json={
+            "disk_mode": _GOLDEN,
+            "vm_id": vm.vm_id,
+            "cmdline": _BASE,
+            "flavor": "small",
+            "s3_bucket": "b",
+            "s3_key_prefix": "tenant/golden-old/",
+            "kernel_sha256_hex": "ce" * 32,
+            "initrd_sha256_hex": own_initrd,
+            "rootfs_img_sha256_hex": "aa" * 32,
+            "rootfs_verity_sha256_hex": "bb" * 32,
+        },
+        userdata_vault_path=f"x/{vm.vm_id}/userdata",
+        userdata_vault_version=1,
+        kek_vault_path=f"x/{vm.vm_id}/luks-kek",
+        state=LaunchJobState.SUCCEEDED.value,
+        phase_started_at=now,
+        finished_at=now,
+        result_json={
+            "emit": {
+                "measured_cmdline": _MEASURED,
+                "initrd_path": f"/var/lib/hippius-miner/staging/{vm.vm_id}/tenant.initrd.img",
+            }
+        },
+        decided_by=make_service_client(),
+    )
+
+    paths = effects._launch_paths(vm)
+    # The suite's autouse `fx` fakes this peer effect; call the real one.
+    staged = fx.real["resolve_boot_artifacts"](vm)
+
+    assert paths["cmdline"] == _MEASURED, (
+        "a pre-#1304 VM's stored cmdline must replay byte-for-byte on §25"
+    )
+    assert "systemd.import_credentials" not in paths["cmdline"]
+    assert staged is not None
+    assert staged["initrd"]["sha256_hex"] == own_initrd, (
+        "§25 must stage the VM's own initrd, never a newer blessed bake's"
+    )
+    assert staged["initrd"]["url"].endswith("tenant/golden-old/tenant.initrd.img")

@@ -25,7 +25,8 @@ use ciborium::value::Value;
 use ed25519_dalek::{Signer, SigningKey};
 use hippius_types::cbor::to_canonical_vec;
 use hippius_types::heartbeat::{
-    MinerHeartbeat, SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION, SIGNATURE_LEN,
+    CapacityDeclaration, MinerHeartbeat, SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION,
+    SIGNATURE_LEN,
 };
 
 /// The pinned KAT signing-key seed — identical to
@@ -94,6 +95,12 @@ fn kat_heartbeat() -> MinerHeartbeat {
         memory_available_mib: 131_072,
         domain: DOMAIN.into(),
         graceful_exit_requested: false,
+        cvm_cpu_budget: 0,
+        cvm_memory_mb_budget: 0,
+        asid_capacity: 0,
+        asid_used: 0,
+        disk: hippius_types::heartbeat::DiskDeclaration::default(),
+        host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
     }
 }
 
@@ -193,6 +200,128 @@ fn happy_path_kat_returns_the_decoded_body() {
     assert_eq!(body["memory_available_mib"], 131_072);
     // A v1 body never carries the flag — the JSON always emits it false.
     assert_eq!(body["graceful_exit_requested"], false);
+    // ... and never the v3 capacity declarations.
+    assert_no_capacity_keys(body);
+}
+
+const CAPACITY_KEYS: [&str; 4] = [
+    "cvm_cpu_budget",
+    "cvm_memory_mb_budget",
+    "asid_capacity",
+    "asid_used",
+];
+
+fn assert_no_capacity_keys(body: &serde_json::Value) {
+    let obj = body.as_object().expect("body is an object");
+    for key in CAPACITY_KEYS {
+        assert!(!obj.contains_key(key), "{key} emitted for a pre-v3 body");
+    }
+}
+
+#[test]
+fn v3_kat_emits_the_capacity_declarations() {
+    // The committed frozen v3 envelope, through the real binary.
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v3.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v3.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    assert_eq!(run.exit, 0, "stderr: {}", run.stderr);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    let body = &json["body"];
+    assert_eq!(body["schema_version"], 3);
+    assert_eq!(body["memory_available_mib"], 131_072);
+    assert_eq!(body["graceful_exit_requested"], false);
+    assert_eq!(body["cvm_cpu_budget"], 44);
+    assert_eq!(body["cvm_memory_mb_budget"], 120_000);
+    assert_eq!(body["asid_capacity"], 99);
+    assert_eq!(body["asid_used"], 2);
+}
+
+#[test]
+fn v4_kat_emits_the_capacity_and_disk_declarations() {
+    // The committed frozen v4 envelope, through the real binary — the
+    // JSON keys the vali consumer reads.
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v4.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v4.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    assert_eq!(run.exit, 0, "stderr: {}", run.stderr);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    let body = &json["body"];
+    assert_eq!(body["schema_version"], 4);
+    assert_eq!(body["cvm_cpu_budget"], 44);
+    assert_eq!(body["asid_used"], 2);
+    assert_eq!(body["cvm_disk_gb_budget"], 3_000);
+    assert_eq!(body["data_disk_total_gb"], 3_500);
+    assert_eq!(body["data_disk_available_gb"], 2_900);
+    assert_eq!(body["staging_disk_available_gb"], 400);
+}
+
+#[test]
+fn v5_kat_emits_the_host_health_report() {
+    // The committed frozen v5 envelope, through the real binary — the
+    // JSON keys the vali consumer reads.
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v5.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v5.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    assert_eq!(run.exit, 0, "stderr: {}", run.stderr);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    let body = &json["body"];
+    assert_eq!(body["schema_version"], 5);
+    assert_eq!(body["asid_capacity"], 99);
+    assert_eq!(body["data_disk_total_gb"], 3_500);
+    assert_eq!(body["snp_enabled"], true);
+    assert_eq!(body["cpus_offline"], 24);
+    assert_eq!(body["snp_launches_since_boot"], 97);
+    assert_eq!(body["df_flush_failures"], 3);
+}
+
+#[test]
+fn v3_unknown_capacity_is_emitted_as_zero() {
+    // `0` = the miner could not read it — still emitted (the key's
+    // presence says "v3 declaration"), vali maps it to NULL.
+    let sk = SigningKey::from_bytes(&[0xC5u8; 32]);
+    let hb = kat_heartbeat().with_capacity(CapacityDeclaration::default());
+    let run = run_verify_heartbeat(&vk_hex(&sk), &signed_envelope(hb.canonical().unwrap(), &sk));
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    for key in CAPACITY_KEYS {
+        assert_eq!(json["body"][key], 0, "{key}");
+    }
+}
+
+#[test]
+fn v3_asid_used_above_capacity_is_capacity_invalid() {
+    let sk = SigningKey::from_bytes(&[0xC6u8; 32]);
+    let mut pairs = body_pairs(&[("schema_version", Value::Integer(3.into()))]);
+    pairs.extend([
+        (
+            Value::Text("graceful_exit_requested".into()),
+            Value::Bool(false),
+        ),
+        (
+            Value::Text("cvm_cpu_budget".into()),
+            Value::Integer(0.into()),
+        ),
+        (
+            Value::Text("cvm_memory_mb_budget".into()),
+            Value::Integer(0.into()),
+        ),
+        (
+            Value::Text("asid_capacity".into()),
+            Value::Integer(99.into()),
+        ),
+        (Value::Text("asid_used".into()), Value::Integer(100.into())),
+    ]);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &signed_envelope(forged_body(pairs), &sk));
+    assert_reject(&run, "capacity_invalid");
 }
 
 /// A v2 graceful-exit heartbeat tuple — 11 fields, the flag true.
@@ -226,6 +355,7 @@ fn v2_graceful_exit_heartbeat_verifies_and_echoes_the_flag() {
     assert_eq!(body["schema_version"], 2);
     assert_eq!(body["miner_id"], "miner-a");
     assert_eq!(body["graceful_exit_requested"], true);
+    assert_no_capacity_keys(body);
 }
 
 #[test]
@@ -352,11 +482,11 @@ fn over_cap_envelope_is_body_too_large() {
 
 #[test]
 fn wrong_schema_version_is_rejected() {
-    // Version 3 is unknown (neither v1 nor v2). A 10-field body matches
+    // Version 6 is unknown (not v1 through v5). A 10-field body matches
     // the v1-count branch, so it decodes cleanly and the failure lands
     // on the schema-version gate.
     let sk = SigningKey::from_bytes(&[0x77u8; 32]);
-    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(3.into()))]));
+    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(6.into()))]));
     let run = run_verify_heartbeat(&vk_hex(&sk), &signed_envelope(body, &sk));
     assert_reject(&run, "wrong_schema_version");
 }

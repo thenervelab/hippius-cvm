@@ -35,6 +35,26 @@ pub fn hpke_wrap(
     let info = ctx.canonical()?;
     let pk = <Kem as KemT>::PublicKey::from_bytes(recipient_pub)
         .map_err(|e| KbsError::Crypto(format!("hpke pubkey: {e}")))?;
+    #[cfg(test)]
+    if let Some(sealed) = test_rng::with_seeded(|rng| {
+        hpke::single_shot_seal::<Aead, Kdf, Kem, _>(
+            &OpModeS::Base,
+            &pk,
+            &info,
+            plaintext,
+            &info,
+            rng,
+        )
+    }) {
+        let (encapped, ct) = sealed.map_err(|e| KbsError::Crypto(format!("hpke seal: {e}")))?;
+        return Ok(WrappedSecret {
+            secret_type: ctx.secret_type.to_string(),
+            secret_path: ctx.secret_path.to_string(),
+            secret_version: ctx.secret_version,
+            enc: encapped.to_bytes().to_vec(),
+            ct,
+        });
+    }
     let mut csprng = rand::rngs::OsRng;
     let (encapped, ct) = hpke::single_shot_seal::<Aead, Kdf, Kem, _>(
         &OpModeS::Base,
@@ -69,6 +89,48 @@ pub fn hpke_unwrap(
     let pt =
         hpke::single_shot_open::<Aead, Kdf, Kem>(&OpModeR::Base, &sk, &enc, &info, &w.ct, &info)
             .map_err(|e| KbsError::Crypto(format!("hpke open: {e}")))?;
+    Ok(Zeroizing::new(pt))
+}
+
+/// HPKE seal (the §20 suite) with a caller-chosen `info` and `aad`, for
+/// payloads that are not a §20 release secret — the custody rekey KEK
+/// (`crate::custody`), whose `info` is its own domain and whose `aad`
+/// binds the exact signed verdict it travels with. Returns `(enc, ct)`.
+pub fn hpke_seal_raw(
+    recipient_pub: &[u8; 32],
+    plaintext: &[u8],
+    info: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pk = <Kem as KemT>::PublicKey::from_bytes(recipient_pub)
+        .map_err(|e| KbsError::Crypto(format!("hpke pubkey: {e}")))?;
+    let mut csprng = rand::rngs::OsRng;
+    let (encapped, ct) = hpke::single_shot_seal::<Aead, Kdf, Kem, _>(
+        &OpModeS::Base,
+        &pk,
+        info,
+        plaintext,
+        aad,
+        &mut csprng,
+    )
+    .map_err(|e| KbsError::Crypto(format!("hpke seal: {e}")))?;
+    Ok((encapped.to_bytes().to_vec(), ct))
+}
+
+/// Recipient side of [`hpke_seal_raw`] (guest parity / tests).
+pub fn hpke_open_raw(
+    recipient_secret: &[u8; 32],
+    enc: &[u8],
+    ct: &[u8],
+    info: &[u8],
+    aad: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let sk = <Kem as KemT>::PrivateKey::from_bytes(recipient_secret)
+        .map_err(|e| KbsError::Crypto(format!("hpke privkey: {e}")))?;
+    let enc = <Kem as KemT>::EncappedKey::from_bytes(enc)
+        .map_err(|e| KbsError::Crypto(format!("hpke enc: {e}")))?;
+    let pt = hpke::single_shot_open::<Aead, Kdf, Kem>(&OpModeR::Base, &sk, &enc, info, ct, aad)
+        .map_err(|e| KbsError::Crypto(format!("hpke open: {e}")))?;
     Ok(Zeroizing::new(pt))
 }
 
@@ -125,9 +187,52 @@ pub fn sign_denial(
     })
 }
 
+/// TEST-ONLY deterministic randomness for [`hpke_wrap`], so a whole
+/// release can be pinned byte for byte (a known-answer test on the full
+/// signed response). Production always draws from `OsRng`.
+#[cfg(test)]
+pub(crate) mod test_rng {
+    use rand::SeedableRng;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HPKE_RNG: RefCell<Option<rand::rngs::StdRng>> = const { RefCell::new(None) };
+    }
+
+    /// Every `hpke_wrap` on this thread draws from one `StdRng` seeded
+    /// with `seed` until [`clear`].
+    pub(crate) fn seed(seed: u64) {
+        HPKE_RNG.with(|c| *c.borrow_mut() = Some(rand::rngs::StdRng::seed_from_u64(seed)));
+    }
+
+    pub(crate) fn clear() {
+        HPKE_RNG.with(|c| *c.borrow_mut() = None);
+    }
+
+    pub(crate) fn with_seeded<T>(f: impl FnOnce(&mut rand::rngs::StdRng) -> T) -> Option<T> {
+        HPKE_RNG.with(|c| c.borrow_mut().as_mut().map(f))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// A FIXED X25519 keypair derived from `ikm` (known-answer tests).
+    pub fn fixed_x25519(ikm: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let (sk, pk) = Kem::derive_keypair(ikm);
+        let pkb: [u8; 32] = pk
+            .to_bytes()
+            .as_slice()
+            .try_into()
+            .expect("x25519 pubkey is 32 bytes");
+        let skb: [u8; 32] = sk
+            .to_bytes()
+            .as_slice()
+            .try_into()
+            .expect("x25519 secret is 32 bytes");
+        (pkb, skb)
+    }
 
     pub fn gen_x25519() -> ([u8; 32], [u8; 32]) {
         let mut rng = rand::rngs::OsRng;
@@ -227,13 +332,13 @@ mod tests {
             kbs_kid: b"kbs-kid".to_vec(),
             hpke_suite_id: HPKE_SUITE_ID,
             allowed_userdata_digest: vec![9u8; 32],
-            luks: WrappedSecret {
+            luks: Some(WrappedSecret {
                 secret_type: "luks".into(),
                 secret_path: "p".into(),
                 secret_version: 1,
                 enc: vec![1],
                 ct: vec![2],
-            },
+            }),
             userdata: WrappedSecret {
                 secret_type: "userdata".into(),
                 secret_path: "q".into(),
@@ -245,6 +350,7 @@ mod tests {
             boot_counter: 0,
             expected_volume_stamp: 0,
             volume_stamp_token: None,
+            volume_stamp_transition: None,
         };
         let signed = sign_response(&sk, &resp).unwrap();
         assert_eq!(verify_response(&sk.verifying_key(), &signed).unwrap(), resp);

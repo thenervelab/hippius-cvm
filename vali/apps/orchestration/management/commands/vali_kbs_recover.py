@@ -112,7 +112,8 @@ recovery. (The nearest wrong move fails safely: seeding 0 is a clean
 
 - **Dry-run is the DEFAULT.** Nothing is minted, written or POSTed without
   an explicit `--commit`. The dry-run runs the SAME fail-closed resolution
-  the committing path runs (`migration_ticket.resolve_ticket_inputs`), so
+  the committing path runs (`migration_ticket.resolve_ticket_inputs`, then
+  `assert_userdata_rebindable` — the §6 re-derivation precondition), so
   its verdict is the real verdict.
 - **Fail CLOSED, per VM.** No launch record / no measurement / no host / no
   miner chip identity ⇒ that VM is refused loudly and NOTHING is minted for
@@ -121,28 +122,69 @@ recovery. (The nearest wrong move fails safely: seeding 0 is a clean
   re-mint to re-derive the §6 digest) are never printed. Only non-secret
   identifiers, the public measurement, and Vault PATHS reach stdout.
 
+## Only an ACTIVE VM is ever re-registered
+
+Seed + register re-creates `Active{gen, host}` in the KBS, which is only the
+truth for a vali VM in `active`. A `decommissioning` / `destroyed` VM would
+get its release (and custody lease) re-opened after vali killed it — it gets
+`--reinstall-tombstones` instead. A `migrating` VM would be pinned back to
+`Active{old_gen, source}`, re-admitting the source §25 fenced out — re-drive
+or recover the migration first (`vali_migration_recover`), then recover it
+here once it is `active`. Every other state is refused as
+`refused-not-active` (an exit-code failure), and the state is re-read from
+the database before anything, again right before the seed and again right
+before the register, so a VM whose teardown starts mid-run is skipped rather
+than put back. A seed that already landed for such a VM is inert: without a
+registration the KBS releases nothing.
+
+## `--reinstall-tombstones` — the dead VMs the restart forgot
+
+The same wipe also forgets every VM vali decommissioned or destroyed. For a
+release that is harmless (an absent row already refuses), but not for the
+guest custody lease: to a KBS with no row, a decommissioned guest that is
+still running is an "unknown VM" — retried, never revoked — so it keeps its
+disk keys until its lease runs out instead of losing them at the next
+renew. `--reinstall-tombstones` puts the facts back: `decommission` for
+every vali VM in `decommissioning`, `tombstone(gen)` for every one in
+`destroyed` (or only the `--vm-id`s given, which must be in one of those
+states). Both KBS routes are idempotent, so a re-run is safe; a tombstone is
+PERMANENT, so the committing run needs `--yes`. It is a separate mode: it
+never seeds and never registers.
+
+Deliberately independent of `VALI_KBS_FENCE_ENABLED`: that flag governs what
+the orchestrator does on its own; this is an operator ceremony step, run by
+hand against a KBS the operator has just deployed.
+
 ## CLI
 
     python manage.py vali_kbs_recover --vm-id VM [--vm-id VM ...] | --all-active
                                       [--commit] [--dry-run]
                                       [--boot-counter-file PATH | --boot-counter N]
                                       [--counter-source HOST] [--yes]
+    python manage.py vali_kbs_recover --reinstall-tombstones [--vm-id VM ...]
+                                      [--commit --yes] [--dry-run]
 
 Exit 0 when every selected VM succeeded, 1 when any failed.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 
 from apps.lifecycle.models import Vm, VmState
 from apps.orchestration import effects, kbs_admin
-from apps.orchestration.services import migration_ticket
+from apps.orchestration.services import launch_record, migration_ticket
+from apps.telemetry import vm_liveness
+
+log = logging.getLogger("apps.orchestration.vali_kbs_recover")
 
 #: Exit code when at least one selected VM was NOT recovered — a wrapper
 #: script gates on this. A clean run returns normally (exit 0).
@@ -167,9 +209,22 @@ _WARN_SEED_NOT_DEPLOYED = "seed-route-missing+register-skipped"
 _WARN_SEED_NOT_WIPED = "seed-refused-not-wiped+register-skipped"
 _WOULD = "would-recover"
 _FAILED = "failed"
+#: The VM is not `active` in vali (checked before anything, and re-checked
+#: from the database right before the seed and right before the register).
+#: A failure for the exit code: nothing was seeded or registered for it.
+_REFUSED_NOT_ACTIVE = "refused-not-active"
+#: `--reinstall-tombstones` outcomes.
+_WOULD_TOMBSTONE = "would-reinstall"
+_OK_FENCED = "fenced"
+_OK_TOMBSTONED = "tombstoned"
+#: The KBS already holds a tombstone at ANOTHER generation: the VM is dead
+#: to the KBS either way, but the two records disagree — worth a look.
+_WARN_TOMBSTONE_CONFLICT = "tombstone-conflict"
 
 #: Outcomes that count as a warning (reported, but not an exit-code failure).
-_WARN_OUTCOMES = frozenset({_WARN_SEED_NOT_DEPLOYED, _WARN_SEED_NOT_WIPED})
+_WARN_OUTCOMES = frozenset(
+    {_WARN_SEED_NOT_DEPLOYED, _WARN_SEED_NOT_WIPED, _WARN_TOMBSTONE_CONFLICT}
+)
 
 #: Seed outcomes after which the register MUST NOT run — the counter was not
 #: established by us, so registering would re-open the release-path gap (and,
@@ -191,7 +246,7 @@ class VmOutcome:
 
     @property
     def failed(self) -> bool:
-        return self.outcome == _FAILED
+        return self.outcome in (_FAILED, _REFUSED_NOT_ACTIVE)
 
     @property
     def warned(self) -> bool:
@@ -204,6 +259,34 @@ class SeedInput:
 
     counter: int
     provenance: str
+
+
+# The KBS admin listener rate-limits (10/s, burst 20 in the chart). A
+# reinstall walks every dead VM — 440 on 2026-09-25, when 400 of them came
+# back 429 and had to be redone by hand. A 429 is a "later", not a failure.
+_RATE_LIMIT_RETRIES = 8
+_RATE_LIMIT_BACKOFF_S = 0.5
+_RATE_LIMIT_BACKOFF_CAP_S = 5.0
+
+
+def _is_rate_limited(outcome: VmOutcome) -> bool:
+    return outcome.outcome == _FAILED and "HTTP 429" in (outcome.detail or "")
+
+
+def _paced(attempt: Any, *, sleep: Any = None) -> VmOutcome:
+    """Run one reinstall `attempt`, retrying with backoff while the KBS
+    answers 429. Every other outcome — including the last 429 — is final."""
+    import time
+
+    sleep = sleep or time.sleep
+    delay = _RATE_LIMIT_BACKOFF_S
+    for _ in range(_RATE_LIMIT_RETRIES):
+        outcome = attempt()
+        if not _is_rate_limited(outcome):
+            return outcome
+        sleep(delay)
+        delay = min(delay * 2, _RATE_LIMIT_BACKOFF_CAP_S)
+    return attempt()
 
 
 class Command(BaseCommand):
@@ -222,6 +305,17 @@ class Command(BaseCommand):
     # ── arguments ───────────────────────────────────────────────────────
 
     def add_arguments(self, parser: Any) -> None:
+        parser.add_argument(
+            "--binding-max-age",
+            type=int,
+            default=3600,
+            help=(
+                "Step 3 (keepalive binding): only vouch for a guest whose newest "
+                "live attestation is at most this many seconds old. Run the "
+                "recovery promptly after the KBS restart — in enforce mode no "
+                "attestation can arrive until the binding is re-seeded."
+            ),
+        )
         parser.add_argument(
             "--vm-id",
             action="append",
@@ -270,7 +364,19 @@ class Command(BaseCommand):
         parser.add_argument(
             "--yes",
             action="store_true",
-            help="Confirm the irreversible one-shot boot-counter seed.",
+            help=(
+                "Confirm the irreversible one-shot boot-counter seed, or the "
+                "permanent tombstones of --reinstall-tombstones."
+            ),
+        )
+        parser.add_argument(
+            "--reinstall-tombstones",
+            action="store_true",
+            help=(
+                "Separate mode: re-install the KBS decommission fence for every "
+                "vali VM in 'decommissioning' and the tombstone for every one in "
+                "'destroyed' (or only the given --vm-id). Never seeds or registers."
+            ),
         )
 
     # ── entry point ─────────────────────────────────────────────────────
@@ -279,12 +385,20 @@ class Command(BaseCommand):
         commit: bool = bool(opts["commit"])
         if opts["dry_run"] and commit:
             raise CommandError("--dry-run and --commit are contradictory")
+        if opts["reinstall_tombstones"]:
+            self._reinstall_tombstones(opts, commit=commit)
+            return
 
         #: vm_ids for which THIS invocation received a seed 200. The only
         #: thing that distinguishes "my own retry" from "was never wiped"
         #: when the KBS answers 409 (see `_seed_one`). Run-local by design:
         #: a 409 in a FRESH run is never evidence that we did anything.
         self._seeded_ok: set[str] = set()
+        #: Step 3 bookkeeping: VMs with no vouchable guest (informational)
+        #: and VMs whose binding seed went wrong (non-zero exit).
+        self._binding_skipped: list[str] = []
+        self._binding_problems: list[str] = []
+        self._binding_max_age_s: int = int(opts["binding_max_age"])
 
         vms = self._select_vms(opts)
         # Parse + validate the seed BEFORE any network call, so a malformed
@@ -312,8 +426,14 @@ class Command(BaseCommand):
             # fail identically. Abort the run and surface it.
             raise CommandError(f"ABORTING the run — {exc}. No further VM was touched.") from exc
         self._report(outcomes, mode=mode)
+        if commit:
+            self.stdout.write(
+                f"vali-kbs-recover: keepalive binding: skipped={len(self._binding_skipped)} "
+                f"problems={len(self._binding_problems)}"
+                + (f" ({', '.join(self._binding_problems)})" if self._binding_problems else "")
+            )
 
-        if any(o.failed for o in outcomes):
+        if any(o.failed for o in outcomes) or self._binding_problems:
             sys.exit(EXIT_SOME_FAILED)
 
     # ── selection ───────────────────────────────────────────────────────
@@ -470,11 +590,32 @@ class Command(BaseCommand):
         next VM is still processed.
         """
         vm_id = vm.vm_id
+        refusal = _not_active(vm)
+        if refusal is not None:
+            self._line(vm_id, _REFUSED_NOT_ACTIVE, detail=refusal)
+            return VmOutcome(vm_id, None, "", _REFUSED_NOT_ACTIVE, refusal)
         try:
+            # An `already-launched` answer left this record waiting for its
+            # guest to attest which boot runs: registering the one on record
+            # could bind the KBS to a launch that is not running, whose newer
+            # ticket then refuses the running guest's own.
+            launch_record.assert_boot_verified(vm_id)
             node_id, generation = migration_ticket.current_placement(vm)
             inputs = migration_ticket.resolve_ticket_inputs(
                 vm, node_id=node_id, generation=generation
             )
+            # The re-mint's OTHER precondition, checked here so the dry-run
+            # and the commit agree BEFORE anything one-shot happens: can the
+            # §6 userdata digest be re-derived for this VM at all? A VM whose
+            # canonical copy is Transit-wrapped and whose working copy is not
+            # paired to it (staged before the working copy existed, or before
+            # the stamp) cannot have a fresh ticket minted — vali holds no
+            # decrypt for the KBS key. Left to the mint, this surfaced AFTER
+            # the boot-counter seed on 2026-09-21: three tenant VMs ended the
+            # run seeded but UNREGISTERED, which a fresh KBS refuses to
+            # release to, and the dry-run minutes earlier had said
+            # `would-recover` for all three.
+            migration_ticket.assert_userdata_rebindable(vm)
         except effects.EffectError as exc:
             self._line(vm_id, _FAILED, detail=str(exc))
             return VmOutcome(vm_id, None, "", _FAILED, str(exc))
@@ -491,7 +632,13 @@ class Command(BaseCommand):
                 if seed is not None
                 else "1:seed=skipped(no counter supplied) 2:remint+register"
             )
-            detail = f"{plan} order={steps}"
+            guest = self._released_guest(vm_id, inputs.platform_id, inputs.measurement_hex)
+            binding = (
+                f"3:seed-binding(report={_short(guest.report_id_hex)})"
+                if isinstance(guest, vm_liveness.ReleasedGuest)
+                else f"3:binding=skipped({guest})"
+            )
+            detail = f"{plan} order={steps} {binding}"
             self._line(vm_id, _WOULD, detail=detail)
             return VmOutcome(vm_id, inputs.generation, inputs.node_id, _WOULD, detail)
 
@@ -504,7 +651,17 @@ class Command(BaseCommand):
         seed_outcome = _OK_REGISTERED
         seed_detail = ""
         if seed is not None:
-            seed_outcome, seed_detail = self._seed_one(vm_id, seed)
+            # Checked and seeded under the row lock, so the VM cannot leave
+            # `active` (or move) between the check and the seed.
+            with transaction.atomic():
+                refusal = _locked_refusal(vm, inputs.generation, inputs.node_id)
+                if refusal is None:
+                    seed_outcome, seed_detail = self._seed_one(vm_id, seed)
+            if refusal is not None:
+                self._line(vm_id, _REFUSED_NOT_ACTIVE, detail=f"{plan} before-seed: {refusal}")
+                return VmOutcome(
+                    vm_id, inputs.generation, inputs.node_id, _REFUSED_NOT_ACTIVE, refusal
+                )
             if seed_outcome in _SEED_OUTCOMES_BLOCKING_REGISTER:
                 self._line(vm_id, seed_outcome, detail=f"{plan} {seed_detail}")
                 return VmOutcome(
@@ -516,9 +673,79 @@ class Command(BaseCommand):
                 )
 
         # ── step 2: re-mint at (current gen, current host) + register ────
+        # Re-read once more: a VM whose decommission (or migration) started
+        # since the plan must not be put back as `Active` in a wiped KBS. A
+        # seed that already landed for it is inert without a registration.
+        refusal = _not_active(vm)
+        if refusal is not None:
+            detail = f"{plan} {seed_detail} before-register: {refusal}"
+            self._line(vm_id, _REFUSED_NOT_ACTIVE, detail=detail)
+            return VmOutcome(
+                vm_id, inputs.generation, inputs.node_id, _REFUSED_NOT_ACTIVE, detail
+            )
         try:
             cose = migration_ticket.remint_current_ticket(vm)
-            ok = kbs_admin.register_vm_active_with_vm_id(vm_id=vm_id, cose_ticket=cose)
+            # The re-mint is slow (Vault reads + the mint shell-out). The
+            # register happens under the row lock, and only if the VM is
+            # STILL active at the generation and host the ticket was minted
+            # for: a decommission or §25 move that committed meanwhile waits
+            # for this call instead of racing it, and a ticket minted for a
+            # placement that moved is never registered.
+            with transaction.atomic():
+                refusal = _locked_refusal(vm, inputs.generation, inputs.node_id)
+                if refusal is None:
+                    # Again under the launch record's lock: an
+                    # `already-launched` answer may have landed since the plan.
+                    launch_record.lock_latest_succeeded(vm_id)
+                    launch_record.assert_boot_verified(vm_id)
+                    # And the boot the ticket was minted for is still the one
+                    # on record, inside the guest components floor (both
+                    # re-read here, under the locks, BEFORE the KBS call: a
+                    # guest upgrade or a relaunch that committed during the
+                    # slow re-mint must not get a stale ticket registered).
+                    locked_inputs = migration_ticket.resolve_ticket_inputs(
+                        vm, node_id=inputs.node_id, generation=inputs.generation
+                    )
+                    if locked_inputs.measurement_hex != inputs.measurement_hex:
+                        refusal = (
+                            "the launch measurement changed during the recovery — "
+                            "re-run to recover the boot now on record"
+                        )
+                if refusal is None:
+                    ok = kbs_admin.register_vm_active_with_vm_id(
+                        vm_id=vm_id, cose_ticket=cose
+                    )
+                    # Step 3 under the SAME row lock: a §25 move or a
+                    # decommission cannot start between the register and
+                    # the binding seed (the KBS re-checks Active + host too).
+                    # The measurement is re-read HERE, not taken from the
+                    # plan, with the launch record ROW-LOCKED: the Vm lock
+                    # does not cover it, and `launch_record.record_relaunch`
+                    # updates that same row under its own `for_update`, so a
+                    # relaunch cannot commit between this read and the seed.
+                    launch_record.lock_latest_succeeded(vm_id)
+                    current = migration_ticket.resolve_ticket_inputs(
+                        vm, node_id=inputs.node_id, generation=inputs.generation
+                    ).measurement_hex
+                    if current != inputs.measurement_hex:
+                        self._binding_problems.append(vm_id)
+                        binding = (
+                            "binding=REFUSED(the launch measurement changed during "
+                            "the recovery — re-run WITHOUT a boot counter: the "
+                            "counter seed has already been consumed)"
+                        )
+                    else:
+                        binding = self._seed_binding(vm_id, inputs.platform_id, current)
+            if refusal is not None:
+                detail = f"{plan} {seed_detail} before-register: {refusal}"
+                self._line(vm_id, _REFUSED_NOT_ACTIVE, detail=detail)
+                return VmOutcome(
+                    vm_id, inputs.generation, inputs.node_id, _REFUSED_NOT_ACTIVE, detail
+                )
+        except effects.KbsAdminContractMismatch:
+            # Only the step-3 binding seed raises it here (register/mint do
+            # not): the whole run aborts, as for the counter seed.
+            raise
         except effects.EffectError as exc:
             # Covers KbsAdminConflict (409 — the KBS holds a DIFFERENT state
             # for this VM; an operator must reconcile), KbsAdminTerminal, and
@@ -528,7 +755,8 @@ class Command(BaseCommand):
 
         detail = (
             f"{plan} {seed_detail} ticket_id={ok.ticket_id} "
-            f"registered_gen={ok.vm_generation} cached={str(ok.cached).lower()}"
+            f"registered_gen={ok.vm_generation} cached={str(ok.cached).lower()} "
+            f"{binding}"
         )
         self._line(vm_id, seed_outcome, detail=detail)
         return VmOutcome(vm_id, inputs.generation, inputs.node_id, seed_outcome, detail)
@@ -597,6 +825,190 @@ class Command(BaseCommand):
             "with the KBS. Register SKIPPED — investigate before re-running.",
         )
 
+    # ── step 3: the keepalive binding ───────────────────────────────────
+
+    def _released_guest(
+        self, vm_id: str, platform_id: str, measurement_hex: str
+    ) -> vm_liveness.ReleasedGuest | str:
+        return vm_liveness.current_released_guest(
+            vm_id,
+            platform_id=platform_id,
+            measurement_hex=measurement_hex,
+            now_unix=int(time.time()),
+            max_age_s=self._binding_max_age_s,
+        )
+
+    def _seed_binding(self, vm_id: str, platform_id: str, measurement_hex: str) -> str:
+        """Re-seed the guest the KBS released this VM to (the wiped
+        keepalive-binding store), right after the register and under its
+        row lock. Returns the detail fragment.
+
+        It never changes the VM's own outcome — the register stands — but
+        every outcome other than seeded/matched/no-vouchable-guest is a
+        PROBLEM (`self._binding_problems`) that makes the run exit
+        non-zero: in `record` mode such a VM is only `first-use`, in
+        `enforce` its keepalives are refused until its next boot.
+
+        A `KbsAdminContractMismatch` (400) propagates and aborts the run,
+        as for the counter seed: vali checked the inputs, so the deployed
+        KBS disagrees about the contract.
+        """
+        guest = self._released_guest(vm_id, platform_id, measurement_hex)
+        if guest == vm_liveness.DIFFERENT_GUEST_SINCE_RELEASE:
+            # A guest other than the released one was served (first-use)
+            # for this VM since its release — e.g. inside enforce's
+            # post-restart grace window. Nothing is seeded, and it is
+            # surfaced: a hostile guest racing the re-seed looks exactly
+            # like this.
+            log.error(
+                "keepalive-binding ANOMALY vm=%s: a guest other than the one the KBS "
+                "released to has attested since the release — not re-seeded; "
+                "investigate before the VM's next boot",
+                vm_id,
+            )
+            self._binding_problems.append(vm_id)
+            return f"binding=ANOMALY({guest})"
+        if not isinstance(guest, vm_liveness.ReleasedGuest):
+            self._binding_skipped.append(vm_id)
+            return f"binding=skipped({guest})"
+        report = _short(guest.report_id_hex)
+        try:
+            result = effects.seed_keepalive_binding(
+                vm_id, chip_id_hex=guest.chip_id_hex, report_id_hex=guest.report_id_hex
+            )
+        except effects.KbsAdminContractMismatch:
+            raise
+        except effects.KbsBindingConflict:
+            detail = (
+                f"binding=CONFLICT(KBS holds a DIFFERENT guest than report={report}, "
+                "or the VM is poisoned — its last release could not be recorded; "
+                "only its next release can fix either)"
+            )
+        except effects.KbsBindingPrecondition as exc:
+            detail = f"binding=REFUSED({exc})"
+        except effects.KbsRouteMissing:
+            # The KBS predates binding persistence: there is nothing to seed
+            # into, exactly as before this step existed. Not a problem.
+            self._binding_skipped.append(vm_id)
+            return "binding=skipped(KBS 404: this KBS image has no binding re-seed)"
+        except effects.EffectError as exc:
+            detail = f"binding=FAILED({exc})"
+        else:
+            return f"binding={result}(report={report})"
+        self._binding_problems.append(vm_id)
+        return detail
+
+    # ── --reinstall-tombstones ──────────────────────────────────────────
+
+    def _reinstall_tombstones(self, opts: dict[str, Any], *, commit: bool) -> None:
+        if opts["all_active"]:
+            raise CommandError("--reinstall-tombstones and --all-active are mutually exclusive")
+        if opts["boot_counter_file"] or opts["boot_counter"] is not None or opts["counter_source"]:
+            raise CommandError(
+                "--reinstall-tombstones never seeds a boot counter — drop "
+                "--boot-counter-file / --boot-counter / --counter-source"
+            )
+        vms = self._select_dead_vms(list(opts["vm_id"] or []))
+        mode = "commit" if commit else "dry-run"
+        self.stdout.write(
+            f"vali-kbs-recover: reinstall-tombstones mode={mode} selected={len(vms)}"
+        )
+        for vm in vms:
+            self.stdout.write(f"vali-kbs-recover: tombstone-plan vm={vm.vm_id} {_dead_op(vm)}")
+        if commit and vms and not opts["yes"]:
+            raise CommandError(
+                "refusing to write KBS tombstones without --yes: a tombstone is "
+                "PERMANENT — the KBS never releases to that VM again"
+            )
+
+        outcomes: list[VmOutcome] = []
+        for vm in vms:
+            try:
+                outcomes.append(self._reinstall_one(vm, commit=commit))
+            except effects.KbsRouteMissing as exc:
+                # Every remaining VM would 404 identically: the deployed KBS
+                # does not serve the fence routes. Stop, say so.
+                raise CommandError(
+                    f"ABORTING the run — {exc}. Deploy the KBS that serves the "
+                    "decommission/tombstone routes first."
+                ) from exc
+        self._report(outcomes, mode=mode)
+        if any(o.failed for o in outcomes):
+            sys.exit(EXIT_SOME_FAILED)
+
+    def _select_dead_vms(self, vm_ids: list[str]) -> list[Vm]:
+        dead = (VmState.DECOMMISSIONING, VmState.DESTROYED)
+        if not vm_ids:
+            return list(Vm.objects.filter(state__in=dead).order_by("vm_id"))
+        rows = {vm.vm_id: vm for vm in Vm.objects.filter(vm_id__in=vm_ids)}
+        missing = [v for v in vm_ids if v not in rows]
+        if missing:
+            raise CommandError(f"unknown vm_id(s): {', '.join(sorted(missing))}")
+        alive = sorted(v for v in rows if rows[v].state not in dead)
+        if alive:
+            # A tombstone on a live VM would lock its tenant out for good.
+            raise CommandError(
+                "refusing: not decommissioning/destroyed in vali: " + ", ".join(alive)
+            )
+        seen: set[str] = set()
+        ordered: list[Vm] = []
+        for vm_id in vm_ids:
+            if vm_id not in seen:
+                seen.add(vm_id)
+                ordered.append(rows[vm_id])
+        return ordered
+
+    def _reinstall_one(self, vm: Vm, *, commit: bool) -> VmOutcome:
+        return _paced(lambda: self._reinstall_one_attempt(vm, commit=commit))
+
+    def _reinstall_one_attempt(self, vm: Vm, *, commit: bool) -> VmOutcome:
+        """Fence or tombstone ONE VM. Only `KbsRouteMissing` escapes (the
+        caller aborts the run on it); everything else becomes a row."""
+        op = _dead_op(vm)
+        if not commit:
+            self._line(vm.vm_id, _WOULD_TOMBSTONE, detail=op)
+            return VmOutcome(vm.vm_id, vm.generation, "", _WOULD_TOMBSTONE, op)
+        # Re-read right before the write: the plan was printed from a snapshot,
+        # and a VM that finished its teardown since must get the TOMBSTONE —
+        # a bare fence on a destroyed VM is never upgraded later.
+        vm.refresh_from_db()
+        op = _dead_op(vm)
+        if vm.state not in (VmState.DECOMMISSIONING, VmState.DESTROYED):
+            detail = f"vm is {vm.state!r} now — refusing to fence a VM that is not dead"
+            self._line(vm.vm_id, _FAILED, detail=detail)
+            return VmOutcome(vm.vm_id, vm.generation, "", _FAILED, detail)
+        try:
+            if vm.state == VmState.DESTROYED:
+                res = effects.kbs_tombstone(vm.vm_id, generation=int(vm.generation))
+                outcome = _OK_TOMBSTONED
+            else:
+                res = effects.kbs_fence_decommission(vm.vm_id)
+                outcome = _OK_FENCED
+                # Its teardown may have finished while the fence was in
+                # flight; a bare fence on a destroyed VM is never upgraded
+                # later, so follow it with the tombstone.
+                vm.refresh_from_db()
+                if vm.state == VmState.DESTROYED:
+                    op = _dead_op(vm)
+                    res = effects.kbs_tombstone(vm.vm_id, generation=int(vm.generation))
+                    outcome = _OK_TOMBSTONED
+        except effects.KbsRouteMissing:
+            raise
+        except effects.KbsTombstoneConflict as exc:
+            detail = f"{op} error={exc}"
+            self._line(vm.vm_id, _WARN_TOMBSTONE_CONFLICT, detail=detail)
+            return VmOutcome(vm.vm_id, vm.generation, "", _WARN_TOMBSTONE_CONFLICT, detail)
+        except effects.EffectError as exc:
+            detail = f"{op} error={exc}"
+            self._line(vm.vm_id, _FAILED, detail=detail)
+            return VmOutcome(vm.vm_id, vm.generation, "", _FAILED, detail)
+        detail = (
+            f"{op} previous={res.previous} state={res.state} "
+            f"cached={str(res.cached).lower()}"
+        )
+        self._line(vm.vm_id, outcome, detail=detail)
+        return VmOutcome(vm.vm_id, vm.generation, "", outcome, detail)
+
     # ── output ──────────────────────────────────────────────────────────
 
     def _line(self, vm_id: str, outcome: str, *, detail: str) -> None:
@@ -619,6 +1031,91 @@ class Command(BaseCommand):
         )
         self.stdout.write("")
         self.stdout.write(self.style.ERROR(summary) if failed else self.style.SUCCESS(summary))
+
+
+def _not_active(vm: Vm, *, refresh: bool = True) -> str | None:
+    """Re-read `vm` from the database and say why it must NOT be
+    re-registered, or `None` when it is `active`.
+
+    Seed + register re-creates `Active{gen, host}` in the KBS. That is only
+    true of an active VM:
+
+    - `decommissioning` / `destroyed` — re-registering re-opens the release
+      (and the custody lease) of a VM vali already killed. Those get
+      `--reinstall-tombstones` instead.
+    - `migrating` — the KBS row is `Migrating{old, new, source, dest}`;
+      registering `Active{old_gen, source}` would re-admit the fenced-out
+      source. Re-drive or recover the migration (`vali_migration_recover`)
+      first; once the VM is `active` again it can be recovered here.
+    """
+    if refresh:
+        vm.refresh_from_db()
+    if vm.state == VmState.ACTIVE:
+        return _guest_upgrade_refusal(vm)
+    if vm.state == VmState.MIGRATING:
+        return (
+            f"vm is 'migrating' — refusing to register Active{{gen={vm.generation}, "
+            f"host={vm.host or '-'}}} over a §25 fence; re-drive or recover the "
+            "migration first, then recover the VM once it is active"
+        )
+    return (
+        f"vm is {vm.state!r} — refusing to re-register a VM vali decommissioned "
+        "(that would re-open its release); use --reinstall-tombstones for it"
+    )
+
+
+def _guest_upgrade_refusal(vm: Vm) -> str | None:
+    """A guest upgrade between its stop and its accepted relaunch (or in its
+    rollback) is moving the launch record: the boot on record may be one
+    that no longer runs and never will. The job registers its own launch;
+    recover the VM once the job has ended or relaunched it."""
+    from apps.orchestration.models import GuestUpgradeJob, GuestUpgradeState
+
+    job = (
+        GuestUpgradeJob.objects.filter(
+            vm=vm,
+            state__in=(
+                GuestUpgradeState.STOPPING,
+                GuestUpgradeState.LAUNCHING,
+                GuestUpgradeState.ROLLING_BACK,
+            ),
+        )
+        .values_list("job_id", "state")
+        .first()
+    )
+    if job is None:
+        return None
+    return (
+        f"guest upgrade {job[0]} is {job[1]} — the launch record is being moved; "
+        "recover the VM once the upgrade has relaunched it or ended"
+    )
+
+
+def _locked_refusal(vm: Vm, generation: int, node_id: str) -> str | None:
+    """Inside a transaction: lock `vm`'s row and say why it must not be
+    seeded/registered now — not `active`, or no longer at the `(generation,
+    host)` the plan resolved — or `None`. Holding the lock across the KBS call
+    makes every vali transition of this VM (all row-version CASes) wait for
+    it rather than slip in between the check and the write.
+    """
+    locked = Vm.objects.select_for_update().get(id=vm.id)
+    vm.state, vm.generation, vm.host = locked.state, locked.generation, locked.host
+    refusal = _not_active(vm, refresh=False)
+    if refusal is not None:
+        return refusal
+    if int(locked.generation) != int(generation) or locked.host != node_id:
+        return (
+            f"vm moved since the plan (gen={locked.generation} host={locked.host or '-'}, "
+            f"planned gen={generation} host={node_id}) — re-run to recover it"
+        )
+    return None
+
+
+def _dead_op(vm: Vm) -> str:
+    """The KBS write `--reinstall-tombstones` makes for a dead vali VM."""
+    if vm.state == VmState.DESTROYED:
+        return f"op=tombstone gen={vm.generation}"
+    return "op=decommission"
 
 
 def _short(value: str, keep: int = 16) -> str:

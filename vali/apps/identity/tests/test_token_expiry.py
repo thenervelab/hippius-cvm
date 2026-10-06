@@ -333,6 +333,8 @@ def test_migration_0004_defines_every_pre_existing_row() -> None:
                 expires_at=None,
             )
     finally:
-        # Leave the schema where the rest of the suite expects it.
+        # Leave the schema where the rest of the suite expects it: EVERY
+        # leaf, not just identity 0004 — going back to 0003 also unapplied
+        # the migrations of other apps that depend on 0004.
         executor.loader.build_graph()
-        executor.migrate([_IDENTITY_0004])
+        executor.migrate(executor.loader.graph.leaf_nodes())

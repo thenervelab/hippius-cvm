@@ -52,6 +52,63 @@
 //!     SAME transport selection (`--kbs-url`) release uses. Mutually
 //!     exclusive with every release-mode flag.
 //!
+//!   **Stamp protocol v2** (a timeline-bound volume stamp, M0/M1): the
+//!   release attests v2 in its SNP `REPORT_DATA`
+//!   (`hippius_types::report_data::tenant_stamp_v2`) and accepts ONLY a
+//!   `HIPPIUS_KBS_RELEASE_V2` response carrying a
+//!   `volume_stamp_transition {expected, target}`, which
+//!   `--volume-stamp-transition-out` hands to the shell gate
+//!   (`<expected hex> <target hex>\n`) and the ctx file carries as
+//!   `"timeline"` for the confirm. A KBS that predates v2 refuses a v2
+//!   report outright (403), and that 403 is FINAL: a v2-capable M0/M1
+//!   guest NEVER retries attesting v1. Every KBS refusal is the same
+//!   generic 403, so a miner could forge one; a v1 retry would then let
+//!   it get a v1 adopt of an old zero-timeline disk after a KBS store
+//!   wipe and keep the VM on the zero timeline past its first confirm
+//!   (reopening every abandoned zero-timeline disk). A denial is a
+//!   denial: the boot fails (a denial of service the miner can always
+//!   cause anyway), nothing is written for the gate. The KBS is rolled
+//!   to v2 BEFORE any v2 guest is baked and must never go below it. M2
+//!   (`customer`) attests v1 only, exactly as before — its stamp is the
+//!   guardian's, the KBS has none to bind to a timeline.
+//!
+//!   **`--integrity-wipe DEVICE`** is a third DISTINCT mode, with no KBS
+//!   traffic at all: it zeroes a freshly `luksFormat --integrity-no-wipe`'d
+//!   mapping with parallel `O_DIRECT` writers so every sector carries a
+//!   valid dm-integrity tag before the filesystem is laid down. It lives
+//!   here because this binary is already static and already staged in
+//!   both initramfs families. See [`wipe`].
+//!
+//! **Customer-held disk keys (M1 `split` / M2 `customer`).** The
+//! release mode reads the MEASURED cmdline (`/proc/cmdline`) with
+//! [`GuardianBinding::from_cmdline`]; a grammar error fails closed.
+//! No binding (M0, `hippius`) ⇒ exactly the exchange above, nothing
+//! else. With a binding:
+//!
+//! 1. the ticket's signed `key_mode` must equal the measured mode;
+//! 2. the **guardian leg** runs FIRST ([`guardian_leg`]) — before any
+//!    KBS contact, waiting indefinitely inside this boot for a verified
+//!    `share_C` (never a reboot, never a KBS call while waiting). The
+//!    one terminal answer, a signed `erased`, halts the guest in place;
+//! 3. the KBS leg runs unchanged, except that M1 requires the KBS KEK
+//!    (`share_H`) and M2 refuses one;
+//! 4. `combine_kek(mode, share_H, share_C, vm_id)` is what reaches
+//!    stdout — 32 bytes, as before. Both shares and the result are
+//!    `Zeroizing`;
+//! 5. `--share-c-version-out` records the share version the guardian
+//!    sealed (the shell stores it in the volume's LUKS2 token), and in
+//!    M2 the volume stamp comes from the guardian: the ctx file names
+//!    the guardian as the confirm target, so `--confirm-volume-stamp`
+//!    confirms there instead of at the KBS;
+//! 6. `--instance-id-out` records the VM's stable cloud-init
+//!    instance-id (derived from the same `vm_id`); the golden overlay
+//!    hands the released user-data to cloud-init on the volume's first
+//!    boot only (H5b).
+//!
+//! In every mode, a `/proc/cmdline` long enough that the kernel or the
+//! EFI stub may have cut a key-mode token off, and that carries none,
+//! is refused before any contact (see [`cmdline_may_hide_key_mode`]).
+//!
 //! `cryptsetup-initramfs` (Debian/Ubuntu) calls this binary as the
 //! `keyscript` for the `cryptroot` entry in `/etc/crypttab` and reads
 //! the KEK from its stdout into libcryptsetup's mlocked buffer for
@@ -84,13 +141,25 @@ use hippius_agent_initramfs::stages::{
     kbs_client, keygen, snp_report, ticket as ticket_stage, verify,
 };
 use hippius_agent_initramfs::{
-    is_vsock_url, AgentError, HttpClient, ReqwestHttpClient, VsockHttpClient,
-    PINNED_KBS_RESPONSE_KID, PINNED_KBS_RESPONSE_VK,
+    guardian_relay_url, is_vsock_url, AgentError, GuardianVsockClient, HttpClient,
+    ReqwestHttpClient, SnpReportProvider, VsockHttpClient, PINNED_KBS_RESPONSE_KID,
+    PINNED_KBS_RESPONSE_VK,
 };
-use hippius_guest::UnwrappedSecrets;
+use hippius_guest::{AttestedStampProtocol, GuardianRelease};
 use hippius_types::cbor::{assert_canonical, to_canonical_vec};
+use hippius_types::guardian::{
+    combine_kek, encode_canonical, GuardianBinding, GuardianStampConfirm, KeyMode,
+    GUARDIAN_STAMP_CONFIRM_PATH, GUARDIAN_WIRE_V, KEY_LEN, MAX_CMDLINE_LEN, OVMF_INITRD_PREFIX,
+};
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
+use zeroize::Zeroizing;
+
+mod guardian_leg;
+#[cfg(test)]
+mod keyed_tests;
+mod wipe;
 
 /// Exit codes the keyscript caller distinguishes.
 const EXIT_OK: u8 = 0;
@@ -99,6 +168,9 @@ const EXIT_USAGE: u8 = 1;
 /// Maps every closed-vocabulary `AgentError::class()` to this exit
 /// code; the operator distinguishes on stderr classification tags.
 const EXIT_RELEASE_FAILED: u8 = 3;
+/// `--integrity-wipe` failed: the device is NOT fully initialised and
+/// must not get a filesystem.
+const EXIT_WIPE_FAILED: u8 = 4;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -109,9 +181,10 @@ const EXIT_RELEASE_FAILED: u8 = 3;
 struct Cli {
     /// HTTPS base URL for the KBS, e.g.
     /// `https://kbs.hippius.network`. The release POST hits
-    /// `${KBS_URL}/v1/kbs/release`.
-    #[arg(long)]
-    kbs_url: String,
+    /// `${KBS_URL}/v1/kbs/release`. Required in every mode except
+    /// `--integrity-wipe`, which talks to no KBS.
+    #[arg(long, required_unless_present = "integrity_wipe")]
+    kbs_url: Option<String>,
 
     /// Path to the raw COSE_Sign1 OrderTicket bytes (same bytes
     /// the miner-agent pushes over AF_VSOCK; the bake-time alternative
@@ -154,7 +227,7 @@ struct Cli {
     #[arg(long)]
     lifecycle_key_out: Option<std::path::PathBuf>,
 
-    /// Phase 2A of audit follow-up Codex #2 — anti-rollback for
+    /// Phase 2A of audit follow-up Review #2 — anti-rollback for
     /// valid-old-ciphertext replay. When set, read the previous
     /// KBS-issued boot counter from this file (newline-stripped
     /// ASCII decimal). On the FIRST boot the file should not exist
@@ -226,6 +299,52 @@ struct Cli {
     #[arg(long)]
     volume_stamp_expected_out: Option<std::path::PathBuf>,
 
+    /// Stamp protocol v2 — companion to `--volume-stamp-expected-out`:
+    /// when the release attested v2 and the KBS answered with a
+    /// `volume_stamp_transition`, write `<expected hex> <target hex>\n`
+    /// (two 64-char lowercase hex timeline ids), mode `0644`, nothing
+    /// secret. The shell gate then accepts the volume only on the
+    /// `expected` timeline and stamps the `target` one. When the release
+    /// carried NO transition (a v1 release — M2 only; M0/M1 never get
+    /// one) the file is REMOVED, never left stale: its absence is what
+    /// tells the gate to run the v1 comparison (M2) or to refuse (M0/M1). Written BEFORE `--volume-stamp-expected-out`, so the
+    /// expectation file (which the gate treats as authoritative) never
+    /// exists without its transition. A release that carried a transition
+    /// while `--volume-stamp-expected-out` is set but this flag is not is
+    /// REFUSED (the gate would read the expectation as a v1 one).
+    #[arg(long)]
+    volume_stamp_transition_out: Option<std::path::PathBuf>,
+
+    /// Customer-held keys (M1/M2 only) — the `share_C` version recorded
+    /// in the overlay upper's LUKS2 `hippius-keymode` token. Absent on
+    /// first boot (blank volume). Folded into the guardian report and
+    /// request; the guardian must seal exactly this version. Refused on
+    /// an M0 (`hippius`) cmdline.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    share_c_version: Option<u32>,
+
+    /// Customer-held keys (M1/M2: REQUIRED there, refused in M0) —
+    /// where to write the `share_C` version the guardian sealed, as
+    /// ASCII decimal + newline, mode `0644` (not a secret). Written
+    /// after every other `*_out` file and BEFORE the KEK ships; the
+    /// golden overlay records it in the volume's LUKS2 token on first
+    /// boot.
+    #[arg(long)]
+    share_c_version_out: Option<std::path::PathBuf>,
+
+    /// Customer-held keys (M1/M2: REQUIRED there, refused in M0) —
+    /// where to write this VM's STABLE cloud-init instance-id
+    /// ([`cloud_init_instance_id`] of the ticket's `vm_id`, the same
+    /// `vm_id` the keyslot key is combined under), as `iid-<32 hex>` +
+    /// newline, mode `0644` (not a secret). The golden overlay puts it
+    /// in the NoCloud `meta-data` on every boot, so cloud-init sees ONE
+    /// instance for the volume's lifetime and its per-instance modules
+    /// run once — the KBS-released user-data is handed to cloud-init on
+    /// the volume's first boot only (M0 keeps a random instance-id per
+    /// boot and the user-data every boot).
+    #[arg(long)]
+    instance_id_out: Option<std::path::PathBuf>,
+
     /// `kbs-core::volume_stamp` — CONFIRM MODE. When set, this binary
     /// does NOT run the release exchange at all: it reads the ctx file
     /// a PRIOR `--volume-stamp-ctx-out` invocation wrote, and POSTs
@@ -236,6 +355,11 @@ struct Cli {
     /// earlier is exactly the "remote brick" the module docs on
     /// `kbs-core::volume_stamp` warn about. Mutually exclusive with
     /// every release-mode flag.
+    ///
+    /// The ctx file names the confirm target: the KBS (M0/M1, no
+    /// target field — byte-identical to before) or, in M2, the
+    /// customer's guardian via the guardian relay (`"to":"guardian"`).
+    /// The guardian's answer is an unsigned ack and is only logged.
     #[arg(long, conflicts_with_all = [
         "ticket",
         "userdata_out",
@@ -244,8 +368,37 @@ struct Cli {
         "new_counter_file",
         "volume_stamp_ctx_out",
         "volume_stamp_expected_out",
+        "volume_stamp_transition_out",
+        "share_c_version",
+        "share_c_version_out",
+        "instance_id_out",
     ])]
     confirm_volume_stamp: Option<std::path::PathBuf>,
+
+    /// INTEGRITY-WIPE MODE. Zero every sector of DEVICE (a block device
+    /// directly under `/dev/mapper/`, opened `O_DIRECT|O_EXCL`) with
+    /// parallel writers, then `fdatasync`. For a LUKS2 + dm-integrity
+    /// volume formatted with `--integrity-no-wipe` and activated with
+    /// `--integrity-no-journal`: afterwards every sector carries a valid
+    /// tag, exactly as after cryptsetup's own (serial) wipe. Exit
+    /// `EXIT_WIPE_FAILED` on any error. No KBS traffic; mutually
+    /// exclusive with every other flag.
+    #[arg(long, conflicts_with_all = [
+        "kbs_url",
+        "ticket",
+        "userdata_out",
+        "lifecycle_key_out",
+        "last_counter_file",
+        "new_counter_file",
+        "volume_stamp_ctx_out",
+        "volume_stamp_expected_out",
+        "volume_stamp_transition_out",
+        "confirm_volume_stamp",
+        "share_c_version",
+        "share_c_version_out",
+        "instance_id_out",
+    ])]
+    integrity_wipe: Option<std::path::PathBuf>,
 }
 
 /// The tmpfs subtree every SECRET-bearing `*_out` file must live under.
@@ -377,6 +530,33 @@ fn outside_prefix_msg(flag: &str, path: &std::path::Path, prefix: &std::path::Pa
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Integrity-wipe mode: no KBS, no secrets — clap has already refused
+    // it alongside any other flag.
+    if let Some(device) = cli.integrity_wipe.as_deref() {
+        return match wipe::run(device) {
+            Ok(size) => {
+                eprintln!(
+                    "hippius-guest-release: integrity-wipe {}: done, {} MiB",
+                    device.display(),
+                    size >> 20
+                );
+                ExitCode::from(EXIT_OK)
+            }
+            Err(e) => {
+                eprintln!(
+                    "hippius-guest-release: fail-closed: integrity-wipe {}: {e}",
+                    device.display()
+                );
+                ExitCode::from(EXIT_WIPE_FAILED)
+            }
+        };
+    }
+    // `required_unless_present` guarantees this outside wipe mode.
+    let Some(kbs_url) = cli.kbs_url.as_deref() else {
+        eprintln!("hippius-guest-release: fail-closed: usage: --kbs-url is required");
+        return ExitCode::from(EXIT_USAGE);
+    };
+
     // P9/#12 — enforce the tmpfs-only contract on every SECRET-bearing
     // `*_out` path BEFORE anything else, so a mis-pointed path never
     // even reaches the KBS: no release exchange runs, no key is
@@ -408,7 +588,7 @@ fn main() -> ExitCode {
     // flag alongside any release-mode flag, so reaching here means
     // ONLY `--kbs-url` + `--confirm-volume-stamp` were given.
     if let Some(ctx_path) = cli.confirm_volume_stamp.as_deref() {
-        return match run_confirm(&cli.kbs_url, ctx_path) {
+        return match run_confirm(kbs_url, ctx_path) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(e) => {
                 log_fatal(&e);
@@ -425,8 +605,15 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
 
-    let kek = match run(&cli) {
-        Ok(secrets) => secrets,
+    let kek = match run(&cli, kbs_url) {
+        Ok(released) => released,
+        // Customer-held keys: the guardian signed `erased`. Terminal —
+        // no retry can clear it — but exiting would hand the boot to a
+        // failure path that may power the guest off (dracut) or panic
+        // it (initramfs-tools), and a relaunch loop would re-ask the
+        // guardian forever. Halt in place instead: the disk stays
+        // locked, the KBS is never contacted, the console says why.
+        Err(AgentError::Guardian(guardian_leg::ERASED)) => halt_erased(),
         Err(e) => {
             log_fatal(&e);
             return ExitCode::from(EXIT_RELEASE_FAILED);
@@ -473,7 +660,7 @@ fn main() -> ExitCode {
     // byte-exact; a newline would corrupt the passphrase.
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    if let Err(e) = handle.write_all(kek.luks.as_slice()) {
+    if let Err(e) = handle.write_all(kek.kek.as_slice()) {
         // Best we can do — diagnostics already on stderr.
         eprintln!(
             "hippius-guest-release: fail-closed: stdout-write {}",
@@ -488,7 +675,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(EXIT_RELEASE_FAILED);
     }
-    // `kek.luks` + `kek.userdata` drop + `Zeroizing`-wipe here.
+    // `kek.kek` + `kek.userdata` drop + `Zeroizing`-wipe here.
     ExitCode::from(EXIT_OK)
 }
 
@@ -560,48 +747,119 @@ fn write_secret_0600_at_mode(
     Ok(())
 }
 
-fn run(cli: &Cli) -> Result<UnwrappedSecrets, AgentError> {
-    // 1. Load the COSE ticket from disk. `ticket::load` accepts either
-    //    a `vsock://CID:PORT` URI (production) or an absolute file
-    //    path (smoke / dev), exactly as the legacy agent does.
-    //    `main` already refused to call `run` with no `--ticket`; the
-    //    `ok_or` here is a defensive re-statement of that invariant,
-    //    never actually taken.
-    let ticket_path = cli
-        .ticket
-        .as_deref()
-        .ok_or(AgentError::Ticket("missing"))?
-        .to_string_lossy()
-        .into_owned();
-    let ticket = ticket_stage::load(&ticket_path)?;
+/// What a successful release hands to `main`: the keyslot key for
+/// stdout and the two secrets that must land on tmpfs BEFORE it ships.
+struct Released {
+    /// M0: the KBS KEK, byte-for-byte as released. M1/M2: the 32-byte
+    /// [`combine_kek`] output.
+    kek: Zeroizing<Vec<u8>>,
+    userdata: Zeroizing<Vec<u8>>,
+    lifecycle_key: Option<Zeroizing<Vec<u8>>>,
+}
 
-    // 2. X25519 ephemeral keygen — `Zeroizing<[u8; 32]>` for the
-    //    secret scalar, public bytes exposed for the SNP REPORT_DATA.
-    let keys = keygen::generate_ephemeral()?;
+/// Everything [`run_with`] talks to, injectable so the whole exchange —
+/// guardian leg, KBS leg, combine — runs in tests against fakes.
+struct Deps<'a> {
+    kbs: &'a dyn HttpClient,
+    guardian: &'a dyn HttpClient,
+    guardian_url: &'a str,
+    snp: &'a dyn SnpReportProvider,
+    kbs_vk: &'a [u8; 32],
+    kbs_kid: &'a [u8],
+    env: &'a mut dyn guardian_leg::LegEnv,
+}
 
-    // 3. KBS transport, selected by the `--kbs-url` scheme:
+fn run(cli: &Cli, kbs_url: &str) -> Result<Released, AgentError> {
+    // Customer-held keys: the MEASURED cmdline selects the key mode.
+    // `/proc/cmdline` is what the kernel was launched with — the string
+    // SEV measured (plus the one `\n` the kernel appends, which the
+    // parser strips). Unreadable ⇒ the mode is unknown ⇒ fail closed.
+    let cmdline = std::fs::read_to_string("/proc/cmdline")
+        .map_err(|_| AgentError::Guardian("cmdline-read"))?;
+
+    // KBS transport, selected by the `--kbs-url` scheme:
     //    - `vsock://CID:PORT` → relay the two KBS POSTs over AF_VSOCK
     //      to the miner-agent (the guest needs NO network to reach the
     //      KBS — the robust permissionless path, see
     //      `kbs_vsock_client`);
     //    - `https://…` → direct `reqwest`/`rustls` blocking client
     //      (legacy network path), §20 strict 5 s connect / 30 s request.
-    let http: Box<dyn HttpClient> = if is_vsock_url(&cli.kbs_url) {
+    // Constructing either client does no I/O.
+    let kbs: Box<dyn HttpClient> = if is_vsock_url(kbs_url) {
         Box::new(VsockHttpClient::new())
     } else {
         Box::new(ReqwestHttpClient::new().map_err(|e| AgentError::Kbs(e.class()))?)
     };
-
-    // 4. Fresh single-use KBS nonce.
-    let nonce = kbs_client::fetch_nonce(http.as_ref(), &cli.kbs_url)?;
-
-    // 5. SEV-SNP report — `/dev/sev-guest` ioctl with the §20
-    //    REPORT_DATA layout (`nonce ‖ x25519_pub`).
+    let guardian = GuardianVsockClient::new();
+    let guardian_url = guardian_relay_url();
     let provider = snp_provider();
-    let report = snp_report::request(provider.as_ref(), &nonce.0, keys.public_bytes())?;
-    let measurement = snp_report::measurement(&report)?;
+    let mut env = ConsoleEnv;
+    run_with(
+        cli,
+        kbs_url,
+        &cmdline,
+        Deps {
+            kbs: kbs.as_ref(),
+            guardian: &guardian,
+            guardian_url: &guardian_url,
+            snp: provider.as_ref(),
+            kbs_vk: &PINNED_KBS_RESPONSE_VK,
+            kbs_kid: PINNED_KBS_RESPONSE_KID,
+            env: &mut env,
+        },
+    )
+}
 
-    // 5b. Phase 2A of audit follow-up Codex #2 — read the previous
+fn run_with(
+    cli: &Cli,
+    kbs_url: &str,
+    cmdline: &str,
+    deps: Deps<'_>,
+) -> Result<Released, AgentError> {
+    // 0. Customer-held keys: read the measured binding (`None` = M0).
+    //    A cmdline the grammar refuses is refused here — before any
+    //    contact with anyone.
+    if cmdline_may_hide_key_mode(cmdline) {
+        return Err(AgentError::Guardian("cmdline-may-be-truncated"));
+    }
+    let binding = GuardianBinding::from_cmdline(cmdline)
+        .map_err(|_| AgentError::Guardian("cmdline-grammar"))?;
+    let mode = binding.as_ref().map_or(KeyMode::Hippius, |b| b.mode);
+    check_key_mode_flags(cli, binding.is_some())?;
+
+    // 1. Load the COSE ticket from disk. `ticket::load` accepts either
+    //    a `vsock://CID:PORT` URI (production) or an absolute file
+    //    path (smoke / dev), exactly as the legacy agent does.
+    //    `main` already refused to call `run` with no `--ticket`; the
+    //    `ok_or` here is a defensive re-statement of that invariant,
+    //    never actually taken. The ticket's signed `key_mode` must be
+    //    the measured one (M0: exactly the pre-guardian refusal).
+    let ticket_path = cli
+        .ticket
+        .as_deref()
+        .ok_or(AgentError::Ticket("missing"))?
+        .to_string_lossy()
+        .into_owned();
+    let ticket = ticket_stage::load_for_mode(&ticket_path, mode)?;
+
+    // 1b. Customer-held keys: the GUARDIAN LEG, before any KBS contact
+    //     (see `guardian_leg`: it waits inside this boot, it never
+    //     returns without a verified share except on a signed
+    //     `erased`). M0 never gets here.
+    let guardian = match binding.as_ref() {
+        Some(b) => Some(guardian_leg::run(
+            deps.guardian,
+            deps.guardian_url,
+            deps.snp,
+            deps.env,
+            b,
+            &ticket.order().vm_id,
+            cli.share_c_version,
+        )?),
+        None => None,
+    };
+
+    // 5b. Phase 2A of audit follow-up Review #2 — read the previous
     // KBS-issued boot counter from `--last-counter-file` (if set) and
     // submit `prev + 1`. Missing or empty file → first boot, submit
     // `1`. Bad content (non-ASCII-decimal) is a guest bug — fail
@@ -622,27 +880,50 @@ fn run(cli: &Cli) -> Result<UnwrappedSecrets, AgentError> {
         return Err(AgentError::Kbs("counter-file-usage"));
     }
 
-    // 6. POST /v1/kbs/release.
-    let signed = kbs_client::release(
-        http.as_ref(),
-        &cli.kbs_url,
+    // 2-6. The release exchange: a fresh X25519 key, a fresh KBS nonce,
+    //    an SNP report binding both, POST /v1/kbs/release. M0/M1 attest
+    //    STAMP PROTOCOL v2 in REPORT_DATA and NEVER fall back to v1: a
+    //    denial of the v2 report is final (a forged 403 must not buy a v1
+    //    release — see the module docs). M2 attests v1 only (its stamp is
+    //    the guardian's; the KBS has none to bind to a timeline).
+    let attested = if mode == KeyMode::Customer {
+        AttestedStampProtocol::V1
+    } else {
+        AttestedStampProtocol::V2
+    };
+    let (signed, keys, nonce, measurement) = release_exchange(
+        &deps,
+        kbs_url,
         ticket.cose_bytes(),
-        &nonce,
-        &report,
         submitted_boot_counter,
+        attested,
     )?;
 
     // 7. §6/§7/§19/§20 binding gate + HPKE unwrap. `keys` is consumed
     //    by value — the X25519 secret scalar drops + wipes
-    //    immediately after this returns.
-    let secrets = verify::verify_and_unwrap(
+    //    immediately after this returns. The KEK must be present in
+    //    M0/M1 (in M1 it is `share_H`) and absent in M2. The response
+    //    shape must be the ATTESTED protocol's (v2: the V2 domain and a
+    //    timeline transition; v1: exactly the pre-v2 response).
+    let mut secrets = verify::verify_and_unwrap_attested(
         &signed,
         keys,
         &nonce,
         &ticket,
         &measurement,
-        &PINNED_KBS_RESPONSE_VK,
-        PINNED_KBS_RESPONSE_KID,
+        deps.kbs_vk,
+        deps.kbs_kid,
+        mode,
+        attested,
+    )?;
+
+    // 7a. The keyslot key. M0 is the KBS KEK verbatim; M1/M2 derive it
+    //     from both shares (M1) or the guardian's alone (M2).
+    let kek = keyslot_key(
+        mode,
+        secrets.luks.take(),
+        guardian.as_ref(),
+        &ticket.order().vm_id,
     )?;
 
     // 7b. Phase 2A — write the KBS-issued counter to
@@ -655,48 +936,361 @@ fn run(cli: &Cli) -> Result<UnwrappedSecrets, AgentError> {
         write_new_counter(path, secrets.boot_counter).map_err(AgentError::Kbs)?;
     }
 
-    // 7c. `kbs-core::volume_stamp` — write the anti-rollback confirm
-    // context BEFORE we ship the LUKS KEK, same fail-closed ordering
-    // as 7b. A requested-but-absent token (a KBS that predates this
-    // gate) is FATAL rather than a silent skip: the operator asked
-    // for the gate, so getting none must surface as an error, not
-    // quietly proceed unrolled-back-protected.
+    // 7c/7d. The volume stamp: the KBS's in M0/M1 (exactly as before),
+    //        the guardian's in M2 (the KBS notes no stamp for an M2
+    //        VM, so the one it echoes binds nothing).
+    let stamp = match guardian.as_ref().and_then(|g| g.stamp.as_ref()) {
+        Some(g) => StampSource::Guardian {
+            expected: g.expected,
+            token: &g.token,
+        },
+        None => StampSource::Kbs {
+            expected: secrets.expected_volume_stamp,
+            token: secrets.volume_stamp_token.as_deref(),
+            transition: secrets.volume_stamp_transition,
+        },
+    };
+    write_stamp_outputs(cli, &ticket.order().vm_id, &stamp)?;
+
+    // 7e. Customer-held keys: the share version for the LUKS2 token,
+    //     after every other `*_out` file and before the KEK ships.
+    if let (Some(path), Some(g)) = (cli.share_c_version_out.as_deref(), guardian.as_ref()) {
+        write_share_c_version(path, g.share_c_version).map_err(AgentError::Guardian)?;
+    }
+    // 7f. Customer-held keys: the stable cloud-init instance-id, from the
+    //     `vm_id` the keyslot key was just combined under.
+    if let (Some(path), Some(_)) = (cli.instance_id_out.as_deref(), guardian.as_ref()) {
+        write_instance_id(path, &cloud_init_instance_id(&ticket.order().vm_id))
+            .map_err(AgentError::Guardian)?;
+    }
+
+    Ok(Released {
+        kek,
+        userdata: std::mem::take(&mut secrets.userdata),
+        lifecycle_key: secrets.lifecycle_key.take(),
+    })
+}
+
+/// One exchange: `(signed response, the key it is sealed to, the nonce,
+/// the guest's own measurement)`.
+type Exchange = (
+    hippius_types::release::SignedResponse,
+    keygen::Ephemeral,
+    kbs_client::KbsNonce,
+    [u8; snp_report::MEASUREMENT_LEN],
+);
+
+/// Steps 2-6, ONCE, attesting `attested`. There is no second attempt: a
+/// KBS denial (403) is returned as is — never retried under another stamp
+/// protocol — like every other failure.
+fn release_exchange(
+    deps: &Deps<'_>,
+    kbs_url: &str,
+    cose_ticket: &[u8],
+    submitted_boot_counter: Option<u64>,
+    attested: AttestedStampProtocol,
+) -> Result<Exchange, AgentError> {
+    // 2. X25519 ephemeral keygen — `Zeroizing<[u8; 32]>` for the
+    //    secret scalar, public bytes exposed for the SNP REPORT_DATA.
+    let keys = keygen::generate_ephemeral()?;
+    // 4. Fresh single-use KBS nonce.
+    let nonce = kbs_client::fetch_nonce(deps.kbs, kbs_url)?;
+    // 5. SEV-SNP report — `/dev/sev-guest` ioctl. v1: the §20 layout
+    //    `nonce ‖ x25519_pub`; v2: `SHA-256(v2 domain ‖ nonce) ‖
+    //    x25519_pub` — the guest's only (PSP-signed) v2 claim.
+    let report = match attested {
+        AttestedStampProtocol::V2 => {
+            snp_report::request_stamp_v2(deps.snp, &nonce.0, keys.public_bytes())?
+        }
+        AttestedStampProtocol::V1 => snp_report::request(deps.snp, &nonce.0, keys.public_bytes())?,
+    };
+    let measurement = snp_report::measurement(&report)?;
+    // 6. POST /v1/kbs/release.
+    let signed = kbs_client::release(
+        deps.kbs,
+        kbs_url,
+        cose_ticket,
+        &nonce,
+        &report,
+        submitted_boot_counter,
+    )?;
+    Ok((signed, keys, nonce, measurement))
+}
+
+/// The customer-held-keys flags belong to M1/M2 only, and there
+/// `--share-c-version-out` is required: without it a first boot would
+/// format a volume whose LUKS2 token cannot record the share version.
+fn check_key_mode_flags(cli: &Cli, keyed: bool) -> Result<(), AgentError> {
+    if keyed {
+        if cli.share_c_version_out.is_none() {
+            return Err(AgentError::Guardian("share-c-version-out-required"));
+        }
+        if cli.instance_id_out.is_none() {
+            return Err(AgentError::Guardian("instance-id-out-required"));
+        }
+    } else if cli.share_c_version.is_some()
+        || cli.share_c_version_out.is_some()
+        || cli.instance_id_out.is_some()
+    {
+        return Err(AgentError::Guardian("key-mode-flags-without-binding"));
+    }
+    Ok(())
+}
+
+/// The bytes `main` writes to stdout.
+///
+/// - M0: the KBS KEK verbatim (the caller checks its length, as before).
+/// - M1: `combine_kek(split, share_H, share_C)`; `share_H` must be
+///   exactly 32 bytes.
+/// - M2: `combine_kek(customer, —, share_C)`.
+///
+/// The shares are consumed and wipe on drop; any other combination
+/// fails closed.
+fn keyslot_key(
+    mode: KeyMode,
+    kbs_kek: Option<Zeroizing<Vec<u8>>>,
+    guardian: Option<&GuardianRelease>,
+    vm_id: &str,
+) -> Result<Zeroizing<Vec<u8>>, AgentError> {
+    let combined = match (mode, kbs_kek, guardian) {
+        (KeyMode::Hippius, Some(kek), None) => return Ok(kek),
+        (KeyMode::Split, Some(kek), Some(g)) => {
+            if kek.len() != KEY_LEN {
+                return Err(AgentError::Guardian("share-h-length"));
+            }
+            let mut share_h = Zeroizing::new([0u8; KEY_LEN]);
+            share_h.copy_from_slice(&kek);
+            combine_kek(mode, Some(&share_h), Some(&g.share_c), vm_id)
+        }
+        (KeyMode::Customer, None, Some(g)) => combine_kek(mode, None, Some(&g.share_c), vm_id),
+        _ => return Err(AgentError::Guardian("shares-do-not-match-mode")),
+    }
+    .map_err(|_| AgentError::Guardian("combine"))?;
+    Ok(Zeroizing::new(combined.to_vec()))
+}
+
+/// Where this boot's volume-stamp expectation and confirm token came
+/// from — and so where the confirm goes.
+enum StampSource<'a> {
+    /// M0/M1: the KBS's `kbs-core::volume_stamp`. `transition` is the
+    /// stamp-protocol-v2 `(expected, target)` timelines (`None` for a v1
+    /// release).
+    Kbs {
+        expected: u64,
+        token: Option<&'a [u8; 32]>,
+        transition: Option<([u8; 32], [u8; 32])>,
+    },
+    /// M2: the customer's guardian (signed response, sealed token).
+    Guardian { expected: u64, token: &'a [u8; 32] },
+}
+
+/// 7c + 7d. `kbs-core::volume_stamp` — write the anti-rollback confirm
+/// context BEFORE we ship the LUKS KEK, same fail-closed ordering as
+/// 7b. A requested-but-absent token (a KBS that predates this gate) is
+/// FATAL rather than a silent skip: the operator asked for the gate, so
+/// getting none must surface as an error, not quietly proceed
+/// unrolled-back-protected.
+///
+/// Then the PLAIN decimal `expected` value for the POSIX-sh initramfs
+/// gate, strictly AFTER the fatal-on-no-token check. `expected` is
+/// always present on the wire (defaults to `0`), so this never fails
+/// closed the way the ctx write can — but ordering it after means a
+/// fatal ctx error returns before this file is ever created, so a
+/// `--volume-stamp-ctx-out` no-token failure never leaves a stale
+/// expectation file for the shell to (wrongly) trust.
+fn write_stamp_outputs(cli: &Cli, vm_id: &str, stamp: &StampSource<'_>) -> Result<(), AgentError> {
+    let (expected, token, to, transition) = match *stamp {
+        StampSource::Kbs {
+            expected,
+            token,
+            transition,
+        } => (expected, token, ConfirmTo::Kbs, transition),
+        StampSource::Guardian { expected, token } => {
+            (expected, Some(token), ConfirmTo::Guardian, None)
+        }
+    };
+    // A v2 expectation only means something WITH its transition: the gate
+    // reads a missing transition file as a v1 release and would compare
+    // the value alone — against a volume the release bound to a timeline.
+    // Refuse before anything is written for the gate.
+    if transition.is_some()
+        && cli.volume_stamp_expected_out.is_some()
+        && cli.volume_stamp_transition_out.is_none()
+    {
+        eprintln!(
+            "hippius-guest-release: fail-closed: the release carried a volume-stamp timeline \
+             transition but --volume-stamp-transition-out is not set (--volume-stamp-expected-out \
+             is)"
+        );
+        return Err(AgentError::Kbs("volume-stamp-transition-out-required"));
+    }
     if let Some(path) = cli.volume_stamp_ctx_out.as_deref() {
-        let token = secrets.volume_stamp_token.as_ref().ok_or_else(|| {
+        let token = token.ok_or_else(|| {
             eprintln!(
                 "hippius-guest-release: fail-closed: volume-stamp-ctx-out: \
                  no-token-in-release (KBS predates the volume-stamp gate)"
             );
             AgentError::Kbs("volume-stamp-no-token")
         })?;
-        let target = secrets
-            .expected_volume_stamp
+        let target = expected
             .checked_add(1)
             .ok_or(AgentError::Kbs("volume-stamp-overflow"))?;
         write_volume_stamp_ctx(
             path,
-            &ticket.order().vm_id,
-            secrets.expected_volume_stamp,
+            vm_id,
+            expected,
             target,
             token,
+            to,
+            transition.as_ref().map(|(_, t)| t),
         )
         .map_err(AgentError::Kbs)?;
     }
-
-    // 7d. `kbs-core::volume_stamp` — write the PLAIN decimal `expected`
-    // value for the POSIX-sh initramfs gate, strictly AFTER 7c's
-    // fatal-on-no-token check. `expected_volume_stamp` is always
-    // present on the wire (defaults to `0`), so this never fails
-    // closed the way 7c can — but ordering it after 7c means a fatal
-    // 7c error returns before this file is ever created, so a
-    // `--volume-stamp-ctx-out` no-token failure never leaves a stale
-    // expectation file for the shell to (wrongly) trust.
+    // The transition BEFORE the expectation: the gate treats an existing
+    // expectation file as authoritative, so it must never see one without
+    // the transition that came with it.
+    if let Some(path) = cli.volume_stamp_transition_out.as_deref() {
+        write_volume_stamp_transition(path, transition.as_ref()).map_err(AgentError::Kbs)?;
+    }
     if let Some(path) = cli.volume_stamp_expected_out.as_deref() {
-        write_volume_stamp_expected(path, secrets.expected_volume_stamp)
-            .map_err(AgentError::Kbs)?;
+        write_volume_stamp_expected(path, expected).map_err(AgentError::Kbs)?;
+    }
+    Ok(())
+}
+
+/// `--share-c-version-out`: `N\n`, mode `0644` (a version number the
+/// guardian also sends in the clear to the relay — not a secret).
+fn write_share_c_version(path: &std::path::Path, version: u32) -> Result<(), &'static str> {
+    write_secret_0600_at_mode(path, format!("{version}\n").as_bytes(), 0o644)
+}
+
+/// Domain separator of [`cloud_init_instance_id`]. Changing it changes
+/// the instance-id of every M1/M2 volume, which makes cloud-init treat
+/// each one as a NEW instance on its next boot.
+const INSTANCE_ID_DOMAIN: &[u8] = b"hippius-iid-v1\0";
+
+/// The stable cloud-init instance-id of an M1/M2 VM:
+/// `iid-` + the first 32 lowercase hex characters of
+/// `SHA-256("hippius-iid-v1\0" ‖ vm_id)`.
+///
+/// The same `vm_id` feeds [`combine_kek`], so a boot under another
+/// `vm_id` opens no keyslot: the id cannot be moved without also losing
+/// the disk. It is not a secret (the `vm_id` is on the measured
+/// cmdline already); it only has to be stable per VM and distinct
+/// between VMs.
+fn cloud_init_instance_id(vm_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(INSTANCE_ID_DOMAIN);
+    h.update(vm_id.as_bytes());
+    let digest = h.finalize();
+    let mut out = String::with_capacity(4 + 32);
+    out.push_str("iid-");
+    for b in &digest[..16] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// `--instance-id-out`: `iid-<32 hex>\n`, mode `0644` (not a secret).
+fn write_instance_id(path: &std::path::Path, iid: &str) -> Result<(), &'static str> {
+    write_secret_0600_at_mode(path, format!("{iid}\n").as_bytes(), 0o644)
+}
+
+/// The longest spelling of the key-mode token.
+const LONGEST_KEY_MODE_TOKEN: &str = "hippius.key_mode=customer";
+
+/// The shortest `/proc/cmdline` (without its trailing `\n`) that a
+/// truncation could have produced while cutting a key-mode token off.
+///
+/// SEV measures the whole cmdline; the guest sees at most
+/// [`MAX_CMDLINE_LEN`] bytes of it. Both truncations on the boot path
+/// cut from the end:
+/// - the kernel's own copy is bytewise, so what survives is exactly
+///   2047 bytes;
+/// - the EFI stub (`efi_convert_cmdline`, the path OVMF direct boot
+///   takes) cuts at the last whitespace before byte 2048, so less
+///   survives — but when the token it cut was the key-mode token
+///   itself, that token started within its own length of the limit, so
+///   at least `2047 - 25 = 2022` bytes survive.
+///
+/// All of this is about `/proc/cmdline` as the guest sees it, which is
+/// what both truncations act on: OVMF puts [`OVMF_INITRD_PREFIX`]
+/// (`initrd=initrd `, 14 bytes) in front of the measured cmdline, so in
+/// MEASURED bytes the floor is [`KEY_MODE_TRUNCATION_FLOOR_MEASURED`]
+/// (2008) and the longest cmdline that is never cut is
+/// [`MAX_MEASURED_CMDLINE_LEN`](hippius_types::guardian::MAX_MEASURED_CMDLINE_LEN) (2033). Those two are vali's numbers.
+///
+/// A key-mode token cut off makes an M1/M2 launch look like M0 from
+/// inside the guest, which would then skip the guardian and format a
+/// first-boot volume under the KBS KEK alone. An honest vali never
+/// mints a measured cmdline over [`MAX_MEASURED_CMDLINE_LEN`](hippius_types::guardian::MAX_MEASURED_CMDLINE_LEN), so an
+/// honest launch never loses a token this way; a compromised one is
+/// refused here.
+const KEY_MODE_TRUNCATION_FLOOR: usize = MAX_CMDLINE_LEN - LONGEST_KEY_MODE_TOKEN.len();
+
+/// [`KEY_MODE_TRUNCATION_FLOOR`] in measured bytes (without the OVMF
+/// prefix): vali must not mint a token-less cmdline this long or longer.
+#[cfg_attr(not(test), allow(dead_code))]
+const KEY_MODE_TRUNCATION_FLOOR_MEASURED: usize =
+    KEY_MODE_TRUNCATION_FLOOR - OVMF_INITRD_PREFIX.len();
+
+/// `true` when `/proc/cmdline` carries NO key-mode token and is long
+/// enough ([`KEY_MODE_TRUNCATION_FLOOR`]) that one may have been cut
+/// off. The guest then refuses to boot rather than guess M0. The cost
+/// is that an M0 launch whose `/proc/cmdline` is 2022..=2047 bytes
+/// (measured 2008..=2033) no longer boots.
+///
+/// What this cannot see: a truncation that dropped a key-mode token
+/// placed AFTER a long token straddling the limit, or anything after a
+/// `\n` (the EFI stub stops there). Neither yields a key the customer
+/// did not approve: a guest that believes it is M0 never asks the
+/// guardian, so the VM never enrolls, which is what the customer's
+/// first-boot enrollment check catches (the same as an M0 launch sold
+/// as M1).
+fn cmdline_may_hide_key_mode(cmdline: &str) -> bool {
+    let cmdline = cmdline.strip_suffix('\n').unwrap_or(cmdline);
+    if cmdline.len() < KEY_MODE_TRUNCATION_FLOOR {
+        return false;
+    }
+    !cmdline
+        .split_ascii_whitespace()
+        .any(|t| t.split_once('=').map_or(t, |(k, _)| k) == "hippius.key_mode")
+}
+
+/// Production [`guardian_leg::LegEnv`]: really sleep, and put every
+/// status line on stderr (the kmsg the shell captures) AND the console,
+/// where `quiet` would otherwise hide a guest that is waiting for its
+/// guardian. Status lines carry no secrets.
+struct ConsoleEnv;
+
+impl guardian_leg::LegEnv for ConsoleEnv {
+    fn pause(&mut self, delay: Duration) -> bool {
+        std::thread::sleep(delay);
+        true
     }
 
-    Ok(secrets)
+    fn status(&mut self, line: &str) {
+        eprintln!("hippius-guest-release: {line}");
+        if let Ok(mut console) = std::fs::OpenOptions::new().write(true).open("/dev/console") {
+            let _ = writeln!(console, "hippius-guest-release: {line}");
+        }
+    }
+}
+
+/// The guardian signed `erased`: this VM's customer share is gone and
+/// no retry can bring it back. Never returns — see the call site.
+fn halt_erased() -> ! {
+    let mut env = ConsoleEnv;
+    loop {
+        guardian_leg::LegEnv::status(
+            &mut env,
+            "fail-closed: the customer key guardian ERASED this VM's key share. \
+             The disk cannot be unlocked and its data is unrecoverable. \
+             Halting here (no reboot, no KBS contact); stop or delete the VM.",
+        );
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 /// Phase 2A — read the previous KBS-issued counter from `path`.
@@ -781,19 +1375,71 @@ fn write_new_counter(path: &std::path::Path, value: u64) -> Result<(), &'static 
 /// `vm_id` comes from the (unverified-by-us, KBS-bound) ticket, so it
 /// is escaped as a JSON string rather than trusted to be quote-safe —
 /// defence-in-depth, not a correctness requirement in practice.
+///
+/// `to` names the confirm target. A KBS ctx (M0/M1) carries no target
+/// field — byte-identical to every ctx written before customer-held
+/// keys; a guardian ctx (M2) ends in `"to":"guardian"`.
 fn write_volume_stamp_ctx(
     path: &std::path::Path,
     vm_id: &str,
     expected: u64,
     target: u64,
     token: &[u8; 32],
+    to: ConfirmTo,
+    timeline: Option<&[u8; 32]>,
 ) -> Result<(), &'static str> {
+    let to_field = match to {
+        ConfirmTo::Kbs => "",
+        ConfirmTo::Guardian => ",\"to\":\"guardian\"",
+    };
+    // Stamp protocol v2: the timeline the guest stamps and confirms on.
+    // Absent for a v1 release (byte-identical to before).
+    let timeline_field = match timeline {
+        Some(t) => format!(",\"timeline\":\"{}\"", encode_hex(t)),
+        None => String::new(),
+    };
     let json = format!(
-        "{{\"vm_id\":{},\"expected\":{expected},\"target\":{target},\"token\":\"{}\"}}",
+        "{{\"vm_id\":{},\"expected\":{expected},\"target\":{target},\"token\":\"{}\"{to_field}{timeline_field}}}",
         json_escape_string(vm_id),
         encode_hex(token),
     );
     write_secret_0600(path, json.as_bytes())
+}
+
+/// Stamp protocol v2 — `--volume-stamp-transition-out`: write
+/// `<expected hex> <target hex>\n` (mode `0644`, not a secret) for a
+/// release that carried a transition; REMOVE the file for one that did
+/// not, so the shell gate never runs the v2 comparison on a stale
+/// transition. A failed write removes whatever landed, like
+/// [`write_volume_stamp_expected`].
+fn write_volume_stamp_transition(
+    path: &std::path::Path,
+    transition: Option<&([u8; 32], [u8; 32])>,
+) -> Result<(), &'static str> {
+    let Some((expected, target)) = transition else {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("volume-stamp-transition-remove"),
+        };
+    };
+    let line = format!("{} {}\n", encode_hex(expected), encode_hex(target));
+    match write_secret_0600_at_mode(path, line.as_bytes(), 0o644) {
+        Ok(()) => Ok(()),
+        Err(cls) => {
+            let _ = std::fs::remove_file(path);
+            Err(cls)
+        }
+    }
+}
+
+/// Who a volume-stamp confirm goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmTo {
+    /// `POST /v1/kbs/volume-stamp/confirm` (M0/M1).
+    Kbs,
+    /// `POST /v1/guardian/stamp/confirm` via the guardian relay (M2).
+    Guardian,
 }
 
 /// `kbs-core::volume_stamp` — write ONLY the decimal `expected` value
@@ -859,6 +1505,9 @@ struct VolumeStampCtx {
     vm_id: String,
     target: u64,
     token: [u8; 32],
+    to: ConfirmTo,
+    /// Stamp protocol v2: the timeline the volume was stamped on.
+    timeline: Option<[u8; 32]>,
 }
 
 /// Parse the FIXED-shape JSON [`write_volume_stamp_ctx`] wrote. This
@@ -876,11 +1525,26 @@ fn read_volume_stamp_ctx(path: &std::path::Path) -> Result<VolumeStampCtx, &'sta
     let target = extract_json_number(text, "\"target\":").ok_or("ctx-target")?;
     let token_hex = extract_json_string(text, "\"token\":\"").ok_or("ctx-token")?;
     let token = decode_hex_32(&token_hex).ok_or("ctx-token-hex")?;
+    let to = match extract_json_string(text, "\"to\":\"").as_deref() {
+        None => ConfirmTo::Kbs,
+        Some("guardian") => ConfirmTo::Guardian,
+        Some(_) => return Err("ctx-to"),
+    };
+    let timeline = match extract_json_string(text, "\"timeline\":\"") {
+        None => None,
+        Some(h) => Some(decode_hex_32(&h).ok_or("ctx-timeline-hex")?),
+    };
+    // A guardian confirm never carries a KBS timeline.
+    if to == ConfirmTo::Guardian && timeline.is_some() {
+        return Err("ctx-timeline");
+    }
 
     Ok(VolumeStampCtx {
         vm_id,
         target,
         token,
+        to,
+        timeline,
     })
 }
 
@@ -941,6 +1605,22 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 fn run_confirm(kbs_url: &str, ctx_path: &std::path::Path) -> Result<(), AgentError> {
     let ctx = read_volume_stamp_ctx(ctx_path).map_err(AgentError::Kbs)?;
 
+    // M2: the stamp is the guardian's — confirm there, over the
+    // guardian relay. The KBS is not involved. The answer must be signed
+    // by the guardian key the MEASURED cmdline pins, read again here
+    // (this is a separate process from the release).
+    if ctx.to == ConfirmTo::Guardian {
+        let cmdline = std::fs::read_to_string("/proc/cmdline")
+            .map_err(|_| AgentError::Guardian("cmdline-read"))?;
+        let binding = confirm_binding(&cmdline)?;
+        return confirm_to_guardian(
+            &GuardianVsockClient::new(),
+            &guardian_relay_url(),
+            &ctx,
+            &binding,
+        );
+    }
+
     // Same transport dispatch as `run` step 3 — reusing the exact
     // `HttpClient` abstraction rather than a second client.
     let http: Box<dyn HttpClient> = if is_vsock_url(kbs_url) {
@@ -949,8 +1629,8 @@ fn run_confirm(kbs_url: &str, ctx_path: &std::path::Path) -> Result<(), AgentErr
         Box::new(ReqwestHttpClient::new().map_err(|e| AgentError::Kbs(e.class()))?)
     };
 
-    let body =
-        encode_confirm_request(&ctx.vm_id, ctx.target, &ctx.token).map_err(AgentError::Kbs)?;
+    let body = encode_confirm_request(&ctx.vm_id, ctx.target, &ctx.token, ctx.timeline.as_ref())
+        .map_err(AgentError::Kbs)?;
     let url = format!(
         "{}/v1/kbs/volume-stamp/confirm",
         kbs_url.trim_end_matches('/')
@@ -960,6 +1640,66 @@ fn run_confirm(kbs_url: &str, ctx_path: &std::path::Path) -> Result<(), AgentErr
         return Err(AgentError::Kbs("confirm-http-status"));
     }
     decode_confirm_response(&response.body).map_err(AgentError::Kbs)
+}
+
+/// The measured binding an M2 confirm verifies its ack against: the same
+/// `/proc/cmdline` rules as release mode (a possibly-truncated cmdline or
+/// a grammar error fails closed), and it must be `customer` — only M2
+/// writes a guardian confirm context.
+fn confirm_binding(cmdline: &str) -> Result<GuardianBinding, AgentError> {
+    if cmdline_may_hide_key_mode(cmdline) {
+        return Err(AgentError::Guardian("cmdline-may-be-truncated"));
+    }
+    match GuardianBinding::from_cmdline(cmdline) {
+        Ok(Some(b)) if b.mode == KeyMode::Customer => Ok(b),
+        Ok(_) => Err(AgentError::Guardian("confirm-not-customer-mode")),
+        Err(_) => Err(AgentError::Guardian("cmdline-grammar")),
+    }
+}
+
+/// M2 confirm: `POST /v1/guardian/stamp/confirm` with the token the
+/// SIGNED guardian response sealed to this boot. The miner relays the
+/// answer, so it counts only as a [`SignedGuardianStampAck`] that
+/// verifies under the measured `guardian_pk` and echoes THIS confirm
+/// (`vm_id`, `target`, `sha256(token)`) — [`hippius_guest::verify_stamp_ack`].
+/// Anything else (unsigned, forged, another confirm's ack, a relay error)
+/// is an `Err`: the mandatory first-boot confirm retries and then fails
+/// closed, a later-boot confirm logs a warning. The stamp value itself is
+/// never read from the ack; the next boot's signed `expected_volume_stamp`
+/// is the only stamp the guest trusts.
+///
+/// [`SignedGuardianStampAck`]: hippius_types::guardian::SignedGuardianStampAck
+fn confirm_to_guardian(
+    relay: &dyn HttpClient,
+    relay_url: &str,
+    ctx: &VolumeStampCtx,
+    binding: &GuardianBinding,
+) -> Result<(), AgentError> {
+    let confirm = GuardianStampConfirm {
+        v: GUARDIAN_WIRE_V,
+        vm_id: ctx.vm_id.clone(),
+        target: ctx.target,
+        token: ctx.token.to_vec(),
+    };
+    let body =
+        encode_canonical(&confirm).map_err(|_| AgentError::Guardian("confirm-request-encode"))?;
+    let url = format!(
+        "{}{GUARDIAN_STAMP_CONFIRM_PATH}",
+        relay_url.trim_end_matches('/')
+    );
+    let response = relay.post_cbor(&url, &body)?;
+    if !(200..300).contains(&response.status) {
+        return Err(AgentError::Guardian("confirm-http-status"));
+    }
+    hippius_guest::verify_stamp_ack(&response.body, binding, &confirm).map_err(|e| {
+        AgentError::Guardian(match e {
+            hippius_guest::GuestError::Signature(_) => "confirm-ack-bad-signature",
+            hippius_guest::GuestError::Schema(_) => "confirm-ack-mismatch",
+            _ => "confirm-ack-decode",
+        })
+    })?;
+    eprintln!("hippius-guest-release: volume stamp confirm: guardian-signed ack verified");
+    Ok(())
 }
 
 /// Encode the `POST /v1/kbs/volume-stamp/confirm` request body —
@@ -972,13 +1712,19 @@ fn encode_confirm_request(
     vm_id: &str,
     target: u64,
     token: &[u8; 32],
+    timeline: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, &'static str> {
-    let value = Value::Map(vec![
+    let mut entries = vec![
         (Value::Text("vm_id".into()), Value::Text(vm_id.to_string())),
         (Value::Text("value".into()), Value::Integer(target.into())),
         (Value::Text("token".into()), Value::Bytes(token.to_vec())),
-    ]);
-    to_canonical_vec(&value).map_err(|_| "confirm-request-encode")
+    ];
+    // Stamp protocol v2 only; a v1 confirm body is byte-identical to
+    // before (`VolumeStampConfirmBody::timeline_id` is optional).
+    if let Some(t) = timeline {
+        entries.push((Value::Text("timeline_id".into()), Value::Bytes(t.to_vec())));
+    }
+    to_canonical_vec(&Value::Map(entries)).map_err(|_| "confirm-request-encode")
 }
 
 /// Decode a `VolumeStampConfirmResponse { confirmed: u64 }` body. Only
@@ -1077,6 +1823,12 @@ mod secret_out_path_tests {
                 "--userdata-out",
                 Path::new("/run/cloud-init/seed/user-data")
             ),
+            Ok(())
+        );
+        // M1/M2 (H5b): the golden overlay's staging path — the user-data
+        // reaches the seed only on the volume's first boot.
+        assert_eq!(
+            check_secret_out_path("--userdata-out", Path::new("/run/hippius/userdata.staged")),
             Ok(())
         );
         assert_eq!(
@@ -1302,7 +2054,15 @@ mod volume_stamp_ctx_tests {
     fn volume_stamp_ctx_round_trips_through_disk() {
         let path = tmp_path("roundtrip");
         let token = [0xABu8; 32];
-        write_volume_stamp_ctx(&path, "vm-abc", 4, 5, &token).unwrap();
+        write_volume_stamp_ctx(&path, "vm-abc", 4, 5, &token, ConfirmTo::Kbs, None).unwrap();
+        // The KBS ctx is byte-identical to the pre-customer-keys file.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!(
+                "{{\"vm_id\":\"vm-abc\",\"expected\":4,\"target\":5,\"token\":\"{}\"}}",
+                "ab".repeat(32)
+            )
+        );
 
         #[cfg(unix)]
         {
@@ -1315,7 +2075,37 @@ mod volume_stamp_ctx_tests {
         assert_eq!(ctx.vm_id, "vm-abc");
         assert_eq!(ctx.target, 5);
         assert_eq!(ctx.token, token);
+        assert_eq!(ctx.to, ConfirmTo::Kbs);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_guardian_ctx_names_its_target_and_round_trips() {
+        let path = tmp_path("guardian-ctx");
+        let token = [0xCDu8; 32];
+        write_volume_stamp_ctx(&path, "vm-abc", 41, 42, &token, ConfirmTo::Guardian, None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with(",\"to\":\"guardian\"}"), "{text}");
+        let ctx = read_volume_stamp_ctx(&path).unwrap();
+        assert_eq!(ctx.to, ConfirmTo::Guardian);
+        assert_eq!(ctx.target, 42);
+        assert_eq!(ctx.token, token);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_ctx_naming_an_unknown_target_is_refused() {
+        let path = tmp_path("bad-to");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"vm_id\":\"v\",\"expected\":1,\"target\":2,\"token\":\"{}\",\"to\":\"kbs2\"}}",
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(read_volume_stamp_ctx(&path), Err("ctx-to")));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1413,7 +2203,7 @@ mod volume_stamp_ctx_tests {
     #[test]
     fn encode_confirm_request_is_canonical_and_carries_the_three_fields() {
         let token = [0x11u8; 32];
-        let body = encode_confirm_request("vm-abc", 5, &token).unwrap();
+        let body = encode_confirm_request("vm-abc", 5, &token, None).unwrap();
         assert_canonical(&body).expect("confirm request body must be canonical CBOR");
         let value: Value = ciborium::de::from_reader(body.as_slice()).unwrap();
         let Value::Map(entries) = value else {
@@ -1438,6 +2228,87 @@ mod volume_stamp_ctx_tests {
             _ => None,
         });
         assert_eq!(token_field.as_deref(), Some(&token[..]));
+    }
+
+    /// Stamp protocol v2: the confirm names the timeline it stamped
+    /// (`timeline_id`, 32 bytes) — and only then; a v1 body keeps its
+    /// three fields.
+    #[test]
+    fn a_v2_confirm_carries_the_timeline_and_a_v1_one_does_not() {
+        let token = [0x11u8; 32];
+        let body = encode_confirm_request("vm-abc", 5, &token, Some(&[0x7c; 32])).unwrap();
+        assert_canonical(&body).unwrap();
+        let Value::Map(entries) = ciborium::de::from_reader::<Value, _>(body.as_slice()).unwrap()
+        else {
+            panic!("not a map");
+        };
+        assert_eq!(entries.len(), 4);
+        let t = entries.iter().find_map(|(k, v)| match (k, v) {
+            (Value::Text(k), Value::Bytes(b)) if k == "timeline_id" => Some(b.clone()),
+            _ => None,
+        });
+        assert_eq!(t.as_deref(), Some(&[0x7c; 32][..]));
+    }
+
+    /// A v2 ctx round-trips its timeline; a guardian ctx with a timeline,
+    /// or a timeline that is not 64 hex chars, is refused.
+    #[test]
+    fn a_v2_ctx_round_trips_its_timeline() {
+        let path = tmp_path("v2ctx");
+        let token = [0xABu8; 32];
+        write_volume_stamp_ctx(
+            &path,
+            "vm-abc",
+            4,
+            5,
+            &token,
+            ConfirmTo::Kbs,
+            Some(&[0x7c; 32]),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.ends_with(&format!(",\"timeline\":\"{}\"}}", "7c".repeat(32))),
+            "{text}"
+        );
+        let ctx = read_volume_stamp_ctx(&path).unwrap();
+        assert_eq!(ctx.timeline, Some([0x7c; 32]));
+        assert_eq!(ctx.to, ConfirmTo::Kbs);
+        std::fs::write(&path, text.replace(&"7c".repeat(32), "7c")).unwrap();
+        assert!(matches!(
+            read_volume_stamp_ctx(&path),
+            Err("ctx-timeline-hex")
+        ));
+        write_volume_stamp_ctx(&path, "vm-abc", 4, 5, &token, ConfirmTo::Guardian, None).unwrap();
+        let g = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            g.replace("}", &format!(",\"timeline\":\"{}\"}}", "7c".repeat(32))),
+        )
+        .unwrap();
+        assert!(matches!(read_volume_stamp_ctx(&path), Err("ctx-timeline")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The transition file: `<expected hex> <target hex>\n` at 0644 for a
+    /// v2 release; REMOVED (never left stale) for a v1 one.
+    #[test]
+    fn the_transition_file_is_written_for_v2_and_removed_for_v1() {
+        let path = tmp_path("transition");
+        write_volume_stamp_transition(&path, Some(&([0xa1; 32], [0xb2; 32]))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{} {}\n", "a1".repeat(32), "b2".repeat(32))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644);
+        }
+        write_volume_stamp_transition(&path, None).unwrap();
+        assert!(!path.exists(), "a v1 release leaves no transition behind");
+        write_volume_stamp_transition(&path, None).unwrap();
     }
 
     #[test]

@@ -120,6 +120,32 @@ pub const LIFECYCLE_STOPPED_PATH: &str = "/v1/lifecycle/stopped";
 /// test still passed.
 pub const KBS_KEEPALIVE_PATH: &str = "/v1/attest/keepalive";
 
+/// Custody lease bind (see [`crate::custody`]) — attested, rare.
+pub const KBS_CUSTODY_BIND_PATH: &str = "/v1/kbs/custody/bind";
+
+/// Custody lease renew — lease-key signed, every few minutes.
+pub const KBS_CUSTODY_RENEW_PATH: &str = "/v1/kbs/custody/renew";
+
+/// Custody lease rekey — lease-key signed, after a suspend.
+pub const KBS_CUSTODY_REKEY_PATH: &str = "/v1/kbs/custody/rekey";
+
+/// The custody paths, all forwarded to the KBS. Kept as their own list
+/// (as well as in [`ALLOWED_PATHS`]) because the relay gates them behind
+/// its own switch and rate limit: a guest's custody daemon talks far more
+/// often than its initramfs does, and a miner-agent that predates the
+/// KBS routes must be able to refuse them locally.
+///
+/// Same fail-closed asymmetry as [`KBS_VOLUME_STAMP_CONFIRM_PATH`]: the
+/// guest reaches the KBS only over vsock, so a path missing from
+/// [`ALLOWED_PATHS`] fails every real renew with `vsock-path-forbidden`
+/// while every https-based test still passes — and here the failure is
+/// a suspended tenant disk at the lease deadline.
+pub const CUSTODY_PATHS: &[&str] = &[
+    KBS_CUSTODY_BIND_PATH,
+    KBS_CUSTODY_RENEW_PATH,
+    KBS_CUSTODY_REKEY_PATH,
+];
+
 /// The paths the proxy is allowed to forward — matched against the
 /// **path component only** (any `?query` is stripped before the check;
 /// see [`is_allowed_path`]). Restricting this is load-bearing: it stops
@@ -128,13 +154,18 @@ pub const KBS_KEEPALIVE_PATH: &str = "/v1/attest/keepalive";
 /// - the two §21 KBS release endpoints (forwarded to the KBS),
 /// - the volume-stamp confirm (forwarded to the KBS),
 /// - the §23 keepalive live-attestation mint (forwarded to the KBS), and
-/// - the §24/§25 guest stopped-ack ingress (forwarded to vali).
+/// - the §24/§25 guest stopped-ack ingress (forwarded to vali), and
+/// - the three custody-lease endpoints ([`CUSTODY_PATHS`], forwarded to
+///   the KBS; the relay additionally gates them, see there).
 pub const ALLOWED_PATHS: &[&str] = &[
     KBS_NONCE_PATH,
     KBS_RELEASE_PATH,
     KBS_VOLUME_STAMP_CONFIRM_PATH,
     KBS_KEEPALIVE_PATH,
     LIFECYCLE_STOPPED_PATH,
+    KBS_CUSTODY_BIND_PATH,
+    KBS_CUSTODY_RENEW_PATH,
+    KBS_CUSTODY_REKEY_PATH,
 ];
 
 /// Split a request `path` into its path component and the raw query
@@ -165,6 +196,12 @@ pub fn is_allowed_path(path: &str) -> bool {
 pub fn is_lifecycle_path(path: &str) -> bool {
     let (component, _query) = split_query(path);
     component == LIFECYCLE_STOPPED_PATH
+}
+
+/// `true` iff `path` (ignoring any `?query`) is a custody-lease endpoint.
+pub fn is_custody_path(path: &str) -> bool {
+    let (component, _query) = split_query(path);
+    CUSTODY_PATHS.contains(&component)
 }
 
 /// Guest → host: "POST this body to `<kbs_url><path>` and give me the
@@ -234,6 +271,20 @@ mod tests {
         assert!(!is_allowed_path(
             "/v1/admin/allowlist/reload?vm_id=x&generation=1"
         ));
+    }
+
+    #[test]
+    fn custody_paths_are_forwarded_to_the_kbs_and_flagged_as_custody() {
+        for p in CUSTODY_PATHS {
+            assert!(is_allowed_path(p), "{p} must be relayable");
+            assert!(is_custody_path(p));
+            assert!(!is_lifecycle_path(p), "{p} goes to the KBS, not vali");
+        }
+        assert!(is_custody_path("/v1/kbs/custody/renew?x=1"));
+        assert!(!is_custody_path(KBS_RELEASE_PATH));
+        assert!(!is_custody_path("/v1/kbs/custody"));
+        assert!(!is_custody_path("/v1/kbs/custody/other"));
+        assert!(!is_allowed_path("/v1/kbs/custody/other"));
     }
 
     #[test]

@@ -70,8 +70,8 @@ DIFFERENT question from "can this host start one?". Only an observed
 self-recovering**, not a permanent per-host wedge. Measured on the live
 fleet at the time of writing:
 
-- miner-3: 105 CVM start attempts over 22 days, **one** such failure;
-- miner-2: **three** such failures in ~5 days — and it started a CVM
+- host A: 105 CVM start attempts over 22 days, **one** such failure;
+- host B: **three** such failures in ~5 days — and it started a CVM
   successfully between each, unaided.
 
 (The `kvm_amd: SEV-SNP: DF_FLUSH failed` line that accompanies it is
@@ -82,7 +82,7 @@ Two design consequences follow directly, and they are the reason this
 module counts rather than latches:
 
 1. **A single failure must never hard-exclude a host.** Under that rule
-   miner-2 would have been pulled out of the fleet three times in five
+   host B would have been pulled out of the fleet three times in five
    days for a condition it recovered from by itself. One failure buys a
    *decaying soft* penalty (`DEGRADED`) and nothing more.
 2. **The expensive part is not the failure, it is giving up on it.** A
@@ -109,6 +109,14 @@ cleanly:
 - `insufficient-resources` (503) says the host is FULL. That is capacity,
   which #668's fit gate already models; a full host is not an incapable
   one.
+- `insufficient-disk` (507) — and any class naming `insufficient-space`
+  — says the host has no room for the VM's DATA disk. Capacity again,
+  modelled by vali's disk gate; charged to the host's earned DISK ceiling
+  (`capacity_earn.DISK_INSUFFICIENT`), never to its SEV record. Legacy
+  agents answered a disk-full LAUNCH as a generic `dispatch-failed` (the
+  `data-disk/insufficient-space` detail was only logged on the host), so
+  those remain indistinguishable from a real start failure and still
+  count — there is no honest way to excuse them.
 - `vsock-cid-exhausted` (503) is CID allocation — the same-miner dispatch
   retry exists precisely for it, and it says nothing about SEV.
 - `ticket-delivery-failed` (500) fires only AFTER the domain reached
@@ -151,7 +159,7 @@ once too often, which is soft, self-clearing and visible.
 
 Why 3-consecutive-within-an-hour: against the measured base rate above,
 isolated failures are followed by a success on the very next attempt, so
-a streak cannot form — miner-2 never exceeds 1. Three back-to-back with
+a streak cannot form — host B never exceeds 1. Three back-to-back with
 nothing succeeding in between is a qualitatively different signal, and
 the hour bound keeps it a statement about NOW: failures from yesterday
 cannot accumulate into today's verdict (the streak is restarted at write
@@ -181,9 +189,9 @@ no evidence whatsoever that it had recovered. On 2026-08-13 that cost a
 second tenant launch, and the trace is unambiguous:
 
 ```
-12:00:02  synmon-cs10-…  → miner-3   3 dispatches, all rejected
+12:00:02  synmon-cs10-…  → miner-c   3 dispatches, all rejected
 12:01:20  ledger: streak=3  ⇒ INCAPABLE          ← the gate worked
-13:51:10  stamp-fed-1    → miner-3   ← 1 h 50 m later: streak aged out,
+13:51:10  stamp-fed-1    → miner-c   ← 1 h 50 m later: streak aged out,
                                        verdict UNKNOWN, and an idle host
                                        has the FREEST capacity, so it
                                        ranked FIRST again
@@ -191,7 +199,7 @@ second tenant launch, and the trace is unambiguous:
                                                    burned launch later
 ```
 
-Two miners were `PROVEN` at that moment. Nothing needed miner-3, and
+Two miners were `PROVEN` at that moment. Nothing needed miner-c, and
 nothing had observed it recover — the clock alone re-admitted it.
 
 So the hard exclusion now relaxes in TWO stages instead of one:
@@ -290,9 +298,13 @@ CLASSES_NOT_START_CAPABILITY = frozenset(
         # ── the dispatch reached the lifecycle, but not the SEV start ──
         "launch-input",  # 422 — bad order/digest: the VM's fault
         "insufficient-resources",  # 503 — the host is FULL (capacity, #668)
+        # (507 `insufficient-disk` and every `*insufficient-space*` class —
+        # no room for the DATA disk — are excused by `is_disk_refusal`.)
         "vsock-cid-exhausted",  # 503 — CID allocation; the retry clears it
         "ticket-delivery-failed",  # 500 — domain ALREADY reached Running
         "not-yet-wired",  # 501 — miner-agent build skew
+        "relaunch-disks-missing",  # 412 — this host lacks the VM's disks
+        "relaunch-disks-unreadable",  # 503 — could not stat them (retryable)
         # ── the order never reached the lifecycle at all ──────────────
         # Usually a vali-side minting/clock fault every miner would
         # reject identically — counting it could empty the fleet through
@@ -311,6 +323,22 @@ CLASSES_NOT_START_CAPABILITY = frozenset(
         "bad-vm-id",
     }
 )
+
+
+#: Substring that marks a DISK refusal whatever the exact class a miner
+#: build names it (`data-disk/insufficient-space`, `…/insufficient-space`).
+DISK_REFUSAL_MARKER = "insufficient-space"
+
+
+def is_disk_refusal(classifier: str) -> bool:
+    """Is a miner rejection class a DATA-disk capacity refusal — the 507
+    `insufficient-disk`, or any class containing `insufficient-space`?
+
+    Miner-controlled, like every class: it can only move a failure from
+    the host's SEV record to its (earned) disk ceiling — a cut to its OWN
+    capacity — never mark a rival."""
+    c = (classifier or "").strip().lower()[:_MAX_REASON]
+    return c == "insufficient-disk" or DISK_REFUSAL_MARKER in c
 
 
 def is_start_capability_failure(classifier: str) -> bool:
@@ -334,9 +362,65 @@ def is_start_capability_failure(classifier: str) -> bool:
     it. It can never mark a rival, and it can never buy `PROVEN`
     (`record_start_ok` is written from a 2xx, not from a string).
     """
+    if is_disk_refusal(classifier):
+        return False
     return (classifier or "").strip().lower()[:_MAX_REASON] not in (
         CLASSES_NOT_START_CAPABILITY
     )
+
+
+# §25 dest-activation failure classes (`migration/<class>` on the dest's
+# status route) that end the attempt BEFORE any CVM start: the restore never
+# reached a boot, so its failure says nothing about SEV. Same direction as
+# `CLASSES_NOT_START_CAPABILITY` — a deny-list of excuses; anything else,
+# including no class at all (an agent predating the field), still counts.
+DEST_ACTIVATION_CLASSES_NOT_START_CAPABILITY = frozenset(
+    {
+        "migration/dest-settle-by-passed",  # vali's deadline left no room
+        "migration/dest-artifacts-missing",  # boot artifacts absent
+        "migration/state-disk-size",  # the source's state disk is malformed
+        "migration/activate-on-source",  # this host is the VM's source
+        # A same-host restore's staged-swap refusals — the staged overlay is
+        # gone, staging was never `Staged`, a swap-in-progress marker
+        # conflicts, or the staged/live artifacts don't match what was
+        # recorded at stage time. All of these are decided by `swap_in`
+        # BEFORE any domain start is attempted (see `service._h_mig_dest_
+        # activating`'s `_TERMINAL_RESTORE_ACTIVATION_CLASSES`, which treats
+        # the same classes as a terminal, no-retry refusal for the same
+        # reason): the tenant's own staging state, not this host's SEV
+        # capability.
+        "migration/restore-staged-missing",
+        "migration/restore-not-staged",
+        "migration/staged-restore-conflict",
+        "migration/restore-size-mismatch",
+        "migration/restore-swap-conflict",
+    }
+)
+DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY = (
+    "migration/snapshot-",  # snapshot download / verification / its budget
+    "migration/download-",  # a presigned GET failed
+    "migration/dest-artifact-",  # artifact staging (sha mismatch, budget, …)
+    "migration/chain-",  # a backup-chain restore was refused
+    "backup/",  # the backup-chain restore itself failed
+)
+
+
+def is_dest_activation_start_failure(failure_class: str) -> bool:
+    """Is a `failed` §25 dest activation evidence that this HOST cannot
+    start a confidential guest?
+
+    `False` only for the excused classes above — a restore that failed
+    before any boot. `True` for everything else, `""` included, so an agent
+    that reports no class keeps today's behaviour. Like
+    `is_start_capability_failure`, the class is miner-controlled and can
+    only remove a penalty from the host that reported it.
+    """
+    c = (failure_class or "").strip().lower()[:_MAX_REASON]
+    if c in DEST_ACTIVATION_CLASSES_NOT_START_CAPABILITY or is_disk_refusal(c):
+        # A dest with no room for the restore (`…/insufficient-space`)
+        # never reached a boot either.
+        return False
+    return not c.startswith(DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY)
 
 
 def fail_window_s() -> int:
@@ -469,6 +553,15 @@ def _classify_row(
         fail_threshold=thresh,
         proof_ttl_s=ttl,
         probation_s=prob,
+    )
+
+
+def capability_of_row(row: Any, *, now: datetime | None = None) -> str:
+    """The verdict for ONE already-loaded `MinerCapacity` row — for a
+    caller that holds the mirror rows (the operator fleet readout) and
+    must not re-query them. Same policy as [`capability_by_node`]."""
+    return _classify_row(
+        row, now or timezone.now(), fail_window_s(), fail_threshold(), proof_ttl_s(), probation_s()
     )
 
 

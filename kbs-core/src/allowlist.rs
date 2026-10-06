@@ -642,6 +642,58 @@ mod tests {
         assert_eq!(al.epoch().unwrap(), Some(1));
     }
 
+    /// A resize (any accepted relaunch) makes vali install an allowlist
+    /// that no longer carries the earlier launch's measurement. The old
+    /// ticket names exactly that measurement, so the release gate refuses
+    /// it — the old size cannot get its key — while the new launch's
+    /// ticket keeps working. Before the eviction lands (a failed relaunch,
+    /// the rollback case) the old ticket still releases.
+    #[test]
+    fn an_evicted_launch_measurement_no_longer_releases() {
+        use crate::snp::{check_attestation, LaunchPolicy, VerifiedReport};
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let (old, new) = ([7u8; 48], [8u8; 48]);
+        let al = InstalledAllowlist::new(sk.verifying_key(), Box::new(InMemoryHwm::default()));
+        let rd = [3u8; 64];
+        let policy = LaunchPolicy {
+            min_tcb: 0,
+            required_bits: 0,
+            allowed_mask: u64::MAX,
+        };
+        let release = |measurement: [u8; 48]| {
+            let report = VerifiedReport {
+                measurement,
+                report_data: rd,
+                tcb: 1,
+                policy: 0,
+                chip_id: [0u8; 64],
+                chain_pem: Vec::new(),
+            };
+            // Each launch's ticket allows exactly its own measurement.
+            check_attestation(&report, &[measurement.to_vec()], &al, &rd, &policy)
+        };
+
+        // The relaunch is pinned (both carried) but not accepted yet.
+        al.install(&sign_artifact(&sk, &body_value(1, &[old, new])))
+            .unwrap();
+        assert!(
+            release(old).is_ok(),
+            "the old size stays valid until the relaunch is accepted"
+        );
+        assert!(release(new).is_ok());
+
+        // Accepted ⇒ vali re-installs without the superseded measurement.
+        al.install(&sign_artifact(&sk, &body_value(2, &[new])))
+            .unwrap();
+        let denied = release(old).unwrap_err().to_string();
+        assert!(denied.contains("not in offline KBS allowlist"), "{denied}");
+        assert!(release(new).is_ok());
+        // And the older artifact cannot be replayed to bring it back.
+        assert!(al
+            .install(&sign_artifact(&sk, &body_value(1, &[old, new])))
+            .is_err());
+    }
+
     #[test]
     fn bad_signature_denied() {
         let sk = SigningKey::from_bytes(&[1u8; 32]);

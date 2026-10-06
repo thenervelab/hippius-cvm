@@ -1,0 +1,60 @@
+#!/bin/sh
+# initramfs-tools hook: keep BUILD-HOST state out of the tenant initrd.
+#
+# The bake runs update-initramfs in a chroot with the build host's /dev,
+# /proc and /sys bind-mounted (apt and the kernel postinst need them), so
+# three stock hooks write the HOST's state into the guest initrd:
+#   - mdadm: the guest mdadm.conf lists no ARRAY, so the hook runs
+#     `mkconf` against the host's /proc/mdstat and ships the host's md
+#     arrays (the build host's own md arrays in the 2026-08 golden bakes),
+#     or a mkconf leftover `mdadm.conf.tmp`;
+#   - mdadm: `force_load efivarfs` whenever the HOST has /sys/firmware/efi;
+#   - overlayroot (Ubuntu): 4 KiB of the host's /dev/random as
+#     /.random-seed. Only overlayroot's crypt: mode reads it, it only
+#     writes it to /dev/urandom (credits no entropy), and the golden image
+#     runs overlayroot disabled — but a published initrd must not carry
+#     build-host randomness, and it made every initrd byte-unique.
+#
+# Hooks under /etc/initramfs-tools/hooks run AFTER every
+# /usr/share/initramfs-tools/hooks one (mkinitramfs), so this one sees
+# the finished DESTDIR and puts back the GUEST's own view:
+#   - no /.random-seed (overlayroot treats a missing seed as "skip");
+#   - the guest's own /etc/mdadm/mdadm.conf (CREATE commented out, as the
+#     mdadm hook does), no mkconf output, no leftover;
+#   - efivarfs (load line + any copied .ko) dropped unless the guest's own
+#     /etc/initramfs-tools/modules asks for it (systemd mounts efivarfs
+#     itself after switch_root; the load was only for Intel RST IMSM).
+# A no-op on a base without mdadm / overlayroot (Debian genericcloud).
+# tenant-image-bake.sh re-checks the shipped initrd (exit 3).
+#
+# HIPPIUS_HOST_STATE_ROOT: test seam — prefix for the guest's own config
+# files (unset in the guest, where the hook runs inside the chroot).
+
+PREREQ=""
+prereqs() { echo "${PREREQ}"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+set -e
+: "${DESTDIR:?DESTDIR unset — not run by mkinitramfs}"
+guest="${HIPPIUS_HOST_STATE_ROOT:-}"
+
+rm -f "${DESTDIR}/.random-seed"
+
+if [ -d "${DESTDIR}/etc/mdadm" ]; then
+    rm -f "${DESTDIR}/etc/mdadm/mdadm.conf.tmp"
+    if [ -f "${guest}/etc/mdadm/mdadm.conf" ]; then
+        sed '/^CREATE/s/^/#/' "${guest}/etc/mdadm/mdadm.conf" > "${DESTDIR}/etc/mdadm/mdadm.conf"
+    else
+        rm -f "${DESTDIR}/etc/mdadm/mdadm.conf"
+    fi
+fi
+
+if ! grep -qx 'efivarfs' "${guest}/etc/initramfs-tools/modules" 2>/dev/null; then
+    [ ! -f "${DESTDIR}/conf/modules" ] || sed -i '/^efivarfs$/d' "${DESTDIR}/conf/modules"
+    # force_load also copies the module when it is not built in (Ubuntu:
+    # before /etc hooks run). depmod runs after the hooks.
+    find "${DESTDIR}" -path '*/lib/modules/*' -name 'efivarfs.ko*' -exec rm -f {} + 2>/dev/null || true
+fi
+exit 0

@@ -45,6 +45,11 @@ data:
   # `read-miner-status` is built `--features tls` so it reaches this
   # HTTPS testnet over vali's `world:443` egress. Empty ⇒ fail-closed.
   VALI_THEBRAIN_RPC_URL: {{ .Values.config.thebrainRpcUrl | quote }}
+  # Miner geolocation: only a `verified` detected location counts for the
+  # scheduler's `region` gate and for GET /v1/operator/regions.
+  VALI_GEO_REQUIRE_VERIFIED: {{ .Values.config.geoRequireVerified | quote }}
+  # Public IPs: how long a released address is held away from other tenants.
+  VALI_PUBLIC_IP_QUARANTINE_S: {{ required "config.publicIpQuarantineS is required" .Values.config.publicIpQuarantineS | quote }}
   # The single `ServiceClient.name` that `IsMinerAdmin` accepts on the
   # miner-register / quarantine endpoints. Seeded by `manage.py
   # vali_identity_seed_miner_admin` — see vali/apps/miners/README.md.
@@ -174,6 +179,13 @@ data:
   VALI_SNP_OVMF_S3_URI: {{ .Values.config.snpOvmfS3Uri | default "" | quote }}
   VALI_SNP_OVMF_SHA256: {{ .Values.config.snpOvmfSha256 | default "" | quote }}
   VALI_SNP_GUEST_FEATURES: {{ .Values.config.snpGuestFeatures | default "0x1" | quote }}
+  # Per-pod cache of the sha-pinned recompute inputs (OVMF, each bake's
+  # kernel/initrd), re-verified on every load. The directory is the
+  # dedicated `artifact-cache` emptyDir the launch-path deployments mount
+  # (vali, launch-tick, orchestration-tick); keep MAX_BYTES under its
+  # sizeLimit. A pod without the mount degrades to direct fetches.
+  VALI_ARTIFACT_CACHE_DIR: "/var/cache/vali-artifacts"
+  VALI_ARTIFACT_CACHE_MAX_BYTES: "314572800"
   VALI_LAUNCH_DIGEST_ENFORCE: {{ .Values.config.launchDigestEnforce | default false | quote }}
   VALI_KBS_ALLOWLIST_TOOL_BIN: "/usr/local/bin/hippius-kbs-allowlist-tool"
   # In-cluster manifest TOML the auto-pin reads + bumps + signs. The
@@ -278,8 +290,8 @@ data:
   VALI_EPOCH_WEIGHT_SOURCE: {{ .Values.epochWeightSource | default "snapshot" | quote }}
   # §23 — VM owners (the launch spec's `user_id`, recorded as
   # `Placement.owner`) whose usage earns NO reward weight and NO bill:
-  # OUR OWN infrastructure. Measured live 2026-08-11, operator VMs held
-  # 30.6 % of the reward pot. The synthetic monitor's own tenant
+  # the operator's OWN infrastructure, which would otherwise dilute the
+  # reward pot away from honest miners. The synthetic monitor's own tenant
   # (`VALI_SYNTHETIC_TENANT_ID`) is excluded by construction and does NOT
   # need to be listed here — this is for the OTHER operator identities
   # (rehearsals, proofs). Empty ⇒ only the synthetic tenant is excluded.
@@ -296,6 +308,11 @@ data:
   VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION: {{ required "uptimeLiveness.requireAttestation must be set explicitly — false keeps today's accrual, true credits only SNP-attested-alive time; see values.yaml for the arming sequence" .Values.uptimeLiveness.requireAttestation | quote }}
   VALI_UPTIME_LIVENESS_COVERAGE_S: {{ .Values.uptimeLiveness.coverageSeconds | quote }}
   VALI_UPTIME_LIVENESS_GRACE_S: {{ .Values.uptimeLiveness.graceSeconds | quote }}
+  VALI_GUEST_ATTEST_RESOURCES: {{ .Values.guestResources.attest | default false | quote }}
+  VALI_GUEST_RESOURCES_ENFORCE: {{ .Values.guestResources.enforce | default false | quote }}
+  VALI_GUEST_ACCEPT_MEMORY_EAGER: {{ .Values.guestResources.acceptMemoryEager | default false | quote }}
+  VALI_GUEST_MEM_FIRMWARE_SLACK_MIB: {{ .Values.guestResources.memFirmwareSlackMib | default 64 | quote }}
+  VALI_GUEST_MEM_TOTAL_SLACK_MIB: {{ .Values.guestResources.memTotalSlackMib | default 256 | quote }}
   # §23 placement concentration cap (soft): de-prioritise a miner already
   # hosting ≥ this fraction of all active placements, so tenant VMs spread
   # across the fleet instead of piling on the single cheapest miner. 1.0 =
@@ -313,6 +330,17 @@ data:
   VALI_SCHEDULER_HOST_RESERVE_MEMORY_MB: {{ .Values.scheduler.hostReserveMemoryMb | quote }}
   VALI_SCHEDULER_SLOT_REF_CPUS: {{ .Values.scheduler.slotRefCpus | quote }}
   VALI_SCHEDULER_SLOT_REF_MEMORY_MB: {{ .Values.scheduler.slotRefMemoryMb | quote }}
+  # The largest flavor a tenant may launch — a commercial cap, not a
+  # hardware verdict (`flavors.max_offered_flavor`; a typo crash-loops vali
+  # at start rather than failing every launch).
+  VALI_SCHEDULER_MAX_FLAVOR: {{ .Values.scheduler.maxFlavor | quote }}
+  # Capacity v2 — see values.yaml `scheduler.resourceAdmission`.
+  VALI_SCHEDULER_RESOURCE_ADMISSION: {{ .Values.scheduler.resourceAdmission | quote }}
+  VALI_SCHEDULER_CPU_OVERCOMMIT: {{ .Values.scheduler.cpuOvercommit | quote }}
+  VALI_SCHEDULER_PER_VM_OVERHEAD_MB: {{ .Values.scheduler.perVmOverheadMb | quote }}
+  # Customer-held disk keys (M1 split / M2 customer) on NEW launches — see
+  # values.yaml `customerKeys.enabled`.
+  VALI_CUSTOMER_KEYS_ENABLED: {{ .Values.customerKeys.enabled | quote }}
   # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids
   # (distro → Succeeded golden bake_id, JSON) + the Pushgateway URL result
   # metrics are pushed to. Every other VALI_SYNTHETIC_* knob keeps its

@@ -33,10 +33,12 @@
 //! root MUST sign over `(record_count, head)` periodically. This
 //! module is the substrate that root will sign over.
 
+use crate::audit_journal::{self, ChainFiles, Walk};
+use crate::audit_read::{self, AuditPage, LogIndex};
 use crate::error::{KbsError, Result};
 use crate::release::AuditSink;
 use ciborium::value::Value;
-use hippius_types::cbor::{assert_canonical, to_canonical_vec};
+use hippius_types::cbor::to_canonical_vec;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -50,6 +52,11 @@ pub const AUDIT_DOMAIN: &str = "HIPPIUS_KBS_AUDIT_V1";
 const LOG_FILENAME: &str = "audit.log";
 const HEAD_FILENAME: &str = "head.sha256";
 const LOCK_FILENAME: &str = "audit.lock";
+const FILES: ChainFiles = ChainFiles {
+    label: "audit",
+    log: LOG_FILENAME,
+    head: HEAD_FILENAME,
+};
 
 /// Durable file-backed sink with a single-file append-only log + hash
 /// chain + cross-process advisory lock.
@@ -69,6 +76,9 @@ struct HeadState {
     prev_hash: [u8; 32],
     /// Next sequence number to issue (== record count so far).
     next_seq: u64,
+    /// Byte index of `audit.log` for the read route
+    /// (`crate::audit_read`).
+    index: LogIndex,
 }
 
 impl FileAuditSink {
@@ -77,6 +87,12 @@ impl FileAuditSink {
     /// `audit.log` to derive the true tail — `head.sha256` is treated
     /// as a cache and repaired on disagreement.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_at(dir, unix_now())
+    }
+
+    /// [`Self::open`] with the clock of an `audit-truncated` record chained
+    /// at open (tests and the shared wire fixture pin it).
+    pub fn open_at(dir: impl Into<PathBuf>, now_unix: u64) -> Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)
             .map_err(|e| KbsError::Vault(format!("audit create_dir_all: {e}")))?;
@@ -92,34 +108,21 @@ impl FileAuditSink {
         lock.lock()
             .map_err(|e| KbsError::Vault(format!("audit lock acquire: {e}")))?;
 
-        // Walk the log to compute the real tail. If the log is
-        // absent, the chain is fresh (prev_hash = 0). `head.sha256` is
-        // repaired if it doesn't agree.
-        let verified = walk_log(&dir)?;
-        let head_path = dir.join(HEAD_FILENAME);
-        match fs::read(&head_path) {
-            Ok(bytes) if bytes == verified.head => {}
-            Ok(bytes) if bytes.is_empty() && verified.records == 0 => {}
-            Ok(_) => {
-                // Stale or empty/zero head + records present (or vice
-                // versa) — repair to match the log.
-                write_head_atomic(&dir, &verified.head)?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if verified.records > 0 {
-                    write_head_atomic(&dir, &verified.head)?;
-                }
-            }
-            Err(e) => return Err(KbsError::Vault(format!("audit head read: {e}"))),
-        }
-        // Also clean up any stale temp head from a crashed prior run.
-        let _ = fs::remove_file(dir.join(format!("{HEAD_FILENAME}.tmp")));
+        // Walk the log to compute the real tail. Journal semantics — see
+        // `crate::audit_journal`: a torn trailing record is truncated (and
+        // an `audit-truncated` record chained in its place), a stale head is
+        // repaired; only a state no crash produces refuses.
+        let opened = audit_journal::open_recover(&dir, FILES, walk_bytes, |prev, seq, torn| {
+            let reason = torn.marker_reason(seq);
+            Self::build_record(prev, seq, false, None, None, &reason, now_unix)
+        })?;
         Ok(Self {
             dir,
             _lock: lock,
             state: Mutex::new(HeadState {
-                prev_hash: verified.head,
-                next_seq: verified.records,
+                prev_hash: opened.head,
+                next_seq: opened.records,
+                index: opened.index,
             }),
         })
     }
@@ -191,24 +194,36 @@ impl FileAuditSink {
         h.copy_from_slice(Sha256::digest(&body).as_slice());
 
         // Append the line. Format `<seq>:<hex_body>:<hex_hash>\n`.
-        let log_path = self.dir.join(LOG_FILENAME);
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| KbsError::Vault(format!("audit open: {e}")))?;
         let line = format!("{seq}:{}:{}\n", hex::encode(&body), hex::encode(h));
-        f.write_all(line.as_bytes())
-            .map_err(|e| KbsError::Vault(format!("audit write: {e}")))?;
-        f.sync_all()
-            .map_err(|e| KbsError::Vault(format!("audit fsync: {e}")))?;
+        let offset = audit_journal::append_line(&self.dir, FILES, g.index.end(), line.as_bytes())?;
 
         // Update head pointer via atomic rename.
-        write_head_atomic(&self.dir, &h)?;
-
+        // The record is durable from here: advance the chain state BEFORE
+        // the head cache, so a failed head write cannot leave a persisted
+        // record outside the index (and the next append re-using its seq).
         g.prev_hash = h;
         g.next_seq = seq.saturating_add(1);
+        g.index.push(offset, line.len() as u64, h);
+
+        // Head pointer: a cache, repaired from the log at every open.
+        audit_journal::write_head_atomic(&self.dir, FILES, &h)?;
         Ok(h)
+    }
+
+    /// One page of the persisted chain for `GET /v1/admin/audit`: records
+    /// after `after_seq` (from `seq=0` when `None`), at most `limit`
+    /// (clamped to `1..=ADMIN_AUDIT_PAGE_MAX`). Read-only — see
+    /// `crate::audit_read`. The mutex is held only to cut the snapshot,
+    /// so a release never waits on the disk read.
+    pub fn read_page(&self, after_seq: Option<u64>, limit: u32) -> Result<AuditPage> {
+        let snap = {
+            let g = self
+                .state
+                .lock()
+                .map_err(|_| KbsError::Vault("audit lock poisoned".into()))?;
+            g.index.snapshot(g.prev_hash, after_seq, limit)
+        };
+        audit_read::read_snapshot(&self.dir.join(LOG_FILENAME), snap)
     }
 
     /// Read all records back, recompute the chain, return the
@@ -247,141 +262,51 @@ pub struct VerifiedAudit {
 }
 
 /// Read + decode + chain-check the log file. Returns the records
-/// count and the computed tail hash. Does NOT touch `head.sha256` —
-/// the caller decides whether to reconcile.
+/// count and the computed tail hash. Does NOT touch `head.sha256`. Strict:
+/// a torn tail is an error here (open has already truncated any).
 fn walk_log(dir: &std::path::Path) -> Result<VerifiedAudit> {
-    let log_path = dir.join(LOG_FILENAME);
-    let head_path = dir.join(HEAD_FILENAME);
-    let bytes = match fs::read(&log_path) {
+    let bytes = match fs::read(dir.join(LOG_FILENAME)) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Log missing. If head exists with a non-zero hash, the
-            // log was deleted out from under us — tamper.
-            match fs::read(&head_path) {
-                Ok(h) if h.iter().all(|b| *b == 0) => {}
-                Ok(h) if h.is_empty() => {}
-                Ok(_) => {
-                    return Err(KbsError::Vault(
-                        "audit log missing but head.sha256 references records (tamper)".into(),
-                    ))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(KbsError::Vault(format!("audit head probe: {e}"))),
-            }
-            return Ok(VerifiedAudit {
-                records: 0,
-                head: [0u8; 32],
-            });
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(KbsError::Vault(format!("audit walk read: {e}"))),
     };
-    if bytes.is_empty() {
-        // Empty log file. Head must be absent or zero.
-        match fs::read(&head_path) {
-            Ok(h) if h.iter().all(|b| *b == 0) => {}
-            Ok(h) if h.is_empty() => {}
-            Ok(_) => {
-                return Err(KbsError::Vault(
-                    "audit log empty but head.sha256 references records (tamper)".into(),
-                ))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(KbsError::Vault(format!("audit head probe: {e}"))),
-        }
-        return Ok(VerifiedAudit {
-            records: 0,
-            head: [0u8; 32],
-        });
-    }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|e| KbsError::Vault(format!("audit log not utf8: {e}")))?;
-    let mut expected_prev = [0u8; 32];
-    let mut records = 0u64;
-    let mut last_hash = [0u8; 32];
-    for (lineno, raw) in text.lines().enumerate() {
-        let mut parts = raw.splitn(3, ':');
-        let seq_str = parts
-            .next()
-            .ok_or_else(|| KbsError::Vault(format!("audit line {lineno}: missing seq")))?;
-        let body_hex = parts
-            .next()
-            .ok_or_else(|| KbsError::Vault(format!("audit line {lineno}: missing body")))?;
-        let hash_hex = parts
-            .next()
-            .ok_or_else(|| KbsError::Vault(format!("audit line {lineno}: missing hash")))?;
-        let line_seq: u64 = seq_str
-            .parse()
-            .map_err(|_| KbsError::Vault(format!("audit line {lineno}: bad seq")))?;
-        if line_seq != records {
-            return Err(KbsError::Vault(format!(
-                "audit line {lineno}: seq {line_seq} != expected {records}"
-            )));
-        }
-        let body = hex::decode(body_hex)
-            .map_err(|_| KbsError::Vault(format!("audit line {lineno}: bad body hex")))?;
-        // Strict: canonical CBOR + correct domain + matching seq +
-        // matching prev_hash, ALL enforced before we accept the line.
-        assert_canonical(&body)
-            .map_err(|e| KbsError::Vault(format!("audit line {lineno}: non-canonical: {e}")))?;
-        let decoded = decode_strict(&body)
-            .ok_or_else(|| KbsError::Vault(format!("audit line {lineno}: invalid schema")))?;
-        if decoded.domain != AUDIT_DOMAIN {
-            return Err(KbsError::Vault(format!(
-                "audit line {lineno}: wrong domain"
-            )));
-        }
-        if decoded.seq != line_seq {
-            return Err(KbsError::Vault(format!(
-                "audit line {lineno}: body seq {} != line seq {}",
-                decoded.seq, line_seq
-            )));
-        }
-        let mut recomputed = [0u8; 32];
-        recomputed.copy_from_slice(Sha256::digest(&body).as_slice());
-        let on_disk: Vec<u8> = hex::decode(hash_hex)
-            .map_err(|_| KbsError::Vault(format!("audit line {lineno}: bad hash hex")))?;
-        if on_disk != recomputed {
-            return Err(KbsError::Vault(format!(
-                "audit line {lineno}: hash mismatch — body tampered"
-            )));
-        }
-        if decoded.prev_hash != expected_prev {
-            return Err(KbsError::Vault(format!(
-                "audit line {lineno}: chain broken (prev_hash != expected)"
-            )));
-        }
-        expected_prev = recomputed;
-        last_hash = recomputed;
-        records += 1;
+    let w = walk_bytes(&bytes, None).map_err(|e| KbsError::Vault(format!("audit: {e}")))?;
+    if let Some(t) = w.torn {
+        return Err(KbsError::Vault(format!(
+            "audit: torn tail at byte {}: {}",
+            t.offset, t.why
+        )));
     }
     Ok(VerifiedAudit {
-        records,
-        head: last_hash,
+        records: w.records,
+        head: w.head,
     })
 }
 
-/// Atomic-rename write of `head.sha256`. Uses a unique-name temp so
-/// stale `.tmp` from a previous crash doesn't block this write.
-fn write_head_atomic(dir: &std::path::Path, h: &[u8; 32]) -> Result<()> {
-    use rand::RngCore;
-    let head_path = dir.join(HEAD_FILENAME);
-    let mut rand_bytes = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut rand_bytes);
-    let tmp = dir.join(format!("{HEAD_FILENAME}.tmp.{}", hex::encode(rand_bytes)));
-    let mut hf = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|e| KbsError::Vault(format!("audit head temp open: {e}")))?;
-    hf.write_all(h)
-        .map_err(|e| KbsError::Vault(format!("audit head write: {e}")))?;
-    hf.sync_all()
-        .map_err(|e| KbsError::Vault(format!("audit head fsync: {e}")))?;
-    drop(hf);
-    fs::rename(&tmp, &head_path).map_err(|e| KbsError::Vault(format!("audit head rename: {e}")))?;
-    let dirf = File::open(dir).map_err(|e| KbsError::Vault(format!("audit dir open: {e}")))?;
-    dirf.sync_all()
-        .map_err(|e| KbsError::Vault(format!("audit dir fsync: {e}")))?;
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn walk_bytes(bytes: &[u8], head_probe: Option<[u8; 32]>) -> std::result::Result<Walk, String> {
+    audit_journal::walk(bytes, head_probe, check_body)
+}
+
+/// A self-consistent release record at chain position `(seq, prev)`:
+/// strict schema, the domain tag, its own `seq`, and its `prev_hash`.
+fn check_body(body: &[u8], seq: u64, prev: &[u8; 32]) -> std::result::Result<(), String> {
+    let decoded = decode_strict(body).ok_or_else(|| "invalid schema".to_string())?;
+    if decoded.domain != AUDIT_DOMAIN {
+        return Err("wrong domain".into());
+    }
+    if decoded.seq != seq {
+        return Err(format!("body seq {} != line seq {seq}", decoded.seq));
+    }
+    if decoded.prev_hash != *prev {
+        return Err("chain broken (prev_hash != expected)".into());
+    }
     Ok(())
 }
 
@@ -502,11 +427,7 @@ impl AuditSink for FileAuditSink {
         // handle (eprintln! would also work but acquires the lock per
         // write and is documented as panicking on stderr fail in some
         // std versions; this form is more explicit).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Err(e) = self.append(granted, ticket_id, vm_id, reason, now) {
+        if let Err(e) = self.append(granted, ticket_id, vm_id, reason, unix_now()) {
             let mut err = std::io::stderr().lock();
             let _ = writeln!(err, "kbs-core::audit: failed to append record: {e}");
         }
@@ -605,7 +526,7 @@ mod tests {
         assert_eq!(v.records, 1);
     }
 
-    /// Codex round-1 H1: an attacker who removes the entire log file
+    /// Review round-1 H1: an attacker who removes the entire log file
     /// while head.sha256 still references records MUST be caught.
     #[test]
     fn log_deletion_with_stale_head_is_tamper() {
@@ -624,7 +545,7 @@ mod tests {
         assert!(r.is_err(), "expected open to detect log-deletion tamper");
     }
 
-    /// Codex round-1 H1 variant: log truncated to empty with a stale
+    /// Review round-1 H1 variant: log truncated to empty with a stale
     /// non-zero head must be caught.
     #[test]
     fn empty_log_with_stale_head_is_tamper() {
@@ -637,7 +558,7 @@ mod tests {
         assert!(FileAuditSink::open(td.path()).is_err());
     }
 
-    /// Codex round-1 H3: open() repairs head.sha256 if the log is
+    /// Review round-1 H3: open() repairs head.sha256 if the log is
     /// ahead. Simulates "log fsync happened, head rename did not".
     #[test]
     fn open_repairs_stale_head_against_log() {
@@ -655,7 +576,7 @@ mod tests {
         assert_eq!(v.records, 1);
     }
 
-    /// Codex round-1 H2: cross-process lock prevents two
+    /// Review round-1 H2: cross-process lock prevents two
     /// simultaneous sinks. Spawn a thread that tries to open while we
     /// hold the lock; it must block. We use try_lock instead of lock
     /// in the test to keep determinism.
@@ -686,7 +607,91 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// Codex round-1 M1: verify() rejects a record whose body decodes
+    struct Release;
+
+    impl crate::audit_journal::crash_tests::Harness for Release {
+        const FILES: ChainFiles = FILES;
+        type Sink = FileAuditSink;
+        fn open(dir: &std::path::Path) -> Result<FileAuditSink> {
+            FileAuditSink::open(dir)
+        }
+        fn append(s: &FileAuditSink, i: u64) -> [u8; 32] {
+            s.append(
+                true,
+                Some(&format!("tk-{i}")),
+                Some("vm"),
+                "released",
+                1_000 + i,
+            )
+            .unwrap()
+        }
+        fn records(s: &FileAuditSink) -> u64 {
+            s.state.lock().unwrap().next_seq
+        }
+        fn page(s: &FileAuditSink) -> Vec<(u64, [u8; 32])> {
+            let p = s.read_page(None, 500).unwrap();
+            p.entries.iter().map(|e| (e.seq, e.sha256)).collect()
+        }
+        fn marker_reason(s: &FileAuditSink, seq: u64) -> Option<String> {
+            let p = s.read_page(seq.checked_sub(1), 1).unwrap();
+            let e = p.entries.into_iter().find(|e| e.seq == seq)?;
+            let v: Value = ciborium::de::from_reader(e.body.as_slice()).unwrap();
+            let Value::Map(m) = v else { return None };
+            let get = |k: &str| {
+                m.iter()
+                    .find(|(kk, _)| kk.as_text() == Some(k))
+                    .map(|(_, v)| v.clone())
+            };
+            let reason = get("reason")?.into_text().ok()?;
+            let is_marker = reason.starts_with(crate::audit_journal::AUDIT_TRUNCATED)
+                && get("granted") == Some(Value::Bool(false))
+                && get("ticket_id") == Some(Value::Text(String::new()))
+                && get("vm_id") == Some(Value::Text(String::new()));
+            is_marker.then_some(reason)
+        }
+    }
+
+    #[test]
+    fn every_append_crash_point_starts_and_keeps_chaining() {
+        crate::audit_journal::crash_tests::every_crash_point_starts::<Release>();
+    }
+
+    #[test]
+    fn torn_tail_variants_start() {
+        crate::audit_journal::crash_tests::torn_tail_variants_start::<Release>();
+    }
+
+    #[test]
+    fn a_crash_inside_the_recovery_is_recovered() {
+        crate::audit_journal::crash_tests::recovery_is_crash_safe::<Release>();
+    }
+
+    #[test]
+    fn real_inconsistency_refuses_to_start() {
+        crate::audit_journal::crash_tests::real_inconsistency_refuses::<Release>();
+    }
+
+    #[test]
+    fn hooked_append_crash_points_start() {
+        crate::audit_journal::crash_tests::hooked_append_crash_points::<Release>();
+    }
+
+    #[test]
+    fn hooked_recovery_crash_points_start() {
+        crate::audit_journal::crash_tests::hooked_recovery_crash_points::<Release>();
+    }
+
+    #[test]
+    fn a_failed_head_write_leaves_no_temp() {
+        crate::audit_journal::crash_tests::failed_head_write_leaves_no_temp::<Release>();
+    }
+
+    #[test]
+    fn a_failed_append_is_cut_by_the_next() {
+        crate::audit_journal::crash_tests::failed_append_is_cut_at_the_next::<Release>();
+    }
+
+    /// Review round-1 M1: verify() rejects a record whose body decodes
     /// to a wrong domain.
     #[test]
     fn wrong_domain_in_body_rejected() {

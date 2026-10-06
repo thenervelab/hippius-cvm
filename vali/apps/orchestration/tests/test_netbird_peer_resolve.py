@@ -28,6 +28,10 @@ from apps.orchestration.effects import (
     resolve_netbird_peer_ip,
 )
 
+# The resolver reads the VM's recorded peer id (`Vm.netbird_peer_id`) first;
+# these VMs have no row, so they resolve by name.
+pytestmark = pytest.mark.django_db
+
 
 class _FakeResponse:
     def __init__(self, status: int, body: bytes) -> None:

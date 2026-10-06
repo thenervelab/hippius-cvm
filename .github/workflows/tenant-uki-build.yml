@@ -36,6 +36,14 @@ on:
   # measurement on a PR branch before opening a KAT re-pin commit,
   # without rolling main first.
   workflow_dispatch:
+  # Pull requests — so a change that moves the launch digest fails its
+  # OWN review instead of turning `main` red after the merge. Every
+  # push to `main` ran this gate while every PR skipped it, and the
+  # pinned KAT went stale for months: `kbs-core` / `hippius-types` are
+  # linked into agent-initramfs, so ordinary KBS work moves the initrd
+  # bytes. The `Scope` step below keeps PRs that cannot move the digest
+  # to a cheap no-op.
+  pull_request:
 
 # Minimal: read the repo, build, upload a workflow artifact. No job
 # here writes to the repo or needs an OIDC token.
@@ -44,6 +52,9 @@ permissions:
 
 jobs:
   tenant-uki-build:
+    # Stays GitHub-hosted: a measured-boot artifact whose main-branch publish
+    # leans on ubuntu-latest's preinstalled rustup/AWS CLI, a path a PR run
+    # cannot exercise on another runner.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -111,6 +122,40 @@ jobs:
         # manifest rejects under `--locked`.
         run: cargo test -p hippius-uki-measure --features snp
 
+      - name: Scope — can this PR move the measurement?
+        id: scope
+        # Push / tag / dispatch: always build (unchanged behaviour).
+        # Pull request: build only when the PR touches a measurement
+        # input — the crates the measured binaries link (derived from
+        # `cargo tree`, see the script), `packer/tenant-uki/`, the lockfiles,
+        # the KAT or this workflow. `HEAD` is the PR merge commit the
+        # checkout produced, so `HEAD^1` is the base it merged onto.
+        env:
+          PINS_RESOLVED: ${{ steps.guard.outputs.pins_resolved }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$PINS_RESOLVED" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "sde_touched=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scope="$(.github/scripts/uki_pr_scope.sh HEAD^1 packer/tenant-uki \
+            "hippius-agent-initramfs hippius-agent-tenant-telemetry hippius-agent-tenant-init hippius-uki-measure+snp" \
+            "packer/kbs-uki/ovmf packer/kbs-uki/keys Cargo.lock Cargo.toml rust-toolchain.toml .cargo .dockerignore test_vectors/uki/tenant-measurement.json .github/workflows/tenant-uki-build.yml .github/scripts/uki_pr_scope.sh")"
+          echo "$scope"
+          echo "$scope" >> "$GITHUB_OUTPUT"
+          if grep -qx 'in_scope=true' <<< "$scope"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=UKI build skipped::this PR changes no measurement input."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: NOTICE — tenant UKI build skipped (pins unresolved)
         if: steps.guard.outputs.pins_resolved != 'true'
         run: |
@@ -134,7 +179,7 @@ jobs:
           EOF
 
       - name: Install UKI build dependencies
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         # `make uki` itself runs the build inside Docker (the UKI
         # Dockerfile carries veritysetup / mksquashfs); these host
         # packages cover `make test-rootfs` + the documented build
@@ -142,11 +187,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y squashfs-tools cryptsetup-bin
 
       - name: Build the tenant UKI end-to-end
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         run: make -C packer/tenant-uki/uki uki
 
       - name: Chown build outputs back to the runner user
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         # The docker container writes `rootfs.verity` (the dm-verity
         # hash tree) as root mode 0600 onto the bind-mounted host path
         # — veritysetup's default — and the non-root runner user then
@@ -167,7 +212,7 @@ jobs:
             packer/tenant-uki/uki/fetched
 
       - name: Compare the measurement against test_vectors/uki/
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         # Fail loud with a visible diff on any drift. `tenant-measurement.json`
         # is the tenant-specific KAT — the first publish records it from
         # an actual build (same procedure as kbs's `measurement.json`).
@@ -178,10 +223,23 @@ jobs:
             echo "::error::${expected} is missing — populate it from the first reproducible build's output."
             exit 1
           fi
-          diff -u "$expected" packer/tenant-uki/uki/output/measurement.json
+          if diff -u "$expected" packer/tenant-uki/uki/output/measurement.json; then
+            exit 0
+          fi
+          # A PR that touches `packer/tenant-uki/` shifts SOURCE_DATE_EPOCH
+          # when it is squash-merged, so its pre-merge digest cannot
+          # predict main's. Say so and leave the verdict to the push
+          # run; re-pin with a test_vectors-only follow-up
+          # (test_vectors/uki/REGENERATE.md).
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "${{ steps.scope.outputs.sde_touched }}" = "true" ]; then
+            echo "::warning title=UKI KAT not predictive::this PR touches packer/tenant-uki/ — the squash re-timestamps SOURCE_DATE_EPOCH; re-pin test_vectors/uki/tenant-measurement.json from the main run."
+            exit 0
+          fi
+          exit 1
 
       - name: Reproducibility check (double build, byte-identical)
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         # The Makefile target `uki-reproducible-check` builds twice
         # into isolated dirs and runs `diff -r`. The docker container
         # writes `rootfs.verity` as root mode 0600 onto the bind-
@@ -231,7 +289,7 @@ jobs:
           fi
 
       - name: Upload the tenant UKI as a workflow artifact
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # `github.ref_name` carries the branch name verbatim, which
@@ -252,7 +310,7 @@ jobs:
         # signed by that root. The dev key under `packer/kbs-uki/keys/dev/`
         # is the SHARED §22 root for the whole fleet —
         # `DO-NOT-TRUST-IN-PROD` until rotated.
-        if: steps.guard.outputs.pins_resolved == 'true'
+        if: steps.scope.outputs.build == 'true'
         run: |
           set -euo pipefail
           # `--built-at` MUST track the Makefile's SOURCE_DATE_EPOCH
@@ -289,7 +347,7 @@ jobs:
         # under the pinned `--built-at` + signing-key; a divergence means
         # someone re-signed under different metadata and we must NOT
         # silently overwrite the audit trail).
-        if: steps.guard.outputs.pins_resolved == 'true' && github.ref == 'refs/heads/main'
+        if: steps.scope.outputs.build == 'true' && github.ref == 'refs/heads/main'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.HIPPIUS_S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.HIPPIUS_S3_SECRET_KEY }}

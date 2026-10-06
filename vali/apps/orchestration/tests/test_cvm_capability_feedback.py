@@ -139,10 +139,142 @@ def test_a_transient_dest_failure_is_retried_not_fatal(fx: FakeEffects) -> None:
     job.refresh_from_db()
     vm.refresh_from_db()
     assert _activate_dispatches(fx) == 2
+    # The retry is dispatched as a DIFFERENT attempt — `dispatch_migrate_
+    # activate` folds it into the order_id, so the dest runs it again
+    # instead of replaying the first acceptance.
+    attempts = [c[6] for c in fx.calls if c[0] == "dispatch_migrate_activate"]
+    assert attempts == [0, 1]
     assert job.state == MigrationState.DONE.value
     assert vm.host == "node-dst"  # the tenant kept its VM
     # ...and the transient left a soft mark, not an exclusion.
     assert cvm_capability.capability_of(DST_NODE) == cvm_capability.PROVEN
+
+
+def test_a_slow_restore_does_not_spend_the_retry_budget(fx: FakeEffects) -> None:
+    """A multi-GB restore runs for many backoff windows. Each is NOT a new
+    attempt: with a clock-derived attempt number vali sent a new order per
+    window, the dest answered `activate-in-progress` to each, and a
+    restore that then failed found every retry already spent."""
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    fx.dest_activation_status = "running"
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    service.tick_once()
+    for minutes in (3, 6, 9, 12):
+        _age_phase(job, minutes * 60)
+        service.tick_once()
+    assert _activate_dispatches(fx) == 1, "a running restore is waited on, not re-sent"
+
+    # It fails at minute 15 — the first real failure, so a real retry.
+    _age_phase(job, 15 * 60)
+    fx.dest_activation_status = "failed"
+    service.tick_once()
+    job.refresh_from_db()
+    assert job.state == MigrationState.DEST_ACTIVATING.value
+    fx.dest_activation_status = "done"
+    service.tick_once()
+
+    job.refresh_from_db()
+    attempts = [c[6] for c in fx.calls if c[0] == "dispatch_migrate_activate"]
+    assert attempts == [0, 1]
+    assert job.state == MigrationState.DONE.value
+
+
+def test_every_attempt_carries_the_phase_deadline_as_settle_by(
+    fx: FakeEffects, settings
+) -> None:
+    """The dest's clock used to restart with each attempt while vali's ran
+    from entering the phase, so a retry could settle — boot the guest at
+    `new_gen` — after vali had failed the job. Every attempt now carries
+    vali's own deadline, less the safety margin, taken from
+    `phase_started_at`: the same instant for the first order and a retry."""
+    settings.VALI_ORCHESTRATION_ACTIVATE_TIMEOUT_S = 1800.0
+    settings.VALI_MIGRATION_DEST_ACTIVATE_BACKOFF_S = 0.0
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    fx.dest_activation_status = "failed"
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    # Well into the phase, so "now + timeout" would be a different answer.
+    _age_phase(job, 700)
+
+    service.tick_once()  # attempt 0 — dispatched, dest says failed
+    service.tick_once()  # attempt 1 — the retry, a new order
+
+    job.refresh_from_db()
+    attempts = [c[6] for c in fx.calls if c[0] == "dispatch_migrate_activate"]
+    assert attempts == [0, 1]
+    expected = int(job.phase_started_at.timestamp() + 1800) - 60
+    assert fx.activate_settle_by == [expected, expected]
+
+
+def test_no_retry_is_sent_once_the_dest_could_not_settle_in_time(
+    fx: FakeEffects,
+) -> None:
+    """Past `settle_by - DEST_LAUNCH_MARGIN` the dest refuses the order
+    before doing anything and reports `failed` — which would be booked as
+    one more CVM start failure against a host never asked to start. So
+    vali stops asking and lets the phase deadline fail the job."""
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    fx.dest_activation_status = "failed"
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    service.tick_once()  # attempt 0 — dispatched, dest says failed
+    assert _activate_dispatches(fx) == 1
+
+    # 2700 - 60 - 240 = 2400 s: the last instant a dest accepts an order.
+    _age_phase(job, 2410)
+    service.tick_once()
+    service.tick_once()
+
+    job.refresh_from_db()
+    assert _activate_dispatches(fx) == 1, "no order the dest must refuse"
+    assert job.state == MigrationState.DEST_ACTIVATING.value
+
+
+def test_a_done_from_a_dest_that_accepted_no_order_is_not_this_restore(
+    fx: FakeEffects, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live (a migrated VM, A→B→A): the dest was the VM's previous SOURCE and
+    refused every activate (`activate-on-source`); its status route then
+    reported that old source leg's `done`, and vali activated a VM that
+    nothing had restored. A `done` only counts once the dest accepted one
+    of THIS job's orders."""
+    from apps.orchestration import effects, idempotency
+
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    fx.dest_activation_status = "running"
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    job.refresh_from_db()
+
+    # Every activate refused by the dest: nothing is recorded as sent.
+    def _refused(*_a: object, **_kw: object) -> None:
+        raise effects.EffectError("migrate-activate: dest miner rejected (status=409)")
+
+    monkeypatch.setattr(effects, "dispatch_migrate_activate", _refused)
+    # Its retries spent (as the pre-fix clock counter spent them).
+    for n in range(service._dest_activate_max_attempts()):
+        idempotency.record(service._mig_key(job, service._failure_step(n)), "x")
+    fx.dest_activation_status = "done"
+    for _ in range(3):
+        service.tick_once()
+
+    job.refresh_from_db()
+    vm.refresh_from_db()
+    assert job.state == MigrationState.DEST_ACTIVATING.value
+    assert vm.host == "node-src", "never activated on an unrestored dest"
 
 
 def test_retries_are_bounded(fx: FakeEffects) -> None:
@@ -239,6 +371,75 @@ def test_a_dest_that_fails_every_attempt_becomes_incapable(
 
     assert MinerCapacity.objects.get(miner_node_id=DST_NODE).cvm_fail_streak == 3
     assert cvm_capability.capability_of(DST_NODE) == cvm_capability.INCAPABLE
+
+
+def _fail_one_attempt_with(fx: FakeEffects, failure_class: str) -> MigrationJob:
+    """Drive a migration to `DestActivating`, have the dest report attempt 0
+    `failed` with `failure_class`, and let the retry go out."""
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(
+        vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
+    )
+    fx.dest_activation_status = "failed"
+    fx.dest_activation_class = failure_class
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    service.tick_once()  # attempt 0 — dispatched, dest says failed
+    _age_phase(job, 130)
+    service.tick_once()  # attempt 1 — the retry
+    job.refresh_from_db()
+    return job
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        "migration/dest-settle-by-passed",
+        "migration/snapshot-download-budget",
+        "migration/snapshot-sha256-mismatch",
+        "migration/download-send",
+        "migration/dest-artifact-sha-mismatch",
+        "migration/dest-artifacts-missing",
+        "migration/state-disk-size",
+        "migration/chain-vm-live",
+        "backup/full-size-mismatch",
+        "migration/restore-staged-missing",
+        "migration/restore-not-staged",
+        "migration/staged-restore-conflict",
+        "migration/restore-size-mismatch",
+        "migration/restore-swap-conflict",
+    ],
+)
+def test_a_failure_before_any_cvm_start_advances_the_attempt_but_is_no_evidence(
+    fx: FakeEffects, failure_class: str
+) -> None:
+    """A migrated VM booked `dest-artifact-sha-mismatch` on miner-c as a CVM start
+    failure. A restore that failed before any boot is a real failed attempt
+    — the retry goes out — but says nothing about SEV, and this streak
+    hard-excludes hosts."""
+    _fail_one_attempt_with(fx, failure_class)
+
+    attempts = [c[6] for c in fx.calls if c[0] == "dispatch_migrate_activate"]
+    assert attempts == [0, 1], "the excused failure still advances the attempt"
+    assert cvm_capability.capability_of(DST_NODE) == cvm_capability.UNKNOWN
+    assert MinerCapacity.objects.get(miner_node_id=DST_NODE).cvm_fail_streak == 0
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    ["", "migration/dest-launch-failed", "libvirt-driver/create", "something-new"],
+)
+def test_a_start_failure_or_an_unexcused_class_is_still_evidence(
+    fx: FakeEffects, failure_class: str
+) -> None:
+    """No class (an agent predating it), a launch failure and anything not
+    explicitly excused keep today's behaviour: one failed attempt, one mark."""
+    _fail_one_attempt_with(fx, failure_class)
+
+    attempts = [c[6] for c in fx.calls if c[0] == "dispatch_migrate_activate"]
+    assert attempts == [0, 1]
+    assert cvm_capability.capability_of(DST_NODE) == cvm_capability.DEGRADED
+    assert MinerCapacity.objects.get(miner_node_id=DST_NODE).cvm_fail_streak == 2
 
 
 def test_dest_activation_failure_is_recorded_for_a_golden_vm_too(
@@ -340,6 +541,39 @@ def test_start_migration_refuses_an_incapable_destination() -> None:
     assert vm.state == VmState.ACTIVE
     assert vm.host == "node-src"
     assert vm.migration_dest == ""
+
+
+def test_start_migration_refuses_a_destination_without_disk_room(settings) -> None:
+    """The same intake, for the DATA-disk gate: under `enforce` a named
+    destination that cannot hold the VM's disk is refused before the source
+    is touched (under `record` it is only logged)."""
+    from apps.scheduler.models import Placement, PlacementStatus
+
+    _mirror(DST_NODE)
+    MinerCapacity.objects.filter(miner_node_id=DST_NODE).update(
+        declared_disk_gb_budget=10, disk_reported_at=timezone.now()
+    )
+    vm = make_vm(generation=5, host="node-src")
+    Placement.objects.create(
+        vm=vm,
+        vm_family="t",
+        resource_class="large",
+        miner_node_id="11" * 32,
+        status=PlacementStatus.BOUND.value,
+        chain_epoch=1,
+        decided_by=make_service_client(),
+        bound_at=timezone.now(),
+    )
+    settings.VALI_SCHEDULER_DISK_GATE = "enforce"
+    with pytest.raises(service.StartError) as exc:
+        service.start_migration(vm=vm, dest_node_id="node-dst", decided_by=make_service_client())
+    assert exc.value.category == "dest-insufficient-disk"
+    vm.refresh_from_db()
+    assert (vm.state, vm.host, vm.migration_dest) == (VmState.ACTIVE, "node-src", "")
+
+    settings.VALI_SCHEDULER_DISK_GATE = "record"
+    job = service.start_migration(vm=vm, dest_node_id="node-dst", decided_by=make_service_client())
+    assert job.state == MigrationState.DRAINING.value
 
 
 def test_start_migration_allows_an_unknown_destination() -> None:
@@ -455,7 +689,7 @@ def _departing_drain(monkeypatch) -> list[str]:
     monkeypatch.setattr("apps.scheduler.chain.read_miner_status", lambda: snapshot)
     chosen: list[str] = []
 
-    def _fake_start(*, vm, dest_node_id, decided_by):
+    def _fake_start(*, vm, dest_node_id, decided_by, cold=False):
         chosen.append(dest_node_id)
         return type("J", (), {"job_id": "fake-job"})()
 

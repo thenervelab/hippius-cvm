@@ -44,7 +44,7 @@ if [[ "$OVMF_SHA256" == "$ZERO_DIGEST" ]]; then
     exit 65
 fi
 
-# Clean before extracting — codex review flagged that stale files
+# Clean before extracting — review flagged that stale files
 # from a previous run could survive into a new `vmlinuz-*` glob
 # pick at the bottom of this script and silently affect the next
 # build. The reproducibility check (`make uki-reproducible-check`)

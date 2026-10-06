@@ -122,12 +122,12 @@ impl Flavor {
     /// vary per launch without rotating the allowlist.
     pub const fn memory_mb(self) -> u32 {
         match self {
-            Self::Small => 2048,
-            Self::Medium => 4096,
-            Self::Large => 8192,
-            Self::Xlarge => 16384,
-            Self::X2large => 32768,
-            Self::X4large => 65536,
+            Self::Small => 4096,
+            Self::Medium => 8192,
+            Self::Large => 16384,
+            Self::Xlarge => 32768,
+            Self::X2large => 65536,
+            Self::X4large => 131072,
         }
     }
 
@@ -139,12 +139,12 @@ impl Flavor {
     /// LUKS keyslot offsets and different SHA-256s.
     pub const fn disk_gb(self) -> u32 {
         match self {
-            Self::Small => 8,
-            Self::Medium => 16,
-            Self::Large => 32,
-            Self::Xlarge => 64,
-            Self::X2large => 128,
-            Self::X4large => 256,
+            Self::Small => 40,
+            Self::Medium => 80,
+            Self::Large => 160,
+            Self::Xlarge => 320,
+            Self::X2large => 640,
+            Self::X4large => 1280,
         }
     }
 
@@ -226,28 +226,28 @@ mod tests {
         // Pin the catalogue values so a doc-comment edit can't drift
         // from the runtime numbers without the test catching it.
         assert_eq!(Flavor::Small.vcpus(), 1);
-        assert_eq!(Flavor::Small.memory_mb(), 2048);
-        assert_eq!(Flavor::Small.disk_gb(), 8);
+        assert_eq!(Flavor::Small.memory_mb(), 4096);
+        assert_eq!(Flavor::Small.disk_gb(), 40);
 
         assert_eq!(Flavor::Medium.vcpus(), 2);
-        assert_eq!(Flavor::Medium.memory_mb(), 4096);
-        assert_eq!(Flavor::Medium.disk_gb(), 16);
+        assert_eq!(Flavor::Medium.memory_mb(), 8192);
+        assert_eq!(Flavor::Medium.disk_gb(), 80);
 
         assert_eq!(Flavor::Large.vcpus(), 4);
-        assert_eq!(Flavor::Large.memory_mb(), 8192);
-        assert_eq!(Flavor::Large.disk_gb(), 32);
+        assert_eq!(Flavor::Large.memory_mb(), 16384);
+        assert_eq!(Flavor::Large.disk_gb(), 160);
 
         assert_eq!(Flavor::Xlarge.vcpus(), 8);
-        assert_eq!(Flavor::Xlarge.memory_mb(), 16384);
-        assert_eq!(Flavor::Xlarge.disk_gb(), 64);
+        assert_eq!(Flavor::Xlarge.memory_mb(), 32768);
+        assert_eq!(Flavor::Xlarge.disk_gb(), 320);
 
         assert_eq!(Flavor::X2large.vcpus(), 16);
-        assert_eq!(Flavor::X2large.memory_mb(), 32768);
-        assert_eq!(Flavor::X2large.disk_gb(), 128);
+        assert_eq!(Flavor::X2large.memory_mb(), 65536);
+        assert_eq!(Flavor::X2large.disk_gb(), 640);
 
         assert_eq!(Flavor::X4large.vcpus(), 32);
-        assert_eq!(Flavor::X4large.memory_mb(), 65536);
-        assert_eq!(Flavor::X4large.disk_gb(), 256);
+        assert_eq!(Flavor::X4large.memory_mb(), 131072);
+        assert_eq!(Flavor::X4large.disk_gb(), 1280);
     }
 
     #[test]
@@ -334,8 +334,8 @@ mod tests {
     #[test]
     fn from_vcpus_recovers_memory_for_the_preflight_gate() {
         // The exact recovery the preflight capacity check performs:
-        // cpu_count → flavor → memory_mb. A 2xlarge (16 vCPU) is 32 GiB.
-        assert_eq!(Flavor::from_vcpus(16).map(Flavor::memory_mb), Some(32768));
+        // cpu_count → flavor → memory_mb. A 2xlarge (16 vCPU) is 64 GiB.
+        assert_eq!(Flavor::from_vcpus(16).map(Flavor::memory_mb), Some(65536));
     }
 
     #[test]

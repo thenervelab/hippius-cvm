@@ -2,7 +2,7 @@
 # libvirt + QEMU — the tenant-CVM hypervisor stack. Tasks file
 # imported by 06-miner-bootstrap.yml play "02".
 #
-# Distro packages from Ubuntu 24.04 (libvirt 10.0.x / qemu 8.2.x — see
+# Distro packages (Ubuntu 26.04: libvirt 12.0 / qemu 10.2 — see
 # `versions` in group_vars/miner_nodes.yml). They are NOT apt-version-
 # pinned: pinning a distro's own default blocks its security point
 # releases. `apt` with `state: present` is idempotent — a second run
@@ -42,11 +42,60 @@
     - "qemu-system-x86_64 --version"
   register: miner_hv_versions
   changed_when: false
+  check_mode: false
 
 - name: Show the installed hypervisor versions
   ansible.builtin.debug:
     msg: >-
       {{ miner_hv_versions.results | map(attribute='stdout') | list }}
+
+# Play 00 checked what apt would resolve; this checks what actually runs.
+# `virsh --version` prints the libvirt version, QEMU prints
+# "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-...)".
+- name: Assert the installed hypervisor can launch a SEV-SNP guest
+  ansible.builtin.assert:
+    that:
+      - miner_hv_libvirt is version(miner_min_libvirt_version, '>=')
+      - miner_hv_qemu is version(miner_min_qemu_version, '>=')
+    fail_msg: >-
+      Installed libvirt {{ miner_hv_libvirt }} / QEMU {{ miner_hv_qemu }} is
+      below the SEV-SNP minimum (libvirt >= {{ miner_min_libvirt_version }},
+      QEMU >= {{ miner_min_qemu_version }}).
+  vars:
+    miner_hv_libvirt: "{{ miner_hv_versions.results[0].stdout | trim }}"
+    miner_hv_qemu: "{{ miner_hv_versions.results[1].stdout | regex_search('version ([0-9.]+)', '\\1') | first }}"
+
+# ── virt-aa-helper: the dm-verity hash disk ─────────────────────────
+#
+# libvirt runs virt-aa-helper at every define to build the per-domain
+# AppArmor profile, and the helper opens each disk to probe it. Its stock
+# profile allows `/**.img`, `/**.raw`, `/**.qcow2`… but not `*.verity`, so
+# every golden define logs 4 `apparmor="DENIED" … rootfs.verity` lines
+# (#1247). The domain still starts (the generated QEMU profile lists the
+# disk by path) — the denial is noise, but noise that hides a real one.
+# The stock profile ends in `include if exists <local/…>`, the supported
+# extension point; a package update never overwrites it.
+- name: Let virt-aa-helper read the staged dm-verity hash disks
+  ansible.builtin.copy:
+    dest: /etc/apparmor.d/local/usr.lib.libvirt.virt-aa-helper
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (miner-tasks/libvirt-install.yml). Do not edit by hand.
+      /var/lib/hippius-miner/staging/*/rootfs.verity r,
+      # Legacy default `rootfs_hash_path` (orders/types.rs) for orders
+      # that do not name a per-VM staging path.
+      /var/lib/hippius-miner/rootfs.verity r,
+  register: miner_aa_helper_local
+
+# Reloads only the helper's own profile — running domains keep theirs.
+# Unconditional (it is cheap): gating it on the copy above would leave the
+# rule unloaded forever if a reload ever failed after the copy succeeded.
+- name: Reload the virt-aa-helper AppArmor profile
+  ansible.builtin.command:
+    cmd: apparmor_parser -r /etc/apparmor.d/usr.lib.libvirt.virt-aa-helper
+  changed_when: miner_aa_helper_local.changed
 
 # ── Tenant OVMF ──────────────────────────────────────────────────────
 #

@@ -302,8 +302,8 @@ type MaxValidatorIdLen: Get<u32>;
 type MaxFamilyIdLen: Get<u32>;
 type MaxAuditVmKeyIdLen: Get<u32>;
 type ComputePalletInstance: Get<[u8; 32]>;
-type ComputeChainGenesis: Get<[u8; 32]>;       // codex CRITICAL fix
-type NowUnix: frame_support::traits::UnixTime; // codex/gemini CRITICAL fix (expiry)
+type ComputeChainGenesis: Get<[u8; 32]>;       // review CRITICAL fix
+type NowUnix: frame_support::traits::UnixTime; // review/review CRITICAL fix (expiry)
 ```
 
 **Why `ComputeChainGenesis` is a Config constant, not
@@ -366,19 +366,19 @@ would diverge the on-chain `prev_aggregate_hash` from what the
 off-chain audit-VM computes, breaking chain continuity after the
 first submission. `sp_io::hashing::sha2_256` is the no_std-compatible
 host-function shim and is available in every Substrate runtime
-build. (Codex + Gemini CRITICAL flagged this in PR-I3 review.)
+build. (Review CRITICAL flagged this in PR-I3 review.)
 
-### Convergent codex + gemini review (PR-I3)
+### Convergent review (PR-I3)
 
 Applied pre-merge:
 
 - **CRITICAL** (both reviewers): `T::Hashing::hash` instead of SHA-256
   for `body_hash` would diverge from the off-chain audit-VM. Fixed
   by switching to `sp_io::hashing::sha2_256`; test pin updated.
-- **CRITICAL** (codex): `frame_system::block_hash(0)` is pruned
+- **CRITICAL** (review): `frame_system::block_hash(0)` is pruned
   after `BlockHashCount` blocks. Fixed by adding
   `T::ComputeChainGenesis: Get<[u8; 32]>` Config constant.
-- **CRITICAL** (codex + gemini): `view.expiry` had an `AggregateExpired`
+- **CRITICAL** (review): `view.expiry` had an `AggregateExpired`
   error variant but was never enforced. Fixed by adding
   `T::NowUnix: UnixTime` Config item and a
   `ensure!(view.expiry > now_unix_secs, …)` check; new
@@ -389,22 +389,22 @@ Applied pre-merge:
   `AggregateView`. Fixed by constructing both sides with the same
   payloads and `assert_eq!`-ing every field; any future drift breaks
   compilation or asserts.
-- **MEDIUM** (codex): canonical-CBOR re-binding (`signed.body ==
+- **MEDIUM** (review): canonical-CBOR re-binding (`signed.body ==
   canonical(view_without_served_units)`) would close the validator-
   trust gap on every field except `served_units` without a schema
   change. Documented as PR-I3.1 follow-up below; out of PR-I3 scope
   because it requires a CBOR encoder in no_std and a
   `view_hash`-style §23 schema decision.
-- **MEDIUM** (codex): pre-existing `log2_fixed_u128` scaling drift in
+- **MEDIUM** (review): pre-existing `log2_fixed_u128` scaling drift in
   `compute_node_weight_from_quality` (divides by `127` instead of
   `127 * 256`) is an upstream arion-pallet bug that survived the
   PR-I2 vendor; not corrected here to keep the byte-for-byte mirror.
   Flagged for an upstream fix or a documented divergence in PR-I4.
-- **MEDIUM** (gemini): the `body_hash` defensive length check
+- **MEDIUM** (review): the `body_hash` defensive length check
   reused `AggregateChainGenesisMismatch`. Fixed by switching to
   `sp_io::hashing::sha2_256` which returns `[u8; 32]` directly — the
   length check (and its misleading error mapping) goes away entirely.
-- **LOW** (codex): `large_enum_variant` allow comment about SCALE
+- **LOW** (review): `large_enum_variant` allow comment about SCALE
   wire-shape was wrong (`Box<T>` SCALE-encodes transparently);
   comment corrected to reflect the real reason (visible metadata /
   client-interface surface change for no real saving).
@@ -713,9 +713,9 @@ weight), `set_audit_vm_pubkey`, `set_lockup_enabled`,
 `set_base_child_deposit`, `set_free_child_slots_per_family`, and
 NEW `vali_submit_epoch_close(n)`.
 
-### Convergent codex + gemini review (PR-I4)
+### Convergent review (PR-I4)
 
-Applied pre-merge. No CRITICAL findings (gemini flagged a
+Applied pre-merge. No CRITICAL findings (review flagged a
 "scalability bottleneck" — see follow-up note below); the
 convergent HIGH + MEDIUM punchlist:
 
@@ -739,27 +739,27 @@ convergent HIGH + MEDIUM punchlist:
   the off-chain ranking reader can distinguish `None` (not
   reported — off-chain accounting decides) vs `Some(0)` (explicit
   zero-reward verdict, e.g. Quarantined). Tests updated.
-- **LOW (codex)**: mock `MaxMinerStatusUpdatesPerCall` was 256;
+- **LOW (review)**: mock `MaxMinerStatusUpdatesPerCall` was 256;
   recommendation 64–128 until the production bound is set by
   benchmarks. Mock dropped to 128; production picks from
   block-weight headroom.
-- **LOW (codex)**: `AuditStatsSubmitted` event still carries
+- **LOW (review)**: `AuditStatsSubmitted` event still carries
   `served_units` on the wire. Confirmed-kept for off-chain
   indexers; the doc-comment + CHANGES.md note that the field is
   *advisory* until a `view_hash`-binding §23 schema change
   (PR-I3.1) lands.
-- **LOW (gemini)**: missing `Quarantined → Active` test → added
+- **LOW (review)**: missing `Quarantined → Active` test → added
   alongside the row-removal fix (above).
 
-#### gemini "CRITICAL" scalability note — kept as a follow-up
+#### review "CRITICAL" scalability note — kept as a follow-up
 
-Gemini flagged that `epoch > CurrentEpoch` + a one-shot
+Review flagged that `epoch > CurrentEpoch` + a one-shot
 `CurrentEpoch::put(epoch)` means the network can't scale beyond
 `T::MaxMinerStatusUpdatesPerCall` nodes per epoch. The
 recommended fix (`epoch >= cur` + cross-batch dedupe via
 `EpochWeights::contains_key`) is functionally clean but
 introduces a "is this the last batch?" ambiguity (when does
-`EpochClosed` fire? when does `CurrentEpoch` advance?). Codex
+`EpochClosed` fire? when does `CurrentEpoch` advance?). Review
 explicitly disagreed that this is critical for the v1
 single-operator root-only design.
 
@@ -967,9 +967,9 @@ Total: 26 unit tests (was 25). Workspace `cargo test` /
 `cargo clippy --workspace --all-targets -- -D warnings` /
 `cargo fmt --check` all green.
 
-### Convergent codex + gemini review (PR-I5)
+### Convergent review (PR-I5)
 
-Applied pre-merge. No CRITICAL findings (codex flagged the
+Applied pre-merge. No CRITICAL findings (review flagged the
 upstream `pallet-staking/reward-fn/Cargo.toml` typo warning as
 critical, but the build + tests + clippy all complete cleanly
 in our cargo version — confirmed `cargo test --workspace
@@ -993,7 +993,7 @@ in our cargo version — confirmed `cargo test --workspace
   registered owner but with a non-Validator node type" vs
   "caller has no registration record at all". Block explorers /
   indexers can now distinguish.
-- **MEDIUM (codex)**: `get_node_registration_info` excludes
+- **MEDIUM (review)**: `get_node_registration_info` excludes
   `Degraded` nodes. **Decision kept**: "actively registered"
   IS the right gate for `submit_audit_stats` since a Degraded
   node hasn't recovered yet and shouldn't earn reward weight.
@@ -1001,10 +1001,10 @@ in our cargo version — confirmed `cargo test --workspace
   `MockRegistration` thread-local; the production behaviour
   matches the §13 §23 spec's "reward-eligible only" intent.
   Documented in the trait impl comment.
-- **LOW (codex)**: unused `use pallet_proxy;` /
+- **LOW (review)**: unused `use pallet_proxy;` /
   `use pallet_registration::{self, NodeType, …}` imports.
   Removed — fully-qualified paths in the trait impls suffice.
-- **LOW (gemini)**: missing `force_deregister_child` tests.
+- **LOW (review)**: missing `force_deregister_child` tests.
   Added `force_deregister_child_happy_path` +
   `force_deregister_child_unregistered_via_root_origin_rejected`
   + a compile-only sentinel `force_deregister_child_rejects_unregistered_caller`
@@ -1012,7 +1012,7 @@ in our cargo version — confirmed `cargo test --workspace
 - **LOW (both)**: `[u8; 32].to_vec()` allocation on every
   `submit_audit_stats` is acceptable (32 bytes per call, before
   Ed25519 verify which dominates). Documented.
-- **LOW (codex)**: `try-runtime` could forward to
+- **LOW (review)**: `try-runtime` could forward to
   `pallet-registration/try-runtime` /
   `pallet-proxy/try-runtime`. Not required for v1; skipped
   until try-runtime infrastructure lands.
@@ -1075,7 +1075,7 @@ pallet_rankings::Config
   + frame_system::offchain::SigningTypes
 ```
 
-The recon agent (codex agentId `af100ce764b73a0eb`) verified
+The recon agent (review agentId `af100ce764b73a0eb`) verified
 that upstream thebrain's own mocks at this pinned commit are
 either stale 57-line stubs that don't satisfy the real Config
 trait, or fully commented-out dead code (`pallets/ranking/src/
@@ -1210,13 +1210,13 @@ Total: 32 unit tests (was 29 in PR-I5). Workspace `cargo test`
 + `cargo clippy --workspace --all-targets -- -D warnings` +
 `cargo fmt --check` all green.
 
-### Convergent codex + gemini review (PR-I6)
+### Convergent review (PR-I6)
 
-Applied pre-merge. No CRITICAL findings from codex; gemini
+Applied pre-merge. No CRITICAL findings from review; review
 flagged ONE critical performance issue. The convergent
 HIGH + MEDIUM punchlist:
 
-- **CRITICAL (gemini) / HIGH (codex)**: `vali_submit_epoch_close`
+- **CRITICAL (review) / HIGH (review)**: `vali_submit_epoch_close`
   was doing an extra O(n) storage iter via `epoch_weights_for(
   epoch)` AFTER the per-update writes — `n` redundant reads of
   data we just wrote. **Fixed**: the snapshot is now built
@@ -1234,19 +1234,19 @@ HIGH + MEDIUM punchlist:
   shape demo only; production OCWs MUST define a
   normalization strategy (e.g. `weight * u16::MAX /
   total_weight_this_epoch`).
-- **MEDIUM (codex)**: `RankingsSink::push_rankings` returns
+- **MEDIUM (review)**: `RankingsSink::push_rankings` returns
   `()`, can't report failure — concerning if the docs imply
   a synchronous in-runtime adapter. **Fixed**: trait
   doc-comment now explicitly says **best-effort, no-fail**:
   implementations MUST NOT roll back the epoch close;
   adapters needing fallible dispatch route through an OCW
   triggered by the `EpochClosed` event.
-- **MEDIUM (gemini)**: `EpochWeights` grows indefinitely.
+- **MEDIUM (review)**: `EpochWeights` grows indefinitely.
   Added a `TODO` comment on the storage definition; pruning
   strategy deferred to a future PR (likely as
   `prune_historical_epoch_weights(epoch, count)` once
   retention policy is locked).
-- **MEDIUM (codex)**: bridge test only demonstrates 2 of 4
+- **MEDIUM (review)**: bridge test only demonstrates 2 of 4
   parallel vectors `pallet_rankings::update_rankings` expects
   (`weights: Vec<u16>`, `node_ids: Vec<Vec<u8>>` — but NOT
   `all_nodes_ss58: Vec<Vec<u8>>` or `node_types: Vec<NodeType>`).
@@ -1255,11 +1255,11 @@ HIGH + MEDIUM punchlist:
   `pallet_registration::get_node_registration_info` lookups
   the mock doesn't model. Real four-vector alignment would
   need the deferred `construct_runtime!` PR.
-- **LOW (codex)**: "Production default: ()" wording was
+- **LOW (review)**: "Production default: ()" wording was
   imprecise — `RankingsSink` has no FRAME default. **Fixed**:
   Config doc now says "Recommended production binding: `()`"
   and notes the runtime must bind explicitly.
-- **LOW (codex)**: exactly-once `push_rankings` coverage is
+- **LOW (review)**: exactly-once `push_rankings` coverage is
   already pinned by `pushed.len() == 1` assertions in
   `epoch_close_pushes_full_snapshot_to_rankings_sink` and
   `full_bridge_flow_register_audit_close_push`. No extra

@@ -725,6 +725,13 @@ def test_launch_stamps_the_bound_tenant_onto_the_job_row() -> None:
 
     with (
         mock.patch.object(launch_jobs.vault_kv, "put_kv", _put_kv),
+        # Intake Transit-WRAPS the userdata working copy before staging
+        # it; that is the userdata-at-rest property, not this test's
+        # subject.
+        mock.patch.object(launch_jobs.vault_kv, "ensure_transit_key"),
+        mock.patch.object(
+            launch_jobs.vault_kv, "transit_encrypt", return_value=b"vault:v1:ct"
+        ),
         mock.patch.object(launch_jobs.launch, "check_netbird_userdata", return_value=None),
         override_settings(VALI_VAULT_KV_PREFIX="hippius-compute/vms"),
     ):

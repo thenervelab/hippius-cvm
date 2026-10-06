@@ -2,7 +2,7 @@
 
 ## The defect, live 2026-08-13
 
-`stamp-fedora-3` was refused by the scheduler — `no-eligible-miner`. It
+`vm-fedora-3` was refused by the scheduler — `no-eligible-miner`. It
 never reached a miner, so no measured cmdline was ever baked and the row
 carries no `hippius.eol_nonce`. Its per-VM Vault-Transit KEK, however,
 was provisioned at API INTAKE (`launch_jobs._provision_golden_overlay_kek`
@@ -13,7 +13,7 @@ runs inside `start_launch`, long before placement), so it was alive:
     DecommissionJob: state=failed
         reason = "draining:vm has no eol_nonce (launch did not bake
                   hippius.eol_nonce) — cannot decommission"
-    Vault: transit/keys/kek-stamp-fedora-3  ->  LIVE
+    Vault: transit/keys/kek-vm-fedora-3  ->  LIVE
 
 A VM the control plane believed was `active`, that no host was running,
 holding a live KEK — and §24, the ONLY automated path that erases a KEK,
@@ -64,7 +64,7 @@ from apps.orchestration.models import (
 
 pytestmark = pytest.mark.django_db
 
-VM_ID = "stamp-fedora-3"
+VM_ID = "vm-fedora-3"
 
 
 # ── builders ─────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ def _actor(name: str) -> ServiceClient:
 
 
 def _never_placed_vm(vm_id: str = VM_ID, **fields) -> Vm:
-    """`stamp-fedora-3` exactly: active, no host, NO `eol_nonce` (no
+    """`vm-fedora-3` exactly: active, no host, NO `eol_nonce` (no
     cmdline was ever baked), marked abandoned with `no-eligible-miner`
     and `registered=False` (it never reached the KBS register either)."""
     fields.setdefault("launch_abandoned_at", timezone.now() - timedelta(hours=3))
@@ -120,7 +120,7 @@ def _placement_refused_launch_job(vm_id: str = VM_ID) -> LaunchJob:
     )
 
 
-def _ran_vm(vm_id: str = "realtenant-1", **fields) -> Vm:
+def _ran_vm(vm_id: str = "tenant-1", **fields) -> Vm:
     """A VM that DID run: a miner accepted its dispatch (`host` stamped),
     it reported `running`, it spoke from inside the guest, and the
     reconcile loop saw its domain up."""
@@ -131,7 +131,7 @@ def _ran_vm(vm_id: str = "realtenant-1", **fields) -> Vm:
         state=VmState.ACTIVE.value,
         generation=1,
         signing_generation=1,
-        host="miner-1",
+        host="miner-a",
         lifecycle_vk=bytes(32),
         eol_nonce=fields.pop("eol_nonce", b"\x11" * 32),
         boot_phase=VmBootPhase.RUNNING.value,
@@ -140,7 +140,7 @@ def _ran_vm(vm_id: str = "realtenant-1", **fields) -> Vm:
         guest_signal_kind="served_receipt",
         **fields,
     )
-    RebootRecovery.objects.create(vm=vm, host="miner-1", seen_running=True)
+    RebootRecovery.objects.create(vm=vm, host="miner-a", seen_running=True)
     now = timezone.now()
     LaunchJob.objects.create(
         job_id=f"job-{vm_id}-ok",
@@ -153,7 +153,7 @@ def _ran_vm(vm_id: str = "realtenant-1", **fields) -> Vm:
         kek_vault_path=f"x/{vm_id}/luks-kek",
         state=LaunchJobState.SUCCEEDED.value,
         reason="",
-        miner_id="miner-1",
+        miner_id="miner-a",
         phase_started_at=now,
         finished_at=now,
         decided_by=_actor(f"worker-{vm_id}"),
@@ -203,7 +203,7 @@ def test_a_launch_refused_at_placement_leaves_no_active_vm_with_a_live_kek(
     fx, no_probe_allowed
 ) -> None:
     """THE defect, end to end and with NO operator in the loop: build
-    `stamp-fedora-3`'s exact live shape, run the orchestration tick, and
+    `vm-fedora-3`'s exact live shape, run the orchestration tick, and
     the row must end up `destroyed` with its per-VM Vault-Transit key
     destroyed."""
     vm = _never_placed_vm()
@@ -296,13 +296,13 @@ def test_a_vm_that_DID_run_is_refused_the_ticket_freeze_without_a_nonce(
     with pytest.raises(service.EffectError) as exc:
         service._decommission_vm(job)
     assert "cannot prove no guest was ever created" in str(exc.value)
-    assert "host-bound:miner-1" in str(exc.value)
+    assert "host-bound:miner-a" in str(exc.value)
 
 
 @pytest.mark.parametrize(
     "field,value,expected",
     [
-        ("host", "miner-1", "host-bound:miner-1"),
+        ("host", "miner-a", "host-bound:miner-a"),
         ("boot_phase", VmBootPhase.KEK_RELEASED.value, "boot-phase:kek_released"),
         ("generation", 2, "generation:2"),
     ],
@@ -345,27 +345,27 @@ def test_968_a_vm_with_a_nonce_but_no_ack_still_takes_the_existing_path(
     `never_ran_veto` shortcut is what carries it to the crypto-erase, and
     it still probes the miner its order was sent to."""
     vm = _never_placed_vm(
-        vm_id="stamp-fed-1",
+        vm_id="vm-fed-1",
         eol_nonce=b"\x11" * 32,
         launch_abandoned_outcome="dispatch-failed-after-register",
         launch_abandoned_registered=True,
     )
     now = timezone.now()
     LaunchJob.objects.create(
-        job_id="job-stamp-fed-1",
-        vm_id="stamp-fed-1",
+        job_id="job-vm-fed-1",
+        vm_id="vm-fed-1",
         tenant_id="t-stamp",
         flavor="small",
-        spec_json={"vm_id": "stamp-fed-1"},
-        userdata_vault_path="x/stamp-fed-1/userdata",
+        spec_json={"vm_id": "vm-fed-1"},
+        userdata_vault_path="x/vm-fed-1/userdata",
         userdata_vault_version=1,
-        kek_vault_path="x/stamp-fed-1/luks-kek",
+        kek_vault_path="x/vm-fed-1/luks-kek",
         state=LaunchJobState.FAILED.value,
         reason="dispatch-failed-after-register",
-        miner_id="miner-3",
+        miner_id="miner-c",
         phase_started_at=now,
         finished_at=now,
-        decided_by=_actor("worker-stamp-fed-1"),
+        decided_by=_actor("worker-vm-fed-1"),
     )
     fx.eol_ack = None
 
@@ -376,7 +376,7 @@ def test_968_a_vm_with_a_nonce_but_no_ack_still_takes_the_existing_path(
     job = DecommissionJob.objects.get(vm=vm)
     assert job.reason == "never-ran:no-guest-was-ever-created"
     # #968's evidence path, not this PR's: the miner WAS asked.
-    assert set(domain_down) == {"miner-3"}
+    assert set(domain_down) == {"miner-c"}
 
 
 def test_968_a_dark_miner_still_blocks_the_post_register_phantom(
@@ -385,27 +385,27 @@ def test_968_a_dark_miner_still_blocks_the_post_register_phantom(
     """And the probe still vetoes when a miner exists but does not
     answer. Only the "no miner was ever chosen" emptiness is an answer."""
     vm = _never_placed_vm(
-        vm_id="stamp-fed-2",
+        vm_id="vm-fed-2",
         eol_nonce=b"\x11" * 32,
         launch_abandoned_outcome="dispatch-failed-after-register",
         launch_abandoned_registered=True,
     )
     now = timezone.now()
     LaunchJob.objects.create(
-        job_id="job-stamp-fed-2",
-        vm_id="stamp-fed-2",
+        job_id="job-vm-fed-2",
+        vm_id="vm-fed-2",
         tenant_id="t-stamp",
         flavor="small",
-        spec_json={"vm_id": "stamp-fed-2"},
-        userdata_vault_path="x/stamp-fed-2/userdata",
+        spec_json={"vm_id": "vm-fed-2"},
+        userdata_vault_path="x/vm-fed-2/userdata",
         userdata_vault_version=1,
-        kek_vault_path="x/stamp-fed-2/luks-kek",
+        kek_vault_path="x/vm-fed-2/luks-kek",
         state=LaunchJobState.FAILED.value,
         reason="dispatch-failed-after-register",
-        miner_id="miner-3",
+        miner_id="miner-c",
         phase_started_at=now,
         finished_at=now,
-        decided_by=_actor("worker-stamp-fed-2"),
+        decided_by=_actor("worker-vm-fed-2"),
     )
     monkeypatch.setattr(effects, "poll_domain_running_on", lambda vm, n: None)
 
@@ -433,7 +433,7 @@ def test_the_sweep_opens_the_teardown_itself(fx, no_probe_allowed) -> None:
 
 
 def test_a_previously_FAILED_teardown_does_not_strand_it(fx, no_probe_allowed) -> None:
-    """The live row's compounding shape: `stamp-fedora-3` already carries
+    """The live row's compounding shape: `vm-fedora-3` already carries
     a `failed` DecommissionJob from the refusal this PR removes.
 
     Two things have to hold for that not to be an operator DB fixup. The

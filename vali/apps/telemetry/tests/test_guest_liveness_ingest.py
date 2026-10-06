@@ -62,7 +62,7 @@ def _ingest_receipt(client: APIClient, vm_id: str, *, body: bytes) -> None:
 # ─── the §23 served receipt — the UNIVERSAL signal ───────────────────
 #
 # Measured on the live fleet 2026-08-12: BOTH Active tenant VMs emit it
-# (realtenant-ubuntu-1 = 30 690 receipts, p1-liveness-1 = 460), while
+# (tenant-vm-1 = 30 690 receipts, p1-liveness-1 = 460), while
 # only the newer image emits a §322 live attestation. That is why the
 # served receipt is the primary feed.
 
@@ -190,6 +190,9 @@ def live_attestation(monkeypatch, settings):
         )
 
     monkeypatch.setattr(vm_liveness.verifier, "verify_live_attestation", _fake)
+    from apps.orchestration.models import MeasurementLedger
+
+    MeasurementLedger.objects.create(vm_id="vm-la", launch_digest_hex="44" * 48, allowlist_epoch=1)
     VmBillingBinding.objects.create(
         vm_id="vm-la",
         node_id_hex=node_id,

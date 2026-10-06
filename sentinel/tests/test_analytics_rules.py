@@ -422,7 +422,7 @@ def test_miner_quarantine_proximity_rejects_zero_epoch_seconds() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Env-validation surfaces (codex PR-S4 review MED finding)
+# Env-validation surfaces (review PR-S4 review MED finding)
 # ---------------------------------------------------------------------------
 
 
@@ -475,7 +475,7 @@ def test_replay_attempts_rejects_negative_threshold(
 
 
 def test_release_anomaly_rejects_oversized_pct_kwarg() -> None:
-    """Direct-kwarg path validates too (codex round-2 MED)."""
+    """Direct-kwarg path validates too (review round-2 MED)."""
 
     with pytest.raises(ValueError):
         ReleaseAnomalyRule(denial_threshold_pct=200.0)
@@ -484,7 +484,7 @@ def test_release_anomaly_rejects_oversized_pct_kwarg() -> None:
 
 
 def test_finding_details_are_immutable_after_emit() -> None:
-    """Codex round-2 MED: Finding.details must not be mutable post-emit."""
+    """Review round-2 MED: Finding.details must not be mutable post-emit."""
 
     from sentinel.analytics.base import Finding, Severity
 
@@ -500,7 +500,7 @@ def test_finding_details_are_immutable_after_emit() -> None:
 
 
 def test_finding_details_snapshot_decouples_from_caller_dict() -> None:
-    """Codex round-3 MED: caller mutating backing dict must NOT change details."""
+    """Review round-3 MED: caller mutating backing dict must NOT change details."""
 
     from sentinel.analytics.base import Finding, Severity
 
@@ -536,7 +536,7 @@ def test_finding_details_snapshot_decouples_from_mapping_proxy_backing() -> None
 
 
 def test_audit_chain_break_does_not_leak_error_message_into_finding() -> None:
-    """Codex HIGH: error_excerpt must NOT contain raw error bytes."""
+    """Review HIGH: error_excerpt must NOT contain raw error bytes."""
 
     rule = AuditChainBreakRule()
     secret_like = "BEGIN PRIVATE KEY ...AAAA..."

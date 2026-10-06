@@ -891,7 +891,7 @@ fn vali_submit_epoch_close_rejects_duplicate_node_in_batch() {
 
 #[test]
 fn vali_submit_epoch_close_quarantined_to_active_removes_row() {
-    // Codex/gemini convergent MEDIUM: a node that recovers from
+    // Review/review convergent MEDIUM: a node that recovers from
     // Quarantined back to Active MUST NOT leave an explicit
     // `Active` row in `MinerStatuses` — that would contradict the
     // "default-Active implicit / only non-default rows
@@ -1416,6 +1416,7 @@ fn canonical_la_body(
     view: &LiveAttestationView<<TestRuntime as crate::pallet::Config>::MaxVmIdLen>,
 ) -> Vec<u8> {
     hippius_types::live_attestation::LiveAttestation {
+        components: None,
         schema_version: hippius_types::live_attestation::LIVE_ATTESTATION_SCHEMA_VERSION,
         chain_genesis: view.chain_genesis,
         pallet_instance: view.pallet_instance,
@@ -1433,6 +1434,8 @@ fn canonical_la_body(
         prev_attestation_hash: view.prev_attestation_hash,
         expiry_unix: view.expiry_unix,
         signer_pubkey: view.signer_pubkey,
+        guest: None,
+        resources: None,
     }
     .canonical()
     .expect("test view is well-formed")

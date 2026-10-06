@@ -9,15 +9,14 @@ section). The Phases 2/3 text is retained below for history.
 ## Redesign: separate fresh-formatted data disk (the shipped approach)
 
 **Why the resize plan died.** The matrix the original design gated on
-(run on miner-1, cryptsetup 2.8; the guest's 2.7 has the same limit)
+(run on a Genoa host, cryptsetup 2.8; the guest's 2.7 has the same limit)
 showed `cryptsetup resize` of a LUKS2 + `--integrity hmac-sha256`
 volume returns a hard refusal — *"Resize of LUKS2 device with integrity
 protection is not supported."* — and `cryptsetup open` has no
 `--integrity-recalculate` flag. Growing the inner dm-integrity layer
 (`integritysetup resize`) + reopening is off-label, fragile, and leaves
 the grown region tag-less (EIO) with no clean cryptsetup-level
-backfill. Not shippable on a security-critical disk. (Memory:
-`grow_365_cryptsetup_integrity_resize_unsupported`.)
+backfill. Not shippable on a security-critical disk.
 
 **The approach that ships.** Stop trying to grow one disk:
 
@@ -56,7 +55,7 @@ critical path (the original win) while keeping it a supported op.
 `mkfs.ext4` → mount → reboot (close/reopen) → fsck clean, canary +
 payload intact → tamper of an unwritten region = EIO. Plus the guest
 `hippius-data-disk-init` logic (no-token skip, short-disk fail-closed,
-first-boot format, reboot reopen, tamper EIO) — all green on miner-1.
+first-boot format, reboot reopen, tamper EIO) — all green on a Genoa host.
 
 ---
 

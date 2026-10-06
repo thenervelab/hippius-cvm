@@ -239,7 +239,7 @@ def test_dispatch_preflight_passes_decoded_digest(
         initrd=preflight_svc.S3Artifact("b", "k3.initrd.img", "c" * 64),
     )
     result = preflight_svc.dispatch_preflight(
-        miner_id="miner-1",
+        miner_id="miner-a",
         netbird_ip="100.64.0.10",
         order_id="ord-x",
         vm_id="vm-x",
@@ -281,7 +281,7 @@ def test_dispatch_preflight_surfaces_miner_rejection(
     )
     with pytest.raises(EffectError, match="miner-rejected"):
         preflight_svc.dispatch_preflight(
-            miner_id="miner-1",
+            miner_id="miner-a",
             netbird_ip="100.64.0.10",
             order_id="ord-y",
             vm_id="vm-y",

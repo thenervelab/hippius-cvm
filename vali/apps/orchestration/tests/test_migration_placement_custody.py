@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from django.utils import timezone
 
-from apps.lifecycle.models import Vm, VmState
+from apps.lifecycle.models import Vm, VmPowerState, VmState
 from apps.orchestration import service
 from apps.orchestration.models import MigrationJob, MigrationState
 from apps.scheduler.models import (
@@ -173,8 +173,8 @@ def _drain_enrolments(monkeypatch, *, departing: str) -> list[str]:
     )
     seen: list[str] = []
 
-    def _fake_start(*, vm, dest_node_id, decided_by):
-        seen.append(vm.vm_id)
+    def _fake_start(*, vm, dest_node_id, decided_by, cold=False):
+        seen.append(vm.vm_id + (":cold" if cold else ""))
         return type("J", (), {"job_id": "fake-job"})()
 
     monkeypatch.setattr(service, "start_migration", _fake_start)
@@ -387,9 +387,53 @@ def test_reboot_recovery_relaunch_creates_no_second_placement(
     monkeypatch.setattr(
         launch,
         "launch_on_miner",
-        lambda spec, m: SimpleNamespace(disposition=launch.ACCEPTED),
+        lambda spec, m, **_kw: SimpleNamespace(disposition=launch.ACCEPTED),
     )
 
     assert service._reboot_recovery_relaunch(vm, "node-dst") is True
 
     assert list(Placement.objects.filter(vm=vm).values_list("id", flat=True)) == before
+
+
+# ── a stopped VM is never put into §25 (#1150) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "power_state",
+    [VmPowerState.STOPPED, VmPowerState.STOPPING, VmPowerState.STARTING],
+)
+def test_a_vm_that_is_not_running_cannot_be_migrated(
+    fx: FakeEffects, power_state
+) -> None:
+    """§25 activates the destination only on the running source guest's
+    signed stopped-ack. A stopped VM has no guest: the job would time out
+    with the VM fenced in `Migrating` — unstartable, data behind an
+    operator recovery."""
+    vm = _placed_vm(generation=5, host="node-src")
+    Vm.objects.filter(pk=vm.pk).update(power_state=power_state)
+    vm.refresh_from_db()
+    with pytest.raises(service.StartError) as exc:
+        _start(vm)
+    assert exc.value.category == "vm-not-running"
+    vm.refresh_from_db()
+    assert vm.state == VmState.ACTIVE, "the VM must not be fenced"
+
+
+def test_the_departing_miner_drain_migrates_a_stopped_vm_cold(
+    fx: FakeEffects, monkeypatch
+) -> None:
+    """A stopped VM no longer stays behind on a departing miner (#1150): it
+    is migrated COLD — started on its source, stopped at the destination."""
+    running = _placed_vm(vm_id="vm-running", lease_id="lease-r", generation=5, host="node-src")
+    stopped = _placed_vm(vm_id="vm-stopped", lease_id="lease-s", generation=5, host="node-src")
+    Vm.objects.filter(pk=stopped.pk).update(power_state=VmPowerState.STOPPED)
+    assert sorted(_drain_enrolments(monkeypatch, departing=SRC_NODE)) == [
+        running.vm_id,
+        f"{stopped.vm_id}:cold",
+    ]
+
+
+def test_the_departing_miner_drain_leaves_a_vm_mid_power_op(fx: FakeEffects, monkeypatch) -> None:
+    starting = _placed_vm(vm_id="vm-starting", lease_id="lease-t", generation=5, host="node-src")
+    Vm.objects.filter(pk=starting.pk).update(power_state=VmPowerState.STARTING)
+    assert _drain_enrolments(monkeypatch, departing=SRC_NODE) == []

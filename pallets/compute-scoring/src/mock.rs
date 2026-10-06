@@ -228,7 +228,7 @@ impl pallet_compute_scoring::Config for TestRuntime {
     type NowUnix = Timestamp;
 
     // PR-I4 epoch close. Mock bound at 128; production runtimes
-    // pick from block-weight benchmarks (codex/gemini review LOW:
+    // pick from block-weight benchmarks (review/review LOW:
     // recommend 64–128 starting point, with pagination as a
     // PR-I4.1 follow-up if the network grows past one batch per
     // epoch — see CHANGES.md PR-I4).

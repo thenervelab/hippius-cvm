@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from .models import LaunchPhase
+from .models import GuestUpgradeState, LaunchPhase, ResizeState
 
 
 class LaunchIntentSerializer(serializers.Serializer):
@@ -38,7 +38,12 @@ class LaunchIntentSerializer(serializers.Serializer):
     )
     lease_id = serializers.CharField(help_text="Marketplace lease id.")
     flavor = serializers.CharField(
-        help_text="Resource flavor name (must be a known flavor, e.g. `small`)."
+        help_text=(
+            "Resource flavor name (e.g. `small`). Must be in the catalogue (or an "
+            "unlisted `runner-*` flavor) AND at or below the largest offered size "
+            "(`VALI_SCHEDULER_MAX_FLAVOR`, default `2xlarge`; a runner flavor goes "
+            "by its compute class); a larger one is refused 400 `flavor-not-offered`."
+        ),
     )
     cmdline = serializers.CharField(help_text="Guest kernel cmdline.")
     s3_bucket = serializers.CharField(
@@ -107,13 +112,67 @@ class LaunchIntentSerializer(serializers.Serializer):
         required=False, default="/var/lib/hippius-miner/rootfs.verity"
     )
     kid = serializers.CharField(required=False, default="l1-order-ticket-v1")
-    expiry_seconds = serializers.IntegerField(required=False, default=86400)
+    expiry_seconds = serializers.IntegerField(
+        required=False,
+        default=86400,
+        min_value=60,
+        max_value=86400,
+        help_text=(
+            "Lifetime of the minted OrderTicket — the authorization to "
+            "release this VM's KEK + userdata to whoever attests. Bounded "
+            "rather than free-form for that reason."
+        ),
+    )
+    region = serializers.RegexField(
+        r"^[A-Za-z]{2}$",
+        required=False,
+        default="",
+        help_text=(
+            "Optional region constraint: an ISO 3166-1 alpha-2 country code "
+            "(`FR`, case-insensitive). The VM is placed ONLY on a miner the "
+            "validator has DETECTED and verified in that country (nothing is "
+            "declared by miners); if none is eligible the launch fails with "
+            "`no-miner-in-region` rather than falling back elsewhere. "
+            "Discover regions via `GET /v1/operator/regions`; pre-check with "
+            "`GET /v1/scheduler/feasibility?region=`."
+        ),
+    )
     max_price_per_unit = serializers.IntegerField(
         required=False,
         allow_null=True,
         help_text=(
             "Tenant price ceiling (USD/unit ×1e6), positive int or null. Null "
             "⇒ the VM is never migrated on a miner price change."
+        ),
+    )
+    key_mode = serializers.ChoiceField(
+        choices=["hippius", "split", "customer"],
+        required=False,
+        default="hippius",
+        help_text=(
+            "Who holds the disk key. `hippius` (default): today's launch, "
+            "unchanged. `split` (M1): the key needs Hippius' share AND the "
+            "customer guardian's. `customer` (M2): the guardian's share only — "
+            "Hippius holds no disk key. `split`/`customer` are refused unless "
+            "customer keys are enabled on this validator, the launch is a "
+            "golden image whose bake is marked capable, and both guardian "
+            "fields are set. Fixed for the VM's life."
+        ),
+    )
+    guardian_endpoint = serializers.CharField(
+        required=False,
+        help_text=(
+            "`split`/`customer` only: the customer guardian's canonical "
+            "`host:port` (IPv4, `[IPv6]` in RFC 5952 form, or a lowercase DNS "
+            "name; no leading zeros). Measured into the guest cmdline."
+        ),
+    )
+    guardian_pubkey = serializers.RegexField(
+        r"^[0-9a-f]{64}$",
+        required=False,
+        help_text=(
+            "`split`/`customer` only: the guardian's Ed25519 identity key, 64 "
+            "lowercase hex. Measured into the guest cmdline."
         ),
     )
 
@@ -200,6 +259,16 @@ class DecommissionJobSerializer(serializers.Serializer):
     started_at = serializers.DateTimeField()
     finished_at = serializers.DateTimeField(allow_null=True)
     version = serializers.IntegerField()
+    data_death = serializers.ChoiceField(
+        choices=["crypto-erased", "customer-erase-required"],
+        allow_null=True,
+        help_text=(
+            "Null until the erase step ran. `crypto-erased`: Hippius destroyed the key "
+            "the disk needs. `customer-erase-required`: an M2 (`key_mode=customer`) VM — "
+            "Hippius never held its disk key; its stored copies are deleted, and only "
+            "the customer's `guardian erase <vm>` makes the data unrecoverable."
+        ),
+    )
 
 
 class MeasurementLedgerRowSerializer(serializers.Serializer):
@@ -227,3 +296,201 @@ class MeasurementAuditSerializer(serializers.Serializer):
     limit = serializers.IntegerField()
     offset = serializers.IntegerField()
     total = serializers.IntegerField()
+
+
+class ResizeStartRequestSerializer(serializers.Serializer):
+    """`POST /v1/vm/<vm_id>/resize` body."""
+
+    flavor = serializers.CharField(
+        max_length=32, help_text="Target flavor: its vCPU/RAM; the VM keeps its own data disk."
+    )
+
+
+class ResizeJobSerializer(serializers.Serializer):
+    """A `ResizeJob` row (`_serialize_resize`)."""
+
+    job_id = serializers.CharField()
+    vm_id = serializers.CharField()
+    from_flavor = serializers.CharField()
+    to_flavor = serializers.CharField()
+    state = serializers.ChoiceField(choices=ResizeState.values)
+    node_id = serializers.CharField(help_text="Miner the in-place steps run on.")
+    prior_power_state = serializers.CharField()
+    migration_job_id = serializers.CharField(allow_null=True)
+    reserved = serializers.BooleanField()
+    relaunched_at = serializers.DateTimeField(allow_null=True)
+    rolled_back = serializers.BooleanField()
+    reason = serializers.CharField(allow_null=True)
+    decided_by = serializers.CharField()
+    phase_started_at = serializers.DateTimeField()
+    started_at = serializers.DateTimeField()
+    finished_at = serializers.DateTimeField(allow_null=True)
+    version = serializers.IntegerField()
+
+
+class ResizeFlavorOptionSerializer(serializers.Serializer):
+    flavor = serializers.CharField()
+    cpu_count = serializers.IntegerField()
+    memory_mb = serializers.IntegerField()
+    data_disk_size_gb = serializers.IntegerField()
+    fits_current_host = serializers.BooleanField()
+    needs_migration = serializers.BooleanField()
+    available = serializers.BooleanField()
+    reason = serializers.CharField(allow_null=True)
+
+
+class ResizeFlavorsSerializer(serializers.Serializer):
+    """`GET /v1/vm/<vm_id>/resize/flavors` body."""
+
+    vm_id = serializers.CharField()
+    current_flavor = serializers.CharField(allow_null=True)
+    power_state = serializers.CharField()
+    blocked = serializers.CharField(allow_null=True)
+    options = ResizeFlavorOptionSerializer(many=True)
+
+
+class GuestUpgradeStartRequestSerializer(serializers.Serializer):
+    """`POST /v1/vm/<vm_id>/guest-upgrade` body."""
+
+    release = serializers.IntegerField(
+        min_value=1, help_text="The guest components release to move the VM onto."
+    )
+    not_before = serializers.DateTimeField(
+        required=False,
+        help_text="Not before this time (the tenant's maintenance window); now when omitted.",
+    )
+
+
+class GuestUpgradeRecoverySerializer(serializers.Serializer):
+    """One audited operator recovery of a failed / blocked guest upgrade."""
+
+    at = serializers.DateTimeField()
+    by = serializers.CharField()
+    action = serializers.CharField()
+    reason = serializers.CharField()
+    attempt = serializers.CharField()
+    release = serializers.IntegerField()
+    result = serializers.CharField(
+        help_text="`started`, `refused:<reason>`, `error:<type>` or `dispatching`."
+    )
+
+
+class GuestUpgradeRecoverRequestSerializer(serializers.Serializer):
+    """`POST /v1/vm/<vm_id>/guest-upgrade/<job_id>/recover` body."""
+
+    action = serializers.ChoiceField(choices=["start-on-target"])
+    reason = serializers.CharField(help_text="Why (audited on the job).")
+
+
+class GuestUpgradeJobSerializer(serializers.Serializer):
+    """A `GuestUpgradeJob` row (`guest_upgrade.serialize_job`)."""
+
+    job_id = serializers.CharField()
+    vm_id = serializers.CharField()
+    release = serializers.IntegerField()
+    build_prefix = serializers.CharField()
+    state = serializers.ChoiceField(choices=GuestUpgradeState.values)
+    not_before = serializers.DateTimeField()
+    previous_prefix = serializers.CharField()
+    previous_epoch = serializers.IntegerField()
+    node_id = serializers.CharField(help_text="Miner the upgrade runs on.")
+    reason = serializers.CharField(allow_null=True)
+    outcome = serializers.CharField(
+        allow_null=True,
+        help_text="Why the target did not come up (`health-failed`, `health-latched`, "
+        "`guest-restarted`, `resources-mismatch`, `no-sample`, `measurement-mismatch`, "
+        "`dispatch-failed`, `stop-timeout`, `launch-timeout`, `c2-not-enforced`, "
+        "`vm-moved`); null while it has not failed.",
+    )
+    suspect = serializers.CharField(
+        allow_null=True,
+        help_text="Whose side the outcome points at: `release`, `miner`, `vali`, `fleet` "
+        "(a first lead, not a verdict).",
+    )
+    retry_of = serializers.CharField(
+        allow_null=True, help_text="The upgrade_blocked job this one retries."
+    )
+    recoveries = GuestUpgradeRecoverySerializer(many=True)
+    decided_by = serializers.CharField()
+    phase_started_at = serializers.DateTimeField()
+    started_at = serializers.DateTimeField()
+    finished_at = serializers.DateTimeField(allow_null=True)
+    version = serializers.IntegerField()
+
+
+class GuestComponentsSerializer(serializers.Serializer):
+    """`GET /v1/vm/<vm_id>/guest-components` body."""
+
+    vm_id = serializers.CharField()
+    release = serializers.IntegerField(
+        allow_null=True, help_text="The release the VM boots; null on its bare base."
+    )
+    security_epoch = serializers.IntegerField()
+    build_prefix = serializers.CharField(allow_null=True)
+    required_epoch = serializers.IntegerField()
+    attested_epoch = serializers.IntegerField()
+    newest_release = serializers.IntegerField(allow_null=True)
+    newest_security_epoch = serializers.IntegerField(
+        allow_null=True,
+        help_text="That release's security epoch: above `security_epoch`, the update fixes "
+        "a security flaw (a shorter deadline).",
+    )
+    upgrade = GuestUpgradeJobSerializer(allow_null=True)
+    needs_operator = GuestUpgradeJobSerializer(
+        allow_null=True,
+        help_text="The VM's latest job when it ended failed / upgrade_blocked: the VM "
+        "needs an operator (a recovery start, a retry).",
+    )
+
+
+class GuestRolloutScopeSerializer(serializers.Serializer):
+    vm_ids = serializers.ListField(child=serializers.CharField(), required=False)
+    tenant_ids = serializers.ListField(child=serializers.CharField(), required=False)
+    node_ids = serializers.ListField(child=serializers.CharField(), required=False)
+    bake_ids = serializers.ListField(child=serializers.CharField(), required=False)
+
+
+class GuestRolloutStartRequestSerializer(serializers.Serializer):
+    """`POST /v1/guest-rollouts` body."""
+
+    release = serializers.IntegerField(min_value=1)
+    canary_vm_ids = serializers.ListField(child=serializers.CharField(), min_length=1)
+    scope = GuestRolloutScopeSerializer(required=False)
+    waves = serializers.ListField(
+        child=serializers.IntegerField(min_value=1, max_value=100), required=False
+    )
+    max_concurrent = serializers.IntegerField(min_value=1, max_value=50, required=False)
+    wave_pause_s = serializers.IntegerField(min_value=0, required=False)
+    max_failure_ratio = serializers.FloatField(min_value=0, max_value=0.99, required=False)
+    not_before = serializers.DateTimeField(required=False)
+
+
+class GuestRolloutSerializer(serializers.Serializer):
+    """A `GuestRollout` (`guest_rollout.serialize_rollout`)."""
+
+    rollout_id = serializers.CharField()
+    release = serializers.IntegerField()
+    state = serializers.CharField()
+    paused_reason = serializers.CharField(allow_null=True)
+    current_wave = serializers.IntegerField()
+    waves = serializers.ListField(child=serializers.IntegerField())
+    canary_vm_ids = serializers.ListField(child=serializers.CharField())
+    scope = GuestRolloutScopeSerializer()
+    members = serializers.ListField(
+        child=serializers.CharField(), help_text="The VMs fixed at creation (canaries apart)."
+    )
+    population = serializers.IntegerField()
+    assigned = serializers.DictField(child=serializers.ListField(child=serializers.CharField()))
+    jobs = serializers.DictField(
+        child=serializers.DictField(child=serializers.IntegerField()),
+        help_text="Per wave, the count of its jobs by state (`pending-stopped`: waiting "
+        "for the VM's next start).",
+    )
+    skipped = serializers.DictField(child=serializers.CharField())
+    max_concurrent = serializers.IntegerField()
+    wave_pause_s = serializers.IntegerField()
+    max_failure_ratio = serializers.FloatField()
+    not_before = serializers.DateTimeField(allow_null=True)
+    decided_by = serializers.CharField()
+    created_at = serializers.DateTimeField()
+    finished_at = serializers.DateTimeField(allow_null=True)

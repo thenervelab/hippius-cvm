@@ -79,4 +79,5 @@ def _serialize_image(img: GoldenImage, bake: TenantBake | None) -> dict[str, Any
         "is_golden": is_golden,
         "blessed_at": img.blessed_at.isoformat(),
         "blessed_by": img.blessed_by or "",
+        "guest_release": img.guest_release,
     }

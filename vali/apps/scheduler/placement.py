@@ -35,6 +35,29 @@ Four §23 constraints gate eligibility, all fail-closed:
       [`cvm_capability`] for where the evidence comes from, the measured
       base rate behind the threshold, and why a miner can neither claim
       capability it lacks nor deny a rival's.
+  (f) **Detected region** — when the caller constrains the launch to a
+      region, only a miner the geo-probe has MEASURED there (and, by
+      default, verified — see `service.region_by_node`) is a candidate.
+      Nothing declared by the miner ever enters this gate; a miner
+      absent from the map is in no region at all.
+  (g) **Concurrent boots per miner** — when the caller supplies it, a
+      miner already booting `max_booting_per_node` guests (a launch being
+      dispatched, or a guest with no in-guest signal yet since its current
+      boot began) takes no further launch until one of them comes up. A
+      first boot formats a LUKS2 + dm-integrity disk and is the most
+      CPU/IO-hungry minute of a VM's life, and admission (a) only prices
+      the RESERVED vCPU: a burst of launches would otherwise all fit, all
+      land on the roomiest host and boot at once (2026-10-05: 13
+      simultaneous boots on one host, load ~396, every guest stuck after
+      its KEK release). Transient by nature, so it has its own error
+      category and the launch path waits for a boot slot instead of
+      failing. The operator may set a per-miner cap
+      (`MinerCapacity.max_booting`) over the fleet value.
+  (h) **Cordon** — an operator-cordoned miner (`MinerCapacity.cordoned_at`)
+      takes no new placement from any caller. HARD, no fallback. It only
+      closes the door: the VMs already there, their telemetry, recovery,
+      power and same-host relaunches never pass through here, so nothing
+      about them changes (unlike a `QUARANTINED` miner, which is drained).
 
 Among the eligible, the winner is chosen by a **composite selection
 score** — NOT by reward weight alone. Ranking by reward weight is a
@@ -62,13 +85,31 @@ Only miners in on-chain `Active` status are ever considered.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from .chain import ChainSnapshot
+
+log = logging.getLogger("apps.scheduler.placement")
 
 # On-chain `MinerStatus` label that gates scheduling. Mirrors the
 # `read-miner-status` output + `MinerStatusMirror.ACTIVE`.
 MINER_ACTIVE = "active"
+
+# A region is an ISO 3166-1 alpha-2 country code (`FR`). Defined HERE, in
+# the pure module, so the launch intake (`orchestration.launch_jobs`), the
+# feasibility view and the gate below all accept exactly the same shape;
+# a caller's `fra` / `France` is rejected at the edge instead of silently
+# matching nothing and surfacing as a fleet-wide "no miner in region".
+REGION_RE = re.compile(r"^[A-Za-z]{2}$")
+
+# The `PlacementError` category raised when gate (g) — concurrent boots per
+# miner — is what emptied the candidate set. Transient: the launch path
+# waits for a boot slot on it instead of failing the job.
+MINERS_BOOTING = "miners-booting"
 
 # The two `cvm_capability` verdicts this module acts on. Re-declared as
 # plain literals rather than imported so this module stays free of the
@@ -78,6 +119,38 @@ MINER_ACTIVE = "active"
 _CVM_PROVEN = "proven"
 _CVM_DEGRADED = "degraded"
 _CVM_INCAPABLE = "incapable"
+
+
+@dataclass(frozen=True)
+class ResourceFit:
+    """Capacity v2's answer for ONE VM of `resource_class` (see
+    `service.resource_fit`): which hosts it fits in real units, and how
+    empty each host is (`capacity.free_fraction`).
+
+    - `enforce`  True ⇒ gate (a) is the v2 fit (a node absent from
+                 `fits_by_node` is refused — fail closed) and the ranking's
+                 free term is `free_fraction`. False ⇒ the v1 slot gate
+                 decides and every disagreement is LOGGED (the shadow run
+                 that proves v2 before it is switched on).
+    - `shadow_log`  False silences the shadow line (feasibility asks the
+                 scheduler five times per board — the launch path is the
+                 one worth logging).
+    """
+
+    resource_class: str
+    fits_by_node: Mapping[str, bool]
+    free_fraction_by_node: Mapping[str, float]
+    enforce: bool = False
+    shadow_log: bool = True
+    #: The DATA-disk gate (`VALI_SCHEDULER_DISK_GATE`), independent of the
+    #: admission model: `off` ignores disk; `record` admits but logs every
+    #: CHOSEN node `enforce` would have refused; `enforce` refuses. The map
+    #: holds, per node, the reason `enforce` would refuse (`""` = admits);
+    #: a node absent from it has no mirror row and is refused by gate (a)
+    #: anyway.
+    disk_mode: str = "off"
+    disk_gb: int = 0
+    disk_refusal_by_node: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -182,6 +255,9 @@ class Candidate:
     # supply the ledger ranks exactly as before — absence of evidence is
     # scored as absence of evidence, never as evidence.
     cvm_proven: bool = False
+    # Capacity v2 load-balance term (0..1), set only when resource
+    # admission is ENFORCED; `None` ⇒ the v1 `free_slots / capacity` ratio.
+    free_fraction: float | None = None
 
 
 def _score(
@@ -206,7 +282,10 @@ def _score(
     spread_penalty = c.family_load * weights.spread
     # Free-capacity ratio (0..1): emptier miners preferred (load-balance);
     # a near-full high-merit miner naturally stops winning.
-    free = (c.free_slots / c.capacity) if c.capacity > 0 else 0.0
+    if c.free_fraction is not None:
+        free = c.free_fraction
+    else:
+        free = (c.free_slots / c.capacity) if c.capacity > 0 else 0.0
     # Merit: normalized reward weight (0..1). Bounded by `weights.merit`
     # so it breaks ties among trusted miners but never starves newcomers.
     merit = (c.quality / max_quality) if max_quality > 0 else 0.0
@@ -258,6 +337,15 @@ def decide_placement(
     owner_load_by_node: dict[str, int] | None = None,
     max_owner_placements_per_miner: int = 0,
     cvm_capability_by_node: dict[str, str] | None = None,
+    region: str = "",
+    region_by_node: Mapping[str, str] | None = None,
+    pinned: frozenset[str] | None = None,
+    zombie_quarantined: frozenset[str] | None = None,
+    resource_fit: ResourceFit | None = None,
+    booting_by_node: Mapping[str, int] | None = None,
+    max_booting_per_node: int = 0,
+    max_booting_by_node: Mapping[str, int] | None = None,
+    cordoned: Mapping[str, str] | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -328,14 +416,69 @@ def decide_placement(
                          only provable by being placed) and NOT assumed
                          capable (it earns no bonus). `None` ⇒ no gate,
                          no de-rate, no bonus (legacy/tests).
+    - `region`           gate (f): an ISO 3166-1 alpha-2 country code the
+                         VM must land in (case-insensitive; `""` ⇒ no
+                         gate, which is every legacy caller). HARD, no
+                         fallback: a tenant who asked for `FR` is never
+                         silently placed in `DE`.
+    - `region_by_node`   `{node_id: country_code}` from
+                         `service.region_by_node()` — the regions the
+                         geo-probe has MEASURED (verified only, by
+                         default). Fail-closed: a node ABSENT from the map
+                         is in NO region, so a fleet the probe has not
+                         reached yet places nothing under a region
+                         constraint rather than placing anywhere. `None`
+                         with a non-empty `region` is that same empty map.
 
-    Raises [`PlacementError`] (`no-eligible-miner`) if nothing
-    qualifies.
+    - `pinned`           when not `None`, the ONLY node_ids the VM may land
+                         on — the miner(s) whose registered `platform_id`
+                         the launch named (`service.pin_arguments`). HARD,
+                         no fallback: the launch ticket binds the VCEK of
+                         that chip, and vali's launch-digest recompute
+                         (C2) uses its CPU family, so any other host fails
+                         late. An empty set places nothing. `None` ⇒ no pin.
+
+    - `zombie_quarantined`  lower-case node_ids currently relaying frames
+                         from a VM whose §24 crypto-erase already ran
+                         (`apps.lifecycle.zombie.quarantined_node_ids`):
+                         the miner is still running a VM it was told to
+                         kill. HARD, no fallback — derived from FRESH
+                         signals only, so it lifts on its own once the
+                         frames stop or the destroy is confirmed. `None` ⇒
+                         no gate.
+
+    - `resource_fit`     capacity v2 (see [`ResourceFit`]). `None` ⇒ v1
+                         only (legacy/tests). Enforced ⇒ gate (a) asks
+                         "does THIS flavor fit in vCPU, RAM and VM count",
+                         not "is a slot free".
+
+    - `booting_by_node`  gate (g): `{node_id: guests booting there now}`
+                         (`service.booting_by_node`).
+    - `max_booting_per_node`  a miner with `≥` this many booting guests is
+                         skipped. HARD, no fallback — the point is to stop
+                         a burst from booting on one host at once. `0` ⇒
+                         no gate (every caller but the launch path).
+    - `max_booting_by_node`  per-node override of `max_booting_per_node`
+                         (`MinerCapacity.max_booting`); a node in it is
+                         capped at its own value even when the fleet value
+                         is `0`. Only read alongside `booting_by_node`.
+    - `cordoned`         gate (h): `{lower-case node_id: reason}` of the
+                         operator-cordoned miners
+                         (`service.cordoned_node_ids`). HARD, no fallback.
+                         `None` ⇒ no gate.
+
+    Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
+    candidate that passed all the others (retry shortly);
+    `no-miner-in-region` when candidates reached gate (f) and it removed
+    every one of them (the fleet is reachable, just not there); otherwise
+    `no-eligible-miner`.
     """
     weights = weights or SelectionWeights()
     stake_ok = stake_sufficient_by_node or {}
     prices = price_by_node or {}
     cvm_capability = cvm_capability_by_node or {}
+    region = region.strip().upper()
+    regions = region_by_node or {}
 
     # ── Is the reward signal ALIVE? (fossil guard) ───────────────────
     # A runtime upgrade that DROPS `pallet-compute-scoring` does not
@@ -361,14 +504,40 @@ def decide_placement(
     merit_is_live = bool(getattr(snapshot, "pallet_live", True))
 
     eligible: list[Candidate] = []
+    # gate (a) verdicts per node, v1 vs v2 — the shadow run's evidence.
+    shadow: dict[str, tuple[bool, bool]] = {}
     # How many candidates gate (e) removed. Reported in the
     # `no-eligible-miner` message: a fleet that is empty BECAUSE every
     # host has been observed failing to start a confidential guest looks
     # identical, from the error string alone, to a fleet that is out of
     # capacity or epoch-stale — and those call for opposite responses.
     cvm_incapable_skipped = 0
+    # How many candidates reached gate (f), and how many it removed. The
+    # two together decide the error category: `no-miner-in-region` is
+    # claimed ONLY when the region gate is what emptied the set, so a
+    # caller never retries a region that was never the problem.
+    region_seen = 0
+    region_skipped = 0
+    zombie_skipped = 0
+    disk_skipped = 0
+    booting = booting_by_node or {}
+    # Gate (g)'s removals, `{node_id: booting count}` — logged, and named
+    # in the `miners-booting` error.
+    booting_skipped: dict[str, int] = {}
+    booting_caps = max_booting_by_node or {}
+    # Gate (h)'s removals, `{node_id: reason}` — logged and counted.
+    cordon_skipped: dict[str, str] = {}
     for miner in snapshot.miners:
         if miner.node_id in excluded:
+            continue
+        if zombie_quarantined and miner.node_id.lower() in zombie_quarantined:
+            zombie_skipped += 1
+            continue
+        # (h) operator cordon — no new work, whoever asks.
+        if cordoned and miner.node_id.lower() in cordoned:
+            cordon_skipped[miner.node_id] = cordoned[miner.node_id.lower()]
+            continue
+        if pinned is not None and miner.node_id not in pinned:
             continue
         # Defense-in-depth liveness/completeness gate. The chain's `Active`
         # set is authoritative, but on mainnet it is kept honest by the §23
@@ -383,6 +552,18 @@ def decide_placement(
         # vali never dispatches to a miner it cannot actually reach + attest.
         if dispatchable is not None and miner.node_id not in dispatchable:
             continue
+        # (f) detected region — HARD, fail-closed. Placed right after the
+        # dispatchability gate so `region_seen` counts miners vali could
+        # actually launch onto: "no miner in region" must mean the
+        # reachable fleet has none there, not that the fleet is dark.
+        # `regions.get(...) != region` deliberately treats an absent node
+        # like a mismatched one — the map holds what the probe MEASURED
+        # (and verified), and a miner it has not measured has no region.
+        if region:
+            region_seen += 1
+            if regions.get(miner.node_id) != region:
+                region_skipped += 1
+                continue
         # Only on-chain Active miners are ever schedulable (§23).
         if miner.status != MINER_ACTIVE:
             continue
@@ -424,15 +605,43 @@ def decide_placement(
         if cvm_capability.get(miner.node_id) == _CVM_INCAPABLE:
             cvm_incapable_skipped += 1
             continue
+        # (a') the DATA-disk dimension — under either admission model, and
+        # ahead of (a) so a disk refusal is counted as one (v2's own fit
+        # also includes disk while the gate is enforced). Enforced, a flavor
+        # whose disk does not fit is refused here instead of by the miner
+        # (507 `insufficient-disk`) after vali committed to the host.
+        if (
+            resource_fit is not None
+            and resource_fit.disk_mode == "enforce"
+            and resource_fit.disk_refusal_by_node.get(miner.node_id, "")
+        ):
+            disk_skipped += 1
+            continue
         # (a) admission bounded by proven capacity.
         capacity = capacity_by_node.get(miner.node_id)
-        if capacity is None:
-            # No mirror row ⇒ unknown capacity ⇒ fail closed.
-            continue
         load = load_by_node.get(miner.node_id, 0)
-        free_slots = capacity - load
-        if free_slots <= 0:
+        free_slots = (capacity - load) if capacity is not None else 0
+        v1_ok = capacity is not None and free_slots > 0
+        v2_ok = resource_fit is not None and resource_fit.fits_by_node.get(miner.node_id, False)
+        if resource_fit is not None:
+            shadow[miner.node_id] = (v1_ok, v2_ok)
+        if resource_fit is not None and resource_fit.enforce:
+            # v2: the flavor must fit. A node vali has no budget for is
+            # absent from the map ⇒ refused (fail closed).
+            if not v2_ok:
+                continue
+        elif not v1_ok:
+            # v1: no mirror row ⇒ unknown capacity ⇒ fail closed; else a
+            # free slot is required.
             continue
+        # (g) concurrent boots — LAST, so a node counted here passed every
+        # other gate: when this empties the set, waiting is the answer.
+        n_booting = booting.get(miner.node_id, 0)
+        boot_cap = booting_caps.get(miner.node_id, max_booting_per_node)
+        if (miner.node_id in booting_caps or boot_cap > 0) and n_booting >= boot_cap:
+            booting_skipped[miner.node_id] = n_booting
+            continue
+
         # Merit under a dead pallet: ZERO, uniformly. There is no live
         # reward signal, so no miner may convert a frozen number into an
         # advantage — in EITHER direction. Zeroing (rather than keeping a
@@ -447,7 +656,7 @@ def decide_placement(
                 node_id=miner.node_id,
                 quality=quality,
                 free_slots=free_slots,
-                capacity=capacity,
+                capacity=capacity if capacity is not None else 0,
                 load=load,
                 # Unproven (no reward weight yet) ⇒ newcomer grace. Under
                 # a dead pallet this is true of EVERYONE, so grace becomes
@@ -488,10 +697,35 @@ def decide_placement(
                 # `is` the PROVEN literal, not "not incapable": the bonus
                 # must rest on a POSITIVE observation. Unknown gets zero.
                 cvm_proven=cvm_capability.get(miner.node_id) == _CVM_PROVEN,
+                free_fraction=(
+                    resource_fit.free_fraction_by_node.get(miner.node_id, 0.0)
+                    if resource_fit is not None and resource_fit.enforce
+                    else None
+                ),
             )
         )
 
+    if cordon_skipped:
+        log.info(
+            "cordon: skipped %s",
+            ", ".join(
+                f"{nid} ({why or 'no reason'})" for nid, why in sorted(cordon_skipped.items())
+            ),
+        )
+    booted = ", ".join(
+        f"{nid}={n}/{booting_caps.get(nid, max_booting_per_node)}"
+        for nid, n in sorted(booting_skipped.items())
+    )
+    if booting_skipped:
+        log.info("boot cap: skipped %s (booting/cap)", booted)
     if not eligible:
+        _log_shadow(resource_fit, shadow, chosen=None)
+        if booting_skipped:
+            raise PlacementError(
+                "every eligible miner is already at its concurrent-boot cap "
+                f"(booting/cap: {booted}); retry once one of them is up",
+                MINERS_BOOTING,
+            )
         cvm_note = (
             f" ({cvm_incapable_skipped} candidate(s) removed by the OBSERVED "
             "SNP-start-capability gate: vali watched them fail to start a "
@@ -500,11 +734,50 @@ def decide_placement(
             if cvm_incapable_skipped
             else ""
         )
+        if region and region_seen and region_skipped == region_seen:
+            # Every reachable candidate was removed BY the region gate:
+            # the fleet is fine, it is simply not where the tenant asked.
+            raise PlacementError(
+                f"no dispatchable miner is detected in region {region!r} "
+                f"({region_skipped} reachable candidate(s) are elsewhere or "
+                "not yet verified there — see GET /v1/operator/regions)",
+                "no-miner-in-region",
+            )
+        region_note = (
+            f" (constrained to region {region!r}: {region_skipped} of "
+            f"{region_seen} reachable candidate(s) removed by the region gate)"
+            if region
+            else ""
+        )
+        zombie_note = (
+            f" ({zombie_skipped} candidate(s) zombie-quarantined: still running "
+            "a VM whose §24 crypto-erase already ran)"
+            if zombie_skipped
+            else ""
+        )
+        pin_note = (
+            " (pinned by platform_id to "
+            f"{len(pinned)} registered miner(s), none of them placeable now)"
+            if pinned is not None
+            else ""
+        )
+        disk_note = (
+            f" ({disk_skipped} candidate(s) removed by the data-disk gate: "
+            f"no room for {resource_fit.disk_gb if resource_fit else 0} GiB)"
+            if disk_skipped
+            else ""
+        )
+        cordon_note = (
+            f" ({len(cordon_skipped)} candidate(s) cordoned by the operator)"
+            if cordon_skipped
+            else ""
+        )
         raise PlacementError(
             "no miner satisfies the §23 dispatchability (reachable + "
             "attestable + live) / admission / anti-affinity / "
             "epoch-freshness / stake / observed-SNP-start-capability "
-            f"constraints{cvm_note}",
+            f"constraints{cvm_note}{region_note}{pin_note}{zombie_note}{disk_note}"
+            f"{cordon_note}",
             "no-eligible-miner",
         )
 
@@ -585,4 +858,76 @@ def decide_placement(
         for c in eligible
     }
     eligible.sort(key=lambda c: (-scores[c.node_id], c.node_id))
+    _log_shadow(resource_fit, shadow, chosen=eligible[0].node_id)
+    _log_disk_record(resource_fit, chosen=eligible[0].node_id)
     return eligible[0].node_id
+
+
+def _log_disk_record(resource_fit: ResourceFit | None, *, chosen: str) -> None:
+    """`record` mode: the chosen node is one `enforce` would have refused
+    on disk — log it (structured, stable event name) and admit anyway."""
+    if resource_fit is None or resource_fit.disk_mode != "record" or not resource_fit.shadow_log:
+        return
+    reason = resource_fit.disk_refusal_by_node.get(chosen, "")
+    if reason:
+        log_disk_would_reject(
+            node_id=chosen,
+            resource_class=resource_fit.resource_class,
+            disk_gb=resource_fit.disk_gb,
+            reason=reason,
+            context="placement",
+        )
+
+
+def log_disk_would_reject(
+    *, node_id: str, resource_class: str, disk_gb: int, reason: str, context: str
+) -> None:
+    """The `record`-mode evidence: one structured WARNING per decision
+    `enforce` would have refused, under the stable event name
+    `disk_gate_would_reject` (count it in the log pipeline — the same
+    log-derived shape the capacity-v2 shadow run was judged by)."""
+    log.warning(
+        "disk-gate: %s",
+        json.dumps(
+            {
+                "event": "disk_gate_would_reject",
+                "mode": "record",
+                "node_id": node_id,
+                "resource_class": resource_class,
+                "disk_gb": disk_gb,
+                "reason": reason,
+                "context": context,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def _log_shadow(
+    resource_fit: ResourceFit | None,
+    shadow: Mapping[str, tuple[bool, bool]],
+    *,
+    chosen: str | None,
+) -> None:
+    """One INFO line per decision while v2 runs in shadow: what gate (a)
+    said under v1 and under v2 for every node that reached it, and the
+    choice. Silent when v2 is enforced (it decided) or not supplied."""
+    if resource_fit is None or resource_fit.enforce or not resource_fit.shadow_log:
+        return
+    disagree = sorted(nid for nid, (v1, v2) in shadow.items() if v1 != v2)
+    log.info(
+        "capacity-v2 shadow: %s",
+        json.dumps(
+            {
+                "resource_class": resource_fit.resource_class,
+                "chosen": chosen,
+                "chosen_fits_v2": (
+                    None if chosen is None else resource_fit.fits_by_node.get(chosen, False)
+                ),
+                "v1_admits": sorted(nid for nid, (v1, _) in shadow.items() if v1),
+                "v2_admits": sorted(nid for nid, (_, v2) in shadow.items() if v2),
+                "disagree": disagree,
+            },
+            sort_keys=True,
+        ),
+    )

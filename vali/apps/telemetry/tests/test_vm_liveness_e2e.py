@@ -72,6 +72,10 @@ def _pin_clock(monkeypatch):
 
 @pytest.fixture
 def _binding():
+    from apps.orchestration.models import MeasurementLedger
+
+    # The KAT body's measurement, as the launch's auto-pin would record it.
+    MeasurementLedger.objects.create(vm_id=KAT_VM, launch_digest_hex="33" * 48, allowlist_epoch=1)
     return VmBillingBinding.objects.create(
         vm_id=KAT_VM,
         node_id_hex=KAT_NODE,
@@ -175,3 +179,121 @@ def test_replaying_the_real_attestation_is_idempotent(settings, _binding) -> Non
         assert created_again is False
         assert again.pk == first.pk
     assert VmLiveAttestation.objects.count() == 1
+
+
+VECTOR_V2 = VECTOR.with_name("signed_live_attestation_v2.cbor")
+KAT_V2_CHIP = "5e" * 64
+KAT_V2_REPORT = "7a" * 32
+
+
+def _kat_miner(platform_id: str) -> None:
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.create(
+        miner_id="miner-kat",
+        pubkey_hex="ab" * 32,
+        platform_id=platform_id,
+        chain_node_id=KAT_NODE,
+    )
+
+
+@_needs_bin
+@pytest.mark.skipif(not VECTOR_V2.is_file(), reason=f"KAT vector missing at {VECTOR_V2}")
+def test_a_real_v2_attestation_carries_the_bound_guest(settings, _binding) -> None:
+    """The v2 (guest-bound) contract, Rust→JSON→Python with real bytes."""
+    settings.VALI_KBS_L0_VERIFYING_KEY = KAT_KBS_L0
+    _kat_miner(KAT_V2_CHIP)
+
+    row, created = vm_liveness.ingest_live_attestation(envelope=VECTOR_V2.read_bytes())
+
+    assert created is True
+    assert (row.binding_source, row.chip_id, row.report_id) == (
+        "release",
+        KAT_V2_CHIP,
+        KAT_V2_REPORT,
+    )
+
+
+@_needs_bin
+@pytest.mark.skipif(not VECTOR_V2.is_file(), reason=f"KAT vector missing at {VECTOR_V2}")
+def test_a_real_v2_attestation_off_the_nodes_chip_is_refused(settings, _binding) -> None:
+    settings.VALI_KBS_L0_VERIFYING_KEY = KAT_KBS_L0
+    _kat_miner("6f" * 64)
+
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=VECTOR_V2.read_bytes())
+
+    assert exc.value.category == "chip-mismatch"
+    assert VmLiveAttestation.objects.count() == 0
+
+
+VECTOR_V3 = VECTOR.with_name("signed_live_attestation_v3.cbor")
+
+
+@_needs_bin
+@pytest.mark.skipif(not VECTOR_V3.is_file(), reason=f"KAT vector missing at {VECTOR_V3}")
+@pytest.mark.parametrize(
+    ("flavor", "verdict"),
+    [("large", "ok"), ("xlarge", "short")],
+)
+def test_a_real_v3_attestation_carries_the_attested_resources(
+    settings, _binding, flavor: str, verdict: str
+) -> None:
+    """The v3 (attested resources) contract, Rust→JSON→Python with real
+    bytes: the KAT guest attests 4 vCPU / 16 GiB, a `large`."""
+    from apps.telemetry.models import GuestResourceShortfall
+
+    settings.VALI_KBS_L0_VERIFYING_KEY = KAT_KBS_L0
+    _kat_miner(KAT_V2_CHIP)
+    VmBillingBinding.objects.filter(pk=_binding.pk).update(resource_class=flavor)
+
+    row, created = vm_liveness.ingest_live_attestation(envelope=VECTOR_V3.read_bytes())
+
+    assert created is True
+    assert (row.vcpus_online, row.mem_firmware_kib, row.mem_total_kib, row.mem_unaccepted_kib) == (
+        4,
+        16_776_164,
+        15_337_812,
+        1024,
+    )
+    assert row.binding_source == "release"
+    assert row.resource_verdict == verdict
+    assert GuestResourceShortfall.objects.filter(vm_id=KAT_VM).exists() is (verdict == "short")
+
+
+VECTOR_V4 = VECTOR.with_name("signed_live_attestation_v4.cbor")
+
+
+@_needs_bin
+@pytest.mark.skipif(not VECTOR_V4.is_file(), reason=f"KAT vector missing at {VECTOR_V4}")
+def test_a_real_v4_attestation_carries_the_attested_components(settings, _binding) -> None:
+    """The v4 (guest components) contract, Rust→JSON→Python with real
+    bytes: release 2, epoch 1, every health check passing, keepalive
+    instance 0x12345678 with one failing tick latched."""
+    settings.VALI_KBS_L0_VERIFYING_KEY = KAT_KBS_L0
+    _kat_miner(KAT_V2_CHIP)
+    VmBillingBinding.objects.filter(pk=_binding.pk).update(resource_class="large")
+
+    row, created = vm_liveness.ingest_live_attestation(envelope=VECTOR_V4.read_bytes())
+
+    assert created is True
+    assert (
+        row.components_release_version,
+        row.components_security_epoch,
+        row.components_health,
+        row.components_instance,
+        row.components_unhealthy_ticks,
+    ) == (2, 1, 15, 0x1234_5678, 1)
+    # v4 keeps v3's resources and v2's binding when they are present.
+    assert row.vcpus_online == 4
+    assert row.binding_source == "release"
+
+
+@_needs_bin
+@_needs_vector
+def test_a_pre_v4_attestation_has_no_components(settings, _binding) -> None:
+    settings.VALI_KBS_L0_VERIFYING_KEY = KAT_KBS_L0
+
+    row, _ = vm_liveness.ingest_live_attestation(envelope=VECTOR.read_bytes())
+
+    assert row.components_health is None and row.components_release_version is None

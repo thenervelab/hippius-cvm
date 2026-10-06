@@ -59,12 +59,25 @@ pub enum OrderKind {
     /// `new_gen`. Only ever dispatched AFTER vali's verified source-ack
     /// fence + the KBS `Migrating{new_gen, dest}` transition.
     MigrateActivate,
+    /// Live backup of a running golden VM: copy its overlay (full, or the
+    /// clusters written since the chain's last run) without pausing the
+    /// guest and upload it + the state disk through presigned URLs. Runs
+    /// async; read back via `GET /v1/miner/backup/{vm_id}/status`.
+    Backup,
+    /// Staged restore of a VM from its backups (`stage` / `abort` /
+    /// `reclaim`, see [`crate::backup::staged`]). `stage` runs async;
+    /// read back via `GET /v1/miner/restore/{vm_id}/status`.
+    Restore,
     /// Pre-launch: fetch tenant artifacts via S3 presigned URLs +
     /// verify SHAs + compute the SNP launch_digest. Returns a JSON
     /// envelope vali parses for the digest before minting the
     /// matching `OrderTicket`. Same Edge signing + idempotency +
     /// freshness window as the other kinds.
     TenantPreflight,
+    /// Host-wide guest network policy (egress rules, per-VM caps). Names
+    /// no VM; replay is refused by a revision persisted on disk
+    /// ([`crate::netpolicy`]).
+    NetPolicy,
 }
 
 impl OrderKind {
@@ -78,7 +91,10 @@ impl OrderKind {
             OrderKind::MigrateQuiesce => "migrate-quiesce",
             OrderKind::MigrateSnapshot => "migrate-snapshot",
             OrderKind::MigrateActivate => "migrate-activate",
+            OrderKind::Backup => "backup",
+            OrderKind::Restore => "restore",
             OrderKind::TenantPreflight => "tenant-preflight",
+            OrderKind::NetPolicy => "net-policy",
         }
     }
 }
@@ -107,7 +123,7 @@ pub struct SignedOrder {
 /// ## Cross-miner / long-term replay protection
 ///
 /// `target_miner_id` and `issued_at_unix` were added in the §H phase-2
-/// order-dispatch follow-up (gemini r1 High findings): without them,
+/// order-dispatch follow-up (review r1 High findings): without them,
 /// a signed order intercepted on one miner could be replayed to any
 /// other miner (every miner pins the SAME Edge order-signing key), and
 /// a captured order would remain valid indefinitely. The miner-agent
@@ -235,6 +251,49 @@ pub struct LaunchOrder {
     /// addition is a `serde` field-set extension only; no Edge
     /// wire-protocol change.
     pub cose_ticket: ByteBuf,
+    /// This order RELAUNCHES a VM that already ran on this host (vali's
+    /// reboot-recovery and the power API's `start`): its per-VM disks —
+    /// the anti-rollback state disk, and the golden overlay upper or the
+    /// legacy data disk — must ALREADY be here. `true` makes the launch
+    /// refuse with [`crate::error::MinerAgentError::RelaunchDisksMissing`]
+    /// instead of creating a blank one: a blank state disk resets the
+    /// boot counter the KBS checks, and a blank golden overlay is
+    /// `luksFormat`ted by the guest on the first boot that gets a KEK —
+    /// a relaunch onto a host that never held the data would destroy
+    /// the tenant's disk rather than fail.
+    ///
+    /// Not measured (the launch digest covers ovmf / kernel / initrd /
+    /// cmdline / vcpus only) and not part of the L1 ticket. `serde
+    /// (default)` ⇒ `false` = first launch, the pre-existing behaviour;
+    /// encoded ONLY when `true`, so a first-launch body is byte-identical
+    /// to before and an agent too old to know the field rejects a
+    /// relaunch at decode (`deny_unknown_fields`) — fail-closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_existing_disks: bool,
+    /// Customer-held keys (M1/M2): the canonical `host:port` of the VM's
+    /// key guardian — the ONLY destination the guardian vsock relay
+    /// ([`crate::vsock::guardian_relay`]) dials for this VM's CID.
+    ///
+    /// Must be the canonical spelling ([`hippius_types::guardian::
+    /// GuardianEndpoint`]) and equal the MEASURED `hippius.guardian_ep=`
+    /// cmdline token once DECODED (the cmdline carries the lowercase hex
+    /// of this string; this field stays plain); a customer-keys cmdline
+    /// without it, or it without a
+    /// customer-keys cmdline, refuses the launch (see
+    /// [`crate::lifecycle::guardian::check_order_guardian`]). Not
+    /// measured itself, not part of the L1 ticket.
+    ///
+    /// `serde(default)` ⇒ `None` = M0, and encoded ONLY when set: an M0
+    /// launch body is byte-identical to before, and an agent too old to
+    /// know the key refuses a customer-keys launch at decode
+    /// (`deny_unknown_fields`) — fail-closed, which is why miner-agents
+    /// deploy BEFORE vali.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_ep: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A request to stop a running tenant CVM.
@@ -382,6 +441,16 @@ pub struct MigrateActivateOrder {
     /// forward-compat reason as [`MigrateSnapshotOrder::state_put_url`].
     #[serde(default)]
     pub state_get_url: String,
+    /// The snapshot's exact length and lower-case hex sha256, as the
+    /// source reported them when it uploaded (vali relays them from the
+    /// multipart receipts). The download is checked against both before
+    /// the volume is ever attached. `0` / empty ⇒ not known (a single-PUT
+    /// snapshot, or a vali predating the fields).
+    #[serde(default)]
+    pub snapshot_size: u64,
+    /// See [`Self::snapshot_size`].
+    #[serde(default)]
+    pub snapshot_sha256_hex: String,
     /// The forward-only generation the destination boots at. Folded into
     /// the cmdline by vali (`hippius.vm_generation=`) so the guest
     /// re-attests at this generation; the KBS releases the KEK only to
@@ -434,6 +503,65 @@ pub struct MigrateActivateOrder {
     /// existence check (`dest-artifacts-missing`) — never a half boot.
     #[serde(default)]
     pub boot_artifacts: Option<crate::orders::migration::DestStagingArtifacts>,
+    /// Backup failover: restore the overlay + state disk from this backup
+    /// chain instead of `get_url` / `state_get_url` (see
+    /// [`crate::orders::migration::activate_dest_with_chain`]). Absent for
+    /// a §25 migration.
+    #[serde(default)]
+    pub backup_chain: Option<crate::backup::restore::RestoreChain>,
+    /// vali's `DestActivating` phase deadline, less a safety margin, as
+    /// unix seconds: the wall-clock instant by which this host must have
+    /// settled the activation (`done` or `failed`). vali measures ONE
+    /// deadline from entering the phase and re-dispatches retries as new
+    /// orders; every attempt carries the SAME value, so a retry's clock
+    /// can no longer outlive vali's (see
+    /// [`crate::orders::migration::activate_dest_with_chain`]).
+    ///
+    /// `0` / absent ⇒ not carried (a vali predating the field): the
+    /// per-attempt budget alone applies, as before. Serialized only when
+    /// nonzero so an order without it stays byte-identical — and an agent
+    /// too old to know the key refuses an order that carries it at decode
+    /// (`deny_unknown_fields`), which is why agents deploy before vali.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub settle_by_unix: u64,
+    /// Staged restore: boot the disks the `restore` order `stage`d under
+    /// this id (see [`crate::backup::staged::swap_in`]) instead of
+    /// downloading anything — `get_url` / `state_get_url` /
+    /// `backup_chain` must then be empty (`staged-restore-conflict`), and
+    /// the staging must be `staged` (`restore-not-staged`). Allowed on the
+    /// VM's current host iff its domain is down (`restore-vm-live`).
+    /// Empty ⇒ not a staged restore; serialized only when set, for the
+    /// same forward-compat reason as [`Self::settle_by_unix`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub staged_restore_id: String,
+    /// The VM's key guardian endpoint — see [`LaunchOrder::guardian_ep`].
+    /// The destination of a §25 migration / backup failover / staged
+    /// restore boots the SAME measured cmdline, so its guest needs the
+    /// relay to reach the SAME guardian; [`Self::into_launch_order`]
+    /// carries it. Encoded only when set (agents deploy before vali).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_ep: Option<String>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+impl MigrateActivateOrder {
+    /// The field-consistency rule of a staged restore (see
+    /// [`Self::staged_restore_id`]). A plain activation always passes.
+    pub fn check_staged_restore(&self) -> std::result::Result<(), &'static str> {
+        if self.staged_restore_id.is_empty() {
+            return Ok(());
+        }
+        crate::backup::staged::check_restore_id(&self.staged_restore_id)
+            .map_err(|_| "restore-bad-id")?;
+        if !self.get_url.is_empty() || !self.state_get_url.is_empty() || self.backup_chain.is_some()
+        {
+            return Err("staged-restore-conflict");
+        }
+        Ok(())
+    }
 }
 
 /// §25 migration **M1** — snapshot the SOURCE CVM's writable volume.
@@ -455,8 +583,21 @@ pub struct MigrateSnapshotOrder {
     /// The source host id vali addressed. Correlation metadata only.
     pub node_id: String,
     /// Short-TTL, single-object presigned S3 **PUT** URL the encrypted
-    /// volume is streamed to. Never persisted by the miner.
+    /// volume is streamed to. Never persisted by the miner. Unused (and
+    /// may be omitted) when [`Self::disk_part_urls`] is set.
+    #[serde(default)]
     pub put_url: String,
+    /// Multipart upload of the volume: one presigned `UploadPart` URL per
+    /// part (URL `i` is part `i+1`), each part [`Self::part_size`] bytes
+    /// but the last. vali completes the upload from the part receipts the
+    /// status route reports. A single PUT is refused by the store above a
+    /// per-request size a golden overlay exceeds; empty ⇒ the single PUT
+    /// to [`Self::put_url`] (a vali predating multipart).
+    #[serde(default)]
+    pub disk_part_urls: Vec<String>,
+    /// Bytes per multipart part (see [`Self::disk_part_urls`]).
+    #[serde(default)]
+    pub part_size: u64,
     /// Short-TTL presigned S3 **PUT** URL for the per-VM anti-rollback
     /// state disk (`state/{vm_id}.raw`, the guest's `/dev/vdd`). Uploaded
     /// right after the volume; the destination restores it before booting
@@ -486,6 +627,126 @@ pub struct MigrateSnapshotOrder {
     /// `deny_unknown_fields`. Empty ⇒ skip the upload.
     #[serde(default)]
     pub state_put_url: String,
+}
+
+/// Live backup of one running golden VM (see [`OrderKind::Backup`] and
+/// [`crate::backup`]).
+///
+/// Not `Debug`: every URL is a short-TTL write capability.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupOrder {
+    /// The VM to back up.
+    pub vm_id: VmId,
+    /// vali's id for this run (`[a-z0-9-]{1,64}`); names the run's point
+    /// bitmap. A repeat of the same run is an idempotent no-op.
+    pub run_id: String,
+    /// The last run of the chain vali COMMITTED. An incremental copies
+    /// what changed since that point (required; `bitmap-missing` if QEMU
+    /// no longer has it ⇒ take a full). A full may name one point to keep
+    /// so the current chain survives the full failing. Every other point
+    /// is pruned.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    /// `full` or `incremental`.
+    pub kind: crate::backup::BackupKind,
+    /// Multipart part size in bytes (5 MiB ..= 5 GiB).
+    pub part_size: u64,
+    /// Presigned `UploadPart` URLs for the disk piece, part 1 first. The
+    /// miner uses `ceil(len / part_size)` of them and fails
+    /// `too-few-part-urls` up front if that is more than given.
+    pub disk_part_urls: Vec<String>,
+    /// Presigned single PUT for the 1 MiB state disk.
+    pub state_put_url: String,
+}
+
+impl BackupOrder {
+    /// The miner-side request.
+    pub fn into_request(self) -> crate::backup::BackupRequest {
+        crate::backup::BackupRequest {
+            vm_id: self.vm_id,
+            run_id: self.run_id,
+            parent_run_id: self.parent_run_id,
+            kind: self.kind,
+            part_size: self.part_size,
+            disk_part_urls: self.disk_part_urls,
+            state_put_url: self.state_put_url,
+        }
+    }
+}
+
+impl Order for BackupOrder {
+    fn vm_id(&self) -> &VmId {
+        &self.vm_id
+    }
+}
+
+fn default_restore_streams() -> u8 {
+    crate::backup::transfer::DEFAULT_STREAMS as u8
+}
+
+/// A staged restore op (see [`OrderKind::Restore`] and
+/// [`crate::backup::staged`]).
+///
+/// Not `Debug`: `chain` holds presigned URLs.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreOrder {
+    /// The VM.
+    pub vm_id: VmId,
+    /// vali's id for this restore attempt: 32 lower-case hex.
+    pub restore_id: String,
+    /// `stage`, `abort` or `reclaim`.
+    pub op: crate::backup::staged::RestoreOp,
+    /// `stage` only (absent otherwise): the point to rebuild. Its
+    /// `restore_id` must equal the order's.
+    #[serde(default)]
+    pub chain: Option<crate::backup::restore::RestoreChain>,
+    /// `stage` only: the full's expected size (the VM's disk size); `0`
+    /// for `abort` / `reclaim`.
+    #[serde(default)]
+    pub disk_bytes: u64,
+    /// Parallel ranged GETs per piece; clamped to `1..=16`.
+    #[serde(default = "default_restore_streams")]
+    pub streams: u8,
+}
+
+impl RestoreOrder {
+    /// Check the id and the op/field consistency; a `stage` chain is also
+    /// checked whole (sizes, part layouts) so vali hears about a bad one
+    /// on the order response.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::backup::staged::{check_restore_id, RestoreOp};
+        use crate::error::MinerAgentError;
+        check_restore_id(&self.restore_id)?;
+        match self.op {
+            RestoreOp::Stage => {
+                let chain = self
+                    .chain
+                    .as_ref()
+                    .ok_or(MinerAgentError::Backup("restore-chain-missing"))?;
+                if chain.restore_id != self.restore_id {
+                    return Err(MinerAgentError::Backup("restore-id-mismatch"));
+                }
+                if self.disk_bytes == 0 {
+                    return Err(MinerAgentError::Backup("restore-disk-bytes"));
+                }
+                crate::backup::restore::check_chain(chain, Some(self.disk_bytes))
+            }
+            RestoreOp::Abort | RestoreOp::Reclaim => {
+                if self.chain.is_some() || self.disk_bytes != 0 {
+                    return Err(MinerAgentError::Backup("restore-fields"));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Order for RestoreOrder {
+    fn vm_id(&self) -> &VmId {
+        &self.vm_id
+    }
 }
 
 /// One artifact the miner downloads via an S3 presigned URL during a
@@ -548,11 +809,101 @@ pub struct TenantPreflightOrder {
     pub cpu_count: u8,
 }
 
-/// Common surface over the order kinds the miner-agent processes —
-/// every order names exactly one tenant VM.
+/// Common surface over the per-VM order kinds — each names exactly one
+/// tenant VM.
 pub trait Order {
     /// The tenant VM this order concerns.
     fn vm_id(&self) -> &VmId;
+}
+
+/// What an order's log lines name: its VM, or `host` for a host-wide
+/// order ([`NetPolicyOrder`]).
+pub trait OrderSubject {
+    /// A charset-safe token for the `vm=` log field.
+    fn log_subject(&self) -> &str;
+}
+
+impl<T: Order> OrderSubject for T {
+    fn log_subject(&self) -> &str {
+        self.vm_id().as_str()
+    }
+}
+
+impl OrderSubject for NetPolicyOrder {
+    fn log_subject(&self) -> &str {
+        "host"
+    }
+}
+
+/// `local`: guests leave through the miner's own NAT. `edge`: through
+/// the region's edge, the miner allowing only the listed endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetPolicyMode {
+    Local,
+    Edge,
+}
+
+/// What the local-mode rules do with a matching packet: only count it,
+/// or drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetPolicyLocalAction {
+    Count,
+    Drop,
+}
+
+/// Transport of an allowed endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetProto {
+    Tcp,
+    Udp,
+}
+
+/// One allowed destination, `ip` in canonical dotted-quad IPv4 form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetEndpoint {
+    pub ip: String,
+    pub proto: NetProto,
+    pub port: u16,
+}
+
+/// The host-wide guest network policy (`net-policy`), see
+/// `docs/design/egress-and-bandwidth.md` §7.
+///
+/// `revision` is per miner and monotonic: the agent refuses a lower one,
+/// and the same one with other content ([`crate::netpolicy`]). A
+/// rollback is a higher revision. `not_after_unix` is the policy's own
+/// expiry; vali re-sends within it, so it is left out of the content
+/// hash. `uplink_hint` is the only optional field and is not encoded when
+/// absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetPolicyOrder {
+    pub revision: u64,
+    pub not_after_unix: u64,
+    /// vali's region code, `[a-z0-9-]`.
+    pub region: String,
+    pub mode: NetPolicyMode,
+    pub enforce: bool,
+    pub local_action: NetPolicyLocalAction,
+    /// Interface name of the uplink; absent ⇒ the default-route one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uplink_hint: Option<String>,
+    /// Edge and infra WireGuard endpoints (edge mode).
+    pub infra: Vec<NetEndpoint>,
+    /// The region's miners, any UDP port (edge mode), IPv4.
+    pub region_miners: Vec<String>,
+    /// NetBird management, signal and STUN endpoints (edge mode).
+    pub nb_control: Vec<NetEndpoint>,
+    /// Per-tap DNS budget, packets per second.
+    pub dns_limit_pps: u32,
+    /// VMs exempt from the outbound TCP 25 drop.
+    pub smtp_allowed_vms: Vec<VmId>,
+    /// Per-VM cap in Mbit/s, keyed by VM id.
+    pub vm_caps: std::collections::BTreeMap<String, u32>,
 }
 
 impl Order for LaunchOrder {
@@ -643,6 +994,11 @@ impl MigrateActivateOrder {
             cpu_count: self.cpu_count,
             memory_mb: self.memory_mb,
             cose_ticket: self.cose_ticket,
+            // The §25 dest-activation writes the migrated disks itself,
+            // right before this launch; the relaunch guard is not wired
+            // into that path.
+            require_existing_disks: false,
+            guardian_ep: self.guardian_ep,
         }
     }
 }
@@ -673,8 +1029,47 @@ mod tests {
             cpu_count: 2,
             memory_mb: 2048,
             cose_ticket: ByteBuf::new(),
+            require_existing_disks: false,
+            guardian_ep: None,
         };
         assert_eq!(order.vm_id().as_str(), "tenant-1");
+    }
+
+    /// `require_existing_disks` is invisible on a first launch (absent ⇒
+    /// `false`, `false` ⇒ not encoded) and survives the wire when set.
+    #[test]
+    fn require_existing_disks_is_wire_optional_and_round_trips() {
+        let order = |require_existing_disks: bool| LaunchOrder {
+            vm_id: VmId::new("tenant-1").unwrap(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+            initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+            cmdline: "quiet".to_string(),
+            luks_disk_path: PathBuf::from("/var/lib/hippius-miner/d.img"),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 0,
+            rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+            rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: ByteBuf::from(vec![1u8]),
+            require_existing_disks,
+            guardian_ep: None,
+        };
+        let encode = |o: &LaunchOrder| {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(o, &mut buf).unwrap();
+            buf
+        };
+        let key = b"require_existing_disks";
+        let first = encode(&order(false));
+        assert!(!first.windows(key.len()).any(|w| w == key.as_slice()));
+        let back: LaunchOrder = ciborium::de::from_reader(first.as_slice()).unwrap();
+        assert!(!back.require_existing_disks);
+
+        let relaunch = encode(&order(true));
+        let back: LaunchOrder = ciborium::de::from_reader(relaunch.as_slice()).unwrap();
+        assert!(back.require_existing_disks);
     }
 
     #[test]
@@ -687,6 +1082,10 @@ mod tests {
             OrderKind::MigrateQuiesce,
             OrderKind::MigrateSnapshot,
             OrderKind::MigrateActivate,
+            OrderKind::Backup,
+            OrderKind::Restore,
+            OrderKind::TenantPreflight,
+            OrderKind::NetPolicy,
         ] {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&kind, &mut buf).unwrap();
@@ -745,6 +1144,8 @@ mod tests {
                 vm_id: VmId::new("tenant-x").unwrap(),
                 get_url: "https://s3.example/snap?sig=abc".to_string(),
                 state_get_url: String::new(),
+                snapshot_size: 0,
+                snapshot_sha256_hex: String::new(),
                 new_gen: 6,
                 ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
                 kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
@@ -758,6 +1159,10 @@ mod tests {
                 memory_mb: 2048,
                 cose_ticket: ByteBuf::new(),
                 boot_artifacts: None,
+                backup_chain: None,
+                staged_restore_id: String::new(),
+                guardian_ep: None,
+                settle_by_unix: 0,
             },
         };
         let mut buf = Vec::new();
@@ -789,6 +1194,30 @@ mod tests {
         assert!(parsed.is_err());
     }
 
+    /// `settle_by_unix` is invisible when not carried (absent/0 ⇒ the
+    /// body is byte-identical to the pre-field wire) and round-trips when
+    /// it is.
+    #[test]
+    fn settle_by_unix_is_wire_optional_and_round_trips() {
+        let encode = |settle_by_unix: u64| {
+            let mut order = activate_order_with("ro", 10);
+            order.settle_by_unix = settle_by_unix;
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&order, &mut buf).unwrap();
+            buf
+        };
+        let key = b"settle_by_unix";
+        let absent = encode(0);
+        assert!(!absent.windows(key.len()).any(|w| w == key));
+        let back: MigrateActivateOrder = ciborium::de::from_reader(absent.as_slice()).unwrap();
+        assert_eq!(back.settle_by_unix, 0);
+
+        let carried = encode(1_790_000_000);
+        assert!(carried.windows(key.len()).any(|w| w == key));
+        let back: MigrateActivateOrder = ciborium::de::from_reader(carried.as_slice()).unwrap();
+        assert_eq!(back.settle_by_unix, 1_790_000_000);
+    }
+
     /// Build a `MigrateActivateOrder` with a caller-chosen cmdline +
     /// overlay size — for the mode-dependent `into_launch_order` sizing.
     fn activate_order_with(cmdline: &str, luks_disk_size_gb: u32) -> MigrateActivateOrder {
@@ -796,6 +1225,8 @@ mod tests {
             vm_id: VmId::new("mig-x").unwrap(),
             get_url: "https://s3/snap".to_string(),
             state_get_url: String::new(),
+            snapshot_size: 0,
+            snapshot_sha256_hex: String::new(),
             new_gen: 6,
             ovmf_path: PathBuf::from("/x/ovmf.fd"),
             kernel_path: PathBuf::from("/x/vmlinuz"),
@@ -809,6 +1240,10 @@ mod tests {
             memory_mb: 2048,
             cose_ticket: ByteBuf::new(),
             boot_artifacts: None,
+            backup_chain: None,
+            staged_restore_id: String::new(),
+            guardian_ep: None,
+            settle_by_unix: 0,
         }
     }
 
@@ -898,6 +1333,8 @@ mod tests {
                 node_id: "miner-a".to_string(),
                 put_url: "https://s3.example/snap?sig=abc".to_string(),
                 state_put_url: String::new(),
+                disk_part_urls: Vec::new(),
+                part_size: 0,
             },
         };
         let mut buf = Vec::new();
@@ -916,5 +1353,244 @@ mod tests {
         let json = r#"{"vm_id":"tenant-x","node_id":"m","put_url":"u","extra":1}"#;
         let parsed: std::result::Result<MigrateSnapshotOrder, _> = serde_json::from_str(json);
         assert!(parsed.is_err());
+    }
+
+    // ── restore order ───────────────────────────────────────────────
+
+    const RID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn stage_json(extra: &str) -> String {
+        let sha = "ab".repeat(32);
+        format!(
+            r#"{{"vm_id":"tenant-x","restore_id":"{RID}","op":"stage","disk_bytes":1048576,
+            "chain":{{"restore_id":"{RID}",
+              "full":{{"url":"u/f","sha256_hex":"{sha}","size":1048576,
+                       "part_size":5242880,"part_sha256_hex":["{sha}"]}},
+              "incrementals":[],
+              "state":{{"url":"u/s","sha256_hex":"{sha}","size":1048576}}}}{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn a_stage_order_decodes_and_validates_with_the_defaults() {
+        let o: RestoreOrder = serde_json::from_str(&stage_json("")).unwrap();
+        assert_eq!(o.streams, 8, "streams defaults to 8");
+        let chain = o.chain.as_ref().unwrap();
+        assert_eq!(chain.full.part_size, 5 << 20);
+        assert_eq!(chain.state.part_size, 0, "absent part fields default");
+        assert!(chain.state.part_sha256_hex.is_empty());
+        o.validate().unwrap();
+        // CBOR through an order body, as the miner decodes it.
+        let body = OrderBody {
+            domain: ORDER_DOMAIN.to_string(),
+            order_id: "r-1".to_string(),
+            kind: OrderKind::Restore,
+            target_miner_id: "miner-a".to_string(),
+            issued_at_unix: 1_770_000_000,
+            payload: o,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&body, &mut buf).unwrap();
+        let back: OrderBody<RestoreOrder> = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back.kind.as_class_str(), "restore");
+        assert_eq!(back.payload.restore_id, RID);
+    }
+
+    #[test]
+    fn restore_orders_reject_unknown_fields() {
+        assert!(serde_json::from_str::<RestoreOrder>(&stage_json(r#","extra":1"#)).is_err());
+        // …in a chain piece too.
+        let bad = stage_json("").replace(r#""size":1048576}}}"#, r#""size":1048576,"x":1}}}"#);
+        assert_ne!(bad, stage_json(""));
+        assert!(serde_json::from_str::<RestoreOrder>(&bad).is_err());
+    }
+
+    #[test]
+    fn a_restore_order_for_another_id_or_with_stray_fields_is_refused() {
+        let class = |json: &str| match serde_json::from_str::<RestoreOrder>(json)
+            .unwrap()
+            .validate()
+        {
+            Err(crate::error::MinerAgentError::Backup(c)) => c,
+            other => panic!("{:?}", other.err()),
+        };
+        let other = "fedcba9876543210fedcba9876543210";
+        assert_eq!(
+            class(&stage_json("").replacen(RID, other, 1)),
+            "restore-id-mismatch"
+        );
+        assert_eq!(
+            class(&stage_json("").replace(RID, "0123456789ABCDEF0123456789ABCDEF")),
+            "restore-bad-id"
+        );
+        assert_eq!(
+            class(&stage_json("").replace(r#""disk_bytes":1048576,"#, "")),
+            "restore-disk-bytes"
+        );
+        assert_eq!(
+            class(&stage_json("").replace(r#""disk_bytes":1048576"#, r#""disk_bytes":2"#)),
+            "full-size-mismatch"
+        );
+        assert_eq!(
+            class(&stage_json("").replace(r#""part_sha256_hex":["#, r#""part_sha256_hex":["00","#)),
+            "part-sha-count"
+        );
+        let no_chain =
+            format!(r#"{{"vm_id":"tenant-x","restore_id":"{RID}","op":"stage","disk_bytes":1}}"#);
+        assert_eq!(class(&no_chain), "restore-chain-missing");
+        for op in ["abort", "reclaim"] {
+            let ok = format!(r#"{{"vm_id":"tenant-x","restore_id":"{RID}","op":"{op}"}}"#);
+            serde_json::from_str::<RestoreOrder>(&ok)
+                .unwrap()
+                .validate()
+                .unwrap();
+            let zero = format!(
+                r#"{{"vm_id":"tenant-x","restore_id":"{RID}","op":"{op}","disk_bytes":0,"chain":null}}"#
+            );
+            serde_json::from_str::<RestoreOrder>(&zero)
+                .unwrap()
+                .validate()
+                .unwrap();
+            let stray = stage_json("").replace(r#""op":"stage""#, &format!(r#""op":"{op}""#));
+            assert_eq!(class(&stray), "restore-fields");
+        }
+        assert!(serde_json::from_str::<RestoreOrder>(
+            &stage_json("").replace(r#""op":"stage""#, r#""op":"swap""#)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn staged_restore_id_is_serialized_only_when_set() {
+        let mut order = activate_order_with("ro hippius.vm_generation=6", 0);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&order, &mut buf).unwrap();
+        let v: ciborium::Value = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        let has = |v: &ciborium::Value| {
+            v.as_map()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| k.as_text() == Some("staged_restore_id"))
+        };
+        assert!(!has(&v));
+        order.staged_restore_id = RID.into();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&order, &mut buf).unwrap();
+        let v: ciborium::Value = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert!(has(&v));
+        let back: MigrateActivateOrder = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back.staged_restore_id, RID);
+    }
+
+    /// The pre-H4 `LaunchOrder` wire shape, field for field.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LaunchOrderPreGuardian {
+        vm_id: VmId,
+        ovmf_path: PathBuf,
+        kernel_path: PathBuf,
+        initrd_path: PathBuf,
+        cmdline: String,
+        luks_disk_path: PathBuf,
+        luks_disk_size_gb: u32,
+        #[serde(default)]
+        data_disk_size_gb: u32,
+        #[serde(default = "default_rootfs_data_path")]
+        rootfs_data_path: PathBuf,
+        #[serde(default = "default_rootfs_hash_path")]
+        rootfs_hash_path: PathBuf,
+        cpu_count: u8,
+        memory_mb: u32,
+        cose_ticket: ByteBuf,
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_existing_disks: bool,
+    }
+
+    fn guardian_launch(guardian_ep: Option<&str>) -> LaunchOrder {
+        LaunchOrder {
+            vm_id: VmId::new("tenant-g").unwrap(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+            initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+            cmdline: "quiet".to_string(),
+            luks_disk_path: PathBuf::from("/var/lib/hippius-miner/d.img"),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 32,
+            rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+            rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: ByteBuf::from(vec![1u8, 2, 3]),
+            require_existing_disks: true,
+            guardian_ep: guardian_ep.map(String::from),
+        }
+    }
+
+    fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(v, &mut buf).unwrap();
+        buf
+    }
+
+    /// An M0 launch (no guardian) encodes BYTE-IDENTICALLY to the pre-H4
+    /// shape, and the pre-H4 decoder still reads it — so vali can ship the
+    /// field before any VM uses it.
+    #[test]
+    fn m0_launch_bytes_are_identical_to_the_pre_guardian_shape() {
+        let order = guardian_launch(None);
+        let old = LaunchOrderPreGuardian {
+            vm_id: order.vm_id.clone(),
+            ovmf_path: order.ovmf_path.clone(),
+            kernel_path: order.kernel_path.clone(),
+            initrd_path: order.initrd_path.clone(),
+            cmdline: order.cmdline.clone(),
+            luks_disk_path: order.luks_disk_path.clone(),
+            luks_disk_size_gb: order.luks_disk_size_gb,
+            data_disk_size_gb: order.data_disk_size_gb,
+            rootfs_data_path: order.rootfs_data_path.clone(),
+            rootfs_hash_path: order.rootfs_hash_path.clone(),
+            cpu_count: order.cpu_count,
+            memory_mb: order.memory_mb,
+            cose_ticket: order.cose_ticket.clone(),
+            require_existing_disks: order.require_existing_disks,
+        };
+        let new_bytes = cbor(&order);
+        assert_eq!(new_bytes, cbor(&old));
+        let _: LaunchOrderPreGuardian = ciborium::de::from_reader(new_bytes.as_slice()).unwrap();
+    }
+
+    /// With a guardian the key rides the wire and round-trips; an agent
+    /// that predates it REFUSES the order at decode (fail-closed) — the
+    /// reason miner-agents deploy before vali.
+    #[test]
+    fn guardian_ep_round_trips_and_an_old_agent_refuses_it() {
+        let bytes = cbor(&guardian_launch(Some("100.64.0.1:7443")));
+        let back: LaunchOrder = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.guardian_ep.as_deref(), Some("100.64.0.1:7443"));
+        assert!(ciborium::de::from_reader::<LaunchOrderPreGuardian, _>(bytes.as_slice()).is_err());
+        let m0: LaunchOrder =
+            ciborium::de::from_reader(cbor(&guardian_launch(None)).as_slice()).unwrap();
+        assert!(m0.guardian_ep.is_none());
+    }
+
+    /// The dest of a §25 migration / restore boots the same measured
+    /// cmdline, so it must dial the same guardian.
+    #[test]
+    fn migrate_activate_carries_the_guardian_into_the_launch() {
+        let mut order = activate_order_with("quiet", 10);
+        assert!(order.guardian_ep.is_none());
+        let key = b"guardian_ep";
+        assert!(!cbor(&order).windows(key.len()).any(|w| w == key.as_slice()));
+        assert!(activate_order_with("quiet", 10)
+            .into_launch_order()
+            .guardian_ep
+            .is_none());
+        order.guardian_ep = Some("[2001:db8::1]:7443".into());
+        let bytes = cbor(&order);
+        let back: MigrateActivateOrder = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            back.into_launch_order().guardian_ep.as_deref(),
+            Some("[2001:db8::1]:7443")
+        );
     }
 }

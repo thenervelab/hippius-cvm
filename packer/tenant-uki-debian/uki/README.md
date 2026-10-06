@@ -131,7 +131,7 @@ After Phase 2 merges, the operator:
 1. `aws s3 cp test_vectors/allowlist/dev.cose s3://hippius-compute-images/allowlist/v1/dev.cose --acl public-read`
 2. Argo refresh `hippius-compute-kbs` → KBS pod roll → log
    `allowlist epoch=N+1`
-3. Stage the Debian UKI on miner-1 with the new S3 SHA
+3. Stage the Debian UKI on a Genoa host with the new S3 SHA
    (`scripts/tenant-uki-stage-miner.sh --tenant-uki-sha <new>`).
 4. Mint the OrderTicket with `--allowed-measurement-hex <new
    tenant-debian measurement>`.

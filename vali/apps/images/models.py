@@ -50,6 +50,13 @@ class GoldenImage(models.Model):
     bake_id = models.CharField(max_length=64)
     blessed_at = models.DateTimeField()
     blessed_by = models.CharField(max_length=128, blank=True, default="")
+    # The guest components release a launch of this image boots
+    # (docs/design/guest-component-rollout.md, phase 7): the image's bake
+    # with that release's build appended to its initrd. NULL = the bare
+    # bake. Set only by `vali_bless_guest_release` (validated: a build of the
+    # release exists for the blessed bake); re-blessing another bake clears
+    # it.
+    guest_release = models.PositiveIntegerField(null=True, blank=True, default=None)
 
     class Meta:
         ordering = ["image_name"]

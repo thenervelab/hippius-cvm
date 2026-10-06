@@ -6,34 +6,19 @@ image:
   # deployed image is content-addressed). Produced by the
   # `edge-image.yml` workflow; see README.md "Image".
   #
-  # Bumped to the main build at 50962e5 (#648 §23 served-receipt auth):
-  # the served-receipt JSON forward to vali now stamps `Authorization:
-  # Bearer <token>` from HIPPIUS_EDGE_VALI_INGEST_TOKEN (the
-  # edge-gateway-vali-ingest-token ExternalSecret below), so a relayed
-  # tenant-VM served-receipt is no longer 401'd by vali's
-  # ServiceTokenAuthentication. Inherits #560 (§25 stopped-ack relay) +
-  # #639 (served-receipt JSON-wrap forward).
+  # Keep this pin equal to what the cluster runs: it is the contract, not
+  # a comment. Never set the image out of band (`kubectl set image`, and
+  # never a mutable tag on the running object): a gitops sync against a
+  # stale pin silently reverts production.
   #
-  # PIN CORRECTED 2026-07-28 — was sha256:5bb92136… (`sha-0c44985d6da4`,
-  # 2026-07-06), 3 weeks behind an out-of-band deploy. Reverting it would
-  # drop #852 (the read-only per-VM domain-state endpoint), plus #789
-  # (guest-boot progress relay) and the host-attestor channels #811/#814.
-  #
-  # The failure mode is SILENT, which is what makes it dangerous: without
-  # #852 the relay 404s, and `effects.poll_domain_running` folds every
+  # Some reverts fail SILENTLY: e.g. an Edge without the read-only per-VM
+  # domain-state relay 404s, and `effects.poll_domain_running` folds every
   # non-200 into `None` — the documented fail-safe boundary on which the
-  # caller takes NO recovery action. So reboot-recovery (ENABLED in
-  # production) neither errors nor alerts; it goes quietly inert, and tenants
-  # simply never come back after a host reboot. Keep this pin honest: it is
-  # the contract, not a comment.
-  # Re-pinned 2026-08-13 to what the cluster has ACTUALLY been running
-  # since 2026-08-10: the b2493cd pin above was 27 commits behind, and the
-  # live Deployment was carrying the mutable TAG `sha-7f93d33815bb`, which
-  # resolves to this digest. Arming ArgoCD against the old pin would have
-  # REVERTED production by 27 commits. The tag is the deeper defect — #927
-  # removed tag-pinning from the charts, but an out-of-band `set image`
-  # put one back on the running object.
-  digest: "sha256:9e0905fb1b90493d11c6d8a9439eac0ca3db8099e97c6d1661861606454c6bb7"
+  # caller takes NO recovery action. Reboot-recovery then neither errors
+  # nor alerts; it goes quietly inert, and tenants never come back after a
+  # host reboot. Roll new order kinds (backup, restore, §25 snapshots) on
+  # the Edge BEFORE the vali release that dispatches them.
+  digest: "sha256:d432cbd96b8db87b2b37ff504b275b077a5d95b9cc0e65fa3d9c1d73872dc6bd"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED, not a comment: `.github/scripts/verify_image_
   # provenance.py` runs `cosign verify` with these exact values as
@@ -43,21 +28,12 @@ image:
   # declaration fails CI. The offline half runs in the required `rust`
   # job (scripts/dev/image-provenance-test.sh). Purely declarative — no
   # template reads `image.provenance`, so it cannot change what renders.
-  #
-  # This one was worth establishing rather than assuming. The digest was
-  # re-pinned by #975 from the LIVE pod's resolved `imageID`, i.e. from
-  # the cluster, NOT from a CI run — so "which source built it" was an
-  # inference off the mutable `sha-7f93d33815bb` tag the running
-  # Deployment carried. The signature confirms the inference: a
-  # `refs/heads/main` push build at 7f93d338 ("credit uptime only for
-  # time an SNP-attested LIVE guest proved", #904). The tag and the
-  # digest agree — the difference is that the agreement is now checked.
   provenance:
     # Fulcio SAN on the signature — workflow AND the git ref it ran on.
-    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/edge-image.yml@refs/heads/main"
+    workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/edge-image.yml@refs/heads/main"
     # `githubWorkflowSha` on the signing cert — the exact source commit.
-    commitSha: "7f93d33815bb49657d90b650ea38ccb9d36d6b7b"
-    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/31368039521/attempts/1"
+    commitSha: "98e79d2f6dd1323e67ac873b6fef7103879a6581"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/36302355765/attempts/1"
     # false ⇒ built from a ref other than refs/heads/main, i.e. from a
     # tree that is NOT in this repo's history.
     mergedSource: true
@@ -126,8 +102,8 @@ mtls:
 # miner's SELF-SIGNED identity cert iff its node_id is registered +
 # Active on `pallet-compute-scoring` (§23). The Edge polls that set from
 # the vali feed (its egress is locked off the chain RPC); vali reads the
-# chain. THIS cluster is flipped to `onchain` once miner-1 + miner-3 are
-# registered on-chain and running the self-signing agent.
+# chain. Flip a cluster to `onchain` only once its miners are registered
+# on-chain and running the self-signing agent.
 minerAuth:
   mode: onchain
   # vali's in-cluster registry feed. The Edge's CiliumNetworkPolicy

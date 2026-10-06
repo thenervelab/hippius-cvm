@@ -50,7 +50,7 @@
 //! This listener is **plain HTTP** bound to a cluster-internal address
 //! — there is no mTLS here. Vali does not (yet) own a client cert
 //! against the Edge CA (confirmed against
-//! `/Users/dubs/dev/everything/hippius-compute-key/` — the CA has
+//! the operator's offline CA key store — the CA has
 //! issued the Edge server cert and per-miner client certs, but no
 //! vali client cert), so the access control is the Cilium
 //! NetworkPolicy gating the inner listener's Service to the vali
@@ -70,9 +70,10 @@
 //!
 //! [`DefaultBodyLimit::max`] with
 //! [`MAX_MINER_ORDER_BODY`](crate::forward::MAX_MINER_ORDER_BODY)
-//! (64 KiB — matches the miner-agent's `MAX_ORDER_BODY`) is layered on
-//! the router, so an oversized body is rejected `413` before the
-//! handler runs and before any signing work.
+//! (64 KiB — matches the miner-agent's `MAX_ORDER_BODY`; 2 MiB for the
+//! multipart kinds, `OrderKind::max_order_body`) bounds the body, so an
+//! oversized one is rejected `413` before the handler runs and before any
+//! signing work.
 //!
 //! ## Logging discipline
 //!
@@ -84,7 +85,7 @@
 //! `&'static str`-only discipline the miner router uses.
 
 use crate::forward::{
-    MinerForward, MinerForwardError, MinerForwardResponse, OrderKind, MAX_MINER_ORDER_BODY,
+    MinerForward, MinerForwardError, MinerForwardResponse, OrderKind, MAX_MULTIPART_ORDER_BODY,
 };
 use crate::order_signing::OrderSigner;
 use axum::body::Bytes;
@@ -129,7 +130,7 @@ const CGNAT_PREFIX_SECOND_UPPER: u8 = 127;
 /// `vali/apps/orchestration/order_dispatch.py::DEFAULT_DISPATCH_TIMEOUT_S`
 /// (45 s), so a stalled body becomes a 408 here rather than a
 /// vali-side timeout. Matches the miner listener's own
-/// `REQUEST_BODY_TIMEOUT` (15 s). (codex r1 Medium.)
+/// `REQUEST_BODY_TIMEOUT` (15 s). (review r1 Medium.)
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared state every router handler reads. Cheap to clone — every
@@ -185,7 +186,9 @@ pub fn build_inner_router(state: InnerRouterState) -> Router {
         // / broken vali pod even though the NetworkPolicy gate already
         // restricts who may connect — defense in depth.
         .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_TIMEOUT))
-        .layer(DefaultBodyLimit::max(MAX_MINER_ORDER_BODY))
+        // The largest per-kind cap; the handler holds every other kind to
+        // its own (`OrderKind::max_order_body`) once the kind is known.
+        .layer(DefaultBodyLimit::max(MAX_MULTIPART_ORDER_BODY))
         .with_state(state)
 }
 
@@ -242,6 +245,16 @@ async fn handle_order(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+    if bytes_in > kind.max_order_body() {
+        log_order(
+            Some(target_addr),
+            Some(kind),
+            bytes_in,
+            None,
+            "body-too-large",
+        );
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
 
     // (2) Sign + forward. The body is OPAQUE — passed verbatim to the
     //     signer + the forwarder. The miner-agent's `verify_strict`

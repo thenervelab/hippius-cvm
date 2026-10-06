@@ -158,6 +158,38 @@ else
 fi
 rm -rf "${ROOT}"
 
+# ── 6. #365 data-disk provisioner on the golden base → fails closed ─
+# (#1350) A golden VM has no data disk: the unit could only act on a
+# miner-attached /dev/vde. The unit file, its enablement symlink alone
+# (dangling), or the init script alone each fail the bake.
+for what in unit wants script; do
+    ROOT="$(make_root)"
+    case "${what}" in
+        unit)   printf '[Service]\n' > "${ROOT}/etc/systemd/system/hippius-data-disk.service" ;;
+        wants)  mkdir -p "${ROOT}/etc/systemd/system/multi-user.target.wants"
+                ln -s ../hippius-data-disk.service "${ROOT}/etc/systemd/system/multi-user.target.wants/hippius-data-disk.service" ;;
+        script) mkdir -p "${ROOT}/usr/local/sbin"; printf '#!/bin/bash\n' > "${ROOT}/usr/local/sbin/hippius-data-disk-init" ;;
+    esac
+    if ( golden_sanitize_base "${ROOT}" ) 2>/dev/null; then
+        err "a data-disk ${what} on the golden base did NOT fail the bake (fail-open!)"
+    else
+        ok "a data-disk ${what} on the golden base fails the bake closed"
+    fi
+    rm -rf "${ROOT}"
+done
+
+# The bake itself must skip the section for goldens: the whole #365 block
+# sits inside the not-golden guard.
+block="$(awk '/^# ── #365 tenant data disk first-boot provisioner/{f=1} /^# ── 4b\. Run the chroot apt install/{f=0} f' "${BAKE}")"
+first="$(grep -v -e '^#' -e '^$' <<< "${block}" | head -1)"
+last="$(grep -v '^$' <<< "${block}" | tail -1)"
+if [[ "${first}" == 'if [[ "${disk_mode}" != "golden_verity_overlay" ]]; then' && "${last}" == fi ]] \
+    && grep -q 'hippius-data-disk.service' <<< "${block}"; then
+    ok "the bake installs the #365 provisioner only outside golden mode"
+else
+    err "the #365 provisioner is not wrapped in the not-golden guard (first='${first}' last='${last}')"
+fi
+
 if [[ "${fail}" -ne 0 ]]; then
     echo "golden-sanitize-test: FAILED" >&2
     exit 1

@@ -2,20 +2,20 @@
 
 ## The defect, measured live 2026-08-13
 
-A fedora launch failed `dispatch-failed-after-register` on miner-3
+A fedora launch failed `dispatch-failed-after-register` on miner-c
 (miner-side `class=libvirt-driver/create` — the domain was never
 created), leaving the phantom this repo already knows: `state=active`,
 `host=''`, a live per-VM Vault-Transit KEK, no guest anywhere. Its §24
 teardown then sat in `awaiting_eol_ack`:
 
-    stamp-fed-1 decomm: awaiting_eol_ack | forced: False | ack: False
+    vm-fed-1 decomm: awaiting_eol_ack | forced: False | ack: False
     Vm: state=decommissioning boot_phase=''
     phase_started_at 13:55:55  →  ack_timeout 600 s  →  forced 14:05:55
 
 Ten minutes of a live KEK, waiting for a guest-signed `StoppedAck` from
 a guest that was never created — and vali held the proof throughout:
 `boot_phase=''`, no guest signal, never bound to a host, the launch's own
-`dispatch-failed-after-register`, and miner-3 answering `running: false`
+`dispatch-failed-after-register`, and miner-c answering `running: false`
 to the live domain probe. The wait then ends in a "forced reclaim" that
 records `forced=True` and §13-quarantines the host for failing to ack for
 a guest it never managed to start.
@@ -53,7 +53,7 @@ from apps.orchestration.models import (
 
 pytestmark = pytest.mark.django_db
 
-VM_ID = "stamp-fed-1"
+VM_ID = "vm-fed-1"
 
 
 # ── builders ─────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ def _never_ran_vm(vm_id: str = VM_ID, **fields) -> Vm:
     )
 
 
-def _ran_vm(vm_id: str = "realtenant-1") -> Vm:
+def _ran_vm(vm_id: str = "tenant-1") -> Vm:
     """A VM that DID run: a miner accepted its dispatch (so `host` is
     stamped), it reported `running`, it spoke from inside the guest, and
     the reconcile loop saw its domain up."""
@@ -96,7 +96,7 @@ def _ran_vm(vm_id: str = "realtenant-1") -> Vm:
         state=VmState.ACTIVE.value,
         generation=1,
         signing_generation=1,
-        host="miner-1",
+        host="miner-a",
         lifecycle_vk=bytes(32),
         eol_nonce=b"\x11" * 32,
         boot_phase=VmBootPhase.RUNNING.value,
@@ -104,8 +104,8 @@ def _ran_vm(vm_id: str = "realtenant-1") -> Vm:
         guest_signal_at=timezone.now(),
         guest_signal_kind="served_receipt",
     )
-    RebootRecovery.objects.create(vm=vm, host="miner-1", seen_running=True)
-    _launch_job(vm_id, state=LaunchJobState.SUCCEEDED.value, miner_id="miner-1")
+    RebootRecovery.objects.create(vm=vm, host="miner-a", seen_running=True)
+    _launch_job(vm_id, state=LaunchJobState.SUCCEEDED.value, miner_id="miner-a")
     return vm
 
 
@@ -113,7 +113,7 @@ def _launch_job(
     vm_id: str = VM_ID,
     *,
     state: str = LaunchJobState.FAILED.value,
-    miner_id: str = "miner-3",
+    miner_id: str = "miner-c",
 ) -> LaunchJob:
     now = timezone.now()
     return LaunchJob.objects.create(
@@ -187,7 +187,7 @@ def test_a_vm_that_never_ran_is_erased_without_waiting_the_ack_timeout(
     vm.refresh_from_db()
     assert vm.state == VmState.DESTROYED
     # It asked the one miner that could have been running it.
-    assert domain_down == ["miner-3"]
+    assert domain_down == ["miner-c"]
 
 
 def test_the_shortcut_is_recorded_as_never_ran_not_as_a_forced_reclaim(
@@ -271,7 +271,7 @@ def test_a_vm_that_DID_run_takes_the_forced_reclaim_path_untouched(
 
     job.refresh_from_db()
     assert job.forced is True
-    assert job.quarantine_node_id == "miner-1"
+    assert job.quarantine_node_id == "miner-a"
     assert job.reason == "eol-ack-timeout:forced-reclaim"
 
 
@@ -298,13 +298,13 @@ def _apply(vm: Vm, evidence: str) -> None:
     """One positive record that a guest existed, applied to an otherwise
     never-ran-looking row."""
     if evidence == "host-bound":
-        Vm.objects.filter(id=vm.id).update(host="miner-3")
+        Vm.objects.filter(id=vm.id).update(host="miner-c")
     elif evidence == "boot-phase":
         Vm.objects.filter(id=vm.id).update(boot_phase=VmBootPhase.BOOTING.value)
     elif evidence == "guest-signal":
         Vm.objects.filter(id=vm.id).update(guest_signal_at=timezone.now())
     elif evidence == "seen-running":
-        RebootRecovery.objects.create(vm=vm, host="miner-3", seen_running=True)
+        RebootRecovery.objects.create(vm=vm, host="miner-c", seen_running=True)
     elif evidence == "generation":
         Vm.objects.filter(id=vm.id).update(generation=2, signing_generation=2)
     elif evidence == "launch-in-flight":
@@ -431,9 +431,9 @@ def test_never_ran_veto_names_the_evidence(domain_down) -> None:
     _launch_job()
     assert service.never_ran_veto(vm) is None
 
-    Vm.objects.filter(id=vm.id).update(host="miner-3")
+    Vm.objects.filter(id=vm.id).update(host="miner-c")
     vm.refresh_from_db()
-    assert service.never_ran_veto(vm) == "host-bound:miner-3"
+    assert service.never_ran_veto(vm) == "host-bound:miner-c"
 
 
 def test_the_reap_and_the_ack_wait_agree_on_the_same_vm(domain_down) -> None:

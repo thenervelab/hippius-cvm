@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{MinerAgentError, Result};
 use crate::lifecycle::cvm_handle::VmId;
+use crate::lifecycle::disk_space;
 
 /// One GiB in bytes — the unit `disk_gb` is expressed in.
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -58,7 +59,12 @@ const DATA_DIR_NAME: &str = "data";
 /// it. Used by config-rendering paths that need the path to interpolate
 /// into the libvirt XML.
 pub fn data_disk_path(miner_root: &Path, vm_id: &VmId) -> PathBuf {
-    miner_root.join(DATA_DIR_NAME).join(format!("{vm_id}.img"))
+    data_dir(miner_root).join(format!("{vm_id}.img"))
+}
+
+/// The directory holding every per-VM data disk under `miner_root`.
+pub(crate) fn data_dir(miner_root: &Path) -> PathBuf {
+    miner_root.join(DATA_DIR_NAME)
 }
 
 /// Idempotent creation: ensure a blank sparse `size_gb` GiB data disk
@@ -115,17 +121,24 @@ pub(crate) fn ensure_data_disk_bytes(
 
     // Free-space pre-check. The file is created SPARSE (`set_len`), so
     // ENOSPC does NOT surface here — it surfaces minutes later when the
-    // GUEST writes the full dm-integrity wipe, as a mid-format pause on
-    // the live VM (observed live). Check the backing mount has room
-    // for the whole disk up front, so an over-committed / over-declared
-    // miner is rejected cleanly BEFORE the VM is dispatched — vali can
-    // then re-place. This is the fail-closed backstop; it does not need to
-    // trust the miner (the physical free space cannot be faked). It does
-    // NOT serialise concurrent launches (two sparse creates can both pass
-    // then both wipe) — the in-guest ENOSPC stays the ultimate backstop,
-    // and the scheduler's disk budget reserves up front (separate change).
-    let free = free_bytes(parent)?;
-    if free < bytes {
+    // GUEST writes the dm-integrity format, as a mid-format pause on the
+    // live VM (observed live). Check the backing mount has room for the
+    // whole disk up front, so an over-committed / over-declared miner is
+    // rejected cleanly (`insufficient-disk`) BEFORE the VM is dispatched.
+    // "Room" is the free space net of the unwritten tail of every
+    // writable disk already there and of every in-flight writer's
+    // reservation (backup, restore, §25 download), measured under the
+    // process-wide disk lock — so neither a concurrent launch, a
+    // half-written VM nor a running backup can be promised the same bytes
+    // (`disk_space`). The lock is held through the
+    // create below so the next measurer sees this file.
+    let reserved = disk_space::create_lock();
+    if path.exists() {
+        return Ok(path);
+    }
+    let headroom = disk_space::headroom_bytes(*reserved, miner_root, parent)
+        .map_err(MinerAgentError::DataDisk)?;
+    if headroom < bytes {
         return Err(MinerAgentError::DataDisk("insufficient-space"));
     }
 
@@ -151,20 +164,13 @@ pub(crate) fn ensure_data_disk_bytes(
 }
 
 /// Bytes currently available to an unprivileged writer on the filesystem
-/// backing `dir` (`statvfs` `f_bavail * f_frsize`). Used by
-/// [`ensure_data_disk`] to fail closed before sparse-creating a disk the
-/// mount cannot actually hold once the guest wipes it.
+/// backing `dir` (`statvfs` `f_bavail * f_frsize`) — the raw figure,
+/// before [`disk_space::headroom_bytes`] nets out the sparse tails.
+#[cfg(test)]
 fn free_bytes(dir: &Path) -> Result<u64> {
-    let st = nix::sys::statvfs::statvfs(dir).map_err(|_| MinerAgentError::DataDisk("statvfs"))?;
-    // `blocks_available()`/`fragment_size()` are `fsblkcnt_t`/`c_ulong` —
-    // already u64 on this target (hence clippy's useless-conversion gripe),
-    // but narrower on 32-bit libc. The `try_from` keeps the math correct
-    // there; allow the lint rather than drop the portable conversion.
-    #[allow(clippy::useless_conversion)]
-    let avail = u64::try_from(st.blocks_available()).unwrap_or(0);
-    #[allow(clippy::useless_conversion)]
-    let frsize = u64::try_from(st.fragment_size()).unwrap_or(0);
-    Ok(avail.saturating_mul(frsize))
+    disk_space::fs_bytes(dir)
+        .map(|(_, avail)| avail)
+        .ok_or(MinerAgentError::DataDisk("statvfs"))
 }
 
 #[cfg(test)]
@@ -290,6 +296,57 @@ mod tests {
             Err(MinerAgentError::DataDisk("insufficient-space"))
         ));
         assert!(!data_disk_path(tmp.path(), &vm("tenant-over-free")).exists());
+    }
+
+    /// A sparse file under `<root>/data/` that promises all but
+    /// `leave_bytes` of the filesystem's current free space.
+    fn promise_all_but(root: &Path, name: &str, leave_bytes: u64) {
+        let free = free_bytes(root).expect("statvfs");
+        std::fs::create_dir_all(data_dir(root)).unwrap();
+        let f = std::fs::File::create(data_dir(root).join(name)).unwrap();
+        f.set_len(free.saturating_sub(leave_bytes)).unwrap();
+    }
+
+    #[test]
+    fn a_second_disk_is_measured_against_the_first_ones_promise() {
+        let _tight = disk_space::tight_tests();
+        // 1.5 GiB of real headroom: one 1 GiB sparse disk fits, a second
+        // does not — though a bare statvfs still shows the same free space
+        // after the first create (it allocated nothing). The 512 MiB margin
+        // absorbs concurrent tests' writes on the same filesystem.
+        let tmp = TempDir::new().unwrap();
+        promise_all_but(tmp.path(), "filler.img", 3 << 29);
+        ensure_data_disk_bytes(tmp.path(), &vm("tenant-first"), 1 << 30).expect("the first fits");
+        assert!(matches!(
+            ensure_data_disk_bytes(tmp.path(), &vm("tenant-second"), 1 << 30),
+            Err(MinerAgentError::DataDisk("insufficient-space"))
+        ));
+        assert!(!data_disk_path(tmp.path(), &vm("tenant-second")).exists());
+    }
+
+    #[test]
+    fn a_create_waits_for_the_create_lock_and_measures_after_it() {
+        // Concurrent creates are serialised: while another create holds the
+        // lock this one neither measures nor creates, and once it runs it
+        // sees what the holder promised in the meantime.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let held = disk_space::create_lock();
+        let waiter = {
+            let root = root.clone();
+            std::thread::spawn(move || ensure_data_disk(&root, &vm("tenant-waiter"), 1))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "the create ran past a held lock");
+        assert!(!data_disk_path(&root, &vm("tenant-waiter")).exists());
+        // What the lock holder promises before releasing it…
+        promise_all_but(&root, "holder.img", 0);
+        drop(held);
+        // …is what the waiter is measured against.
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(MinerAgentError::DataDisk("insufficient-space"))
+        ));
     }
 
     #[test]

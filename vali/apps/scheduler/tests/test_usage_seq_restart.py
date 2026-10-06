@@ -4,7 +4,7 @@ The defect these pin, proven live before the fix:
 
     p1-liveness-1        (rebooted)      watermark frozen at seq 10354,
                                          ZERO accruals — for hours
-    realtenant-ubuntu-1  (not rebooted)  watermark seq 34, billing normally
+    tenant-vm-1          (not rebooted)  watermark seq 34, billing normally
 
 The guest's `monotonic_seq` lives in RAM inside the tenant VM
 (`agent-tenant-telemetry`'s `ReceiptBuilder`, `FIRST_SEQ = 1`), so it

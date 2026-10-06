@@ -11,7 +11,7 @@
 # Multi-stage:
 #   - Stage 1 (`agent-builder`): `rust:1.93-slim-trixie` builds
 #     `hippius-agent-initramfs` for x86_64-unknown-linux-gnu. PR-F2
-#     review (codex) flagged that a host-built binary may be
+#     review (review) flagged that a host-built binary may be
 #     Mach-O/arm64 on macOS — building inside the pinned Linux/amd64
 #     image is the only way to keep the agent binary's bytes inside
 #     the reproducibility boundary.

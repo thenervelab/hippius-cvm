@@ -14,6 +14,9 @@ envelope.
 | File | Provenance |
 |---|---|
 | `signed_live_attestation.cbor` | **Frozen output** — `SignedLiveAttestation::encode()`: the `{body, sig}` envelope, `sig` = Ed25519 over `LiveAttestation::canonical()` by the pinned test key. |
+| `signed_live_attestation_v2.cbor` | **Frozen output** — the same, for `kat_attestation_v2()`: schema v2 with a release-time guest binding (`chip_id = [0x5E; 64]`, `report_id = [0x7A; 32]`). |
+| `signed_live_attestation_v3.cbor` | **Frozen output** — the same, for `kat_attestation_v3()`: the v2 body plus attested guest resources (`vcpus_online = 4`, `mem_firmware_kib = 16776164`, `mem_total_kib = 15337812`, `mem_unaccepted_kib = 1024`). |
+| `signed_live_attestation_v4.cbor` | **Frozen output** — the same, for `kat_attestation_v4()`: the v3 body plus the attested guest components (`components_release_version = 2`, `components_security_epoch = 1`, `components_health = 15`, `components_instance = 0x12345678`, `components_unhealthy_ticks = 1`). |
 
 ## Pinned inputs
 

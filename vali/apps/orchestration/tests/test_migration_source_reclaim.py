@@ -120,6 +120,18 @@ def _grant_evidence(monkeypatch, job: MigrationJob, *, vm_id: str) -> None:
             "granted_at_unix": int(timezone.now().timestamp()) + 5,
         },
     )
+    _dest_alive(job)
+
+
+def _dest_alive(job: MigrationJob, *, after_s: float = 3600.0) -> None:
+    """The destination GUEST proved it runs: an in-guest signal `after_s`
+    after the migration finished (the finish is backdated to allow it)."""
+    now = timezone.now()
+    MigrationJob.objects.filter(id=job.id).update(
+        finished_at=now - timedelta(seconds=after_s)
+    )
+    Vm.objects.filter(id=job.vm_id).update(guest_signal_at=now)
+    job.refresh_from_db()
 
 
 def _stub_evidence(monkeypatch, bundle):
@@ -594,3 +606,194 @@ def test_the_sweep_is_a_no_op_when_disabled(monkeypatch, settings):
 
     assert service.reclaim_migrated_sources() == 0
     assert spy.calls == []
+
+
+# ── defense in depth: the destination GUEST must prove it runs ───────
+
+
+@pytest.mark.parametrize(
+    ("signal_after_s", "reclaimed"),
+    [
+        (None, False),  # key released, then silence: the live truncation case
+        (60.0, False),  # alive, but not yet past the grace period
+        (3600.0, True),
+    ],
+)
+def test_the_source_waits_for_the_destination_guest_to_prove_it_runs(
+    monkeypatch, signal_after_s, reclaimed
+):
+    """Live: a destination was released its key for a truncated volume and
+    hung — the KBS grant alone let vali delete the only good copy."""
+    vm, job = _done_migration()
+    _grant_evidence(monkeypatch, job, vm_id=vm.vm_id)
+    now = timezone.now()
+    MigrationJob.objects.filter(id=job.id).update(finished_at=now - timedelta(hours=1))
+    Vm.objects.filter(id=vm.id).update(
+        guest_signal_at=None
+        if signal_after_s is None
+        else now - timedelta(hours=1) + timedelta(seconds=signal_after_s)
+    )
+    spy = _Dispatches()
+    monkeypatch.setattr(effects, "dispatch_source_reclaim", spy)
+
+    service.reclaim_migrated_sources()
+
+    job.refresh_from_db()
+    assert bool(spy.calls) is reclaimed
+    assert (job.source_reclaim_state == SourceReclaimState.RECLAIMED.value) is reclaimed
+    if not reclaimed:
+        assert job.source_reclaim_state == SourceReclaimState.PENDING.value, "still waiting"
+
+
+# ── the S3 snapshot follows the same proof ───────────────────────────
+
+
+def _with_snapshot(job: MigrationJob) -> tuple[str, str]:
+    from apps.storage import s3
+
+    bucket = "snaps"
+    key, state_key = f"migrations/{job.job_id}.luks", f"migrations/{job.job_id}.state"
+    client = s3.get_s3_client()
+    client.put_object(bucket=bucket, key=key, body=b"ciphertext", content_type="x")
+    client.put_object(bucket=bucket, key=state_key, body=b"counter", content_type="x")
+    MigrationJob.objects.filter(id=job.id).update(
+        snapshot_bucket=bucket, snapshot_key=key, snapshot_state_key=state_key
+    )
+    job.refresh_from_db()
+    return key, state_key
+
+
+def _stored(key: str) -> bool:
+    from apps.storage import s3
+
+    return s3.get_s3_client().head_object(bucket="snaps", key=key) is not None
+
+
+def test_the_snapshot_is_deleted_once_the_destination_is_proven_alive(monkeypatch):
+    vm, job = _done_migration()
+    key, state_key = _with_snapshot(job)
+    _grant_evidence(monkeypatch, job, vm_id=vm.vm_id)
+    monkeypatch.setattr(effects, "dispatch_source_reclaim", _Dispatches())
+
+    service.reclaim_migrated_sources()
+
+    job.refresh_from_db()
+    assert not _stored(key) and not _stored(state_key)
+    assert job.snapshot_deleted_at is not None
+
+
+def test_the_snapshot_is_kept_while_the_destination_is_unproven(monkeypatch):
+    vm, job = _done_migration()
+    key, _ = _with_snapshot(job)
+    _grant_evidence(monkeypatch, job, vm_id=vm.vm_id)
+    Vm.objects.filter(id=vm.id).update(guest_signal_at=None)
+    monkeypatch.setattr(effects, "dispatch_source_reclaim", _Dispatches())
+
+    service.reclaim_migrated_sources()
+    service.gc_migration_snapshots()
+
+    assert _stored(key)
+
+
+@pytest.mark.parametrize(
+    ("job_state", "vm_state", "on_source", "age_h", "deleted"),
+    [
+        # a terminal job whose VM is gone
+        (MigrationState.FAILED.value, VmState.DESTROYED.value, True, 0, True),
+        # failed, VM restored to its source, past retention
+        (MigrationState.FAILED.value, VmState.ACTIVE.value, True, 100, True),
+        # ... within retention
+        (MigrationState.FAILED.value, VmState.ACTIVE.value, True, 1, False),
+        # failed, and the VM has since moved on elsewhere, past retention
+        (MigrationState.FAILED.value, VmState.ACTIVE.value, False, 100, True),
+        # failed and still fenced: a forward re-drive needs the snapshot
+        (MigrationState.FAILED.value, VmState.MIGRATING.value, False, 100, False),
+        # a job that is not terminal is never touched
+        (MigrationState.UPLOADING.value, VmState.DESTROYED.value, True, 100, False),
+    ],
+)
+def test_the_snapshot_janitor(job_state, vm_state, on_source, age_h, deleted):
+    vm = make_vm(host="node-src", generation=1)
+    job = make_migration_job(vm, state=job_state)
+    MigrationJob.objects.filter(id=job.id).update(
+        finished_at=timezone.now() - timedelta(hours=age_h)
+    )
+    patch = {"state": vm_state, "host": "node-src" if on_source else "node-dst"}
+    if vm_state == VmState.MIGRATING.value:
+        patch.update(migration_dest="node-dst", new_generation=job.new_gen)
+    Vm.objects.filter(id=vm.id).update(**patch)
+    job.refresh_from_db()
+    key, _ = _with_snapshot(job)
+
+    service.gc_migration_snapshots()
+
+    assert _stored(key) is not deleted
+
+
+def test_a_job_reclaimed_on_the_kbs_grant_alone_keeps_its_snapshot():
+    """Rows reclaimed before the liveness gate existed — `reclaimed` does not
+    prove the destination runs (the live data-loss case was one)."""
+    vm, job = _done_migration()
+    MigrationJob.objects.filter(id=job.id).update(
+        source_reclaim_state=SourceReclaimState.RECLAIMED.value,
+        finished_at=timezone.now() - timedelta(days=10),
+    )
+    job.refresh_from_db()
+    key, _ = _with_snapshot(job)
+
+    service.gc_migration_snapshots()
+    assert _stored(key)
+
+    _dest_alive(job)
+    service.gc_migration_snapshots()
+    assert not _stored(key)
+
+
+def test_a_redriven_job_shares_the_snapshot_until_it_too_is_retired():
+    """`vali_migration_recover --action redrive-dest` copies the failed job's
+    snapshot keys: the old job being retired must not take the new job's
+    only copy."""
+    vm = make_vm(host="node-src", generation=1)
+    old = make_migration_job(vm, state=MigrationState.FAILED.value)
+    MigrationJob.objects.filter(id=old.id).update(
+        finished_at=timezone.now() - timedelta(days=10)
+    )
+    old.refresh_from_db()
+    key, state_key = _with_snapshot(old)
+    new = make_migration_job(vm, state=MigrationState.DONE.value)
+    MigrationJob.objects.filter(id=new.id).update(
+        snapshot_bucket="snaps", snapshot_key=key, snapshot_state_key=state_key
+    )
+    Vm.objects.filter(id=vm.id).update(
+        state=VmState.ACTIVE.value, host="node-dst", generation=new.new_gen
+    )
+    new.refresh_from_db()
+
+    service.gc_migration_snapshots()
+    assert _stored(key), "the re-driven destination has not proved it runs"
+
+    _dest_alive(new)
+    service.gc_migration_snapshots()
+    assert not _stored(key)
+    left = MigrationJob.objects.filter(snapshot_key=key, snapshot_deleted_at__isnull=True)
+    assert not left.exists()
+
+
+def test_jobs_that_never_retire_do_not_starve_the_janitor():
+    for i in range(25):  # older, never retirable: Done, destination unproven
+        v = make_vm(vm_id=f"vm-stuck-{i}", host="node-dst", generation=2)
+        j = make_migration_job(v, state=MigrationState.DONE.value)
+        MigrationJob.objects.filter(id=j.id).update(
+            finished_at=timezone.now() - timedelta(days=30)
+        )
+        j.refresh_from_db()
+        _with_snapshot(j)
+    vm = make_vm(vm_id="vm-gone", host="node-src", generation=1)
+    job = make_migration_job(vm, state=MigrationState.FAILED.value)
+    Vm.objects.filter(id=vm.id).update(state=VmState.DESTROYED.value)
+    job.refresh_from_db()
+    key, _ = _with_snapshot(job)
+
+    service.gc_migration_snapshots()
+
+    assert not _stored(key)

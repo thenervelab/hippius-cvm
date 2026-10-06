@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from apps.miners.models import SnpGeneration
+
 from .models import EnvelopeKind, SourceType
 
 
@@ -197,6 +199,15 @@ class HostAttestorReleaseRequestSerializer(serializers.Serializer):
     version = serializers.CharField(
         max_length=64, help_text="Release version label (opaque)."
     )
+    generation = serializers.ChoiceField(
+        choices=SnpGeneration.values,
+        help_text=(
+            "SEV-SNP CPU generation the measurement is for (the VMSA carries "
+            "the vCPU CPUID signature, so one UKI measures differently per "
+            "generation). Selects the per-generation {current, previous} "
+            "grace window. Required."
+        ),
+    )
     artifact_b64 = serializers.CharField(
         help_text="Base64 of the cosign-signed blackbox UKI blob."
     )
@@ -218,6 +229,7 @@ class HostAttestorReleaseResponseSerializer(serializers.Serializer):
 
     measurement = serializers.CharField(help_text="The class-pinned measurement (hex).")
     version = serializers.CharField(allow_blank=True)
+    generation = serializers.CharField(help_text="SEV-SNP generation of the release.")
     is_active = serializers.BooleanField(help_text="True — the new desired release.")
     allowlist_epoch = serializers.IntegerField(
         help_text="The §22 epoch the host-attestor-class pin landed at."
@@ -234,15 +246,26 @@ class _HostAttestorReleaseView(serializers.Serializer):
 
     measurement = serializers.CharField()
     version = serializers.CharField(allow_blank=True)
+    generation = serializers.CharField(
+        allow_blank=True, help_text='SEV-SNP generation ("" = legacy untagged).'
+    )
     cosign_identity = serializers.CharField()
     created_at = serializers.DateTimeField()
 
 
 class HostAttestorDesiredResponseSerializer(serializers.Serializer):
     """`GET /v1/miner/<node_id>/host-attestor/desired` body — the {current,
-    previous} grace window a miner boots its host attestor onto. Both null
-    before the operator has admitted any release."""
+    previous} grace window a miner boots its host attestor onto, for the
+    miner's SEV-SNP generation. Both null before the operator has admitted
+    any release."""
 
+    generation = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            'The generation whose window is served ("" = legacy untagged '
+            "window: the node's generation is unresolved or has no release)."
+        ),
+    )
     current = _HostAttestorReleaseView(allow_null=True)
     previous = _HostAttestorReleaseView(allow_null=True)
 

@@ -12,7 +12,7 @@
 #   * `external-secret-grafana.yaml` — Grafana admin password from Vault
 #   * `external-secret-alertmanager.yaml` — Alertmanager full config
 #                                      (with Slack webhook URL) from Vault
-#   * `ingress-grafana.yaml`         — `grafana.hippius.network` Ingress
+#   * `ingress-grafana.yaml`         — `grafana.example.com` Ingress
 #                                      (NetBird CGNAT only, mirrors the
 #                                       Edge ingress source-range gate)
 #   * `prometheusrule-critical.yaml` — first-tier alert rules we can fire

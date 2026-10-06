@@ -30,7 +30,7 @@ on:
 
 jobs:
   lsinitrd-gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON_BUILD || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

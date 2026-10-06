@@ -13,7 +13,7 @@ lists what is currently registered.
 
 | Endpoint                                       | Auth                | Idempotency                                |
 | ---------------------------------------------- | ------------------- | ------------------------------------------ |
-| `POST /v1/admin/miner/register`                | miner-admin token   | same `(miner_id, pubkey_hex, platform_id)` ⇒ `200`; mismatch ⇒ `409` |
+| `POST /v1/admin/miner/register`                | miner-admin token   | same `(miner_id, pubkey_hex, platform_id)` ⇒ `200`; upgrades an auto-provisioned `"onchain:<node_id>"` placeholder ⇒ `200`; mismatch ⇒ `409` |
 | `POST /v1/admin/miner/<miner_id>/quarantine`   | miner-admin token   | already quarantined ⇒ `200`                |
 | `GET  /v1/admin/miner/list`                    | any service token   | offset-paginated by `miner_id`             |
 
@@ -68,20 +68,22 @@ issue a second named token under a stable label (e.g.
 
 ## Register a miner
 
-The body is JSON with three required fields and two optional ones:
+The body is JSON with three required fields and four optional ones:
 
 ```sh
-VALI_URL="https://vali.hippius.network"   # or the in-cluster Service DNS
+VALI_URL="https://vali.example.com"   # or the in-cluster Service DNS
 
 curl -sf -X POST "$VALI_URL/v1/admin/miner/register" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d '{
-          "miner_id":     "miner-2",
+          "miner_id":     "miner-b",
           "pubkey_hex":   "0123...64 lowercase hex chars (Ed25519 pubkey)",
           "platform_id":  "amd-epyc-9254",
           "netbird_peer_id": "abcdef0123456789",
-          "netbird_ip":   "100.64.0.30"
+          "netbird_ip":   "100.64.0.30",
+          "chain_node_id": "…64 hex (on-chain compute node_id)",
+          "snp_generation": "milan"
         }' | jq
 ```
 
@@ -93,11 +95,68 @@ curl -sf -X POST "$VALI_URL/v1/admin/miner/register" \
 - `netbird_peer_id` / `netbird_ip` are optional but recommended once
   the miner is in the mesh — they help operators correlate envelopes
   to a NetBird dashboard row.
+- `snp_generation` is the host's SEV-SNP generation: `milan`, `genoa`
+  or `turin`. It selects the vCPU model vali measures the guest with
+  (`EpycMilan` / `EpycGenoa` / `EpycTurin`) in the launch-digest
+  recompute, and the §25 same-generation migration gate. Omitted, vali
+  infers it from the chip_id length: 8 bytes ⇒ Turin, 64 bytes ⇒ Genoa.
+  **Required for Milan**: a Milan chip_id is 64 bytes too, so an unset
+  Milan host is measured as Genoa and every launch is refused
+  (`launch-digest-mismatch`). It must agree with the chip_id length
+  (`turin` = 8 bytes, `genoa` / `milan` = 64), else `400`
+  `snp-generation-mismatch`. It is backfillable: re-posting with a
+  generation sets it once on a row that has none; a **different** stored
+  value is `409` (correct a wrong one from the Django admin, which runs
+  the same consistency check). A re-post that omits it leaves it as is.
+  The length check cannot tell Milan from Genoa, so a wrong
+  `genoa`/`milan` is accepted and then fails every launch on that host
+  closed (`launch-digest-mismatch`): confirm the CPU (`lscpu`, EPYC
+  7003 = Milan, 9004 = Genoa) before posting it.
 
 Re-registering the **same** `(miner_id, pubkey_hex, platform_id)`
 triple returns `200` (idempotent); a `miner_id` with different key
 material — or a `pubkey_hex` / `platform_id` that collides with a
 **different** miner — returns `409`.
+
+**Auto-provisioned miners.** A permissionless miner's first
+on-chain-gated heartbeat makes vali create its row itself
+(`apps.telemetry.service.autoprovision_node_heartbeat_source`), with
+`pubkey_hex` = `chain_node_id` = the node id and the placeholder
+per-node placeholder `platform_id = "onchain:<node_id>"`
+(`apps.miners.models.autoprovision_platform_id`; recognised everywhere
+through `is_autoprovision_placeholder`, which also accepts the legacy bare
+`"onchain"` that migration `0006` rewrites) — vali cannot know the
+CHIP_ID, and the scheduler and the launch-digest mapping both refuse the
+placeholder. Registering that `miner_id` with the **same**
+`pubkey_hex` upgrades the row: the placeholder becomes the posted
+`platform_id` and the unset fields below are backfilled. That is the
+only case in which a stored `platform_id` changes; a different
+`pubkey_hex`, or a stored real `platform_id` that differs, is still
+`409`. Because the replacement is one-way, the posted `platform_id` must
+be the CHIP_ID as bare hex, ≥ 8 bytes (no `0x`, no whitespace), else
+`400` and the placeholder stays. `miner_id` must be the id the agent
+signs its heartbeats with (the auto-provisioned row's key) — any other
+id is a new registration and collides on `pubkey_hex` (`409`). A
+concurrent auto-provision that lands mid-register is handled like a
+sequential re-register.
+
+The placeholder carries the node id because `platform_id` is unique: any
+number of permissionless miners can be auto-provisioned before any of
+them is registered. Posting a placeholder (another node's, or the legacy
+literal) never replaces a stored one — that is a plain mismatch (`409`) —
+and a NEW miner cannot be created on a placeholder (`400`): it would squat
+that node's auto-provision.
+
+Backfill rules on an existing row (all `409` checks run before any
+write, and every change lands in one savepoint, so a `409` — including
+a unique collision on `platform_id` / `chain_node_id` with another
+miner — leaves the row untouched):
+
+| Field | Unset on the row | Same value | Different value |
+| ----- | ---------------- | ---------- | --------------- |
+| `platform_id` | — | `200` | `409`, unless the stored one is the placeholder ⇒ upgraded |
+| `chain_node_id`, `snp_generation` | set | `200` | `409` |
+| `netbird_peer_id`, `netbird_ip` | set | `200` | ignored — stored value kept, `200` |
 
 ## Quarantine a miner
 
@@ -106,7 +165,7 @@ Quarantine deactivates the miner's linked `TelemetrySource`, so the
 re-registers it. Idempotent — already-quarantined is `200`:
 
 ```sh
-curl -sf -X POST "$VALI_URL/v1/admin/miner/miner-2/quarantine" \
+curl -sf -X POST "$VALI_URL/v1/admin/miner/miner-b/quarantine" \
     -H "Authorization: Bearer $TOKEN" | jq
 ```
 

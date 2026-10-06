@@ -41,11 +41,13 @@ done
 # ── Golden tooling ──────────────────────────────────────────────────
 # veritysetup: opens the dm-verity lower. mkfs.ext4: lays down the
 # first-boot filesystem on the guest-keyed upper. cryptsetup itself is
-# already staged by cryptsetup-initramfs.
+# already staged by cryptsetup-initramfs. udevadm (normally staged by the
+# udev hook) pauses udev's queue around the first-boot wipe.
 for bin in /usr/sbin/veritysetup /sbin/veritysetup \
            /usr/sbin/mkfs.ext4 /sbin/mkfs.ext4 \
            /usr/sbin/cryptsetup /sbin/cryptsetup \
-           /sbin/blockdev /usr/sbin/blockdev; do
+           /sbin/blockdev /usr/sbin/blockdev \
+           /usr/bin/udevadm /bin/udevadm; do
     if [ -x "$bin" ]; then
         copy_exec "$bin"
     fi

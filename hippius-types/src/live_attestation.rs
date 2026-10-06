@@ -73,8 +73,161 @@ use ciborium::value::Value;
 /// replay as a live-attestation.
 pub const LIVE_ATTESTATION_DOMAIN: &str = "HIPPIUS_LIVE_ATTESTATION_V1";
 
-/// The only `schema_version` this build understands.
+/// The original `schema_version` — no guest binding. Its wire bytes are
+/// frozen by the `live_attestation_kat` vector.
 pub const LIVE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+
+/// `schema_version` of a body that also carries the attested GUEST
+/// identity ([`GuestBinding`]): the SEV-SNP `CHIP_ID` and firmware
+/// `REPORT_ID` of the report the KBS verified, plus where the KBS's
+/// expectation for that pair came from.
+///
+/// Why it exists: a v1 body binds its `vm_id` only through
+/// `REPORT_DATA`, which the guest chooses — so root inside ONE running
+/// allowlisted guest could mint valid samples for ANY `vm_id`. The KBS
+/// now records the `(chip_id, report_id)` of the guest it RELEASED to for
+/// each `vm_id` and refuses a keepalive from any other guest; the body
+/// states the pair so a consumer can count distinct live guests per chip.
+///
+/// Additive: a decoder accepts both versions; a v1 body is byte-identical
+/// to before.
+pub const LIVE_ATTESTATION_SCHEMA_VERSION_BOUND: u32 = 2;
+
+/// `schema_version` of a body that also carries the resources the guest
+/// ATTESTED it runs with ([`GuestResources`]). The guest binding stays as
+/// in v2 — present iff the KBS runs a binding mode — so a v3 body is a v1
+/// or v2 body plus four keys.
+///
+/// Why it exists: SEV-SNP measures the vCPU count (one VMSA per vCPU) but
+/// NOT the memory size, which the VMM announces through the firmware
+/// memory map. A miner could launch a VM with less RAM than its flavor
+/// and nothing in the launch would see it. The guest therefore reads what
+/// it was actually given and folds it into `REPORT_DATA`
+/// ([`crate::report_data::live_attestation_with_resources`]); the KBS
+/// signs it only after the PSP-signed report matched, so the host that
+/// relays the bytes cannot change a single number.
+///
+/// Additive: a decoder accepts all three versions; v1/v2 bodies are
+/// byte-identical to before.
+pub const LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES: u32 = 3;
+
+/// `schema_version` of a body that also carries the guest components
+/// release the guest ATTESTED it booted, and the health of its agents
+/// ([`GuestComponents`], docs/design/guest-component-rollout.md, "Component
+/// health in `REPORT_DATA`"). The guest binding and the resources are
+/// each optional, exactly as the KBS mode and the guest's own flags make
+/// them; the components are required.
+///
+/// Additive: a decoder accepts all four versions; v1–v3 bodies are
+/// byte-identical to before.
+pub const LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS: u32 = 4;
+
+/// [`GuestComponents::health`] bits — one per check the keepalive runs.
+/// Append-only: a bit keeps its meaning forever; a release declares the
+/// checks it ships (`health_mask`) and vali judges against that mask.
+pub mod components_health {
+    /// `/run/hippius/guest-components` says the release image is mounted.
+    pub const MOUNTED: u32 = 1 << 0;
+    /// The keepalive itself runs from the release image.
+    pub const KEEPALIVE_FROM_RELEASE: u32 = 1 << 1;
+    /// `hippius-tenant-telemetry.service` is active.
+    pub const TELEMETRY_ACTIVE: u32 = 1 << 2;
+    /// `hippius-eol-sign.service` is active (its `ExecStop` signs the
+    /// stopped-ack) and the binary it runs is present.
+    pub const EOL_SIGN_ARMED: u32 = 1 << 3;
+    /// Every check this build of the types knows.
+    pub const ALL: u32 = MOUNTED | KEEPALIVE_FROM_RELEASE | TELEMETRY_ACTIVE | EOL_SIGN_ARMED;
+}
+
+/// SEV-SNP `CHIP_ID` length.
+pub const CHIP_ID_LEN: usize = 64;
+
+/// SEV-SNP `REPORT_ID` length — assigned by the PSP firmware per guest
+/// launch; the guest cannot choose it.
+pub const REPORT_ID_LEN: usize = 32;
+
+/// Where the KBS's expected `(chip_id, report_id)` for a `vm_id` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingSource {
+    /// Recorded at the §20 release to that guest — the strong binding:
+    /// only the guest the KBS released the disk key to can match it.
+    Release,
+    /// No release was on record (e.g. the KBS restarted after the VM
+    /// booted): the pair is the guest that ASKED, served unpinned. It is
+    /// not proven to be the VM's guest — consumers that need proof (the
+    /// capacity tick) ignore these.
+    FirstUse,
+}
+
+impl BindingSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BindingSource::Release => "release",
+            BindingSource::FirstUse => "first-use",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "release" => Some(BindingSource::Release),
+            "first-use" => Some(BindingSource::FirstUse),
+            _ => None,
+        }
+    }
+}
+
+/// The attested guest a v2 body is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestBinding {
+    pub chip_id: [u8; CHIP_ID_LEN],
+    pub report_id: [u8; REPORT_ID_LEN],
+    pub source: BindingSource,
+}
+
+/// What the guest observed it runs with, attested through `REPORT_DATA`.
+///
+/// Every value is read inside the guest at report time:
+/// - `vcpus_online`: CPUs online (`/sys/devices/system/cpu/online`).
+///   The vCPU COUNT is already enforced by the launch measurement; this
+///   catches a host that never runs some of the measured vCPUs.
+/// - `mem_firmware_kib`: the sum of the `System RAM` ranges of the
+///   firmware memory map (`/sys/firmware/memmap`) — the RAM the VMM
+///   announced, before the kernel reserves anything. `0` when the guest
+///   kernel exposes no firmware map.
+/// - `mem_total_kib`: `MemTotal` from `/proc/meminfo` — what the tenant
+///   sees, after the kernel's own reservations (memmap, SEV swiotlb).
+/// - `mem_unaccepted_kib`: `Unaccepted` from `/proc/meminfo` — RAM the
+///   VMM announced that the guest has not accepted (PVALIDATEd) yet, so
+///   the host has not had to back it. `0` on a kernel without
+///   unaccepted-memory support (the firmware accepted everything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestResources {
+    pub vcpus_online: u32,
+    pub mem_firmware_kib: u64,
+    pub mem_total_kib: u64,
+    pub mem_unaccepted_kib: u64,
+}
+
+/// The guest components release the guest attested it booted, and the
+/// health of its agents — read inside the guest at report time and folded
+/// into `REPORT_DATA` ([`crate::report_data::live_attestation_with_components`]).
+/// `release_version` / `security_epoch` come from the record the measured
+/// initramfs wrote (`0` when there is none); `health` is a
+/// [`components_health`] bitmap.
+///
+/// `instance` is a random value the keepalive draws when it starts (a
+/// restarted keepalive has another); `unhealthy_ticks` counts that
+/// instance's ticks that found a check failing, counted in the guest
+/// before any request leaves it — so a sample the host withholds still
+/// shows in every later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestComponents {
+    pub release_version: u32,
+    pub security_epoch: u32,
+    pub health: u32,
+    pub instance: u32,
+    pub unhealthy_ticks: u32,
+}
 
 /// Ed25519 public-key length (KBS L0 signer + the `node_id`).
 pub const PUBKEY_LEN: usize = 32;
@@ -156,6 +309,15 @@ pub struct LiveAttestation {
     /// verifier checks it equals its pinned root-allowlisted KBS
     /// pubkey before trusting the signature.
     pub signer_pubkey: [u8; PUBKEY_LEN],
+    /// v2 ([`LIVE_ATTESTATION_SCHEMA_VERSION_BOUND`]) and optionally v3:
+    /// the attested guest. Always `None` on a v1 body.
+    pub guest: Option<GuestBinding>,
+    /// v3 (required) and v4 (optional): the resources the guest
+    /// attested. Always `None` on a v1/v2 body.
+    pub resources: Option<GuestResources>,
+    /// v4 only ([`LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS`]): the guest
+    /// components release and its health. `None` exactly for v1–v3.
+    pub components: Option<GuestComponents>,
 }
 
 impl LiveAttestation {
@@ -163,11 +325,53 @@ impl LiveAttestation {
     /// [`canonical`](Self::canonical) and [`decode`](Self::decode) so a
     /// hand-crafted canonical body cannot skip the encode-time gates.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != LIVE_ATTESTATION_SCHEMA_VERSION {
-            return Err(schema(format!(
-                "unknown schema_version {} (want {LIVE_ATTESTATION_SCHEMA_VERSION})",
-                self.schema_version
-            )));
+        match (self.schema_version, &self.components) {
+            (LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS, None) => {
+                return Err(schema("a v4 body must carry the guest components".into()));
+            }
+            (LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS, Some(_)) | (_, None) => {}
+            (_, Some(_)) => {
+                return Err(schema("only a v4 body carries guest components".into()));
+            }
+        }
+        match (self.schema_version, &self.guest, &self.resources) {
+            // v4: binding and resources each optional (checked above).
+            (LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS, _, _) => {}
+            (LIVE_ATTESTATION_SCHEMA_VERSION, None, None)
+            | (LIVE_ATTESTATION_SCHEMA_VERSION_BOUND, Some(_), None)
+            | (LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES, _, Some(_)) => {}
+            (LIVE_ATTESTATION_SCHEMA_VERSION, Some(_), _) => {
+                return Err(schema("a v1 body carries no guest binding".into()));
+            }
+            (LIVE_ATTESTATION_SCHEMA_VERSION_BOUND, None, _) => {
+                return Err(schema("a v2 body must carry the guest binding".into()));
+            }
+            (
+                LIVE_ATTESTATION_SCHEMA_VERSION | LIVE_ATTESTATION_SCHEMA_VERSION_BOUND,
+                _,
+                Some(_),
+            ) => {
+                return Err(schema("only a v3 body carries guest resources".into()));
+            }
+            (LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES, _, None) => {
+                return Err(schema("a v3 body must carry the guest resources".into()));
+            }
+            (v, _, _) => {
+                return Err(schema(format!(
+                    "unknown schema_version {v} (want {LIVE_ATTESTATION_SCHEMA_VERSION}, \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_BOUND}, \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES} or \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS})"
+                )));
+            }
+        }
+        if let Some(r) = &self.resources {
+            if r.vcpus_online == 0 {
+                return Err(schema("vcpus_online must be > 0".into()));
+            }
+            if r.mem_total_kib == 0 {
+                return Err(schema("mem_total_kib must be > 0".into()));
+            }
         }
         if self.vm_id.is_empty() {
             return Err(schema("vm_id must be non-empty".into()));
@@ -196,7 +400,7 @@ impl LiveAttestation {
     /// ordering: alphabetic on text-keys (RFC 8949 §4.2.1).
     pub fn canonical(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let v = Value::Map(vec![
+        let mut entries = vec![
             (
                 Value::Text("attestation_seq".into()),
                 Value::Integer(self.attestation_seq.into()),
@@ -258,8 +462,72 @@ impl LiveAttestation {
                 Value::Integer(self.verified_at_unix.into()),
             ),
             (Value::Text("vm_id".into()), Value::Text(self.vm_id.clone())),
-        ]);
-        to_canonical_vec(&v).map_err(|e| schema(format!("encode: {e}")))
+        ];
+        // v2 adds three keys; the canonical encoder sorts them in, so a
+        // v1 body re-encodes byte-identically to every prior build.
+        if let Some(g) = &self.guest {
+            entries.extend([
+                (
+                    Value::Text("binding_source".into()),
+                    Value::Text(g.source.as_str().into()),
+                ),
+                (
+                    Value::Text("chip_id".into()),
+                    Value::Bytes(g.chip_id.to_vec()),
+                ),
+                (
+                    Value::Text("report_id".into()),
+                    Value::Bytes(g.report_id.to_vec()),
+                ),
+            ]);
+        }
+        // v3 adds four more, sorted in the same way (optional in v4).
+        if let Some(r) = &self.resources {
+            entries.extend([
+                (
+                    Value::Text("mem_firmware_kib".into()),
+                    Value::Integer(r.mem_firmware_kib.into()),
+                ),
+                (
+                    Value::Text("mem_total_kib".into()),
+                    Value::Integer(r.mem_total_kib.into()),
+                ),
+                (
+                    Value::Text("mem_unaccepted_kib".into()),
+                    Value::Integer(r.mem_unaccepted_kib.into()),
+                ),
+                (
+                    Value::Text("vcpus_online".into()),
+                    Value::Integer(r.vcpus_online.into()),
+                ),
+            ]);
+        }
+        // v4 adds three.
+        if let Some(c) = &self.components {
+            entries.extend([
+                (
+                    Value::Text("components_health".into()),
+                    Value::Integer(c.health.into()),
+                ),
+                (
+                    Value::Text("components_instance".into()),
+                    Value::Integer(c.instance.into()),
+                ),
+                (
+                    Value::Text("components_release_version".into()),
+                    Value::Integer(c.release_version.into()),
+                ),
+                (
+                    Value::Text("components_security_epoch".into()),
+                    Value::Integer(c.security_epoch.into()),
+                ),
+                (
+                    Value::Text("components_unhealthy_ticks".into()),
+                    Value::Integer(c.unhealthy_ticks.into()),
+                ),
+            ]);
+        }
+        to_canonical_vec(&Value::Map(entries)).map_err(|e| schema(format!("encode: {e}")))
     }
 
     /// Decode + validate a canonical-CBOR body. Hostile-origin parser
@@ -280,11 +548,51 @@ impl LiveAttestation {
             )));
         }
         let schema_version = take_u32(&mut map, "schema_version")?;
-        if schema_version != LIVE_ATTESTATION_SCHEMA_VERSION {
-            return Err(schema(format!(
-                "unknown schema_version {schema_version} (want {LIVE_ATTESTATION_SCHEMA_VERSION})"
-            )));
-        }
+        let (guest, resources, components) = match schema_version {
+            LIVE_ATTESTATION_SCHEMA_VERSION => (None, None, None),
+            LIVE_ATTESTATION_SCHEMA_VERSION_BOUND => (Some(take_guest(&mut map)?), None, None),
+            LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS => {
+                // Binding and resources are each all-or-nothing, decided by
+                // one key; a stray partial set is left over and refused.
+                let guest = if map.contains_key("binding_source") {
+                    Some(take_guest(&mut map)?)
+                } else {
+                    None
+                };
+                let resources = if map.contains_key("vcpus_online") {
+                    Some(take_resources(&mut map)?)
+                } else {
+                    None
+                };
+                let components = GuestComponents {
+                    release_version: take_u32(&mut map, "components_release_version")?,
+                    security_epoch: take_u32(&mut map, "components_security_epoch")?,
+                    health: take_u32(&mut map, "components_health")?,
+                    instance: take_u32(&mut map, "components_instance")?,
+                    unhealthy_ticks: take_u32(&mut map, "components_unhealthy_ticks")?,
+                };
+                (guest, resources, Some(components))
+            }
+            LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES => {
+                // The binding is all-or-nothing: `binding_source` decides,
+                // and a stray `chip_id` / `report_id` without it is left
+                // over and refused below.
+                let guest = if map.contains_key("binding_source") {
+                    Some(take_guest(&mut map)?)
+                } else {
+                    None
+                };
+                (guest, Some(take_resources(&mut map)?), None)
+            }
+            v => {
+                return Err(schema(format!(
+                    "unknown schema_version {v} (want {LIVE_ATTESTATION_SCHEMA_VERSION}, \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_BOUND}, \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES} or \
+                     {LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS})"
+                )));
+            }
+        };
         let chain_genesis = take_byte_array::<DIGEST_LEN>(&mut map, "chain_genesis")?;
         let pallet_instance = take_byte_array::<DIGEST_LEN>(&mut map, "pallet_instance")?;
         let vm_id = take_text(&mut map, "vm_id")?;
@@ -318,6 +626,9 @@ impl LiveAttestation {
             prev_attestation_hash,
             expiry_unix,
             signer_pubkey,
+            guest,
+            resources,
+            components,
         };
         att.validate()?;
         Ok(att)
@@ -373,6 +684,26 @@ impl SignedLiveAttestation {
 }
 
 // ── decode helpers (module-local, mirroring `audit_vm_cert.rs`) ─────
+
+fn take_resources(map: &mut BTreeMap<String, Value>) -> Result<GuestResources> {
+    Ok(GuestResources {
+        vcpus_online: take_u32(map, "vcpus_online")?,
+        mem_firmware_kib: take_u64(map, "mem_firmware_kib")?,
+        mem_total_kib: take_u64(map, "mem_total_kib")?,
+        mem_unaccepted_kib: take_u64(map, "mem_unaccepted_kib")?,
+    })
+}
+
+fn take_guest(map: &mut BTreeMap<String, Value>) -> Result<GuestBinding> {
+    let source_text = take_text(map, "binding_source")?;
+    let source = BindingSource::parse(&source_text)
+        .ok_or_else(|| schema(format!("unknown binding_source {source_text:?}")))?;
+    Ok(GuestBinding {
+        chip_id: take_byte_array::<CHIP_ID_LEN>(map, "chip_id")?,
+        report_id: take_byte_array::<REPORT_ID_LEN>(map, "report_id")?,
+        source,
+    })
+}
 
 fn schema(msg: String) -> HippiusTypesError {
     HippiusTypesError::LiveAttestationSchema(msg)
@@ -457,6 +788,7 @@ mod tests {
 
     fn sample() -> LiveAttestation {
         LiveAttestation {
+            components: None,
             schema_version: LIVE_ATTESTATION_SCHEMA_VERSION,
             chain_genesis: [0xAA; DIGEST_LEN],
             pallet_instance: [0xDD; DIGEST_LEN],
@@ -472,7 +804,173 @@ mod tests {
             prev_attestation_hash: [0x44; DIGEST_LEN],
             expiry_unix: 1_800_000_900,
             signer_pubkey: [0xCC; PUBKEY_LEN],
+            guest: None,
+            resources: None,
         }
+    }
+
+    fn sample_v2() -> LiveAttestation {
+        LiveAttestation {
+            components: None,
+            schema_version: LIVE_ATTESTATION_SCHEMA_VERSION_BOUND,
+            guest: Some(GuestBinding {
+                chip_id: [0x66; CHIP_ID_LEN],
+                report_id: [0x77; REPORT_ID_LEN],
+                source: BindingSource::Release,
+            }),
+            ..sample()
+        }
+    }
+
+    #[test]
+    fn v2_round_trips_and_is_v1_plus_three_keys() {
+        let a = sample_v2();
+        let body = a.canonical().unwrap();
+        assert_canonical(&body).unwrap();
+        assert_eq!(LiveAttestation::decode(&body).unwrap(), a);
+        let v1 = sample().canonical().unwrap();
+        let keys = |b: &[u8]| -> Vec<String> {
+            let v: Value = ciborium::de::from_reader(b).unwrap();
+            match v {
+                Value::Map(e) => e
+                    .into_iter()
+                    .map(|(k, _)| match k {
+                        Value::Text(t) => t,
+                        _ => panic!(),
+                    })
+                    .collect(),
+                _ => panic!(),
+            }
+        };
+        let mut extra: Vec<String> = keys(&body)
+            .into_iter()
+            .filter(|k| !keys(&v1).contains(k))
+            .collect();
+        extra.sort();
+        assert_eq!(extra, vec!["binding_source", "chip_id", "report_id"]);
+    }
+
+    #[test]
+    fn the_guest_binding_is_signed() {
+        let base = sample_v2().canonical().unwrap();
+        let mutate: &[fn(&mut GuestBinding)] = &[
+            |g| g.chip_id[0] ^= 0xFF,
+            |g| g.report_id[0] ^= 0xFF,
+            |g| g.source = BindingSource::FirstUse,
+        ];
+        for m in mutate {
+            let mut a = sample_v2();
+            m(a.guest.as_mut().unwrap());
+            assert_ne!(base, a.canonical().unwrap());
+        }
+    }
+
+    #[test]
+    fn version_and_binding_must_agree() {
+        let mut v1_with = sample();
+        v1_with.guest = sample_v2().guest;
+        assert!(v1_with.canonical().is_err());
+        let mut v2_without = sample_v2();
+        v2_without.guest = None;
+        assert!(v2_without.canonical().is_err());
+        let mut v3 = sample_v2();
+        v3.schema_version = 3;
+        assert!(v3.canonical().is_err());
+    }
+
+    #[test]
+    fn a_v1_body_with_binding_keys_is_refused_on_decode() {
+        // Take a v2 body and relabel it v1: the leftover keys must fail.
+        let v2 = sample_v2().canonical().unwrap();
+        let v: Value = ciborium::de::from_reader(v2.as_slice()).unwrap();
+        let Value::Map(entries) = v else { panic!() };
+        let relabelled: Vec<(Value, Value)> = entries
+            .into_iter()
+            .map(|(k, val)| {
+                if matches!(&k, Value::Text(t) if t == "schema_version") {
+                    (k, Value::Integer(1.into()))
+                } else {
+                    (k, val)
+                }
+            })
+            .collect();
+        let bytes = to_canonical_vec(&Value::Map(relabelled)).unwrap();
+        assert!(LiveAttestation::decode(&bytes).is_err());
+    }
+
+    fn sample_v3() -> LiveAttestation {
+        LiveAttestation {
+            components: None,
+            schema_version: LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES,
+            resources: Some(GuestResources {
+                vcpus_online: 2,
+                mem_firmware_kib: 8_386_000,
+                mem_total_kib: 7_900_000,
+                mem_unaccepted_kib: 0,
+            }),
+            ..sample_v2()
+        }
+    }
+
+    /// Re-encode `body` with `schema_version` set to `version`.
+    fn relabel(body: &[u8], version: u32) -> Vec<u8> {
+        let v: Value = ciborium::de::from_reader(body).unwrap();
+        let Value::Map(entries) = v else { panic!() };
+        let relabelled: Vec<(Value, Value)> = entries
+            .into_iter()
+            .map(|(k, val)| {
+                if matches!(&k, Value::Text(t) if t == "schema_version") {
+                    (k, Value::Integer(version.into()))
+                } else {
+                    (k, val)
+                }
+            })
+            .collect();
+        to_canonical_vec(&Value::Map(relabelled)).unwrap()
+    }
+
+    #[test]
+    fn v3_round_trips_and_every_resource_is_signed() {
+        let a = sample_v3();
+        let body = a.canonical().unwrap();
+        assert_canonical(&body).unwrap();
+        assert_eq!(LiveAttestation::decode(&body).unwrap(), a);
+        let mutate: &[fn(&mut GuestResources)] = &[
+            |r| r.vcpus_online -= 1,
+            |r| r.mem_firmware_kib -= 1,
+            |r| r.mem_total_kib -= 1,
+            |r| r.mem_unaccepted_kib += 1,
+        ];
+        for m in mutate {
+            let mut b = sample_v3();
+            m(b.resources.as_mut().unwrap());
+            assert_ne!(body, b.canonical().unwrap());
+        }
+    }
+
+    #[test]
+    fn resource_keys_only_decode_under_v3() {
+        let v3 = sample_v3().canonical().unwrap();
+        // Relabelled v2 (or v1): the resource keys are left over.
+        assert!(LiveAttestation::decode(&relabel(&v3, 2)).is_err());
+        assert!(LiveAttestation::decode(&relabel(&v3, 1)).is_err());
+        // A v2 body relabelled v3 is missing its resources.
+        let v2 = sample_v2().canonical().unwrap();
+        assert!(LiveAttestation::decode(&relabel(&v2, 3)).is_err());
+        assert!(LiveAttestation::decode(&relabel(&v3, 4)).is_err());
+    }
+
+    #[test]
+    fn an_unknown_binding_source_is_refused() {
+        assert_eq!(
+            BindingSource::parse("release"),
+            Some(BindingSource::Release)
+        );
+        assert_eq!(
+            BindingSource::parse("first-use"),
+            Some(BindingSource::FirstUse)
+        );
+        assert_eq!(BindingSource::parse("trust-me"), None);
     }
 
     #[test]

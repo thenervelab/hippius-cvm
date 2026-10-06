@@ -1,0 +1,353 @@
+The guest components release step (docs/design/guest-component-rollout.md),
+as a strict patch on top of m0..m3: `hippius_golden_mount_components`,
+called by `hippius_golden_run` after the M0 hardening, exactly as on main.
+On an initrd that carries no release record (/lib/hippius/guest/release)
+it is a strict no-op, which is what every minimal-delta rebuild is: the
+step only acts once a release cpio is appended to the initrd.
+Applies with no fuzz after m0-initramfs-guard.patch,
+m1-golden-data-bind.patch, m2-golden-mask-data-disk.patch and
+m3-golden-sshd-key-only.patch, on the pre-M0, M0-era and stamp-v2 bases
+alike.
+
+diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
+index 1b7b7a66..cb29875b 100644
+--- a/scripts/initramfs/hippius-golden-overlay.sh
++++ b/scripts/initramfs/hippius-golden-overlay.sh
+@@ -1831,6 +1831,327 @@ hippius_golden_harden_root() {
+     hippius_log "golden: M0 guest masks + cloud-init pin + sshd key-only re-asserted into the overlay upper"
+ }
+ 
++# ── Guest components release (docs/design/guest-component-rollout.md) ──
++# A components release is appended to the base's initrd as one more cpio
++# member. It replaces this library and the other Hippius initramfs files,
++# and carries the Hippius ROOTFS agents (keepalive, telemetry, eol-sign)
++# and their units as ONE squashfs image. This step mounts that image in
++# guest RAM and points the units at it, so every Hippius byte the guest
++# runs comes from its measured initrd (G1), never from the base.
++#
++# The release lives at fixed paths of the initrd — constants of this
++# measured file, NOT cmdline-, env- or device-selectable:
++#   ${dir}/release             the release record (below)
++#   ${dir}/components.squashfs the rootfs components image
++#   ${dir}/busybox             static busybox (sha256sum, cp, loop mount):
++#                              no dependency on the base initrd's tools
++#
++# The record is `key=value` lines, written by
++# scripts/guest/build-guest-release.sh:
++#   version=<int>  security_epoch=<int>  commit=<40 hex>
++#   squashfs_sha256=<64 hex>
++#   enable=<unit>:<target>   (repeatable) link the unit + its .wants link
++#   retire=<unit>            (repeatable) mask a unit an earlier release
++#                            (or the base) shipped
++#
++# Policy:
++#   - no record ⇒ strict no-op (every initrd built before this design):
++#     the base's units and agents run as before;
++#   - a record ⇒ the links are ALWAYS written, fail-closed like the M0
++#     masks, whether or not the image mounted. A mount failure (only a
++#     build bug can cause it: record and image are both measured) leaves
++#     the links dangling and NO Hippius agent running — never the base's
++#     older agents;
++#   - a malformed record is a build bug ⇒ fail-closed.
++HIPPIUS_GUEST_DIR="/lib/hippius/guest"
++HIPPIUS_GUEST_RUN="/run/hippius"
++# The image is mounted at ${HIPPIUS_GUEST_RUN}/guest. /run is moved into
++# the new root at switch_root by both initramfs families (with its
++# submounts) and systemd keeps it. A mount of its own, so the `noexec`
++# initramfs-tools puts on /run does not apply to it.
++HIPPIUS_GUEST_MOUNT_NAME="guest"
++
++# Pure predicate: a systemd unit or target name we accept in a record.
++hippius_golden_valid_unit_name() {
++    case "$1" in
++        '' | *[!A-Za-z0-9@._-]* | .* ) return 1 ;;
++        *.service | *.target | *.socket | *.timer | *.path ) return 0 ;;
++    esac
++    return 1
++}
++
++# Pure parser (testable): validate a release record and print it back as
++# normalised lines (`version N`, `security_epoch N`, `commit H`,
++# `squashfs_sha256 H`, then `enable <unit> <target>` / `retire <unit>` in
++# record order). Non-zero on any malformed line, unknown or repeated
++# scalar key, or a missing required key.
++hippius_golden_parse_release() (
++    set -f
++    _hgpr_file="$1"
++    [ -r "${_hgpr_file}" ] || exit 1
++    _hgpr_v="" _hgpr_e="" _hgpr_c="" _hgpr_s="" _hgpr_h=""
++    _hgpr_out=""
++    _hgpr_nl='
++'
++    while IFS= read -r _hgpr_line || [ -n "${_hgpr_line}" ]; do
++        case "${_hgpr_line}" in
++            '' | '#'*) continue ;;
++        esac
++        _hgpr_key="${_hgpr_line%%=*}"
++        _hgpr_val="${_hgpr_line#*=}"
++        [ "${_hgpr_key}" != "${_hgpr_line}" ] || exit 1
++        case "${_hgpr_key}" in
++            version)
++                case "${_hgpr_val}" in '' | *[!0-9]*) exit 1 ;; esac
++                [ -z "${_hgpr_v}" ] || exit 1
++                _hgpr_v="${_hgpr_val}"
++                ;;
++            security_epoch)
++                case "${_hgpr_val}" in '' | *[!0-9]*) exit 1 ;; esac
++                [ -z "${_hgpr_e}" ] || exit 1
++                _hgpr_e="${_hgpr_val}"
++                ;;
++            commit)
++                case "${_hgpr_val}" in *[!0-9a-f]*) exit 1 ;; esac
++                [ "${#_hgpr_val}" -eq 40 ] && [ -z "${_hgpr_c}" ] || exit 1
++                _hgpr_c="${_hgpr_val}"
++                ;;
++            squashfs_sha256)
++                case "${_hgpr_val}" in *[!0-9a-f]*) exit 1 ;; esac
++                [ "${#_hgpr_val}" -eq 64 ] && [ -z "${_hgpr_s}" ] || exit 1
++                _hgpr_s="${_hgpr_val}"
++                ;;
++            health_mask)
++                # The health checks the release's keepalive attests (vali's
++                # gate reads it from the build); nothing at boot uses it.
++                case "${_hgpr_val}" in '' | *[!0-9]*) exit 1 ;; esac
++                [ "${#_hgpr_val}" -le 10 ] && [ -z "${_hgpr_h}" ] || exit 1
++                _hgpr_h="${_hgpr_val}"
++                ;;
++            enable)
++                _hgpr_unit="${_hgpr_val%%:*}"
++                _hgpr_tgt="${_hgpr_val#*:}"
++                [ "${_hgpr_unit}" != "${_hgpr_val}" ] || exit 1
++                hippius_golden_valid_unit_name "${_hgpr_unit}" || exit 1
++                case "${_hgpr_unit}" in *.target) exit 1 ;; esac
++                case "${_hgpr_tgt}" in *.target) ;; *) exit 1 ;; esac
++                hippius_golden_valid_unit_name "${_hgpr_tgt}" || exit 1
++                _hgpr_out="${_hgpr_out}enable ${_hgpr_unit} ${_hgpr_tgt}${_hgpr_nl}"
++                ;;
++            retire)
++                hippius_golden_valid_unit_name "${_hgpr_val}" || exit 1
++                _hgpr_out="${_hgpr_out}retire ${_hgpr_val}${_hgpr_nl}"
++                ;;
++            *) exit 1 ;;
++        esac
++    done < "${_hgpr_file}"
++    [ -n "${_hgpr_v}" ] && [ -n "${_hgpr_e}" ] && [ -n "${_hgpr_c}" ] && [ -n "${_hgpr_s}" ] \
++        || exit 1
++    printf 'version %s\nsecurity_epoch %s\ncommit %s\nsquashfs_sha256 %s\n%s' \
++        "${_hgpr_v}" "${_hgpr_e}" "${_hgpr_c}" "${_hgpr_s}" "${_hgpr_out}"
++)
++
++# Strict SELinux label: set ${ctx} on ${dst} and VERIFY it took. ${ctx}
++# comes from the verity-checked LOWER (never from the tenant-writable
++# upper), so a forged or missing upper label cannot be copied along.
++# Unlike the best-effort `_hippius_golden_relabel_from`, a miss is fatal:
++# a unit link systemd may not read would silently drop the agent. No-op
++# when ${ctx} is empty (a base without SELinux).
++_hippius_golden_label_strict() {
++    _hgls_ctx="$1"
++    _hgls_dst="$2"
++    [ -n "${_hgls_ctx}" ] || return 0
++    setfattr -h -n security.selinux -v "${_hgls_ctx}" "${_hgls_dst}" 2>/dev/null \
++        || hippius_die "golden: components: could not label ${_hgls_dst}"
++    [ "$(_hippius_golden_selinux_ctx "${_hgls_dst}")" = "${_hgls_ctx}" ] \
++        || hippius_die "golden: components: label of ${_hgls_dst} did not take"
++}
++
++# The context unit links get on this base: the label of the LOWER's
++# /etc/systemd/system, or nothing on a base without SELinux. Fatal when
++# the base is SELinux but the label (or the tools) cannot be had.
++_hippius_golden_unit_ctx() {
++    [ -e "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux/config" ] || return 0
++    command -v getfattr >/dev/null 2>&1 && command -v setfattr >/dev/null 2>&1 \
++        || hippius_die "golden: components: SELinux base but no getfattr/setfattr in the initramfs"
++    _hguc_ctx="$(_hippius_golden_selinux_ctx "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/systemd/system")"
++    [ -n "${_hguc_ctx}" ] \
++        || hippius_die "golden: components: the base's /etc/systemd/system carries no SELinux label"
++    printf '%s' "${_hguc_ctx}"
++}
++
++# Is ${root}/${rel} reachable as REAL directories only? Walks one component
++# at a time and creates a missing one, but never follows a symlink: ${root}
++# is the overlay as the initramfs sees it, so an absolute symlink the
++# tenant planted in the upper (`/etc/systemd/system -> /x`) would resolve
++# against the INITRAMFS and send every write outside the guest root.
++# Non-zero when a component is a symlink or not a directory.
++_hippius_golden_real_dir() {
++    _hgrd_path="$1"
++    _hgrd_rest="$2"
++    { [ -d "${_hgrd_path}" ] && [ ! -L "${_hgrd_path}" ]; } || return 1
++    while [ -n "${_hgrd_rest}" ]; do
++        _hgrd_part="${_hgrd_rest%%/*}"
++        if [ "${_hgrd_part}" = "${_hgrd_rest}" ]; then _hgrd_rest=""; else _hgrd_rest="${_hgrd_rest#*/}"; fi
++        _hgrd_path="${_hgrd_path}/${_hgrd_part}"
++        if [ -L "${_hgrd_path}" ]; then
++            return 1
++        elif [ ! -e "${_hgrd_path}" ]; then
++            mkdir "${_hgrd_path}" || return 1
++        elif [ ! -d "${_hgrd_path}" ]; then
++            return 1
++        fi
++    done
++    return 0
++}
++
++# Directory-safe symlink: ${path} -> ${target}, whatever was there before
++# (a tenant file, a directory, another link), verified, labelled strictly.
++# The caller has checked the parent with `_hippius_golden_real_dir`.
++# Fail-closed, like `_hippius_golden_mask_path`.
++_hippius_golden_link_path() {
++    _hglp_path="$1"
++    _hglp_target="$2"
++    _hglp_ctx="$3"
++    rm -rf "${_hglp_path}" 2>/dev/null || true
++    ln -s "${_hglp_target}" "${_hglp_path}" \
++        || hippius_die "golden: components: could not link ${_hglp_path}"
++    { [ -L "${_hglp_path}" ] && [ "$(readlink "${_hglp_path}")" = "${_hglp_target}" ]; } \
++        || hippius_die "golden: components: link verify failed for ${_hglp_path}"
++    _hippius_golden_label_strict "${_hglp_ctx}" "${_hglp_path}"
++}
++
++# Mount the components image. Best-effort: non-zero on any miss, after
++# logging why. ${dir} is the release dir in the initramfs, ${run} the
++# /run/hippius directory, ${sha} the record's image sha256.
++_hippius_golden_components_mount() {
++    _hgcm_dir="$1"
++    _hgcm_run="$2"
++    _hgcm_sha="$3"
++    _hgcm_bb="${_hgcm_dir}/busybox"
++    _hgcm_img="${_hgcm_dir}/components.squashfs"
++    _hgcm_copy="${_hgcm_run}/${HIPPIUS_GUEST_MOUNT_NAME}.squashfs"
++    _hgcm_mnt="${_hgcm_run}/${HIPPIUS_GUEST_MOUNT_NAME}"
++    [ -x "${_hgcm_bb}" ] || { hippius_log "golden: components: WARN no busybox in the release"; return 1; }
++    [ -r "${_hgcm_img}" ] || { hippius_log "golden: components: WARN no image in the release"; return 1; }
++    mkdir -p "${_hgcm_mnt}" || { hippius_log "golden: components: WARN cannot create ${_hgcm_mnt}"; return 1; }
++    # Into guest RAM (tmpfs): the initramfs's own files are freed at
++    # switch_root; the copy is what the loop device keeps open. The sha is
++    # checked on the copy, the bytes actually mounted.
++    "${_hgcm_bb}" cp "${_hgcm_img}" "${_hgcm_copy}" \
++        || { hippius_log "golden: components: WARN copy to ${_hgcm_copy} failed"; return 1; }
++    _hgcm_got="$("${_hgcm_bb}" sha256sum "${_hgcm_copy}" 2>/dev/null)" || _hgcm_got=""
++    _hgcm_got="${_hgcm_got%% *}"
++    if [ "${_hgcm_got}" != "${_hgcm_sha}" ]; then
++        rm -f "${_hgcm_copy}"
++        hippius_log "golden: components: WARN image sha256 mismatch (got '${_hgcm_got}')"
++        return 1
++    fi
++    # `loop` is built in on most kernels; where it is a module the
++    # initramfs may not carry it, so fall back to the base's own module
++    # tree on the verity-checked lower (open and mounted at this point).
++    if [ ! -e /dev/loop-control ]; then
++        modprobe loop 2>/dev/null \
++            || modprobe -d "${HIPPIUS_GOLDEN_LOWER_MNT}" loop 2>/dev/null \
++            || true
++    fi
++    "${_hgcm_bb}" mount -t squashfs -o ro,nosuid,nodev,loop "${_hgcm_copy}" "${_hgcm_mnt}" \
++        || { hippius_log "golden: components: WARN mount of the image failed"; return 1; }
++    if [ ! -d "${_hgcm_mnt}/units" ]; then
++        "${_hgcm_bb}" umount "${_hgcm_mnt}" 2>/dev/null || true
++        hippius_log "golden: components: WARN the image carries no units/"
++        return 1
++    fi
++    return 0
++}
++
++# The boot step proper, parameterised for the unit test: ${root} is the
++# assembled overlay root, ${dir} the release dir, ${run} /run/hippius as
++# the initramfs sees it. The links always name the FINAL path
++# (${HIPPIUS_GUEST_RUN}/guest/units/...), the one the booted system sees.
++_hippius_golden_components_run() {
++    _hgcr_root="$1"
++    _hgcr_dir="$2"
++    _hgcr_run="$3"
++    _hgcr_rec="${_hgcr_dir}/release"
++    if [ ! -e "${_hgcr_rec}" ] && [ ! -L "${_hgcr_rec}" ]; then
++        hippius_log "golden: components: no release in this initrd — base agents unchanged"
++        return 0
++    fi
++    _hgcr_parsed="$(hippius_golden_parse_release "${_hgcr_rec}")" \
++        || hippius_die "golden: components: malformed release record ${_hgcr_rec} — fail-closed"
++    _hgcr_version="" _hgcr_epoch="" _hgcr_commit="" _hgcr_sha=""
++    while read -r _hgcr_k _hgcr_v _hgcr_rest; do
++        case "${_hgcr_k}" in
++            version) _hgcr_version="${_hgcr_v}" ;;
++            security_epoch) _hgcr_epoch="${_hgcr_v}" ;;
++            commit) _hgcr_commit="${_hgcr_v}" ;;
++            squashfs_sha256) _hgcr_sha="${_hgcr_v}" ;;
++        esac
++    done <<HIPPIUS_REC_EOF
++${_hgcr_parsed}
++HIPPIUS_REC_EOF
++
++    mkdir -p "${_hgcr_run}" \
++        || hippius_die "golden: components: could not create ${_hgcr_run}"
++    _hgcr_mounted=no
++    if _hippius_golden_components_mount "${_hgcr_dir}" "${_hgcr_run}" "${_hgcr_sha}"; then
++        _hgcr_mounted=yes
++    fi
++
++    # The unit links. A symlinked /etc, /etc/systemd or /etc/systemd/system
++    # (something only in-guest root can plant: the upper is guest-keyed) is
++    # never followed — it would resolve against the initramfs — and the
++    # links cannot be written without it, so the boot stops: a release
++    # never runs the base's agents. A symlinked .wants is replaced.
++    _hgcr_ctx="$(_hippius_golden_unit_ctx)" \
++        || hippius_die "golden: components: cannot determine the unit label"
++    _hgcr_sysd="${_hgcr_root}/etc/systemd/system"
++    _hippius_golden_real_dir "${_hgcr_root}" etc/systemd/system \
++        || hippius_die "golden: components: /etc/systemd/system is not a plain directory in the guest root (a symlink?) — the unit links cannot be written — fail-closed"
++    _hippius_golden_label_strict "${_hgcr_ctx}" "${_hgcr_sysd}"
++    while read -r _hgcr_k _hgcr_unit _hgcr_tgt; do
++        case "${_hgcr_k}" in
++            enable)
++                _hippius_golden_link_path "${_hgcr_sysd}/${_hgcr_unit}" \
++                    "${HIPPIUS_GUEST_RUN}/${HIPPIUS_GUEST_MOUNT_NAME}/units/${_hgcr_unit}" \
++                    "${_hgcr_ctx}"
++                _hgcr_wants="${_hgcr_sysd}/${_hgcr_tgt}.wants"
++                if [ -L "${_hgcr_wants}" ] || { [ -e "${_hgcr_wants}" ] && [ ! -d "${_hgcr_wants}" ]; }; then
++                    rm -f "${_hgcr_wants}" \
++                        || hippius_die "golden: components: could not replace ${_hgcr_wants}"
++                fi
++                _hippius_golden_real_dir "${_hgcr_sysd}" "${_hgcr_tgt}.wants" \
++                    || hippius_die "golden: components: could not create ${_hgcr_wants}"
++                _hippius_golden_label_strict "${_hgcr_ctx}" "${_hgcr_wants}"
++                _hippius_golden_link_path "${_hgcr_wants}/${_hgcr_unit}" "../${_hgcr_unit}" \
++                    "${_hgcr_ctx}"
++                ;;
++            retire)
++                _hippius_golden_link_path "${_hgcr_sysd}/${_hgcr_unit}" /dev/null \
++                    "${_hgcr_ctx}"
++                ;;
++        esac
++    done <<HIPPIUS_REC_EOF
++${_hgcr_parsed}
++HIPPIUS_REC_EOF
++    # For the agents to report; nothing at boot reads it.
++    printf 'version=%s\nsecurity_epoch=%s\ncommit=%s\nmounted=%s\n' \
++        "${_hgcr_version}" "${_hgcr_epoch}" "${_hgcr_commit}" "${_hgcr_mounted}" \
++        > "${_hgcr_run}/guest-components" \
++        || hippius_die "golden: components: could not write ${_hgcr_run}/guest-components"
++    if [ "${_hgcr_mounted}" = yes ]; then
++        hippius_log "golden: components: release ${_hgcr_version} (epoch ${_hgcr_epoch}) mounted at ${HIPPIUS_GUEST_RUN}/${HIPPIUS_GUEST_MOUNT_NAME}"
++    else
++        hippius_log "golden: components: WARN release ${_hgcr_version} NOT mounted — no Hippius agent runs this boot"
++    fi
++}
++
++hippius_golden_mount_components() {
++    [ -n "$1" ] || hippius_die "golden: mount_components needs a rootmnt arg"
++    _hippius_golden_components_run "$1" "${HIPPIUS_GUEST_DIR}" "${HIPPIUS_GUEST_RUN}"
++}
++
+ # Caller MUST have already sourced hippius-release-core.sh.
+ hippius_golden_run() {
+     _hgrun_rootmnt="$1"
+@@ -1915,5 +2236,9 @@ hippius_golden_run() {
+     # bake-time hardening. Fail-closed like the rest of this path.
+     hippius_golden_harden_root "${_hgrun_rootmnt}"
+ 
++    # Guest components release: mount the measured agents image and point
++    # the units at it (strict no-op on an initrd that carries no release).
++    hippius_golden_mount_components "${_hgrun_rootmnt}"
++
+     hippius_log "golden: boot assembled — handing control back for switch_root into ${_hgrun_rootmnt}"
+ }

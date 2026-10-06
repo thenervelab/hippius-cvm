@@ -243,7 +243,7 @@ class AnalyticsLoop:
                 st.consecutive_failures += 1
                 # Defer the rule by at least one tick interval so a
                 # broken rule that raises during scheduling doesn't
-                # spin every tick (codex round-3 LOW).
+                # spin every tick (review round-3 LOW).
                 st.next_due_unix = max(
                     st.next_due_unix, clock + max(self._tick_interval_s, 1.0)
                 )
@@ -295,7 +295,7 @@ class AnalyticsLoop:
         # The counter is reset by `tick_once` *after* the value is
         # validated as a real Finding (or as a deliberate None). A
         # rule that returns garbage every tick keeps incrementing,
-        # which surfaces in the warning log (codex round-2 LOW).
+        # which surfaces in the warning log (review round-2 LOW).
         if finding is None:
             st.consecutive_failures = 0
             return None

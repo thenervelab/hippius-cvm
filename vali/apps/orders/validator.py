@@ -78,6 +78,9 @@ class ParsedTicket:
     platform_id: str
     resource_class: str
     kid_hex: str
+    # Customer-held keys: the signed `key_mode`. The validator omits the
+    # key for an M0 ticket (none on the wire), which reads as `hippius`.
+    key_mode: str = "hippius"
 
 
 def validate_ticket(cose_bytes: bytes) -> ParsedTicket:
@@ -183,6 +186,7 @@ def _coerce_parsed(ticket: dict[str, Any]) -> ParsedTicket:
             ticket["flavor"] if "flavor" in ticket else ticket["resource_class"]
         ),
         kid_hex=str(ticket["kid_hex"]),
+        key_mode=str(ticket.get("key_mode") or "hippius"),
     )
 
 

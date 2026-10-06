@@ -39,3 +39,17 @@ zeroize = "1.8"
 # `hippius-agent-initramfs`'s `kbs_client` stage; declared directly
 # here so this crate can use it too.
 ciborium = "0.2"
+# The stable cloud-init instance-id of an M1/M2 VM (`--instance-id-out`).
+sha2 = "0.10"
+# `O_DIRECT` / `O_EXCL` for `--integrity-wipe` (constants only; the
+# workspace forbids `unsafe`).
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# Customer-held-keys tests: a fake KBS and a fake guardian that sign
+# (Ed25519) and seal (the real §20 HPKE suite) exactly like the real
+# ones, plus the COSE ticket envelope.
+kbs-core = { path = "../../kbs-core" }
+ed25519-dalek = "2.1"
+coset = "0.3"

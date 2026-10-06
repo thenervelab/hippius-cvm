@@ -17,7 +17,12 @@ from apps.lifecycle.models import Vm, VmState
 from apps.miners.models import MinerIdentity, MinerStatus
 from apps.orders.models import OrderTicketIntake
 from apps.scheduler.chain import ChainSnapshot, MinerView
-from apps.scheduler.models import MinerCapacity, Placement, PlacementStatus
+from apps.scheduler.models import (
+    MinerCapacity,
+    Placement,
+    PlacementFailureSource,
+    PlacementStatus,
+)
 
 
 def node_id(seed: int) -> str:
@@ -57,7 +62,7 @@ def make_dispatchable_identity(seed: int) -> MinerIdentity:
     """
     nid = node_id(seed)
     return MinerIdentity.objects.create(
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{seed:02d}",
         pubkey_hex=f"{seed:02x}" + "ab" * 15,
         platform_id=f"{seed:02x}" + "cd" * 15,
         chain_node_id=nid,
@@ -172,10 +177,56 @@ def make_placement(
     chain_epoch: int = 10,
     version: int = 1,
     decided_by: ServiceClient | None = None,
+    reason: str | None = None,
+    failure_source: str | None = None,
 ) -> Placement:
-    """Create a `Placement` directly, satisfying the status CHECKs."""
+    """Create a `Placement` directly, satisfying the status CHECKs and the
+    model's provenance guard.
+
+    `reason` defaults to the placeholder `"seed"` on a FAILED row (the
+    CHECK requires a non-empty reason); pass one of the strings vali really
+    writes (`drain:miner-stale`, `released:vm-destroyed`, ...) when the
+    test is about how the reason is read back.
+
+    `failure_source` defaults to `manual` on a FAILED row — the placeholder
+    reason is exactly what a root `/fail` body looks like, and `manual` is
+    never a refusal, so a test that does not care about provenance gets a
+    row the operator readout ignores. A test about refusals passes the
+    source of the path it is imitating (`scheduler_drain`, `launch`, ...).
+    Pass `legacy` explicitly to imitate a pre-provenance row; the guard
+    refuses that on `create()`, so the factory writes it with `.update()`.
+    """
     actor = decided_by or make_service_client()
     now = timezone.now()
+    if reason is None:
+        reason = "seed" if status == PlacementStatus.FAILED.value else ""
+    failed = status == PlacementStatus.FAILED.value
+    if failure_source is None:
+        failure_source = (
+            PlacementFailureSource.MANUAL.value if failed else PlacementFailureSource.LEGACY.value
+        )
+    if failed and failure_source == PlacementFailureSource.LEGACY.value:
+        # A legacy row is one that ended BEFORE the column existed. The
+        # model guard forbids creating one, by design; imitate history the
+        # way history happened — write the row, then blank its provenance.
+        row = make_placement(
+            vm,
+            miner_node_id,
+            status=status,
+            vm_family=vm_family,
+            owner=owner,
+            resource_class=resource_class,
+            chain_epoch=chain_epoch,
+            version=version,
+            decided_by=actor,
+            reason=reason,
+            failure_source=PlacementFailureSource.MANUAL.value,
+        )
+        Placement.objects.filter(id=row.id).update(
+            failure_source=PlacementFailureSource.LEGACY.value
+        )
+        row.refresh_from_db()
+        return row
     return Placement.objects.create(
         vm=vm,
         vm_family=vm_family,
@@ -187,6 +238,7 @@ def make_placement(
         version=version,
         decided_by=actor,
         bound_at=now if status == PlacementStatus.BOUND.value else None,
-        failed_at=now if status == PlacementStatus.FAILED.value else None,
-        reason="seed" if status == PlacementStatus.FAILED.value else "",
+        failed_at=now if failed else None,
+        reason=reason,
+        failure_source=failure_source,
     )

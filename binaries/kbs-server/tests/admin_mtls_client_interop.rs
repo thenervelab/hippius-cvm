@@ -124,9 +124,15 @@ async fn start(dir: &Path, server_ca: &(Certificate, KeyPair), client_ca_pem: &s
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        hippius_kbs_server::admin_tls::serve_admin_mtls(listener, acceptor, router, async {
-            let _ = rx.await;
-        })
+        hippius_kbs_server::admin_tls::serve_admin_mtls(
+            listener,
+            acceptor,
+            router,
+            Arc::new(vec![kbs_transport::SpiffeId::parse(VALI_SAN_URI).unwrap()]),
+            async {
+                let _ = rx.await;
+            },
+        )
         .await;
     });
     // Let the accept loop reach `listener.accept()`.

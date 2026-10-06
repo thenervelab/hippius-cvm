@@ -1,0 +1,385 @@
+{
+  "about": "C-4 rollback wire, produced by kbs-core/tests/rollback_wire_fixture.rs. body_text is the exact HTTP body; body is the same JSON parsed.",
+  "authorize_rollback_request": {
+    "body": {
+      "checkpoint_cbor_hex": "a865766d5f6964782433663163326239652d366134642d346532622d396331612d30643565376638613962313066646f6d61696e7822484950504955535f4b42535f524f4c4c4241434b5f434845434b504f494e545f56326a67656e65726174696f6e026c626f6f745f636f756e746572046c766f6c756d655f7374616d70036e6973737565645f61745f756e69781a6ab13b8074756e636f6e6669726d65645f72656c6561736573017818766f6c756d655f7374616d705f74696d656c696e655f696458205c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "dest_platform_id_hex": "0011223344556677",
+      "new_gen": 3,
+      "point_manifest_b64": "eyJib290X2NvdW50ZXIiOjQsImtic19yb2xsYmFja19jaGVja3BvaW50Ijp7ImNoZWNrcG9pbnQiOnsiYm9vdF9jb3VudGVyIjo0LCJkb21haW4iOiJISVBQSVVTX0tCU19ST0xMQkFDS19DSEVDS1BPSU5UX1YyIiwiZ2VuZXJhdGlvbiI6MiwiaXNzdWVkX2F0X3VuaXgiOjE3OTAwMDAwMDAsInVuY29uZmlybWVkX3JlbGVhc2VzIjoxLCJ2bV9pZCI6IjNmMWMyYjllLTZhNGQtNGUyYi05YzFhLTBkNWU3ZjhhOWIxMCIsInZvbHVtZV9zdGFtcCI6Mywidm9sdW1lX3N0YW1wX3RpbWVsaW5lX2lkX2hleCI6IjVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWMifSwiY2hlY2twb2ludF9jYm9yX2hleCI6ImE4NjU3NjZkNWY2OTY0NzgyNDMzNjYzMTYzMzI2MjM5NjUyZDM2NjEzNDY0MmQzNDY1MzI2MjJkMzk2MzMxNjEyZDMwNjQzNTY1Mzc2NjM4NjEzOTYyMzEzMDY2NjQ2ZjZkNjE2OTZlNzgyMjQ4NDk1MDUwNDk1NTUzNWY0YjQyNTM1ZjUyNGY0YzRjNDI0MTQzNGI1ZjQzNDg0NTQzNGI1MDRmNDk0ZTU0NWY1NjMyNmE2NzY1NmU2NTcyNjE3NDY5NmY2ZTAyNmM2MjZmNmY3NDVmNjM2Zjc1NmU3NDY1NzIwNDZjNzY2ZjZjNzU2ZDY1NWY3Mzc0NjE2ZDcwMDM2ZTY5NzM3Mzc1NjU2NDVmNjE3NDVmNzU2ZTY5NzgxYTZhYjEzYjgwNzQ3NTZlNjM2ZjZlNjY2OTcyNmQ2NTY0NWY3MjY1NmM2NTYxNzM2NTczMDE3ODE4NzY2ZjZjNzU2ZDY1NWY3Mzc0NjE2ZDcwNWY3NDY5NmQ2NTZjNjk2ZTY1NWY2OTY0NTgyMDVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWMiLCJzaWduYXR1cmVfaGV4IjoiNDg2MmZjM2M1MTkxOWI0M2Q3NTM2ZmE1ZGRmMzk2NWQ2OGJjNzc4MWY1OGU5Yzg3ZTlkYWExYzg3NjkzNjNlMjkyNWFkMjZkMmI1MDU3NTg3OThmYmJiN2Y3ZDA2NjA4ZDJhMGI1NDZlZmY1MGYxNWEyNWFjYWJiMzA2ZmU4MDYiLCJzaWduZXJfcHVia2V5X2hleCI6IjBkNzU1MDc1NGUwODAwYTVkMjM3ZWVmNTgyNjAzNTc2NmI5YjNlNWExNTg2OGE5NDBhYjI4OTk1ODc4OGUzYjAifSwidm1faWQiOiIzZjFjMmI5ZS02YTRkLTRlMmItOWMxYS0wZDVlN2Y4YTliMTAifQ==",
+      "point_manifest_sha256_hex": "62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb",
+      "requested_by": "tenant:42",
+      "restore_id": "restore-fixture-2",
+      "signature_hex": "4862fc3c51919b43d7536fa5ddf3965d68bc7781f58e9c87e9daa1c8769363e2925ad26d2b505758798fbbb7f7d06608d2a0b546eff50f15a25acabb306fe806",
+      "ttl_s": 1800
+    },
+    "body_text": "{\"checkpoint_cbor_hex\":\"a865766d5f6964782433663163326239652d366134642d346532622d396331612d30643565376638613962313066646f6d61696e7822484950504955535f4b42535f524f4c4c4241434b5f434845434b504f494e545f56326a67656e65726174696f6e026c626f6f745f636f756e746572046c766f6c756d655f7374616d70036e6973737565645f61745f756e69781a6ab13b8074756e636f6e6669726d65645f72656c6561736573017818766f6c756d655f7374616d705f74696d656c696e655f696458205c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"signature_hex\":\"4862fc3c51919b43d7536fa5ddf3965d68bc7781f58e9c87e9daa1c8769363e2925ad26d2b505758798fbbb7f7d06608d2a0b546eff50f15a25acabb306fe806\",\"point_manifest_sha256_hex\":\"62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb\",\"point_manifest_b64\":\"eyJib290X2NvdW50ZXIiOjQsImtic19yb2xsYmFja19jaGVja3BvaW50Ijp7ImNoZWNrcG9pbnQiOnsiYm9vdF9jb3VudGVyIjo0LCJkb21haW4iOiJISVBQSVVTX0tCU19ST0xMQkFDS19DSEVDS1BPSU5UX1YyIiwiZ2VuZXJhdGlvbiI6MiwiaXNzdWVkX2F0X3VuaXgiOjE3OTAwMDAwMDAsInVuY29uZmlybWVkX3JlbGVhc2VzIjoxLCJ2bV9pZCI6IjNmMWMyYjllLTZhNGQtNGUyYi05YzFhLTBkNWU3ZjhhOWIxMCIsInZvbHVtZV9zdGFtcCI6Mywidm9sdW1lX3N0YW1wX3RpbWVsaW5lX2lkX2hleCI6IjVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWMifSwiY2hlY2twb2ludF9jYm9yX2hleCI6ImE4NjU3NjZkNWY2OTY0NzgyNDMzNjYzMTYzMzI2MjM5NjUyZDM2NjEzNDY0MmQzNDY1MzI2MjJkMzk2MzMxNjEyZDMwNjQzNTY1Mzc2NjM4NjEzOTYyMzEzMDY2NjQ2ZjZkNjE2OTZlNzgyMjQ4NDk1MDUwNDk1NTUzNWY0YjQyNTM1ZjUyNGY0YzRjNDI0MTQzNGI1ZjQzNDg0NTQzNGI1MDRmNDk0ZTU0NWY1NjMyNmE2NzY1NmU2NTcyNjE3NDY5NmY2ZTAyNmM2MjZmNmY3NDVmNjM2Zjc1NmU3NDY1NzIwNDZjNzY2ZjZjNzU2ZDY1NWY3Mzc0NjE2ZDcwMDM2ZTY5NzM3Mzc1NjU2NDVmNjE3NDVmNzU2ZTY5NzgxYTZhYjEzYjgwNzQ3NTZlNjM2ZjZlNjY2OTcyNmQ2NTY0NWY3MjY1NmM2NTYxNzM2NTczMDE3ODE4NzY2ZjZjNzU2ZDY1NWY3Mzc0NjE2ZDcwNWY3NDY5NmQ2NTZjNjk2ZTY1NWY2OTY0NTgyMDVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWM1YzVjNWMiLCJzaWduYXR1cmVfaGV4IjoiNDg2MmZjM2M1MTkxOWI0M2Q3NTM2ZmE1ZGRmMzk2NWQ2OGJjNzc4MWY1OGU5Yzg3ZTlkYWExYzg3NjkzNjNlMjkyNWFkMjZkMmI1MDU3NTg3OThmYmJiN2Y3ZDA2NjA4ZDJhMGI1NDZlZmY1MGYxNWEyNWFjYWJiMzA2ZmU4MDYiLCJzaWduZXJfcHVia2V5X2hleCI6IjBkNzU1MDc1NGUwODAwYTVkMjM3ZWVmNTgyNjAzNTc2NmI5YjNlNWExNTg2OGE5NDBhYjI4OTk1ODc4OGUzYjAifSwidm1faWQiOiIzZjFjMmI5ZS02YTRkLTRlMmItOWMxYS0wZDVlN2Y4YTliMTAifQ==\",\"new_gen\":3,\"dest_platform_id_hex\":\"0011223344556677\",\"restore_id\":\"restore-fixture-2\",\"ttl_s\":1800,\"requested_by\":\"tenant:42\"}"
+  },
+  "authorize_rollback_response": {
+    "body": {
+      "arm": {
+        "armed_at_unix": 1790086400,
+        "dest_platform_id_hex": "0011223344556677",
+        "expires_at_unix": 1790088200,
+        "from_counter": 4,
+        "new_gen": 3,
+        "point_manifest_sha256_hex": "62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb",
+        "requested_by": "tenant:42",
+        "restore_id": "restore-fixture-2",
+        "to_stamp": 3,
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      }
+    },
+    "body_text": "{\"arm\":{\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"restore_id\":\"restore-fixture-2\",\"point_manifest_sha256_hex\":\"62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb\",\"new_gen\":3,\"dest_platform_id_hex\":\"0011223344556677\",\"from_counter\":4,\"to_stamp\":3,\"armed_at_unix\":1790086400,\"expires_at_unix\":1790088200,\"requested_by\":\"tenant:42\"}}",
+    "status": 201
+  },
+  "point_manifest_text": "{\"boot_counter\":4,\"kbs_rollback_checkpoint\":{\"checkpoint\":{\"boot_counter\":4,\"domain\":\"HIPPIUS_KBS_ROLLBACK_CHECKPOINT_V2\",\"generation\":2,\"issued_at_unix\":1790000000,\"unconfirmed_releases\":1,\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"volume_stamp\":3,\"volume_stamp_timeline_id_hex\":\"5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\"},\"checkpoint_cbor_hex\":\"a865766d5f6964782433663163326239652d366134642d346532622d396331612d30643565376638613962313066646f6d61696e7822484950504955535f4b42535f524f4c4c4241434b5f434845434b504f494e545f56326a67656e65726174696f6e026c626f6f745f636f756e746572046c766f6c756d655f7374616d70036e6973737565645f61745f756e69781a6ab13b8074756e636f6e6669726d65645f72656c6561736573017818766f6c756d655f7374616d705f74696d656c696e655f696458205c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"signature_hex\":\"4862fc3c51919b43d7536fa5ddf3965d68bc7781f58e9c87e9daa1c8769363e2925ad26d2b505758798fbbb7f7d06608d2a0b546eff50f15a25acabb306fe806\",\"signer_pubkey_hex\":\"0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0\"},\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+  "refusals": [
+    {
+      "body": {
+        "reason": "vm-id-empty",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"vm-id-empty\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "vm-id-empty",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-restore-id",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-restore-id\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-restore-id",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-manifest-sha256",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-manifest-sha256\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-manifest-sha256",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-dest-platform-id",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-dest-platform-id\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-dest-platform-id",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-requested-by",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-requested-by\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-requested-by",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-new-gen",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-new-gen\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-new-gen",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-point-manifest",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-point-manifest\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-point-manifest",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "bad-checkpoint-signature",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"bad-checkpoint-signature\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "bad-checkpoint-signature",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "checkpoint-vm-mismatch",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"checkpoint-vm-mismatch\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "checkpoint-vm-mismatch",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "not-a-rollback",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"not-a-rollback\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "not-a-rollback",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "row-not-activated",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"row-not-activated\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "row-not-activated",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "arm-exists",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"arm-exists\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "arm-exists",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "rollback-rate-limited",
+        "retry_after_s": 1200,
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"rollback-rate-limited\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"retry_after_s\":1200}",
+      "reason": "rollback-rate-limited",
+      "status": 429
+    },
+    {
+      "body": {
+        "reason": "ttl-out-of-range",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"ttl-out-of-range\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "ttl-out-of-range",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "no-vm-row",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"no-vm-row\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "no-vm-row",
+      "status": 404
+    },
+    {
+      "body": {
+        "reason": "no-boot-counter",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"no-boot-counter\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "no-boot-counter",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "vm-fenced",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"vm-fenced\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "vm-fenced",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "restore-id-consumed",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"restore-id-consumed\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "restore-id-consumed",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "rollback-pending",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"rollback-pending\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "rollback-pending",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "admin-client-cert-required",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"admin-client-cert-required\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "admin-client-cert-required",
+      "status": 403
+    },
+    {
+      "body": {
+        "reason": "checkpoint-unstamped",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"checkpoint-unstamped\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "checkpoint-unstamped",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "manifest-mismatch",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"manifest-mismatch\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "manifest-mismatch",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "guest-not-rollback-capable",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"guest-not-rollback-capable\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "guest-not-rollback-capable",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "checkpoint-not-timeline-bound",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"checkpoint-not-timeline-bound\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "checkpoint-not-timeline-bound",
+      "status": 409
+    },
+    {
+      "body": {
+        "reason": "rate-limited",
+        "retry_after_s": 1,
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"rate-limited\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"retry_after_s\":1}",
+      "reason": "rate-limited",
+      "status": 429
+    },
+    {
+      "body": {
+        "reason": "body-too-large",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"body-too-large\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "body-too-large",
+      "status": 413
+    },
+    {
+      "body": {
+        "reason": "clock-unavailable",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"clock-unavailable\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "clock-unavailable",
+      "status": 500
+    },
+    {
+      "body": {
+        "reason": "rollback-unavailable",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"rollback-unavailable\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "rollback-unavailable",
+      "status": 503
+    },
+    {
+      "body": {
+        "reason": "checkpoint-body-decode",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"checkpoint-body-decode\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "checkpoint-body-decode",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "authorize-body-decode",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"authorize-body-decode\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "authorize-body-decode",
+      "status": 400
+    },
+    {
+      "body": {
+        "reason": "audit-unavailable",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"audit-unavailable\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "audit-unavailable",
+      "status": 500
+    },
+    {
+      "body": {
+        "reason": "internal-error",
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "body_text": "{\"reason\":\"internal-error\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\"}",
+      "reason": "internal-error",
+      "status": 500
+    }
+  ],
+  "rollback_checkpoint_response": {
+    "body": {
+      "checkpoint": {
+        "boot_counter": 4,
+        "domain": "HIPPIUS_KBS_ROLLBACK_CHECKPOINT_V2",
+        "generation": 2,
+        "issued_at_unix": 1790000000,
+        "unconfirmed_releases": 1,
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10",
+        "volume_stamp": 3,
+        "volume_stamp_timeline_id_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+      },
+      "checkpoint_cbor_hex": "a865766d5f6964782433663163326239652d366134642d346532622d396331612d30643565376638613962313066646f6d61696e7822484950504955535f4b42535f524f4c4c4241434b5f434845434b504f494e545f56326a67656e65726174696f6e026c626f6f745f636f756e746572046c766f6c756d655f7374616d70036e6973737565645f61745f756e69781a6ab13b8074756e636f6e6669726d65645f72656c6561736573017818766f6c756d655f7374616d705f74696d656c696e655f696458205c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "signature_hex": "4862fc3c51919b43d7536fa5ddf3965d68bc7781f58e9c87e9daa1c8769363e2925ad26d2b505758798fbbb7f7d06608d2a0b546eff50f15a25acabb306fe806",
+      "signer_pubkey_hex": "0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0"
+    },
+    "body_text": "{\"checkpoint\":{\"domain\":\"HIPPIUS_KBS_ROLLBACK_CHECKPOINT_V2\",\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"boot_counter\":4,\"volume_stamp\":3,\"volume_stamp_timeline_id_hex\":\"5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"unconfirmed_releases\":1,\"generation\":2,\"issued_at_unix\":1790000000},\"checkpoint_cbor_hex\":\"a865766d5f6964782433663163326239652d366134642d346532622d396331612d30643565376638613962313066646f6d61696e7822484950504955535f4b42535f524f4c4c4241434b5f434845434b504f494e545f56326a67656e65726174696f6e026c626f6f745f636f756e746572046c766f6c756d655f7374616d70036e6973737565645f61745f756e69781a6ab13b8074756e636f6e6669726d65645f72656c6561736573017818766f6c756d655f7374616d705f74696d656c696e655f696458205c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"signature_hex\":\"4862fc3c51919b43d7536fa5ddf3965d68bc7781f58e9c87e9daa1c8769363e2925ad26d2b505758798fbbb7f7d06608d2a0b546eff50f15a25acabb306fe806\",\"signer_pubkey_hex\":\"0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0\"}",
+    "status": 200
+  },
+  "rollback_status_response": {
+    "body": {
+      "arm": {
+        "armed_at_unix": 1790086400,
+        "dest_platform_id_hex": "0011223344556677",
+        "expires_at_unix": 1790088200,
+        "from_counter": 4,
+        "new_gen": 3,
+        "point_manifest_sha256_hex": "62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb",
+        "requested_by": "tenant:42",
+        "restore_id": "restore-fixture-2",
+        "to_stamp": 3,
+        "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+      },
+      "last_clear": {
+        "at": 1789996400,
+        "reason": "rollback-disarmed",
+        "restore_id": "restore-fixture-1"
+      },
+      "last_rollback": {
+        "consumed_at_unix": 1789913600,
+        "delivered": true,
+        "from_counter": 1,
+        "manifest_sha256_hex": "abababababababababababababababababababababababababababababababab",
+        "requested_by": "superuser:7",
+        "restore_id": "restore-fixture-0",
+        "reverted": false,
+        "stamp": 1,
+        "to_counter": 3
+      },
+      "rollback_capable": true
+    },
+    "body_text": "{\"arm\":{\"vm_id\":\"3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10\",\"restore_id\":\"restore-fixture-2\",\"point_manifest_sha256_hex\":\"62197812b66a0f793d14f5eb192757f7fd2e836a0eba3c3923522b1e194828bb\",\"new_gen\":3,\"dest_platform_id_hex\":\"0011223344556677\",\"from_counter\":4,\"to_stamp\":3,\"armed_at_unix\":1790086400,\"expires_at_unix\":1790088200,\"requested_by\":\"tenant:42\"},\"last_rollback\":{\"restore_id\":\"restore-fixture-0\",\"manifest_sha256_hex\":\"abababababababababababababababababababababababababababababababab\",\"from_counter\":1,\"to_counter\":3,\"stamp\":1,\"consumed_at_unix\":1789913600,\"requested_by\":\"superuser:7\",\"delivered\":true,\"reverted\":false},\"last_clear\":{\"restore_id\":\"restore-fixture-1\",\"reason\":\"rollback-disarmed\",\"at\":1789996400},\"rollback_capable\":true}",
+    "status": 200
+  },
+  "signing_seed_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "version": 2,
+  "vm_id": "3f1c2b9e-6a4d-4e2b-9c1a-0d5e7f8a9b10"
+}

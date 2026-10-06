@@ -28,6 +28,22 @@ fn put_framed(h: &mut Sha256, s: &[u8]) {
 /// Compute the `allowed_userdata_digest` over the canonical preimage.
 /// Caller passes a borrowed `plaintext` slice (typically backed by a
 /// `Zeroizing<Vec<u8>>` on the KBS side; L1 may zeroize similarly).
+///
+/// THREE parties compute this, and they must agree byte-for-byte:
+/// L1 (vali) mints it into the ticket, the KBS recomputes it over the
+/// bytes it unwrapped, and the GUEST re-derives it a third time over the
+/// plaintext it receives (`hippius_guest::release`) and refuses the
+/// release on a mismatch. The guest half is baked into every tenant
+/// image, so the preimage cannot be changed on the server side alone —
+/// doing so denies every release, on the KBS or in the guest, until the
+/// whole fleet is re-baked.
+///
+/// It is always the PLAINTEXT, never the Transit ciphertext the value is
+/// stored as: the guest never sees the stored form, so it could not
+/// verify anything else. The consequence for whoever mints a ticket is
+/// that they must hold the plaintext at mint time — see
+/// `launch_jobs.start_launch`, which is why vali computes every digest a
+/// VM will ever need at intake, while it still has it.
 #[allow(clippy::too_many_arguments)]
 pub fn userdata_digest(
     tenant_id: &str,

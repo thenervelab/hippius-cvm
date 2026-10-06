@@ -183,10 +183,12 @@ impl DomainUuid {
 /// Holds only non-secret control-plane facts: the ids, the current
 /// [`CvmPhase`], the pre-flight launch digest (a public measurement,
 /// not a secret), the resources charged against the host budget, and
-/// the LUKS data-disk *path*. No VM memory, no disk *content*, no
-/// kernel cmdline is ever stored here — the disk path is the file
-/// location the §24 `destroy` capacity-reclaim unlinks, not the
-/// ciphertext, and it is a non-secret path under the miner root.
+/// the LUKS data-disk *path*. No VM memory and no disk *content* is
+/// ever stored here — the disk path is the file location the §24
+/// `destroy` capacity-reclaim unlinks, not the ciphertext, and it is a
+/// non-secret path under the miner root. The only cmdline held is a
+/// customer-keys VM's measured one, inside its guardian recipe (never
+/// `Debug`-printed).
 #[derive(Debug, Clone)]
 pub struct CvmHandle {
     /// The tenant id this CVM was launched for (or the singleton
@@ -231,6 +233,13 @@ pub struct CvmHandle {
     /// secrets — see hippius-types::ticket docs), so caching them
     /// in miner state is §20-safe.
     pub cose_ticket: Vec<u8>,
+    /// Customer-held keys: the VM's guardian endpoint + launch recipe
+    /// (see [`super::guardian::GuardianRoute`]). `None` for an M0 VM —
+    /// the guardian relay then refuses its CID. The recipe carries the
+    /// measured cmdline, which is why [`GuardianRoute`](super::guardian::GuardianRoute)'s
+    /// `Debug` redacts it; like the ticket it is a public measurement
+    /// input, not a secret.
+    pub guardian: Option<super::guardian::GuardianRoute>,
 }
 
 impl CvmHandle {

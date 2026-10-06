@@ -1,0 +1,200 @@
+{{- if eq (toString .Values.goldenRebake.enabled) "true" }}
+---
+# Scheduled golden re-bake (F6, `vali_scheduled_golden_rebake`). Monthly:
+# re-bakes every golden image from its blessed bake's inputs WITH a package
+# refresh, one bake in flight at a time, runs the synthetic full e2e on
+# each new UNBLESSED bake, and pushes the results to the Pushgateway. It
+# never blesses — a human does, after the real-boot checks
+# (docs/operator/golden-rebake-runbook.md).
+#
+# The pod only writes Queued TenantBake rows; the `vali-bake-spawner`
+# worker (the sole holder of the create-jobs capability, RA-N9) spawns the
+# baker Jobs. Same posture as synthetic-monitor-full for the e2e: the
+# orchestration-root Bearer token drives the real launch/§24 API, and the
+# Vault credential backs the crypto-erase differential.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: golden-rebake
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: golden-rebake
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.goldenRebake.schedule | quote }}
+  # Forbid: a second run would queue bakes next to the first's.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.goldenRebake.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: golden-rebake
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: golden-rebake
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_scheduled_golden_rebake"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: VALI_GOLDEN_REBAKE_ENABLED
+                  value: "true"
+                - name: VALI_GOLDEN_REBAKE_E2E
+                  value: {{ .Values.goldenRebake.e2e | toString | quote }}
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+                {{- if eq (toString .Values.goldenRebake.e2e) "true" }}
+                - name: VALI_SYNTHETIC_ROOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-synthetic-monitor
+                      key: root-token
+                {{- end }}
+                {{- include "vali.vaultStaticTokenEnv" . | nindent 16 }}
+                {{- include "vali.vaultAuthEnv" . | nindent 16 }}
+                - name: VALI_VAULT_ADDR
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-vault
+                      key: address
+              resources:
+                {{- .Values.goldenRebake.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                {{- include "vali.vaultTokenVolumeMount" . | nindent 16 }}
+                {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 16 }}
+                - name: tmp
+                  mountPath: /tmp
+                - name: vault-ca
+                  mountPath: /etc/hippius/vault-ca
+                  readOnly: true
+          volumes:
+            {{- include "vali.vaultTokenVolume" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolume" . | nindent 12 }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+            - name: vault-ca
+              configMap:
+                name: vault-ca
+{{- end }}
+{{- if eq (toString .Values.goldenRebake.freshness.enabled) "true" }}
+---
+# Golden freshness report (F6, `vali_scheduled_golden_rebake --report-only`).
+# Hourly, read-only: the blessed bake's age per distro and whether a
+# Succeeded re-bake awaits a bless. Feeds the `hippius-golden-rebake`
+# alerts. DB-only — no Vault, no API token.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: golden-freshness
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: golden-freshness
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.goldenRebake.freshness.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: golden-freshness
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: golden-freshness
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_scheduled_golden_rebake", "--report-only"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+              resources:
+                {{- .Values.goldenRebake.freshness.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+{{- end }}

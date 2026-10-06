@@ -11,7 +11,7 @@
 #     `packer/kbs-uki/` — one fleet-wide §22 dev key + one OVMF anchor
 #     for both UKI flavours, never duplicated.
 #
-# Reproducibility discipline (codex+gemini review applied):
+# Reproducibility discipline (review applied):
 #   - SOURCE_DATE_EPOCH derived from the repo HEAD commit date
 #     (`git log -1 --format=%ct`).
 #   - Docker --platform=linux/amd64 with the agent binaries BUILT
@@ -105,7 +105,7 @@ OVMF_SHA256 := $(shell awk -F'= ' '/^OVMF_SHA256/{print $$2}' $(OVMF_LOCK))
 #
 # SNP_VCPU_TYPE folds the host silicon's cpu_sig into the VMSA, so it is
 # PER-GENERATION: the default `EpycGenoa` measures the digest a Genoa
-# host (miner-1) produces; for a Turin host (miner-2/miner-3, EPYC 9255)
+# host produces; for a Turin host (e.g. EPYC 9255)
 # build the allowlist entry with `make SNP_VCPU_TYPE=EpycTurin`. The
 # launch-time authority is the miner-agent, which derives the model from
 # the host's own CPUID; this build-time value only pre-pins the matching

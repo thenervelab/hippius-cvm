@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from django.contrib import admin
 
-from .models import TelemetryEnvelope, TelemetrySource
+from .models import GuestResourceShortfall, TelemetryEnvelope, TelemetrySource
 
 
 @admin.register(TelemetrySource)
@@ -108,4 +108,31 @@ class TelemetryEnvelopeAdmin(admin.ModelAdmin):
         # sanctioned reaper for terminal envelopes; admin delete
         # would bypass GC's age + status guards. Blocking here also
         # removes the `delete_selected` bulk action.
+        return False
+
+
+@admin.register(GuestResourceShortfall)
+class GuestResourceShortfallAdmin(admin.ModelAdmin):
+    """Evidence written by the live-attestation ingest
+    (`apps.telemetry.guest_resources`) — inspection only."""
+
+    list_display = (
+        "vm_id",
+        "node_id_hex",
+        "flavor",
+        "reason",
+        "vcpus_online",
+        "mem_firmware_kib",
+        "samples",
+        "first_seen_at",
+        "last_seen_at",
+    )
+    list_filter = ("reason", "flavor")
+    search_fields = ("vm_id", "node_id_hex")
+    ordering = ("-last_seen_at",)
+
+    def get_readonly_fields(self, request, obj=None):  # type: ignore[override]
+        return [f.name for f in self.model._meta.fields]
+
+    def has_add_permission(self, request) -> bool:  # type: ignore[override]
         return False

@@ -51,6 +51,36 @@ pub trait TicketPusher: Send + Sync {
     /// failure classes) is shared by both impls — the mock simply
     /// short-circuits the network bits.
     async fn push(&self, cid: u32, port: u32, cose: &[u8]) -> Result<()>;
+
+    /// [`Self::push`], but only while `still_owner()` holds — checked
+    /// before the first connect, before every boot-race reconnect, and
+    /// once more before a single ticket byte is written. A `false` fails
+    /// closed with `TicketDelivery("cid-not-owned")`.
+    ///
+    /// A CID names whichever guest holds it NOW, not the VM the ticket
+    /// was minted for: the moment that VM is stopped its CID is free, and
+    /// the next launch gets it. A push that keeps (re)connecting past that
+    /// point lands in the NEW tenant's initramfs listener, which consumes
+    /// the foreign ticket, gets a KBS 403, and never retries — the new VM
+    /// is bricked and another tenant's signed ticket leaked into it
+    /// (observed live 2026-09-24 on every CID reuse). Callers pass a
+    /// guard that re-resolves "does this CID still belong to the VM whose
+    /// ticket this is".
+    ///
+    /// The default only checks once up front — right for impls with no
+    /// connect loop (the mock).
+    async fn push_guarded(
+        &self,
+        cid: u32,
+        port: u32,
+        cose: &[u8],
+        still_owner: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<()> {
+        if !still_owner() {
+            return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+        }
+        self.push(cid, port, cose).await
+    }
 }
 
 /// Production [`TicketPusher`] — real AF_VSOCK `connect(2)` + framed
@@ -69,6 +99,16 @@ impl VsockTicketPusher {
 impl TicketPusher for VsockTicketPusher {
     async fn push(&self, cid: u32, port: u32, cose: &[u8]) -> Result<()> {
         push_ticket(cid, port, cose).await
+    }
+
+    async fn push_guarded(
+        &self,
+        cid: u32,
+        port: u32,
+        cose: &[u8],
+        still_owner: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<()> {
+        push_ticket_guarded(cid, port, cose, still_owner).await
     }
 }
 
@@ -120,8 +160,23 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// - `connect-timeout` — the guest never accepted within
 ///   `PUSH_TIMEOUT_SECS`;
 /// - `write-failed` — the framed write erred mid-stream.
-#[cfg(target_os = "linux")]
 pub async fn push_ticket(cid: u32, port: u32, cose: &[u8]) -> Result<()> {
+    push_ticket_guarded(cid, port, cose, &|| true).await
+}
+
+/// [`push_ticket`] gated on `still_owner` — see
+/// [`TicketPusher::push_guarded`]. The guard runs before EVERY
+/// `connect(2)` of the boot-race loop (which can spin for
+/// `PUSH_TIMEOUT_SECS`, long enough for the CID to change hands) and
+/// again between connect and write, so a push that outlives its VM
+/// fails closed instead of reaching the CID's next owner.
+#[cfg(target_os = "linux")]
+pub async fn push_ticket_guarded(
+    cid: u32,
+    port: u32,
+    cose: &[u8],
+    still_owner: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<()> {
     use tokio_vsock::{VsockAddr, VsockStream};
 
     // Producer-side preconditions checked BEFORE any network I/O.
@@ -132,11 +187,42 @@ pub async fn push_ticket(cid: u32, port: u32, cose: &[u8]) -> Result<()> {
         return Err(MinerAgentError::TicketDelivery("oversize"));
     }
 
-    // Boot-race: retry connect until the deadline expires.
-    let deadline = Instant::now() + Duration::from_secs(PUSH_TIMEOUT_SECS);
     let addr = VsockAddr::new(cid, port);
-    let mut stream: VsockStream = loop {
-        match VsockStream::connect(addr).await {
+    deliver_guarded(
+        || VsockStream::connect(addr),
+        Duration::from_secs(PUSH_TIMEOUT_SECS),
+        cose,
+        still_owner,
+    )
+    .await
+}
+
+/// The transport-generic half of [`push_ticket_guarded`]: the boot-race
+/// connect loop, the ownership re-checks, and the one-shot framed write.
+/// Generic over the connector so the tests drive this exact sequence over
+/// `tokio::io::duplex` (no AF_VSOCK on a CI runner).
+///
+/// `still_owner` is checked before every connect AND once more after the
+/// connect succeeds — a connect is the moment the CID's CURRENT owner
+/// answers, so ownership has to be re-proved between it and the write.
+pub(crate) async fn deliver_guarded<S, F, Fut>(
+    mut connect: F,
+    budget: Duration,
+    cose: &[u8],
+    still_owner: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<()>
+where
+    S: AsyncWriteExt + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+{
+    // Boot-race: retry connect until the deadline expires.
+    let deadline = Instant::now() + budget;
+    let mut stream = loop {
+        if !still_owner() {
+            return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+        }
+        match connect().await {
             Ok(s) => break s,
             Err(_) if Instant::now() < deadline => {
                 sleep(CONNECT_RETRY_INTERVAL).await;
@@ -145,6 +231,9 @@ pub async fn push_ticket(cid: u32, port: u32, cose: &[u8]) -> Result<()> {
             Err(_) => return Err(MinerAgentError::TicketDelivery("connect-timeout")),
         }
     };
+    if !still_owner() {
+        return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+    }
 
     // Framed write. `cose.len()` is bounded above to `MAX_TICKET_BYTES`
     // (≤ 8 KiB), so the `u32` cast can never truncate.
@@ -165,7 +254,15 @@ pub async fn push_ticket(cid: u32, port: u32, cose: &[u8]) -> Result<()> {
 /// no-op there (the dispatch path tolerates it; the live wire-up only
 /// runs on a Linux miner).
 #[cfg(not(target_os = "linux"))]
-pub async fn push_ticket(_cid: u32, _port: u32, cose: &[u8]) -> Result<()> {
+pub async fn push_ticket_guarded(
+    _cid: u32,
+    _port: u32,
+    cose: &[u8],
+    still_owner: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<()> {
+    if !still_owner() {
+        return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+    }
     if cose.is_empty() {
         return Err(MinerAgentError::TicketDelivery("empty"));
     }
@@ -224,5 +321,59 @@ mod tests {
         let payload = vec![0u8; MAX_TICKET_BYTES + 1];
         let err = push_ticket(3, 0x4849, &payload).await.unwrap_err();
         assert!(matches!(err, MinerAgentError::TicketDelivery("oversize")));
+    }
+
+    /// The CID changes hands WHILE the push is connecting: the connect
+    /// reaches the new owner's listener, so the ticket must not be
+    /// written. The post-connect re-check is the only thing between the
+    /// two — the pre-connect check had already passed.
+    #[tokio::test]
+    async fn ownership_lost_during_connect_writes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let owned = Arc::new(AtomicBool::new(true));
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut a = Some(a);
+        let flip = Arc::clone(&owned);
+        let guard_owned = Arc::clone(&owned);
+        let err = deliver_guarded(
+            move || {
+                flip.store(false, Ordering::SeqCst);
+                let stream = a.take();
+                async move { stream.ok_or_else(|| std::io::Error::other("reconnect")) }
+            },
+            Duration::from_secs(1),
+            b"stale-ticket",
+            &move || guard_owned.load(Ordering::SeqCst),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::TicketDelivery("cid-not-owned")
+        ));
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty(), "a ticket byte reached the CID's new owner");
+    }
+
+    #[tokio::test]
+    async fn an_owned_cid_gets_the_framed_ticket() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut a = Some(a);
+        deliver_guarded(
+            move || {
+                let stream = a.take();
+                async move { stream.ok_or_else(|| std::io::Error::other("reconnect")) }
+            },
+            Duration::from_secs(1),
+            b"own-ticket",
+            &|| true,
+        )
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).await.unwrap();
+        assert_eq!(&got[4..], b"own-ticket");
     }
 }

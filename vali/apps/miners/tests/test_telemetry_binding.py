@@ -42,11 +42,11 @@ def test_registered_miner_telemetry_is_accepted_and_bumps_last_seen(
     admin_client: APIClient, plain_client: APIClient, fake_verifier: FakeVerifier
 ) -> None:
     admin_client.post(REGISTER_URL, register_payload(), format="json")
-    miner = MinerIdentity.objects.get(miner_id="miner-1")
+    miner = MinerIdentity.objects.get(miner_id="miner-a")
     assert miner.last_seen_at is None
 
     resp = plain_client.post(
-        INGEST_URL, _ingest_body("miner", "miner-1"), format="json"
+        INGEST_URL, _ingest_body("miner", "miner-a"), format="json"
     )
     assert resp.status_code == 202, resp.content
 
@@ -71,16 +71,16 @@ def test_quarantined_miner_telemetry_is_rejected_and_last_seen_untouched(
 ) -> None:
     admin_client.post(REGISTER_URL, register_payload(), format="json")
     admin_client.post(
-        reverse("miner_quarantine", args=["miner-1"])
+        reverse("miner_quarantine", args=["miner-a"])
     )
 
     resp = plain_client.post(
-        INGEST_URL, _ingest_body("miner", "miner-1"), format="json"
+        INGEST_URL, _ingest_body("miner", "miner-a"), format="json"
     )
     # Quarantine deactivated the linked source ⇒ ingest 403; the
     # rejected envelope never reaches the last_seen_at hook.
     assert resp.status_code == 403
-    miner = MinerIdentity.objects.get(miner_id="miner-1")
+    miner = MinerIdentity.objects.get(miner_id="miner-a")
     assert miner.last_seen_at is None
 
 
@@ -88,12 +88,12 @@ def test_deduplicated_miner_envelope_does_not_rebump_last_seen(
     admin_client: APIClient, plain_client: APIClient, fake_verifier: FakeVerifier
 ) -> None:
     admin_client.post(REGISTER_URL, register_payload(), format="json")
-    body = _ingest_body("miner", "miner-1")
+    body = _ingest_body("miner", "miner-a")
 
     first = plain_client.post(INGEST_URL, body, format="json")
     assert first.status_code == 202
     seen_after_first = MinerIdentity.objects.get(
-        miner_id="miner-1"
+        miner_id="miner-a"
     ).last_seen_at
     assert seen_after_first is not None
 
@@ -104,7 +104,7 @@ def test_deduplicated_miner_envelope_does_not_rebump_last_seen(
     assert second.status_code == 200
     assert second.json()["created"] is False
     seen_after_replay = MinerIdentity.objects.get(
-        miner_id="miner-1"
+        miner_id="miner-a"
     ).last_seen_at
     assert seen_after_replay == seen_after_first
 

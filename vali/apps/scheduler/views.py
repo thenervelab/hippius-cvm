@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import asdict
 from typing import Any
 
 from django.conf import settings
@@ -53,23 +54,32 @@ from rest_framework.views import APIView
 from apps.common.schemas import ErrorSerializer
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
+from apps.orchestration.services import flavors
 from apps.orders.models import OrderTicketIntake
 
-from . import chain, scoring, service
+from . import chain, feasibility, scoring, service
 from . import cvm_capability as cvm_cap
 from .models import (
     ACTIVE_PLACEMENT_STATES,
     Placement,
+    PlacementFailureSource,
     PlacementStatus,
     PriceMigrationRecommendation,
     PriceRecommendationStatus,
 )
 from .packer_trigger import ensure_guest_image_build
 from .permissions import IsRootClient
-from .placement import PlacementError, SelectionWeights, decide_placement
+from .placement import (
+    MINER_ACTIVE,
+    REGION_RE,
+    PlacementError,
+    SelectionWeights,
+    decide_placement,
+)
 from .schemas import (
     EdgeRegistryFeedSerializer,
     EpochWeightsSerializer,
+    FeasibilityListSerializer,
     IfVersionRequestSerializer,
     PlacementConflictSerializer,
     PlacementSerializer,
@@ -165,6 +175,8 @@ class SchedulerPlaceView(APIView):
             vm = Vm.objects.get(vm_id=vm_id)
         except Vm.DoesNotExist:
             return _error(status.HTTP_404_NOT_FOUND, "vm not found", "not-found")
+        # A re-placement of a resized VM carries its launch disk.
+        carried_disk = service.carried_data_disk_gb(vm)
 
         # Anti-affinity family = the VM's tenant, taken from its
         # OrderTicket. No ticket ⇒ family unknown ⇒ fail closed: the
@@ -207,6 +219,10 @@ class SchedulerPlaceView(APIView):
                 family_load_by_node=family_load,
                 max_epoch_lag=service.max_epoch_lag(),
                 dispatchable=service.dispatchable_node_ids(),
+                # Gate (f) — the region the VM's launch asked for, if any.
+                # `/place` sees no intent of its own, so it is read back
+                # from the LaunchJob; a VM with none stays unconstrained.
+                **service.region_arguments(service.launch_region_for_vm(vm_id)),
                 weights=SelectionWeights.from_settings(),
                 max_host_share=service.max_host_share(),
                 # §23 marketplace — cheaper announced prices rank up.
@@ -221,6 +237,15 @@ class SchedulerPlaceView(APIView):
                 # Gate (e) — never place onto a host vali has OBSERVED
                 # fail to start a confidential guest.
                 cvm_capability_by_node=service.cvm_capability_by_node(),
+                # A miner still running a crypto-erased VM takes no new VMs.
+                zombie_quarantined=service.zombie_quarantined_node_ids(),
+                cordoned=service.cordoned_node_ids(),
+                # Capacity v2 — does THIS resource_class fit (with the VM's
+                # own disk when a resize left it another than the flavor's).
+                resource_fit=service.resource_fit(
+                    resource_class,
+                    disk_gb=service.placement_disk_gb(resource_class, carried_disk),
+                ),
             )
         except PlacementError as exc:
             return _error(status.HTTP_409_CONFLICT, exc.message, exc.category)
@@ -236,6 +261,7 @@ class SchedulerPlaceView(APIView):
                     vm_family=vm_family,
                     owner=getattr(ticket, "user_id", "") or "",
                     resource_class=resource_class,
+                    data_disk_gb=carried_disk,
                     miner_node_id=chosen,
                     status=PlacementStatus.PENDING.value,
                     chain_epoch=snapshot.current_epoch,
@@ -330,7 +356,10 @@ class SchedulerCapacityView(APIView):
         service.refresh_miner_capacity(snapshot)
         # `vm_family=""` → a global view (the family set only drives
         # anti-affinity, which is per-launch, not a capacity property).
-        capacity, load, _family = service.decision_inputs("")
+        # Units of the ACTIVE admission model (v1 slots / v2 resource-true
+        # units) — `service.CapacityView`, shared with the regions readout.
+        views = service.capacity_views()
+        zombies = {z.lower() for z in service.zombie_quarantined_node_ids()}
         dispatchable = service.dispatchable_node_ids()
         max_lag = service.max_epoch_lag()
         # §23 gate (e) — the OBSERVED SNP start-capability verdict. Without
@@ -340,6 +369,11 @@ class SchedulerCapacityView(APIView):
         # placement failure surfaces as an unexplained `no-eligible-miner`
         # against a capacity view that said everything was fine.
         cvm_capability = service.cvm_capability_by_node()
+        # Gate (h) + gate (g)'s per-miner cap, so an operator sees here why
+        # a host with room takes nothing (or boots fewer at once).
+        cordoned = service.cordoned_node_ids()
+        boot_caps = service.max_booting_overrides()
+        fleet_boot_cap = service.max_booting_per_miner()
 
         miners: list[dict[str, Any]] = []
         total_capacity = total_free = incapable = 0
@@ -357,9 +391,29 @@ class SchedulerCapacityView(APIView):
             startable = verdict != cvm_cap.INCAPABLE
             if not startable:
                 incapable += 1
-            cap = capacity.get(miner.node_id, 0)
-            ld = load.get(miner.node_id, 0)
-            free = max(0, cap - ld) if (epoch_fresh and startable) else 0
+            view = views.get(miner.node_id)
+            cap = view.total_units if view is not None else 0
+            # v1: active placements, exactly as before. v2: committed units,
+            # so `capacity_slots = load + free` holds in the unit it reports.
+            if view is None:
+                ld = 0
+            elif view.model == "v1":
+                ld = view.placements
+            else:
+                ld = view.committed_units
+            # Every hard gate `decide_placement` applies to an otherwise
+            # dispatchable miner: on-chain active, epoch-fresh, not
+            # CVM-incapable, not zombie-quarantined, not cordoned.
+            is_cordoned = miner.node_id.lower() in cordoned
+            offerable = (
+                miner.status == MINER_ACTIVE
+                and epoch_fresh
+                and startable
+                and miner.node_id.lower() not in zombies
+                and not is_cordoned
+                and view is not None
+            )
+            free = view.free_units if offerable else 0
             total_capacity += cap
             total_free += free
             miners.append(
@@ -372,6 +426,15 @@ class SchedulerCapacityView(APIView):
                     "free_slots": free,
                     "epoch_fresh": epoch_fresh,
                     "cvm_capability": verdict,
+                    "cordoned": is_cordoned,
+                    "cordon_reason": cordoned.get(miner.node_id.lower()) if is_cordoned else None,
+                    "max_booting": boot_caps.get(miner.node_id, fleet_boot_cap),
+                    "model": view.model if view is not None else None,
+                    "free_by_flavor": (
+                        dict(view.free_by_flavor)
+                        if offerable
+                        else {name: 0 for name in (view.free_by_flavor if view else {})}
+                    ),
                 }
             )
 
@@ -406,6 +469,136 @@ class SchedulerCapacityView(APIView):
 
 
 # ─── /v1/admin/epoch-weights ─────────────────────────────────────────
+
+
+class SchedulerFeasibilityView(APIView):
+    """`GET /v1/scheduler/feasibility[?flavor=…]` — "can we place this
+    BEFORE we sell it?".
+
+    The complement to `/v1/scheduler/capacity`, which answers in
+    admission SLOTS. Slots cannot answer a question about a FLAVOR: a
+    slot is sized by the reference flavor and one placement costs one
+    slot whatever its size, so a `4xlarge` looks placeable on a host
+    with one free slot and is then refused by the miner at preflight.
+    This view asks both halves — would the scheduler choose someone,
+    AND does the flavor physically fit — and reports them separately.
+
+    The `verdict` is the field to branch on, and the distinction that
+    matters commercially is `not-now` (the fleet is full; retry) versus
+    `never` (no reachable host is big enough; do not take the money).
+
+    Read-only: no `Vm`, no `Placement`, no chain write. Asking whether a
+    VM could be placed must never place one.
+
+    `IsAuthenticated` service principal, same as the rest of the read
+    surface. Per-miner free resources are cross-tenant operational data,
+    hence `OPERATOR_ONLY`.
+    """
+
+    object_scope = scoping.OPERATOR_ONLY
+
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "options"]
+
+    @extend_schema(
+        summary="Can a VM of this flavor be placed right now?",
+        description=(
+            "Pre-sale feasibility. For each flavor: `verdict` "
+            "(`yes` / `not-now` / `never`), `headroom` (how many more the "
+            "fleet could take), and the per-host fit breakdown. `never` means "
+            "no reachable host is big enough and retrying cannot help — the "
+            "answer that must stop a sale; `not-now` is retryable. "
+            "Advisory, NOT a reservation: any concurrent launch consumes the "
+            "headroom. The DATA-disk dimension joins the answer only under "
+            "`VALI_SCHEDULER_DISK_GATE=enforce` (`disk_checked: true` when every "
+            "fitting host had disk data); otherwise per-host disk figures are "
+            "reported and disk stays gated by the miner at dispatch."
+        ),
+        tags=["Scheduler"],
+        parameters=[
+            OpenApiParameter(
+                name="flavor",
+                description=(
+                    "Restrict to one flavor. Omit for the whole catalogue "
+                    "(the 'what can I sell right now' board)."
+                ),
+                required=False,
+                type=str,
+            ),
+            OpenApiParameter(
+                name="tenant_id",
+                description=(
+                    "Optional. Feeds anti-affinity, so the answer is about "
+                    "THIS tenant rather than about anybody."
+                ),
+                required=False,
+                type=str,
+            ),
+            OpenApiParameter(
+                name="user_id",
+                description=(
+                    "Optional. Feeds the per-owner sub-budget, same rationale "
+                    "as `tenant_id`."
+                ),
+                required=False,
+                type=str,
+            ),
+            OpenApiParameter(
+                name="region",
+                description=(
+                    "Optional ISO 3166-1 alpha-2 country code (`FR`, "
+                    "case-insensitive). Answers for the miners the validator "
+                    "has DETECTED in that country only — what a launch with "
+                    "the same `region` would see. Adds `region-unknown` "
+                    "(probe not run; retry), `no-miner-in-region` (`never`) "
+                    "and `region-unverified` (miners there, not yet proven; "
+                    "retry) to `reason`. 400 on a malformed code."
+                ),
+                required=False,
+                type=str,
+            ),
+        ],
+        responses={
+            200: FeasibilityListSerializer,
+            400: OpenApiResponse(ErrorSerializer, "Unknown flavor / malformed region."),
+        },
+    )
+    def get(self, request: Request) -> Response:
+        flavor = (request.query_params.get("flavor") or "").strip()
+        tenant_id = (request.query_params.get("tenant_id") or "").strip()
+        user_id = (request.query_params.get("user_id") or "").strip()
+        region = (request.query_params.get("region") or "").strip()
+        if region and not REGION_RE.match(region):
+            # Same rule as the launch intake: a malformed code is a caller
+            # error, not "nobody is there" — `never` from a typo would
+            # take a whole country off the shelf.
+            return _error(
+                status.HTTP_400_BAD_REQUEST,
+                "region must be an ISO 3166-1 alpha-2 country code (e.g. 'FR')",
+                "invalid",
+            )
+
+        try:
+            if flavor:
+                results = [
+                    feasibility.assess(
+                        flavor, tenant_id=tenant_id, user_id=user_id, region=region
+                    )
+                ]
+            else:
+                results = feasibility.assess_catalogue(
+                    tenant_id=tenant_id, user_id=user_id, region=region
+                )
+        except flavors.UnknownFlavor as exc:
+            # A flavor that does not exist is a CALLER error, not "cannot
+            # place" — flattening the two would have a typo read as a
+            # capacity problem and quietly stop a sellable sale.
+            return _error(status.HTTP_400_BAD_REQUEST, str(exc), "invalid")
+
+        return Response(
+            {"flavors": [asdict(r) for r in results]},
+            status=status.HTTP_200_OK,
+        )
 
 
 class EpochWeightsView(APIView):
@@ -700,6 +893,9 @@ class SchedulerFailView(APIView):
                 version=if_version + 1,
                 failed_at=timezone.now(),
                 reason=reason,
+                # Provenance: a root caller's free text. Whatever it spells
+                # — even a launch outcome verbatim — it is never a refusal.
+                failure_source=PlacementFailureSource.MANUAL,
             )
         if updated == 0:
             return _version_conflict(placement.id)
@@ -792,6 +988,9 @@ def _replace(
             max_epoch_lag=service.max_epoch_lag(),
             excluded=frozenset({failed.miner_node_id}),
             dispatchable=service.dispatchable_node_ids(),
+            # Gate (f) — a re-placement must stay in the region the VM was
+            # sold in; the failed row does not carry it, the LaunchJob does.
+            **service.region_arguments(service.launch_region_for_vm(vm.vm_id)),
             weights=SelectionWeights.from_settings(),
             max_host_share=service.max_host_share(),
             price_by_node=service.price_by_node(snapshot),
@@ -805,6 +1004,12 @@ def _replace(
             # Gate (e) — a re-placement after a failure is exactly when
             # NOT landing on a CVM-incapable host matters most.
             cvm_capability_by_node=service.cvm_capability_by_node(),
+            zombie_quarantined=service.zombie_quarantined_node_ids(),
+            cordoned=service.cordoned_node_ids(),
+            resource_fit=service.resource_fit(
+                failed.resource_class,
+                disk_gb=service.placement_disk_gb(failed.resource_class, failed.data_disk_gb),
+            ),
         )
     except PlacementError as exc:
         return None, {"error": exc.message, "category": exc.category}
@@ -816,6 +1021,7 @@ def _replace(
                 vm_family=failed.vm_family,
                 owner=failed.owner,
                 resource_class=failed.resource_class,
+                data_disk_gb=failed.data_disk_gb,
                 miner_node_id=chosen,
                 status=PlacementStatus.PENDING.value,
                 chain_epoch=snapshot.current_epoch,

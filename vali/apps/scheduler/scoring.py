@@ -91,15 +91,41 @@ def compute_epoch_weights() -> dict[str, int]:
     `apply_attestor_liveness_multiplier`). Never additive — an idle-but-alive
     attestor keeps earning 0, a real-usage miner with a dead attestor drops
     to 0.
+
+    Zombie withhold: a miner that is zombie-quarantined when the weights
+    are computed (still relaying frames from a VM whose §24 crypto-erase
+    already ran — `apps.lifecycle.zombie`) is DROPPED from this epoch's
+    weights, whichever source is selected. Derived from fresh signals only:
+    the next computation after the frames stop pays it normally again.
     """
     source = str(getattr(settings, "VALI_EPOCH_WEIGHT_SOURCE", "snapshot"))
     base = _usage_weights() if source == "usage" else _snapshot_weights()
+    base = withhold_zombie_quarantined(base)
     # DEFAULT-OFF ⇒ return the base weights UNCHANGED (byte-identical to the
     # pre-PR-11 behaviour). The multiplier only applies once an operator
     # arms `VALI_REWARD_REQUIRE_ATTESTOR` at PR-13.
     if not bool(getattr(settings, "VALI_REWARD_REQUIRE_ATTESTOR", False)):
         return base
     return apply_attestor_liveness_multiplier(base)
+
+
+def withhold_zombie_quarantined(base: dict[str, int]) -> dict[str, int]:
+    """Drop every zombie-quarantined miner from `base`, loudly."""
+    from apps.lifecycle.zombie import quarantined_node_ids
+
+    quarantined = quarantined_node_ids()
+    if not quarantined:
+        return base
+    kept = {n: w for n, w in base.items() if n.lower() not in quarantined}
+    for node_id in sorted(set(base) - set(kept)):
+        log.error(
+            "scoring: WITHHOLDING reward weight %d from node %s — it is "
+            "zombie-quarantined (still running a VM whose §24 crypto-erase "
+            "already ran)",
+            base[node_id],
+            node_id[:16],
+        )
+    return kept
 
 
 def apply_attestor_liveness_multiplier(base: dict[str, int]) -> dict[str, int]:
@@ -138,11 +164,11 @@ def _excluded_owners() -> frozenset[str]:
     OUR OWN infrastructure, not tenants.
 
     **Why this exists.** With `VALI_EPOCH_WEIGHT_SOURCE=usage` the ledger
-    IS the reward. Measured live on 2026-08-11 (chain epoch 2702), our own
-    operator VMs held 30.6 % of the whole pot: one dead synthetic-monitor
-    probe (`synmon-debian-1785751760`, destroyed five days earlier) alone
-    carried 400,974,150 of 1,322,247,180 unit_seconds, because a suspended
-    closer never rolls the bucket over. Paying ourselves out of the miner
+    IS the reward. Without this filter an operator VM could hold a large
+    share of the epoch's units: a single dead synthetic-monitor probe
+    (destroyed days earlier) can keep carrying a large slice of the
+    epoch's unit_seconds on its own, because a suspended closer never
+    rolls the bucket over. Paying ourselves out of the miner
     reward pot is a straight dilution of every honest miner.
 
     **The discriminator is `Placement.owner`, not `UsageAccrual.lease_id`.**
@@ -158,12 +184,12 @@ def _excluded_owners() -> frozenset[str]:
       again). `owner` comes from the launch spec, the same
       `VALI_SYNTHETIC_TENANT_ID` the synthetic reaper already keys its
       "never touch a real tenant" invariant on.
-    - It covers MORE of the live rows for LESS configuration. The three
-      live operator lease shapes are `synmon-*` (31 rows), `kbsrehearse-1`
-      and `stampproof-1-lease`; a lease filter needs three separate
-      patterns, while `stampproof-1-lease` already carries
-      `owner="synthetic-monitor"` and is caught for free — two configured
-      owners cover all 33 rows.
+    - It covers MORE of the operator rows for LESS configuration. Operator
+      lease ids come in several shapes (`synmon-*`, a one-off harness's
+      own lease, an ordinary-looking lease id); a lease filter needs a
+      separate pattern for each, while an ordinary-looking lease that
+      carries `owner="synthetic-monitor"` is caught for free — a couple of
+      configured owners cover every operator row.
 
     **Neither field is authenticated, and that is load-bearing.** `owner`
     is `spec.user_id` copied straight out of the launch body
@@ -265,8 +291,11 @@ def _billable_usage_rows(epoch: int) -> list[tuple[str, int]]:
 
 
 def _snapshot_weights() -> dict[str, int]:
-    """Instantaneous Σ resource_units of BOUND placements (§13 drain keeps
-    dark miners out, but a bound-but-down VM still counts).
+    """Instantaneous Σ resource_units of BOUND placements (a bound-but-down
+    VM still counts). The §13 drain still keeps a DARK miner out; a miner
+    that is up but quarantined or chain-stale keeps its placements while
+    its VMs still run there (`reeval_once` holds them), so this source
+    pays it until they migrate off. `usage` pays only attested uptime.
 
     Operator-owned placements are dropped here too (see
     [`_excluded_owners`]): the two weight sources must agree on whose VMs
@@ -315,11 +344,11 @@ def billing_epoch() -> int | None:
     while the chain epoch keeps advancing, so the SAME bucket is handed
     to every subsequent close and paid again each time.
 
-    It is not hypothetical. In production on 2026-08-03 the ledger held
-    exactly one row for epoch 2696 (100170 unit_seconds) and the closer
-    logged `vali weights: 1 miner(s), total 100170` at 06:40, 06:50 AND
-    07:20 — one bucket of proven uptime submitted as the weights of chain
-    epochs 2700, 2701 and 2702.
+    It is not hypothetical. In production the ledger once held exactly
+    one row for an older epoch N and the closer logged the same
+    `vali weights: 1 miner(s), total ...` on three consecutive closes —
+    one bucket of proven uptime submitted as the weights of chain epochs
+    N+4, N+5 and N+6.
 
     Keying on the chain epoch makes a stalled ledger fail CLOSED instead:
     the close reads the new epoch's bucket, finds it empty, and submits
@@ -387,8 +416,8 @@ def compute_owed_micro_usd(price_by_node: dict[str, int]) -> dict[str, int]:
 
     **Operator-owned VMs are excluded here too** (see [`_excluded_owners`]),
     for the same reason the epochs must match: this readout is the direct
-    answer an operator gets to "how much do we owe each miner", and 30.6 %
-    of it was, live, the cost of our own monitoring. Two defensible
+    answer an operator gets to "how much do we owe each miner", and a
+    large share of it could otherwise be the cost of our own monitoring. Two defensible
     positions existed — a miner really did burn CPU hosting our probe, so
     one could argue we owe for it — and this one is chosen because the
     readout's stated purpose is the miner payout, and a bill that says a

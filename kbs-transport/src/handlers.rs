@@ -30,6 +30,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hippius_types::host_attestor::HostEnrollment;
+use hippius_types::live_attestation::{GuestComponents, GuestResources};
 use serde_bytes::ByteBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,6 +67,15 @@ pub struct AppState<S: KbsService + 'static> {
     /// no Vault/HPKE) and the call is paired 1:1 with a prior release, so
     /// it uses the same generous default rate.
     pub volume_stamp_confirm_limiter: Arc<NonceRateLimiter>,
+    /// Custody lease bind/renew/rekey (`kbs_core::custody`) — own bucket.
+    /// Every custody guest renews every few minutes, so this scales with
+    /// the fleet like keepalive; the miner relay also rate-limits per VM.
+    pub custody_limiter: Arc<NonceRateLimiter>,
+    /// Custody BIND — its own, stingy bucket: a bind is rare (per boot /
+    /// daemon restart / KBS restart) and may cost an AMD KDS fetch, so a
+    /// bind flood must not be able to starve renews (which are cheap and
+    /// what keeps guests' disks unlocked).
+    pub custody_bind_limiter: Arc<NonceRateLimiter>,
 }
 
 impl<S: KbsService + 'static> Clone for AppState<S> {
@@ -77,6 +87,8 @@ impl<S: KbsService + 'static> Clone for AppState<S> {
             keepalive_limiter: Arc::clone(&self.keepalive_limiter),
             host_enroll_limiter: Arc::clone(&self.host_enroll_limiter),
             volume_stamp_confirm_limiter: Arc::clone(&self.volume_stamp_confirm_limiter),
+            custody_limiter: Arc::clone(&self.custody_limiter),
+            custody_bind_limiter: Arc::clone(&self.custody_bind_limiter),
         }
     }
 }
@@ -351,10 +363,24 @@ pub async fn volume_stamp_confirm<S: KbsService + 'static>(
         Ok(v) => v,
         Err(_) => return ErrorBody::bad_request("malformed request").into_response(),
     };
-    match state
-        .svc
-        .process_volume_stamp_confirm(&parsed.vm_id, parsed.value, parsed.token.as_ref())
-    {
+    // v2 (a timeline named): the timeline-bound CAS; v1: the plain one.
+    let outcome = match parsed.timeline_id.as_ref() {
+        Some(t) => match <[u8; 32]>::try_from(t.as_ref()) {
+            Ok(timeline) => state.svc.process_volume_stamp_confirm_timeline(
+                &parsed.vm_id,
+                parsed.value,
+                parsed.token.as_ref(),
+                &timeline,
+            ),
+            Err(_) => return ErrorBody::bad_request("malformed request").into_response(),
+        },
+        None => state.svc.process_volume_stamp_confirm(
+            &parsed.vm_id,
+            parsed.value,
+            parsed.token.as_ref(),
+        ),
+    };
+    match outcome {
         Ok(confirmed) => {
             let resp_body = VolumeStampConfirmResponse { confirmed };
             encode_to_response(StatusCode::OK, &resp_body, /* no_store */ true)
@@ -415,6 +441,8 @@ pub async fn keepalive<S: KbsService + 'static>(
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
+    let resources: Option<GuestResources> = parsed.resources.map(GuestResources::from);
+    let components: Option<GuestComponents> = parsed.components.map(GuestComponents::from);
     match state.svc.process_keepalive(
         &parsed.vm_id,
         &node_id,
@@ -422,6 +450,8 @@ pub async fn keepalive<S: KbsService + 'static>(
         &nonce,
         parsed.epoch,
         parsed.expiry_unix,
+        resources.as_ref(),
+        components.as_ref(),
         now,
     ) {
         Ok(signed) => {
@@ -519,6 +549,102 @@ pub async fn host_enroll<S: KbsService + 'static>(
         }
         // Generic 403; detailed reason is in the audit channel.
         Err(_) => ErrorBody::forbidden("host-enroll denied").into_response(),
+    }
+}
+
+/// Which custody request a route carries.
+enum CustodyRoute {
+    Bind,
+    Renew,
+    Rekey,
+}
+
+/// `POST /v1/kbs/custody/bind` — see `kbs_core::custody::process_bind`.
+pub async fn custody_bind<S: KbsService + 'static>(
+    State(state): State<AppState<S>>,
+    request: Request,
+) -> Response {
+    custody(state, request, CustodyRoute::Bind).await
+}
+
+/// `POST /v1/kbs/custody/renew` — see `kbs_core::custody::process_renew`.
+pub async fn custody_renew<S: KbsService + 'static>(
+    State(state): State<AppState<S>>,
+    request: Request,
+) -> Response {
+    custody(state, request, CustodyRoute::Renew).await
+}
+
+/// `POST /v1/kbs/custody/rekey` — see `kbs_core::custody::process_rekey`.
+pub async fn custody_rekey<S: KbsService + 'static>(
+    State(state): State<AppState<S>>,
+    request: Request,
+) -> Response {
+    custody(state, request, CustodyRoute::Rekey).await
+}
+
+/// Shared shell of the three custody routes. A signed verdict (or rekey
+/// response) is a 200 CBOR body; everything else is an UNSIGNED status
+/// with a closed-vocabulary text reason, which the guest treats as "retry,
+/// change nothing".
+async fn custody<S: KbsService + 'static>(
+    state: AppState<S>,
+    request: Request,
+    route: CustodyRoute,
+) -> Response {
+    use hippius_types::custody::decode_canonical as decode;
+    use kbs_core::custody::CustodyReply;
+    let (parts, body) = request.into_parts();
+    if let Err(e) = require_cbor(&parts.headers) {
+        return e.into_response();
+    }
+    let limiter = match route {
+        CustodyRoute::Bind => &state.custody_bind_limiter,
+        CustodyRoute::Renew | CustodyRoute::Rekey => &state.custody_limiter,
+    };
+    if !limiter.try_acquire() {
+        let mut resp = ErrorBody::too_many_requests("rate-limited").into_response();
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return resp;
+    }
+    let bytes = match to_bytes(body, MAX_REQUEST_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return ErrorBody::payload_too_large(&format!(
+                "request body exceeds {MAX_REQUEST_BYTES} bytes"
+            ))
+            .into_response();
+        }
+    };
+    let now = match now_unix() {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+    let reply = match route {
+        CustodyRoute::Bind => match decode(&bytes) {
+            Ok(req) => state.svc.process_custody_bind(&req, now),
+            Err(_) => return ErrorBody::bad_request("malformed").into_response(),
+        },
+        CustodyRoute::Renew => match decode(&bytes) {
+            Ok(req) => state.svc.process_custody_renew(&req, now),
+            Err(_) => return ErrorBody::bad_request("malformed").into_response(),
+        },
+        CustodyRoute::Rekey => match decode(&bytes) {
+            Ok(req) => state.svc.process_custody_rekey(&req, now),
+            Err(_) => return ErrorBody::bad_request("malformed").into_response(),
+        },
+    };
+    match reply {
+        CustodyReply::Verdict(v) => {
+            encode_to_response(StatusCode::OK, &v, /* no_store */ true)
+        }
+        CustodyReply::Rekey(r) => encode_to_response(StatusCode::OK, &r, /* no_store */ true),
+        CustodyReply::Retry { status, reason } => ErrorBody {
+            code: StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            msg: reason.to_string(),
+        }
+        .into_response(),
     }
 }
 

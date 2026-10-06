@@ -49,7 +49,7 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::lifecycle::cvm_handle::VmId;
-use crate::lifecycle::CvmLifecycle;
+use crate::lifecycle::{CvmLifecycle, TicketPushState};
 use crate::vsock::ticket_push::TicketPusher;
 
 /// Prefix every tenant domain name carries.
@@ -111,7 +111,11 @@ const DOMSTATE_POLL_DEADLINE: Duration = Duration::from_secs(30);
 /// success then exits) — acceptable given the cost of the
 /// alternative (a 7-min boot that wedges 30 s into the keyscript).
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 120; // 10 min total — covers slow SEV-SNP firmware boots.
+const MAX_RETRIES: u32 = 120;
+/// Wall-clock bound on the whole re-push task. Each push can itself spin
+/// in its connect loop for `PUSH_TIMEOUT_SECS` (180 s), so `MAX_RETRIES`
+/// alone stretched the "10 min" window to ~6 h.
+const RETRY_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Per-vm timestamps of recent restarts. Pruned to the sliding
 /// `RESTART_WINDOW` on every check.
@@ -224,11 +228,26 @@ async fn handle_event_line(
 ///
 /// #294 — the `Started` event arrives well before the guest's vsock
 /// listener has bound, so a single push at this point races and loses
-/// on fresh launches. Spawn a retry task that re-pushes every
-/// [`RETRY_INTERVAL`] up to [`MAX_RETRIES`] times. The keyscript's
-/// receiver `accept()`-and-`exit()`-s, so once it has the ticket
-/// subsequent pushes get ECONNRESET — that's logged but doesn't
-/// break the boot (we already won).
+/// on fresh launches. Spawn a task that pushes every [`RETRY_INTERVAL`]
+/// for at most [`MAX_RETRIES`] attempts inside [`RETRY_WINDOW`].
+///
+/// The task keeps pushing after a delivery on purpose: the legacy LUKS
+/// keyscript runs under cryptroot's retry loop, and every rerun binds a
+/// fresh listener that needs the ticket again. That is only ever THIS
+/// VM's own guest asking — which is what the ownership guard below
+/// enforces on every attempt.
+///
+/// What the task must never do is outlive its VM. A CID is an address,
+/// not an identity: once the VM is stopped its CID is free and the next
+/// launch may take it. The task is registered with the lifecycle
+/// ([`CvmLifecycle::begin_ticket_push`]) so a stop / §24 destroy cancels
+/// it before the CID is released, a new `Started` for the same VM
+/// supersedes it, and every connect re-checks
+/// [`CvmLifecycle::ticket_push_current`] — so a dead VM's ticket can
+/// never reach the guest that inherits its CID (observed live
+/// 2026-09-24: a destroyed VM's hours-long retry loop delivered its
+/// ticket to the new VM on the reused CID first → KBS 403 → the golden
+/// initramfs fails closed and the new tenant never boots).
 async fn handle_started(
     vm_id: &VmId,
     lifecycle: &Arc<CvmLifecycle>,
@@ -238,54 +257,142 @@ async fn handle_started(
         return;
     };
     eprintln!(
-        "hippius-miner-agent: reboot-watcher: vm={} event=Started cid={cid} re-push attempt=initial",
+        "hippius-miner-agent: reboot-watcher: vm={} event=Started cid={cid} re-push window open",
         vm_id.as_str()
     );
-    // First, immediate push. Most common outcome: ECONNRESET because
-    // the guest listener isn't up yet. That's fine — the retry task
-    // below covers it.
-    if let Err(err) = pusher
-        .push(cid, hippius_types::ticket_vsock::PORT, &cose_ticket)
-        .await
-    {
-        eprintln!(
-            "hippius-miner-agent: reboot-watcher: vm={} re-push attempt=initial failed: {err} (expected on fresh launches; retry task will cover)",
-            vm_id.as_str(),
-        );
-    }
+    // A re-adopted VM whose cid is still unconfirmed: its restarted guest
+    // is now waiting for this ticket, which waits on that confirmation.
+    lifecycle.expedite_cid_check(vm_id);
+    let cancel = lifecycle.begin_ticket_push(vm_id);
+    tokio::spawn(repush_ticket(
+        vm_id.clone(),
+        cose_ticket,
+        Arc::clone(lifecycle),
+        Arc::clone(pusher),
+        cancel,
+        RetrySchedule::PRODUCTION,
+    ));
+}
 
-    // Retry task — fire-and-forget. The watcher's process lifetime
-    // bounds the task; on cancel the parent task exits + drops the
-    // tokio runtime, sweeping these in turn.
-    let pusher = Arc::clone(pusher);
-    let vm_id_owned = vm_id.clone();
-    let ticket_owned = cose_ticket.clone();
-    tokio::spawn(async move {
-        for attempt in 1..=MAX_RETRIES {
-            tokio::time::sleep(RETRY_INTERVAL).await;
-            match pusher
-                .push(cid, hippius_types::ticket_vsock::PORT, &ticket_owned)
-                .await
-            {
-                Ok(()) => {
-                    eprintln!(
-                        "hippius-miner-agent: reboot-watcher: vm={} re-push attempt={attempt}/{MAX_RETRIES} ok",
-                        vm_id_owned.as_str(),
-                    );
+/// Timing of one re-push task — a parameter so the tests can run the
+/// real loop in milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct RetrySchedule {
+    interval: Duration,
+    max_attempts: u32,
+    window: Duration,
+}
+
+impl RetrySchedule {
+    const PRODUCTION: Self = Self {
+        interval: RETRY_INTERVAL,
+        max_attempts: MAX_RETRIES,
+        window: RETRY_WINDOW,
+    };
+}
+
+/// The re-push loop for one `Started` event. Ends on the first of:
+/// cancellation (stop / destroy / superseded), the VM no longer owning
+/// `cid` with this ticket, the attempt budget, or the wall-clock window
+/// — each push is bounded by the window too, since one connect loop can
+/// otherwise spin for `PUSH_TIMEOUT_SECS`.
+async fn repush_ticket(
+    vm_id: VmId,
+    cose_ticket: Vec<u8>,
+    lifecycle: Arc<CvmLifecycle>,
+    pusher: Arc<dyn TicketPusher>,
+    cancel: CancellationToken,
+    schedule: RetrySchedule,
+) {
+    // However the loop ends, this task is no longer trying: cancelling its
+    // own (still registered) token is what tells `ticket_lost` so.
+    let _no_longer_trying = cancel.clone().drop_guard();
+    let deadline = tokio::time::Instant::now() + schedule.window;
+    let mut last_cid = 0u32;
+    for attempt in 1..=schedule.max_attempts {
+        if cancel.is_cancelled() {
+            return;
+        }
+        // Re-resolve the VM's CURRENT cid every attempt: a launch may have
+        // re-allocated it after an orphan collision, and a re-adopted cid
+        // may since have been re-keyed to the live one.
+        let (state, cid) = lifecycle.ticket_push_target(&vm_id, &cose_ticket);
+        last_cid = cid;
+        match state {
+            TicketPushState::Deliver => {}
+            // Not yet provable: a fresh launch's `Started` fires while the
+            // lifecycle is still `Launching`, and a re-adopted cid may still
+            // await confirmation against the live XML. Sit this one out.
+            TicketPushState::Wait => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = tokio::time::sleep(schedule.interval) => {}
                 }
-                Err(err) => {
-                    // ECONNRESET after the guest has the ticket is
-                    // expected (receiver exits after one accept). Other
-                    // errors (no route, libvirt down) also just log —
-                    // the next interval retry covers transients.
-                    eprintln!(
-                        "hippius-miner-agent: reboot-watcher: vm={} re-push attempt={attempt}/{MAX_RETRIES} failed: {err}",
-                        vm_id_owned.as_str(),
-                    );
-                }
+                continue;
+            }
+            TicketPushState::Abort => {
+                eprintln!(
+                    "hippius-miner-agent: reboot-watcher: vm={} cid={cid} re-push stopped at \
+                     attempt={attempt}: VM stopped, superseded, or no longer owns the cid",
+                    vm_id.as_str(),
+                );
+                return;
             }
         }
-    });
+        let still_owner = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let cancel = cancel.clone();
+            let vm_id = vm_id.clone();
+            let cose_ticket = cose_ticket.clone();
+            move || {
+                !cancel.is_cancelled() && lifecycle.ticket_push_current(&vm_id, cid, &cose_ticket)
+            }
+        };
+        let push = pusher.push_guarded(
+            cid,
+            hippius_types::ticket_vsock::PORT,
+            &cose_ticket,
+            &still_owner,
+        );
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            outcome = tokio::time::timeout_at(deadline, push) => outcome,
+        };
+        match outcome {
+            Ok(Ok(())) => {
+                lifecycle.note_ticket_delivered(&vm_id, cid, &cose_ticket);
+                eprintln!(
+                    "hippius-miner-agent: reboot-watcher: vm={} cid={cid} re-push \
+                     attempt={attempt}/{} ok",
+                    vm_id.as_str(),
+                    schedule.max_attempts,
+                )
+            }
+            // Before the guest listener binds the connect times out; after
+            // it has consumed the ticket the connect is reset. Both are the
+            // normal shape of a boot — the next attempt covers transients.
+            Ok(Err(err)) => eprintln!(
+                "hippius-miner-agent: reboot-watcher: vm={} cid={cid} re-push \
+                 attempt={attempt}/{} failed: {err}",
+                vm_id.as_str(),
+                schedule.max_attempts,
+            ),
+            Err(_) => break,
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep(schedule.interval) => {}
+        }
+    }
+    eprintln!(
+        "hippius-miner-agent: reboot-watcher: vm={} cid={last_cid} re-push window closed",
+        vm_id.as_str(),
+    );
 }
 
 /// `virsh start` the domain after the qemu process exits, under the
@@ -324,10 +431,13 @@ async fn handle_stopped(
             return;
         }
     }
-    // Only act on domains we admitted. A Stopped event for a domain
-    // we never tracked (orphan, foreign tenant on the same libvirtd,
-    // a transient test domain) is benign — ignore it.
-    if lifecycle.ticket_for_vm(vm_id).is_none() {
+    // Only act on domains we admitted AND that went down on their own.
+    // A Stopped event for a domain we never tracked (orphan, foreign
+    // tenant on the same libvirtd, a transient test domain) is benign —
+    // ignore it. So is one the agent itself is stopping (`Stopping`
+    // phase: a stop / §24 destroy in flight) — restarting it would
+    // resurrect the VM being torn down.
+    if !lifecycle.restart_eligible(vm_id) {
         return;
     }
     if !claim_restart_slot(vm_id, history) {
@@ -342,6 +452,15 @@ async fn handle_stopped(
     if !wait_for_shut_off(domain_name).await {
         eprintln!(
             "hippius-miner-agent: reboot-watcher: vm={} domstate-poll-timeout",
+            vm_id.as_str()
+        );
+        return;
+    }
+    // Re-check after the wait: a stop / §24 destroy that began while we
+    // polled for shut-off owns this domain now.
+    if !lifecycle.restart_eligible(vm_id) {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} stopped by the agent meanwhile, not restarting",
             vm_id.as_str()
         );
         return;
@@ -419,6 +538,7 @@ async fn virsh_domstate(name: &str) -> Result<String, &'static str> {
 /// The XML / measurement is unchanged so the §22 allowlist + KBS
 /// release path still admits the boot.
 async fn virsh_start(name: &str) -> Result<(), &'static str> {
+    crate::host_health::record_domain_start();
     let out = Command::new("virsh")
         .args(["start", name])
         .output()
@@ -527,5 +647,454 @@ mod tests {
         }
         assert!(!claim_restart_slot(&a, &history));
         assert!(claim_restart_slot(&b, &history));
+    }
+
+    // ── Ticket re-push must never outlive its VM ────────────────────────
+    //
+    // The live failure (2026-09-24): VM A's re-push task was still spinning
+    // when A was destroyed; B launched on A's freed CID, B's initramfs
+    // listener came up, and A's task delivered A's ticket into it → KBS 403,
+    // and the golden initramfs never retries. These tests drive the real
+    // `repush_ticket` loop against the real lifecycle + CID allocator.
+
+    use crate::error::{MinerAgentError, Result};
+    use crate::lifecycle::{CvmPhase, HostResources, MockLaunchDigest, MockLibvirtDriver};
+    use crate::orders::LaunchOrder;
+    use async_trait::async_trait;
+    use ciborium::value::Value;
+    use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    const FAST: RetrySchedule = RetrySchedule {
+        interval: Duration::from_millis(2),
+        max_attempts: 100_000,
+        window: Duration::from_secs(30),
+    };
+
+    /// Models guests' vsock listeners per CID. A push behaves like the
+    /// production connect loop: it spins (re-checking the guard, as
+    /// `push_ticket_guarded` does) until a listener is bound on the CID,
+    /// then delivers. `ignore_guard` models a pusher that never re-checks.
+    #[derive(Default)]
+    struct ListenerPusher {
+        listening: Mutex<HashSet<u32>>,
+        delivered: Mutex<Vec<(u32, Vec<u8>)>>,
+        ignore_guard: bool,
+    }
+
+    impl ListenerPusher {
+        fn listen(&self, cid: u32) {
+            self.listening.lock().unwrap().insert(cid);
+        }
+        fn delivered(&self) -> Vec<(u32, Vec<u8>)> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TicketPusher for ListenerPusher {
+        async fn push(&self, cid: u32, port: u32, cose: &[u8]) -> Result<()> {
+            self.push_guarded(cid, port, cose, &|| true).await
+        }
+        async fn push_guarded(
+            &self,
+            cid: u32,
+            _port: u32,
+            cose: &[u8],
+            still_owner: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<()> {
+            loop {
+                if !self.ignore_guard && !still_owner() {
+                    return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+                }
+                if self.listening.lock().unwrap().contains(&cid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if !self.ignore_guard && !still_owner() {
+                return Err(MinerAgentError::TicketDelivery("cid-not-owned"));
+            }
+            self.delivered.lock().unwrap().push((cid, cose.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A structurally valid COSE ticket (flavor `medium` ↔ 2 vCPUs, the
+    /// launch-time peek) whose bytes are unique per `tag`.
+    fn ticket(tag: &str) -> Vec<u8> {
+        let payload = Value::Map(vec![
+            (Value::Text("v".into()), Value::Integer(2.into())),
+            (Value::Text("flavor".into()), Value::Text("medium".into())),
+            (Value::Text("vm".into()), Value::Text(tag.into())),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut buf).unwrap();
+        CoseSign1Builder::new()
+            .protected(
+                HeaderBuilder::new()
+                    .algorithm(coset::iana::Algorithm::EdDSA)
+                    .build(),
+            )
+            .payload(buf)
+            .create_signature(b"", |_| vec![0u8; 64])
+            .build()
+            .to_vec()
+            .unwrap()
+    }
+
+    fn order(vm: &str) -> LaunchOrder {
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        LaunchOrder {
+            vm_id: VmId::new(vm).unwrap(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+            initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+            cmdline: "quiet panic=0".to_string(),
+            luks_disk_path: PathBuf::from(format!("/var/lib/hippius-miner/{vm}.img")),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 0,
+            rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+            rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: serde_bytes::ByteBuf::from(ticket(vm)),
+            require_existing_disks: false,
+            guardian_ep: None,
+        }
+    }
+
+    fn lifecycle() -> Arc<CvmLifecycle> {
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        Arc::new(
+            CvmLifecycle::new_with_poll(
+                Arc::new(MockLibvirtDriver::new()),
+                Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+                HostResources {
+                    total_cpus: 16,
+                    total_memory_mb: 65536,
+                    total_disk_gb: 0,
+                },
+                Duration::from_millis(1),
+                5,
+            )
+            .skip_state_disk_provision_for_tests(),
+        )
+    }
+
+    /// Launch `vm` and start its re-push task exactly as `handle_started`
+    /// does. Returns the CID and ticket it holds, and the task.
+    async fn launch_and_repush(
+        lc: &Arc<CvmLifecycle>,
+        pusher: &Arc<ListenerPusher>,
+        vm: &str,
+        cancel: Option<CancellationToken>,
+    ) -> (u32, Vec<u8>, tokio::task::JoinHandle<()>) {
+        let vm_id = lc.launch(order(vm)).await.unwrap();
+        let (cid, t) = lc.ticket_for_vm(&vm_id).unwrap();
+        let cancel = cancel.unwrap_or_else(|| lc.begin_ticket_push(&vm_id));
+        let pusher: Arc<dyn TicketPusher> = pusher.clone();
+        let task = tokio::spawn(repush_ticket(
+            vm_id,
+            t.clone(),
+            Arc::clone(lc),
+            pusher,
+            cancel,
+            FAST,
+        ));
+        (cid, t, task)
+    }
+
+    /// Stop A while its push is spinning, launch B on A's freed CID, bring
+    /// B's listener up. Returns what reached that CID, plus both tickets.
+    async fn reuse_cid_scenario(
+        pusher: Arc<ListenerPusher>,
+        a_cancel: Option<CancellationToken>,
+    ) -> (Vec<(u32, Vec<u8>)>, Vec<u8>, Vec<u8>) {
+        let lc = lifecycle();
+        let (cid_a, ticket_a, task_a) = launch_and_repush(&lc, &pusher, "vm-a", a_cancel).await;
+        // A's guest never binds its listener: A's push is mid connect-loop.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        lc.stop(&VmId::new("vm-a").unwrap(), false).await.unwrap();
+
+        let (cid_b, ticket_b, task_b) = launch_and_repush(&lc, &pusher, "vm-b", None).await;
+        assert_eq!(cid_a, cid_b, "precondition: B must inherit A's freed CID");
+        assert_ne!(ticket_a, ticket_b);
+        pusher.listen(cid_b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        lc.stop(&VmId::new("vm-b").unwrap(), false).await.unwrap();
+        for task in [task_a, task_b] {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("a re-push task outlived its VM's stop")
+                .unwrap();
+        }
+        (pusher.delivered(), ticket_a, ticket_b)
+    }
+
+    fn assert_only_b(delivered: &[(u32, Vec<u8>)], ticket_a: &[u8], ticket_b: &[u8]) {
+        assert!(
+            delivered.iter().any(|(_, t)| t == ticket_b),
+            "B's own ticket must reach B"
+        );
+        assert!(
+            delivered.iter().all(|(_, t)| t != ticket_a),
+            "a stopped VM's ticket reached the guest that inherited its CID"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_vms_repush_never_reaches_the_vm_that_inherits_its_cid() {
+        let (delivered, a, b) = reuse_cid_scenario(Arc::new(ListenerPusher::default()), None).await;
+        assert_only_b(&delivered, &a, &b);
+    }
+
+    #[tokio::test]
+    async fn the_ownership_guard_alone_stops_a_stale_push() {
+        // Defence in depth: even if A's task was never cancelled (a token
+        // the lifecycle does not know), the per-connect guard refuses to
+        // deliver A's ticket once A no longer owns the CID.
+        let untracked = CancellationToken::new();
+        let (delivered, a, b) =
+            reuse_cid_scenario(Arc::new(ListenerPusher::default()), Some(untracked)).await;
+        assert_only_b(&delivered, &a, &b);
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_push_even_through_a_pusher_that_ignores_the_guard() {
+        // And the other layer on its own: a pusher that never re-checks the
+        // guard mid-connect is still cut off by the stop's cancellation.
+        let pusher = Arc::new(ListenerPusher {
+            ignore_guard: true,
+            ..Default::default()
+        });
+        let (delivered, a, b) = reuse_cid_scenario(pusher, None).await;
+        assert_only_b(&delivered, &a, &b);
+    }
+
+    #[tokio::test]
+    async fn a_new_started_supersedes_the_previous_repush_for_the_same_vm() {
+        let lc = lifecycle();
+        let vm = VmId::new("vm-s").unwrap();
+        let first = lc.begin_ticket_push(&vm);
+        let second = lc.begin_ticket_push(&vm);
+        assert!(
+            first.is_cancelled(),
+            "the superseded task must be cancelled"
+        );
+        assert!(!second.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn the_repush_window_bounds_a_push_that_never_returns() {
+        // One production push can spin for PUSH_TIMEOUT_SECS; the attempt
+        // count alone let the "10 min" window run for hours.
+        struct Hang;
+        #[async_trait]
+        impl TicketPusher for Hang {
+            async fn push(&self, _: u32, _: u32, _: &[u8]) -> Result<()> {
+                std::future::pending().await
+            }
+        }
+        let lc = lifecycle();
+        let vm_id = lc.launch(order("vm-h")).await.unwrap();
+        let (_, t) = lc.ticket_for_vm(&vm_id).unwrap();
+        let cancel = lc.begin_ticket_push(&vm_id);
+        let schedule = RetrySchedule {
+            window: Duration::from_millis(50),
+            ..FAST
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            repush_ticket(vm_id, t, lc, Arc::new(Hang), cancel, schedule),
+        )
+        .await
+        .expect("the re-push task must end when its window closes");
+    }
+
+    #[tokio::test]
+    async fn a_running_vm_keeps_receiving_its_own_ticket() {
+        // The legacy keyscript's cryptroot retry re-binds its listener and
+        // needs the ticket again — the guard must not block the VM's OWN
+        // guest.
+        let lc = lifecycle();
+        let pusher = Arc::new(ListenerPusher::default());
+        let (cid, t, task) = launch_and_repush(&lc, &pusher, "vm-own", None).await;
+        pusher.listen(cid);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lc.stop(&VmId::new("vm-own").unwrap(), false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = pusher.delivered();
+        assert!(delivered.len() > 1, "own-guest re-deliveries must continue");
+        assert!(delivered.iter().all(|(c, d)| *c == cid && d == &t));
+    }
+
+    #[tokio::test]
+    async fn a_launching_vm_waits_then_gets_its_ticket_once_running() {
+        // The fresh launch's `Started` fires while the lifecycle is still
+        // `Launching` — the CID is selected but not yet proven (an orphan
+        // may hold it). The task must wait, not deliver and not give up.
+        let lc = lifecycle();
+        let vm_id = lc.launch(order("vm-l")).await.unwrap();
+        let (cid, t) = lc.ticket_for_vm(&vm_id).unwrap();
+        lc.force_phase_for_tests(&vm_id, CvmPhase::Launching);
+        assert_eq!(lc.ticket_push_state(&vm_id, cid, &t), TicketPushState::Wait);
+
+        let pusher = Arc::new(ListenerPusher::default());
+        pusher.listen(cid);
+        let dyn_pusher: Arc<dyn TicketPusher> = pusher.clone();
+        let cancel = lc.begin_ticket_push(&vm_id);
+        let task = tokio::spawn(repush_ticket(
+            vm_id.clone(),
+            t.clone(),
+            Arc::clone(&lc),
+            dyn_pusher,
+            cancel,
+            FAST,
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(pusher.delivered().is_empty(), "delivered while Launching");
+        assert!(!task.is_finished(), "gave up while Launching");
+
+        lc.force_phase_for_tests(&vm_id, CvmPhase::Running);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(pusher.delivered().iter().any(|(c, d)| *c == cid && d == &t));
+        lc.stop(&vm_id, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_repush_follows_an_unverified_cid_rekeyed_to_the_live_one() {
+        // Re-adoption with an unreadable XML holds the sidecar's cid 7
+        // unverified. A guest reboot's `Started` starts a re-push that must
+        // WAIT, and once the live XML shows cid 9 it must deliver to 9 —
+        // never to 7, which belongs to whoever the kernel gave it.
+        let tmp = tempfile::tempdir().unwrap();
+        let t = ticket("vm-rk");
+        let dir = tmp.path().join("adopt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("vm-rk.json"),
+            format!(
+                r#"{{"vm_id":"vm-rk","domain_id":"hippius-tenant-vm-rk",
+                "domain_uuid":"11111111-2222-4333-8444-555555555555",
+                "launch_digest_hex":"{}","cpu_count":2,"memory_mb":2048,
+                "data_disk_size_gb":0,"luks_disk_path":"/var/lib/hippius-miner/x.img",
+                "cid":7,"cose_ticket_hex":"{}"}}"#,
+                "00".repeat(48),
+                hex::encode(&t),
+            ),
+        )
+        .unwrap();
+        let driver = Arc::new(MockLibvirtDriver::new());
+        let domain = crate::lifecycle::DomainId::new("hippius-tenant-vm-rk").unwrap();
+        driver.seed_domain(domain.clone(), crate::lifecycle::DomainState::Running);
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        let lc = Arc::new(
+            CvmLifecycle::new_with_poll(
+                driver.clone(),
+                Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+                HostResources {
+                    total_cpus: 16,
+                    total_memory_mb: 65536,
+                    total_disk_gb: 0,
+                },
+                Duration::from_millis(1),
+                5,
+            )
+            .skip_state_disk_provision_for_tests()
+            .with_state_disk_root(tmp.path().to_path_buf()),
+        );
+        assert_eq!(lc.readopt_running().await.unwrap(), 1);
+        let vm_id = VmId::new("vm-rk").unwrap();
+
+        let pusher = Arc::new(ListenerPusher::default());
+        pusher.listen(7);
+        pusher.listen(9);
+        let dyn_pusher: Arc<dyn TicketPusher> = pusher.clone();
+        let cancel = lc.begin_ticket_push(&vm_id);
+        let task = tokio::spawn(repush_ticket(
+            vm_id.clone(),
+            t.clone(),
+            Arc::clone(&lc),
+            dyn_pusher,
+            cancel,
+            FAST,
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            pusher.delivered().is_empty(),
+            "delivered on an unverified cid"
+        );
+
+        driver.seed_domain_xml(
+            domain,
+            crate::lifecycle::DomainState::Running,
+            "<domain type='kvm'><name>hippius-tenant-vm-rk</name>\
+                 <uuid>11111111-2222-4333-8444-555555555555</uuid>\
+                 <memory unit='KiB'>2097152</memory><vcpu>2</vcpu><devices>\
+                 <disk type='file' device='disk'><source file='/var/lib/hippius-miner/x.img'/>\
+                 <target dev='vda' bus='virtio'/></disk>\
+                 <vsock model='virtio'><cid auto='no' address='9'/></vsock>\
+                 </devices></domain>",
+        );
+        let verdicts = lc
+            .verify_pending_cids(std::time::Instant::now() + Duration::from_secs(3600))
+            .await;
+        assert_eq!(
+            verdicts,
+            vec![(vm_id.clone(), crate::lifecycle::CidVerdict::Rekeyed)]
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        lc.stop(&vm_id, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = pusher.delivered();
+        assert!(
+            delivered.iter().any(|(c, d)| *c == 9 && d == &t),
+            "the live cid got nothing"
+        );
+        assert!(
+            delivered.iter().all(|(c, _)| *c == 9),
+            "a push hit the stale cid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_whose_cid_is_not_yet_created_waits_rather_than_aborts() {
+        // The libvirt `Started` event can beat `create_domain`'s
+        // `mark_verified`: the re-push must wait for it, not give up.
+        let lc = lifecycle();
+        let vm_id = lc.launch(order("vm-pc")).await.unwrap();
+        let (cid, t) = lc.ticket_for_vm(&vm_id).unwrap();
+        lc.force_phase_for_tests(&vm_id, CvmPhase::Launching);
+        let alloc = lc.cid_allocator();
+        alloc.release(&vm_id).unwrap();
+        assert_eq!(
+            alloc.allocate(&vm_id).unwrap(),
+            cid,
+            "same slot, now pending-create"
+        );
+        assert_eq!(lc.ticket_push_state(&vm_id, cid, &t), TicketPushState::Wait);
     }
 }

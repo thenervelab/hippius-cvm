@@ -275,7 +275,7 @@ def autoprovision_node_heartbeat_source(
         return None
     # (3) Provision (idempotent). `source_id == hb.miner_id` so the
     #     peer-vs-body gate (5) passes on the ingest that follows.
-    from apps.miners.models import MinerIdentity
+    from apps.miners.models import MinerIdentity, autoprovision_platform_id
 
     miner_id = hb.miner_id
     with transaction.atomic():
@@ -283,7 +283,9 @@ def autoprovision_node_heartbeat_source(
             miner_id=miner_id,
             defaults={
                 "pubkey_hex": node_id_hex,
-                "platform_id": "onchain",
+                # Per node — `platform_id` is unique, so a shared literal
+                # would let only one unregistered miner exist at a time.
+                "platform_id": autoprovision_platform_id(node_id_hex),
                 "chain_node_id": node_id_hex,
             },
         )
@@ -402,6 +404,27 @@ def ingest(
         schema_version=schema_version,
         body=body,
     )
+    # 6b. Zombie gate — a NEW, verified served receipt from a VM whose
+    #     §24 crypto-erase already ran proves a miner is still running a
+    #     VM it was told to kill. Refuse it (never enqueued ⇒ never
+    #     billed) and record the observation. A byte-identical REPLAY of a
+    #     receipt accepted while the VM was live is not new evidence: it
+    #     falls through to the dedupe below, unchanged.
+    if (
+        source == SourceType.TENANT_VM.value
+        and kind == EnvelopeKind.SERVED_RECEIPT.value
+        and not TelemetryEnvelope.objects.filter(dedupe_digest=digest).exists()
+    ):
+        from apps.lifecycle import zombie
+
+        dead_vm = zombie.erased_vm(source_id, now)
+        if dead_vm is not None:
+            zombie.observe(dead_vm, kind=kind, now=now)
+            raise IngestError(
+                message=f"vm is past its {zombie.erase_phrase(dead_vm)}; receipt refused",
+                category="vm-not-live",
+                http_status=410,
+            )
     try:
         with transaction.atomic():
             envelope = TelemetryEnvelope.objects.create(
@@ -449,6 +472,86 @@ def ingest(
 
 
 # ─── heartbeat ingest (§K / PR-Part4-B) ──────────────────────────────
+
+
+#: The largest value a `MinerCapacity.declared_*` column can hold.
+_DECLARED_MAX = 2_147_483_647
+
+
+def declared_capacity_columns(
+    declared: verifier.DeclaredCapacity,
+) -> dict[str, int | None]:
+    """Map a `v3` declaration onto the `MinerCapacity.declared_*` columns.
+
+    `0` on the wire means "the miner could not read it", so it is stored
+    as NULL (no clamp) — never as a literal 0, which would be read as a
+    zero budget and starve the miner.
+    """
+
+    def _known(value: int) -> int | None:
+        # 0 = unknown. Above the column's range (signed 32-bit on
+        # Postgres) is not a real host either — and a u32 the heartbeat
+        # schema allows must not turn into a 500 on the write. Both mean
+        # "no clamp", which can only leave vali's trusted bound in charge.
+        return value if 0 < value <= _DECLARED_MAX else None
+
+    return {
+        "declared_cpu_budget": _known(declared.cvm_cpu_budget),
+        "declared_memory_mb_budget": _known(declared.cvm_memory_mb_budget),
+        "declared_asid_capacity": _known(declared.asid_capacity),
+        "declared_asid_used": _known(declared.asid_used),
+    }
+
+
+def declared_disk_columns(declared: verifier.DeclaredDisk) -> dict[str, int | None]:
+    """Map a `v4` disk report onto the `MinerCapacity` disk columns.
+
+    Same rule as [`declared_capacity_columns`]: `0` on the wire means
+    "unknown" and is stored as NULL (no term), and a value above the
+    column's range is not a real host either — never a 500 on the write.
+    One exception: a data-fs `available` of 0 next to a known total is a
+    full disk, and is kept (it can only LOWER capacity)."""
+
+    def _known(value: int) -> int | None:
+        return value if 0 < value <= _DECLARED_MAX else None
+
+    def _available(value: int, total: int | None) -> int | None:
+        # statvfs rounds DOWN to whole GiB, so a genuinely full fs reports
+        # available = 0. Next to a known total that 0 is a MEASUREMENT (the
+        # most important one — it is what stops placements onto a full
+        # disk), not "unknown"; without a total it stays unknown.
+        if value == 0 and total is not None:
+            return 0
+        return _known(value)
+
+    data_total = _known(declared.data_disk_total_gb)
+    return {
+        "declared_disk_gb_budget": _known(declared.cvm_disk_gb_budget),
+        "reported_data_disk_total_gb": data_total,
+        "reported_data_disk_available_gb": _available(
+            declared.data_disk_available_gb, data_total
+        ),
+        "reported_staging_disk_available_gb": _known(declared.staging_disk_available_gb),
+    }
+
+
+def host_health_columns(declared: verifier.DeclaredHostHealth) -> dict[str, int | bool | None]:
+    """Map a `v5` host-health report onto the `MinerCapacity` columns.
+
+    Unlike the capacity figures, `0` is a real reading here (no CPU
+    offline, no flush failure) and is stored as is. A count above the
+    column's range is not a real host and is stored as NULL rather than
+    turning the write into a 500."""
+
+    def _count(value: int) -> int | None:
+        return value if 0 <= value <= _DECLARED_MAX else None
+
+    return {
+        "reported_snp_enabled": declared.snp_enabled,
+        "reported_cpus_offline": _count(declared.cpus_offline),
+        "reported_snp_launches_since_boot": _count(declared.snp_launches_since_boot),
+        "reported_df_flush_failures": _count(declared.df_flush_failures),
+    }
 
 
 def ingest_heartbeat(
@@ -676,6 +779,50 @@ def ingest_heartbeat(
                 ).update(
                     reported_memory_available_mib=hb.memory_available_mib,
                     reported_at=now,
+                )
+            # The `v3` capacity declarations (capacity v2 §4.2) — the
+            # miner's own #668 budget and SEV-ES ASID figures. UNTRUSTED,
+            # consumed only as DOWN-ONLY clamps (`budget_inputs`), so this
+            # is the same kind of targeted, filtered UPDATE as the RAM
+            # report. A `v1`/`v2` heartbeat carries no declaration
+            # (`declared_capacity is None`) and leaves the stored one
+            # UNTOUCHED — it goes stale on its own via `declared_at`
+            # instead of being clobbered by a miner mid-upgrade.
+            if hb.declared_capacity is not None and miner.chain_node_id:
+                from apps.scheduler.models import MinerCapacity
+
+                MinerCapacity.objects.filter(
+                    miner_node_id=miner.chain_node_id
+                ).update(
+                    **declared_capacity_columns(hb.declared_capacity),
+                    declared_at=now,
+                )
+            # The `v4` DATA-disk figures (storage-aware placement). UNTRUSTED,
+            # consumed only as DOWN-ONLY terms of the disk budget
+            # (`scheduler.capacity.disk_budget`) and the over-claim alarm.
+            # A pre-v4 heartbeat carries none and leaves the stored ones
+            # UNTOUCHED — they age out via `disk_reported_at`.
+            if hb.declared_disk is not None and miner.chain_node_id:
+                from apps.scheduler.models import MinerCapacity
+
+                MinerCapacity.objects.filter(
+                    miner_node_id=miner.chain_node_id
+                ).update(
+                    **declared_disk_columns(hb.declared_disk),
+                    disk_reported_at=now,
+                )
+            # The `v5` SEV-SNP host-health report. UNTRUSTED, alerted on
+            # only (`vali_scheduler_reeval`); a pre-v5 heartbeat leaves the
+            # stored report untouched — it ages out via
+            # `host_health_reported_at`.
+            if hb.declared_host_health is not None and miner.chain_node_id:
+                from apps.scheduler.models import MinerCapacity
+
+                MinerCapacity.objects.filter(
+                    miner_node_id=miner.chain_node_id
+                ).update(
+                    **host_health_columns(hb.declared_host_health),
+                    host_health_reported_at=now,
                 )
     except IngestError:
         raise
@@ -1417,9 +1564,11 @@ def _resolve_tenant_netbird_ip(vm) -> None:
             "netbird ip resolve unavailable for vm_id=%s: %s", vm.vm_id, exc
         )
         return
-    if ip:
+    # Only while still empty: the orchestration tick's refresh
+    # (`netbird_binding.refresh_overlay_ips`) may have written a newer
+    # address while this call was out.
+    if ip and type(vm).objects.filter(pk=vm.pk, netbird_ip="").update(netbird_ip=ip):
         vm.netbird_ip = ip
-        vm.save(update_fields=["netbird_ip", "updated_at"])
         log.info("resolved netbird ip for vm_id=%s", vm.vm_id)
 
 

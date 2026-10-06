@@ -28,7 +28,7 @@ from .factories import make_miner, make_snapshot, node_id
 
 # ─── The live-measured case (testnet, 2026-08-11) ────────────────────
 # Synthetic node_ids in the real 64-hex width, standing in for the three
-# the live read reported. TENANT hosts realtenant-ubuntu-1 and reads quality=0;
+# the live read reported. TENANT hosts tenant-vm-1 and reads quality=0;
 # PROBE's entire history is the validator's own synthetic monitor and it
 # reads the 100170 frozen at the last close. The fossil ranks them
 # backwards — that inversion is the whole defect.
@@ -146,11 +146,11 @@ def test_on_a_live_chain_the_lead_still_decides(leader: int) -> None:
 
 def _live_case(pallet_live: bool):
     return make_snapshot(
-        2702,
+        5002,
         [
-            make_miner(TENANT, status="active", data_epoch=2702, quality=0),
-            make_miner(PROBE, status="active", data_epoch=2702, quality=FOSSIL_LEAD),
-            make_miner(THIRD, status="active", data_epoch=2702, quality=0),
+            make_miner(TENANT, status="active", data_epoch=5002, quality=0),
+            make_miner(PROBE, status="active", data_epoch=5002, quality=FOSSIL_LEAD),
+            make_miner(THIRD, status="active", data_epoch=5002, quality=0),
         ],
         pallet_live=pallet_live,
     )

@@ -2,7 +2,7 @@
 //! mTLS leaf certificate.
 //!
 //! PR-H3 keyed every per-source counter on the raw socket
-//! [`std::net::IpAddr`]. Codex review of PR-H3 v2 flagged the obvious
+//! [`std::net::IpAddr`]. Review of PR-H3 v2 flagged the obvious
 //! NAT gap: a NetBird peer behind CGNAT shares an apparent source IP
 //! with every other peer on the same exit node, so "one bad peer
 //! gets the whole NAT range rate-limited" is the unintended outcome.

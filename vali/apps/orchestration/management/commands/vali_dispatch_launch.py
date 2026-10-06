@@ -26,7 +26,11 @@ classifier), 3 on Edge transport failure / misconfiguration.
 The command is read-only against vali state: it does NOT mutate
 ``MinerIdentity``, ``Vm``, ``LeaseAssignment``, or any other model —
 this is a smoke driver, not a step in the actual orchestrator
-state machine.
+state machine. It does READ the ``Vm`` row: the ticket must name
+``--vm-id`` and the target miner's chip, and the KBS ``register-vm``
+only runs if that row exists and is ``active`` at the ticket's
+generation, unbound or bound to ``--miner-id``
+(``services.register_gate``).
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ from django.core.management.base import BaseCommand, CommandError
 from apps.miners.models import MinerIdentity
 from apps.orchestration import kbs_admin, order_dispatch
 from apps.orchestration.effects import EffectError, EffectUnavailable
+from apps.orchestration.services import register_gate
+from apps.orders import validator
 
 # Exit code per outcome — picked to match the orchestrator's
 # fail-closed grammar elsewhere.
@@ -51,6 +57,49 @@ EXIT_EDGE_FAILURE = 3
 # different (KBS pod / network ACL vs Edge / miner). The launch
 # was NOT dispatched.
 EXIT_KBS_ADMIN_FAILURE = 4
+
+
+def _customer_keys_mismatch(vm_id: str, cmdline: str, ticket_key_mode: str) -> str | None:
+    """Customer-held keys: this command registers + dispatches a caller-built
+    cmdline and ticket, so it must hold them to the same rules the launch
+    pipeline does — the cmdline's guardian binding, the ticket's signed
+    `key_mode` and the mode pinned on the `Vm` row must all agree. A VM
+    with no row can only be dispatched M0 here (customer keys are pinned by
+    the launch API). Returns the refusal, or `None`."""
+    from apps.lifecycle.models import Vm
+    from apps.orchestration.services import customer_keys
+
+    try:
+        binding = customer_keys.parse_cmdline(cmdline)
+        customer_keys.check_cloud_init_markers(binding, cmdline=cmdline)
+    except customer_keys.CustomerKeysError as exc:
+        return f"--cmdline: {exc}"
+    cmdline_len = len(cmdline.encode("utf-8"))
+    if cmdline_len > customer_keys.MAX_MEASURED_CMDLINE_LEN:
+        return (
+            f"--cmdline is {cmdline_len} bytes (> {customer_keys.MAX_MEASURED_CMDLINE_LEN}); "
+            "with OVMF's initrd= prefix the guest kernel would truncate it"
+        )
+    if customer_keys.cmdline_may_hide_key_mode(cmdline):
+        return (
+            f"--cmdline is >= {customer_keys.KEY_MODE_TRUNCATION_FLOOR_MEASURED} bytes with no "
+            f"{customer_keys.KEY_MODE_TOKEN} token; the guest refuses to boot it"
+        )
+    if ticket_key_mode != customer_keys.ticket_key_mode(binding):
+        return (
+            f"ticket key_mode {ticket_key_mode!r} does not match the cmdline's "
+            f"{customer_keys.ticket_key_mode(binding)!r}"
+        )
+    vm = Vm.objects.filter(vm_id=vm_id).first()
+    if vm is None:
+        if binding is not None:
+            return "customer-keys VMs are launched through the launch API (no Vm row to pin)"
+        return None
+    try:
+        customer_keys.check_pinned(vm, binding)
+    except customer_keys.CustomerKeysError as exc:
+        return str(exc)
+    return None
 
 
 class Command(BaseCommand):
@@ -219,11 +268,48 @@ class Command(BaseCommand):
         #   - KbsAdminTerminal: terminal 4xx other than 409. Operator
         #     must check the ticket itself (expired, bad signature,
         #     URL mismatch).
+        # The ticket alone used to be enough to register. It is not: the
+        # ticket may be valid (signed, unexpired) yet name a VM that vali
+        # has since started decommissioning or migrating, a generation it
+        # has left, or another miner. So verify it, match it to the CLI's
+        # --vm-id / --miner-id, and register only under the Vm row lock
+        # (`register_gate`), exactly like the launch pipeline.
         try:
-            admin_ok = kbs_admin.register_vm_active_with_vm_id(
-                vm_id=opts["vm_id"],
-                cose_ticket=cose_ticket,
+            parsed = validator.validate_ticket(cose_ticket)
+        except validator.ValidatorUnavailable as exc:
+            # The validator binary could not run — nothing is known about
+            # the ticket; not the same thing as a ticket found invalid.
+            self._emit({"ok": False, "outcome": "ticket-validator-unavailable", "error": str(exc)})
+            sys.exit(EXIT_KBS_ADMIN_FAILURE)
+        except validator.ValidatorError as exc:
+            self._emit({"ok": False, "outcome": "ticket-invalid", "error": str(exc)})
+            sys.exit(EXIT_KBS_ADMIN_FAILURE)
+        mismatch = None
+        if parsed.vm_id != opts["vm_id"]:
+            mismatch = f"ticket names vm {parsed.vm_id!r}, --vm-id is {opts['vm_id']!r}"
+        elif parsed.platform_id.strip().lower() != (identity.platform_id or "").strip().lower():
+            mismatch = (
+                f"ticket platform_id {parsed.platform_id!r} is not miner "
+                f"{miner_id!r}'s ({identity.platform_id!r})"
             )
+        if mismatch is None:
+            mismatch = _customer_keys_mismatch(opts["vm_id"], opts["cmdline"], parsed.key_mode)
+        if mismatch is not None:
+            self._emit({"ok": False, "outcome": "ticket-mismatch", "error": mismatch})
+            sys.exit(EXIT_KBS_ADMIN_FAILURE)
+        try:
+            admin_ok = register_gate.register_under_vm_lock(
+                opts["vm_id"],
+                generation=parsed.vm_generation,
+                miner_id=miner_id,
+                register=lambda: kbs_admin.register_vm_active_with_vm_id(
+                    vm_id=opts["vm_id"],
+                    cose_ticket=cose_ticket,
+                ),
+            )
+        except register_gate.RegisterRefused as exc:
+            self._emit({"ok": False, "outcome": "kbs-admin-vm-state-refused", "error": str(exc)})
+            sys.exit(EXIT_KBS_ADMIN_FAILURE)
         except kbs_admin.KbsAdminConflict as exc:
             self._emit(
                 {

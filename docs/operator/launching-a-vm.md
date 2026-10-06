@@ -72,6 +72,71 @@ drives the (up-to-30-min) preflight + dispatch; you poll for the result.
 
 ### 1. POST the launch intent
 
+## Before you sell it: `GET /v1/scheduler/feasibility`
+
+A launch that cannot place fails *after* the customer has paid. Ask
+first:
+
+```
+GET /v1/scheduler/feasibility?flavor=2xlarge&tenant_id=t-acme
+Authorization: Bearer <service-token>
+```
+
+Omit `flavor` for the whole catalogue — the "what can I sell right now"
+board. In the SDK: `client.can_place("2xlarge", tenant_id=...)`, or
+`client.feasibility()` for the board.
+
+Branch on `verdict`, and treat the two negatives differently:
+
+| verdict | meaning | what to do |
+|---|---|---|
+| `yes` | a miner would be chosen and the flavor fits it | sell it |
+| `not-now` | the fleet CAN run this flavor but has no room / no eligible host right now | retry later — the hardware is fine |
+| `never` | no reachable host is big enough | **do not take the money**; retrying cannot help |
+
+`never` is the one that matters commercially, and it is not
+hypothetical: on hardware of 125 GB / 24 cores, `4xlarge` asks 128 GiB
+and 32 vCPU and can never place.
+
+⚠️ **`never` is only returned when vali actually knows every reachable
+host's size.** That size is the operator-registered anchor
+(`MinerCapacity.total_memory_mb` / `total_cpus`). A miner without it
+answers `not-now` with reason `host-size-unknown` for every flavor, and
+its admission runs on the flat `capacity_slots` fallback rather than
+dynamic capacity. The fleet operator seeds it from their own reading of the hardware (`nproc`, and
+`MemTotal` kB / 1024 from `/proc/meminfo`):
+
+```sh
+python manage.py vali_set_miner_capacity --miner-id <MINER_ID> \
+    --cpus <NPROC> --memory-mb <MEMTOTAL_MB> --dry-run          # check first
+python manage.py vali_set_miner_capacity --miner-id <MINER_ID> \
+    --cpus <NPROC> --memory-mb <MEMTOTAL_MB> --by <you>
+```
+
+`--node-id <64-hex>` works in place of `--miner-id`, and `--clear` removes
+the anchor. The command refuses an anchor smaller than the VMs vali has
+already placed on the miner. It warns when a fresh heartbeat's free-memory
+report looks inconsistent with the anchor. It prints an audit record
+(who, node, before, after) as its last line of output. Keep that line: with
+`kubectl exec` it does not reach the pod log. The numbers must be your own
+reading of the hardware, never the miner operator's claim. See
+[onboarding a miner §6b](onboarding-a-miner.md#6b-register-the-hosts-size-fleet-operator).
+
+Two limits worth knowing, both reported rather than hidden:
+
+- **`headroom` is advisory, not a reservation.** It is a snapshot; a
+  concurrent launch consumes it. The authoritative admission is still
+  the launch itself.
+- **`disk_checked` is always `false`.** Miner heartbeats report memory
+  and CPU but never disk, so vali cannot evaluate the DATA-disk
+  dimension — it stays gated by the miner at dispatch (503
+  `insufficient-resources`, and vali re-places).
+
+This is distinct from `GET /v1/scheduler/capacity`, which answers in
+admission *slots*. A slot is sized by the reference flavor and one
+placement costs one slot whatever its size, so `capacity` cannot tell
+you whether a *particular* flavor fits.
+
 ```
 POST /v1/vm/launch          Authorization: Bearer <root-service-token>
 Content-Type: application/json
@@ -79,7 +144,7 @@ Content-Type: application/json
   "tenant_id": "t-acme", "user_id": "u-1",
   "vm_id": "acme-web-1",            // [a-z0-9-]{1,64} — interpolated into Vault paths
   "lease_id": "lease-42",
-  "flavor": "xlarge",              // small|medium|large|xlarge|2xlarge|4xlarge
+  "flavor": "xlarge",              // small|medium|large|xlarge|2xlarge|4xlarge, or unlisted runner-small|runner-medium|runner-large
   "cmdline": "console=ttyS0,115200 ... ds=nocloud;s=/run/cloud-init/seed/",
   "s3_bucket": "hippius-compute-images",
   "s3_key_prefix": "tenant/acme-web-1/",
@@ -88,13 +153,20 @@ Content-Type: application/json
   "initrd_sha256_hex":      "<64-hex>",
   "luks_header_sha256_hex": "<64-hex>",
   "kek_vault_path": "hippius-compute/kbs/tenants/acme-web-1/luks-kek",  // MUST be under {prefix}/{vm_id}/
-  "userdata": "#cloud-config\n...{{NETBIRD_SETUP_KEY}}...",  // cloud-init plaintext — staged to Vault, never stored in the DB
+  "userdata": "#cloud-config\n...{{NETBIRD_SETUP_KEY}}...",  // cloud-init plaintext in the REQUEST only — vali Transit-wraps it before staging; never in the DB, never plaintext at rest
   "auto_pin_allowlist": true,   // see note below — NOT optional in practice
   // optional: platform_id, measurement_hex,
   //           netbird_group, ovmf_path, ... (see launch_jobs._OPTIONAL)
 }
 → 202 { "job_id": "...", "vm_id": "...", "state": "queued", ... }
 ```
+
+The `runner-*` flavors (1/4 GB/20 GB, 2/8 GB/20 GB, 4/16 GB/30 GB) are for
+single-use CI VMs: the compute of `small`/`medium`/`large` with a small data
+disk, so the first-boot integrity wipe is short. They are not in the
+feasibility board, fleet views or resize targets, and the OrderTicket carries
+their compute class (`small`/`medium`/`large`), so they need no KBS, guest or
+miner-agent change (`apps/orchestration/services/flavors.py`).
 
 `auto_pin_allowlist` is listed as optional in `launch_jobs._OPTIONAL` and
 defaults to `false`, but in practice every launch needs it: each one bakes
@@ -189,6 +261,33 @@ python manage.py vali_create_vm \
   --cmdline 'console=ttyS0,115200 … ds=nocloud;s=/run/cloud-init/seed/' \
   --flavor xlarge --enable-netbird --auto-pin-allowlist
 ```
+
+---
+
+## Customer-held keys (M1 `split` / M2 `customer`) — operator notes
+
+- **Guardian on NetBird.** `PUT /v1/guardian/<tenant>/netbird/policy` and
+  `POST …/setup-key` (root principal) create a policy that lets the miners
+  reach the tenant's guardian on its TCP port, and nothing else. That only
+  holds if (1) NetBird's `Default` All↔All policy is **disabled** (vali
+  refuses `409 guardian-netbird-open-policy` while any enabled policy reaches
+  `All` or the guardian group), and (2) `VALI_NETBIRD_MINERS_GROUP` names a
+  group holding **only miner peers** (vali cannot check this; audit it before
+  enabling). `DELETE /v1/guardian/<tenant>/netbird` revokes everything.
+- **Userdata `netbird up` shapes.** For an M1/M2 VM with NetBird, vali inserts
+  `--disable-dns --disable-client-routes --disable-server-routes` after
+  `up`. Supported: an unquoted flow list (`[ netbird, up, … ]`), a block list
+  (`- netbird` / `- up`), or a shell string containing `netbird up` (also
+  `/usr/bin/netbird up`). NOT supported — refused
+  `customer-keys-netbird-up-not-found`: a quoted flow list
+  (`[ "netbird", "up" ]`), a `netbird up` only in a comment, or none at all.
+- **Restore.** An M2 restore to an earlier boot is the customer's
+  (`guardian authorize-rollback`) and is refused today (the KBS boot counter
+  has no M2 rollback). An M2 current-boot (A1) restore works, but once it has
+  committed it **cannot be undone** (`…/revert` is a KBS rollback, which M2
+  never gets).
+- **§24.** An M2 decommission reports `data_death: customer-erase-required`:
+  tell the customer to run `guardian erase <vm>` for a cryptographic erase.
 
 ---
 

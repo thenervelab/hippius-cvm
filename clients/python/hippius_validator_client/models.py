@@ -168,6 +168,194 @@ class Image:
         return _build(cls, body)
 
 
+# ─── Pre-sale feasibility ───────────────────────────────────────────────
+
+
+@dataclass
+class HostFit:
+    """One host's contribution to a :class:`Feasibility` answer."""
+
+    node_id: str = ""
+    #: Is the HARDWARE big enough, ignoring what is placed on it?
+    big_enough: bool = False
+    #: The validator has no trusted hardware anchor for this host, so
+    #: neither :attr:`big_enough` nor :attr:`fits` is an answer. The host
+    #: does not count towards a ``never`` verdict.
+    size_unknown: bool = False
+    #: Is there room right now? Implies :attr:`big_enough`.
+    fits: bool = False
+    free_memory_mb: int | None = None
+    free_cpus: int | None = None
+    budget_memory_mb: int | None = None
+    budget_cpus: int | None = None
+    #: Which dimension fell short, and by how much. Empty when it fits.
+    shortfall: str = ""
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, body: dict[str, Any]) -> HostFit:
+        return _build(cls, body)
+
+
+@dataclass
+class Feasibility:
+    """Can a VM of this flavor be placed right now — asked BEFORE selling.
+
+    Branch on :attr:`verdict`. The distinction that matters commercially
+    is ``not-now`` versus ``never``:
+
+    - ``"yes"``      a miner would be chosen and the flavor fits it.
+    - ``"not-now"``  the fleet CAN run this flavor but has no room or no
+                     eligible host at this instant. Retryable.
+    - ``"never"``    no reachable host is big enough. Retrying cannot
+                     help — this is the answer that must stop a sale.
+
+    ``never`` is only ever returned when the validator actually KNOWS
+    every reachable host's size. Where an anchor is missing the answer is
+    ``not-now`` with reason ``host-size-unknown`` — missing data must not
+    take a flavor off the shelf.
+
+    :attr:`headroom` is advisory, not a reservation: it is a snapshot and
+    a concurrent launch consumes it.
+
+    ⚠️ :attr:`disk_checked` is always ``False``. The validator has no
+    mirror of any host's free disk (miner heartbeats report memory and
+    CPU only), so the DATA-disk dimension stays gated by the miner at
+    dispatch. The field exists so this limit is visible rather than
+    assumed away.
+    """
+
+    flavor: str = ""
+    verdict: str = ""
+    placeable_now: bool = False
+    fits_any_host: bool = False
+    headroom: int = 0
+    cpu_count: int = 0
+    memory_mb: int = 0
+    data_disk_size_gb: int = 0
+    reason: str = ""
+    scheduler_error: str = ""
+    disk_checked: bool = False
+    hosts: list[HostFit] = field(default_factory=list)
+    #: The region the answer was computed for (``""`` = fleet-wide). With a
+    #: region, ``reason`` can also be ``region-unknown`` (probe not run;
+    #: retry), ``no-miner-in-region`` (``never``) or ``region-unverified``
+    #: (miners detected there but not yet proven; retry). An older
+    #: validator omits the key and this reads ``""``.
+    region: str = ""
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, body: dict[str, Any]) -> Feasibility:
+        obj = _build(cls, body)
+        obj.hosts = [HostFit.from_dict(h) for h in body.get("hosts", [])]
+        return obj
+
+    @property
+    def sellable(self) -> bool:
+        """Shorthand for "take the money": the flavor is placeable now."""
+        return self.verdict == "yes"
+
+
+# ─── Regions ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RegionCapacity:
+    """Admission units summed over the miners counted in a :class:`Region`."""
+
+    total_units: int = 0
+    committed_units: int = 0
+    free_units: int = 0
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, body: dict[str, Any]) -> RegionCapacity:
+        return _build(cls, body)
+
+
+@dataclass
+class Region:
+    """One row of ``GET /v1/operator/regions`` — a country the validator has
+    DETECTED miners in. Nothing here is declared by a miner: the validator
+    measures each miner's location (server-observed IP, GeoIP, round-trip
+    latency, the egress of its own tenant VMs) and grades it.
+
+    :attr:`region` is the ISO 3166-1 alpha-2 code to pass as
+    :attr:`LaunchRequest.region` / ``feasibility(region=)``.
+    :attr:`miners_total` / :attr:`miners_verified` always count every
+    located miner; :attr:`node_ids`, :attr:`miners_dispatchable`,
+    :attr:`hosted_vm_count` and :attr:`capacity` count only those the
+    scheduler would actually place in (verified, unless the report was
+    asked with ``verified_only=False``).
+    """
+
+    region: str = ""
+    country_code: str = ""
+    miners_total: int = 0
+    miners_verified: int = 0
+    miners_dispatchable: int = 0
+    hosted_vm_count: int = 0
+    #: ``None`` when no counted miner has a capacity mirror row yet.
+    capacity: RegionCapacity | None = None
+    node_ids: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, body: dict[str, Any]) -> Region:
+        obj = _build(cls, body)
+        cap = body.get("capacity")
+        obj.capacity = RegionCapacity.from_dict(cap) if isinstance(cap, dict) else None
+        obj.node_ids = list(body.get("node_ids") or [])
+        return obj
+
+    @property
+    def placeable(self) -> bool:
+        """Could a launch constrained to this region land right now — at
+        least one counted miner is dispatchable AND a free unit is KNOWN.
+        Unknown capacity (``None``) reads as not placeable: this is a
+        sales hint, and a hint must not be built on missing data. The
+        authoritative answer is ``can_place(flavor, region=...)``."""
+        return (
+            self.miners_dispatchable > 0
+            and self.capacity is not None
+            and self.capacity.free_units > 0
+        )
+
+
+@dataclass
+class RegionsReport:
+    """``GET /v1/operator/regions`` — the regions miners exist in, with
+    capacity. Sorted by :attr:`Region.region`."""
+
+    regions: list[Region] = field(default_factory=list)
+    #: Bridged miners the probe has not located yet (no row, or no
+    #: country). They are in NO region for placement purposes.
+    unlocated_miners: int = 0
+    #: Whether the per-region counts include only ``verified`` miners.
+    require_verified: bool = True
+    #: Where the latency bound is measured from (``name`` / ``latitude`` /
+    #: ``longitude``).
+    vantage: dict[str, Any] = field(default_factory=dict)
+    generated_at: str = ""
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, body: dict[str, Any]) -> RegionsReport:
+        obj = _build(cls, body)
+        obj.regions = [Region.from_dict(r) for r in body.get("regions", [])]
+        obj.vantage = dict(body.get("vantage") or {})
+        return obj
+
+    def get(self, region: str) -> Region | None:
+        """The row for ``region`` (case-insensitive), or ``None``."""
+        code = region.strip().upper()
+        for row in self.regions:
+            if row.region.upper() == code:
+                return row
+        return None
+
+
 # ─── Launch ─────────────────────────────────────────────────────────────
 
 
@@ -239,6 +427,14 @@ class LaunchRequest:
     kid: str | None = None
     expiry_seconds: int | None = None
     max_price_per_unit: int | None = None
+    # Region constraint: an ISO 3166-1 alpha-2 country code (``FR``,
+    # case-insensitive). The VM is placed ONLY on a miner the validator has
+    # DETECTED and verified there; when none is eligible the launch fails
+    # ``no-miner-in-region`` rather than landing elsewhere. Discover codes
+    # with :meth:`HippiusValidatorClient.regions`, pre-check with
+    # :meth:`HippiusValidatorClient.can_place`\ ``(…, region=)``. ``None``
+    # (the default) places anywhere.
+    region: str | None = None
 
     def to_body(self, userdata: str | None = None) -> dict[str, Any]:
         """Render the request body. ``userdata`` overrides ``self.userdata``."""
@@ -303,6 +499,12 @@ class Vm:
     generation: int | None = None
     new_generation: int | None = None
     host: str | None = None
+    #: ISO 3166-1 alpha-2 country the VM runs in (its host's verified,
+    #: detected location); ``None`` when unknown or on an older validator.
+    region: str | None = None
+    #: The public IPv4 attached to the VM, as ``{address, edge, region}``;
+    #: ``None`` when it has none or on an older validator.
+    public_ip: dict[str, str] | None = None
     migration_dest: str | None = None
     # In-guest boot progress, recorded by vali on the VM lifecycle row and
     # surfaced on ``GET /v1/vm/<vm_id>``. ``boot_phase`` is one of ``""``
@@ -316,11 +518,13 @@ class Vm:
     # the SSH-reachable IP for the guest. ``None`` here on an older validator
     # that omits the key entirely (see :func:`reports_netbird_ip`).
     netbird_ip: str | None = None
-    # Post-migration overlay verdict: ``""`` (nothing to verify) |
-    # ``pending`` | ``ok`` | ``lost``. ``lost`` means the VM is running but
-    # OFF the overlay after a §25 migration and CANNOT re-enrol itself —
-    # ``netbird_ip`` above is then a stale, unreachable address. ``None``
-    # here on an older validator that omits the key entirely.
+    # Overlay verdict: ``""`` (nothing to verify) | ``pending`` | ``ok`` |
+    # ``lost``. ``lost`` means the VM is running but OFF the overlay (after a
+    # §25 migration, or its peer record deleted) and CANNOT re-enrol itself.
+    # With ``netbird_ip == ""`` the validator CLEARED the address (NetBird may
+    # recycle it to another peer) — drop any copy; with an address, that
+    # address is stale and unreachable. ``None`` here on an older validator
+    # that omits the key entirely.
     netbird_status: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -783,6 +987,8 @@ VM_POWER_RUNNING = "running"
 VM_POWER_STOPPING = "stopping"
 VM_POWER_STOPPED = "stopped"
 VM_POWER_STARTING = "starting"
+#: Terminal: the VM is ``destroyed``; no guest can run again.
+VM_POWER_OFF = "off"
 
 
 @dataclass
@@ -815,4 +1021,4 @@ class VmPower:
     @property
     def is_settled(self) -> bool:
         """False while a stop/start is still in flight on the miner."""
-        return self.power_state in (VM_POWER_RUNNING, VM_POWER_STOPPED)
+        return self.power_state in (VM_POWER_RUNNING, VM_POWER_STOPPED, VM_POWER_OFF)

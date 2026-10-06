@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -64,7 +64,7 @@ const IMAGE_CACHE_DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
 /// Resolve the cache byte-cap: `HIPPIUS_IMAGE_CACHE_MAX_BYTES` if set to a
 /// parseable non-zero `u64`, else [`IMAGE_CACHE_DEFAULT_MAX_BYTES`].
-fn image_cache_max_bytes() -> u64 {
+pub(crate) fn image_cache_max_bytes() -> u64 {
     std::env::var("HIPPIUS_IMAGE_CACHE_MAX_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -441,23 +441,8 @@ async fn fetch_verify_stage_cached(
     }
 
     // ── Cache MISS / corruption — download, verify, stage, populate ──
-    let resp = reqwest::get(url)
-        .await
-        .map_err(|_| MinerAgentError::Preflight("fetch-network"))?;
-    if !resp.status().is_success() {
-        return Err(MinerAgentError::Preflight("fetch-http-status"));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|_| MinerAgentError::Preflight("fetch-body"))?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = hasher.finalize();
-    if actual.as_slice() != expected.as_slice() {
-        return Err(MinerAgentError::Preflight("sha256-mismatch"));
-    }
+    // `download_verified` returns ONLY bytes that hash to `expected`.
+    let bytes = download_verified(url, &expected, &DOWNLOAD_RETRY_PAUSES).await?;
 
     // Atomic-ish stage: write to `<out>.partial`, fsync, rename. A
     // crash mid-write leaves the previous good file (if any) in place.
@@ -483,6 +468,115 @@ async fn fetch_verify_stage_cached(
     Ok(())
 }
 
+/// Pauses between download attempts on a TRANSIENT failure (three
+/// attempts in all). Object stores answer `SlowDown` (HTTP 503), other
+/// 5xx and throttling (408/429) under load, connections stall or drop, and
+/// a presigned GET has once returned a 200 whose bytes did not hash to the
+/// pin (a migration, 2026-09) while the next GET was byte-exact. One
+/// of those used to fail the whole launch.
+#[cfg(not(test))]
+const DOWNLOAD_RETRY_PAUSES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+#[cfg(test)]
+const DOWNLOAD_RETRY_PAUSES: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
+
+/// No retry is started past this budget, measured from the first attempt:
+/// it stays under the Edge/vali preflight dispatch timeout (30 min), so a
+/// late retry cannot land a stage nobody is waiting for.
+const DOWNLOAD_BUDGET: Duration = Duration::from_secs(25 * 60);
+
+/// Connect timeout for an artifact GET.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle timeout: a GET that delivers no bytes for this long is a failed
+/// attempt, not a hang. There is deliberately no whole-request timeout —
+/// a legacy tenant qcow2 can be many GB.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn download_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|_| MinerAgentError::Preflight("fetch-client"))?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// One GET of `url`, verified against `expected`. `Err((class, transient,
+/// detail))`: a connection/body error, a 5xx, a 408/429 or a digest
+/// mismatch is transient; any other status (a 403/404: an expired or wrong
+/// URL, a missing object) will answer the same way again.
+async fn download_once(
+    url: &str,
+    expected: &[u8; 32],
+) -> std::result::Result<bytes::Bytes, (&'static str, bool, String)> {
+    let resp = download_client()
+        .map_err(|_| ("fetch-client", false, String::new()))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| ("fetch-network", true, String::new()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let transient = status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err((
+            "fetch-http-status",
+            transient,
+            format!("http {}", status.as_u16()),
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|_| ("fetch-body", true, String::new()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    if hasher.finalize().as_slice() != expected.as_slice() {
+        return Err(("sha256-mismatch", true, format!("{} bytes", bytes.len())));
+    }
+    Ok(bytes)
+}
+
+/// Whether a retry after `pause` still starts inside [`DOWNLOAD_BUDGET`],
+/// `elapsed` being the time since the first attempt.
+fn retry_fits(elapsed: Duration, pause: Duration) -> bool {
+    elapsed + pause < DOWNLOAD_BUDGET
+}
+
+/// GET `url` until it yields bytes hashing to `expected`, retrying a
+/// transient failure after each of `pauses` while within
+/// [`DOWNLOAD_BUDGET`]. Returns ONLY verified bytes; the last failure's
+/// class otherwise. The URL is a presigned secret and is never logged.
+async fn download_verified(
+    url: &str,
+    expected: &[u8; 32],
+    pauses: &[Duration],
+) -> Result<bytes::Bytes> {
+    let started = std::time::Instant::now();
+    let mut pauses = pauses.iter();
+    loop {
+        let (class, transient, detail) = match download_once(url, expected).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(failure) => failure,
+        };
+        match pauses.next() {
+            Some(pause) if transient && retry_fits(started.elapsed(), *pause) => {
+                eprintln!(
+                    "hippius-miner-agent: preflight — transient download failure \
+                     ({class} {detail}), retrying in {}s",
+                    pause.as_secs()
+                );
+                tokio::time::sleep(*pause).await;
+            }
+            _ => return Err(MinerAgentError::Preflight(class)),
+        }
+    }
+}
+
 /// Read `path` and return whether its sha256 equals `expected`. Any I/O
 /// error reads as "does not match" (fail-closed on the trust question:
 /// an unreadable cache entry is not trusted and triggers a re-download).
@@ -505,7 +599,7 @@ pub(crate) fn file_sha256_matches(path: &Path, expected: &[u8; 32]) -> bool {
 /// The copy goes to `<out>.partial` then renames — the cache entry stays
 /// pristine (the per-VM qcow2 is written during boot; a hardlink would
 /// corrupt the shared cache entry, so we never hardlink).
-fn materialize_from_cache(cache_path: &Path, out_path: &Path) -> std::io::Result<()> {
+pub(crate) fn materialize_from_cache(cache_path: &Path, out_path: &Path) -> std::io::Result<()> {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -531,7 +625,7 @@ fn materialize_from_cache(cache_path: &Path, out_path: &Path) -> std::io::Result
 /// concurrent reader never observes a partial entry and a racing writer
 /// is idempotent (last-writer-wins on identical content). Reaps LRU
 /// entries first to stay under `max_bytes`. Entirely best-effort.
-fn populate_cache(
+pub(crate) fn populate_cache(
     cache_root: &Path,
     cache_path: &Path,
     bytes: &[u8],
@@ -800,6 +894,186 @@ mod tests {
         format!("http://{addr}/")
     }
 
+    /// Raw-TCP HTTP server answering successive connections with the
+    /// scripted `(status, body)` list; returns its URL and a counter of the
+    /// connections it accepted.
+    async fn serve_seq(
+        answers: Vec<(u16, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for (status, body) in answers {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn sha_of(bytes: &[u8]) -> [u8; 32] {
+        parse_sha256_hex(&sha256_hex_of(bytes)).unwrap()
+    }
+
+    async fn get(url: &str, want: &[u8]) -> Result<bytes::Bytes> {
+        download_verified(url, &sha_of(want), &DOWNLOAD_RETRY_PAUSES).await
+    }
+
+    #[test]
+    fn no_retry_starts_past_the_download_budget() {
+        let pause = Duration::from_secs(5);
+        assert!(retry_fits(Duration::ZERO, pause));
+        assert!(retry_fits(
+            DOWNLOAD_BUDGET - pause - Duration::from_secs(1),
+            pause
+        ));
+        assert!(!retry_fits(DOWNLOAD_BUDGET - pause, pause));
+        assert!(!retry_fits(DOWNLOAD_BUDGET, Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn a_slowdown_503_is_retried_until_the_download_lands() {
+        let (url, n) = serve_seq(vec![(503, b"SlowDown".to_vec()), (200, b"img".to_vec())]).await;
+        assert_eq!(&get(&url, b"img").await.unwrap()[..], b"img");
+        assert_eq!(hits(&n), 2);
+    }
+
+    #[tokio::test]
+    async fn throttling_429_and_timeout_408_are_transient() {
+        for code in [429, 408] {
+            let (url, n) = serve_seq(vec![(code, vec![]), (200, b"img".to_vec())]).await;
+            assert_eq!(&get(&url, b"img").await.unwrap()[..], b"img", "{code}");
+            assert_eq!(hits(&n), 2, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_5xx_that_persists_fails_after_the_retries() {
+        let (url, n) = serve_seq(vec![(503, vec![]); 3]).await;
+        let err = get(&url, b"img").await.unwrap_err();
+        assert!(
+            matches!(err, MinerAgentError::Preflight("fetch-http-status")),
+            "{err:?}"
+        );
+        assert_eq!(hits(&n), 3);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_4xx_fails_at_once() {
+        let (url, n) = serve_seq(vec![(404, vec![]), (200, b"img".to_vec())]).await;
+        let err = get(&url, b"img").await.unwrap_err();
+        assert!(
+            matches!(err, MinerAgentError::Preflight("fetch-http-status")),
+            "{err:?}"
+        );
+        assert_eq!(hits(&n), 1);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_body_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // First answer promises 100 bytes and sends 3; the second is whole.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let n = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = n.clone();
+        tokio::spawn(async move {
+            for (len, body) in [(100usize, &b"img"[..]), (3, &b"img"[..])] {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let url = format!("http://{addr}/");
+        assert_eq!(&get(&url, b"img").await.unwrap()[..], b"img");
+        assert_eq!(hits(&n), 2);
+    }
+
+    #[tokio::test]
+    async fn a_digest_mismatch_is_retried_and_only_the_pinned_bytes_return() {
+        let (url, n) = serve_seq(vec![(200, b"bad".to_vec()), (200, b"img".to_vec())]).await;
+        assert_eq!(&get(&url, b"img").await.unwrap()[..], b"img");
+        assert_eq!(hits(&n), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_store_fails_as_a_network_error_after_the_retries() {
+        let err = get("http://127.0.0.1:1/", b"img").await.unwrap_err();
+        assert!(
+            matches!(err, MinerAgentError::Preflight("fetch-network")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stage_path_retries_and_still_verifies_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        let out = dir.path().join("staging/vm/rootfs.img");
+        let body = b"golden-base".to_vec();
+        let sha = sha256_hex_of(&body);
+        let (url, n) = serve_seq(vec![(503, vec![]), (200, body.clone())]).await;
+        fetch_verify_stage_cached(&url, &sha, &out, &cache, u64::MAX, StagePolicy::Replace)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert_eq!(hits(&n), 2);
+    }
+
+    #[tokio::test]
+    async fn the_stage_path_never_stages_bytes_that_miss_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        let out = dir.path().join("staging/vm/rootfs.img");
+        let sha = sha256_hex_of(b"golden-base");
+        let (url, n) = serve_seq(vec![
+            (503, vec![]),
+            (200, b"tampered".to_vec()),
+            (200, b"tampered".to_vec()),
+        ])
+        .await;
+        let err =
+            fetch_verify_stage_cached(&url, &sha, &out, &cache, u64::MAX, StagePolicy::Replace)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, MinerAgentError::Preflight("sha256-mismatch")),
+            "{err:?}"
+        );
+        assert_eq!(hits(&n), 3);
+        assert!(!out.exists(), "unverified bytes must never be staged");
+        assert!(!cache.join(&sha).exists(), "nor cached");
+    }
+
     #[tokio::test]
     async fn cache_miss_downloads_and_populates_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -883,8 +1157,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("image-cache");
         let out = dir.path().join("staging/vm/tenant.qcow2");
-        // Server returns bytes that do NOT match the expected sha.
-        let url = serve_once(b"wrong-bytes".to_vec()).await;
+        // Every attempt returns bytes that do NOT match the expected sha
+        // (a mismatch is retried, so the server answers each attempt).
+        let (url, _) = serve_seq(vec![(200, b"wrong-bytes".to_vec()); 3]).await;
         let sha = sha256_hex_of(b"the-expected-image");
 
         let err =
@@ -1053,7 +1328,7 @@ mod tests {
         let cache = dir.path().join("image-cache");
         let out = dir.path().join("staging/vm-a/rootfs.img");
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
-        std::fs::write(&out, b"miner-3s-divergent-2026-07-29-rootfs").unwrap();
+        std::fs::write(&out, b"host-bs-divergent-2026-07-29-rootfs").unwrap();
 
         let authentic = b"the-base-this-spec-actually-names".to_vec();
         let sha = sha256_hex_of(&authentic);

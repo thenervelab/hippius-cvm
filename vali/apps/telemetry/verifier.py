@@ -271,8 +271,96 @@ HEARTBEAT_ERROR_CLASSES: frozenset[str] = frozenset(
         "wrong_schema_version",
         "wrong_domain",
         "miner_id_invalid",
+        # `v3` only: `asid_used > asid_capacity` with a known capacity.
+        "capacity_invalid",
     }
 )
+
+# The four `v3` capacity-declaration keys `verify-heartbeat` emits for a
+# `v3` body ONLY (never for `v1`/`v2`).
+HEARTBEAT_CAPACITY_KEYS: tuple[str, ...] = (
+    "cvm_cpu_budget",
+    "cvm_memory_mb_budget",
+    "asid_capacity",
+    "asid_used",
+)
+
+
+# The four `v4` disk keys `verify-heartbeat` emits for a `v4` body ONLY
+# (never for `v1`/`v2`/`v3`). All GiB; `0` = unknown / undeclared.
+HEARTBEAT_DISK_KEYS: tuple[str, ...] = (
+    "cvm_disk_gb_budget",
+    "data_disk_total_gb",
+    "data_disk_available_gb",
+    "staging_disk_available_gb",
+)
+
+
+# The four `v5` host-health keys `verify-heartbeat` emits for a `v5` body
+# ONLY. `snp_enabled` is a JSON bool, the other three integers.
+HEARTBEAT_HOST_HEALTH_KEYS: tuple[str, ...] = (
+    "snp_enabled",
+    "cpus_offline",
+    "snp_launches_since_boot",
+    "df_flush_failures",
+)
+
+
+@dataclass(frozen=True)
+class DeclaredHostHealth:
+    """A `v5` heartbeat's UNTRUSTED SEV-SNP host-health report, raw.
+
+    - `snp_enabled`             kvm_amd runs with SEV-SNP on.
+    - `cpus_offline`            present CPUs that are offline. With
+                                SNP on, the firmware then refuses the
+                                `DF_FLUSH` that recycles ASIDs, so the host
+                                stops launching once its pool is used up.
+    - `snp_launches_since_boot` guest starts the agent issued since boot.
+    - `df_flush_failures`       kernel `DF_FLUSH failed` lines since boot:
+                                every new SNP guest fails until a reboot.
+
+    Observability only — alerted on, never used for placement.
+    """
+
+    snp_enabled: bool
+    cpus_offline: int
+    snp_launches_since_boot: int
+    df_flush_failures: int
+
+
+@dataclass(frozen=True)
+class DeclaredDisk:
+    """A `v4` heartbeat's UNTRUSTED disk figures, raw (GiB, `0` = unknown).
+
+    - `cvm_disk_gb_budget`        the operator's `[host] cvm_disk_gb_budget`.
+    - `data_disk_total_gb` / `data_disk_available_gb`
+                                  statvfs total / available (f_bavail) of
+                                  the fs holding `[storage].data_disk_root`.
+    - `staging_disk_available_gb` statvfs available of the staging fs.
+
+    Disk cannot be attested: the scheduler uses these only as DOWN-ONLY
+    terms of the disk budget, so inflating them gains nothing.
+    """
+
+    cvm_disk_gb_budget: int
+    data_disk_total_gb: int
+    data_disk_available_gb: int
+    staging_disk_available_gb: int
+
+
+@dataclass(frozen=True)
+class DeclaredCapacity:
+    """A `v3` heartbeat's UNTRUSTED capacity declarations, raw.
+
+    `0` in any field means the miner could not read it (unknown). The
+    scheduler uses them only as DOWN-ONLY clamps (capacity v2 §2.4), so a
+    miner inflating them gains nothing.
+    """
+
+    cvm_cpu_budget: int
+    cvm_memory_mb_budget: int
+    asid_capacity: int
+    asid_used: int
 
 
 @dataclass(frozen=True)
@@ -300,6 +388,16 @@ class HeartbeatBody:
     # carried the key — still deserialises unchanged. A `True` value
     # means the heartbeat is ALSO a self-requested graceful exit.
     graceful_exit_requested: bool = False
+    # The `v3` capacity declarations. `None` for a `v1`/`v2` heartbeat
+    # (the verifier emits the keys ONLY for `v3`) — the ingest then leaves
+    # the stored declaration untouched rather than clearing it.
+    declared_capacity: DeclaredCapacity | None = None
+    # The `v4` disk figures. `None` for a `v1`/`v2`/`v3` heartbeat (the
+    # verifier emits the keys ONLY for `v4`) — the ingest then leaves the
+    # stored figures untouched, exactly like `declared_capacity`.
+    declared_disk: DeclaredDisk | None = None
+    # The `v5` host-health report. `None` before `v5`, same discipline.
+    declared_host_health: DeclaredHostHealth | None = None
 
 
 def verify_heartbeat(*, envelope: bytes, verifying_key: bytes) -> HeartbeatBody:
@@ -486,8 +584,11 @@ class VmProgressBody:
 
     A faithful subset of what `verify-vm-progress` returns on success.
     `milestone` is the HYPHEN wire value (`booting` | `kek-released` |
-    `running`); the endpoint maps it to the underscore `VmBootPhase`
-    choice via `Vm.advance_boot_phase`.
+    `running` | `awaiting-guardian`); the endpoint maps the first three to
+    the underscore `VmBootPhase` choice via `Vm.advance_boot_phase`.
+    `reason` is the closed-vocabulary guardian wait reason the binary
+    verified alongside `awaiting-guardian` (the only milestone with one),
+    else `None`.
     """
 
     schema_version: int
@@ -496,6 +597,7 @@ class VmProgressBody:
     vm_id: str
     milestone: str
     timestamp_unix: int
+    reason: str | None = None
 
 
 def verify_vm_progress(*, envelope: bytes, verifying_key: bytes) -> VmProgressBody:
@@ -505,8 +607,9 @@ def verify_vm_progress(*, envelope: bytes, verifying_key: bytes) -> VmProgressBo
     `verify-vm-progress` subcommand: the whole canonical-CBOR envelope
     rides stdin, `--vk-hex` is the miner's registered key. Returns the
     six-field body (`schema_version, domain, miner_id, vm_id, milestone,
-    timestamp_unix`) so the endpoint can run the identity + skew gates
-    and advance the VM's boot phase. Raises `VerifierFailed` (miner-side
+    timestamp_unix`), plus `reason` for an `awaiting-guardian` milestone,
+    so the endpoint can run the identity + skew gates and advance the VM's
+    boot phase. Raises `VerifierFailed` (miner-side
     reject) or `VerifierUnavailable`.
     """
     bin_path = Path(settings.VALI_TICKET_VALIDATOR_BIN)
@@ -586,13 +689,22 @@ def _vm_progress_body(body: dict[str, object]) -> VmProgressBody:
             )
         return value
 
+    milestone = _str("milestone")
+    reason: str | None = None
+    if "reason" in body:
+        reason = _str("reason")
+    # The binary pairs them (a reason iff `awaiting-guardian`); a body that
+    # does not is a drifted contract, never something to act on.
+    if (reason is not None) != (milestone == "awaiting-guardian"):
+        raise VerifierUnavailable("verifier body pairs milestone and reason inconsistently")
     return VmProgressBody(
         schema_version=_int("schema_version"),
         domain=_str("domain"),
         miner_id=_str("miner_id"),
         vm_id=_str("vm_id"),
-        milestone=_str("milestone"),
+        milestone=milestone,
         timestamp_unix=_int("timestamp_unix"),
+        reason=reason,
     )
 
 
@@ -927,6 +1039,70 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
             )
         return value
 
+    def _declared_capacity() -> DeclaredCapacity | None:
+        # All four keys or none: the binary emits them together for a
+        # `v3` body only. A partial set is contract drift.
+        present = [key for key in HEARTBEAT_CAPACITY_KEYS if key in body]
+        if not present:
+            return None
+        if len(present) != len(HEARTBEAT_CAPACITY_KEYS):
+            raise VerifierUnavailable(
+                "verifier body carried a partial capacity declaration"
+            )
+        values = {key: _opt_uint(key) for key in HEARTBEAT_CAPACITY_KEYS}
+        if any(v is None for v in values.values()):
+            raise VerifierUnavailable(
+                "verifier body carried a null capacity declaration"
+            )
+        return DeclaredCapacity(
+            cvm_cpu_budget=_int("cvm_cpu_budget"),
+            cvm_memory_mb_budget=_int("cvm_memory_mb_budget"),
+            asid_capacity=_int("asid_capacity"),
+            asid_used=_int("asid_used"),
+        )
+
+    def _declared_disk() -> DeclaredDisk | None:
+        # All four keys or none: the binary emits them together for a `v4`
+        # body only. A partial set is contract drift.
+        present = [key for key in HEARTBEAT_DISK_KEYS if key in body]
+        if not present:
+            return None
+        if len(present) != len(HEARTBEAT_DISK_KEYS):
+            raise VerifierUnavailable("verifier body carried a partial disk declaration")
+        values = {key: _opt_uint(key) for key in HEARTBEAT_DISK_KEYS}
+        if any(v is None for v in values.values()):
+            raise VerifierUnavailable("verifier body carried a null disk declaration")
+        return DeclaredDisk(
+            cvm_disk_gb_budget=_int("cvm_disk_gb_budget"),
+            data_disk_total_gb=_int("data_disk_total_gb"),
+            data_disk_available_gb=_int("data_disk_available_gb"),
+            staging_disk_available_gb=_int("staging_disk_available_gb"),
+        )
+
+    def _declared_host_health() -> DeclaredHostHealth | None:
+        # All four keys or none: the binary emits them together for a `v5`
+        # body only. A partial set, or a wrong type, is contract drift.
+        present = [key for key in HEARTBEAT_HOST_HEALTH_KEYS if key in body]
+        if not present:
+            return None
+        if len(present) != len(HEARTBEAT_HOST_HEALTH_KEYS):
+            raise VerifierUnavailable(
+                "verifier body carried a partial host-health report"
+            )
+        if not isinstance(body["snp_enabled"], bool):
+            raise VerifierUnavailable(
+                "verifier body field 'snp_enabled' is not a boolean"
+            )
+        counts = {key: _opt_uint(key) for key in HEARTBEAT_HOST_HEALTH_KEYS[1:]}
+        if any(v is None for v in counts.values()):
+            raise VerifierUnavailable("verifier body carried a null host-health report")
+        return DeclaredHostHealth(
+            snp_enabled=body["snp_enabled"],
+            cpus_offline=_int("cpus_offline"),
+            snp_launches_since_boot=_int("snp_launches_since_boot"),
+            df_flush_failures=_int("df_flush_failures"),
+        )
+
     return HeartbeatBody(
         schema_version=_int("schema_version"),
         domain=_str("domain"),
@@ -935,6 +1111,9 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
         sequence=_int("sequence"),
         memory_available_mib=_opt_uint("memory_available_mib"),
         graceful_exit_requested=_bool_default_false("graceful_exit_requested"),
+        declared_capacity=_declared_capacity(),
+        declared_disk=_declared_disk(),
+        declared_host_health=_declared_host_health(),
     )
 
 
@@ -994,6 +1173,129 @@ class LiveAttestationFields:
     chain_genesis_hex: str
     pallet_instance_hex: str
     body_digest_hex: str
+    # Schema v2 only (all three `None` on v1): the guest the KBS bound
+    # this `vm_id` to — its SNP CHIP_ID and PSP-assigned REPORT_ID, and
+    # whether that binding was recorded at the §20 release (`release`) or
+    # is merely the guest that asked, with no release on record — e.g.
+    # after a KBS restart (`first-use`).
+    binding_source: str | None = None
+    chip_id_hex: str | None = None
+    report_id_hex: str | None = None
+    # Schema v3 only (all four `None` before): what the guest attested it
+    # runs with — vCPUs online, the firmware map's `System RAM` (KiB, `0`
+    # when the guest kernel has no firmware map), `MemTotal` (KiB) and the
+    # RAM it has not accepted yet (KiB). Bound into the PSP-signed
+    # REPORT_DATA, so the relaying miner cannot change them; see
+    # `apps.telemetry.guest_resources`.
+    vcpus_online: int | None = None
+    mem_firmware_kib: int | None = None
+    mem_total_kib: int | None = None
+    mem_unaccepted_kib: int | None = None
+    # Schema v4 only (all `None` before): the guest components release the
+    # guest attested it booted, its security epoch, the health bitmap of
+    # its agents (`hippius_types::live_attestation::components_health`),
+    # the keepalive process's random instance and how many of that
+    # process's ticks found a check failing (counted in the guest before
+    # anything leaves it). See docs/design/guest-component-rollout.md.
+    components_release_version: int | None = None
+    components_security_epoch: int | None = None
+    components_health: int | None = None
+    components_instance: int | None = None
+    components_unhealthy_ticks: int | None = None
+
+
+#: `schema_version` of a body that carries the guest binding.
+LIVE_ATTESTATION_SCHEMA_VERSION_BOUND = 2
+#: `schema_version` of a body that carries the attested guest resources
+#: (and the guest binding when the KBS runs a binding mode).
+LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES = 3
+#: `schema_version` of a body that carries the attested guest components
+#: (the binding and the resources each optional).
+LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS = 4
+_U32_MAX = 2**32 - 1
+LIVE_ATTESTATION_BINDING_SOURCES: frozenset[str] = frozenset({"release", "first-use"})
+_CHIP_ID_HEX_LEN = 128
+_REPORT_ID_HEX_LEN = 64
+
+
+def _live_attestation_binding(
+    body: dict[str, object], schema_version: int
+) -> tuple[str | None, str | None, str | None]:
+    """The v2 guest-binding triple, or all `None` on v1. The Rust binary
+    guarantees v1 ⇔ absent and v2 ⇔ present; a drift is vali-side."""
+    names = ("binding_source", "chip_id_hex", "report_id_hex")
+    present = [body.get(n) is not None for n in names]
+    if (
+        schema_version
+        in (LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES, LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS)
+        and not any(present)
+    ):
+        return None, None, None
+    if schema_version not in (
+        LIVE_ATTESTATION_SCHEMA_VERSION_BOUND,
+        LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES,
+        LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS,
+    ):
+        if any(present):
+            raise VerifierUnavailable("v1 live-attestation body carries a guest binding")
+        return None, None, None
+    source, chip, report = (_ha_str(body, n) for n in names)
+    if source not in LIVE_ATTESTATION_BINDING_SOURCES:
+        raise VerifierUnavailable(f"unknown live-attestation binding_source {source!r}")
+    for name, value, length in (
+        ("chip_id_hex", chip, _CHIP_ID_HEX_LEN),
+        ("report_id_hex", report, _REPORT_ID_HEX_LEN),
+    ):
+        if len(value) != length or not all(c in "0123456789abcdef" for c in value):
+            raise VerifierUnavailable(f"live-attestation {name} is not {length} lower hex")
+    return source, chip, report
+
+
+def _live_attestation_resources(
+    body: dict[str, object], schema_version: int
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """The resource quadruple: required on v3, optional (all or none) on
+    v4, absent before. As for the binding, the Rust binary guarantees the
+    shape; a drift is vali-side."""
+    names = ("vcpus_online", "mem_firmware_kib", "mem_total_kib", "mem_unaccepted_kib")
+    if schema_version == LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS and not any(
+        body.get(n) is not None for n in names
+    ):
+        return None, None, None, None
+    if schema_version not in (
+        LIVE_ATTESTATION_SCHEMA_VERSION_RESOURCES,
+        LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS,
+    ):
+        if any(body.get(n) is not None for n in names):
+            raise VerifierUnavailable("pre-v3 live-attestation body carries guest resources")
+        return None, None, None, None
+    vcpus, mem_fw, mem_total, mem_unaccepted = (_ha_int(body, n) for n in names)
+    if vcpus <= 0 or mem_total <= 0 or mem_fw < 0 or mem_unaccepted < 0:
+        raise VerifierUnavailable("live-attestation guest resources out of range")
+    return vcpus, mem_fw, mem_total, mem_unaccepted
+
+
+_COMPONENT_NAMES = (
+    "components_release_version",
+    "components_security_epoch",
+    "components_health",
+    "components_instance",
+    "components_unhealthy_ticks",
+)
+
+
+def _live_attestation_components(
+    body: dict[str, object], schema_version: int
+) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    """The v4 components quintuple, or all `None` before v4."""
+    if schema_version != LIVE_ATTESTATION_SCHEMA_VERSION_COMPONENTS:
+        if any(body.get(n) is not None for n in _COMPONENT_NAMES):
+            raise VerifierUnavailable("pre-v4 live-attestation body carries guest components")
+        return None, None, None, None, None
+    values = tuple(_ha_int(body, n) for n in _COMPONENT_NAMES)
+    if any(v < 0 or v > _U32_MAX for v in values):
+        raise VerifierUnavailable("live-attestation guest components out of range")
+    return values  # type: ignore[return-value]
 
 
 def verify_live_attestation(
@@ -1020,8 +1322,22 @@ def verify_live_attestation(
     if not isinstance(body, dict):
         raise VerifierUnavailable("live-attestation accept carried no body object")
     try:
+        schema_version = _ha_int(body, "schema_version")
+        binding_source, chip_id_hex, report_id_hex = _live_attestation_binding(
+            body, schema_version
+        )
+        vcpus_online, mem_firmware_kib, mem_total_kib, mem_unaccepted_kib = (
+            _live_attestation_resources(body, schema_version)
+        )
+        (
+            components_release_version,
+            components_security_epoch,
+            components_health,
+            components_instance,
+            components_unhealthy_ticks,
+        ) = _live_attestation_components(body, schema_version)
         return LiveAttestationFields(
-            schema_version=_ha_int(body, "schema_version"),
+            schema_version=schema_version,
             vm_id=_ha_str(body, "vm_id"),
             node_id_hex=_ha_str(body, "node_id_hex"),
             attestation_seq=_ha_int(body, "attestation_seq"),
@@ -1037,6 +1353,18 @@ def verify_live_attestation(
             chain_genesis_hex=_ha_str(body, "chain_genesis_hex"),
             pallet_instance_hex=_ha_str(body, "pallet_instance_hex"),
             body_digest_hex=_ha_str(body, "body_digest_hex"),
+            binding_source=binding_source,
+            chip_id_hex=chip_id_hex,
+            report_id_hex=report_id_hex,
+            vcpus_online=vcpus_online,
+            mem_firmware_kib=mem_firmware_kib,
+            mem_total_kib=mem_total_kib,
+            mem_unaccepted_kib=mem_unaccepted_kib,
+            components_release_version=components_release_version,
+            components_security_epoch=components_security_epoch,
+            components_health=components_health,
+            components_instance=components_instance,
+            components_unhealthy_ticks=components_unhealthy_ticks,
         )
     except VerifierUnavailable:
         raise

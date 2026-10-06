@@ -2,7 +2,7 @@
 # Step-order golden for `hippius-release-core.sh` (multi-OS series).
 #
 # The §21 unlock sequence's ORDER is security-load-bearing (audit
-# Codex #8: the #296 header gate MUST precede any network activity;
+# Review #8: the #296 header gate MUST precede any network activity;
 # userdata MUST land before the KEK; the state disk MUST be mounted
 # before the release). Both family wrappers delegate to the core's
 # drivers, so pinning the drivers' call order here protects both.
@@ -71,8 +71,16 @@ fi
 # 5. userdata-before-KEK: the release invocation must carry
 #    --userdata-out (the binary enforces write-before-KEK; the flag
 #    being present is the script-side contract).
-body hippius_run_release | grep -q -- '--userdata-out /run/cloud-init/seed/user-data' \
+#    Legacy and golden M0 keep the NoCloud seed as the default target;
+#    only the golden M1/M2 path points it at a staging file (H5b).
+body hippius_run_release | grep -q -- '--userdata-out "$HIPPIUS_USERDATA_OUT"' \
     || err "hippius_run_release lost --userdata-out (fail-closed userdata ordering)"
+# Assigned once at source time (never from the environment), and not
+# re-assigned anywhere else in the core.
+grep -qx 'HIPPIUS_USERDATA_OUT="/run/cloud-init/seed/user-data"' "${CORE}" \
+    || err "the core's --userdata-out is no longer pinned to the NoCloud seed at source time"
+[[ "$(grep -c 'HIPPIUS_USERDATA_OUT=' "${CORE}")" -eq 1 ]] \
+    || err "the core assigns HIPPIUS_USERDATA_OUT more than once"
 
 # 6. Both wrappers source the core and use only the drivers.
 for wrapper in "${HERE}/../initramfs/hippius-luks-keyscript" \

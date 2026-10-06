@@ -17,9 +17,14 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BAKE="${HERE}/../tenant-image-bake.sh"
+REBUILD="${HERE}/../tenant-initrd-rebuild.sh"
+# The guest components release tools live in /usr/local/bin/guest/, so
+# their ${SCRIPT_DIR}/X is /usr/local/bin/guest/X (normalised below).
+GUEST_BUILD="${HERE}/../guest/build-guest-release.sh"
+GUEST_INITRD="${HERE}/../guest/guest-initrd-build.sh"
 DOCKERFILE="${HERE}/../../binaries/tenant-baker/Dockerfile"
 
-for f in "${BAKE}" "${DOCKERFILE}"; do
+for f in "${BAKE}" "${REBUILD}" "${GUEST_BUILD}" "${GUEST_INITRD}" "${DOCKERFILE}"; do
     [[ -r "${f}" ]] || { echo "baker-assets-test: missing ${f}"; exit 1; }
 done
 
@@ -40,9 +45,15 @@ JOINED="$(mktemp)"
 trap 'rm -f "${JOINED}"' EXIT
 sed -e ':a' -e '/\\$/{N;s/\\\n[[:space:]]*/ /;ba' -e '}' "${DOCKERFILE}" > "${JOINED}"
 mapfile -t REFS < <(
-    grep -oE '\$\{SCRIPT_DIR\}/[A-Za-z0-9_./-]+' "${BAKE}" \
+    grep -ohE '\$\{SCRIPT_DIR\}/[A-Za-z0-9_./-]+' "${BAKE}" "${REBUILD}" \
     | sed 's|\${SCRIPT_DIR}/||' \
     | grep -v '^\.\.$' \
+    | sort -u
+)
+mapfile -t -O "${#REFS[@]}" REFS < <(
+    grep -ohE '\$\{SCRIPT_DIR\}/[A-Za-z0-9_./-]+' "${GUEST_BUILD}" "${GUEST_INITRD}" \
+    | sed 's|\${SCRIPT_DIR}/|guest/|' \
+    | while read -r r; do realpath -m --relative-to=/x "/x/${r}"; done \
     | sort -u
 )
 

@@ -16,8 +16,8 @@ zero occurrences of it; `dev` additionally has
 
 A runtime upgrade does not delete storage, so the pallet's twox-128 prefix keeps
 answering reads. `state_getStorage` on `ComputeScoring.CurrentEpoch` still
-returns `2702` — but `api.tx.computeScoring` is gone, so `close-epoch.mjs` dies
-at its first chain call. vali reports `read-miner-status ok: current_epoch=2702`
+returns the last epoch — but `api.tx.computeScoring` is gone, so `close-epoch.mjs` dies
+at its first chain call. vali reports `read-miner-status ok: current_epoch=<N>`
 every 30 s off a **fossil**.
 
 Two consequences that are easy to miss:
@@ -45,7 +45,7 @@ stopped the port dead.
 1. Vendor `pallets/compute-scoring/` — from **hippius-compute**, not from `dev`.
    The two copies are identical apart from the #901 genesis price bounds
    (whole-file diff: 40 lines added, 0 removed, 0 changed) and the storage layout
-   is byte-identical, so the epoch-2702 state decodes either way — but only ours
+   is byte-identical, so the frozen epoch state decodes either way — but only ours
    carries the bounds.
 2. ⚠️ **Vendor `hippius-types` too.** The pallet does
    `hippius-types = { path = "../../hippius-types" }`, and that crate lives in
@@ -99,7 +99,7 @@ stopped the port dead.
    before anyone reads a five-digit jump as "the port landed".
 
 > **Preserve the pallet NAME and index 79.** Storage lives under the twox-128 of
-> the *name*, so the existing state at epoch 2702 is picked up again only if the
+> the *name*, so the existing frozen epoch state is picked up again only if the
 > name matches. The index governs call encoding.
 >
 > ⚠️ There is a `pallets/compute` on `main` already — that is `pallet-compute`,
@@ -228,7 +228,7 @@ decide whether they are what you expect.
 ## Step 6 — resume
 
 `deploy/gitops/apps/vali/values.yaml`, `epochClose.suspend: false`, then apply.
-The first close submits the **entire** accumulated bucket for epoch 2702 as one
+The first close submits the **entire** accumulated bucket for the frozen epoch as one
 epoch's weights — the ledger has been filling since 2026-08-03 and cannot roll
 over until an epoch closes. Expect that first submission to be large and
 lopsided; it is not a bug, but look at the dry run before accepting it.

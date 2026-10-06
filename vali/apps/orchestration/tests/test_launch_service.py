@@ -9,6 +9,9 @@ is faked so the loop logic is tested in isolation.
 
 from __future__ import annotations
 
+import uuid
+from types import SimpleNamespace
+
 import pytest
 from django.utils import timezone
 
@@ -16,7 +19,7 @@ from apps.identity.models import PrincipalScope, ServiceClient
 from apps.miners.models import MinerIdentity, MinerStatus
 from apps.orchestration.services import launch
 from apps.scheduler import chain
-from apps.scheduler.models import Placement, PlacementStatus
+from apps.scheduler.models import Placement, PlacementFailureSource, PlacementStatus
 
 from apps.scheduler.tests.factories import (  # isort: skip
     make_miner,
@@ -56,7 +59,7 @@ def _register_miner(seed: int) -> MinerIdentity:
     dark even though it is on-chain Active.
     """
     return MinerIdentity.objects.create(
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{chr(ord('a') + seed - 1)}",
         pubkey_hex=format(seed, "064x"),
         platform_id=f"{seed:02x}" + "cd" * 15,
         netbird_ip="100.64.0." + str(seed),
@@ -88,7 +91,7 @@ def test_launch_vm_accepts_on_first_miner(monkeypatch) -> None:
     result = launch.launch_vm(_spec(), actor)
 
     assert result.ok is True
-    assert result.miner_id == "miner-1"
+    assert result.miner_id == "miner-a"
     assert result.miner_node_id == node_id(1)
     # Exactly one Bound placement, no Failed.
     assert Placement.objects.filter(status=PlacementStatus.BOUND.value).count() == 1
@@ -118,7 +121,7 @@ def test_launch_vm_stamps_vm_host_on_success(monkeypatch) -> None:
     result = launch.launch_vm(_spec(vm_id="vm-host-1"), actor)
 
     assert result.ok is True
-    assert Vm.objects.get(vm_id="vm-host-1").host == "miner-1"
+    assert Vm.objects.get(vm_id="vm-host-1").host == "miner-a"
 
 
 def test_launch_vm_does_not_clobber_existing_vm_host(monkeypatch) -> None:
@@ -152,20 +155,20 @@ def test_launch_vm_does_not_clobber_existing_vm_host(monkeypatch) -> None:
 
 
 def test_launch_vm_replaces_on_retriable_then_accepts(monkeypatch) -> None:
-    """The core re-place loop: miner-1 rejects (retriable) → miner-2
-    accepts. One Failed + one Bound placement, miner-1 excluded."""
+    """The core re-place loop: miner-a rejects (retriable) → miner-b
+    accepts. One Failed + one Bound placement, miner-a excluded."""
     actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
     _register_miner(1)
     _register_miner(2)
     # Both miners eligible; decide_placement tie-breaks on lowest node_id,
-    # so miner-1 (node 0…01) is tried first, then miner-2 after exclusion.
+    # so miner-a (node 0…01) is tried first, then miner-b after exclusion.
     monkeypatch.setattr(
         chain, "read_miner_status",
         lambda: make_snapshot(10, [make_miner(1), make_miner(2)]),
     )
 
     def fake(spec, miner):
-        if miner.miner_id == "miner-1":
+        if miner.miner_id == "miner-a":
             return _outcome(launch.RETRIABLE, miner.miner_id)
         return _outcome(launch.ACCEPTED, miner.miner_id)
 
@@ -174,16 +177,19 @@ def test_launch_vm_replaces_on_retriable_then_accepts(monkeypatch) -> None:
     result = launch.launch_vm(_spec(), actor)
 
     assert result.ok is True
-    assert result.miner_id == "miner-2"
+    assert result.miner_id == "miner-b"
     # The audit trail records both attempts in order.
     assert [a["disposition"] for a in result.attempts] == [
         launch.RETRIABLE,
         launch.ACCEPTED,
     ]
-    # miner-1's placement Failed; miner-2's Bound.
-    assert Placement.objects.filter(
-        miner_node_id=node_id(1), status=PlacementStatus.FAILED.value
-    ).count() == 1
+    # miner-a's placement Failed; miner-b's Bound.
+    failed = Placement.objects.get(miner_node_id=node_id(1), status=PlacementStatus.FAILED.value)
+    # provenance: `_fail_placement` stamps `launch`; the operator readout
+    # then maps the stored outcome (here the default, an emit with no
+    # `outcome` key → `launch-failed`)
+    assert failed.failure_source == PlacementFailureSource.LAUNCH
+    assert failed.reason == "launch-failed"
     assert Placement.objects.filter(
         miner_node_id=node_id(2), status=PlacementStatus.BOUND.value
     ).count() == 1
@@ -199,7 +205,7 @@ def test_launch_vm_replaces_on_retriable_then_accepts(monkeypatch) -> None:
     # UNCOVERED by tests — stated rather than implied.
     from apps.lifecycle.models import Vm
 
-    assert Vm.objects.get(vm_id=_spec().vm_id).host == "miner-2"
+    assert Vm.objects.get(vm_id=_spec().vm_id).host == "miner-b"
 
 
 def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
@@ -207,7 +213,7 @@ def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
 ) -> None:
     """A dispatch failure AFTER the KBS register (registered=True) must
     retry the SAME miner — re-placing would kbs-admin-conflict. Two
-    transient failures then accept, all on miner-1; miner-2 never tried."""
+    transient failures then accept, all on miner-a; miner-b never tried."""
     actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
     _register_miner(1)
     _register_miner(2)
@@ -222,9 +228,9 @@ def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
 
     def fake(spec, miner):
         calls.append(miner.miner_id)
-        # miner-1 dispatch-fails twice post-register, then accepts.
-        n = calls.count("miner-1")
-        if miner.miner_id == "miner-1" and n < 3:
+        # miner-a dispatch-fails twice post-register, then accepts.
+        n = calls.count("miner-a")
+        if miner.miner_id == "miner-a" and n < 3:
             return launch.LaunchOutcome(
                 disposition=launch.RETRIABLE,
                 emit={"ok": False, "outcome": "miner-rejected"},
@@ -238,9 +244,9 @@ def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
     result = launch.launch_vm(_spec(), actor)
 
     assert result.ok is True
-    assert result.miner_id == "miner-1"
-    # Retried the SAME miner — never re-placed to miner-2.
-    assert calls == ["miner-1", "miner-1", "miner-1"]
+    assert result.miner_id == "miner-a"
+    # Retried the SAME miner — never re-placed to miner-b.
+    assert calls == ["miner-a", "miner-a", "miner-a"]
     assert Placement.objects.filter(
         miner_node_id=node_id(2)
     ).count() == 0
@@ -279,8 +285,8 @@ def test_launch_vm_terminal_when_post_register_dispatch_keeps_failing(
 
     assert result.ok is False
     assert result.outcome == "dispatch-failed-after-register"
-    # First attempt + 2 retries, ALL on miner-1; never re-placed.
-    assert calls == ["miner-1", "miner-1", "miner-1"]
+    # First attempt + 2 retries, ALL on miner-a; never re-placed.
+    assert calls == ["miner-a", "miner-a", "miner-a"]
     assert Placement.objects.filter(miner_node_id=node_id(2)).count() == 0
 
 
@@ -311,8 +317,12 @@ def test_launch_vm_stops_on_terminal(monkeypatch) -> None:
     assert result.ok is False
     assert result.outcome == "vault-failure"
     # Stopped after the first miner — did NOT re-place.
-    assert calls == ["miner-1"]
-    assert Placement.objects.filter(status=PlacementStatus.FAILED.value).count() == 1
+    assert calls == ["miner-a"]
+    failed = Placement.objects.get(status=PlacementStatus.FAILED.value)
+    # provenance is `launch` even for a control-plane fault — the operator
+    # readout excludes it by OUTCOME (`vault-failure` is vali's fault)
+    assert failed.failure_source == PlacementFailureSource.LAUNCH
+    assert failed.reason == "vault-failure"
     assert Placement.objects.filter(status=PlacementStatus.BOUND.value).count() == 0
 
 
@@ -504,7 +514,15 @@ def _fake_the_launch_choreography(monkeypatch, *, dispatch_ok: bool) -> None:
     # harmless only because every consumer is stubbed — exactly the kind of
     # fixture lie that misleads the next person.
     monkeypatch.setattr(ticket_mint, "mint", lambda *a, **k: b"cose")
-    monkeypatch.setattr(eff, "mint_netbird_setup_key", lambda *a, **k: "key")
+    monkeypatch.setattr(
+        "apps.orchestration.services.migration_ticket.persist_intake",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        eff,
+        "mint_netbird_setup_key",
+        lambda *a, **k: eff.MintedSetupKey(id=uuid.uuid4().hex, key="key"),
+    )
     class _Admin:
         def __init__(self, vm_id: str) -> None:
             self.vm_id = vm_id
@@ -565,7 +583,152 @@ def test_launch_on_miner_stamps_vm_host_on_an_accepted_dispatch(monkeypatch) -> 
     )
 
     assert out.disposition == launch.ACCEPTED, out.emit
-    assert Vm.objects.get(vm_id="vm-launch-1").host == "miner-1"
+    assert Vm.objects.get(vm_id="vm-launch-1").host == "miner-a"
+
+
+@pytest.mark.django_db
+def test_launch_on_miner_pins_with_the_vms_ledger_row(monkeypatch) -> None:
+    """The pin records the VM's ledger row itself, under its lock (#1340):
+    the next pin's carry-forward reads it, so it must name this VM, the
+    chip and the miner the VM was dispatched to."""
+    from apps.orchestration.services import allowlist_pin
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    pins: list[dict] = []
+
+    def fake_pin(**kwargs):
+        pins.append(kwargs)
+        return allowlist_pin.PinResult(
+            new_epoch=7, new_cose_sha256_hex="00" * 32, s3_url="s3://b/k"
+        )
+
+    monkeypatch.setattr(allowlist_pin, "pin_measurement", fake_pin)
+
+    out = launch.launch_on_miner(
+        _spec(
+            auto_pin_allowlist=True,
+            userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n",
+        ),
+        miner,
+    )
+
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert [p["ledger"] for p in pins] == [
+        allowlist_pin.PinLedger(
+            vm_id="vm-launch-1",
+            platform_id=miner.platform_id,
+            node_id="miner-a",
+            flavor="small",
+        )
+    ]
+    # ...and ONLY through the pin: the launch writes no row of its own after
+    # it (this fake pin writes none), which is the pre-#1340 window where
+    # a concurrent pin read a carry-forward without this VM.
+    from apps.orchestration.models import MeasurementLedger
+
+    assert not MeasurementLedger.objects.filter(vm_id="vm-launch-1").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("enforce", "explicit", "recomputed"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_the_pin_says_whether_it_is_valis_own_recompute(
+    monkeypatch, enforce: bool, explicit: bool, recomputed: bool
+) -> None:
+    """`recomputed` only when the pinned digest IS vali's recompute (C2
+    ENFORCE, no operator override) — WARN mode pins the miner's digest. The
+    caller's `launch_ref` rides the same row (a guest upgrade's attempt)."""
+    from apps.orchestration.services import allowlist_pin
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    monkeypatch.setattr(launch.launch_digest_svc, "enforce", lambda: enforce)
+    monkeypatch.setattr(launch.launch_digest_svc, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        launch.launch_digest_svc, "recompute_expected_digest", lambda **kw: "ab" * 48
+    )
+    pins: list[dict] = []
+
+    def fake_pin(**kwargs):
+        pins.append(kwargs)
+        return allowlist_pin.PinResult(
+            new_epoch=7, new_cose_sha256_hex="00" * 32, s3_url="s3://b/k"
+        )
+
+    monkeypatch.setattr(allowlist_pin, "pin_measurement", fake_pin)
+
+    out = launch.launch_on_miner(
+        _spec(
+            auto_pin_allowlist=True,
+            userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n",
+            **({"measurement_hex": "ab" * 48} if explicit else {}),
+        ),
+        miner,
+        launch_ref="attempt-1",
+    )
+
+    assert out.disposition == launch.ACCEPTED, out.emit
+    (pin,) = pins
+    assert (pin["ledger"].recomputed, pin["ledger"].launch_ref) == (recomputed, "attempt-1")
+
+
+@pytest.mark.django_db
+def test_a_pin_stuck_behind_other_pins_is_retriable_not_terminal(monkeypatch) -> None:
+    """The tail of a burst of starts waits out the pin lock. Nothing was
+    signed and the KBS is not registered yet, so the launch is RETRIABLE —
+    terminal would fail those VMs for vali's own queue."""
+    from apps.orchestration.services import allowlist_pin
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+
+    def busy(**_kwargs):
+        raise allowlist_pin.AllowlistPinBusy("another pin held the lock for over 30s")
+
+    monkeypatch.setattr(allowlist_pin, "pin_measurement", busy)
+
+    out = launch.launch_on_miner(
+        _spec(
+            auto_pin_allowlist=True,
+            userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n",
+        ),
+        miner,
+    )
+
+    assert out.disposition == launch.RETRIABLE
+    assert out.emit["outcome"] == launch.ALLOWLIST_PIN_BUSY
+    assert out.registered is False
+
+
+def test_launch_vm_keeps_a_miner_eligible_after_a_busy_pin(monkeypatch) -> None:
+    """A busy pin is vali's queue, not the miner: the re-place may pick the
+    same (here: the only) miner again instead of running out of miners."""
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    _register_miner(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    calls: list[str] = []
+
+    def fake(spec, miner):
+        calls.append(miner.miner_id)
+        if len(calls) == 1:
+            return launch.LaunchOutcome(
+                disposition=launch.RETRIABLE,
+                emit={"ok": False, "outcome": launch.ALLOWLIST_PIN_BUSY, "error": "busy"},
+                exit_code=launch.EXIT_ALLOWLIST_FAILURE,
+            )
+        return _outcome(launch.ACCEPTED, miner.miner_id)
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.ok is True, result.emit
+    assert calls == ["miner-a", "miner-a"]
+    failed = Placement.objects.get(status=PlacementStatus.FAILED.value)
+    assert failed.reason == launch.ALLOWLIST_PIN_BUSY
 
 
 @pytest.mark.django_db
@@ -596,3 +759,484 @@ def test_launch_on_miner_does_NOT_stamp_a_rejected_dispatch(monkeypatch) -> None
         "a rejected dispatch must not claim the host — the first stamp wins "
         "forever, so it would permanently mis-bind the VM"
     )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("generation", ["", "genoa", "milan"])
+def test_launch_on_miner_recomputes_the_digest_for_the_miners_generation(
+    monkeypatch, generation: str
+) -> None:
+    """The C2 recompute is handed the placed miner's registered
+    `snp_generation` — the only thing that tells a Milan host (64-byte
+    CHIP_ID, like Genoa) apart. Unset stays unset (legacy inference)."""
+    miner = _register_miner(1)
+    miner.platform_id = "ef" * 64
+    miner.snp_generation = generation
+    miner.save(update_fields=["platform_id", "snp_generation"])
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    monkeypatch.setattr(launch.launch_digest_svc, "enforce", lambda: True)
+    monkeypatch.setattr(launch.launch_digest_svc, "is_enabled", lambda: True)
+    seen: list[dict] = []
+
+    def _recompute(**kw):
+        seen.append(kw)
+        return "ab" * 48  # == the faked preflight digest
+
+    monkeypatch.setattr(
+        launch.launch_digest_svc, "recompute_expected_digest", _recompute
+    )
+
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert len(seen) == 1
+    assert seen[0]["platform_id"] == "ef" * 64
+    assert seen[0]["snp_generation"] == generation
+
+
+@pytest.mark.django_db
+def test_launch_on_miner_refuses_a_stale_explicit_measurement(monkeypatch) -> None:
+    """A caller-supplied measurement_hex that does not match vali's C2
+    recompute of the measured cmdline is pinned + ticketed AS-IS while the
+    guest boots the recomputed cmdline → guaranteed KBS denial. Refuse it.
+
+    This guards an operator/dev override gone stale after a measured-cmdline
+    change (e.g. systemd.import_credentials=no). Production never supplies
+    measurement_hex, so the path costs nothing there."""
+    miner = _register_miner(1)
+    miner.platform_id = "ef" * 64
+    miner.save(update_fields=["platform_id"])
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    monkeypatch.setattr(launch.launch_digest_svc, "enforce", lambda: True)
+    monkeypatch.setattr(launch.launch_digest_svc, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        launch.launch_digest_svc, "recompute_expected_digest", lambda **kw: "ab" * 48
+    )
+
+    out = launch.launch_on_miner(
+        _spec(
+            measurement_hex="cd" * 48,
+            userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n",
+        ),
+        miner,
+    )
+
+    assert out.disposition == launch.TERMINAL, out.emit
+    assert out.emit["outcome"] == "explicit-measurement-stale"
+    assert out.exit_code == launch.EXIT_MEASUREMENT_MISMATCH
+
+
+@pytest.mark.django_db
+def test_launch_on_miner_accepts_a_matching_explicit_measurement(monkeypatch) -> None:
+    """An explicit measurement that DOES match the recompute is not stale —
+    the refusal must fire only on a mismatch."""
+    miner = _register_miner(1)
+    miner.platform_id = "ef" * 64
+    miner.save(update_fields=["platform_id"])
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    monkeypatch.setattr(launch.launch_digest_svc, "enforce", lambda: True)
+    monkeypatch.setattr(launch.launch_digest_svc, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        launch.launch_digest_svc, "recompute_expected_digest", lambda **kw: "ab" * 48
+    )
+
+    out = launch.launch_on_miner(
+        _spec(
+            measurement_hex="ab" * 48,
+            userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n",
+        ),
+        miner,
+    )
+
+    assert out.disposition == launch.ACCEPTED, out.emit
+
+
+# ── the userdata copies staged per launch attempt ────────────────────
+
+
+@pytest.mark.django_db
+def test_both_userdata_copies_hold_the_substituted_bytes(monkeypatch) -> None:
+    """Two copies, and they must agree.
+
+    `{vm}/userdata` is what the ticket binds and the KBS releases, wrapped
+    under `kek-<vm_id>`. `{vm}/userdata-pending` is vali's working copy,
+    wrapped under `ud-<vm_id>` — the only one vali can reopen, and what
+    the §25 / KBS-recovery re-mint re-derives the §6 digest from. So it
+    has to hold the SUBSTITUTED bytes, not the template intake staged: a
+    digest over the template binds bytes the guest never receives, and the
+    release denies.
+
+    And the digest itself stays over the PLAINTEXT — the guest re-derives
+    it that way (`hippius_guest::release`) and refuses otherwise.
+    """
+    from apps.orchestration.services import userdata_digest
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+
+    from apps.orchestration import effects as eff
+    from apps.orchestration.services import ticket_mint, vault_kv
+
+    puts: list[tuple[str, bytes]] = []
+    encrypts: list[tuple[str, bytes]] = []
+    mint_args: dict = {}
+
+    class _V:
+        version = 4
+
+    monkeypatch.setattr(
+        vault_kv, "put_kv", lambda mount, path, value, **kw: (
+            puts.append((path, value)) or _V()
+        )
+    )
+    monkeypatch.setattr(
+        vault_kv,
+        "transit_encrypt",
+        lambda name, pt: (
+            encrypts.append((name, pt))
+            or b"vault:v1:" + pt.hex().encode("ascii")
+        ),
+    )
+    monkeypatch.setattr(
+        ticket_mint, "mint", lambda args: mint_args.update(args=args) or b"cose"
+    )
+    monkeypatch.setattr(
+        "apps.orchestration.services.migration_ticket.persist_intake",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        eff,
+        "mint_netbird_setup_key",
+        lambda **kw: eff.MintedSetupKey(id=uuid.uuid4().hex, key="fake-key"),
+    )
+
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+    assert out.disposition == launch.ACCEPTED, out.emit
+
+    canonical = next(v for p, v in puts if p.endswith("/userdata"))
+    working = next(v for p, v in puts if p.endswith("/userdata-pending"))
+    assert canonical.startswith(b"vault:") and working.startswith(b"vault:")
+    # Same bytes underneath, both with the NetBird key substituted — and
+    # the working copy STAMPED with the canonical version it belongs to,
+    # which is what lets the §25 re-mint prove the correspondence (the two
+    # writes are not atomic).
+    substituted = bytes.fromhex(canonical.removeprefix(b"vault:v1:").decode())
+    working_body = bytes.fromhex(working.removeprefix(b"vault:v1:").decode())
+    assert working_body == launch._WORKING_STAMP + b"4\n" + substituted
+    assert b"fake-key" in substituted
+    assert b"{{NETBIRD_SETUP_KEY}}" not in substituted
+    # …under the two DIFFERENT per-VM keys.
+    assert {name for name, _pt in encrypts} == {"kek-vm-launch-1", "ud-vm-launch-1"}
+
+    args = mint_args["args"]
+    assert args.allowed_userdata_digest_hex == userdata_digest.userdata_digest_hex(
+        tenant_id="t-launch",
+        vm_id="vm-launch-1",
+        ticket_id=args.ticket_id,
+        secret_type=userdata_digest.SECRET_TYPE_USERDATA,
+        path=args.userdata_vault_path,
+        version=args.userdata_vault_version,
+        plaintext=substituted,
+    )
+
+
+@pytest.mark.django_db
+def test_a_decommissioned_vm_id_cannot_be_relaunched(monkeypatch) -> None:
+    """§24 crypto-erased that vm_id: both per-VM Transit keys destroyed,
+    every KV blob deleted. A launch under the same id stages fresh
+    secrets that nothing can ever reach again — a second decommission is
+    refused for an already-Destroyed VM.
+
+    Enforced in `_ensure_vm_row`, which EVERY launch path runs, because
+    the operator CLI never goes through API intake and the async worker
+    acts on a state that may have changed since the POST.
+    """
+    from apps.lifecycle.models import Vm, VmState
+    from apps.orchestration.services import vault_kv
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    puts: list[str] = []
+    monkeypatch.setattr(
+        vault_kv, "put_kv", lambda mount, path, value, **kw: puts.append(path)
+    )
+    Vm.objects.filter(vm_id="vm-launch-1").delete()
+    Vm.objects.create(
+        vm_id="vm-launch-1",
+        tenant_id="t-launch",
+        lease_id="lease-1",
+        state=VmState.DESTROYED,
+        generation=1,
+    )
+
+    with pytest.raises(launch.LaunchConfigError, match="decommissioned"):
+        launch.launch_on_miner(
+            _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+        )
+    assert puts == [], "secrets were staged under a crypto-erased vm_id"
+
+
+# ── relaunch of a VM §25 moved: minted at its generation, not re-registered
+
+
+def _record_mint_and_register(monkeypatch) -> dict:
+    from apps.orchestration import order_dispatch
+    from apps.orchestration.services import ticket_mint
+
+    seen: dict = {"mint_gens": [], "registered": 0, "cmdlines": []}
+
+    def mint(args, *a, **k):
+        seen["mint_gens"].append(args.vm_generation)
+        return b"cose"
+
+    def register(*a, **k):
+        seen["registered"] += 1
+        return SimpleNamespace(vm_id=k.get("vm_id", ""), vm_generation=1, cached=False)
+
+    def payload(*a, **k):
+        seen["cmdlines"].append(k["cmdline"])
+        return {}
+
+    monkeypatch.setattr(ticket_mint, "mint", mint)
+    monkeypatch.setattr(launch.kbs_admin, "register_vm_active_with_vm_id", register)
+    monkeypatch.setattr(order_dispatch, "build_launch_payload", payload)
+    return seen
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("generation", "registers"), [(1, 1), (3, 0)])
+def test_a_relaunch_mints_at_the_vms_generation(monkeypatch, generation, registers) -> None:
+    """Gen 1 registers `Active{1}` as ever. A moved VM (gen >= 2) is minted
+    at its generation and NOT registered: the KBS row its last §25 activate
+    wrote (`Migrating{new_gen, dest}`) already admits exactly that, and
+    `register-vm` would 409 against it. Its measured cmdline still says
+    generation 1 — what it signs acks at, and what its dest booted."""
+    from apps.lifecycle.models import Vm
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_mint_and_register(monkeypatch)
+    Vm.objects.filter(vm_id="vm-launch-1").delete()
+    Vm.objects.create(
+        vm_id="vm-launch-1", tenant_id="t-launch", state="active",
+        host="miner-a", generation=generation,
+    )
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"),
+        miner,
+        generation=generation,
+    )
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert seen["mint_gens"] == [generation]
+    assert seen["registered"] == registers
+    (cmdline,) = seen["cmdlines"]
+    assert "hippius.vm_generation=1" in cmdline.split()
+
+
+@pytest.mark.django_db
+def test_a_relaunch_at_a_generation_the_vm_does_not_hold_is_refused(monkeypatch) -> None:
+    from apps.lifecycle.models import Vm
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_mint_and_register(monkeypatch)
+    Vm.objects.filter(vm_id="vm-launch-1").delete()
+    Vm.objects.create(
+        vm_id="vm-launch-1", tenant_id="t-launch", state="active", host="miner-a", generation=3
+    )
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner, generation=2
+    )
+    assert out.disposition == launch.TERMINAL
+    assert out.emit["outcome"] == "kbs-admin-vm-state-refused"
+    assert seen["mint_gens"] == [] and seen["registered"] == 0
+
+
+# ── vali records every ticket it launches with (stranded-VM restore) ─────
+
+
+@pytest.mark.django_db
+def test_the_launch_ticket_is_recorded_before_it_is_registered(monkeypatch) -> None:
+    """A §25 stranded-VM restore vetoes any KBS grant whose ticket vali has
+    no intake for; the launch ticket IS the grant of every never-moved VM."""
+    from apps.lifecycle.models import Vm
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_mint_and_register(monkeypatch)
+    events: list[tuple] = []
+
+    def persist(cose, **kw):
+        events.append(("intake", cose, kw))
+
+    def register(*a, **k):
+        events.append(("register",))
+        return SimpleNamespace(vm_id=k.get("vm_id", ""), vm_generation=1, cached=False)
+
+    monkeypatch.setattr("apps.orchestration.services.migration_ticket.persist_intake", persist)
+    monkeypatch.setattr(launch.kbs_admin, "register_vm_active_with_vm_id", register)
+    Vm.objects.filter(vm_id="vm-launch-1").delete()
+    Vm.objects.create(
+        vm_id="vm-launch-1", tenant_id="t-launch", state="active", host="", generation=1
+    )
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert seen["mint_gens"] == [1]
+    (intake, reg) = events
+    assert reg == ("register",)
+    assert intake[1] == b"cose"
+    assert intake[2] == {
+        "vm_id": "vm-launch-1",
+        "generation": 1,
+        "ticket_id": out.ticket_id,
+        "received_from": "system:launch",
+        # The launch reads the mode back out of its own ticket (M0 here).
+        "expected_key_mode": "hippius",
+    }
+
+
+@pytest.mark.django_db
+def test_a_ticket_vali_cannot_record_is_never_registered(monkeypatch) -> None:
+    from apps.lifecycle.models import Vm
+    from apps.orchestration.effects import EffectUnavailable
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_mint_and_register(monkeypatch)
+
+    def persist(cose, **kw):
+        raise EffectUnavailable("validator unavailable")
+
+    monkeypatch.setattr("apps.orchestration.services.migration_ticket.persist_intake", persist)
+    Vm.objects.filter(vm_id="vm-launch-1").delete()
+    Vm.objects.create(
+        vm_id="vm-launch-1", tenant_id="t-launch", state="active", host="", generation=1
+    )
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+    assert out.disposition == launch.TERMINAL
+    assert out.emit["outcome"] == "mint-failure"
+    assert seen["registered"] == 0
+
+
+# ── NetBird: only a FIRST launch mints a persistent-peer key ──────────
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("prior_job_state", "persistent"),
+    [(None, True), ("failed", True), ("running", True), ("succeeded", False)],
+)
+def test_only_a_first_launch_mints_a_persistent_netbird_key(
+    monkeypatch, prior_job_state: str | None, persistent: bool
+) -> None:
+    """A relaunch (power start, reboot-recovery — both rebuild from the VM's
+    SUCCEEDED launch) boots the same overlay, so the guest logs in with the
+    identity it holds and never uses the key. Minted persistent, that spare
+    key would let the guest's root enrol a peer that outlives the VM."""
+    from apps.orchestration import effects as eff
+    from apps.orchestration.models import LaunchJob
+
+    from .factories import make_launch_record
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    if prior_job_state is not None:
+        job = make_launch_record(SimpleNamespace(vm_id="vm-launch-1"))  # type: ignore[arg-type]
+        LaunchJob.objects.filter(id=job.id).update(state=prior_job_state)
+    minted: list[dict] = []
+    monkeypatch.setattr(
+        eff,
+        "mint_netbird_setup_key",
+        lambda **kw: minted.append(kw) or eff.MintedSetupKey(id=uuid.uuid4().hex, key="key"),
+    )
+
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert [kw["persistent"] for kw in minted] == [persistent]
+
+
+# ── NetBird: every minted key is recorded against its VM ──────────────
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("prior_job_state", [None, "succeeded"])
+def test_a_minted_netbird_key_is_recorded_before_it_leaves_vali(
+    monkeypatch, prior_job_state: str | None
+) -> None:
+    """The key's id is recorded against the VM BEFORE the key is staged into
+    the userdata the guest receives: whatever peer enrols with it, under
+    whatever name, is traceable to this VM. Recorded even when the launch
+    dies right after (here: the Vault stage), since the key may already
+    have reached nobody — or somebody."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.lifecycle.models import VmNetbirdKey
+    from apps.orchestration import effects as eff
+    from apps.orchestration.effects import EffectUnavailable
+    from apps.orchestration.models import LaunchJob
+    from apps.orchestration.services import vault_kv
+
+    from .factories import make_launch_record
+
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    if prior_job_state is not None:
+        job = make_launch_record(SimpleNamespace(vm_id="vm-launch-1"))  # type: ignore[arg-type]
+        LaunchJob.objects.filter(id=job.id).update(state=prior_job_state)
+    monkeypatch.setattr(
+        eff,
+        "mint_netbird_setup_key",
+        lambda **kw: eff.MintedSetupKey(id="sk-first", key="the-secret"),
+    )
+
+    def _vault_down(*_a: object, **_k: object) -> None:
+        raise EffectUnavailable("vault: down")
+
+    monkeypatch.setattr(vault_kv, "put_kv", _vault_down)
+
+    before = timezone.now()
+    out = launch.launch_on_miner(
+        _spec(userdata=b"#cloud-config\n# {{NETBIRD_SETUP_KEY}}\n"), miner
+    )
+
+    assert out.emit["outcome"] == "vault-failure", out.emit
+    key = VmNetbirdKey.objects.get()
+    assert (key.vm.vm_id, key.setup_key_id) == ("vm-launch-1", "sk-first")
+    assert key.persistent is (prior_job_state is None)
+    assert (key.peer_id, key.settled_at) == ("", None)
+    # A relaunch key lives at most `RELAUNCH_NETBIRD_KEY_TTL_S`.
+    ttl = 3600 if prior_job_state is None else launch.RELAUNCH_NETBIRD_KEY_TTL_S
+    assert before + timedelta(seconds=ttl - 60) < key.expires_at
+    assert key.expires_at <= timezone.now() + timedelta(seconds=ttl)
+
+
+@pytest.mark.parametrize(
+    ("template", "ok"),
+    [
+        ("hippius-tenant-{vm_id}", True),
+        ("hippius-tenant-{vm_id}-x", False),
+        ("my-{vm_id}", False),
+        ("hippius-tenant-fixed", False),
+        ("bad-{tenant_id}", False),
+    ],
+)
+def test_intake_only_accepts_the_revocable_hostname(template: str, ok: bool) -> None:
+    err = launch.check_netbird_hostname(enable=True, hostname_template=template, vm_id="vm-1")
+    assert (err is None) is ok, err
+
+
+def test_the_hostname_rule_is_off_without_netbird() -> None:
+    assert launch.check_netbird_hostname(enable=False, hostname_template="x", vm_id="vm-1") is None

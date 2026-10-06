@@ -11,7 +11,7 @@
 #
 # Migration to remote state (recommended once the team is >1 operator):
 # create a GCS bucket `hippius-tfstate` (versioned, uniform access,
-# CMEK-encrypted) in your own GCP project, then replace the
+# CMEK-encrypted) in your cloud project, then replace the
 # `backend "local"` block below with the commented `backend "gcs"` one
 # and run `terraform init -migrate-state`. GCS encrypts state at rest
 # and supports state locking — both absent from the local backend.

@@ -394,6 +394,13 @@ BAKE_ARGS=(
     --output-qcow2-gb "${BAKE_SIZE_GB}"
     --disk-mode "${BAKE_DISK_MODE}"
 )
+# F6 scheduled golden re-bake: a non-empty BAKE_PACKAGE_REFRESH (vali's
+# `TenantBake.package_refresh`) makes the bake apply every pending distro
+# update and keys the stage-1 cache on it. Absent ⇒ no flag ⇒ the bake is
+# unchanged.
+if [[ -n "${BAKE_PACKAGE_REFRESH:-}" ]]; then
+    BAKE_ARGS+=(--package-refresh "${BAKE_PACKAGE_REFRESH}")
+fi
 if [[ "${BAKE_DISK_MODE}" == "golden_verity_overlay" ]]; then
     /usr/local/bin/tenant-image-bake.sh "${BAKE_ARGS[@]}"
 else

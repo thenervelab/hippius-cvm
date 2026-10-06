@@ -66,7 +66,7 @@ pub fn recv_ticket(port: u32) -> Result<Vec<u8>, AgentError> {
 
     // Real timeout enforcement: `vsock::VsockListener::accept` blocks
     // forever in blocking mode (`set_read_timeout` only affects an
-    // ACCEPTED stream, not the listener's `accept(2)` itself — codex
+    // ACCEPTED stream, not the listener's `accept(2)` itself — review
     // r1 P2). Use non-blocking + a sleep-poll loop bounded by
     // `ACCEPT_TIMEOUT_SECS` so a host that never connects (crashed
     // miner-agent, mis-allocated CID, dispatch aborted before push)

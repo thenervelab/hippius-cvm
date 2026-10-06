@@ -58,9 +58,15 @@ class FakeVerifier:
         self.verified_at_unix = NOW
         self.expiry_unix = NOW + 900
         self.body_digest_hex = "cc" * 32
+        self.measurement_hex = MEASUREMENT
         # The KBS hash-chain back-pointer. All-zero == this attestation is
         # the genesis of a chain (a fresh VM, or a KBS that just restarted).
         self.prev_attestation_hash_hex = "00" * 32
+        # `(binding_source, chip_id_hex, report_id_hex)` ⇒ a schema v2 body.
+        self.guest: tuple[str, str, str] | None = None
+        # `(vcpus_online, mem_firmware_kib, mem_total_kib, mem_unaccepted_kib)`
+        # ⇒ a schema v3 body.
+        self.resources: tuple[int, int, int, int] | None = None
         self.keys_seen: list[bytes | None] = []
 
     def __call__(self, *, envelope: bytes, verifying_key: bytes | None):
@@ -71,8 +77,14 @@ class FakeVerifier:
             )
         if self.outcome == "unavailable":
             raise verifier.VerifierUnavailable("no binary")
+        source, chip, report = self.guest or (None, None, None)
+        vcpus, mem_fw, mem_total, mem_unaccepted = self.resources or (None, None, None, None)
+        if self.resources is not None:
+            schema_version = 3
+        else:
+            schema_version = 1 if self.guest is None else 2
         return verifier.LiveAttestationFields(
-            schema_version=1,
+            schema_version=schema_version,
             vm_id=self.vm_id,
             node_id_hex=self.node_id_hex,
             attestation_seq=self.attestation_seq,
@@ -80,7 +92,7 @@ class FakeVerifier:
             observed_at_unix=self.verified_at_unix - 1,
             verified_at_unix=self.verified_at_unix,
             expiry_unix=self.expiry_unix,
-            measurement_hex=MEASUREMENT,
+            measurement_hex=self.measurement_hex,
             snp_report_digest_hex="11" * 32,
             vcek_chain_digest_hex="22" * 32,
             prev_attestation_hash_hex=self.prev_attestation_hash_hex,
@@ -88,6 +100,13 @@ class FakeVerifier:
             chain_genesis_hex="33" * 32,
             pallet_instance_hex="dd" * 32,
             body_digest_hex=self.body_digest_hex,
+            binding_source=source,
+            chip_id_hex=chip,
+            report_id_hex=report,
+            vcpus_online=vcpus,
+            mem_firmware_kib=mem_fw,
+            mem_total_kib=mem_total,
+            mem_unaccepted_kib=mem_unaccepted,
         )
 
 
@@ -98,7 +117,18 @@ def fake(monkeypatch) -> FakeVerifier:
     return f
 
 
+def _pin_launch_measurement(vm_id: str, measurement: str) -> None:
+    """What a launch's §22 auto-pin writes — the ingest refuses a VM with
+    no pinned measurement."""
+    from apps.orchestration.models import MeasurementLedger
+
+    MeasurementLedger.objects.create(
+        vm_id=vm_id, launch_digest_hex=measurement, allowlist_epoch=1
+    )
+
+
 def _binding(*, vm_id: str = VM, node_id_hex: str = NODE_ID) -> VmBillingBinding:
+    _pin_launch_measurement(vm_id, MEASUREMENT)
     return VmBillingBinding.objects.create(
         vm_id=vm_id,
         node_id_hex=node_id_hex,
@@ -108,6 +138,143 @@ def _binding(*, vm_id: str = VM, node_id_hex: str = NODE_ID) -> VmBillingBinding
 
 
 # ─── ingest gates ────────────────────────────────────────────────────
+
+
+GENOA_CHIP = "5e" * 64
+REPORT_ID = "7a" * 32
+
+
+def _miner(platform_id: str, *, node_id_hex: str = NODE_ID) -> None:
+    from apps.miners.models import MinerIdentity
+
+    MinerIdentity.objects.create(
+        miner_id="miner-live",
+        pubkey_hex="ab" * 32,
+        platform_id=platform_id,
+        chain_node_id=node_id_hex,
+    )
+
+
+def test_a_v2_body_on_its_registered_chip_records_the_guest(fake) -> None:
+    _binding()
+    _miner(GENOA_CHIP)
+    fake.guest = ("release", GENOA_CHIP, REPORT_ID)
+    row, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+    assert (row.binding_source, row.chip_id, row.report_id) == ("release", GENOA_CHIP, REPORT_ID)
+
+
+def test_a_turin_platform_id_matches_as_a_prefix(fake) -> None:
+    # Turin registers the 8-byte id; the report's CHIP_ID is zero-padded
+    # to 64 — the same prefix rule the KBS release applies.
+    _binding()
+    _miner("c0ffee0012345678")
+    fake.guest = ("release", "c0ffee0012345678" + "00" * 56, REPORT_ID)
+    _, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+
+
+@pytest.mark.parametrize(
+    "platform_id",
+    [
+        "6f" * 64,  # another machine
+        None,  # no MinerIdentity for the node at all
+        "onchain:" + NODE_ID,  # auto-provision placeholder, no real chip
+    ],
+)
+def test_a_v2_body_off_the_nodes_chip_is_refused(fake, platform_id) -> None:
+    _binding()
+    if platform_id is not None:
+        _miner(platform_id)
+    fake.guest = ("release", GENOA_CHIP, REPORT_ID)
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "chip-mismatch"
+    assert VmLiveAttestation.objects.count() == 0
+
+
+def _pin(measurement: str, *, vm_id: str = VM) -> None:
+    from apps.orchestration.models import MeasurementLedger
+
+    MeasurementLedger.objects.create(
+        vm_id=vm_id, launch_digest_hex=measurement, allowlist_epoch=1
+    )
+
+
+@pytest.mark.parametrize("schema", ["v1", "v2"])
+def test_another_vms_guest_attesting_for_this_vm_is_refused(fake, schema) -> None:
+    # The original hole: root in ONE guest mints for ANY vm_id. Each VM's
+    # measured cmdline is its own, so the other guest's measurement is not
+    # one pinned for this vm_id — refused whatever the KBS binding state.
+    _binding()
+    _miner(GENOA_CHIP)
+    # This VM's own launch measurement is "55…"; the guest attesting
+    # carries another VM's.
+    from apps.orchestration.models import MeasurementLedger
+
+    MeasurementLedger.objects.filter(vm_id=VM).update(launch_digest_hex="55" * 48)
+    if schema == "v2":
+        fake.guest = ("first-use", GENOA_CHIP, REPORT_ID)
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "measurement-mismatch"
+    assert VmLiveAttestation.objects.count() == 0
+
+
+def test_a_pinned_measurement_is_accepted(fake) -> None:
+    from apps.orchestration.models import MeasurementLedger
+
+    _binding()
+    MeasurementLedger.objects.filter(vm_id=VM).update(launch_digest_hex=MEASUREMENT.upper())
+    _pin("55" * 48)  # a later relaunch of the same VM
+    _, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+
+
+def test_a_vm_with_no_pinned_measurement_is_refused(fake) -> None:
+    from apps.orchestration.models import MeasurementLedger
+
+    _binding()
+    MeasurementLedger.objects.all().delete()
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "measurement-unpinned"
+    assert VmLiveAttestation.objects.count() == 0
+
+
+def test_a_migrated_vm_is_held_to_the_destination_chip(fake) -> None:
+    # After a §25 cutover the body still declares the LAUNCH node (measured
+    # cmdline), but the guest runs on the destination's chip.
+    from apps.miners.models import MinerIdentity
+    from apps.scheduler.models import VmBillingAssignment
+
+    _binding()
+    _miner(GENOA_CHIP)  # the launch node
+    dest = "bb" * 32
+    MinerIdentity.objects.create(
+        miner_id="miner-dest", pubkey_hex="cd" * 32, platform_id="6f" * 64, chain_node_id=dest
+    )
+    VmBillingAssignment.objects.create(
+        vm_id=VM, node_id_hex=dest, effective_from_unix=NOW - 60, reason="migration"
+    )
+    fake.guest = ("release", "6f" * 64, REPORT_ID)
+    _, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+    # …and the SOURCE chip is no longer where this VM may attest from.
+    fake.guest = ("release", GENOA_CHIP, REPORT_ID)
+    fake.body_digest_hex = "cd" * 32
+    fake.attestation_seq = 2
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "chip-mismatch"
+
+
+def test_a_v1_body_needs_no_registered_chip(fake) -> None:
+    # Legacy bodies carry no chip: the gate is the v2 contract only.
+    _binding()
+    row, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+    assert (row.binding_source, row.chip_id, row.report_id) == ("", "", "")
 
 
 def test_records_a_verified_attestation(fake) -> None:
@@ -231,7 +398,7 @@ def test_a_replay_under_a_new_seq_but_same_body_is_still_a_replay(fake) -> None:
     assert VmLiveAttestation.objects.count() == 1
 
 
-# ─── the KBS chain lineage (the 2026-08-13 gateproof-a incident) ─────
+# ─── the KBS chain lineage (the 2026-08-13 zero-uptime incident) ─────
 #
 # The KBS mints `attestation_seq` from state held in its CVM's emptyDir,
 # so a KBS restart reseeds the per-VM chain to genesis. Deduping on
@@ -579,3 +746,65 @@ def test_inverted_window_is_zero(settings) -> None:
     _sample(1060)
     assert vm_liveness.covered_seconds(vm_id=VM, start_unix=1060, end_unix=1000) == 0
     assert vm_liveness.covered_intervals(vm_id=VM, start_unix=1060, end_unix=1000) == []
+
+
+def _released_row(report: str, at: int, source: str = "release") -> None:
+    VmLiveAttestation.objects.create(
+        vm_id=VM,
+        node_id_hex=NODE_ID,
+        attestation_seq=at,
+        epoch=1,
+        observed_at_unix=at,
+        verified_at_unix=at,
+        expiry_unix=at + 900,
+        measurement=MEASUREMENT,
+        snp_report_digest="11" * 32,
+        body_digest=f"{at:064x}",
+        binding_source=source,
+        chip_id=GENOA_CHIP,
+        report_id=report,
+    )
+
+
+def test_a_first_use_duplicate_of_a_live_released_guest_is_refused(fake) -> None:
+    _binding()
+    _miner(GENOA_CHIP)
+    _released_row("7a" * 32, NOW - 120)  # the released guest, still attesting
+    fake.guest = ("first-use", GENOA_CHIP, "7b" * 32)  # a second instance
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "guest-conflict"
+
+
+@pytest.mark.parametrize(
+    ("report", "released_at"),
+    [
+        ("7a" * 32, NOW - 120),  # the released guest itself, first-use after a KBS restart
+        ("7b" * 32, NOW - 7200),  # a new guest while the released one went silent (reboot)
+    ],
+)
+def test_a_first_use_that_is_not_a_live_duplicate_is_accepted(fake, report, released_at) -> None:
+    _binding()
+    _miner(GENOA_CHIP)
+    _released_row("7a" * 32, released_at)
+    fake.guest = ("first-use", GENOA_CHIP, report)
+    _, created = vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert created is True
+
+
+def test_a_duplicate_after_a_pod_replacement_is_refused_while_the_released_guest_lives(
+    fake,
+) -> None:
+    """After a KBS pod replacement the honest released guest has no record
+    and attests `first-use` too; its last RELEASE sample ages past the
+    coverage span while it is fully alive. A duplicate instance on the same
+    chip must still be refused — liveness is judged from ANY-source samples
+    of the released guest."""
+    _binding()
+    _miner(GENOA_CHIP)
+    _released_row("7a" * 32, NOW - 3600)  # released an hour ago, before the pod replacement
+    _released_row("7a" * 32, NOW - 120, source="first-use")  # still alive, unbound
+    fake.guest = ("first-use", GENOA_CHIP, "7b" * 32)  # the duplicate
+    with pytest.raises(vm_liveness.LiveAttestationRefused) as exc:
+        vm_liveness.ingest_live_attestation(envelope=b"\x01")
+    assert exc.value.category == "guest-conflict"

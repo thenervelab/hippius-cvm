@@ -32,12 +32,17 @@ use tower::ServiceExt;
 
 /// Configurable mock: each operation can be programmed to return Ok or a
 /// canned error. We record calls so we can assert side-effects.
+/// `(cose_ticket, snp_report, kbs_nonce, submitted_boot_counter)`.
+type ReleaseArgs = (Vec<u8>, Vec<u8>, [u8; NONCE_LEN], Option<u64>);
+
 struct MockSvc {
     nonce: Mutex<Result<[u8; NONCE_LEN]>>,
     release: Mutex<core::result::Result<SignedResponse, SignedDenial>>,
     host_enroll: Mutex<Result<SignedHostAttestorCert>>,
     volume_stamp_confirm: Mutex<Result<u64>>,
     calls: Mutex<Vec<String>>,
+    /// Exactly what each `process_release` received.
+    release_args: Mutex<Vec<ReleaseArgs>>,
 }
 
 impl MockSvc {
@@ -52,6 +57,7 @@ impl MockSvc {
             host_enroll: Mutex::new(Ok(sample_signed_cert())),
             volume_stamp_confirm: Mutex::new(Ok(1)),
             calls: Mutex::new(Vec::new()),
+            release_args: Mutex::new(Vec::new()),
         }
     }
     fn set_nonce(&self, r: Result<[u8; NONCE_LEN]>) {
@@ -130,13 +136,19 @@ impl KbsService for MockSvc {
     }
     fn process_release(
         &self,
-        _cose: &[u8],
-        _snp: &[u8],
-        _nonce: &[u8; NONCE_LEN],
+        cose: &[u8],
+        snp: &[u8],
+        nonce: &[u8; NONCE_LEN],
         _now: u64,
-        _submitted_boot_counter: Option<u64>,
+        submitted_boot_counter: Option<u64>,
     ) -> core::result::Result<SignedResponse, SignedDenial> {
         self.calls.lock().unwrap().push("process_release".into());
+        self.release_args.lock().unwrap().push((
+            cose.to_vec(),
+            snp.to_vec(),
+            *nonce,
+            submitted_boot_counter,
+        ));
         self.release.lock().unwrap().clone()
     }
     fn process_keepalive(
@@ -147,6 +159,8 @@ impl KbsService for MockSvc {
         _nonce: &[u8; NONCE_LEN],
         _epoch: u64,
         _expiry_unix: u64,
+        _resources: Option<&hippius_types::live_attestation::GuestResources>,
+        _components: Option<&hippius_types::live_attestation::GuestComponents>,
         _now: u64,
     ) -> Result<hippius_types::live_attestation::SignedLiveAttestation> {
         self.calls.lock().unwrap().push("process_keepalive".into());
@@ -186,6 +200,22 @@ impl KbsService for MockSvc {
         // `KbsError` is not `Clone`; reconstruct on the Err arm (the
         // handler maps ANY Err to a generic 403, so the exact variant is
         // immaterial to the transport test).
+        match &*self.volume_stamp_confirm.lock().unwrap() {
+            Ok(v) => Ok(*v),
+            Err(e) => Err(KbsError::Policy(e.to_string())),
+        }
+    }
+    fn process_volume_stamp_confirm_timeline(
+        &self,
+        _vm_id: &str,
+        _value: u64,
+        _token: &[u8],
+        timeline: &[u8; 32],
+    ) -> Result<u64> {
+        self.calls.lock().unwrap().push(format!(
+            "process_volume_stamp_confirm_timeline:{:02x}",
+            timeline[0]
+        ));
         match &*self.volume_stamp_confirm.lock().unwrap() {
             Ok(v) => Ok(*v),
             Err(e) => Err(KbsError::Policy(e.to_string())),
@@ -1115,6 +1145,7 @@ async fn no_admin_route_is_served_by_the_public_release_router() {
         "/v1/admin/vm/vm-1/register-vm",
         "/v1/admin/vm/vm-1/activate",
         "/v1/admin/vm/vm-1/seed-boot-counter",
+        "/v1/admin/vm/vm-1/seed-keepalive-binding",
         "/v1/admin/allowlist/reload",
     ] {
         let app = build_router(svc.clone());
@@ -1414,6 +1445,43 @@ async fn guest_router_does_not_expose_the_admin_suppression_reset() {
 }
 
 #[tokio::test]
+async fn guest_router_does_not_expose_any_rollback_route() {
+    // The authorized rollback (A2) is the one path that admits a
+    // rewound boot. A miner reaching ANY of these routes on the
+    // guest-facing listener could arm, read or disarm its own tenants'
+    // rollbacks, so each must 404 here (they exist ONLY on the mTLS
+    // admin router).
+    let svc = Arc::new(MockSvc::new());
+    let app = build_router(svc.clone());
+    for (method, uri) in [
+        ("POST", "/v1/admin/vm/vm-1/rollback-checkpoint"),
+        ("POST", "/v1/admin/vm/vm-1/authorize-rollback"),
+        ("DELETE", "/v1/admin/vm/vm-1/authorize-rollback/r-1"),
+        ("GET", "/v1/admin/vm/vm-1/rollback"),
+        ("POST", "/v1/kbs/vm/vm-1/authorize-rollback"),
+        ("POST", "/v1/kbs/authorize-rollback"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must not be routable from the guest-facing listener"
+        );
+    }
+}
+
+#[tokio::test]
 async fn guest_router_does_not_expose_the_admin_volume_stamp_report() {
     // The READ side of the same gate. `GET /v1/admin/volume-stamp` is a
     // per-tenant operational readout — which VMs exist, how many
@@ -1450,5 +1518,140 @@ async fn guest_router_does_not_expose_the_admin_volume_stamp_report() {
             StatusCode::NOT_FOUND,
             "{uri} must not be routable from the guest-facing listener"
         );
+    }
+}
+
+// ── stamp protocol v2: the v2 claim is ONLY in the SNP-signed report ──
+
+fn release_request(body: Vec<u8>, header_claim: bool) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/v1/kbs/release")
+        .header(header::CONTENT_TYPE, "application/cbor");
+    if header_claim {
+        b = b
+            .header("x-hippius-guest-stamp-protocol", "2")
+            .header("x-hippius-stamp-protocol", "2");
+    }
+    b.body(Body::from(body)).unwrap()
+}
+
+/// CLAIM (invariant 2): a miner adding a stamp-protocol claim to the
+/// release BODY is refused before the service is reached — the body is
+/// `deny_unknown_fields`, so no unmeasured field can carry a v2 claim.
+#[tokio::test]
+async fn a_stamp_protocol_claim_in_the_release_body_never_reaches_the_service() {
+    for field in [
+        "guest_stamp_protocol",
+        "stamp_protocol",
+        "volume_stamp_transition",
+    ] {
+        let svc = Arc::new(MockSvc::new());
+        let app = build_router_with_rate(svc.clone(), fast_rate());
+        let v = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("cose_ticket".into()),
+                ciborium::value::Value::Bytes(b"cose".to_vec()),
+            ),
+            (
+                ciborium::value::Value::Text("kbs_nonce".into()),
+                ciborium::value::Value::Bytes(vec![1u8; 32]),
+            ),
+            (
+                ciborium::value::Value::Text("snp_report".into()),
+                ciborium::value::Value::Bytes(b"snp".to_vec()),
+            ),
+            (
+                ciborium::value::Value::Text(field.into()),
+                ciborium::value::Value::Integer(2.into()),
+            ),
+        ]);
+        let resp = app
+            .oneshot(release_request(to_canonical_vec(&v).unwrap(), false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{field}");
+        assert!(svc.calls().is_empty(), "{field}: the service was reached");
+    }
+}
+
+/// CLAIM (invariant 2): a stamp-protocol HEADER changes nothing — the
+/// service receives exactly the same inputs with or without it (the
+/// report, the nonce, the ticket, the counter: the protocol is read from
+/// the report's signed REPORT_DATA and from nowhere else).
+#[tokio::test]
+async fn a_stamp_protocol_header_does_not_change_what_the_service_sees() {
+    let mut seen = Vec::new();
+    for header_claim in [false, true] {
+        let svc = Arc::new(MockSvc::new());
+        let app = build_router_with_rate(svc.clone(), fast_rate());
+        let body = canonical_release_body(b"cose", b"snp", &[1u8; 32]);
+        let resp = app
+            .oneshot(release_request(body, header_claim))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        seen.push(svc.release_args.lock().unwrap().clone());
+    }
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0].len(), 1);
+}
+
+/// A v2 confirm (a `timeline_id`) takes the timeline-bound CAS; a v1
+/// one the plain CAS; a malformed timeline is refused before either.
+#[tokio::test]
+async fn a_confirm_naming_a_timeline_takes_the_timeline_cas() {
+    let body = |timeline: Option<Vec<u8>>| {
+        let mut e = vec![
+            (
+                ciborium::value::Value::Text("token".into()),
+                ciborium::value::Value::Bytes(vec![7u8; 32]),
+            ),
+            (
+                ciborium::value::Value::Text("value".into()),
+                ciborium::value::Value::Integer(5.into()),
+            ),
+            (
+                ciborium::value::Value::Text("vm_id".into()),
+                ciborium::value::Value::Text("vm-1".into()),
+            ),
+        ];
+        if let Some(t) = timeline {
+            e.push((
+                ciborium::value::Value::Text("timeline_id".into()),
+                ciborium::value::Value::Bytes(t),
+            ));
+        }
+        to_canonical_vec(&ciborium::value::Value::Map(e)).unwrap()
+    };
+    for (t, status, calls) in [
+        (
+            Some(vec![0xab; 32]),
+            StatusCode::OK,
+            vec!["process_volume_stamp_confirm_timeline:ab".to_string()],
+        ),
+        (
+            None,
+            StatusCode::OK,
+            vec!["process_volume_stamp_confirm".to_string()],
+        ),
+        (Some(vec![0xab; 31]), StatusCode::BAD_REQUEST, vec![]),
+    ] {
+        let svc = Arc::new(MockSvc::new());
+        svc.set_volume_stamp_confirm(Ok(5));
+        let app = build_router_with_rate(svc.clone(), fast_rate());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/kbs/volume-stamp/confirm")
+                    .header(header::CONTENT_TYPE, "application/cbor")
+                    .body(Body::from(body(t.clone())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{t:?}");
+        assert_eq!(svc.calls(), calls, "{t:?}");
     }
 }

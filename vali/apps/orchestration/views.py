@@ -73,6 +73,10 @@ _LAUNCH_INTERNAL_CATEGORIES = frozenset({"internal"})
 # `StartError` categories that are a caller mistake (400) rather than
 # a VM-state conflict (409).
 _BAD_REQUEST_CATEGORIES = frozenset({"same-node"})
+#: A §25 intake refusal that is about the SYSTEM, not the request — the
+#: same call is expected to succeed once Vault answers again. 503 says
+#: "retry", where the 409 default says "this VM cannot migrate".
+_UNAVAILABLE_CATEGORIES = frozenset({"vault-unavailable"})
 
 
 # ─── POST /v1/vm/<vm_id>/migrate ─────────────────────────────────────
@@ -125,6 +129,12 @@ class MigrateStartView(APIView):
                 f"dest_node_id exceeds {_MAX_NODE_ID} chars",
                 "wire",
             )
+        # `cold: true` migrates a tenant-STOPPED VM: started on its source for
+        # the warm §25, stopped again at the destination. Without it a
+        # stopped VM is refused (`vm-not-running`), as before.
+        cold = body.get("cold", False)
+        if not isinstance(cold, bool):
+            return _error(status.HTTP_400_BAD_REQUEST, "cold must be a boolean", "wire")
 
         try:
             vm = Vm.objects.get(vm_id=vm_id)
@@ -133,7 +143,10 @@ class MigrateStartView(APIView):
 
         try:
             job = service.start_migration(
-                vm=vm, dest_node_id=dest_node_id, decided_by=request.user
+                vm=vm,
+                dest_node_id=dest_node_id,
+                decided_by=request.user,
+                cold=cold,
             )
         except StartError as exc:
             return _start_error_response(exc)
@@ -350,7 +363,9 @@ class LaunchStartView(APIView):
         responses={
             202: LaunchJobSerializer,
             400: OpenApiResponse(
-                ErrorSerializer, "Malformed body / bad field (`wire`/`bad-field`)."
+                ErrorSerializer,
+                "Malformed body / bad field (`wire`/`bad-field`), or a flavor above "
+                "the largest offered size (`flavor-not-offered`).",
             ),
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
             409: OpenApiResponse(ErrorSerializer, "In-flight launch already exists for this VM."),
@@ -552,11 +567,12 @@ def _serialize_launch(job: LaunchJob) -> dict[str, Any]:
 
 
 def _start_error_response(exc: StartError) -> Response:
-    http_status = (
-        status.HTTP_400_BAD_REQUEST
-        if exc.category in _BAD_REQUEST_CATEGORIES
-        else status.HTTP_409_CONFLICT
-    )
+    if exc.category in _BAD_REQUEST_CATEGORIES:
+        http_status = status.HTTP_400_BAD_REQUEST
+    elif exc.category in _UNAVAILABLE_CATEGORIES:
+        http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    else:
+        http_status = status.HTTP_409_CONFLICT
     return _error(http_status, exc.message, exc.category)
 
 
@@ -572,6 +588,10 @@ def _serialize_migration(job: MigrationJob) -> dict[str, Any]:
         "source_gen": job.source_gen,
         "new_gen": job.new_gen,
         "state": job.state,
+        # A COLD migration (the VM was stopped): started on its source,
+        # stopped again at the destination once it proved it runs.
+        "cold": job.cold,
+        "cold_settle_reason": job.cold_settle_reason or None,
         "source_ack_verified": job.source_ack_verified,
         # P9/#15 — whether the SOURCE host's per-VM artifacts (the tenant's
         # LUKS overlay, the boot-counter disk, the staged boot artifacts)
@@ -617,6 +637,10 @@ def _serialize_decommission(job: DecommissionJob) -> dict[str, Any]:
         "started_at": job.started_at.isoformat(),
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "version": job.version,
+        # What the erase step achieved for the data, once it ran (else
+        # null): `crypto-erased`, or `customer-erase-required` for an M2
+        # VM (Hippius held no disk key; only `guardian erase` crypto-erases).
+        "data_death": job.data_death or None,
     }
 
 
@@ -639,8 +663,12 @@ _POWER_ERROR_STATUS = {
     "already-starting": status.HTTP_409_CONFLICT,
     "start-in-flight": status.HTTP_409_CONFLICT,
     "no-bound-miner": status.HTTP_409_CONFLICT,
-    "migrated-vm-cannot-restart": status.HTTP_409_CONFLICT,
     "relaunch-rejected": status.HTTP_503_SERVICE_UNAVAILABLE,
+    # transient: other starts held the §22 pin lock — re-ask the start
+    "allowlist-pin-busy": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "disks-missing": status.HTTP_409_CONFLICT,
+    "migration-in-flight": status.HTTP_409_CONFLICT,
+    "resize-in-flight": status.HTTP_409_CONFLICT,
 }
 
 

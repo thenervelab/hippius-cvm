@@ -138,6 +138,7 @@ class Command(BaseCommand):
         # `apps.orchestration` management commands.
         from apps.identity.models import PrincipalScope, ServiceClient
         from apps.tenant_bake.k8s_jobs import K8sUnavailable, spawn_bake_job
+        from apps.tenant_bake.locks import bake_queue_lock
         from apps.tenant_bake.views import _mint_bake_id, _parse_create
 
         # Validate via the same parser the view uses so the rules
@@ -170,12 +171,14 @@ class Command(BaseCommand):
         # ops (`python manage.py rotate_service_token`).
 
         bake_id = _mint_bake_id()
-        row = TenantBake.objects.create(
-            bake_id=bake_id,
-            state=TenantBakeState.QUEUED.value,
-            requested_by=requester,
-            **parsed,
-        )
+        # Ordered against the golden re-bake's check-then-insert (F6).
+        with bake_queue_lock():
+            row = TenantBake.objects.create(
+                bake_id=bake_id,
+                state=TenantBakeState.QUEUED.value,
+                requested_by=requester,
+                **parsed,
+            )
         try:
             spawn_bake_job(row)
         except K8sUnavailable as exc:

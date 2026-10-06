@@ -14,7 +14,12 @@ from rest_framework.test import APIClient
 
 from apps.packer.models import PackerBuild
 from apps.scheduler import chain
-from apps.scheduler.models import MinerCapacity, Placement, PlacementStatus
+from apps.scheduler.models import (
+    MinerCapacity,
+    Placement,
+    PlacementFailureSource,
+    PlacementStatus,
+)
 
 from .factories import (
     make_dispatchable_identity,
@@ -396,6 +401,10 @@ def test_fail_marks_failed_and_replaces_elsewhere(
     # Re-placed OFF the failed miner.
     assert body["replacement"]["miner_node_id"] == node_id(2)
     assert body["replacement_error"] is None
+    # provenance: a root `/fail` is `manual`, whatever its body spells —
+    # the operator readout never surfaces it as a refusal
+    failed = Placement.objects.get(vm=vm, status=PlacementStatus.FAILED.value)
+    assert failed.failure_source == PlacementFailureSource.MANUAL
 
 
 def test_replace_wires_owner_budget_and_circuit_breaker(
@@ -604,3 +613,94 @@ def test_edge_registry_feed_unsigned_when_no_key(monkeypatch: pytest.MonkeyPatch
     resp = APIClient().get(REGISTRY_URL)
     assert resp.status_code == status.HTTP_200_OK
     assert "X-Hippius-Registry-Sig" not in resp.headers
+
+
+# ─── Gate (f): /place and re-placement honour the VM's launch region ──
+
+
+def _locate_seed(seed: int, country: str) -> None:
+    from django.utils import timezone
+
+    from apps.miners.models import LocationVerdict, MinerIdentity, MinerLocation
+
+    MinerLocation.objects.create(
+        miner=MinerIdentity.objects.get(chain_node_id=node_id(seed)),
+        connection_ip="146.10.20.30",
+        country_code=country,
+        verdict=LocationVerdict.VERIFIED,
+        observed_at=timezone.now(),
+    )
+
+
+def test_place_honours_the_region_the_launch_asked_for(
+    root_client: APIClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/place` carries no region of its own; it must read the LaunchJob's.
+    Miner 1 would win the tie-break — it is in DE, the VM asked for FR."""
+    from apps.orchestration.tests.factories import make_launch_record
+
+    vm = make_vm_with_ticket("vm-1", "tenant-1")
+    make_launch_record(vm, region="FR")
+    _locate_seed(1, "DE")
+    _locate_seed(2, "FR")
+    _mock_chain(monkeypatch, make_snapshot(10, [make_miner(1), make_miner(2)]))
+    resp = root_client.post(PLACE_URL, {"vm_id": "vm-1", "resource_class": "std"}, format="json")
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    assert resp.json()["miner_node_id"] == node_id(2)
+
+
+def test_place_409s_no_miner_in_region_rather_than_placing_elsewhere(
+    root_client: APIClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.orchestration.tests.factories import make_launch_record
+
+    vm = make_vm_with_ticket("vm-1", "tenant-1")
+    make_launch_record(vm, region="FR")
+    _locate_seed(1, "DE")
+    _mock_chain(monkeypatch, make_snapshot(10, [make_miner(1), make_miner(2)]))
+    resp = root_client.post(PLACE_URL, {"vm_id": "vm-1", "resource_class": "std"}, format="json")
+    assert resp.status_code == status.HTTP_409_CONFLICT
+    assert resp.json()["category"] == "no-miner-in-region"
+    assert Placement.objects.count() == 0
+
+
+def test_replace_after_fail_stays_in_the_vm_region(
+    root_client: APIClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off miner 1; miner 2 is the tie-break winner but in DE; the VM was
+    sold in FR ⇒ miner 3."""
+    from apps.orchestration.tests.factories import make_launch_record
+
+    vm = make_vm("vm-1")
+    make_placement(vm, node_id(1), status=PlacementStatus.PENDING.value, vm_family="tenant-1")
+    make_launch_record(vm, region="fr")
+    _locate_seed(1, "FR")
+    _locate_seed(2, "DE")
+    _locate_seed(3, "FR")
+    _mock_chain(monkeypatch, make_snapshot(10, [make_miner(1), make_miner(2), make_miner(3)]))
+    resp = root_client.post(_fail_url("vm-1"), {"if_version": 1, "reason": "drop"}, format="json")
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    body = resp.json()
+    assert body["replacement"]["miner_node_id"] == node_id(3)
+    assert body["replacement_error"] is None
+
+
+def test_replace_reports_no_miner_in_region_when_the_region_is_empty(
+    root_client: APIClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failed row is still marked failed; the VM is simply not moved
+    out of its region. The category tells the caller WHY."""
+    from apps.orchestration.tests.factories import make_launch_record
+
+    vm = make_vm("vm-1")
+    make_placement(vm, node_id(1), status=PlacementStatus.PENDING.value, vm_family="tenant-1")
+    make_launch_record(vm, region="FR")
+    _locate_seed(1, "FR")
+    _locate_seed(2, "DE")
+    _mock_chain(monkeypatch, make_snapshot(10, [make_miner(1), make_miner(2)]))
+    resp = root_client.post(_fail_url("vm-1"), {"if_version": 1, "reason": "drop"}, format="json")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    assert body["failed"]["status"] == "failed"
+    assert body["replacement"] is None
+    assert body["replacement_error"]["category"] == "no-miner-in-region"

@@ -2,8 +2,8 @@
 //!
 //! [`VsockPusher::run_with`] is generic over the stream type and over
 //! how a stream is obtained, so the production vsock dial is the only
-//! platform-specific line. These tests drive the real reconnect →
-//! drain → back-off loop over a **TCP loopback** stand-in — exercising
+//! platform-specific line. These tests drive the real dial → push →
+//! close → back-off loop over a **TCP loopback** stand-in — exercising
 //! framing, batching, the no-loss re-queue, connect back-off, and
 //! shutdown promptness on any host (this darwin dev box and Linux CI
 //! alike). The vsock syscall itself only runs inside a real CVM.
@@ -109,6 +109,29 @@ fn read_frame(stream: &mut TcpStream) -> SignedServedDeliveryReceipt {
         .expect("inner body is canonical receipt CBOR")
 }
 
+/// Accept one connection on `listener`, failing the test (instead of
+/// hanging it) if none arrives within 5 s.
+fn accept_within_5s(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                return stream;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "the pusher never dialled");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
 /// A connector closure that dials `addr` over TCP loopback.
 fn tcp_connector(
     addr: SocketAddr,
@@ -209,17 +232,19 @@ fn connect_failures_back_off_and_then_recover() {
 
 #[test]
 fn shutdown_stops_an_idle_pusher_promptly() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    // Empty queue — the pusher connects, then idle-polls.
+    // Empty queue — the pusher idle-polls without dialling.
     let queue = Arc::new(Mutex::new(ReceiptQueue::new()));
     let shutdown = TestShutdown::new();
 
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dials_for_connector = Arc::clone(&dials);
+    let connector = move || {
+        dials_for_connector.fetch_add(1, Ordering::SeqCst);
+        Err::<TcpStream, _>(TelemetryError::Vsock("test-connect"))
+    };
     let pusher = VsockPusher::new(2, 5000, Arc::clone(&queue), shutdown.clone());
-    let connector = tcp_connector(addr);
     let pusher_thread = thread::spawn(move || pusher.run_with(connector));
 
-    let (_peer, _) = listener.accept().unwrap();
     // Let the pusher settle into its idle poll, then shut it down.
     thread::sleep(Duration::from_millis(200));
     let stop = Instant::now();
@@ -232,10 +257,50 @@ fn shutdown_stops_an_idle_pusher_promptly() {
         stop.elapsed() < Duration::from_secs(2),
         "an idle pusher must observe shutdown promptly"
     );
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "an empty queue must never open a connection — not even the final drain"
+    );
 }
 
 #[test]
-fn idle_pusher_resumes_draining_when_a_receipt_arrives() {
+fn the_pusher_closes_the_connection_once_the_queue_is_dry() {
+    // The host relay drops a connection that stays silent for its idle
+    // timeout. A pusher that parked an idle connection raced that close
+    // on every receipt; the guest must instead hang up itself, so the
+    // host reads the frames and then a clean EOF.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let queue = queue_with(&[5, 6]);
+    let shutdown = TestShutdown::new();
+
+    let pusher = VsockPusher::new(2, 5000, Arc::clone(&queue), shutdown.clone());
+    let connector = tcp_connector(addr);
+    let pusher_thread = thread::spawn(move || pusher.run_with(connector));
+
+    let mut peer = accept_within_5s(&listener);
+    assert_eq!(read_frame(&mut peer), receipt(5));
+    assert_eq!(read_frame(&mut peer), receipt(6));
+    // The guest closed its end: the next read is EOF (0 bytes), well
+    // before the 5 s read timeout — not a connection left open.
+    let mut rest = [0u8; 1];
+    assert_eq!(
+        peer.read(&mut rest).expect("EOF, not a read timeout"),
+        0,
+        "the pusher must close the connection after draining the queue"
+    );
+    assert!(queue.lock().unwrap().is_empty(), "every receipt was sent");
+
+    shutdown.trigger();
+    pusher_thread
+        .join()
+        .expect("pusher thread joins")
+        .expect("pusher returns Ok on shutdown");
+}
+
+#[test]
+fn a_later_receipt_is_pushed_on_a_fresh_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let queue = queue_with(&[100]);
@@ -245,16 +310,16 @@ fn idle_pusher_resumes_draining_when_a_receipt_arrives() {
     let connector = tcp_connector(addr);
     let pusher_thread = thread::spawn(move || pusher.run_with(connector));
 
-    let (mut peer, _) = listener.accept().unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut first = accept_within_5s(&listener);
     // First receipt drains immediately.
-    assert_eq!(read_frame(&mut peer), receipt(100));
+    assert_eq!(read_frame(&mut first), receipt(100));
 
-    // Pusher is now idle-polling an empty queue. A late arrival must
-    // still be picked up and drained on the same live connection.
+    // The pusher is now idle-polling an empty queue with no connection
+    // open. A late arrival must be picked up and pushed on a new one.
     thread::sleep(Duration::from_millis(300));
     queue.lock().unwrap().push(receipt(101));
-    assert_eq!(read_frame(&mut peer), receipt(101));
+    let mut second = accept_within_5s(&listener);
+    assert_eq!(read_frame(&mut second), receipt(101));
 
     shutdown.trigger();
     pusher_thread

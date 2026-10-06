@@ -11,13 +11,20 @@
 #   s3://<bucket>/miner-agent/<tag>/hippius-miner-agent   (the binary)
 #   s3://<bucket>/miner-agent/latest.json                 ({tag, sha256, url[, sig]})
 #
-# AUTO-LATEST: publishing flips the WHOLE fleet to this build within ~15 min.
-# ONLY publish validated builds.
+# The fleet timer is DISARMED by default (miner_auto_update_enabled: false in
+# deploy/ansible/group_vars/miner_nodes.yml). On a disarmed miner a publish
+# changes nothing: agent rollouts are a manual canary, host by host (the
+# SIGKILL swap in deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md).
+#
+# On any miner still ARMED, publishing restarts its agent within ~15 min, at
+# the same time as every other armed miner, with no canary. A real upload
+# therefore requires --fleet-roll, an explicit acknowledgement of that.
 #
 # Usage:
 #   publish-miner-agent.sh \
 #       --binary target/release/hippius-miner-agent \
 #       --tag    sha-<gitsha>                         \
+#       --fleet-roll                                  \
 #       [--sign-key /path/to/ed25519-private.pem]      \
 #       [--bucket hippius-compute-images]              \
 #       [--prefix miner-agent]                         \
@@ -45,6 +52,7 @@ BUCKET="${MINER_AGENT_BUCKET:-hippius-compute-images}"
 PREFIX="${MINER_AGENT_PREFIX:-miner-agent}"
 ENDPOINT="${S3_ENDPOINT_URL:-https://s3.hippius.com}"
 DRY_RUN=false
+FLEET_ROLL=false
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -57,6 +65,7 @@ while [ $# -gt 0 ]; do
         --prefix)   PREFIX="$2"; shift 2 ;;
         --endpoint) ENDPOINT="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
+        --fleet-roll) FLEET_ROLL=true; shift ;;
         -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          die "unknown argument: $1" ;;
     esac
@@ -67,6 +76,14 @@ done
 [ -f "$BINARY" ] || die "binary not found: $BINARY"
 command -v aws >/dev/null 2>&1 || die "aws CLI not found on PATH"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found on PATH"
+
+if [ "$DRY_RUN" != "true" ] && [ "$FLEET_ROLL" != "true" ]; then
+    die "refusing to publish without --fleet-roll: every miner with an ARMED
+       hippius-miner-update.timer restarts its agent within ~15 min, all at
+       once, no canary. The fleet default is disarmed
+       (miner_auto_update_enabled: false) and rollouts are a manual canary
+       (SIGKILL swap, deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md)."
+fi
 
 if [ "$DRY_RUN" != "true" ]; then
     [ -n "${AWS_ACCESS_KEY_ID:-}" ]     || die "AWS_ACCESS_KEY_ID is not set"
@@ -160,4 +177,4 @@ aws s3 cp "$MANIFEST_FILE" "s3://${BUCKET}/${MANIFEST_KEY}" \
     --no-progress
 
 echo "Published miner-agent tag=${TAG} sha256=${SHA256}"
-echo "Miners will pick it up within ~15 min (or: systemctl start hippius-miner-update.service)."
+echo "Miners with an armed timer pick it up within ~15 min; disarmed miners are untouched."

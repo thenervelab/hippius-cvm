@@ -110,6 +110,15 @@ pub enum MinerAgentError {
     #[error("cvm-insufficient-resources")]
     InsufficientResources,
 
+    /// Launching the CVM would overcommit the host's tenant DISK: the
+    /// declared `[host] cvm_disk_gb_budget`, or the measured free space of
+    /// `[storage] data_disk_root` net of every existing disk's unwritten
+    /// sparse tail. A distinct class from [`Self::InsufficientResources`]
+    /// so vali can tell a full disk from a full host (and from a SEV start
+    /// failure), re-place, and account it as a capacity event.
+    #[error("cvm-insufficient-disk")]
+    InsufficientDisk,
+
     /// A `LaunchOrder` / `QemuConfig` field is unusable. The
     /// sub-classifier names which check failed — a compile-time
     /// constant, never an echoed path or run-time value.
@@ -191,6 +200,31 @@ pub enum MinerAgentError {
     #[error("heartbeat-sequence/{0}")]
     HeartbeatSequence(&'static str),
 
+    /// A `net-policy` order failed its shape checks. The sub-classifier
+    /// names the field (`region`, `ip`, `vm-caps`, …).
+    #[error("net-policy-invalid/{0}")]
+    NetPolicyInvalid(&'static str),
+
+    /// A `net-policy` order is past its `not_after_unix`.
+    #[error("net-policy-expired")]
+    NetPolicyExpired,
+
+    /// A `net-policy` order carries a lower revision than the one
+    /// persisted (a replay of an older policy).
+    #[error("net-policy-stale-revision")]
+    NetPolicyStaleRevision,
+
+    /// A `net-policy` order carries the persisted revision with other
+    /// content.
+    #[error("net-policy-revision-conflict")]
+    NetPolicyRevisionConflict,
+
+    /// The persisted net policy could not be read, parsed or written.
+    /// The sub-classifier is `read`, `parse`, `encode`, `write`, `sync`,
+    /// `schema` or `lock`.
+    #[error("net-policy-store/{0}")]
+    NetPolicyStore(&'static str),
+
     /// The heartbeat pusher's mTLS Edge client could not be built
     /// (PR-MA-6) — a bad CA / client cert / key, or a `reqwest`
     /// builder failure. The sub-classifier is `ca`, `client-identity`,
@@ -270,7 +304,7 @@ pub enum MinerAgentError {
     #[error("graceful-exit/{0}")]
     GracefulExit(&'static str),
 
-    /// Phase 2B of audit follow-up Codex #2 — provisioning the per-VM
+    /// Phase 2B of audit follow-up Review #2 — provisioning the per-VM
     /// 1 MiB ext4 state disk that backs the anti-rollback boot counter
     /// failed. Sub-classifiers — all compile-time `&'static str`, never
     /// an echoed path or `mkfs.ext4` stderr line:
@@ -322,6 +356,34 @@ pub enum MinerAgentError {
     /// tag.
     #[error("overlay-disk/{0}")]
     OverlayDisk(&'static str),
+
+    /// A RELAUNCH order (`LaunchOrder::require_existing_disks`) named a
+    /// VM whose per-VM disks are NOT on this host. Every `ensure_*`
+    /// provisioner creates a BLANK disk when the file is absent — right
+    /// for a first launch, a data-death hazard for a relaunch: a blank
+    /// state disk resets the anti-rollback boot counter (the KBS then
+    /// refuses the release) and a blank golden overlay gets
+    /// `luksFormat`ted by the guest the moment a KEK IS released. So a
+    /// relaunch refuses before any of them runs, and creates nothing.
+    /// The sub-classifier names the FIRST missing disk: `state-disk`,
+    /// `overlay` (golden `/dev/vda`) or `data-disk` (legacy `/dev/vde`).
+    #[error("relaunch-disks-missing/{0}")]
+    RelaunchDisksMissing(&'static str),
+
+    /// A relaunch could not tell whether a per-VM disk is present: the
+    /// metadata lookup itself failed (EIO, EACCES, a storage mount not up
+    /// yet). NOT [`Self::RelaunchDisksMissing`] — nothing is known to be
+    /// absent, so it is retryable and must never make vali give up on the
+    /// VM. Same sub-classifiers.
+    #[error("relaunch-disks-unreadable/{0}")]
+    RelaunchDisksUnreadable(&'static str),
+
+    /// A live VM backup (QMP capture, part upload) or a backup-chain
+    /// restore failed. Sub-classifiers are compile-time `&'static str`
+    /// (see `crate::backup`); a presigned URL, a path or QEMU's error
+    /// text never reaches the Display.
+    #[error("backup/{0}")]
+    Backup(&'static str),
 
     /// Issue #116 — `snp_config::SnpCpuConfig::probe` could not read
     /// the SEV-SNP launch parameters from the host CPU's

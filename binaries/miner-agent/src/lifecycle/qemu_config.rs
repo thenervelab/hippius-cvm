@@ -91,7 +91,7 @@ pub struct QemuConfig {
     /// time by `veritysetup format`.
     pub rootfs_hash_path: PathBuf,
     /// Per-VM 1 MiB ext4 state disk (Phase 2B of audit follow-up
-    /// Codex #2). Attached to the guest at `/dev/vdd`; the keyscript
+    /// Review #2). Attached to the guest at `/dev/vdd`; the keyscript
     /// mounts it before invoking `hippius-guest-release` so the
     /// boot counter persists across reboots.
     ///

@@ -21,7 +21,7 @@
 End-to-end operator procedure to bring a single tenant CVM up on
 a miner host under SEV-SNP attestation: stage release secrets,
 mint a signed `OrderTicket`, submit it to vali, watch the chain
-`vali → Edge → miner-1 → KBS → guest`, confirm the tenant joins the
+`vali → Edge → <miner> → KBS → guest`, confirm the tenant joins the
 NetBird mesh.
 
 This is the post-PR-V slice. Each step links to the binary / chart /
@@ -66,12 +66,12 @@ an already-staged sha is a no-op (use `--force` to re-stage).
 # script symlinks from each stage dir. (URL + SHA pinned in
 # packer/kbs-uki/ovmf/ovmf.lock; this script does NOT fetch OVMF —
 # the operator runs the fetch once per miner host.)
-ssh ubuntu@<miner> 'sudo install -m 0644 ovmf.fd /var/lib/hippius-miner/ovmf.fd'
+ssh <user>@<miner> 'sudo install -m 0644 ovmf.fd /var/lib/hippius-miner/ovmf.fd'
 
 # Per tenant launch: stage the signed UKI by content address.
 export VAULT_TOKEN=$(cat ~/.vault-token)    # operator token, S3-read policy
 scripts/tenant-uki-stage-miner.sh \
-    --miner-host ubuntu@<miner-ip> \
+    --miner-host <user>@<miner-ip> \
     --tenant-uki-sha <64-hex>
 ```
 
@@ -160,7 +160,7 @@ Naming convention (dev):
 | `ticket_id` | `tk-2026-05-25-001` | per-mint, single-use; binds the KBS release-once cell |
 | `lease_id` | `lease-2026q2` | not staged; set on the ticket directly |
 | `vm_generation` | `1` | starts at 1 for a fresh `vm_id` |
-| `platform_id` | hex(CHIP_ID) of miner-1 | attested at release time |
+| `platform_id` | hex(CHIP_ID) of the target miner | attested at release time |
 
 Smoke-test ids the dev cluster expects:
 
@@ -230,7 +230,7 @@ still contains literal `REPLACE_ME_` — useful when templating.
 
 ## 5. Stage the release secrets
 
-Run from `~/codex/hippius-compute`:
+Run from the repository root:
 
 ```bash
 export VAULT_ADDR=https://<YOUR_VAULT_HOST>:8200
@@ -282,7 +282,7 @@ The result is `/var/lib/hippius-miner/staging/tenant-<vm-id>/luks.img`
 ```bash
 # Re-uses VAULT_ADDR / VAULT_TOKEN / VAULT_CACERT from §5.
 scripts/archived/tenant-disk-create.sh \
-  --miner-host ubuntu@miner-1.internal \
+  --miner-host <user>@<miner> \
   --vm-id "${VM}" \
   --size-gb 10
 ```
@@ -371,8 +371,8 @@ order-ticket-mint \
   --ticket-id  "${TICKET}" \
   --lease-id   lease-2026q2 \
   --vm-generation 1 \
-  --node-id    miner-1 \
-  --platform-id <hex-CHIP_ID-miner-1> \
+  --node-id    <MINER_ID> \
+  --platform-id <hex-CHIP_ID-of-miner> \
   --allowed-measurement f89f6a20e1e985e483c0b25abbf9d157d7f3e2302baefbe90c5af00e880ccb5ff26f0fd06bc10f1fe99e8c17972fd928 \
   --resource-class standard \
   --lifecycle-perms start,stop \
@@ -438,19 +438,19 @@ kubectl -n vali logs deploy/vali -f | grep -E "ticket|Vm|placement|dispatch"
 # Edge — order forward to the miner over NetBird
 kubectl -n edge-gateway logs deploy/edge-gateway-inner -f | grep order
 
-# miner-agent — libvirt define + launch + ticket push (run on miner-1 itself)
-ssh ubuntu@miner-1 'sudo journalctl -u hippius-miner-agent -f'
+# miner-agent — libvirt define + launch + ticket push (run on the miner itself)
+ssh <user>@<miner> 'sudo journalctl -u hippius-miner-agent -f'
 # A successful push is silent; a failure surfaces as outcome class
 # `ticket-delivery-failed` (with a sub-class `connect-timeout` /
 # `oversize` / `no-cid` / `empty` / `write-failed`). See
 # `binaries/miner-agent/src/error.rs::MinerAgentError::TicketDelivery`.
 
 # guest libvirt domain
-ssh ubuntu@miner-1 'sudo virsh list --all'
+ssh <user>@<miner> 'sudo virsh list --all'
 
 # guest console — early-boot log; the agent-initramfs prints
 # `fail-closed: ticket/vsock-…` on a ticket-load failure
-ssh ubuntu@miner-1 'sudo virsh console tenant-1'   # ^] to exit
+ssh <user>@<miner> 'sudo virsh console tenant-1'   # ^] to exit
 ```
 
 KBS release path (the load-bearing log to confirm):
@@ -489,7 +489,7 @@ Acceptance:
 
 - KBS audit log: one `granted` entry for `(ticket_id, vm_id) =
   (${TICKET}, ${VM})`, no preceding `denied`.
-- `virsh list` on miner-1 shows the guest `running`.
+- `virsh list` on the miner shows the guest `running`.
 - NetBird dashboard lists the new peer with `Connected`.
 - vali `Vm.state = Active{gen=1}`.
 

@@ -109,16 +109,53 @@ class MinerCapacitySerializer(serializers.Serializer):
     node_id = serializers.CharField()
     status = serializers.CharField(help_text="On-chain miner status.")
     quality = serializers.CharField(help_text="Miner quality (u128 as decimal string).")
-    capacity_slots = serializers.IntegerField(help_text="Proven placement capacity.")
-    load = serializers.IntegerField(help_text="Active placements on this miner.")
+    capacity_slots = serializers.IntegerField(
+        help_text=(
+            "Admission capacity in the active model's units (`model`): v1 slots, "
+            "or v2 resource-true reference-flavor units (a flavor N× the "
+            "reference consumes N)."
+        )
+    )
+    load = serializers.IntegerField(
+        help_text="Committed units (v1: active placements); `capacity_slots = load + free`."
+    )
     free_slots = serializers.IntegerField(
         help_text=(
-            "max(0, capacity - load), or 0 when the miner is epoch-stale or "
-            "`cvm_capability` is `incapable` (gate (e) hard-excludes it, so "
-            "its slots are not offerable)."
+            "max(0, capacity - load), or 0 when the miner is epoch-stale, "
+            "cordoned, or `cvm_capability` is `incapable` (gate (e) "
+            "hard-excludes it, so its slots are not offerable)."
         )
     )
     epoch_fresh = serializers.BooleanField(help_text="Miner's data_epoch within max lag.")
+    cordoned = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Operator-cordoned: takes no new placement (its `free_slots` and "
+            "`free_by_flavor` read 0). The VMs already on it are untouched."
+        ),
+    )
+    cordon_reason = serializers.CharField(
+        allow_null=True, required=False, help_text="Why it was cordoned (null when not)."
+    )
+    max_booting = serializers.IntegerField(
+        required=False,
+        help_text=(
+            "Concurrent-boot cap a launch respects on this miner: its own "
+            "override, else the fleet value (`0` = no cap)."
+        ),
+    )
+    model = serializers.CharField(
+        allow_null=True, required=False, help_text="`v1` slots or `v2` resource-true."
+    )
+    free_by_flavor = serializers.DictField(
+        child=serializers.IntegerField(min_value=0),
+        required=False,
+        help_text=(
+            "Per flavor: how many more admission would take here NOW (0 when "
+            "the miner is not offerable, the flavor does not fit, or it is not "
+            "offered)."
+        ),
+    )
     cvm_capability = serializers.CharField(
         help_text=(
             "OBSERVED SEV-SNP start capability (§23 gate (e)): `proven` — vali "
@@ -157,6 +194,169 @@ class SchedulerCapacitySerializer(serializers.Serializer):
         )
     )
     miners = MinerCapacitySerializer(many=True)
+
+
+# ─── /v1/scheduler/feasibility ───────────────────────────────────────
+
+
+class HostFitSerializer(serializers.Serializer):
+    """One dispatchable host, and whether the flavor fits on it."""
+
+    node_id = serializers.CharField()
+    big_enough = serializers.BooleanField(
+        help_text=(
+            "Is the HARDWARE big enough, ignoring what is placed on it? "
+            "`false` on every host is what makes a verdict `never`."
+        )
+    )
+    size_unknown = serializers.BooleanField(
+        help_text=(
+            "vali has no trusted hardware anchor for this host, so neither "
+            "`big_enough` nor `fits` is an ANSWER — both are `false` so this "
+            "never reads as a fit, but the host does not count towards a "
+            "`never` verdict either. Unknown is not \"too small\"."
+        )
+    )
+    fits = serializers.BooleanField(
+        help_text=(
+            "Is there room RIGHT NOW — RAM and vCPU both fit in this host's "
+            "trusted FREE budget. Implies `big_enough`."
+        )
+    )
+    free_memory_mb = serializers.IntegerField(
+        allow_null=True,
+        help_text=(
+            "`null` ⇒ vali has no trusted hardware anchor for this host and "
+            "cannot say. Treated as NOT fitting — an unknown host must never "
+            "be the reason a VM was sold."
+        ),
+    )
+    free_cpus = serializers.IntegerField(allow_null=True)
+    budget_memory_mb = serializers.IntegerField(
+        allow_null=True,
+        help_text=(
+            "The host's whole tenant budget (`total − reserve`), independent "
+            "of what is placed on it. This is what `big_enough` compares "
+            "against."
+        ),
+    )
+    budget_cpus = serializers.IntegerField(allow_null=True)
+    shortfall = serializers.CharField(
+        allow_blank=True,
+        help_text="Which dimension fell short, and by how much. Empty when it fits.",
+    )
+    free_vms = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text=(
+            "Resource admission only (`null` otherwise): VMs this host can still "
+            "take under its VM ceiling / hard cap / SEV-ES ASID limit."
+        ),
+    )
+    headroom = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text="Resource admission only: how many of THIS flavor fit now.",
+    )
+    disk_checked = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "vali has DATA-disk data for this host (an operator anchor or a "
+            "fresh heartbeat-v4 disk report). Disk joins `fits` / `big_enough` "
+            "only when `disk_gate` is `apply` or `deny`."
+        ),
+    )
+    budget_disk_gb = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text="The host's DATA-disk budget (GiB); `null` = unknown.",
+    )
+    free_disk_gb = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text="DATA disk free of vali's committed ledger (GiB); `null` = unknown.",
+    )
+    disk_gate = serializers.ChoiceField(
+        choices=["off", "apply", "deny"],
+        required=False,
+        help_text=(
+            "How admission applies disk here: `off` (gate off / record, or "
+            "unknown data allowed), `apply` (enforced), `deny` (enforced, "
+            "unknown data denied)."
+        ),
+    )
+
+
+class FeasibilitySerializer(serializers.Serializer):
+    """`GET /v1/scheduler/feasibility` 200 element — one flavor's answer."""
+
+    flavor = serializers.CharField()
+    verdict = serializers.ChoiceField(
+        choices=["yes", "not-now", "never"],
+        help_text=(
+            "Branch on this. `yes` — a miner would be chosen and the flavor "
+            "fits it. `not-now` — the fleet COULD run this flavor but nothing "
+            "is free or eligible right now; retrying can succeed. `never` — no "
+            "reachable host is big enough, so retrying cannot help. `never` is "
+            "the answer that must stop a sale."
+        ),
+    )
+    placeable_now = serializers.BooleanField(help_text="`verdict == \"yes\"`.")
+    fits_any_host = serializers.BooleanField(
+        help_text=(
+            "Could the HARDWARE ever run this flavor? Judged against the host "
+            "budget, never against what is free — otherwise a merely-full "
+            "fleet would report a flavor as permanently impossible."
+        )
+    )
+    headroom = serializers.IntegerField(
+        help_text=(
+            "How many more VMs of this flavor the reachable fleet could take, "
+            "summed over hosts. Advisory, NOT a reservation: it is a snapshot "
+            "and any concurrent launch consumes it."
+        )
+    )
+    cpu_count = serializers.IntegerField()
+    memory_mb = serializers.IntegerField()
+    data_disk_size_gb = serializers.IntegerField()
+    reason = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "Why not `yes`. `flavor-not-offered` (`never`): the flavor is above "
+            "the largest size the fleet sells (`VALI_SCHEDULER_MAX_FLAVOR`), "
+            "whatever the hardware could hold. Fleet-wide: `no-dispatchable-miner`, "
+            "`host-size-unknown`, `flavor-exceeds-every-host`, `fleet-full`, "
+            "`no-eligible-miner`, `chain-unavailable`. With `?region=`: "
+            "`region-unknown` (no miner has a detected location yet — the "
+            "probe has not run; retry), `no-miner-in-region` (the fleet is "
+            "located and none of it is there — `never`), `region-unverified` "
+            "(miners detected there but none verified; retry)."
+        ),
+    )
+    scheduler_error = serializers.CharField(allow_blank=True)
+    region = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "The `?region=` this answer was computed for (uppercased), or "
+            "empty when asked fleet-wide."
+        ),
+    )
+    disk_checked = serializers.BooleanField(
+        help_text=(
+            "`true` only when `VALI_SCHEDULER_DISK_GATE=enforce` AND every host "
+            "counted as fitting had DATA-disk data, i.e. `fits` covers disk. "
+            "`false` otherwise: disk is then still gated at dispatch (the miner "
+            "answers 507 `insufficient-disk` and vali re-places). Stated rather "
+            "than implied, so a caller knows exactly how far this answer reaches."
+        )
+    )
+    hosts = HostFitSerializer(many=True)
+
+
+class FeasibilityListSerializer(serializers.Serializer):
+    """`GET /v1/scheduler/feasibility` 200 body."""
+
+    flavors = FeasibilitySerializer(many=True)
 
 
 # ─── /v1/admin/epoch-weights ─────────────────────────────────────────

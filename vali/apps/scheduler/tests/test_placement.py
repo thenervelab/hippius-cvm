@@ -537,9 +537,9 @@ def test_max_host_share_reads_the_scheduler_setting(settings) -> None:
 
 
 def test_owner_cap_prefers_a_miner_under_the_owner_budget() -> None:
-    # Two active miners; the owner already holds 2 placements on miner-1
-    # and the cap is 2 → miner-1 is over-budget for this owner, so the
-    # placement prefers miner-2 even if miner-1 would otherwise rank.
+    # Two active miners; the owner already holds 2 placements on miner 1
+    # and the cap is 2 → miner 1 is over-budget for this owner, so the
+    # placement prefers miner 2 even if miner 1 would otherwise rank.
     snap = make_snapshot(
         10,
         [
@@ -578,9 +578,9 @@ def test_owner_cap_falls_back_when_it_would_leave_nobody() -> None:
 
 def test_owner_cap_disabled_by_zero() -> None:
     # `max_owner_placements_per_miner=0` ⇒ inert; the owner's heavy load on
-    # the merit-winner miner-1 does NOT deprioritise it. Equal free
+    # the merit-winner miner 1 does NOT deprioritise it. Equal free
     # capacity + both proven (quality>0, no newcomer grace) so merit
-    # decides — miner-1 wins.
+    # decides — miner 1 wins.
     snap = make_snapshot(
         10,
         [
@@ -602,8 +602,8 @@ def test_owner_cap_disabled_by_zero() -> None:
 
 def test_owner_cap_deprioritises_the_merit_winner_when_over_budget() -> None:
     # Same scenario but the cap ENABLED at 2: the owner is over budget on
-    # miner-1 (5 ≥ 2), so despite winning on merit it is deprioritised and
-    # miner-2 (under budget) is chosen — the cap changed the outcome.
+    # miner 1 (5 ≥ 2), so despite winning on merit it is deprioritised and
+    # miner 2 (under budget) is chosen — the cap changed the outcome.
     snap = make_snapshot(
         10,
         [
@@ -629,3 +629,130 @@ def test_max_owner_placements_per_miner_default_and_override(settings) -> None:
     assert service.max_owner_placements_per_miner() == 4  # settings.py default
     settings.VALI_SCHEDULER_MAX_OWNER_PLACEMENTS_PER_MINER = 2
     assert service.max_owner_placements_per_miner() == 2
+
+
+# ─── Gate (f): detected region ───────────────────────────────────────
+
+
+def _two_active(*seeds: int):
+    return make_snapshot(10, [make_miner(s, status="active", data_epoch=10) for s in seeds])
+
+
+def test_region_gate_is_inert_when_no_region_is_asked() -> None:
+    """Every pre-existing caller passes no region. The map may be present
+    (a future caller might always supply it) and must change nothing."""
+    snap = _two_active(1, 2)
+    chosen = decide_placement(
+        snapshot=snap,
+        capacity_by_node={node_id(1): 4, node_id(2): 4},
+        load_by_node={},
+        family_load_by_node={},
+        max_epoch_lag=2,
+        region="",
+        region_by_node={node_id(2): "FR"},
+    )
+    assert chosen == node_id(1)
+
+
+def test_region_gate_keeps_only_miners_detected_there() -> None:
+    """Miner 1 would win on the tie-break (lower node_id); it is in DE."""
+    snap = _two_active(1, 2)
+    chosen = decide_placement(
+        snapshot=snap,
+        capacity_by_node={node_id(1): 4, node_id(2): 4},
+        load_by_node={},
+        family_load_by_node={},
+        max_epoch_lag=2,
+        region="FR",
+        region_by_node={node_id(1): "DE", node_id(2): "FR"},
+    )
+    assert chosen == node_id(2)
+
+
+def test_region_is_case_insensitive() -> None:
+    """`fr` and `FR` are one region — `MinerLocation.region` is uppercase
+    and a caller's lowercase must not silently match nobody."""
+    snap = _two_active(1, 2)
+    chosen = decide_placement(
+        snapshot=snap,
+        capacity_by_node={node_id(1): 4, node_id(2): 4},
+        load_by_node={},
+        family_load_by_node={},
+        max_epoch_lag=2,
+        region="fr",
+        region_by_node={node_id(1): "DE", node_id(2): "FR"},
+    )
+    assert chosen == node_id(2)
+
+
+def test_a_miner_absent_from_the_map_is_in_no_region() -> None:
+    """Fail-closed: the map holds what the probe MEASURED. A miner it has
+    not reached is not "maybe in FR" — it is nowhere, and a region-bound
+    launch must not land on it. Same for a `None` map."""
+    snap = _two_active(1, 2)
+    for region_map in ({node_id(1): "DE"}, {}, None):
+        with pytest.raises(PlacementError) as exc:
+            decide_placement(
+                snapshot=snap,
+                capacity_by_node={node_id(1): 4, node_id(2): 4},
+                load_by_node={},
+                family_load_by_node={},
+                max_epoch_lag=2,
+                region="FR",
+                region_by_node=region_map,
+            )
+        assert exc.value.category == "no-miner-in-region", region_map
+
+
+def test_no_miner_in_region_is_claimed_only_when_the_gate_emptied_the_set() -> None:
+    """Miner 2 IS in FR but is out of capacity. The region was not the
+    problem, so the category must stay `no-eligible-miner` — a caller that
+    retries in another region on this answer would be misled. The message
+    still notes the constraint so the operator can see it applied."""
+    snap = _two_active(1, 2)
+    with pytest.raises(PlacementError) as exc:
+        decide_placement(
+            snapshot=snap,
+            capacity_by_node={node_id(1): 4, node_id(2): 1},
+            load_by_node={node_id(2): 1},
+            family_load_by_node={},
+            max_epoch_lag=2,
+            region="FR",
+            region_by_node={node_id(1): "DE", node_id(2): "FR"},
+        )
+    assert exc.value.category == "no-eligible-miner"
+    assert "region 'FR'" in exc.value.message
+    assert "1 of 2" in exc.value.message
+
+
+def test_region_gate_runs_after_the_dispatchable_gate() -> None:
+    """A dark fleet is `no-eligible-miner`, not `no-miner-in-region`: when
+    no candidate is dispatchable, none REACHES the region gate, so the
+    region cannot be what emptied the set. The two answers call for
+    opposite actions (fix reachability vs. sell elsewhere)."""
+    snap = _two_active(1, 2)
+    with pytest.raises(PlacementError) as exc:
+        decide_placement(
+            snapshot=snap,
+            capacity_by_node={node_id(1): 4, node_id(2): 4},
+            load_by_node={},
+            family_load_by_node={},
+            max_epoch_lag=2,
+            dispatchable=frozenset(),
+            region="FR",
+            region_by_node={node_id(1): "FR", node_id(2): "FR"},
+        )
+    assert exc.value.category == "no-eligible-miner"
+    # And a dispatchable miner outside the region IS counted by the gate.
+    with pytest.raises(PlacementError) as exc:
+        decide_placement(
+            snapshot=snap,
+            capacity_by_node={node_id(1): 4, node_id(2): 4},
+            load_by_node={},
+            family_load_by_node={},
+            max_epoch_lag=2,
+            dispatchable=frozenset({node_id(1)}),
+            region="FR",
+            region_by_node={node_id(1): "DE", node_id(2): "FR"},
+        )
+    assert exc.value.category == "no-miner-in-region"

@@ -69,6 +69,7 @@ use clap::Parser;
 use coset::CborSerializable;
 use ed25519_dalek::{Signer, SigningKey};
 use hippius_types::cbor::to_canonical_vec;
+use hippius_types::guardian::KeyMode;
 use hippius_types::ticket::SCHEMA_V;
 use rand_core::{OsRng, RngCore};
 
@@ -190,6 +191,15 @@ struct Args {
     )]
     lifecycle_perms: Vec<String>,
 
+    /// Customer-held disk keys: who holds this VM's disk key
+    /// (`hippius_types::guardian::KeyMode`). Only `split` (M1) or
+    /// `customer` (M2) may be given. Omitted ⇒ M0, and the ticket body
+    /// carries NO `key_mode` entry — byte-identical to a mint made before
+    /// this flag existed. `hippius` is refused: M0 has exactly one wire
+    /// encoding (the absent key), and the verifier rejects the explicit one.
+    #[arg(long, value_name = "MODE", value_parser = parse_key_mode_arg)]
+    key_mode: Option<KeyMode>,
+
     // ─── Output ──────────────────────────────────────────────────────
     /// Write the COSE_Sign1 bytes to this file. Without `--out` the
     /// bytes are written to stdout — handy for piping into a sink.
@@ -202,6 +212,19 @@ struct Args {
 fn parse_flavor_arg(s: &str) -> core::result::Result<hippius_types::flavor::Flavor, String> {
     s.parse::<hippius_types::flavor::Flavor>()
         .map_err(|e| e.to_string())
+}
+
+/// clap value_parser for `--key-mode`: `split` / `customer` only.
+fn parse_key_mode_arg(s: &str) -> core::result::Result<KeyMode, String> {
+    match KeyMode::from_wire(s) {
+        Some(KeyMode::Hippius) => Err(
+            "key_mode=hippius must be omitted (absent means hippius — M0 has one encoding)".into(),
+        ),
+        Some(mode) => Ok(mode),
+        None => Err(format!(
+            "unknown key mode {s:?} (expected split or customer)"
+        )),
+    }
 }
 
 /// Operator-facing error class. Carries a human-readable diagnostic;
@@ -311,7 +334,7 @@ fn run(args: Args) -> Result<(), MintError> {
     // sort the keys + reject duplicates. Mirrors the test fixture in
     // `kbs-core::ticket::tests::ticket_payload` so the encoded shape
     // matches what the verifier already exercises.
-    let body_value = Value::Map(vec![
+    let mut body_entries = vec![
         (
             Value::Text("allowed_measurements".into()),
             Value::Array(
@@ -382,7 +405,16 @@ fn run(args: Args) -> Result<(), MintError> {
             Value::Integer(args.vm_generation.into()),
         ),
         (Value::Text("vm_id".into()), Value::Text(args.vm_id.clone())),
-    ]);
+    ];
+    // Customer-held keys: present only for M1/M2, so an M0 body is
+    // unchanged (the canonical encoder sorts the entry into place).
+    if let Some(mode) = args.key_mode {
+        body_entries.push((
+            Value::Text("key_mode".into()),
+            Value::Text(mode.as_wire().into()),
+        ));
+    }
+    let body_value = Value::Map(body_entries);
     let payload = to_canonical_vec(&body_value)
         .map_err(|e| MintError::BadInput(format!("encode ticket body: {e}")))?;
 

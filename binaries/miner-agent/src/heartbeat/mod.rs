@@ -40,7 +40,10 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-pub use builder::{HeartbeatBuilder, SequenceStore};
+pub use builder::{
+    CapacityDeclarer, DiskDeclarer, DiskReading, DiskSource, HeartbeatBuilder, SequenceStore,
+    StatvfsDiskSource,
+};
 pub use metrics::{HostMetrics, MetricsSource, MockMetricsSource, ProcMetricsSource};
 pub use pusher::{
     build_edge_mtls_client, run_pusher, HeartbeatClient, PushOutcome, ReqwestHeartbeatClient,

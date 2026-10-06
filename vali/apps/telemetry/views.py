@@ -690,6 +690,19 @@ class MinerVmProgressIngestView(APIView):
                 },
                 status=status.HTTP_200_OK,
             )
+        # Zombie gate — a boot milestone for a VM past its §24 crypto-erase
+        # means a miner (re)started a guest it was told to kill. The frame
+        # is signed by that miner's own key and relayed over its own mTLS
+        # leg, so the attribution is exact. Refuse + record.
+        from apps.lifecycle import zombie
+
+        if zombie.is_zombie(vm):
+            zombie.observe(vm, kind="vm_progress", relay_miner_id=miner_id)
+            return _error(
+                status.HTTP_410_GONE,
+                f"vm is past its {zombie.erase_phrase(vm)}",
+                "vm-not-live",
+            )
         # Cross-miner ownership bind — FAIL CLOSED. Only the miner that
         # HOSTS this VM may advance its `boot_phase`; otherwise a registered
         # miner B, knowing a vm_id hosted by miner A, could drive A's tenant
@@ -725,10 +738,45 @@ class MinerVmProgressIngestView(APIView):
                 "reporting miner does not host this vm",
                 "identity",
             )
+        from datetime import UTC, datetime
+
+        from apps.lifecycle import guardian_wait
+
+        # The signed (miner-clock, skew-checked) instant: what orders the
+        # guardian wait against the milestones that clear it.
+        signed_at = datetime.fromtimestamp(body.timestamp_unix, tz=UTC)
+        if body.milestone == guardian_wait.MILESTONE:
+            # Customer-held keys: the guest waits on its guardian. Not a
+            # `boot_phase` step (that axis is monotonic across boots); a
+            # separate display record. An M0 VM has no guardian, so a miner
+            # reporting one is ignored (never a pause it could then forge).
+            recorded = guardian_wait.record(vm, body.reason or "", signed_at)
+            log.info(
+                "vm-progress awaiting-guardian: vm_id=%s reason=%s miner_id=%s recorded=%s",
+                vm.vm_id,
+                body.reason,
+                miner_id,
+                recorded,
+            )
+            return Response(
+                {
+                    "ok": True,
+                    "vm_id": vm.vm_id,
+                    "boot_phase": vm.boot_phase,
+                    "tracked": True,
+                    "advanced": False,
+                },
+                status=status.HTTP_200_OK,
+            )
         advanced = vm.advance_boot_phase(body.milestone)
+        cleared = guardian_wait.clear_on_milestone(vm, body.milestone, signed_at)
+        if advanced or cleared:
+            fields = ["updated_at", *cleared]
+            if advanced:
+                vm.boot_phase_at = timezone.now()
+                fields += ["boot_phase", "boot_phase_at"]
+            vm.save(update_fields=fields)
         if advanced:
-            vm.boot_phase_at = timezone.now()
-            vm.save(update_fields=["boot_phase", "boot_phase_at", "updated_at"])
             log.info(
                 "vm-progress advanced: vm_id=%s boot_phase=%s miner_id=%s",
                 vm.vm_id,
@@ -1010,7 +1058,13 @@ class HostAttestorReleaseView(APIView):
          `host_attestor` CLASS (never aliasing a tenant measurement, NEVER
          auto-pinned from a miner report),
       3. records a `HostAttestorRelease` active (the desired image miners
-         relaunch onto).
+         relaunch onto) in the grace window of its SEV-SNP `generation`.
+
+    `generation` (genoa | turin | milan) is REQUIRED: the attestor launch
+    measurement covers the VMSA's vCPU CPUID signature, so one UKI measures
+    differently per generation and each generation keeps its own {current,
+    previous} window. Missing/unknown ⇒ 400; re-admitting a measurement
+    under a different generation than it was released for ⇒ 409.
 
     Ships INERT: this manages the release + pins the measurement; nothing
     here gates reward / dispatchability (that arms in PR-11). It inherits
@@ -1030,7 +1084,9 @@ class HostAttestorReleaseView(APIView):
             "Host-attestor-admin only. Keyless-cosign-verifies the CI-signed "
             "blackbox UKI (Fulcio cert + Rekor, pinned identity + issuer), then "
             "APPEND-ONLY pins its measurement into the §22 allowlist under the "
-            "`host_attestor` class and records it as the active desired release. "
+            "`host_attestor` class and records it as the active desired release "
+            "of its SEV-SNP `generation` (required: genoa | turin | milan — the "
+            "{current, previous} grace window is kept per generation). "
             "The measurement is operator/CI-pinned here ONLY — never auto-pinned "
             "from a miner report. Ships INERT (does not gate reward/dispatch)."
         ),
@@ -1046,6 +1102,10 @@ class HostAttestorReleaseView(APIView):
                 ErrorSerializer, "Not the host-attestor-admin principal."
             ),
             413: OpenApiResponse(ErrorSerializer, "Release artifact too large."),
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "Measurement already released for a different generation.",
+            ),
             502: OpenApiResponse(ErrorSerializer, "Allowlist pin failed."),
             503: OpenApiResponse(ErrorSerializer, "cosign / pin unavailable."),
         },
@@ -1065,6 +1125,7 @@ class HostAttestorReleaseView(APIView):
         try:
             measurement_hex = _require_str(body, "measurement_hex", max_len=96)
             version = _require_str(body, "version", max_len=64)
+            generation = _require_str(body, "generation", max_len=8)
             artifact = _require_b64(
                 body, "artifact_b64", max_bytes=_max_release_artifact_bytes()
             )
@@ -1080,6 +1141,7 @@ class HostAttestorReleaseView(APIView):
             result = release_service.admit_release(
                 measurement_hex=measurement_hex,
                 version=version,
+                generation=generation,
                 artifact=artifact,
                 signature_b64=signature_b64,
                 certificate_pem=certificate_pem,
@@ -1092,6 +1154,7 @@ class HostAttestorReleaseView(APIView):
             {
                 "measurement": result.release.measurement,
                 "version": result.release.version,
+                "generation": result.release.generation,
                 "is_active": result.release.is_active,
                 "allowlist_epoch": result.new_epoch,
                 "cosign_identity": result.release.cosign_identity,
@@ -1121,9 +1184,14 @@ class HostAttestorDesiredView(APIView):
 
     Unauthenticated + CNP-gated, mirroring the `edge/registry` feed: the
     desired measurement is public data (it is already in the public §22
-    allowlist), and the artifact reference is a public CI artifact. The
-    `node_id` is accepted for symmetry / future per-node rollout + logged;
-    the release is fleet-wide today.
+    allowlist), and the artifact reference is a public CI artifact.
+
+    Per SEV-SNP generation: `node_id` (the on-chain node id, or the
+    `miner_id`) resolves the miner's generation exactly as the launch-digest
+    recompute does (`MinerIdentity.snp_generation`, else CHIP_ID length),
+    and the window returned is THAT generation's. An unresolved node, or a
+    generation with no active release, gets the legacy untagged window
+    (`generation: ""`) — the pre-generation fleet-wide answer.
     """
 
     authentication_classes: list[Any] = []
@@ -1136,10 +1204,13 @@ class HostAttestorDesiredView(APIView):
         summary="The desired host-attestor UKI release for a miner",
         description=(
             "Miner-facing (CNP-gated, unauthenticated — public allowlist data). "
-            "Returns the {current, previous} active releases: the measurement "
-            "the miner should boot its host attestor onto, plus the previous "
-            "one still accepted during a rolling update. Empty `current` before "
-            "the operator has admitted any release."
+            "Returns the {current, previous} active releases OF THE MINER'S "
+            "SEV-SNP GENERATION: the measurement the miner should boot its host "
+            "attestor onto, plus the previous one still accepted during a "
+            "rolling update. `generation` echoes the window served (\"\" = the "
+            "legacy untagged window, used when the node's generation is "
+            "unresolved or has no release). Empty `current` before the operator "
+            "has admitted any release."
         ),
         tags=["Telemetry"],
         parameters=[
@@ -1147,7 +1218,10 @@ class HostAttestorDesiredView(APIView):
                 "node_id",
                 str,
                 OpenApiParameter.PATH,
-                description="The miner's host node id (informational today).",
+                description=(
+                    "The miner's on-chain node id (or miner_id) — selects its "
+                    "SEV-SNP generation's window."
+                ),
             ),
         ],
         responses={
@@ -1162,14 +1236,16 @@ class HostAttestorDesiredView(APIView):
             return _error(
                 status.HTTP_400_BAD_REQUEST, "malformed node_id", "wire"
             )
-        desired = release_service.desired_releases()
+        generation, desired = release_service.desired_releases_for_node(node_id)
         log.info(
-            "host-attestor desired polled: node_id=%s current=%s",
+            "host-attestor desired polled: node_id=%s generation=%s current=%s",
             node_id,
+            generation or "untagged",
             desired.current.measurement[:16] + "…" if desired.current else "none",
         )
         return Response(
             {
+                "generation": generation,
                 "current": _serialize_release(desired.current),
                 "previous": _serialize_release(desired.previous),
             },
@@ -1284,6 +1360,7 @@ def _serialize_release(release: Any) -> dict[str, Any] | None:
     return {
         "measurement": release.measurement,
         "version": release.version,
+        "generation": release.generation,
         "cosign_identity": release.cosign_identity,
         "created_at": release.created_at.isoformat(),
     }
@@ -1605,6 +1682,9 @@ class VmLiveAttestationIngestView(APIView):
             200: VmLiveAttestationResponseSerializer,
             400: OpenApiResponse(
                 ErrorSerializer, "Empty / bad / expired / unbound attestation."
+            ),
+            410: OpenApiResponse(
+                ErrorSerializer, "The VM is past its §24 crypto-erase (zombie)."
             ),
             413: OpenApiResponse(ErrorSerializer, "Body too large."),
             503: OpenApiResponse(

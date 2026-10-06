@@ -48,7 +48,7 @@ Example:
     python manage.py vali_create_vm \\
         --tenant-id t-smoke --vm-id myvm-1 \\
         --user-id u-smoke --lease-id lease-smoke \\
-        --miner-id miner-1 \\
+        --miner-id miner-a \\
         --platform-id <AMD_CHIP_ID_HEX> \\
         --userdata-file ./cloud-init.yaml \\
         --s3-bucket hippius-compute-images \\
@@ -184,8 +184,9 @@ class Command(BaseCommand):
                 "and substitute it for the literal "
                 "`{{NETBIRD_SETUP_KEY}}` placeholder in --userdata-file "
                 "before stashing in Vault. The minted key is "
-                "single-use, ephemeral, expires in --netbird-key-ttl "
-                "seconds, and auto-joins --netbird-group on first boot. "
+                "single-use, expires in --netbird-key-ttl "
+                "seconds, enrols a PERSISTENT peer (revoked on "
+                "decommission), and auto-joins --netbird-group on first boot. "
                 "Userdata template example: "
                 "`docs/operator/userdata-templates/netbird-enabled.yaml"
                 ".example`. ON BY DEFAULT — pass --no-enable-netbird to "
@@ -318,7 +319,7 @@ class Command(BaseCommand):
                 "launch_digest covers it — a miner can't substitute a "
                 "different rootfs because the resulting launch_digest "
                 "won't be in the §22 allowlist (audit follow-up "
-                "Gemini #1 / Codex #1). Optional today for backward "
+                "#1). Optional today for backward "
                 "compatibility with the legacy bake; production "
                 "operators should set this from the Stage 2 "
                 "measurement.json's `rootfs_tar_zst_sha256`."
@@ -351,15 +352,17 @@ class Command(BaseCommand):
         parser.add_argument(
             "--flavor",
             required=True,
-            choices=list(flavors.FLAVOR_NAMES),
+            choices=list(flavors.LAUNCHABLE_FLAVOR_NAMES),
             help=(
                 "Tenant VM size catalogue identifier (#312). REQUIRED "
-                "as of OrderTicket v2 (#312 follow-up); the canonical "
-                "flavor name is the signed-immutable carrier of "
-                "(vcpus, memory_mb, disk_gb) in the ticket. Catalogue: "
-                "small=1c/2GB/8GB, medium=2c/4GB/16GB, large=4c/8GB/32GB, "
-                "xlarge=8c/16GB/64GB, 2xlarge=16c/32GB/128GB, "
-                "4xlarge=32c/64GB/256GB."
+                "as of OrderTicket v2 (#312 follow-up); the ticket signs "
+                "the flavor (its vCPU/RAM class), the data disk rides the "
+                "measured hippius.disk_gb token. Catalogue: "
+                "small=1c/4GB/40GB, medium=2c/8GB/80GB, large=4c/16GB/160GB, "
+                "xlarge=8c/32GB/320GB, 2xlarge=16c/64GB/640GB, "
+                "4xlarge=32c/128GB/1280GB; unlisted runner flavors "
+                "runner-small=1c/4GB/20GB, runner-medium=2c/8GB/20GB, "
+                "runner-large=4c/16GB/30GB are ticketed as small/medium/large."
             ),
         )
         parser.add_argument("--luks-disk-size-gb", type=int, default=10)
@@ -425,6 +428,18 @@ class Command(BaseCommand):
             ) from exc
         if not userdata:
             raise CommandError("--userdata-file is empty — refusing to stage")
+        # `vault:` is the discriminator for "these bytes are already Transit
+        # ciphertext": `launch_on_miner` copies such a value to the canonical
+        # path verbatim and skips both the NetBird substitution and the wrap.
+        # A plaintext file that happens to start with it would therefore be
+        # staged unwrapped and then fail at the KBS's Transit decrypt — a
+        # confusing failure two systems away. The API rejects it at intake for
+        # the same reason; this is the CLI half of that guard.
+        if userdata.startswith(b"vault:"):
+            raise CommandError(
+                "--userdata-file starts with `vault:`, which is reserved for "
+                "Transit ciphertext — pass cloud-init plaintext"
+            )
 
         # Pre-flight the NetBird template so the operator gets a clean
         # CommandError; the launch service applies the SAME rule
@@ -435,6 +450,12 @@ class Command(BaseCommand):
             hostname_template=opts["netbird_hostname_template"],
             vm_id=opts["vm_id"],
         )
+        if nb_err is None:
+            nb_err = launch.check_netbird_hostname(
+                enable=opts["enable_netbird"],
+                hostname_template=opts["netbird_hostname_template"],
+                vm_id=opts["vm_id"],
+            )
         if nb_err is not None:
             raise CommandError(nb_err)
 
@@ -558,7 +579,7 @@ class Command(BaseCommand):
                 raise CommandError(
                     f"--{flag.replace('_', '-')} must be exactly 64 lower-case hex chars"
                 )
-        # Audit follow-up Gemini #1 / Codex #1: optional today, so
+        # Audit follow-up Review #1 / Review #1: optional today, so
         # gate the regex only when the operator opts in. An empty
         # string skips the cmdline append in step 4b; any non-empty
         # value must satisfy the canonical 64-hex shape.
@@ -575,9 +596,9 @@ class Command(BaseCommand):
         # #312 follow-up — OrderTicket v2 makes --flavor required and
         # drops the raw --cpu-count / --memory-mb knobs. The shared
         # `flavors` catalogue resolves it to (cpu, mem, data-disk, rootfs).
-        if opts["flavor"] not in flavors.FLAVOR_NAMES:
+        if opts["flavor"] not in flavors.LAUNCHABLE_FLAVOR_NAMES:
             raise CommandError(
-                f"--flavor must be one of: {', '.join(flavors.FLAVOR_NAMES)}"
+                f"--flavor must be one of: {', '.join(flavors.LAUNCHABLE_FLAVOR_NAMES)}"
             )
         if opts["expiry_seconds"] < 60:
             raise CommandError("--expiry-seconds must be >= 60")

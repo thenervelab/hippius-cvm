@@ -89,20 +89,20 @@ def test_epoch_check_fails_on_a_fossil_pallet(monkeypatch) -> None:
 
     Reproduces production on 2026-08-10: a runtime upgrade dropped
     `pallet-compute-scoring`, its storage prefix kept answering, and the
-    epoch stuck at 2702. The old check asserted only `epoch > 0` and
+    epoch stuck at 5002. The old check asserted only `epoch > 0` and
     reported OK every 15 minutes for a week.
     """
     from apps.scheduler import chain
 
     monkeypatch.setattr(
-        chain, "read_miner_status", lambda: _FakeSnapshot([], 2702, pallet_live=False)
+        chain, "read_miner_status", lambda: _FakeSnapshot([], 5002, pallet_live=False)
     )
     r = checks.check_epoch_close_advancing()
     assert not r.ok, "a fossil pallet must FAIL the monitor, not pass it"
     assert "FOSSIL" in r.detail
     assert r.gauges["hippius_synthetic_chain_pallet_live"] == 0.0
     # the epoch is still reported, so an operator sees WHERE it froze
-    assert r.gauges["hippius_synthetic_current_epoch"] == 2702
+    assert r.gauges["hippius_synthetic_current_epoch"] == 5002
 
 
 @pytest.mark.django_db
@@ -244,7 +244,7 @@ def test_command_acked_failure_keeps_the_tier_metric_at_1(monkeypatch, settings)
         "run_light",
         lambda: [
             checks.CheckResult("vali_api", True, "up"),
-            checks.CheckResult("epoch_close", False, "FOSSIL: current_epoch=2702"),
+            checks.CheckResult("epoch_close", False, "FOSSIL: current_epoch=5002"),
         ],
     )
     settings.VALI_SYNTHETIC_ACK = _ack_spec("epoch_close")
@@ -298,7 +298,7 @@ def test_command_acked_check_is_still_VISIBLE_in_the_output(monkeypatch, setting
     monkeypatch.setattr(
         checks,
         "run_light",
-        lambda: [checks.CheckResult("epoch_close", False, "FOSSIL: current_epoch=2702")],
+        lambda: [checks.CheckResult("epoch_close", False, "FOSSIL: current_epoch=5002")],
     )
     settings.VALI_SYNTHETIC_ACK = _ack_spec("epoch_close")
     _capture_push(monkeypatch)
@@ -391,7 +391,7 @@ def test_command_default_no_ack_is_unchanged_behaviour(monkeypatch, settings) ->
 
 # ── uptime-liveness stall: "this VM is running and earning nothing" ──────
 #
-# The 2026-08-13 gateproof-a incident was invisible: the miner logged ok,
+# The 2026-08-13 zero-uptime incident was invisible: the miner logged ok,
 # vali logged INFO, the VM stayed active and kept emitting served
 # receipts. These pin the signal that makes the next occurrence loud.
 
@@ -444,14 +444,14 @@ def test_uptime_liveness_flags_a_vm_that_STOPPED_attesting(settings) -> None:
     settings.VALI_UPTIME_LIVENESS_STALL_S = 1800
     settings.VALI_UPTIME_REQUIRE_LIVENESS_ATTESTATION = True
     now = int(time.time())
-    _running_vm("gateproof-a")
+    _running_vm("probe-a")
     # Attested steadily until 3.7 h ago, then nothing (the incident shape).
     for i, back in enumerate(range(14_500, 13_000, -300)):
-        _attestation("gateproof-a", now - back, seq=i + 1)
+        _attestation("probe-a", now - back, seq=i + 1)
 
     r = checks.check_uptime_liveness()
     assert not r.ok, "a VM that stopped attesting did not fail the monitor"
-    assert "gateproof-a" in r.detail
+    assert "probe-a" in r.detail
     assert "earning NOTHING" in r.detail
     assert r.gauges["hippius_synthetic_uptime_stalled_vms"] == 1.0
     assert r.gauges["hippius_synthetic_uptime_liveness_armed"] == 1.0

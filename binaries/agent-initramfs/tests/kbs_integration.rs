@@ -234,12 +234,13 @@ fn mint_signed_response(kbs_sk: &SigningKey, guest_pub: &[u8; 32], vm_id: &str) 
         kbs_kid: KBS_KID.to_vec(),
         hpke_suite_id: HPKE_SUITE_ID,
         allowed_userdata_digest: digest.to_vec(),
-        luks,
+        luks: Some(luks),
         userdata,
         lifecycle_key: None,
         boot_counter: 0,
         expected_volume_stamp: 0,
         volume_stamp_token: None,
+        volume_stamp_transition: None,
     };
     kbs_core::crypto::sign_response(kbs_sk, &response).unwrap()
 }
@@ -340,7 +341,7 @@ fn full_release_loop_recovers_the_sealed_secrets() {
             .expect("a valid signed response must verify + unwrap");
 
     // The exact plaintexts the mock KBS sealed come back out.
-    assert_eq!(&secrets.luks[..], &luks_plaintext()[..]);
+    assert_eq!(&secrets.luks.as_deref().unwrap()[..], &luks_plaintext()[..]);
     assert_eq!(&secrets.userdata[..], &userdata_plaintext()[..]);
 }
 

@@ -29,7 +29,10 @@ use crate::stages::keygen::Ephemeral;
 use crate::stages::snp_report::MEASUREMENT_LEN;
 use crate::stages::ticket::Ticket;
 use ed25519_dalek::VerifyingKey;
-use hippius_guest::{verify_and_unwrap_release, ExpectedRelease, UnwrappedSecrets};
+use hippius_guest::{
+    verify_and_unwrap_release_attested, AttestedStampProtocol, ExpectedRelease, UnwrappedSecrets,
+};
+use hippius_types::guardian::KeyMode;
 use hippius_types::release::SignedResponse;
 
 /// Verify `signed` against the pinned KBS Ed25519 key and unwrap the
@@ -56,6 +59,61 @@ pub fn verify_and_unwrap(
     measurement: &[u8; MEASUREMENT_LEN],
     pinned_kbs_vk: &[u8; 32],
     pinned_kbs_kid: &[u8],
+) -> Result<UnwrappedSecrets, AgentError> {
+    verify_and_unwrap_for_mode(
+        signed,
+        keys,
+        nonce,
+        ticket,
+        measurement,
+        pinned_kbs_vk,
+        pinned_kbs_kid,
+        KeyMode::Hippius,
+    )
+}
+
+/// [`verify_and_unwrap`] for a VM whose disk key mode is `mode` — see
+/// [`hippius_guest::verify_and_unwrap_release_for_mode`]: the KEK is
+/// required in `hippius` / `split` and refused in `customer`, every
+/// other binding is identical.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_unwrap_for_mode(
+    signed: &SignedResponse,
+    keys: Ephemeral,
+    nonce: &KbsNonce,
+    ticket: &Ticket,
+    measurement: &[u8; MEASUREMENT_LEN],
+    pinned_kbs_vk: &[u8; 32],
+    pinned_kbs_kid: &[u8],
+    mode: KeyMode,
+) -> Result<UnwrappedSecrets, AgentError> {
+    verify_and_unwrap_attested(
+        signed,
+        keys,
+        nonce,
+        ticket,
+        measurement,
+        pinned_kbs_vk,
+        pinned_kbs_kid,
+        mode,
+        AttestedStampProtocol::V1,
+    )
+}
+
+/// [`verify_and_unwrap_for_mode`] for a release whose SNP report attested
+/// `attested` — see [`hippius_guest::verify_and_unwrap_release_attested`]:
+/// a v2 attestation accepts only a V2 response with a timeline transition.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_unwrap_attested(
+    signed: &SignedResponse,
+    keys: Ephemeral,
+    nonce: &KbsNonce,
+    ticket: &Ticket,
+    measurement: &[u8; MEASUREMENT_LEN],
+    pinned_kbs_vk: &[u8; 32],
+    pinned_kbs_kid: &[u8],
+    mode: KeyMode,
+    attested: AttestedStampProtocol,
 ) -> Result<UnwrappedSecrets, AgentError> {
     // Reconstruct the pinned KBS verifying key from the UKI-baked bytes.
     let kbs_vk = VerifyingKey::from_bytes(pinned_kbs_vk)
@@ -93,5 +151,6 @@ pub fn verify_and_unwrap(
     // binding before it unwraps a single byte. A `GuestError` is
     // wrapped — its `Display` is audited to carry no plaintext, and
     // `main` only logs `AgentError::class()` regardless.
-    verify_and_unwrap_release(signed, &kbs_vk, &guest_sk, &expected).map_err(AgentError::Guest)
+    verify_and_unwrap_release_attested(signed, &kbs_vk, &guest_sk, &expected, mode, attested)
+        .map_err(AgentError::Guest)
 }

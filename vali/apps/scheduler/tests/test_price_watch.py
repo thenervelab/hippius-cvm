@@ -240,3 +240,59 @@ def test_end_to_end_recommends_on_real_vm_ceiling(monkeypatch) -> None:
     assert rec.vm.vm_id == "vm-a"
     assert rec.ceiling == 100
     assert rec.new_price == 500
+
+
+def test_suggested_dest_is_constrained_to_the_vm_region(monkeypatch) -> None:
+    """Gate (f) on the ONLY guard this path has: an operator approving a
+    recommendation calls `start_migration`, which does not check regions,
+    so the suggestion itself must have been made inside the VM's region."""
+    from apps.lifecycle.models import Vm
+    from apps.orchestration.tests.factories import make_launch_record
+
+    _bind("vm-a", node_id(1))
+    _bind("vm-b", node_id(1))
+    make_launch_record(Vm.objects.get(vm_id="vm-a"), region="fr")
+    make_launch_record(Vm.objects.get(vm_id="vm-b"))
+    _patch_common(monkeypatch, ceilings={"vm-a": 100, "vm-b": 100}, dest=node_id(9))
+    seen: dict[str, dict | None] = {}
+
+    def spy(**kw):
+        seen[kw["region"]] = kw["region_by_node"]
+        return node_id(9)
+
+    monkeypatch.setattr(cmd, "decide_placement", spy)
+    monkeypatch.setattr(
+        cmd.chain,
+        "read_pending_price_changes",
+        lambda: _report(PriceAnnouncement(node_id(1), 500, 150)),
+    )
+    call_command("vali_price_watch", once=True)
+    # vm-a asked for FR ⇒ the gate is armed with the (here empty) verified
+    # map; vm-b asked for nothing ⇒ inert and no map at all.
+    assert seen == {"FR": {}, "": None}
+
+
+def test_suggested_dest_is_sized_for_the_vms_own_flavor(monkeypatch) -> None:
+    """The recommended destination must fit the repriced VM's flavor: the
+    watcher hands capacity v2 that placement's `resource_class`."""
+    from apps.scheduler.placement import ResourceFit
+
+    placement = _bind("vm-a", node_id(1))
+    placement.resource_class = "xlarge"
+    placement.save(update_fields=["resource_class"])
+    _patch_common(monkeypatch, ceilings={"vm-a": 100}, dest=node_id(9))
+    asked: list[str] = []
+
+    def record(resource_class: str, **kw: object) -> ResourceFit:
+        asked.append(resource_class)
+        return ResourceFit(resource_class, fits_by_node={}, free_fraction_by_node={})
+
+    monkeypatch.setattr(cmd.service, "resource_fit", record)
+    _no_migration(monkeypatch)
+    monkeypatch.setattr(
+        cmd.chain,
+        "read_pending_price_changes",
+        lambda: _report(PriceAnnouncement(node_id(1), 500, 150)),
+    )
+    call_command("vali_price_watch", once=True)
+    assert asked == ["xlarge"]

@@ -27,6 +27,11 @@ class GoldenImageSerializer(serializers.Serializer):
     )
     blessed_at = serializers.DateTimeField(help_text="When this bake was blessed for the image.")
     blessed_by = serializers.CharField(help_text="Operator identity recorded at bless time.")
+    guest_release = serializers.IntegerField(
+        allow_null=True,
+        help_text="The guest components release a new VM of this image boots (null: the "
+        "bare bake).",
+    )
 
 
 class GoldenImageListSerializer(serializers.Serializer):

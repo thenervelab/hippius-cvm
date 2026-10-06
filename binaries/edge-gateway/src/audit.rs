@@ -392,7 +392,7 @@ fn walk_log(dir: &Path) -> Result<VerifiedEdgeAudit, AuditError> {
         if decoded.prev_hash != expected_prev {
             return Err(AuditError::Tamper);
         }
-        // PR-H6 codex review: bind the SIGNED telemetry envelope to its
+        // PR-H6 review: bind the SIGNED telemetry envelope to its
         // chain position. The envelope's `counter` lives inside the
         // Ed25519-signed body, so a record cannot be moved to a
         // different `seq` (reordered) without breaking either this

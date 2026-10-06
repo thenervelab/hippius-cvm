@@ -175,7 +175,21 @@ struct MigrationEntry {
     /// forge it, and surfacing a stale / wrong ack just makes vali's
     /// `_verify_ack` reject it (fail-closed, never advance).
     source_ack: Option<Vec<u8>>,
+    /// The multipart snapshot's part receipts, once uploaded: what vali
+    /// completes the upload from. `None` for a single-PUT snapshot.
+    snapshot_receipt: Option<crate::backup::transfer::PieceReceipt>,
+    /// Why a DEST activation failed: the error's static class (e.g.
+    /// `migration/dest-settle-by-passed`). Surfaced on the status route so
+    /// vali can tell a restore that never reached a boot from a CVM that
+    /// could not start. Set only by [`MigrationStore::mark_activate_failed`],
+    /// cleared by `set_phase`, and reported only while the phase is
+    /// `Failed` — so a retry in `Activating` never shows the last class.
+    failure_class: Option<String>,
 }
+
+/// Longest failure class the status route reports. The classes are short
+/// static strings; the cap only bounds what a future variant could emit.
+const MAX_FAILURE_CLASS_LEN: usize = 128;
 
 /// In-memory `vm_id → MigrationEntry` map.
 ///
@@ -206,6 +220,7 @@ impl MigrationStore {
         let mut map = self.lock()?;
         let entry = map.entry(vm_id.clone()).or_default();
         entry.phase = Some(phase);
+        entry.failure_class = None;
         Ok(())
     }
 
@@ -275,7 +290,14 @@ impl MigrationStore {
                 return Err(MinerAgentError::Migration("disk-missing"));
             }
         };
-        self.set_phase(vm_id, MigrationPhase::Snapshotting)?;
+        {
+            // A re-drive starts a new upload: the old receipts name parts
+            // of an upload vali may have aborted.
+            let mut map = self.lock()?;
+            let entry = map.entry(vm_id.clone()).or_default();
+            entry.snapshot_receipt = None;
+            entry.phase = Some(MigrationPhase::Snapshotting);
+        }
         Ok(disk_path)
     }
 
@@ -283,6 +305,30 @@ impl MigrationStore {
     /// poll then returns `done`).
     pub fn mark_snapshot_done(&self, vm_id: &VmId) -> Result<()> {
         self.set_phase(vm_id, MigrationPhase::Done)
+    }
+
+    /// [`Self::mark_snapshot_done`] for a multipart snapshot: the status
+    /// poll then also reports `receipt`.
+    pub fn mark_multipart_snapshot_done(
+        &self,
+        vm_id: &VmId,
+        receipt: crate::backup::transfer::PieceReceipt,
+    ) -> Result<()> {
+        let mut map = self.lock()?;
+        let entry = map.entry(vm_id.clone()).or_default();
+        entry.snapshot_receipt = Some(receipt);
+        entry.phase = Some(MigrationPhase::Done);
+        Ok(())
+    }
+
+    /// The part receipts of `vm_id`'s finished multipart snapshot.
+    pub fn snapshot_receipt(&self, vm_id: &VmId) -> Option<crate::backup::transfer::PieceReceipt> {
+        self.entries
+            .lock()
+            .ok()?
+            .get(vm_id)?
+            .snapshot_receipt
+            .clone()
     }
 
     /// §25 M1 — mark the background snapshot upload failed (the status
@@ -298,7 +344,14 @@ impl MigrationStore {
     /// until [`mark_activate_done`] / [`mark_activate_failed`]. Creates the
     /// DEST's migration entry (no prior quiesce on the dest — unlike the
     /// source snapshot, which requires one).
-    pub fn begin_activate(&self, vm_id: &VmId) -> Result<()> {
+    ///
+    /// Returns `Ok(false)` — and changes nothing — when an activation of
+    /// this VM is ALREADY running here: the caller must not start a second
+    /// one. Two concurrent restores would share the same staging dir and
+    /// final disk paths, and one could rename a disk over the other's
+    /// freshly booted guest. The check and the transition happen under one
+    /// lock.
+    pub fn begin_activate(&self, vm_id: &VmId) -> Result<bool> {
         // This host must not be this VM's SOURCE. `Snapshotting`/`Done`
         // mean we quiesced and uploaded it — activating it here would put
         // a second live copy of the VM on the machine the fence just
@@ -309,7 +362,9 @@ impl MigrationStore {
         // future local caller of `begin_activate` would re-arm the
         // split-brain with no compile-time or runtime signal. Make the
         // invariant local and self-enforcing instead.
-        match self.phase(vm_id) {
+        let mut map = self.lock()?;
+        let entry = map.entry(vm_id.clone()).or_default();
+        match entry.phase {
             // Every phase only a SOURCE can be in. `Quiescing` belongs here
             // as much as the other two — `quiesce()` sets it as its very
             // first action, so it is the EARLIEST source marker, and
@@ -317,7 +372,11 @@ impl MigrationStore {
             Some(MigrationPhase::Quiescing)
             | Some(MigrationPhase::Snapshotting)
             | Some(MigrationPhase::Done) => Err(MinerAgentError::Migration("activate-on-source")),
-            _ => self.set_phase(vm_id, MigrationPhase::Activating),
+            Some(MigrationPhase::Activating) => Ok(false),
+            _ => {
+                entry.phase = Some(MigrationPhase::Activating);
+                Ok(true)
+            }
         }
     }
 
@@ -351,9 +410,26 @@ impl MigrationStore {
 
     /// §25 M2 DEST — mark the background restore + boot failed (the status
     /// poll then returns `failed`; vali fails the migration closed — the
-    /// dest is never activated, the split-brain fence holds).
-    pub fn mark_activate_failed(&self, vm_id: &VmId) {
-        let _ = self.set_phase(vm_id, MigrationPhase::Failed);
+    /// dest is never activated, the split-brain fence holds). `err`'s class
+    /// (its `Display`, a static `family/sub-class` string) is kept for the
+    /// status route.
+    pub fn mark_activate_failed(&self, vm_id: &VmId, err: &MinerAgentError) {
+        let Ok(mut map) = self.lock() else { return };
+        let entry = map.entry(vm_id.clone()).or_default();
+        entry.phase = Some(MigrationPhase::Failed);
+        let mut class = err.to_string();
+        class.truncate(MAX_FAILURE_CLASS_LEN);
+        entry.failure_class = Some(class);
+    }
+
+    /// The class of `vm_id`'s failed dest activation, while it is `Failed`.
+    pub fn failure_class(&self, vm_id: &VmId) -> Option<String> {
+        let map = self.entries.lock().ok()?;
+        let entry = map.get(vm_id)?;
+        match entry.phase {
+            Some(MigrationPhase::Failed) => entry.failure_class.clone(),
+            _ => None,
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<VmId, MigrationEntry>>> {
@@ -375,6 +451,17 @@ pub trait SnapshotUploader: Send + Sync {
     /// inspects or transforms them. MUST stream (not buffer the whole
     /// file) — production wraps a `tokio::fs::File` in a `ReaderStream`.
     async fn upload(&self, disk_path: &std::path::Path, put_url: &str) -> Result<()>;
+
+    /// Stream the file at `disk_path` as consecutive `part_size` parts to
+    /// the presigned `UploadPart` URLs, returning each part's receipt.
+    async fn upload_parts(
+        &self,
+        _disk_path: &std::path::Path,
+        _part_size: u64,
+        _part_urls: &[String],
+    ) -> Result<crate::backup::transfer::PieceReceipt> {
+        Err(MinerAgentError::Migration("multipart-unsupported"))
+    }
 }
 
 /// Production [`SnapshotUploader`] — a streaming HTTP PUT.
@@ -428,9 +515,30 @@ impl SnapshotUploader for ReqwestSnapshotUploader {
             .map_err(|_| MinerAgentError::Migration("upload-send"))?;
 
         if !resp.status().is_success() {
+            eprintln!(
+                "hippius-miner-agent: migrate-snapshot: single PUT refused: HTTP {}",
+                resp.status().as_u16()
+            );
             return Err(MinerAgentError::Migration("upload-status"));
         }
         Ok(())
+    }
+
+    async fn upload_parts(
+        &self,
+        disk_path: &std::path::Path,
+        part_size: u64,
+        part_urls: &[String],
+    ) -> Result<crate::backup::transfer::PieceReceipt> {
+        let file =
+            std::fs::File::open(disk_path).map_err(|_| MinerAgentError::Migration("disk-open"))?;
+        let len = file
+            .metadata()
+            .map_err(|_| MinerAgentError::Migration("disk-open"))?
+            .len();
+        crate::backup::transfer::Transfer::new()?
+            .upload_parts(&file, len, part_size, part_urls)
+            .await
     }
 }
 
@@ -509,7 +617,9 @@ impl SnapshotDownloader for ReqwestSnapshotDownloader {
             .await
             .map_err(|_| MinerAgentError::Migration("download-write"))?;
 
+        let declared = resp.content_length();
         let mut stream = resp;
+        let mut written: u64 = 0;
         loop {
             let chunk = stream
                 .chunk()
@@ -520,9 +630,15 @@ impl SnapshotDownloader for ReqwestSnapshotDownloader {
                     file.write_all(&bytes)
                         .await
                         .map_err(|_| MinerAgentError::Migration("download-write"))?;
+                    written += bytes.len() as u64;
                 }
                 None => break,
             }
+        }
+        if declared.is_some_and(|n| n != written) {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(MinerAgentError::Migration("download-short"));
         }
         // fsync the data + rename atomically into place.
         file.flush()
@@ -537,6 +653,177 @@ impl SnapshotDownloader for ReqwestSnapshotDownloader {
             .map_err(|_| MinerAgentError::Migration("download-write"))?;
         Ok(())
     }
+}
+
+/// Pauses before each re-download of a snapshot that did not verify — so
+/// `len + 1` attempts. Live, a GET issued ~30 s after the multipart upload
+/// completed ended cleanly at 2.5 GiB of a 40 GiB object, and a GET MINUTES
+/// later returned all of it: the retries must outlast that, not just repeat.
+#[cfg(not(test))]
+const SNAPSHOT_DOWNLOAD_BACKOFF_S: [u64; 3] = [30, 120, 300];
+#[cfg(test)]
+const SNAPSHOT_DOWNLOAD_BACKOFF_S: [u64; 3] = [0, 0, 0];
+
+/// Attempts at the destination's snapshot download.
+const SNAPSHOT_DOWNLOAD_ATTEMPTS: u32 = SNAPSHOT_DOWNLOAD_BACKOFF_S.len() as u32 + 1;
+
+/// Wall-clock budget for the whole restore before the launch — the boot
+/// artifacts' staging AND every snapshot attempt, on one clock taken when
+/// the activation starts — inside vali's `DestActivating` deadline
+/// (2700 s), so this host gives up before vali does rather than booting
+/// after vali has failed the migration.
+const SNAPSHOT_DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(2400);
+
+/// How far past the restore deadline the launch may wait on the guest's
+/// ticket. For an order that carries vali's phase deadline
+/// (`MigrateActivateOrder::settle_by_unix`) the restore must finish by
+/// `settle_by - DEST_LAUNCH_MARGIN` and the wait ends at `settle_by` at the
+/// latest, on EVERY attempt — vali measures one deadline from entering
+/// `DestActivating`, and retries are new orders that carry the same value,
+/// so this host settles before vali gives up. The margin covers the launch
+/// path's own ticket push (180 s) with room to spare. For an order without
+/// it (a vali predating the field) the clock restarts with each attempt, as
+/// before: `SNAPSHOT_DOWNLOAD_BUDGET` plus this margin, which lines up with
+/// vali's 2700 s only for its first activate.
+const DEST_LAUNCH_MARGIN: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Download the §25 snapshot to `disk_path` and verify it BEFORE anything
+/// attaches it: its length against what the source uploaded
+/// (`order.snapshot_size`) and, for a golden overlay, the size the measured
+/// cmdline names (`overlay_bytes`); its sha256 against the source's
+/// (`order.snapshot_sha256_hex`). Booting an unverified volume is how a
+/// truncated download became a guest that unlocks (releasing its KEK at
+/// the new generation, which lets vali reclaim the source copy) and then
+/// hangs on a partial disk. A file that does not verify is removed.
+///
+/// The download fills its file over minutes, so its whole length is
+/// reserved in `space` (the host ledger the launches and backups admit
+/// under) BEFORE the first byte, and held across every attempt:
+/// otherwise a launch or a backup admitted meanwhile would be promised the
+/// same blocks, and one of them hits `ENOSPC` later — in a live guest. A
+/// host without the room refuses up front with
+/// `Migration("insufficient-space")`, a capacity refusal to vali.
+async fn download_snapshot(
+    downloader: &dyn SnapshotDownloader,
+    space: &crate::backup::capture::SpaceLedger,
+    order: &crate::orders::types::MigrateActivateOrder,
+    disk_path: &std::path::Path,
+    overlay_bytes: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let (expected_len, expected_sha) = snapshot_expectation(order, overlay_bytes)?;
+    let reserve_dir = disk_path
+        .parent()
+        .ok_or(MinerAgentError::Migration("disk-path-invalid"))?;
+    tokio::fs::create_dir_all(reserve_dir)
+        .await
+        .map_err(|_| MinerAgentError::Migration("download-write"))?;
+    // An unknown length (a vali predating `snapshot_size`, a non-golden
+    // volume) cannot be reserved; it downloads as before.
+    let _space = match expected_len {
+        Some(len) => Some(space.reserve(reserve_dir, len, 0).map_err(|e| match e {
+            MinerAgentError::Backup(class) => MinerAgentError::Migration(class),
+            other => other,
+        })?),
+        None => None,
+    };
+    let mut last = MinerAgentError::Migration("download-send");
+    for attempt in 1..=SNAPSHOT_DOWNLOAD_ATTEMPTS {
+        let attempt_once = async {
+            downloader.download(&order.get_url, disk_path).await?;
+            verify_snapshot(disk_path, expected_len, expected_sha).await
+        };
+        let outcome = match tokio::time::timeout_at(deadline, attempt_once).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(MinerAgentError::Migration("snapshot-download-budget")),
+        };
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                eprintln!(
+                    "hippius-miner-agent: migrate-activate: vm={} snapshot download \
+                     attempt {attempt}/{SNAPSHOT_DOWNLOAD_ATTEMPTS} failed: {err}",
+                    order.vm_id.as_str()
+                );
+                let _ = tokio::fs::remove_file(disk_path).await;
+                last = err;
+            }
+        }
+        let Some(pause) = SNAPSHOT_DOWNLOAD_BACKOFF_S.get(attempt as usize - 1) else {
+            break;
+        };
+        let resume = tokio::time::Instant::now() + std::time::Duration::from_secs(*pause);
+        if resume >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(resume).await;
+    }
+    Err(last)
+}
+
+/// What the snapshot must be: its length (the source's, cross-checked with
+/// a golden overlay's cmdline size) and its sha256, when known.
+fn snapshot_expectation(
+    order: &crate::orders::types::MigrateActivateOrder,
+    overlay_bytes: Option<u64>,
+) -> Result<(Option<u64>, Option<[u8; 32]>)> {
+    let expected_sha = match order.snapshot_sha256_hex.as_str() {
+        "" => None,
+        hex_sha => Some(
+            <[u8; 32]>::try_from(
+                hex::decode(hex_sha)
+                    .map_err(|_| MinerAgentError::Migration("snapshot-sha256-invalid"))?,
+            )
+            .map_err(|_| MinerAgentError::Migration("snapshot-sha256-invalid"))?,
+        ),
+    };
+    let expected_len = (order.snapshot_size > 0).then_some(order.snapshot_size);
+    if let (Some(a), Some(b)) = (expected_len, overlay_bytes) {
+        if a != b {
+            return Err(MinerAgentError::Migration("snapshot-size-not-the-overlay"));
+        }
+    }
+    Ok((expected_len.or(overlay_bytes), expected_sha))
+}
+
+/// Check the downloaded snapshot's length and sha256.
+async fn verify_snapshot(
+    path: &std::path::Path,
+    expected_len: Option<u64>,
+    expected_sha: Option<[u8; 32]>,
+) -> Result<()> {
+    let len = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| MinerAgentError::Migration("download-write"))?
+        .len();
+    if expected_len.is_some_and(|want| want != len) {
+        return Err(MinerAgentError::Migration("snapshot-size-mismatch"));
+    }
+    if let Some(want) = expected_sha {
+        let path = path.to_path_buf();
+        let got = tokio::task::spawn_blocking(move || -> std::io::Result<[u8; 32]> {
+            use sha2::Digest;
+            use std::io::Read;
+            let mut file = std::fs::File::open(path)?;
+            let mut hasher = sha2::Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Ok(hasher.finalize().into())
+        })
+        .await
+        .map_err(|_| MinerAgentError::Migration("snapshot-hash"))?
+        .map_err(|_| MinerAgentError::Migration("snapshot-hash"))?;
+        if got != want {
+            return Err(MinerAgentError::Migration("snapshot-sha256-mismatch"));
+        }
+    }
+    Ok(())
 }
 
 /// The seam the §25 ack producer drives the running SOURCE guest's
@@ -799,6 +1086,27 @@ async fn stage_dest_artifacts(
     Ok(())
 }
 
+/// Pauses before each re-fetch of a boot artifact that did not verify — so
+/// `len + 1` attempts. Seen in production: one GET of a 680 MiB golden base
+/// returned a 200 whose bytes did not hash to the pinned digest, while every
+/// GET of the same presigned object minutes later was byte-exact. One bad
+/// body must cost a retry, not the migration.
+#[cfg(not(test))]
+const ARTIFACT_FETCH_BACKOFF_S: [u64; 3] = [5, 20, 60];
+#[cfg(test)]
+const ARTIFACT_FETCH_BACKOFF_S: [u64; 3] = [0, 0, 0];
+
+/// Attempts at fetching one boot artifact.
+const ARTIFACT_FETCH_ATTEMPTS: u32 = ARTIFACT_FETCH_BACKOFF_S.len() as u32 + 1;
+
+/// The launch preflight's content-addressed image cache, which the dest
+/// usually already holds for a golden base (every VM of the bake shares
+/// it). Tests pass their own root; `None` there keeps them off the host.
+#[cfg(not(test))]
+const DEST_ARTIFACT_CACHE: Option<&str> = Some(crate::lifecycle::preflight::IMAGE_CACHE_ROOT);
+#[cfg(test)]
+const DEST_ARTIFACT_CACHE: Option<&str> = None;
+
 /// Fetch one artifact, sha256-verify it, and atomically stage it to
 /// `out_path` (write to a sibling `*.part`, fsync, rename). Mirrors
 /// `lifecycle::preflight::fetch_verify_stage` — the launch-time staging
@@ -808,7 +1116,22 @@ async fn fetch_verify_stage_artifact(
     out_path: &std::path::Path,
     policy: crate::lifecycle::preflight::StagePolicy,
 ) -> Result<()> {
-    use sha2::{Digest, Sha256};
+    fetch_verify_stage_artifact_in(
+        artifact,
+        out_path,
+        policy,
+        DEST_ARTIFACT_CACHE.map(std::path::Path::new),
+    )
+    .await
+}
+
+async fn fetch_verify_stage_artifact_in(
+    artifact: &StagedArtifact,
+    out_path: &std::path::Path,
+    policy: crate::lifecycle::preflight::StagePolicy,
+    cache_root: Option<&std::path::Path>,
+) -> Result<()> {
+    use crate::lifecycle::preflight as pf;
     use tokio::io::AsyncWriteExt;
 
     let expected = parse_sha256_hex(&artifact.sha256_hex)
@@ -821,33 +1144,72 @@ async fn fetch_verify_stage_artifact(
     // booted guest's dm-verity base. Identical bytes ⇒ no-op; differing
     // bytes under a live domain ⇒ fail closed.
     if out_path.exists() {
-        if crate::lifecycle::preflight::file_sha256_matches(out_path, &expected) {
+        if pf::file_sha256_matches(out_path, &expected) {
             return Ok(());
         }
-        if policy == crate::lifecycle::preflight::StagePolicy::PinnedByLiveVm {
+        if policy == pf::StagePolicy::PinnedByLiveVm {
             return Err(MinerAgentError::Migration("dest-artifact-in-use"));
         }
     }
 
-    let resp = reqwest::get(&artifact.url)
+    // Cache HIT: the entry is re-hashed and used only on a match, exactly
+    // as the launch preflight does — so S3 is not asked at all for a base
+    // this host already verified. Any cache-side failure falls through to
+    // the fetch. Hashing and copying a multi-hundred-MB base is blocking
+    // I/O, kept off the async workers.
+    let cache_path = cache_root.map(|root| root.join(hex::encode(expected)));
+    if let Some(cache_path) = cache_path.clone() {
+        let out = out_path.to_path_buf();
+        let hit = tokio::task::spawn_blocking(move || {
+            let hit = cache_path.is_file()
+                && pf::file_sha256_matches(&cache_path, &expected)
+                && pf::materialize_from_cache(&cache_path, &out).is_ok();
+            if hit {
+                // Keep a base that migrations reuse young for the LRU reaper.
+                let _ = std::fs::File::open(&cache_path)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+            }
+            hit
+        })
         .await
-        .map_err(|_| MinerAgentError::Migration("dest-artifact-fetch"))?;
-    if !resp.status().is_success() {
-        return Err(MinerAgentError::Migration("dest-artifact-status"));
+        .unwrap_or(false);
+        if hit {
+            return Ok(());
+        }
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|_| MinerAgentError::Migration("dest-artifact-fetch"))?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    if hasher.finalize().as_slice() != expected.as_slice() {
-        // SECURITY: a sha mismatch means the bytes are NOT the measured
-        // artifact — reject before staging so the dest never boots a
-        // measurement the KBS would (rightly) refuse the KEK for.
-        return Err(MinerAgentError::Migration("dest-artifact-sha-mismatch"));
+    let name = out_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut last = MinerAgentError::Migration("dest-artifact-fetch");
+    let mut verified: Option<bytes::Bytes> = None;
+    for attempt in 1..=ARTIFACT_FETCH_ATTEMPTS {
+        match fetch_artifact_once(&artifact.url, &expected).await {
+            Ok(bytes) => {
+                verified = Some(bytes);
+                break;
+            }
+            Err(failure) => {
+                // The URL is a presigned secret — log the artifact by name.
+                eprintln!(
+                    "hippius-miner-agent: migrate-activate: artifact {name} fetch \
+                     attempt {attempt}/{ARTIFACT_FETCH_ATTEMPTS} failed: {} ({})",
+                    failure.error, failure.detail
+                );
+                last = failure.error;
+                if !failure.retryable {
+                    break;
+                }
+            }
+        }
+        if let Some(pause) = ARTIFACT_FETCH_BACKOFF_S.get(attempt as usize - 1) {
+            tokio::time::sleep(std::time::Duration::from_secs(*pause)).await;
+        }
     }
+    let Some(bytes) = verified else {
+        return Err(last);
+    };
 
     let parent = out_path
         .parent()
@@ -869,7 +1231,110 @@ async fn fetch_verify_stage_artifact(
     tokio::fs::rename(&partial, out_path)
         .await
         .map_err(|_| MinerAgentError::Migration("dest-artifact-stage"))?;
+
+    // Best-effort: the next activation or launch of this bake on this host
+    // is then a cache hit. The artifact is already staged and verified.
+    if let (Some(root), Some(cache_path)) = (cache_root.map(|r| r.to_path_buf()), cache_path) {
+        let _ = tokio::task::spawn_blocking(move || {
+            pf::populate_cache(
+                &root,
+                &cache_path,
+                &bytes,
+                &expected,
+                pf::image_cache_max_bytes(),
+            );
+        })
+        .await;
+    }
     Ok(())
+}
+
+/// Connect timeout for a boot-artifact GET.
+const ARTIFACT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Whole-request timeout for one boot-artifact GET — a stalled body must
+/// cost an attempt, not hang the activation. Generous for the largest
+/// artifact (a golden base, ~700 MiB).
+const ARTIFACT_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn artifact_client() -> std::result::Result<&'static reqwest::Client, ArtifactFetchFailure> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(ARTIFACT_CONNECT_TIMEOUT)
+        .timeout(ARTIFACT_GET_TIMEOUT)
+        .build()
+        .map_err(|e| ArtifactFetchFailure {
+            error: MinerAgentError::Migration("dest-artifact-fetch"),
+            detail: format!("client: {e}"),
+            retryable: false,
+        })?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Why one artifact GET did not yield the pinned bytes.
+struct ArtifactFetchFailure {
+    error: MinerAgentError,
+    /// For the log only (never the URL).
+    detail: String,
+    /// A 4xx other than 408/429 (an expired or wrong presigned URL, a
+    /// missing object) will answer the same way again — fail fast.
+    retryable: bool,
+}
+
+/// One GET of a boot artifact, verified before anything is written: the
+/// status, then the sha256 against the pinned digest. Each failure has its
+/// own class, so a 403 (an expired presigned URL) or a 404 never reads as
+/// a digest mismatch. (A body shorter than its `Content-Length` is a body
+/// error from the HTTP client, i.e. `dest-artifact-fetch`.)
+async fn fetch_artifact_once(
+    url: &str,
+    expected: &[u8; 32],
+) -> std::result::Result<bytes::Bytes, ArtifactFetchFailure> {
+    use sha2::{Digest, Sha256};
+
+    let fetch_failure = |detail: String| ArtifactFetchFailure {
+        error: MinerAgentError::Migration("dest-artifact-fetch"),
+        detail,
+        retryable: true,
+    };
+    let resp = artifact_client()?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fetch_failure(format!("send: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let permanent = status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err(ArtifactFetchFailure {
+            error: MinerAgentError::Migration("dest-artifact-status"),
+            detail: format!("http {}", status.as_u16()),
+            retryable: !permanent,
+        });
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| fetch_failure(format!("body: {e}")))?;
+    let actual = Sha256::digest(&bytes);
+    if actual.as_slice() != expected.as_slice() {
+        // SECURITY: a sha mismatch means the bytes are NOT the measured
+        // artifact — reject before staging so the dest never boots a
+        // measurement the KBS would (rightly) refuse the KEK for.
+        return Err(ArtifactFetchFailure {
+            error: MinerAgentError::Migration("dest-artifact-sha-mismatch"),
+            detail: format!(
+                "{} bytes hashing to {}",
+                bytes.len(),
+                &hex::encode(actual)[..16]
+            ),
+            retryable: true,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Parse a 64-char lower/upper hex SHA-256 into 32 bytes. Mirrors
@@ -991,13 +1456,33 @@ async fn write_restore_marker(path: &std::path::Path, identity: &str) {
 /// guest, which unlocks inside its SNP boundary with the KBS-released
 /// key. The split-brain invariant is enforced UPSTREAM (vali's verified
 /// ack + the KBS fence) — this handler is the mechanical dest restore.
-pub async fn activate_dest(
+///
+/// ## Chain mode (backup failover)
+///
+/// When the order carries a [`crate::backup::restore::RestoreChain`], the
+/// overlay and state disk come from a backup chain instead of a §25
+/// snapshot: `restorer` rebuilds them (full + incrementals, each
+/// sha256-verified) and installs both before the launch. `get_url` /
+/// `state_get_url` are then unused, and the `.restored-from` marker is
+/// keyed on the chain's restore id + last piece. Golden only — the
+/// backup covers the overlay, and a legacy VM has none.
+pub async fn activate_dest_with_chain(
     lifecycle: &CvmLifecycle,
     downloader: &dyn SnapshotDownloader,
+    restorer: Option<&dyn crate::backup::restore::ChainRestorer>,
     pusher: &dyn crate::vsock::ticket_push::TicketPusher,
     mut order: crate::orders::types::MigrateActivateOrder,
 ) -> Result<String> {
     let vm_id = order.vm_id.clone();
+    // Before anything is fetched or booted: an order whose settle-by leaves
+    // no room to restore and launch fails here, so a retry vali has
+    // already given up on never boots the guest at `new_gen`.
+    let clock = activation_clock(
+        order.settle_by_unix,
+        unix_now(),
+        tokio::time::Instant::now(),
+    )?;
+    let deadline = clock.restore_by;
 
     // Idempotent fast-path: if this VM is already running on the dest
     // (a re-driven activate), the launch path's `AlreadyLaunched` →
@@ -1034,7 +1519,9 @@ pub async fn activate_dest(
                 crate::lifecycle::preflight::StagePolicy::PinnedByLiveVm
             }
         };
-        stage_dest_artifacts(&staging, &order, policy).await?;
+        tokio::time::timeout_at(deadline, stage_dest_artifacts(&staging, &order, policy))
+            .await
+            .map_err(|_| MinerAgentError::Migration("dest-artifact-budget"))??;
     }
 
     // GOLDEN mode is derived from the SNP-MEASURED cmdline (same as
@@ -1124,16 +1611,100 @@ pub async fn activate_dest(
     //     arrives when the VM is NOT running here, so this costs nothing
     //     there.
     let marker_path = restore_marker_path(&disk_path);
-    let identity = artifact_identity(&order.get_url).to_string();
+    if !order.staged_restore_id.is_empty() {
+        return activate_staged(lifecycle, pusher, order, is_golden, &marker_path, clock).await;
+    }
+    let identity = match &order.backup_chain {
+        Some(chain) => chain.identity(),
+        None => artifact_identity(&order.get_url).to_string(),
+    };
     let restored = read_restore_marker(&marker_path).await;
+    // Unknown counts as live: a download (and, on a bad one, its removal)
+    // must never touch the backing store of a domain this host cannot rule
+    // out running.
     let running = lifecycle
         .list_tenants()
         .await
         .map(|ts| ts.iter().any(|(id, _)| id == &vm_id))
-        .unwrap_or(false);
+        .unwrap_or(true);
+    // Chain mode never relabels a live VM. A failover restore that finds
+    // the VM already running here from OTHER artifacts cannot restore
+    // under it, and recording this chain's identity would make a later
+    // re-drive (once the VM is down) skip the restore and boot whatever
+    // disk is there. Refuse instead; vali sees the failure.
+    //
+    // "Running" here asks libvirt too, not only the in-memory handle map:
+    // a domain that survived an agent restart without being re-adopted
+    // is still a live QEMU on these very paths. Unknown counts as live.
+    //
+    // And a live domain whose marker DOES match (the restore finished and
+    // it booted, but this process does not track it) is left alone: the
+    // launch below would try to define + start a domain that is running.
+    if order.backup_chain.is_some() {
+        let live = running
+            || lifecycle.tenant_domain_liveness(&vm_id).await
+                != crate::lifecycle::DomainLiveness::Down;
+        if live && restored.as_deref() != Some(identity.as_str()) {
+            return Err(MinerAgentError::Migration("chain-vm-live"));
+        }
+        if live && !running {
+            return Ok("already-running".to_string());
+        }
+    }
     let already_restored = restored.as_deref() == Some(identity.as_str()) || running;
+    let gb = crate::orders::handler::parse_disk_gb_token(&order.cmdline);
+    let overlay = (is_golden && gb > 0).then_some(u64::from(gb) * (1u64 << 30));
+    // A volume an EARLIER attempt restored — possibly by an agent that
+    // verified nothing — is checked like a fresh download before it is
+    // booted, and fetched again if it fails. Only the VOLUME: the state
+    // disk that attempt restored may already carry a counter the guest
+    // advanced, and re-pulling the source's would rewind it.
+    let mut redownload_volume = false;
+    // Every snapshot download reserves in the host ledger (`download_snapshot`).
+    let space = lifecycle.disk_space_ledger();
+    if already_restored && !running && order.backup_chain.is_none() {
+        let (len, sha) = snapshot_expectation(&order, overlay)?;
+        if len.is_some() || sha.is_some() {
+            if let Err(err) = verify_snapshot(&disk_path, len, sha).await {
+                eprintln!(
+                    "hippius-miner-agent: migrate-activate: vm={} restored volume does not \
+                     verify ({err}) — downloading it again",
+                    vm_id.as_str()
+                );
+                redownload_volume = true;
+            }
+        }
+    }
+    if redownload_volume {
+        download_snapshot(downloader, &space, &order, &disk_path, overlay, deadline).await?;
+    }
     if !already_restored {
-        downloader.download(&order.get_url, &disk_path).await?;
+        match &order.backup_chain {
+            Some(chain) => {
+                if !is_golden {
+                    return Err(MinerAgentError::Migration("chain-requires-golden"));
+                }
+                let restorer = restorer.ok_or(MinerAgentError::Migration("chain-unsupported"))?;
+                // The full must be exactly the overlay the measured
+                // cmdline sizes (`hippius.disk_gb=`), when it names one.
+                let gb = crate::orders::handler::parse_disk_gb_token(&order.cmdline);
+                let expected = (gb > 0).then(|| u64::from(gb) * (1u64 << 30));
+                restorer
+                    .restore(
+                        chain,
+                        &lifecycle.backup_dir(&vm_id).join("chain-restore"),
+                        &disk_path,
+                        &lifecycle.state_disk_path(&vm_id),
+                        expected,
+                    )
+                    .await?;
+            }
+            // A golden overlay is exactly the size the measured cmdline
+            // names (`hippius.disk_gb=`), as for the chain restore above.
+            None => {
+                download_snapshot(downloader, &space, &order, &disk_path, overlay, deadline).await?
+            }
+        }
     }
 
     // (2b) Restore the source's ANTI-ROLLBACK STATE DISK — before the
@@ -1154,7 +1725,7 @@ pub async fn activate_dest(
     //      running on it) so a re-drive never rewinds a counter the dest
     //      has since advanced. Empty URL ⇒ nothing was carried; fall
     //      through to `ensure_state_disk`'s blank disk (pre-fix behaviour).
-    if !order.state_get_url.is_empty() && !already_restored {
+    if order.backup_chain.is_none() && !order.state_get_url.is_empty() && !already_restored {
         let state_path = lifecycle.state_disk_path(&vm_id);
         downloader
             .download(&order.state_get_url, &state_path)
@@ -1204,18 +1775,240 @@ pub async fn activate_dest(
     //     it validates + attaches), boots the guest, and pushes the L1
     //     ticket over vsock. The guest re-attests at `new_gen` and the
     //     KBS releases the KEK to (new_gen, dest).
-    let launch_order = order.into_launch_order();
-    match crate::orders::handler::handle_launch(lifecycle, pusher, launch_order).await {
-        Ok(class) => Ok(class),
-        // The launch path's rejection is already a static-class HTTP
-        // mapping; surface a migration-flavoured outcome so vali's audit
-        // log distinguishes a dest-activation launch failure. We map the
-        // launch rejection's class through, but anchor the family.
-        Err(_rej) => {
-            let _ = &vm_id; // vm_id captured for potential future logging.
-            Err(MinerAgentError::Migration("dest-launch-failed"))
+    // The state-disk and chain restores are not bounded by `deadline`, so
+    // re-check it: a launch started past it could have its ticket delivered
+    // after vali failed the job. Only for an order carrying settle-by (the
+    // legacy clock keeps its behaviour), and never for a VM already running
+    // here, whose launch is an `already-launched` no-op.
+    if order.settle_by_unix != 0 && tokio::time::Instant::now() >= deadline && !running {
+        return Err(MinerAgentError::Migration("dest-settle-by-passed"));
+    }
+    launch_dest(
+        lifecycle,
+        pusher,
+        order.into_launch_order(),
+        clock.settle_by,
+    )
+    .await
+}
+
+/// [`activate_dest_with_chain`] for a staged restore
+/// (`staged_restore_id`): swap the staged disks in
+/// ([`crate::backup::staged::swap_in`]) and launch. Nothing is
+/// downloaded. The domain must be down — on the VM's current host that
+/// is the in-place restore — unless it is this very restore already
+/// running (a re-driven activate).
+async fn activate_staged(
+    lifecycle: &CvmLifecycle,
+    pusher: &dyn crate::vsock::ticket_push::TicketPusher,
+    order: crate::orders::types::MigrateActivateOrder,
+    is_golden: bool,
+    marker_path: &std::path::Path,
+    clock: ActivationClock,
+) -> Result<String> {
+    use crate::backup::staged;
+    if !is_golden {
+        return Err(MinerAgentError::Migration("restore-requires-golden"));
+    }
+    order
+        .check_staged_restore()
+        .map_err(MinerAgentError::Migration)?;
+    let vm_id = order.vm_id.clone();
+    let rid = order.staged_restore_id.clone();
+    let ours = read_restore_marker(marker_path).await.as_deref()
+        == Some(staged::staged_marker(&rid).as_str());
+    // Unknown counts as live, as everywhere a disk could be under QEMU.
+    let running = lifecycle
+        .list_tenants()
+        .await
+        .map(|ts| ts.iter().any(|(id, _)| id == &vm_id))
+        .unwrap_or(true);
+    let live = running
+        || lifecycle.tenant_domain_liveness(&vm_id).await != crate::lifecycle::DomainLiveness::Down;
+    if live {
+        if !ours {
+            return Err(MinerAgentError::Migration("restore-vm-live"));
+        }
+        if !running {
+            // This restore, booted, but not tracked by this process: the
+            // launch would try to define a domain that runs.
+            return Ok("already-running".to_string());
+        }
+    } else {
+        let gb = crate::orders::handler::parse_disk_gb_token(&order.cmdline);
+        let expected = (gb > 0).then(|| u64::from(gb) * (1u64 << 30));
+        let paths = staged::RestorePaths::for_vm(lifecycle, &vm_id, &rid);
+        // Re-proven under the restore lock, right before the first rename.
+        let domain_down = async {
+            let tracked = lifecycle
+                .list_tenants()
+                .await
+                .map(|ts| ts.iter().any(|(id, _)| id == &vm_id))
+                .unwrap_or(true);
+            !tracked
+                && lifecycle.tenant_domain_liveness(&vm_id).await
+                    == crate::lifecycle::DomainLiveness::Down
+        };
+        // `domain_down` only proves the guest is down right up to the
+        // swap's first rename (see `swap_in`'s own doc comment) — nothing
+        // between here and the unconditional `launch_dest` call below
+        // re-checks it. A racing relaunch that starts the domain in that
+        // gap is not caught here; it is caught by `launch_dest`'s own
+        // delegate, `handle_launch`'s "already-launched" idempotency. This
+        // function relies on that, rather than re-proving liveness itself.
+        let outcome = staged::swap_in(&paths, &rid, expected, domain_down).await?;
+        eprintln!(
+            "hippius-miner-agent: migrate-activate: vm={vm_id} staged restore {rid} {outcome:?}"
+        );
+    }
+    if order.settle_by_unix != 0 && tokio::time::Instant::now() >= clock.restore_by && !running {
+        return Err(MinerAgentError::Migration("dest-settle-by-passed"));
+    }
+    launch_dest(
+        lifecycle,
+        pusher,
+        order.into_launch_order(),
+        clock.settle_by,
+    )
+    .await
+}
+
+/// The two instants a dest activation works to: `restore_by` bounds the
+/// artifact staging and the snapshot download, `settle_by` bounds the wait
+/// for the guest's ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivationClock {
+    restore_by: tokio::time::Instant,
+    settle_by: tokio::time::Instant,
+}
+
+/// Seconds since the unix epoch on this host's wall clock. A clock before
+/// the epoch reads as the far future, so a carried settle-by fails closed
+/// rather than being ignored.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |d| d.as_secs())
+}
+
+/// Resolve an order's `settle_by_unix` (vali's phase deadline, wall clock)
+/// into the activation's monotonic deadlines, taken at `now` / `now_unix`.
+///
+/// - `0` ⇒ the legacy per-attempt clock: restore within
+///   [`SNAPSHOT_DOWNLOAD_BUDGET`], settle [`DEST_LAUNCH_MARGIN`] later.
+/// - otherwise `restore_by = min(now + BUDGET, settle_by - MARGIN)` and
+///   `settle_by = min(restore_by + MARGIN, settle_by)`. The wall-clock gap
+///   is converted to a duration once, here, and added to the monotonic
+///   `now` — never an `Instant` built from a unix time. When less than the
+///   margin is left (settle-by already passed included) there is no room
+///   to restore and launch: `dest-settle-by-passed`.
+fn activation_clock(
+    settle_by_unix: u64,
+    now_unix: u64,
+    now: tokio::time::Instant,
+) -> Result<ActivationClock> {
+    let restore = if settle_by_unix == 0 {
+        SNAPSHOT_DOWNLOAD_BUDGET
+    } else {
+        let left = settle_by_unix.saturating_sub(now_unix);
+        let restore_left = left.saturating_sub(DEST_LAUNCH_MARGIN.as_secs());
+        if restore_left == 0 {
+            return Err(MinerAgentError::Migration("dest-settle-by-passed"));
+        }
+        SNAPSHOT_DOWNLOAD_BUDGET.min(std::time::Duration::from_secs(restore_left))
+    };
+    let restore_by = now + restore;
+    // `restore_by <= settle_by - MARGIN`, so this IS
+    // `min(restore_by + MARGIN, settle_by)` without a second conversion.
+    Ok(ActivationClock {
+        restore_by,
+        settle_by: restore_by + DEST_LAUNCH_MARGIN,
+    })
+}
+
+/// How often the destination re-checks a ticket the reboot-watcher is
+/// still re-pushing.
+#[cfg(not(test))]
+const DEST_TICKET_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const DEST_TICKET_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Step (3) of [`activate_dest_with_chain`]: boot through the SAME launch
+/// path a fresh launch uses — and settle whether the guest got its ticket
+/// before answering, because the answer becomes vali's `done`.
+///
+/// A launch whose own push failed (180 s) leaves the domain running with
+/// the reboot-watcher still re-pushing (a slow boot). Answering then would
+/// be wrong both ways: `failed` + a teardown kills a boot the re-push was
+/// about to reach, and leaving it makes vali's next attempt an
+/// `already-launched` success for a guest that may never unlock. So wait
+/// here (the activation already runs in the background) until the ticket
+/// is delivered — `launched` — or the re-push gives up or `deadline`
+/// passes — stop the domain this call started, so the next attempt boots
+/// fresh, and fail.
+async fn launch_dest(
+    lifecycle: &CvmLifecycle,
+    pusher: &dyn crate::vsock::ticket_push::TicketPusher,
+    launch_order: crate::orders::LaunchOrder,
+    deadline: tokio::time::Instant,
+) -> Result<String> {
+    let vm_id = launch_order.vm_id.clone();
+    let tracked =
+        |ts: Vec<(VmId, crate::lifecycle::CvmPhase)>| ts.iter().any(|(id, _)| id == &vm_id);
+    // Unknown counts as present: never stop a domain this call may not
+    // have started (a VM already running here can fail the launch before
+    // admission).
+    let pre_existing = lifecycle.list_tenants().await.map(tracked).unwrap_or(true);
+    let rejected =
+        match crate::orders::handler::handle_launch(lifecycle, pusher, launch_order).await {
+            Ok(class) => return Ok(class),
+            Err(rej) => rej,
+        };
+    let started = !pre_existing && lifecycle.list_tenants().await.map(tracked).unwrap_or(false);
+    if started {
+        while !lifecycle.ticket_delivered(&vm_id)
+            && lifecycle.ticket_repush_active(&vm_id)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(DEST_TICKET_POLL).await;
+        }
+        if lifecycle.ticket_delivered(&vm_id) {
+            return Ok("launched".to_string());
+        }
+        eprintln!(
+            "hippius-miner-agent: migrate-activate: vm={vm_id} ticket never reached the \
+             guest ({}) — stopping it for a fresh attempt",
+            rejected.class
+        );
+        match lifecycle.stop(&vm_id, false).await {
+            // Stopped by us, or already gone (a concurrent §24 stop).
+            Ok(()) | Err(MinerAgentError::VmNotFound) => {}
+            // Left running it would make the next attempt `already-launched`.
+            Err(err) => {
+                eprintln!(
+                    "hippius-miner-agent: migrate-activate: vm={vm_id} stopping the ticketless \
+                 domain failed: {err}"
+                );
+                return Err(MinerAgentError::Migration("dest-ticketless-stop-failed"));
+            }
         }
     }
+    // The launch path's rejection is already a static-class HTTP mapping;
+    // surface a migration-flavoured outcome so vali's audit log
+    // distinguishes a dest-activation launch failure.
+    Err(MinerAgentError::Migration("dest-launch-failed"))
+}
+
+/// [`activate_dest_with_chain`] without a chain restorer — the §25
+/// snapshot path the existing tests drive.
+#[cfg(test)]
+pub async fn activate_dest(
+    lifecycle: &CvmLifecycle,
+    downloader: &dyn SnapshotDownloader,
+    pusher: &dyn crate::vsock::ticket_push::TicketPusher,
+    order: crate::orders::types::MigrateActivateOrder,
+) -> Result<String> {
+    activate_dest_with_chain(lifecycle, downloader, None, pusher, order).await
 }
 
 /// Quiesce the source CVM (§25 step 2) — **non-destructive**.
@@ -1423,8 +2216,35 @@ mod tests {
 
         let vm2 = vid("dest-vm-2");
         store.begin_activate(&vm2).unwrap();
-        store.mark_activate_failed(&vm2);
+        store.mark_activate_failed(&vm2, &MinerAgentError::Migration("dest-launch-failed"));
         assert_eq!(store.phase(&vm2).map(|p| p.as_status_str()), Some("failed"));
+    }
+
+    #[test]
+    fn a_failed_activation_keeps_its_class_until_the_next_attempt() {
+        let store = MigrationStore::new();
+        let vm = vid("dest-vm");
+        assert_eq!(store.failure_class(&vm), None);
+        store.begin_activate(&vm).unwrap();
+        assert_eq!(store.failure_class(&vm), None, "running has no class");
+        store.mark_activate_failed(&vm, &MinerAgentError::Migration("dest-settle-by-passed"));
+        assert_eq!(
+            store.failure_class(&vm).as_deref(),
+            Some("migration/dest-settle-by-passed")
+        );
+        // A retry starts clean: a stale class must not describe it.
+        store.begin_activate(&vm).unwrap();
+        assert_eq!(store.failure_class(&vm), None);
+        store.mark_activate_done(&vm).unwrap();
+        assert_eq!(store.failure_class(&vm), None);
+
+        // A later failure that carries no class (the source leg) does not
+        // inherit the dest leg's.
+        store.begin_activate(&vm).unwrap();
+        store.mark_activate_failed(&vm, &MinerAgentError::Migration("dest-launch-failed"));
+        store.set_phase(&vm, MigrationPhase::Quiescing).unwrap();
+        store.mark_snapshot_failed(&vm);
+        assert_eq!(store.failure_class(&vm), None);
     }
 
     #[test]
@@ -1532,6 +2352,36 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn a_re_driven_snapshot_drops_the_previous_uploads_receipts() {
+        use crate::backup::transfer::PieceReceipt;
+
+        let store = MigrationStore::new();
+        let vm = vid("tenant-x");
+        store.set_phase(&vm, MigrationPhase::Quiescing).unwrap();
+        store
+            .set_disk_path(&vm, Some(PathBuf::from("/d.img")))
+            .unwrap();
+        let receipt = PieceReceipt {
+            parts: Vec::new(),
+            size: 1,
+            sha256_hex: String::new(),
+        };
+        store
+            .mark_multipart_snapshot_done(&vm, receipt.clone())
+            .unwrap();
+        assert_eq!(store.phase(&vm), Some(MigrationPhase::Done));
+        assert_eq!(store.snapshot_receipt(&vm), Some(receipt));
+
+        store.begin_snapshot(&vm).unwrap();
+        assert_eq!(store.phase(&vm), Some(MigrationPhase::Snapshotting));
+        assert_eq!(
+            store.snapshot_receipt(&vm),
+            None,
+            "they name parts of an aborted upload"
+        );
     }
 
     #[tokio::test]
@@ -1694,6 +2544,7 @@ mod tests {
     }
 
     // ── §25 M2 dest-activation tests ────────────────────────────────
+    use crate::backup::capture::SpaceLedger;
 
     use crate::lifecycle::preflight::StagePolicy;
     use crate::lifecycle::{CvmLifecycle, MockLaunchDigest, MockLibvirtDriver};
@@ -1792,6 +2643,8 @@ mod tests {
             vm_id: vid(vm),
             get_url: "https://s3.example/snap?sig=x".to_string(),
             state_get_url: String::new(),
+            snapshot_size: 0,
+            snapshot_sha256_hex: String::new(),
             new_gen: 6,
             ovmf_path: ovmf,
             kernel_path: kernel,
@@ -1805,7 +2658,270 @@ mod tests {
             memory_mb: 2048,
             cose_ticket: ByteBuf::new(),
             boot_artifacts: None,
+            backup_chain: None,
+            staged_restore_id: String::new(),
+            guardian_ep: None,
+            settle_by_unix: 0,
         }
+    }
+
+    /// Writes the next length of `lens` per download (the last one
+    /// repeats) — a store that serves a short body, then the whole one.
+    struct SizedDownloader {
+        lens: Vec<usize>,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl SnapshotDownloader for SizedDownloader {
+        async fn download(&self, _url: &str, dest: &std::path::Path) -> Result<()> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            let len = self.lens[i.min(self.lens.len() - 1)];
+            if let Some(p) = dest.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::write(dest, vec![7u8; len]).unwrap();
+            Ok(())
+        }
+    }
+
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SNAPSHOT_DOWNLOAD_BUDGET
+    }
+
+    fn sha_of(len: usize) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(vec![7u8; len]))
+    }
+
+    /// Download verified ⇒ the launch is attempted (which fails in the test
+    /// sandbox as `dest-launch-failed`); refused ⇒ the verification class.
+    async fn activate_with(
+        lens: Vec<usize>,
+        size: u64,
+        sha: String,
+    ) -> (Result<String>, usize, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle();
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        order.snapshot_size = size;
+        order.snapshot_sha256_hex = sha;
+        let disk = order.luks_disk_path.clone();
+        let dl = SizedDownloader {
+            lens,
+            calls: AtomicUsize::new(0),
+        };
+        let out = activate_dest(&lifecycle, &dl, &pusher, order).await;
+        (out, dl.calls.load(Ordering::SeqCst), disk.exists())
+    }
+
+    #[tokio::test]
+    async fn a_short_snapshot_is_never_attached() {
+        // Live: 2.5 GiB of a 40 GiB object, reported as a clean download.
+        let (out, calls, kept) = activate_with(vec![10], 64, String::new()).await;
+        assert!(matches!(
+            out,
+            Err(MinerAgentError::Migration("snapshot-size-mismatch"))
+        ));
+        assert_eq!(calls, SNAPSHOT_DOWNLOAD_ATTEMPTS as usize, "retried");
+        assert!(!kept, "the partial volume is removed, never left to attach");
+    }
+
+    #[tokio::test]
+    async fn a_short_first_download_is_retried_into_a_good_one() {
+        let (out, calls, _) = activate_with(vec![10, 64], 64, sha_of(64)).await;
+        assert!(!matches!(out, Err(MinerAgentError::Migration(c)) if c.starts_with("snapshot-")));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_whose_bytes_differ_is_never_attached() {
+        let (out, _, kept) = activate_with(vec![64], 64, sha_of(65)).await;
+        assert!(matches!(
+            out,
+            Err(MinerAgentError::Migration("snapshot-sha256-mismatch"))
+        ));
+        assert!(!kept);
+    }
+
+    #[tokio::test]
+    async fn a_verified_snapshot_is_attached() {
+        let (out, calls, kept) = activate_with(vec![64], 64, sha_of(64)).await;
+        assert!(!matches!(out, Err(MinerAgentError::Migration(c)) if c.starts_with("snapshot-")));
+        assert_eq!(calls, 1);
+        assert!(kept);
+    }
+
+    #[tokio::test]
+    async fn a_restored_volume_that_does_not_verify_is_fetched_again_without_the_counter() {
+        // An earlier attempt — e.g. by an agent that verified nothing —
+        // restored a truncated volume and wrote the marker. The re-drive
+        // verifies it, fetches the VOLUME again, and leaves the state disk
+        // that attempt restored alone (the guest may have advanced it).
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        order.state_get_url = "https://s3.example/state?sig=y".to_string();
+        order.snapshot_size = 64;
+        order.snapshot_sha256_hex = sha_of(64);
+        std::fs::write(&order.luks_disk_path, vec![7u8; 10]).unwrap();
+        std::fs::write(
+            restore_marker_path(&order.luks_disk_path),
+            artifact_identity(&order.get_url),
+        )
+        .unwrap();
+        let state_path = lifecycle.state_disk_path(&order.vm_id);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, b"advanced-on-the-dest").unwrap();
+        let disk = order.luks_disk_path.clone();
+        let dl = SizedDownloader {
+            lens: vec![64],
+            calls: AtomicUsize::new(0),
+        };
+
+        let out = activate_dest(&lifecycle, &dl, &pusher, order).await;
+
+        assert!(!matches!(out, Err(MinerAgentError::Migration(c)) if c.starts_with("snapshot-")));
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 1, "the volume only");
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), 64);
+        assert_eq!(std::fs::read(&state_path).unwrap(), b"advanced-on-the-dest");
+    }
+
+    /// Records the ledger's reservation as the download starts.
+    struct ReservationProbe {
+        space: Arc<SpaceLedger>,
+        seen: std::sync::Mutex<Vec<u64>>,
+    }
+    #[async_trait]
+    impl SnapshotDownloader for ReservationProbe {
+        async fn download(&self, _url: &str, dest: &std::path::Path) -> Result<()> {
+            self.seen.lock().unwrap().push(self.space.reserved());
+            std::fs::write(dest, vec![7u8; 64]).unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_download_holds_its_whole_length_reserved_until_it_is_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        order.snapshot_size = 64;
+        let space = Arc::new(SpaceLedger::default());
+        let dl = ReservationProbe {
+            space: Arc::clone(&space),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        download_snapshot(
+            &dl,
+            &space,
+            &order,
+            &order.luks_disk_path,
+            None,
+            far_deadline(),
+        )
+        .await
+        .expect("fits");
+        assert_eq!(*dl.seen.lock().unwrap(), vec![64]);
+        assert_eq!(space.reserved(), 0, "released once in place");
+    }
+
+    #[tokio::test]
+    async fn a_download_the_host_cannot_hold_is_refused_before_the_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        order.snapshot_size = 1 << 60;
+        let dl = SizedDownloader {
+            lens: vec![64],
+            calls: AtomicUsize::new(0),
+        };
+        let err = download_snapshot(
+            &dl,
+            &SpaceLedger::default(),
+            &order,
+            &order.luks_disk_path,
+            None,
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("insufficient-space")
+        ));
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_dest_activation_reserves_its_download_in_the_host_ledger() {
+        // Through `activate_dest`: the host ledger (tails of this host's
+        // disks + every in-flight reservation) gates the download.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        // A live VM's sparse disk on this host is promised all but 512 MiB
+        // of the free space; a raw `statvfs` still shows all of it.
+        let free = crate::backup::capture::free_bytes(dir.path()).unwrap();
+        let data = crate::lifecycle::data_disk::data_dir(dir.path());
+        std::fs::create_dir_all(&data).unwrap();
+        let live = std::fs::File::create(data.join("tenant-live.img")).unwrap();
+        live.set_len(free.saturating_sub(512 << 20)).unwrap();
+        order.snapshot_size = 1 << 30;
+        let dl = SizedDownloader {
+            lens: vec![64],
+            calls: AtomicUsize::new(0),
+        };
+        let out = activate_dest(&lifecycle, &dl, &pusher, order).await;
+        assert!(
+            matches!(out, Err(MinerAgentError::Migration("insufficient-space"))),
+            "{out:?}"
+        );
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_golden_overlay_must_be_the_size_its_cmdline_names() {
+        // No size from vali (a single-PUT snapshot): the measured
+        // `hippius.disk_gb=` still bounds it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut order = activate_order(dir.path(), "tenant-x", true);
+        order.cmdline = format!("{} hippius.disk_gb=1", order.cmdline);
+        let dl = SizedDownloader {
+            lens: vec![10],
+            calls: AtomicUsize::new(0),
+        };
+        let overlay =
+            (crate::orders::handler::parse_disk_gb_token(&order.cmdline) > 0).then_some(1u64 << 30);
+        let err = download_snapshot(
+            &dl,
+            &SpaceLedger::default(),
+            &order,
+            &order.luks_disk_path,
+            overlay,
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("snapshot-size-mismatch")
+        ));
+        order.snapshot_size = 5;
+        let err = download_snapshot(
+            &dl,
+            &SpaceLedger::default(),
+            &order,
+            &order.luks_disk_path,
+            overlay,
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("snapshot-size-not-the-overlay")
+        ));
     }
 
     #[tokio::test]
@@ -1859,6 +2975,158 @@ mod tests {
             outcome,
             Err(MinerAgentError::Migration("dest-launch-failed"))
         ));
+    }
+
+    // ── settle-by: vali's phase deadline carried in the order ──────────
+
+    #[test]
+    fn activation_clock_without_settle_by_is_the_per_attempt_budget() {
+        let now = tokio::time::Instant::now();
+        let clock = activation_clock(0, 1_790_000_000, now).unwrap();
+        assert_eq!(clock.restore_by, now + SNAPSHOT_DOWNLOAD_BUDGET);
+        assert_eq!(
+            clock.settle_by,
+            now + SNAPSHOT_DOWNLOAD_BUDGET + DEST_LAUNCH_MARGIN
+        );
+    }
+
+    #[test]
+    fn activation_clock_clamps_both_deadlines_to_settle_by() {
+        let now = tokio::time::Instant::now();
+        let t = 1_790_000_000;
+        // 1000 s left: restore by 760 s, settle by 1000 s — both inside
+        // what the per-attempt budget alone would allow.
+        let clock = activation_clock(t + 1000, t, now).unwrap();
+        assert_eq!(clock.restore_by, now + std::time::Duration::from_secs(760));
+        assert_eq!(clock.settle_by, now + std::time::Duration::from_secs(1000));
+        // A settle-by further out than the budget changes nothing.
+        let far = activation_clock(t + 10_000, t, now).unwrap();
+        assert_eq!(far, activation_clock(0, t, now).unwrap());
+        // An absurd one neither overflows nor lengthens the budget.
+        assert_eq!(
+            activation_clock(u64::MAX, t, now).unwrap(),
+            activation_clock(0, t, now).unwrap()
+        );
+    }
+
+    #[test]
+    fn activation_clock_refuses_a_settle_by_that_leaves_no_room() {
+        let now = tokio::time::Instant::now();
+        let t = 1_790_000_000;
+        let margin = DEST_LAUNCH_MARGIN.as_secs();
+        for settle_by in [1, t - 1, t, t + margin] {
+            assert!(
+                matches!(
+                    activation_clock(settle_by, t, now),
+                    Err(MinerAgentError::Migration("dest-settle-by-passed"))
+                ),
+                "settle_by={settle_by}"
+            );
+        }
+        let just = activation_clock(t + margin + 1, t, now).unwrap();
+        assert_eq!(just.restore_by, now + std::time::Duration::from_secs(1));
+        assert_eq!(
+            just.settle_by,
+            now + DEST_LAUNCH_MARGIN + std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn dest_activate_with_settle_by_passed_fails_before_any_download_or_launch() {
+        // vali has already given up on this attempt: nothing is fetched,
+        // nothing is booted at `new_gen`.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle();
+        let downloader = MockDownloader::ok();
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-late", true);
+        order.state_get_url = "https://s3.example/state?sig=y".to_string();
+        order.settle_by_unix = unix_now() - 1;
+        let disk_path = order.luks_disk_path.clone();
+
+        let err = activate_dest(&lifecycle, &downloader, &pusher, order)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, MinerAgentError::Migration("dest-settle-by-passed")),
+            "got {err:?}"
+        );
+        assert!(downloader.calls().is_empty());
+        assert!(!disk_path.exists());
+        assert!(lifecycle.list_tenants().await.unwrap().is_empty());
+    }
+
+    /// Delays the download of the volume and/or the state disk (`.raw`),
+    /// then writes it like [`MockDownloader`].
+    struct DelayedDownloader {
+        inner: MockDownloader,
+        volume: std::time::Duration,
+        state: std::time::Duration,
+    }
+    #[async_trait]
+    impl SnapshotDownloader for DelayedDownloader {
+        async fn download(&self, get_url: &str, dest_path: &std::path::Path) -> Result<()> {
+            let is_state = dest_path.extension().and_then(|e| e.to_str()) == Some("raw");
+            tokio::time::sleep(if is_state { self.state } else { self.volume }).await;
+            self.inner.download(get_url, dest_path).await
+        }
+    }
+
+    #[tokio::test]
+    async fn dest_activate_bounds_the_snapshot_download_by_settle_by() {
+        // One second of restore window left (settle-by = now + margin + 1 s):
+        // a 3 s download is cut off at the clamped deadline instead of
+        // running on the 2400 s per-attempt budget.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle();
+        let downloader = DelayedDownloader {
+            inner: MockDownloader::ok(),
+            volume: std::time::Duration::from_secs(3),
+            state: std::time::Duration::ZERO,
+        };
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-clamp", true);
+        order.settle_by_unix = unix_now() + DEST_LAUNCH_MARGIN.as_secs() + 1;
+
+        let err = activate_dest(&lifecycle, &downloader, &pusher, order)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, MinerAgentError::Migration("snapshot-download-budget")),
+            "got {err:?}"
+        );
+        assert!(lifecycle.list_tenants().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dest_activate_does_not_launch_once_the_restore_window_closed() {
+        // The state-disk download is not bounded by the restore deadline;
+        // when it finishes past it, the launch is refused rather than
+        // started with too little time to settle before vali gives up.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let downloader = DelayedDownloader {
+            inner: MockDownloader::ok(),
+            volume: std::time::Duration::ZERO,
+            state: std::time::Duration::from_secs(2),
+        };
+        let pusher = MockTicketPusher::new();
+        let mut order = activate_order(dir.path(), "tenant-window", true);
+        order.state_get_url = "https://s3.example/state?sig=y".to_string();
+        order.settle_by_unix = unix_now() + DEST_LAUNCH_MARGIN.as_secs() + 1;
+
+        let err = activate_dest(&lifecycle, &downloader, &pusher, order)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, MinerAgentError::Migration("dest-settle-by-passed")),
+            "got {err:?}"
+        );
+        assert_eq!(downloader.inner.calls().len(), 2, "volume + state disk");
+        assert!(lifecycle.list_tenants().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1984,6 +3252,463 @@ mod tests {
         );
     }
 
+    // ── backup-failover chain mode ──────────────────────────────────
+
+    use crate::backup::restore::{ChainPiece, ChainRestorer, RestoreChain};
+
+    /// Records restores; writes a stand-in overlay + a legal state disk.
+    /// (identity, overlay, state, expected size) per restore.
+    type RestoreCall = (String, PathBuf, PathBuf, Option<u64>);
+
+    #[derive(Default)]
+    struct MockRestorer {
+        calls: Mutex<Vec<RestoreCall>>,
+    }
+    #[async_trait]
+    impl ChainRestorer for MockRestorer {
+        async fn restore(
+            &self,
+            chain: &RestoreChain,
+            _work_dir: &std::path::Path,
+            overlay_path: &std::path::Path,
+            state_path: &std::path::Path,
+            expected_size: Option<u64>,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push((
+                chain.identity(),
+                overlay_path.to_path_buf(),
+                state_path.to_path_buf(),
+                expected_size,
+            ));
+            std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+            std::fs::write(overlay_path, b"restored").unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                state_path,
+                vec![0u8; crate::lifecycle::state_disk::STATE_DISK_BYTES as usize],
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    fn chain(restore_id: &str) -> RestoreChain {
+        let p = |u: &str| ChainPiece {
+            url: format!("https://s3.example/{u}?X-Amz-Signature=z"),
+            sha256_hex: "00".repeat(32),
+            size: 1,
+            part_size: 0,
+            part_sha256_hex: Vec::new(),
+        };
+        RestoreChain {
+            restore_id: restore_id.into(),
+            full: p("backups/vm/c1/0.full.raw"),
+            incrementals: vec![p("backups/vm/c1/1.inc.qcow2")],
+            state: p("backups/vm/c1/1.state"),
+        }
+    }
+
+    fn golden_chain_order(dir: &std::path::Path, restore_id: &str) -> MigrateActivateOrder {
+        let mut order = activate_order(dir, "golden-bk", true);
+        order.cmdline =
+            "ro dm-verity.root=abc123 hippius.disk_gb=32 hippius.vm_generation=6".to_string();
+        std::fs::write(&order.rootfs_data_path, b"rootfs").unwrap();
+        std::fs::write(&order.rootfs_hash_path, b"verity").unwrap();
+        order.state_get_url = "https://s3.example/state?sig=y".to_string();
+        order.backup_chain = Some(chain(restore_id));
+        order
+    }
+
+    // ── staged restore (`staged_restore_id`) ────────────────────────
+
+    const RID: &str = "00112233445566778899aabbccddeeff";
+
+    /// A golden activation of a staged restore: no URL, no chain.
+    fn staged_order(dir: &std::path::Path) -> MigrateActivateOrder {
+        let mut order = golden_chain_order(dir, "job-1");
+        order.backup_chain = None;
+        order.get_url.clear();
+        order.state_get_url.clear();
+        order.staged_restore_id = RID.to_string();
+        order.cose_ticket = ByteBuf::from(launch_cose_ticket());
+        // A 1 GiB disk keeps the (sparse) staged overlay cheap to launch.
+        order.cmdline =
+            "ro dm-verity.root=abc123 hippius.disk_gb=1 hippius.vm_generation=6".to_string();
+        order
+    }
+
+    /// The VM's live disks + marker, and a staged restore of `RID` whose
+    /// overlay is the 1 GiB the cmdline names (sparse).
+    async fn staged_vm(lifecycle: &CvmLifecycle) -> crate::backup::staged::RestorePaths {
+        let vm = vid("golden-bk");
+        let p = crate::backup::staged::RestorePaths::for_vm(lifecycle, &vm, RID);
+        std::fs::create_dir_all(p.live_overlay.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(p.live_state.parent().unwrap()).unwrap();
+        std::fs::write(&p.live_overlay, b"original").unwrap();
+        std::fs::write(
+            &p.live_state,
+            vec![1u8; crate::lifecycle::state_disk::STATE_DISK_BYTES as usize],
+        )
+        .unwrap();
+        std::fs::write(&p.marker, "chain:job-0:https://s3/x").unwrap();
+        crate::backup::staged::stage_for_tests(
+            &p,
+            RID,
+            b"restored",
+            &vec![2u8; crate::lifecycle::state_disk::STATE_DISK_BYTES as usize],
+        )
+        .await;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p.staged_overlay)
+            .unwrap();
+        f.set_len(1 << 30).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn a_staged_restore_swaps_in_keeps_the_original_and_launches() {
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+        let p = staged_vm(&lifecycle).await;
+        let out = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            staged_order(dir.path()),
+        )
+        .await;
+        assert!(downloader.calls().is_empty(), "nothing downloaded");
+        assert!(restorer.calls.lock().unwrap().is_empty());
+        let mut head = [0u8; 8];
+        std::io::Read::read_exact(
+            &mut std::fs::File::open(&p.live_overlay).unwrap(),
+            &mut head,
+        )
+        .unwrap();
+        assert_eq!(&head, b"restored");
+        assert_eq!(std::fs::read(&p.pre_overlay).unwrap(), b"original");
+        assert_eq!(std::fs::read(&p.pre_state).unwrap()[0], 1);
+        assert_eq!(std::fs::read(&p.live_state).unwrap()[0], 2);
+        assert_eq!(
+            std::fs::read_to_string(&p.marker).unwrap(),
+            format!("staged:{RID}")
+        );
+        assert_eq!(out.unwrap(), "launched");
+        assert!(lifecycle
+            .list_tenants()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &vid("golden-bk")));
+    }
+
+    #[tokio::test]
+    async fn a_staged_restore_never_swaps_under_a_live_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(MockLibvirtDriver::new());
+        let lifecycle = CvmLifecycle::new(
+            driver.clone(),
+            Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+        )
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(dir.path().to_path_buf());
+        let p = staged_vm(&lifecycle).await;
+        driver.seed_domain(
+            crate::lifecycle::DomainId::new("hippius-tenant-golden-bk").unwrap(),
+            crate::lifecycle::DomainState::Running,
+        );
+        let err = activate_dest_with_chain(
+            &lifecycle,
+            &MockDownloader::ok(),
+            None,
+            &MockTicketPusher::new(),
+            staged_order(dir.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MinerAgentError::Migration("restore-vm-live")));
+        assert_eq!(std::fs::read(&p.live_overlay).unwrap(), b"original");
+        assert!(!p.pre_overlay.exists());
+        assert!(p.staged_overlay.exists());
+    }
+
+    #[tokio::test]
+    async fn a_staged_restore_refuses_urls_and_a_missing_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let mut order = staged_order(dir.path());
+        order.get_url = "https://s3.example/snap?sig=x".into();
+        let err = activate_dest(&lifecycle, &downloader, &MockTicketPusher::new(), order)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("staged-restore-conflict")
+        ));
+        let mut order = staged_order(dir.path());
+        order.backup_chain = Some(chain("job-1"));
+        assert_eq!(order.check_staged_restore(), Err("staged-restore-conflict"));
+        let mut order = staged_order(dir.path());
+        order.staged_restore_id = "job-1".into();
+        assert_eq!(order.check_staged_restore(), Err("restore-bad-id"));
+        // Nothing staged for the id.
+        let err = activate_dest(
+            &lifecycle,
+            &downloader,
+            &MockTicketPusher::new(),
+            staged_order(dir.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("restore-not-staged")
+        ));
+        assert!(downloader.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_mode_restores_overlay_and_state_instead_of_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+        let order = golden_chain_order(dir.path(), "job-1");
+        let vm = vid("golden-bk");
+
+        let _ = activate_dest_with_chain(&lifecycle, &downloader, Some(&restorer), &pusher, order)
+            .await;
+
+        assert!(downloader.calls().is_empty(), "no §25 snapshot download");
+        let calls = restorer.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "chain:job-1:https://s3.example/backups/vm/c1/1.inc.qcow2"
+        );
+        assert_eq!(calls[0].1, lifecycle.golden_overlay_path(&vm));
+        assert_eq!(calls[0].2, lifecycle.state_disk_path(&vm));
+        assert_eq!(
+            calls[0].3,
+            Some(32 << 30),
+            "sized from the measured disk_gb"
+        );
+        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm));
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "chain:job-1:https://s3.example/backups/vm/c1/1.inc.qcow2"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_mode_redrive_skips_and_a_new_attempt_restores_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+
+        let _ = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            golden_chain_order(dir.path(), "job-1"),
+        )
+        .await;
+        // Tear the booted domain down so only the marker decides.
+        let _ = lifecycle.stop(&vid("golden-bk"), false).await;
+        let _ = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            golden_chain_order(dir.path(), "job-1"),
+        )
+        .await;
+        assert_eq!(
+            restorer.calls.lock().unwrap().len(),
+            1,
+            "same attempt ⇒ skip"
+        );
+
+        let _ = lifecycle.stop(&vid("golden-bk"), false).await;
+        let _ = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            golden_chain_order(dir.path(), "job-2"),
+        )
+        .await;
+        assert_eq!(
+            restorer.calls.lock().unwrap().len(),
+            2,
+            "a retried job restores again, never boots the failed attempt's disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_mode_never_relabels_a_vm_running_from_other_artifacts() {
+        use crate::orders::LaunchOrder;
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+        let vm = vid("golden-bk");
+        // The VM is already UP here, from earlier artifacts.
+        lifecycle
+            .launch(LaunchOrder {
+                vm_id: vm.clone(),
+                ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+                kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+                initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+                cmdline: "quiet".to_string(),
+                luks_disk_path: PathBuf::from("/var/lib/hippius-miner/golden-bk.img"),
+                luks_disk_size_gb: 10,
+                data_disk_size_gb: 0,
+                rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+                rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+                cpu_count: 2,
+                memory_mb: 2048,
+                cose_ticket: ByteBuf::from(launch_cose_ticket()),
+                require_existing_disks: false,
+                guardian_ep: None,
+            })
+            .await
+            .expect("launch should succeed");
+        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "chain:job-1:https://s3.example/earlier").unwrap();
+
+        let err = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            golden_chain_order(dir.path(), "job-2"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MinerAgentError::Migration("chain-vm-live")));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "chain:job-1:https://s3.example/earlier",
+            "never relabelled"
+        );
+        assert!(restorer.calls.lock().unwrap().is_empty());
+        assert!(downloader.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_mode_leaves_an_untracked_live_domain_alone_when_already_restored() {
+        // Restored + booted, then the agent restarted without re-adopting
+        // it: libvirt runs it, the handle map does not know it. A re-drive
+        // must neither restore under it nor try to launch it again.
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(MockLibvirtDriver::new());
+        driver.seed_domain(
+            crate::lifecycle::DomainId::new("hippius-tenant-golden-bk").unwrap(),
+            crate::lifecycle::DomainState::Running,
+        );
+        let lifecycle = CvmLifecycle::new(
+            driver.clone(),
+            Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+        )
+        .skip_state_disk_provision_for_tests()
+        .with_state_disk_root(dir.path().to_path_buf());
+        let order = golden_chain_order(dir.path(), "job-1");
+        let identity = order.backup_chain.as_ref().unwrap().identity();
+        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vid("golden-bk")));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, &identity).unwrap();
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+
+        let out =
+            activate_dest_with_chain(&lifecycle, &downloader, Some(&restorer), &pusher, order)
+                .await
+                .unwrap();
+        assert_eq!(out, "already-running");
+        assert!(restorer.calls.lock().unwrap().is_empty());
+        assert_eq!(driver.destroy_count(), 0, "the live guest is never touched");
+
+        // A DIFFERENT attempt against that untracked live domain is refused.
+        let err = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            Some(&restorer),
+            &pusher,
+            golden_chain_order(dir.path(), "job-2"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MinerAgentError::Migration("chain-vm-live")));
+    }
+
+    #[tokio::test]
+    async fn chain_mode_refuses_legacy_and_a_missing_restorer() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        let downloader = MockDownloader::ok();
+        let restorer = MockRestorer::default();
+        let pusher = MockTicketPusher::new();
+
+        let mut legacy = activate_order(dir.path(), "legacy-bk", true);
+        legacy.backup_chain = Some(chain("job-1"));
+        let err =
+            activate_dest_with_chain(&lifecycle, &downloader, Some(&restorer), &pusher, legacy)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("chain-requires-golden")
+        ));
+
+        let err = activate_dest_with_chain(
+            &lifecycle,
+            &downloader,
+            None,
+            &pusher,
+            golden_chain_order(dir.path(), "job-1"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("chain-unsupported")
+        ));
+        assert!(downloader.calls().is_empty());
+        assert!(restorer.calls.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn dest_activate_golden_downloads_to_the_overlay_path() {
         // GOLDEN: the golden `launch` ignores `order.luks_disk_path` and
@@ -2106,6 +3831,8 @@ mod tests {
                 cpu_count: 2,
                 memory_mb: 2048,
                 cose_ticket: ByteBuf::from(launch_cose_ticket()),
+                require_existing_disks: false,
+                guardian_ep: None,
             })
             .await
             .expect("launch should succeed");
@@ -2177,15 +3904,19 @@ mod tests {
             assert_eq!(store.phase(&vm), Some(source_phase), "phase must not move");
         }
 
-        // A genuine dest (no entry) and an idempotent re-drive both pass.
+        // A genuine dest (no entry) and an idempotent re-drive both pass;
+        // a re-drive while the first is still running starts nothing.
         let dest = MigrationStore::new();
         let vm2 = vid("tenant-y");
-        dest.begin_activate(&vm2).unwrap();
-        dest.begin_activate(&vm2)
-            .expect("a re-drive must stay idempotent");
+        assert!(dest.begin_activate(&vm2).unwrap());
+        assert!(
+            !dest.begin_activate(&vm2).unwrap(),
+            "a concurrent re-drive must not start a second restore"
+        );
         dest.mark_activate_done(&vm2).unwrap();
-        dest.begin_activate(&vm2)
-            .expect("a re-drive after success must stay idempotent");
+        assert!(dest
+            .begin_activate(&vm2)
+            .expect("a re-drive after success must stay idempotent"));
     }
 
     #[test]
@@ -2380,6 +4111,8 @@ mod tests {
             cpu_count: 2,
             memory_mb: 2048,
             cose_ticket: ByteBuf::from(launch_cose_ticket()),
+            require_existing_disks: false,
+            guardian_ep: None,
         };
         lifecycle
             .launch(order)
@@ -2406,6 +4139,174 @@ mod tests {
         assert_eq!(store.disk_path(&vm).unwrap(), Some(luks));
         // The migration phase was recorded.
         assert_eq!(store.phase(&vm), Some(MigrationPhase::Quiescing));
+    }
+
+    /// A pusher whose guest never takes the ticket.
+    struct UnreachableGuestPusher;
+    #[async_trait]
+    impl crate::vsock::ticket_push::TicketPusher for UnreachableGuestPusher {
+        async fn push(&self, _cid: u32, _port: u32, _cose: &[u8]) -> Result<()> {
+            Err(MinerAgentError::TicketDelivery("connect-timeout"))
+        }
+    }
+
+    fn np_order(vm: &VmId) -> crate::orders::LaunchOrder {
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        crate::orders::LaunchOrder {
+            vm_id: vm.clone(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+            initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+            cmdline: "quiet".to_string(),
+            luks_disk_path: PathBuf::from(format!("/var/lib/hippius-miner/{}.img", vm.as_str())),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 0,
+            rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+            rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: ByteBuf::from(launch_cose_ticket()),
+            require_existing_disks: false,
+            guardian_ep: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dest_whose_ticket_never_arrives_is_stopped_and_retried_fresh() {
+        // Answered `already-launched` on the next attempt, it would be a
+        // success — and vali would activate a guest that never unlocked.
+        let lifecycle = test_lifecycle();
+        let vm = vid("tenant-np");
+        let err = launch_dest(
+            &lifecycle,
+            &UnreachableGuestPusher,
+            np_order(&vm),
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("dest-launch-failed")
+        ));
+        assert!(
+            lifecycle.list_tenants().await.unwrap().is_empty(),
+            "no re-push running, nothing delivered: the ticketless domain is stopped"
+        );
+        let retry = launch_dest(
+            &lifecycle,
+            &MockTicketPusher::new(),
+            np_order(&vm),
+            far_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry, "launched", "a fresh boot, with a fresh ticket push");
+    }
+
+    #[tokio::test]
+    async fn a_slow_dest_boot_the_re_push_reaches_is_a_launch() {
+        // The launch's own push gave up; the reboot-watcher's re-push is
+        // still trying and delivers. That is a booted guest, never a kill.
+        let lifecycle = Arc::new(test_lifecycle());
+        let vm = vid("tenant-slow");
+        let repush = lifecycle.begin_ticket_push(&vm);
+        let (lc, v) = (lifecycle.clone(), vm.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (cid, ticket) = lc.ticket_for_vm(&v).unwrap();
+            lc.note_ticket_delivered(&v, cid, &ticket);
+        });
+        let out = launch_dest(
+            &lifecycle,
+            &UnreachableGuestPusher,
+            np_order(&vm),
+            far_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "launched");
+        assert_eq!(lifecycle.list_tenants().await.unwrap().len(), 1);
+        drop(repush);
+    }
+
+    #[tokio::test]
+    async fn a_re_push_that_gives_up_ends_in_a_stop() {
+        let lifecycle = Arc::new(test_lifecycle());
+        let vm = vid("tenant-gone");
+        let repush = lifecycle.begin_ticket_push(&vm);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            repush.cancel(); // the watcher's window closed without a delivery
+        });
+        let err = launch_dest(
+            &lifecycle,
+            &UnreachableGuestPusher,
+            np_order(&vm),
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("dest-launch-failed")
+        ));
+        assert!(lifecycle.list_tenants().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_vm_already_running_here_survives_a_launch_refused_before_admission() {
+        use crate::orders::LaunchOrder;
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        let lifecycle = test_lifecycle();
+        let vm = vid("tenant-up");
+        let order = |cpu_count: u8| LaunchOrder {
+            vm_id: vm.clone(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            kernel_path: PathBuf::from("/var/lib/hippius-miner/vmlinuz"),
+            initrd_path: PathBuf::from("/var/lib/hippius-miner/initrd"),
+            cmdline: "quiet".to_string(),
+            luks_disk_path: PathBuf::from("/var/lib/hippius-miner/tenant-up.img"),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 0,
+            rootfs_data_path: PathBuf::from("/var/lib/hippius-miner/rootfs.img"),
+            rootfs_hash_path: PathBuf::from("/var/lib/hippius-miner/rootfs.verity"),
+            cpu_count,
+            memory_mb: 2048,
+            cose_ticket: ByteBuf::from(launch_cose_ticket()),
+            require_existing_disks: false,
+            guardian_ep: None,
+        };
+        lifecycle
+            .launch(order(2))
+            .await
+            .expect("launch should succeed");
+
+        // The ticket says `medium` (2 vCPU): 3 fails the flavor check,
+        // before the launch ever looks at the running handle.
+        let err = launch_dest(
+            &lifecycle,
+            &UnreachableGuestPusher,
+            order(3),
+            far_deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("dest-launch-failed")
+        ));
+        assert_eq!(
+            lifecycle.query(&vm).await.unwrap(),
+            crate::lifecycle::CvmPhase::Running,
+            "never stop a domain this call did not start"
+        );
     }
 
     /// A CoseSign1-shaped ticket carrying `flavor: "medium"` so the
@@ -2637,16 +4538,17 @@ mod tests {
 
     // ── §25 M3 — dest artifact STAGING tests ────────────────────────
 
-    /// Spawn a one-shot HTTP server that serves `body` for a single GET,
+    /// Spawn an HTTP server that serves `body` to every GET (a staging
+    /// fetch retries, so a failing response is seen more than once),
     /// returning its `http://127.0.0.1:port/` URL. Dependency-free (a raw
     /// TCP listener) so the staging fetch path is exercised without a new
     /// dev-dependency or a real S3.
-    async fn serve_once(body: Vec<u8>, status_line: &'static str) -> String {
+    async fn serve_every(body: Vec<u8>, status_line: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
+            while let Ok((mut sock, _)) = listener.accept().await {
                 // Drain the request headers (best-effort).
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
@@ -2674,7 +4576,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("tenant.vmlinuz");
         let body = b"measured-kernel-bytes".to_vec();
-        let url = serve_once(body.clone(), "HTTP/1.1 200 OK").await;
+        let url = serve_every(body.clone(), "HTTP/1.1 200 OK").await;
         let artifact = StagedArtifact {
             url,
             sha256_hex: sha256_hex(&body),
@@ -2695,7 +4597,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("tenant.vmlinuz");
         let body = b"tampered-kernel".to_vec();
-        let url = serve_once(body, "HTTP/1.1 200 OK").await;
+        let url = serve_every(body, "HTTP/1.1 200 OK").await;
         let artifact = StagedArtifact {
             url,
             // The sha of DIFFERENT bytes — a mismatch.
@@ -2717,7 +4619,7 @@ mod tests {
     async fn fetch_verify_stage_fails_closed_on_a_non_2xx_status() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("tenant.vmlinuz");
-        let url = serve_once(b"not found".to_vec(), "HTTP/1.1 404 Not Found").await;
+        let url = serve_every(b"not found".to_vec(), "HTTP/1.1 404 Not Found").await;
         let artifact = StagedArtifact {
             url,
             sha256_hex: sha256_hex(b"whatever"),
@@ -2730,6 +4632,158 @@ mod tests {
             MinerAgentError::Migration("dest-artifact-status")
         ));
         assert!(!out.exists());
+    }
+
+    /// Serve `responses` to successive GETs, one connection each; returns
+    /// the URL and a counter of the requests actually served.
+    async fn serve_seq(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            for (status_line, body) in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{addr}/"), served)
+    }
+
+    #[tokio::test]
+    async fn one_bad_body_costs_a_retry_not_the_migration() {
+        // Seen in production: a 200 whose bytes did not hash to the pinned
+        // digest, then byte-exact GETs of the same object minutes later.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rootfs.img");
+        let good = b"golden-base".to_vec();
+        let (url, served) = serve_seq(vec![
+            ("HTTP/1.1 200 OK", b"golden-bXse".to_vec()),
+            ("HTTP/1.1 503 Service Unavailable", b"slow down".to_vec()),
+            ("HTTP/1.1 200 OK", good.clone()),
+        ])
+        .await;
+        let artifact = StagedArtifact {
+            url,
+            sha256_hex: sha256_hex(&good),
+        };
+        fetch_verify_stage_artifact(&artifact, &out, StagePolicy::Replace)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), good);
+        assert_eq!(served.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_expired_url_fails_fast_as_a_status_never_a_sha_mismatch() {
+        // A 403 (expired presigned URL) or 404 answers the same way again:
+        // one request, classed as the status it is.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rootfs.img");
+        let good = b"golden-base".to_vec();
+        let (url, served) = serve_seq(vec![
+            (
+                "HTTP/1.1 403 Forbidden",
+                b"<Error>AccessDenied</Error>".to_vec(),
+            ),
+            ("HTTP/1.1 200 OK", good.clone()),
+        ])
+        .await;
+        let artifact = StagedArtifact {
+            url,
+            sha256_hex: sha256_hex(&good),
+        };
+        let err = fetch_verify_stage_artifact(&artifact, &out, StagePolicy::Replace)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("dest-artifact-status")
+        ));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_verifies_is_refused_after_every_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rootfs.img");
+        let bad = vec![("HTTP/1.1 200 OK", b"tampered".to_vec()); ARTIFACT_FETCH_ATTEMPTS as usize];
+        let (url, served) = serve_seq(bad).await;
+        let artifact = StagedArtifact {
+            url,
+            sha256_hex: sha256_hex(b"the-real-base"),
+        };
+        let err = fetch_verify_stage_artifact(&artifact, &out, StagePolicy::Replace)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MinerAgentError::Migration("dest-artifact-sha-mismatch")
+        ));
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            ARTIFACT_FETCH_ATTEMPTS as usize
+        );
+        assert!(!out.exists());
+        assert!(!out.with_extension("part").exists());
+    }
+
+    #[tokio::test]
+    async fn a_verified_cache_entry_is_staged_without_asking_s3() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let body = b"golden-base".to_vec();
+        std::fs::write(cache.join(sha256_hex(&body)), &body).unwrap();
+        let out = dir.path().join("vm").join("rootfs.img");
+        let artifact = StagedArtifact {
+            // Nothing listens here: a fetch would fail the stage.
+            url: "http://127.0.0.1:1/".to_string(),
+            sha256_hex: sha256_hex(&body),
+        };
+        fetch_verify_stage_artifact_in(&artifact, &out, StagePolicy::Replace, Some(&cache))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_cache_entry_is_bypassed_and_healed() {
+        // SECURITY: the cache is trusted only through a re-hash — a
+        // poisoned entry is never staged, and the verified fetch replaces it.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let body = b"golden-base".to_vec();
+        let entry = cache.join(sha256_hex(&body));
+        std::fs::write(&entry, b"poisoned").unwrap();
+        let out = dir.path().join("vm").join("rootfs.img");
+        let (url, served) = serve_seq(vec![("HTTP/1.1 200 OK", body.clone())]).await;
+        let artifact = StagedArtifact {
+            url,
+            sha256_hex: sha256_hex(&body),
+        };
+        fetch_verify_stage_artifact_in(&artifact, &out, StagePolicy::Replace, Some(&cache))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&entry).unwrap(), body);
     }
 
     #[tokio::test]
@@ -2773,11 +4827,11 @@ mod tests {
         order.boot_artifacts = Some(DestStagingArtifacts {
             ovmf: None,
             kernel: StagedArtifact {
-                url: serve_once(kernel_bytes.clone(), "HTTP/1.1 200 OK").await,
+                url: serve_every(kernel_bytes.clone(), "HTTP/1.1 200 OK").await,
                 sha256_hex: sha256_hex(&kernel_bytes),
             },
             initrd: StagedArtifact {
-                url: serve_once(initrd_bytes.clone(), "HTTP/1.1 200 OK").await,
+                url: serve_every(initrd_bytes.clone(), "HTTP/1.1 200 OK").await,
                 sha256_hex: sha256_hex(&initrd_bytes),
             },
             rootfs_data: None,
@@ -2932,7 +4986,7 @@ mod tests {
 
         let replacement = b"a-different-base".to_vec();
         let artifact = StagedArtifact {
-            url: serve_once(replacement.clone(), "HTTP/1.1 200 OK").await,
+            url: serve_every(replacement.clone(), "HTTP/1.1 200 OK").await,
             sha256_hex: sha256_hex(&replacement),
         };
         let err = fetch_verify_stage_artifact(&artifact, &out, StagePolicy::PinnedByLiveVm)
@@ -2983,7 +5037,7 @@ mod tests {
         order.boot_artifacts = Some(DestStagingArtifacts {
             ovmf: None,
             kernel: StagedArtifact {
-                url: serve_once(kernel_bytes, "HTTP/1.1 200 OK").await,
+                url: serve_every(kernel_bytes, "HTTP/1.1 200 OK").await,
                 sha256_hex: sha256_hex(b"DIFFERENT-bytes"),
             },
             initrd: StagedArtifact {

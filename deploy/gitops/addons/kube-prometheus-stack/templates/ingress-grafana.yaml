@@ -1,5 +1,5 @@
 ---
-# Grafana Ingress — `grafana.hippius.network`. PR-K14, §K (#54), issue #128.
+# Grafana Ingress — `grafana.example.com`. PR-K14, §K (#54), issue #128.
 #
 # Operators reach Grafana over the NetBird mesh only — same access
 # model as every other in-cluster UI in this fleet. Two layers gate
@@ -17,7 +17,7 @@
 # from the `letsencrypt-prod-cloudflare` ClusterIssuer — same pattern
 # as KBS's public ingress, since the hostname is publicly resolvable
 # but the LB IP is private-only reachable via NetBird). Public DNS
-# carries `grafana.hippius.network` → that LB IP in DNS-only mode.
+# carries `grafana.example.com` → that LB IP in DNS-only mode.
 #
 # Backend is the chart's Grafana Service (`kube-prometheus-stack-grafana`
 # — the `fullnameOverride` in ../values.yaml gives that stable name).
@@ -40,10 +40,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - grafana.hippius.network
+        - grafana.example.com
       secretName: grafana-hippius-network-tls
   rules:
-    - host: grafana.hippius.network
+    - host: grafana.example.com
       http:
         paths:
           - path: /

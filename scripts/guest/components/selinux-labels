@@ -1,0 +1,10 @@
+# SELinux label of every entry of the components image, by top-level
+# directory (the label applies to the directory and everything below it).
+# `/` is the image root. Every entry must be covered: the builder refuses
+# an image with an unlabelled entry (an unlabelled directory on a path
+# breaks every confined domain that walks it). Ignored by the
+# Ubuntu/Debian kernels (no SELinux policy loaded).
+/       system_u:object_r:usr_t:s0
+bin     system_u:object_r:bin_t:s0
+units   system_u:object_r:systemd_unit_file_t:s0
+etc     system_u:object_r:etc_t:s0

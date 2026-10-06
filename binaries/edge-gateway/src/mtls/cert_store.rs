@@ -225,7 +225,7 @@ fn parse_certs_pem(
 /// can store it in an [`arc_swap::ArcSwap`] for live rotation. The
 /// [`crate::mtls::MtlsRuntime`] owns that swap and rebuilds the
 /// config on every successful CRL refresh — Blocker #1 from the
-/// codex PR-H4 review.
+/// review PR-H4 review.
 pub fn build_server_config(
     ca_roots: RootCertStore,
     cert_chain: Vec<CertificateDer<'static>>,

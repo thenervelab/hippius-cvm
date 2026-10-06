@@ -75,7 +75,7 @@ def _kv_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(effects, "dispatch_destroy", _REAL_DISPATCH_DESTROY)
 
 
-def _vm(vm_id: str = "vm-golden", host: str = "miner-1", generation: int = 5) -> Vm:
+def _vm(vm_id: str = "vm-golden", host: str = "miner-a", generation: int = 5) -> Vm:
     return Vm.objects.create(
         vm_id=vm_id,
         lease_id=f"lease-{vm_id}",
@@ -115,6 +115,57 @@ def test_golden_erase_destroys_the_right_transit_key_and_kv(
         "secret",
         "hippius-compute/kbs/tenants/vm-golden/luks-kek",
     ) in calls
+
+
+@pytest.mark.django_db
+def test_erase_destroys_both_per_vm_keys_and_deletes_the_userdata_blobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The erase used to destroy `kek-<vm_id>` and delete the KEK blob,
+    and nothing else — so a destroyed VM's cloud-init (SSH keys, API
+    tokens, the NetBird enrolment secret) stayed readable in KV
+    indefinitely, version history included, at BOTH the canonical path and
+    vali's working copy.
+
+    Now: both per-VM Transit keys are destroyed (`kek-<vm_id>` wraps the
+    canonical copy, `ud-<vm_id>` vali's working copy) and all three KV
+    paths are deleted. The key destruction is what makes the wrapped
+    copies unopenable; the deletes are what covers the versions staged
+    BEFORE the wrapping, which are plaintext and which no key destruction
+    can reach."""
+    keys: list[str] = []
+    paths: list[str] = []
+    monkeypatch.setattr(vault_kv, "transit_key_delete", lambda name: keys.append(name))
+    monkeypatch.setattr(
+        vault_kv, "delete_kv_all_versions", lambda mount, path: paths.append(path)
+    )
+    effects.crypto_erase_kek_transit(_vm(vm_id="vm-golden"))
+
+    assert keys == ["kek-vm-golden", "ud-vm-golden"], keys
+    base = "hippius-compute/kbs/tenants/vm-golden"
+    assert paths == [
+        f"{base}/luks-kek",
+        f"{base}/userdata",
+        f"{base}/userdata-pending",
+        f"{base}/userdata-intake",
+    ], paths
+
+
+@pytest.mark.django_db
+def test_erase_destroys_the_keys_before_it_deletes_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order is the retry story: the irreversible step first, then the
+    deletes. A Vault blip between them leaves the decommission retryable
+    with the data ALREADY dead — the reverse would leave live keys with
+    the blobs gone, i.e. a VM reported erased that is not."""
+    seq: list[str] = []
+    monkeypatch.setattr(vault_kv, "transit_key_delete", lambda name: seq.append("transit"))
+    monkeypatch.setattr(
+        vault_kv, "delete_kv_all_versions", lambda mount, path: seq.append("kv")
+    )
+    effects.crypto_erase_kek_transit(_vm(vm_id="vm-golden"))
+    assert seq == ["transit", "transit", "kv", "kv", "kv", "kv"], seq
 
 
 @pytest.mark.django_db
@@ -158,7 +209,7 @@ def test_dispatch_destroy_targets_the_bound_miner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     MinerIdentity.objects.create(
-        miner_id="miner-1",
+        miner_id="miner-a",
         pubkey_hex="ab" * 32,
         platform_id="plat-1",
         netbird_ip="100.64.0.9",
@@ -170,10 +221,10 @@ def test_dispatch_destroy_targets_the_bound_miner(
         return order_dispatch.DispatchResult(ok=True, status=200, classifier="")
 
     monkeypatch.setattr(order_dispatch, "dispatch_order", _fake_dispatch)
-    effects.dispatch_destroy(_vm(vm_id="vm-golden", host="miner-1"))
+    effects.dispatch_destroy(_vm(vm_id="vm-golden", host="miner-a"))
     # Routed to the VM's bound miner via its chain-provisioned NetBird IP —
     # no misroute (address never came from request data).
-    assert captured["miner_id"] == "miner-1"
+    assert captured["miner_id"] == "miner-a"
     assert captured["netbird_ip"] == "100.64.0.9"
     assert captured["kind"] == "destroy"
     assert b"vm-golden" in captured["payload_json"]
@@ -188,12 +239,12 @@ def test_dispatch_destroy_falls_back_to_launch_job_when_host_empty(
     `LaunchJob.miner_id`). The destroy MUST fall back to that trusted
     placement record so the order routes instead of raising `miner ''`."""
     MinerIdentity.objects.create(
-        miner_id="miner-1",
+        miner_id="miner-a",
         pubkey_hex="ab" * 32,
         platform_id="plat-1",
         netbird_ip="100.64.0.9",
     )
-    _launch_job("vm-async", miner_id="miner-1", state=LaunchJobState.SUCCEEDED)
+    _launch_job("vm-async", miner_id="miner-a", state=LaunchJobState.SUCCEEDED)
     captured: dict[str, Any] = {}
 
     def _fake_dispatch(**kwargs: Any) -> order_dispatch.DispatchResult:
@@ -203,7 +254,7 @@ def test_dispatch_destroy_falls_back_to_launch_job_when_host_empty(
     monkeypatch.setattr(order_dispatch, "dispatch_order", _fake_dispatch)
     # host="" → resolve the bound miner from the SUCCEEDED LaunchJob.
     effects.dispatch_destroy(_vm(vm_id="vm-async", host=""))
-    assert captured["miner_id"] == "miner-1"
+    assert captured["miner_id"] == "miner-a"
     assert captured["netbird_ip"] == "100.64.0.9"
     assert captured["kind"] == "destroy"
 
@@ -215,13 +266,13 @@ def test_dispatch_destroy_prefers_vm_host_over_launch_job(
     """`vm.host` is authoritative when set: a stale/other SUCCEEDED launch
     record must never override the VM's current bound host."""
     for mid, pk, ip in (
-        ("miner-1", "ab" * 32, "100.64.0.9"),
-        ("miner-2", "cd" * 32, "100.64.0.8"),
+        ("miner-a", "ab" * 32, "100.64.0.9"),
+        ("miner-b", "cd" * 32, "100.64.0.8"),
     ):
         MinerIdentity.objects.create(
             miner_id=mid, pubkey_hex=pk, platform_id=mid, netbird_ip=ip
         )
-    _launch_job("vm-async2", miner_id="miner-2", state=LaunchJobState.SUCCEEDED)
+    _launch_job("vm-async2", miner_id="miner-b", state=LaunchJobState.SUCCEEDED)
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
         order_dispatch,
@@ -230,8 +281,8 @@ def test_dispatch_destroy_prefers_vm_host_over_launch_job(
             ok=True, status=200, classifier=""
         )),
     )
-    effects.dispatch_destroy(_vm(vm_id="vm-async2", host="miner-1"))
-    assert captured["miner_id"] == "miner-1"
+    effects.dispatch_destroy(_vm(vm_id="vm-async2", host="miner-a"))
+    assert captured["miner_id"] == "miner-a"
 
 
 @pytest.mark.django_db
@@ -271,12 +322,12 @@ def test_dispatch_destroy_uses_a_failed_launch_jobs_miner(
     live CVM tombstoned as Destroyed, holding an ASID and RAM, with no
     further §24 possible (`start_decommission` requires Active).
 
-    Live case: `migproof-1`, whose launch failed on a miner 500 (SEV ASID
-    exhaustion) while its LaunchJob named `miner-2`."""
+    Live case: `vm-migrate-1`, whose launch failed on a miner 500 (SEV ASID
+    exhaustion) while its LaunchJob named `miner-b`."""
     MinerIdentity.objects.create(
-        miner_id="miner-1", pubkey_hex="ab" * 32, platform_id="p", netbird_ip="100.64.0.9"
+        miner_id="miner-a", pubkey_hex="ab" * 32, platform_id="p", netbird_ip="100.64.0.9"
     )
-    _launch_job("vm-failed", miner_id="miner-1", state=LaunchJobState.FAILED)
+    _launch_job("vm-failed", miner_id="miner-a", state=LaunchJobState.FAILED)
     dispatched: list[Any] = []
     monkeypatch.setattr(
         order_dispatch,
@@ -286,7 +337,7 @@ def test_dispatch_destroy_uses_a_failed_launch_jobs_miner(
     )
     effects.dispatch_destroy(_vm(vm_id="vm-failed", host=""))
     assert len(dispatched) == 1
-    assert dispatched[0]["miner_id"] == "miner-1"
+    assert dispatched[0]["miner_id"] == "miner-a"
 
 
 @pytest.mark.django_db
@@ -311,7 +362,7 @@ def test_dispatch_destroy_raises_on_miner_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     MinerIdentity.objects.create(
-        miner_id="miner-1",
+        miner_id="miner-a",
         pubkey_hex="ab" * 32,
         platform_id="plat-1",
         netbird_ip="100.64.0.9",
@@ -324,7 +375,7 @@ def test_dispatch_destroy_raises_on_miner_rejection(
         ),
     )
     with pytest.raises(effects.EffectError):
-        effects.dispatch_destroy(_vm(host="miner-1"))
+        effects.dispatch_destroy(_vm(host="miner-a"))
 
 
 @pytest.mark.django_db
@@ -332,7 +383,7 @@ def test_dispatch_destroy_maps_unavailable_to_effect_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     MinerIdentity.objects.create(
-        miner_id="miner-1",
+        miner_id="miner-a",
         pubkey_hex="ab" * 32,
         platform_id="plat-1",
         netbird_ip="100.64.0.9",
@@ -341,6 +392,9 @@ def test_dispatch_destroy_maps_unavailable_to_effect_unavailable(
     def _unavail(**kw: Any) -> Any:
         raise order_dispatch.OrderDispatchUnavailable("edge down")
 
+    # The settled dispatch pauses before its re-ask; not in a unit test.
+    monkeypatch.setattr(order_dispatch.time, "sleep", lambda _s: None)
+
     monkeypatch.setattr(order_dispatch, "dispatch_order", _unavail)
     with pytest.raises(effects.EffectUnavailable):
-        effects.dispatch_destroy(_vm(host="miner-1"))
+        effects.dispatch_destroy(_vm(host="miner-a"))

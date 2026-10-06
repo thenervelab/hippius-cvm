@@ -14,7 +14,11 @@
 # `{{NETBIRD_SETUP_KEY}}` token — `vali_create_vm` will refuse the
 # stage if it is missing while `--enable-netbird` is on.
 
-ssh_pwauth: true
+# Key-only SSH. `true` made cloud-init write `PasswordAuthentication yes` to
+# /etc/ssh/sshd_config.d/50-cloud-init.conf, which sshd reads before the
+# image's own `no` (the first value wins). The golden images also ship a
+# 00-hippius-harden.conf that wins over it, but the seed must not ask.
+ssh_pwauth: false
 # `default` resolves to the cloud image's OWN built-in admin user, as
 # declared in that image's `/etc/cloud/cloud.cfg` `system_info:
 # default_user`. Do NOT hardcode a distro-specific name here: a literal
@@ -32,9 +36,10 @@ users:
 # launch — an empty list with no password leaves the VM unreachable.
 ssh_authorized_keys: []
 
-# DEV-SMOKE ONLY: uncomment to also allow password login on the default
-# user. `default` is accepted by chpasswd and maps to the distro admin
-# user resolved above. Prefer SSH keys for anything beyond dev smoke.
+# DEV-SMOKE ONLY: uncomment to give the default user a password (sudo).
+# `default` is accepted by chpasswd and maps to the distro admin user
+# resolved above. SSH stays key-only either way: `ssh_pwauth` is false and
+# the images ship /etc/ssh/sshd_config.d/00-hippius-harden.conf.
 # chpasswd:
 #   expire: false
 #   users:
@@ -43,12 +48,9 @@ ssh_authorized_keys: []
 #       type: text
 
 write_files:
-  # The setup-key file the netbird systemd unit reads at first boot.
-  # `0600` + root:root — netbird runs as root inside the tenant. The
-  # file is on tmpfs (`/var/lib/cloud/seed/nocloud/` is the
-  # NoCloud datasource directory cloud-init wrote into, and the
-  # cmdline `ds=nocloud;s=/run/cloud-init/seed/` routes that into
-  # the §21-released tmpfs).
+  # The setup-key file `netbird up` reads below. `0600` + root:root —
+  # netbird runs as root inside the tenant. NOT tmpfs: this path is on the
+  # guest's root filesystem; the purge at the end of runcmd removes it.
   - path: /var/lib/cloud/seed/nocloud/netbird-setup-key
     permissions: '0600'
     owner: root:root
@@ -76,13 +78,27 @@ runcmd:
   # so the joined peer's FQDN is `<template>.hippius.decentralized`.
   # Per-vm-id stable FQDNs let operators ssh into a specific tenant by
   # name without an IP lookup (#309).
+  #
+  # Customer-held keys (key_mode split / customer): vali inserts three
+  # flags right after `up` that stop the NetBird management plane from
+  # steering the guest's DNS or routes (`customer_keys.NETBIRD_UP_HARDENING`),
+  # and refuses such a launch when it finds no enrolment to harden. Supported
+  # shapes: this unquoted flow list, a block list (`- netbird` / `- up`), or
+  # a shell string containing `netbird up`. A QUOTED flow list
+  # (`[ "netbird", "up" ]`) is not recognised and refuses the launch.
   - [ netbird, up,
       --setup-key-file=/var/lib/cloud/seed/nocloud/netbird-setup-key,
       --management-url=https://vpn.hippius.network,
       --hostname={{NETBIRD_HOSTNAME}},
       --no-browser ]
-  # Belt-and-suspenders: after `netbird up`, shred the setup-key file
-  # so a tenant operator can't read it after the fact. (The file is
-  # already on tmpfs that disappears at shutdown, but explicit shred
-  # protects against a snapshot of the running VM's tmpfs.)
-  - [ shred, -u, /var/lib/cloud/seed/nocloud/netbird-setup-key ]
+  # Purge the setup-key file and cloud-init's copies of the whole userdata
+  # (the setup key in it): the released seed and the combined config under
+  # /run, and user-data.txt(.i) / cloud-config.txt / the pickled datasource
+  # in every instance dir (one per boot). Queued behind cloud-final.service,
+  # which runs this very runcmd: cloud-init writes its state until its last
+  # stage ends. `--no-block` is load-bearing — waiting for the unit from
+  # inside cloud-final would deadlock. The KBS releases the userdata again
+  # on every boot, so nothing cloud-init needs is lost. Keep it LAST, and on
+  # one line: the backend's HA userdata has ~4 KB of headroom to the cap
+  # (hippius-backend compute/userdata_netbird.yaml carries the same line).
+  - [ systemd-run, --no-block, -pAfter=cloud-final.service, sh, -c, "cd /var/lib/cloud/instances && rm -f */user-data.txt* */cloud-config.txt */obj.pkl ../seed/nocloud/netbird-setup-key /run/cloud-init/seed/user-data /run/cloud-init/combined-cloud-config.json" ]

@@ -317,3 +317,184 @@ def test_vk_recorded_matches_seed_pubkey_via_validator(settings) -> None:
     kp2 = lifecycle_keygen.generate_lifecycle_keypair()
     assert kp.seed != kp2.seed, "each VM must get a fresh seed"
     assert kp.vk != kp2.vk
+
+
+# ─── _stage_userdata (Transit-wrapped at rest) ────────────────────────
+
+
+def test_userdata_is_written_wrapped_never_plaintext() -> None:
+    """THE claim. Before this, the KEK was Transit-enveloped and the
+    cloud-init beside it was not — and it carries SSH keys, API tokens and
+    the NetBird enrolment secret."""
+    plaintext = b"#cloud-config\nssh_authorized_keys: [ssh-ed25519 AAAA...]\n"
+    with (
+        mock.patch.object(
+            launch.vault_kv, "transit_encrypt", return_value=b"vault:v1:CIPHERTEXT"
+        ) as enc,
+        mock.patch.object(launch.vault_kv, "ensure_transit_key") as ensure,
+        mock.patch.object(launch.vault_kv, "put_kv") as put,
+    ):
+        launch._stage_userdata("secret", "p/vm-a/userdata", "vm-a", plaintext)
+
+    (_mount, _path, written), _kw = put.call_args
+    assert written == b"vault:v1:CIPHERTEXT"
+    assert plaintext not in (written,), "the plaintext must never reach Vault"
+    enc.assert_called_once_with("kek-vm-a", plaintext)
+    ensure.assert_called_once_with("kek-vm-a")
+
+
+def test_it_reuses_the_kek_transit_key_so_crypto_erase_covers_it() -> None:
+    """§24 destroys `kek-<vm_id>`. Reusing it is what makes decommission
+    make the userdata unreadable too — the erase path never deleted this
+    KV entry, so it used to outlive the VM. A second key would silently
+    lose that coverage."""
+    with (
+        mock.patch.object(launch.vault_kv, "transit_encrypt", return_value=b"vault:v1:x"),
+        mock.patch.object(launch.vault_kv, "ensure_transit_key"),
+        mock.patch.object(launch.vault_kv, "put_kv"),
+        mock.patch.object(
+            launch.vault_kv, "transit_key_name", wraps=launch.vault_kv.transit_key_name
+        ) as name,
+    ):
+        launch._stage_userdata("secret", "p/vm-b/userdata", "vm-b", b"x")
+    name.assert_called_once_with("vm-b")
+
+
+def test_a_transit_failure_does_not_write_anything() -> None:
+    """Fail closed: if wrapping fails, nothing is staged. Writing the
+    plaintext as a fallback would defeat the entire change."""
+    from apps.orchestration.effects import EffectError
+
+    with (
+        mock.patch.object(
+            launch.vault_kv, "transit_encrypt", side_effect=EffectError("transit down")
+        ),
+        mock.patch.object(launch.vault_kv, "ensure_transit_key"),
+        mock.patch.object(launch.vault_kv, "put_kv") as put,
+    ):
+        with pytest.raises(EffectError):
+            launch._stage_userdata("secret", "p/vm-c/userdata", "vm-c", b"secret")
+    put.assert_not_called()
+
+
+# ─── the working copy (`ud-<vm_id>`, the key vali may open) ───────────
+
+
+def test_the_intake_copy_is_wrapped_under_a_key_vali_can_open() -> None:
+    """TWO per-VM Transit keys, deliberately. The canonical userdata the
+    ticket binds is wrapped under `kek-<vm_id>` — vali may encrypt with it
+    and never decrypt, so only the attested KBS opens it. vali's own
+    working copy is wrapped under `ud-<vm_id>`, which vali MAY open,
+    because the NetBird substitution and the §6 digest re-derivation still
+    need the cloud-init plaintext after intake. Wrapping the working copy
+    under the KEK key would strand both; leaving it in the clear is what
+    this change removes."""
+    plaintext = b"#cloud-config\nssh_authorized_keys: [ssh-ed25519 AAAA]\n"
+    with (
+        mock.patch.object(
+            launch.vault_kv, "transit_encrypt", return_value=b"vault:v1:CT"
+        ) as enc,
+        mock.patch.object(launch.vault_kv, "ensure_transit_key") as ensure,
+        mock.patch.object(launch.vault_kv, "put_kv") as put,
+    ):
+        launch.stage_userdata_intake_copy(
+            "secret", "p/vm-w/userdata-intake", "vm-w", plaintext
+        )
+
+    (_mount, _path, written), _kw = put.call_args
+    assert written == b"vault:v1:CT"
+    assert plaintext not in (written,), "the plaintext must never reach Vault"
+    enc.assert_called_once_with("ud-vm-w", plaintext)
+    ensure.assert_called_once_with("ud-vm-w")
+
+
+def test_the_intake_copy_round_trips_and_a_transit_failure_stages_nothing() -> None:
+    with (
+        mock.patch.object(
+            launch.vault_kv, "get_kv", return_value=b"vault:v1:CT"
+        ),
+        mock.patch.object(
+            launch.vault_kv, "transit_decrypt", return_value=b"#cloud-config\n"
+        ) as dec,
+    ):
+        got = launch.open_userdata_intake_copy("secret", "p/vm-w/userdata-intake", 3, "vm-w")
+    assert got == b"#cloud-config\n"
+    dec.assert_called_once_with("ud-vm-w", b"vault:v1:CT")
+
+    # Fail closed: if wrapping fails, nothing is staged. Writing the
+    # plaintext as a fallback would defeat the entire change.
+    from apps.orchestration.effects import EffectError
+
+    with (
+        mock.patch.object(
+            launch.vault_kv, "transit_encrypt", side_effect=EffectError("transit down")
+        ),
+        mock.patch.object(launch.vault_kv, "ensure_transit_key"),
+        mock.patch.object(launch.vault_kv, "put_kv") as put,
+    ):
+        with pytest.raises(EffectError):
+            launch.stage_userdata_intake_copy(
+                "secret", "p/vm-w/userdata-intake", "vm-w", b"secret"
+            )
+    put.assert_not_called()
+
+
+def test_a_legacy_plaintext_intake_copy_is_returned_verbatim() -> None:
+    """VMs staged before the wrapping hold plaintext there. They must keep
+    launching and recovering — so an unwrapped value passes through
+    instead of being handed to Transit (which would fail)."""
+    with (
+        mock.patch.object(
+            launch.vault_kv, "get_kv", return_value=b"#cloud-config\nlegacy"
+        ),
+        mock.patch.object(launch.vault_kv, "transit_decrypt") as dec,
+    ):
+        got = launch.open_userdata_intake_copy("secret", "p/vm-l/userdata-pending", 1, "vm-l")
+    assert got == b"#cloud-config\nlegacy"
+    dec.assert_not_called()
+
+
+def test_the_working_copy_stamps_the_canonical_version_it_belongs_to() -> None:
+    """The stamp is what makes the pairing provable. The canonical write
+    and this one are two independent KV puts, so a copy that merely EXISTS
+    proves nothing about which canonical version's bytes it holds — and
+    the §25 re-mint has to hash exactly the version its ticket binds."""
+    with (
+        mock.patch.object(
+            launch.vault_kv, "transit_encrypt", side_effect=lambda name, pt: b"CT:" + pt
+        ),
+        mock.patch.object(launch.vault_kv, "ensure_transit_key"),
+        mock.patch.object(launch.vault_kv, "put_kv") as put,
+    ):
+        launch.stage_userdata_working_copy(
+            "secret", "p/vm-w/userdata-pending", "vm-w", b"#cloud-config\nx",
+            canonical_version=7,
+        )
+    (_mount, _path, written), _kw = put.call_args
+    assert written == b"CT:" + launch._WORKING_STAMP + b"7\n#cloud-config\nx"
+
+
+@pytest.mark.parametrize(
+    ("stored", "match"),
+    [
+        (b"#cloud-config\ntemplate", "not Transit-wrapped"),
+        (b"vault:unstamped", "no canonical-version stamp"),
+        (b"vault:" + b"hippius-userdata-for-canonical-v6\nbytes", "stamped for canonical"),
+    ],
+)
+def test_the_working_copy_reader_refuses_anything_it_cannot_pair(stored, match) -> None:
+    """Each refusal is a case where minting anyway produces a ticket bound
+    to bytes the guest never receives: an intake template left at that
+    path by an older build, a copy written before the stamping, or one
+    from an earlier attempt whose canonical write is not the one this
+    ticket binds."""
+    with (
+        mock.patch.object(launch.vault_kv, "get_kv", return_value=stored),
+        mock.patch.object(
+            launch.vault_kv,
+            "transit_decrypt",
+            side_effect=lambda name, ct: ct.removeprefix(b"vault:"),
+        ),
+    ):
+        with pytest.raises(launch.UserdataPairingError, match=match):
+            launch.open_userdata_working_copy("secret", "p/vm-w/userdata-pending", "vm-w", 7)

@@ -53,7 +53,7 @@ const entries = Array.from({ length: NODES }, (_, i) => {
 
 const computeScoringQuery = {
   nodeIdToChild: { entries: async () => entries },
-  currentEpoch: async () => ({ toNumber: () => 2702 }),
+  currentEpoch: async () => ({ toNumber: () => 5002 }),
 };
 
 const api = {

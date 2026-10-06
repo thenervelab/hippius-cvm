@@ -29,6 +29,7 @@ from apps.scheduler import scoring, service
 from apps.scheduler.models import (
     ACTIVE_PLACEMENT_STATES,
     Placement,
+    PlacementFailureSource,
     PlacementStatus,
 )
 
@@ -117,6 +118,8 @@ def test_the_source_row_is_closed_not_re_pointed() -> None:
     assert launch_row.miner_node_id == SRC
     assert launch_row.status == PlacementStatus.MIGRATED.value
     assert launch_row.reason == "migrated:job-abc"
+    # provenance: a hand-over, never a refusal of the source node
+    assert launch_row.failure_source == PlacementFailureSource.MIGRATION
     assert launch_row.kbs_release_ref == "order-42"
 
 

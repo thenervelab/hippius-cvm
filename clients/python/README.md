@@ -231,19 +231,24 @@ cleared field would stay permanently blank, since the server stops re-resolving
 
 | value | meaning |
 | --- | --- |
-| `True` | proven — the KBS holds a signed release bundle |
-| `null` | **unknown** — no bundle came back |
+| `True` | proven — a fresh live attestation, or the KBS release bundle |
+| `null` | **unknown** — neither came back |
 
 It is **never `False` on absent evidence**. Absence is ambiguous: the KBS
-records bundles only when its evidence sink is enabled, and the archive does
-not survive a KBS restart, so "no bundle" covers both "never attested" and
-"attested but unrecorded".
+release archive does not survive a KBS restart, and a VM launched before live
+attestation existed has no live samples, so "nothing on record" covers both
+"never attested" and "attested but unrecorded".
 
 > **Breaking vs 0.4.0.** `if not resp["attested"]` now treats *unknown* as
 > *not attested* — the exact confusion this change removes. Branch on
-> `attestation_status` instead: `evidence-recorded` (proven) /
-> `no-evidence-recorded` (unknown) / `evidence-unavailable` (KBS fetch
-> failed, see `kbs_evidence_error`).
+> `attestation_state` instead: `attested-live` (a KBS-verified live
+> attestation of the current launch within `live_attestation.max_age_s`
+> — survives a KBS restart) / `attested-at-boot` (the release bundle in
+> `kbs_evidence`) / `stale` / `unavailable` (KBS fetch failed, see
+> `kbs_evidence_error`) / `unproven` (nothing on record — not a negative).
+> `attestation_status` keeps its three legacy values: `evidence-recorded`
+> (`attested-live` or `attested-at-boot`) / `no-evidence-recorded` /
+> `evidence-unavailable`.
 
 ## Migrating a VM between miners (§25)
 

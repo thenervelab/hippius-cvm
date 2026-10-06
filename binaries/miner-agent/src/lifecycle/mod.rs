@@ -30,9 +30,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub mod adopt;
+pub mod cid_verify;
 pub mod cvm_handle;
 pub mod data_disk;
+pub(crate) mod disk_space;
 pub mod golden;
+pub mod guardian;
 pub mod infra;
 pub mod launch_digest;
 pub mod libvirt_driver;
@@ -54,8 +57,9 @@ pub use qemu_config::{load_cmdline, QemuConfig};
 
 use crate::error::{MinerAgentError, Result};
 use crate::orders::LaunchOrder;
-use crate::vsock::peer::CidAllocator;
+use crate::vsock::peer::{CidAllocator, CidOwner};
 use cvm_handle::LAUNCH_DIGEST_LEN;
+use tokio_util::sync::CancellationToken;
 
 /// Default gap between domain-state polls.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -105,6 +109,19 @@ pub enum CvmPhase {
     Failed,
 }
 
+/// Whether a ticket push may proceed — see
+/// [`CvmLifecycle::ticket_push_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketPushState {
+    /// The VM is running and owns the CID: deliver.
+    Deliver,
+    /// The VM is still launching on this CID: not yet, but not never.
+    Wait,
+    /// The VM is gone, being torn down, or no longer owns this CID or
+    /// ticket: stop for good.
+    Abort,
+}
+
 /// The outcome of a read-only tenant-domain liveness probe
 /// ([`CvmLifecycle::tenant_domain_liveness`]) — used by the
 /// reboot-recovery reconcile loop to ask "is this VM's domain
@@ -132,13 +149,23 @@ pub struct HostResources {
     /// Total MiB of RAM the host will allot to tenant CVMs.
     pub total_memory_mb: u64,
     /// Total GiB of tenant **data-disk** the host will allot. The
-    /// operator's DECLARED capacity (`[host] cvm_disk_gb_budget`) — vali's
-    /// scheduler reads the same number for proactive placement, and the
+    /// operator's DECLARED capacity (`[host] cvm_disk_gb_budget`). The
     /// miner reserves against it here so concurrent launches can't
-    /// over-commit (the per-create `statvfs` in `data_disk` sees only
-    /// CURRENT free space, which sparse disks under-report until the guest
-    /// wipes them). 0 disables the disk reservation (cpu/mem still apply).
+    /// over-commit, and declares it in the `v4` heartbeat, where vali uses
+    /// it only as a down-only clamp on its own committed-disk ledger. 0
+    /// disables the budget reservation (cpu/mem still apply, and the
+    /// measured free-space gate of `disk_space` always does).
     pub total_disk_gb: u64,
+}
+
+/// What one process saw of delivering a running VM's ticket (see
+/// [`CvmLifecycle::ticket_delivered`]).
+#[derive(Debug, Clone, Default)]
+struct TicketDelivery {
+    cid: u32,
+    cose_ticket: Vec<u8>,
+    delivered: bool,
+    launch_push_failed: bool,
 }
 
 /// The tenant-CVM lifecycle state machine.
@@ -154,7 +181,7 @@ pub struct CvmLifecycle {
     cids: Arc<CidAllocator>,
     poll_interval: Duration,
     poll_attempts: u32,
-    /// Phase 2B of audit follow-up Codex #2 — root directory under
+    /// Phase 2B of audit follow-up Review #2 — root directory under
     /// which [`state_disk::ensure_state_disk`] creates per-VM 1 MiB
     /// ext4 files (`{root}/state/{vm_id}.raw`).
     ///
@@ -193,6 +220,97 @@ pub struct CvmLifecycle {
     /// [`crate::vsock::vm_progress`]). Mirrors the `kek-released` emit
     /// the kbs-proxy fires on a successful KBS release.
     progress: Option<Arc<dyn crate::vsock::VmProgressSink>>,
+    /// The reboot-watcher's in-flight ticket re-push task per VM (see
+    /// [`Self::begin_ticket_push`]). Cancelled when the VM leaves
+    /// `Running` for teardown and BEFORE its CID is released, so no
+    /// re-push can outlive the VM and reach the CID's next owner.
+    ticket_pushes: Mutex<HashMap<VmId, CancellationToken>>,
+    /// What this process has observed about delivering each running VM's
+    /// ticket. Cleared when the VM's CID is released.
+    ticket_delivery: Mutex<HashMap<VmId, TicketDelivery>>,
+    /// Re-adopted VMs whose CID came from the sidecar because the live
+    /// domain XML could not be read — held UNVERIFIED in the allocator
+    /// until [`Self::verify_pending_cids`] confirms, re-keys or drops them.
+    cid_checks: Mutex<HashMap<VmId, CidCheck>>,
+    /// Snapshot vm_ids whose re-adoption failed `reserve-collision` — retried
+    /// after a verification frees or moves a claim (see
+    /// [`Self::retry_collided_readoptions`]).
+    readopt_collided: Mutex<std::collections::HashSet<String>>,
+    /// Set when a CID is released while collided survivors wait — the
+    /// release may have freed exactly the CID that blocked them.
+    readopt_retry_due: std::sync::atomic::AtomicBool,
+    /// The host's SEV-ES ASID pool reader, for the tenant preflight
+    /// ASID gate ([`Self::check_asid_budget`]). Production: the root
+    /// cgroup's `misc.*` files; tests inject a fixed reading via
+    /// [`Self::with_asid_source`].
+    asids: Arc<dyn crate::sev_asid::AsidSource>,
+    /// ASIDs promised by a passed tenant preflight whose launch has not
+    /// finished yet (`vm_id → when`). `misc.current` only counts a guest
+    /// once QEMU holds its ASID, so without these N concurrent preflights
+    /// at the edge of the pool would all pass. Expire after
+    /// [`ASID_RESERVATION_TTL`]; released when the launch ends.
+    asid_reservations: Mutex<HashMap<VmId, std::time::Instant>>,
+}
+
+/// How long a preflight's ASID reservation holds without a launch.
+pub const ASID_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// First retry delay for an unverified re-adoption CID; doubles per
+/// failure up to [`CID_VERIFY_MAX_BACKOFF`].
+pub const CID_VERIFY_BASE_BACKOFF: Duration = Duration::from_secs(5);
+/// Ceiling on the retry delay. Well under the reboot-watcher's 10-min
+/// re-push window, so a VM that reboots while unverified still gets its
+/// CID confirmed — and its ticket — inside that window.
+pub const CID_VERIFY_MAX_BACKOFF: Duration = Duration::from_secs(120);
+/// Bound on one verification attempt (a few `virsh` calls).
+const CID_VERIFY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Retry state for one unverified re-adoption CID.
+#[derive(Debug, Clone)]
+struct CidCheck {
+    /// Unique per scheduled check. A verification attempt awaits libvirt
+    /// with no lock held; before it acts it must find THIS generation still
+    /// queued — a stop (which drops the check) and a relaunch of the same
+    /// `vm_id` in between must not be mutated by the stale result.
+    generation: u64,
+    failures: u32,
+    next_at: std::time::Instant,
+    /// The last failure class logged — a repeat is not re-logged.
+    last_class: &'static str,
+}
+
+/// Source of [`CidCheck::generation`].
+static CID_CHECK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl CidCheck {
+    fn backoff(failures: u32) -> Duration {
+        let factor = 1u32 << failures.saturating_sub(1).min(16);
+        CID_VERIFY_BASE_BACKOFF
+            .saturating_mul(factor)
+            .min(CID_VERIFY_MAX_BACKOFF)
+    }
+}
+
+/// What a verification attempt captured before awaiting libvirt — it may
+/// act only if all of it still holds.
+struct CheckIdentity<'a> {
+    generation: u64,
+    uuid: &'a DomainUuid,
+    held: u32,
+}
+
+/// What one verification attempt concluded — see
+/// [`CvmLifecycle::verify_pending_cids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CidVerdict {
+    /// The live XML shows the recorded CID.
+    Verified,
+    /// The live XML shows a different CID; the handle + allocator moved to it.
+    Rekeyed,
+    /// The domain no longer exists; the handle was dropped.
+    Dropped,
+    /// Still unconfirmed (reason logged on change); retried after backoff.
+    Pending,
 }
 
 impl CvmLifecycle {
@@ -233,7 +351,21 @@ impl CvmLifecycle {
             skip_state_disk_provision: false,
             data_disk_root: std::path::PathBuf::from(qemu_config::MINER_ROOT),
             progress: None,
+            ticket_pushes: Mutex::new(HashMap::new()),
+            ticket_delivery: Mutex::new(HashMap::new()),
+            cid_checks: Mutex::new(HashMap::new()),
+            readopt_collided: Mutex::new(std::collections::HashSet::new()),
+            readopt_retry_due: std::sync::atomic::AtomicBool::new(false),
+            asids: Arc::new(crate::sev_asid::SysfsAsidSource::default()),
+            asid_reservations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replace the SEV-ES ASID pool reader (default: the root cgroup's
+    /// `misc.capacity` / `misc.current`). Tests inject a fixed reading.
+    pub fn with_asid_source(mut self, asids: Arc<dyn crate::sev_asid::AsidSource>) -> Self {
+        self.asids = asids;
+        self
     }
 
     /// Test escape hatch: skip the actual `mkfs.ext4` invocation in
@@ -316,6 +448,30 @@ impl CvmLifecycle {
         state_disk::state_disk_path(&self.state_disk_root, vm_id)
     }
 
+    /// `[storage] data_disk_root` — where the per-VM writable disks live.
+    pub fn data_disk_root(&self) -> &std::path::Path {
+        &self.data_disk_root
+    }
+
+    /// The host disk ledger ([`crate::backup::capture::SpaceLedger::host`])
+    /// over this host's per-VM disks — what an in-flight writer (a §25
+    /// download) reserves in.
+    pub fn disk_space_ledger(&self) -> crate::backup::capture::SpaceLedger {
+        crate::backup::capture::SpaceLedger::host(self.data_disk_root.clone())
+    }
+
+    /// Root of the per-VM backup work dirs (`<data_disk_root>/backup`).
+    /// On the overlay's filesystem, so a restored overlay is renamed into
+    /// place atomically and the space guard sees the right mount.
+    pub fn backup_root(&self) -> std::path::PathBuf {
+        self.data_disk_root.join("backup")
+    }
+
+    /// This VM's backup work dir (`<data_disk_root>/backup/<vm_id>`).
+    pub fn backup_dir(&self, vm_id: &VmId) -> std::path::PathBuf {
+        self.backup_root().join(vm_id.as_str())
+    }
+
     /// Per-VM staging dir (`<root>/staging/<vm_id>`) — the ONLY place this
     /// agent ever writes a boot artifact for `vm_id`.
     ///
@@ -370,11 +526,22 @@ impl CvmLifecycle {
     /// tenant.
     pub async fn launch(&self, order: LaunchOrder) -> Result<VmId> {
         let vm_id = order.vm_id.clone();
+        // Whatever the outcome, the preflight's ASID promise ends here: a
+        // started guest now holds a real ASID (`misc.current` counts it),
+        // a failed one holds none.
+        let result = self.launch_inner(order).await;
+        self.release_asid_reservation(&vm_id);
+        result
+    }
+
+    async fn launch_inner(&self, order: LaunchOrder) -> Result<VmId> {
+        let vm_id = order.vm_id.clone();
         let domain_uuid = DomainUuid::generate()?;
         // Capture the COSE ticket bytes BEFORE moving the order into the
         // QemuConfig — cached in the handle so the reboot-watcher can
         // re-push it on every libvirt domain restart.
         let cose_ticket: Vec<u8> = order.cose_ticket.clone().into_vec();
+        let require_existing_disks = order.require_existing_disks;
         // #312 — refuse the launch if the L1-minted ticket's `flavor`
         // disagrees with the dispatcher's `cpu_count`. The §22
         // allowlist would catch this at KBS release time anyway (vcpus
@@ -383,7 +550,13 @@ impl CvmLifecycle {
         // decode of the COSE payload only — no L1 signature check, by
         // design (see `lifecycle::ticket_peek` doc-block).
         ticket_peek::enforce_flavor_matches_cpu_count(&cose_ticket, order.cpu_count)?;
-        // Phase 2B of audit follow-up Codex #2 — compute the per-VM
+        // Customer-held keys: the order's guardian endpoint must be the
+        // one the MEASURED cmdline pins (and present iff the cmdline asks
+        // for a guardian). Checked before anything is reserved. `None` ⇒
+        // an M0 launch, byte-for-byte today's path.
+        let guardian_ep =
+            guardian::check_order_guardian(&order.cmdline, order.guardian_ep.as_deref())?;
+        // Phase 2B of audit follow-up Review #2 — compute the per-VM
         // state-disk path BEFORE constructing the QemuConfig. The path
         // is rooted under `self.state_disk_root` (defaults to
         // `MINER_ROOT`; tests override via [`Self::with_state_disk_root`]).
@@ -468,6 +641,32 @@ impl CvmLifecycle {
         config.validate()?;
         let domain_id = config.domain_name()?;
 
+        // Customer-keys VM: capture the recipe the digest is computed over
+        // (CID-independent) BEFORE anything is reserved, so a failure here
+        // has nothing to roll back. It goes into the handle at insertion:
+        // the guardian relay only answers a CID whose handle carries a
+        // route, and it is there before the guest can first dial.
+        // Fail-closed like the digest — a VM whose guardian can never
+        // verify it is not started.
+        let guardian_route = match guardian_ep {
+            Some(ep) => Some(guardian::GuardianRoute {
+                endpoint: ep.to_wire(),
+                recipe: self
+                    .digest
+                    .recipe(&guardian::RecipeInputs::from_config(&config))?,
+            }),
+            None => None,
+        };
+
+        // A RELAUNCH must find the VM's disks already here — every
+        // `ensure_*` below would otherwise CREATE blank ones (seen in
+        // production 2026-09-25: a relaunch onto a host that never held the
+        // VM got a blank overlay + a blank boot-counter disk). Checked
+        // before anything is reserved, so a refusal leaves nothing behind.
+        if require_existing_disks {
+            check_relaunch_disks(&config)?;
+        }
+
         // ── Idempotent admission: reclaim a STALE handle ─────────────
         // A `handles` entry can linger for a `vm_id` whose domain is no
         // longer running — an out-of-band `virsh destroy`, a crash the
@@ -515,6 +714,10 @@ impl CvmLifecycle {
                 disk_budget_gb,
             )?;
             config.cid = self.cids.allocate(&vm_id)?;
+            // A fresh launch supersedes any unverified re-adoption of this
+            // vm_id (reclaimed as stale above): its CID is proven by the
+            // `create_domain` below, not by a live-XML check.
+            self.forget_cid_check(&vm_id);
             handles.insert(
                 vm_id.clone(),
                 CvmHandle {
@@ -532,6 +735,7 @@ impl CvmLifecycle {
                     luks_disk_path: config.luks_disk_path.clone(),
                     cid: config.cid,
                     cose_ticket,
+                    guardian: guardian_route,
                 },
             );
         }
@@ -543,7 +747,7 @@ impl CvmLifecycle {
             Ok(digest) => digest,
             Err(err) => {
                 self.unreserve_handle(&vm_id);
-                let _ = self.cids.release(&vm_id);
+                self.release_cid(&vm_id);
                 return Err(err);
             }
         };
@@ -555,7 +759,7 @@ impl CvmLifecycle {
             hex::encode(digest)
         );
 
-        // Phase 2B of audit follow-up Codex #2 — provision the per-VM
+        // Phase 2B of audit follow-up Review #2 — provision the per-VM
         // 1 MiB ext4 state disk that backs the anti-rollback boot
         // counter. Idempotent: a second launch for the same `vm_id`
         // (after a stop) re-uses the existing file so the counter
@@ -570,7 +774,7 @@ impl CvmLifecycle {
         if !self.skip_state_disk_provision {
             if let Err(err) = state_disk::ensure_state_disk(&self.state_disk_root, &vm_id) {
                 self.unreserve_handle(&vm_id);
-                let _ = self.cids.release(&vm_id);
+                self.release_cid(&vm_id);
                 return Err(err);
             }
             if is_golden {
@@ -582,11 +786,18 @@ impl CvmLifecycle {
                 // the per-VM KBS KEK — exactly the `/dev/vde` discipline.
                 // Idempotent (preserves a relaunched VM's overlay writes),
                 // fail-closed BEFORE any `virsh` call.
-                if let Err(err) =
-                    golden::ensure_overlay_disk(&self.data_disk_root, &vm_id, disk_budget_gb)
-                {
+                //
+                // Off the async worker: the create waits on the host disk
+                // lock and lists the disk directories.
+                let (root, id) = (self.data_disk_root.clone(), vm_id.clone());
+                let created = tokio::task::spawn_blocking(move || {
+                    golden::ensure_overlay_disk(&root, &id, disk_budget_gb)
+                })
+                .await
+                .unwrap_or(Err(MinerAgentError::OverlayDisk("join")));
+                if let Err(err) = created {
                     self.unreserve_handle(&vm_id);
-                    let _ = self.cids.release(&vm_id);
+                    self.release_cid(&vm_id);
                     return Err(err);
                 }
             } else if config.data_disk_size_gb > 0 {
@@ -594,13 +805,19 @@ impl CvmLifecycle {
                 // guest formats fresh at first boot (`/dev/vde`). Idempotent
                 // (preserves a relaunched VM's data), fail-closed BEFORE any
                 // `virsh` call. Only when the order requested one.
-                if let Err(err) = data_disk::ensure_data_disk(
-                    &self.data_disk_root,
-                    &vm_id,
+                let (root, id, gb) = (
+                    self.data_disk_root.clone(),
+                    vm_id.clone(),
                     config.data_disk_size_gb,
-                ) {
+                );
+                let created = tokio::task::spawn_blocking(move || {
+                    data_disk::ensure_data_disk(&root, &id, gb)
+                })
+                .await
+                .unwrap_or(Err(MinerAgentError::DataDisk("join")));
+                if let Err(err) = created {
                     self.unreserve_handle(&vm_id);
-                    let _ = self.cids.release(&vm_id);
+                    self.release_cid(&vm_id);
                     return Err(err);
                 }
             }
@@ -701,6 +918,14 @@ impl CvmLifecycle {
                 Err(_) => false,
             },
         }
+    }
+
+    /// Whether libvirt has a domain (running or not) for tenant `vm_id`.
+    /// `None` when libvirt cannot be reached.
+    pub async fn tenant_domain_defined(&self, vm_id: &VmId) -> Option<bool> {
+        let domain_id = DomainId::new(&format!("hippius-tenant-{}", vm_id.as_str())).ok()?;
+        let list = self.driver.list_domains().await.ok()?;
+        Some(list.iter().any(|(id, _)| id == &domain_id))
     }
 
     /// Ask libvirt whether the tenant domain for `vm_id` is actually
@@ -857,7 +1082,7 @@ impl CvmLifecycle {
             Err(_) => true,
         };
         if down && !retried {
-            let _ = self.cids.release(vm_id);
+            self.release_cid(vm_id);
         }
     }
 
@@ -878,7 +1103,14 @@ impl CvmLifecycle {
             let xml = config.to_libvirt_xml();
             self.driver.define_domain(&xml).await?;
             match self.driver.create_domain(domain_id).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    // The kernel just bound `config.cid` to THIS guest — the
+                    // strongest proof there is. Clears an unverified mark the
+                    // idempotent `allocate` may have handed back from a
+                    // reclaimed re-adoption of the same vm_id.
+                    let _ = self.cids.mark_verified(&config.vm_id, config.cid);
+                    break;
+                }
                 Err(MinerAgentError::VsockCid("cid-in-use"))
                     if attempt < MAX_CID_COLLISION_RETRIES =>
                 {
@@ -950,6 +1182,9 @@ impl CvmLifecycle {
             handle.phase = CvmPhase::Stopping;
             handle.domain_id.clone()
         };
+        // The VM is being torn down: nothing may deliver its ticket from
+        // here on (the guest is going away, and its CID with it).
+        self.cancel_ticket_push(vm_id);
 
         let outcome = self.run_stop(&domain_id, graceful).await;
         if outcome.is_ok() {
@@ -977,10 +1212,34 @@ impl CvmLifecycle {
             }
             // The CVM is gone — free its AF_VSOCK CID for reuse + drop
             // the re-adoption snapshot so a restart never re-adopts it.
-            let _ = self.cids.release(vm_id);
+            self.release_cid(vm_id);
             adopt::forget(&self.state_disk_root, vm_id.as_str());
         }
         outcome
+    }
+
+    /// Force a tenant domain down whether or not this process tracks it
+    /// (a restore abort must not leave a restored guest running because
+    /// the agent restarted under it), then prove it is down. Only the
+    /// runtime goes: disks are untouched and the libvirt record is
+    /// undefined only on the tracked path, as [`Self::stop`] does.
+    pub async fn force_stop_tenant(&self, vm_id: &VmId) -> Result<()> {
+        match self.stop(vm_id, false).await {
+            Ok(()) => {}
+            Err(MinerAgentError::VmNotFound) => {
+                self.cancel_ticket_push(vm_id);
+                let domain_id = DomainId::new(&format!("hippius-tenant-{}", vm_id.as_str()))?;
+                // Errors are settled by the liveness proof below.
+                let _ = self.driver.destroy_domain(&domain_id, false).await;
+            }
+            Err(err) => return Err(err),
+        }
+        match self.tenant_domain_liveness(vm_id).await {
+            DomainLiveness::Down => Ok(()),
+            DomainLiveness::Live | DomainLiveness::Unknown => {
+                Err(MinerAgentError::Backup("restore-stop-failed"))
+            }
+        }
     }
 
     /// Destroy a CVM — force-stop it, then unlink its LUKS data disk.
@@ -992,7 +1251,18 @@ impl CvmLifecycle {
     /// readable. Idempotent: a `destroy` of a CVM the lifecycle is not
     /// tracking is a success no-op (§24 — "already destroyed for this
     /// exact `vm_id` ⇒ success, not error").
-    pub async fn destroy(&self, vm_id: &VmId) -> Result<()> {
+    ///
+    /// `restore`, when the host has staged restores enabled, is asked to
+    /// cancel and await any in-flight staging of `vm_id` before its
+    /// backup dir is reclaimed below — an in-progress `restore/<rid>/`
+    /// staging is otherwise wiped out from under a still-running
+    /// `RestoreManager::run_stage`, which then recreates
+    /// `backup/<vm>/restore/status.json` for a VM that no longer exists.
+    pub async fn destroy(
+        &self,
+        vm_id: &VmId,
+        restore: Option<&crate::backup::staged::RestoreManager>,
+    ) -> Result<()> {
         // The handle carries the LEGACY disk path when we still track the
         // VM. It is OPTIONAL: §24 always sends a graceful `stop` ORDER
         // before the `destroy` order, and that stop drops the handle — so
@@ -1036,6 +1306,13 @@ impl CvmLifecycle {
             data_disk::data_disk_path(&self.data_disk_root, vm_id),
             state_disk::state_disk_path(&self.state_disk_root, vm_id),
         ];
+        // A staged restore's retained originals (`*.pre-restore-<id>`),
+        // by the exact paths its persisted record names — never a glob.
+        files.extend(crate::backup::staged::retained_files(
+            &self.backup_dir(vm_id),
+            &self.golden_overlay_path(vm_id),
+            &self.state_disk_path(vm_id),
+        ));
         if let Some(d) = &handle_disk {
             // The legacy boot disk, plus ITS §25 restore marker — only
             // derivable when we still hold the handle that names it.
@@ -1047,20 +1324,33 @@ impl CvmLifecycle {
         // from a lifecycle record or an order field — so a VM staged by
         // ANY older agent is still reclaimable by this one.
         let staging = self.vm_staging_dir(vm_id);
+        // The live-backup work dir (`<data root>/backup/<vm_id>`): the run's
+        // in-flight marker, an interrupted run's leftovers, a chain
+        // restore's pieces. Per-VM like staging, and derived from `vm_id`
+        // alone the same way.
+        let backup = self.backup_dir(vm_id);
 
         // `symlink_metadata`, not `exists()`: a per-VM staging entry that
         // is a DANGLING symlink is still a footprint this destroy owns and
         // must unlink (`exists()` traverses, so it reads `false` and the
         // no-op bail below would strand it). #880's rule — stat before you
         // trust — applied to the entry itself rather than its target.
-        let mut anything = staging.symlink_metadata().is_ok();
+        let mut anything = staging.symlink_metadata().is_ok() || backup.symlink_metadata().is_ok();
         for f in &files {
             if !f.as_os_str().is_empty() && f.exists() {
                 anything = true;
             }
         }
-        if handle_disk.is_none() && !anything {
-            // Never hosted here (or already reclaimed) — idempotent success.
+        if handle_disk.is_none()
+            && !anything
+            && self.tenant_domain_defined(vm_id).await != Some(true)
+        {
+            // Never hosted here (or already reclaimed and undefined) —
+            // idempotent success. A defined-but-down domain with no files
+            // left (a shut-off VM whose disks an earlier destroy already
+            // reclaimed) is NOT this case: it falls through so the record
+            // is undefined below. A libvirt error (`None`) keeps the
+            // misrouted-destroy no-op: "cannot tell" must not fail §24.
             return Ok(());
         }
 
@@ -1128,6 +1418,21 @@ impl CvmLifecycle {
         // unlinks symlinks AS LINKS and refuses to recurse through a
         // per-VM directory that is itself a symlink.
         adopt::forget(&self.state_disk_root, vm_id.as_str());
+        // Drop the libvirt record too, now that the domain is proven down
+        // and its disks are gone. A shut-off definition otherwise stays
+        // forever (only a clean `stop` undefined it), and breaks the next
+        // launch of the same vm_id with `domain already exists`. An
+        // undefine failure is logged, not returned: data death already
+        // happened, and failing here would pin the VM in Decommissioning.
+        if let Ok(domain_id) = DomainId::new(&format!("hippius-tenant-{}", vm_id.as_str())) {
+            if self.driver.undefine_domain(&domain_id).await.is_err() {
+                eprintln!(
+                    "hippius-miner-agent: destroy: vm {} domain stayed defined after \
+                     reclaim — libvirt record may need a manual `virsh undefine`",
+                    vm_id.as_str()
+                );
+            }
+        }
         if !staging.as_os_str().is_empty() {
             if let Err(e) = preflight::reclaim_staging_dir(&staging) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -1137,6 +1442,38 @@ impl CvmLifecycle {
                         vm_id.as_str()
                     );
                 }
+            }
+        }
+        // A staged restore of this VM may still be downloading into
+        // `backup/<vm>/restore/<rid>/` right now — the domain going down
+        // does not stop it, and it does not hold the restore lock while it
+        // runs. Cancel it and wait for it to actually stop writing BEFORE
+        // the reclaim below, or a still-running `RestoreManager::run_stage`
+        // recreates `restore/status.json` for a VM that no longer exists
+        // once it finally does finish, and that file leaks forever (no
+        // other cleanup path ever revisits a destroyed VM). Mirrors
+        // `RestoreManager::abort`'s own cancellation step: done OUTSIDE
+        // the (host-wide) restore lock, so this never blocks an unrelated
+        // VM's `migrate-activate` waiting to enter `Activating`. A timeout
+        // here fails the destroy rather than risk the race.
+        if let Some(restore) = restore {
+            restore.cancel_staging(vm_id).await?;
+        }
+        // The backup work dir, by its exact per-VM path — never the backup
+        // root. Safe after the liveness proof above: its in-flight marker
+        // only records QEMU-side resources (job, fd-passed target, point
+        // bitmap), and those died with the domain, so there is nothing
+        // left for a later release to do. A run that was mid-upload keeps
+        // reading its already-unlinked target through its open fd; its
+        // VM is gone either way. Best-effort, like staging: disk space,
+        // not data death.
+        if let Err(e) = preflight::reclaim_staging_dir(&backup) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "hippius-miner-agent: destroy: backup work dir reclaim failed for \
+                     vm={} (disk space only)",
+                    vm_id.as_str()
+                );
             }
         }
         Ok(())
@@ -1251,90 +1588,208 @@ impl CvmLifecycle {
         let snapshots = adopt::list(&self.state_disk_root);
         let mut adopted = 0usize;
         for snapshot in snapshots {
-            let vm_id_str = snapshot.vm_id.clone();
-            let mut handle = match snapshot.into_handle() {
-                Ok(h) => h,
-                Err(err) => {
-                    // Undecodable: there is no ticket to preserve and no
-                    // resources to charge, so the file is pure noise. The
-                    // orphan sweep still accounts for the domain if it is live.
-                    eprintln!(
-                        "hippius-miner-agent: re-adopt: pruning corrupt snapshot vm={vm_id_str}: {err}"
-                    );
-                    adopt::forget(&self.state_disk_root, &vm_id_str);
-                    continue;
-                }
-            };
-            // Is the domain the snapshot names still live? THREE-valued:
-            // `Unknown` (libvirt unreachable) must NOT delete the sidecar —
-            // it holds the only copy of the vali-signed ticket.
-            match self.domain_liveness(&handle.domain_id).await {
-                DomainLiveness::Live => {}
-                DomainLiveness::Down => {
-                    eprintln!(
-                        "hippius-miner-agent: re-adopt: pruning stale snapshot vm={vm_id_str} \
-                         (domain definitively down)"
-                    );
-                    adopt::forget(&self.state_disk_root, &vm_id_str);
-                    continue;
-                }
-                DomainLiveness::Unknown => {
-                    eprintln!(
-                        "hippius-miner-agent: re-adopt: vm={vm_id_str} libvirt UNREACHABLE — \
-                         snapshot RETAINED, VM not tracked this lifetime (restart the agent \
-                         once libvirtd is up to re-adopt it)"
-                    );
-                    continue;
-                }
+            if self.readopt_one(snapshot).await? {
+                adopted += 1;
             }
-            // Reconcile the sidecar against what libvirt actually runs.
-            // The file is miner-local state and can be stale or edited;
-            // the domain XML is the ground truth for the numbers.
-            self.reconcile_handle_with_libvirt(&mut handle).await;
-
-            let cid = handle.cid;
-            let is_infra = handle.is_infra();
-            // Reserve the exact CID the running guest already uses so the
-            // vsock relay routes correctly after a `skip_shutdown_teardown`
-            // restart. This covers BOTH tenant CVMs and — since PR-10b (S1)
-            // — the Infra host-attestor, which now carries a real vsock CID.
-            // A CID below `MIN_GUEST_CID` is a placeholder / ABI-reserved
-            // value (e.g. a legacy pre-S1 Infra snapshot persisted `cid=0`);
-            // it names no real vsock device, so we track it WITHOUT touching
-            // the allocator (reserving 0/1/2 would fail `reserve-out-of-range`).
-            {
-                let mut handles = self.lock_handles()?;
-                if handles.contains_key(&handle.vm_id) {
-                    // Already tracked (a second call, or a race) — nothing to do.
-                    // Re-inserting would double-count nothing (the map is keyed
-                    // by vm_id) but would clobber a live handle with a snapshot.
-                    continue;
-                }
-                if cid >= crate::vsock::peer::MIN_GUEST_CID {
-                    if let Err(err) = self.cids.reserve(&handle.vm_id, cid) {
-                        eprintln!(
-                            "hippius-miner-agent: re-adopt: CID {cid} for vm={vm_id_str} \
-                             unavailable ({err}) — NOT tracked"
-                        );
-                        continue;
-                    }
-                }
-                handles.insert(handle.vm_id.clone(), handle);
-            }
-            if is_infra {
-                eprintln!(
-                    "hippius-miner-agent: re-adopt: infra vm={vm_id_str} — tracked \
-                     (host-attestor supervised)"
-                );
-            } else {
-                eprintln!(
-                    "hippius-miner-agent: re-adopt: vm={vm_id_str} cid={cid} — tracked \
-                     (capacity + vsock relay + reboot-watcher restored)"
-                );
-            }
-            adopted += 1;
         }
         Ok(adopted)
+    }
+
+    /// Re-adopt ONE persisted snapshot; `Ok(true)` iff it is now tracked.
+    async fn readopt_one(&self, snapshot: adopt::PersistedHandle) -> Result<bool> {
+        let vm_id_str = snapshot.vm_id.clone();
+        let mut handle = match snapshot.into_handle() {
+            Ok(h) => h,
+            Err(err) => {
+                // Undecodable: there is no ticket to preserve and no
+                // resources to charge, so the file is pure noise. The
+                // orphan sweep still accounts for the domain if it is live.
+                eprintln!(
+                    "hippius-miner-agent: re-adopt: pruning corrupt snapshot vm={vm_id_str}: {err}"
+                );
+                adopt::forget(&self.state_disk_root, &vm_id_str);
+                return Ok(false);
+            }
+        };
+        // Is the domain the snapshot names still live? THREE-valued:
+        // `Unknown` (libvirt unreachable) must NOT delete the sidecar —
+        // it holds the only copy of the vali-signed ticket.
+        match self.domain_liveness(&handle.domain_id).await {
+            DomainLiveness::Live => {}
+            DomainLiveness::Down => {
+                eprintln!(
+                    "hippius-miner-agent: re-adopt: pruning stale snapshot vm={vm_id_str} \
+                     (domain definitively down)"
+                );
+                adopt::forget(&self.state_disk_root, &vm_id_str);
+                // A host reboot leaves the persistent definition behind,
+                // shut off. The next launch of this vm_id defines a fresh
+                // UUID under the same name, and libvirt refuses it
+                // (`domain … already exists with uuid …`) until a failed
+                // launch's teardown happens to undefine it — live: one
+                // wasted reboot-recovery attempt per VM, and a failed
+                // host-attestor start, after every miner reboot. The
+                // domain is confirmed down, so drop the record now.
+                //
+                // Only the record: the undefine flags remove libvirt's own
+                // per-domain metadata (managed-save, snapshot/checkpoint
+                // metadata, a libvirt-managed NVRAM file — none of which a
+                // `type='rom'` tenant or attestor domain has), never
+                // storage; the overlay, state disk and staging are
+                // untouched. And only a definition that is STILL shut off
+                // when we get to it: re-read the state right before, so a
+                // domain something started since the liveness read is
+                // left alone (`virsh undefine` of a running domain would
+                // turn it transient). Crashed / unreadable is left too.
+                match self.driver.query_domain_state(&handle.domain_id).await {
+                    Ok(DomainState::ShutOff) => {
+                        if let Err(err) = self.driver.undefine_domain(&handle.domain_id).await {
+                            eprintln!(
+                                "hippius-miner-agent: re-adopt: vm={vm_id_str} stale definition \
+                                 not undefined ({err}) — the next launch may need a retry"
+                            );
+                        }
+                    }
+                    Ok(state) => eprintln!(
+                        "hippius-miner-agent: re-adopt: vm={vm_id_str} definition left in \
+                         place (state {state:?} at undefine time)"
+                    ),
+                    Err(_) => {} // not defined any more — nothing to drop
+                }
+                return Ok(false);
+            }
+            DomainLiveness::Unknown => {
+                eprintln!(
+                    "hippius-miner-agent: re-adopt: vm={vm_id_str} libvirt UNREACHABLE — \
+                     snapshot RETAINED, VM not tracked this lifetime (restart the agent \
+                     once libvirtd is up to re-adopt it)"
+                );
+                return Ok(false);
+            }
+        }
+        // Reconcile the sidecar against what libvirt actually runs.
+        // The file is miner-local state and can be stale or edited;
+        // the domain XML is the ground truth for the numbers.
+        let cid_verified = self.reconcile_handle_with_libvirt(&mut handle).await;
+
+        let cid = handle.cid;
+        let is_infra = handle.is_infra();
+        // Reserve the exact CID the running guest already uses so the
+        // vsock relay routes correctly after a `skip_shutdown_teardown`
+        // restart. This covers BOTH tenant CVMs and — since PR-10b (S1)
+        // — the Infra host-attestor, which now carries a real vsock CID.
+        // A CID below `MIN_GUEST_CID` is a placeholder / ABI-reserved
+        // value (e.g. a legacy pre-S1 Infra snapshot persisted `cid=0`);
+        // it names no real vsock device, so we track it WITHOUT touching
+        // the allocator (reserving 0/1/2 would fail `reserve-out-of-range`).
+        {
+            let mut handles = self.lock_handles()?;
+            if handles.contains_key(&handle.vm_id) {
+                // Already tracked (a second call, or a race) — nothing to do.
+                // Re-inserting would double-count nothing (the map is keyed
+                // by vm_id) but would clobber a live handle with a snapshot.
+                return Ok(false);
+            }
+            if cid >= crate::vsock::peer::MIN_GUEST_CID {
+                // An unconfirmed CID is HELD (nobody else may take it)
+                // but is not an identity until the live XML confirms it:
+                // ticket pushes and relay routing wait on it.
+                let reserved = if cid_verified {
+                    self.cids.reserve(&handle.vm_id, cid)
+                } else {
+                    self.cids.reserve_unverified(&handle.vm_id, cid)
+                };
+                if let Err(err) = reserved {
+                    eprintln!(
+                        "hippius-miner-agent: re-adopt: CID {cid} for vm={vm_id_str} \
+                         unavailable ({err}) — NOT tracked"
+                    );
+                    if matches!(err, MinerAgentError::VsockCid("reserve-collision")) {
+                        // Another VM's record holds this CID — possibly a
+                        // stale UNVERIFIED claim that verification will later
+                        // re-key or drop. Retry this survivor then (#1149).
+                        if let Ok(mut collided) = self.readopt_collided.lock() {
+                            collided.insert(vm_id_str.clone());
+                        }
+                    }
+                    return Ok(false);
+                }
+                if !cid_verified {
+                    self.schedule_cid_check(&handle.vm_id);
+                }
+            }
+            handles.insert(handle.vm_id.clone(), handle);
+        }
+        if is_infra {
+            eprintln!(
+                "hippius-miner-agent: re-adopt: infra vm={vm_id_str} — tracked \
+                 (host-attestor supervised)"
+            );
+        } else {
+            eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm_id_str} cid={cid} — tracked \
+                 (capacity + vsock relay + reboot-watcher restored)"
+            );
+        }
+        Ok(true)
+    }
+
+    /// Retry the re-adoption of survivors whose CID was held by another
+    /// record at startup — called after a verification re-keys or drops an
+    /// unverified claim, which may have been exactly what blocked them.
+    /// Without it such a survivor stayed untracked until the next agent
+    /// restart: capacity uncounted, no relay, no reboot supervision (#1149).
+    async fn retry_collided_readoptions(&self) -> usize {
+        let pending: Vec<String> = match self.readopt_collided.lock() {
+            Ok(mut collided) => collided.drain().collect(),
+            Err(_) => return 0,
+        };
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut adopted = 0usize;
+        let mut keep: Vec<String> = Vec::new();
+        for snapshot in adopt::list(&self.state_disk_root) {
+            if !pending.contains(&snapshot.vm_id) {
+                continue;
+            }
+            let vm_id = snapshot.vm_id.clone();
+            // Bounded like a verification attempt: `virsh` has no timeout of
+            // its own, and this runs inside the verify loop.
+            match tokio::time::timeout(CID_VERIFY_ATTEMPT_TIMEOUT, self.readopt_one(snapshot)).await
+            {
+                Ok(Ok(true)) => adopted += 1,
+                // Not adopted: still waiting unless it is tracked now (a
+                // fresh launch took over) or its sidecar was pruned. A
+                // renewed collision re-records itself; a libvirt blip or a
+                // timeout must not silently drop it.
+                Ok(Ok(false)) => keep.push(vm_id),
+                Ok(Err(err)) => {
+                    eprintln!("hippius-miner-agent: re-adopt retry failed vm={vm_id}: {err}");
+                    keep.push(vm_id);
+                }
+                Err(_) => {
+                    eprintln!("hippius-miner-agent: re-adopt retry timed out vm={vm_id}");
+                    keep.push(vm_id);
+                }
+            }
+        }
+        let still_waiting: Vec<String> = keep
+            .into_iter()
+            .filter(|id| {
+                let tracked = VmId::new(id)
+                    .ok()
+                    .is_some_and(|v| self.lock_handles().is_ok_and(|h| h.contains_key(&v)));
+                let has_sidecar = adopt::list(&self.state_disk_root)
+                    .iter()
+                    .any(|s| &s.vm_id == id);
+                !tracked && has_sidecar
+            })
+            .collect();
+        if let Ok(mut collided) = self.readopt_collided.lock() {
+            collided.extend(still_waiting);
+        }
+        adopted
     }
 
     /// Correct a snapshot-rebuilt handle against the LIVE domain XML.
@@ -1359,7 +1814,13 @@ impl CvmLifecycle {
     /// An unreadable/unparseable XML leaves the snapshot values in place:
     /// charging the recorded numbers is strictly better than charging
     /// nothing, which is what refusing to adopt would do.
-    async fn reconcile_handle_with_libvirt(&self, handle: &mut CvmHandle) {
+    ///
+    /// Returns whether the vsock CID was CONFIRMED by the live XML. When it
+    /// was not, the caller holds the recorded CID unverified: resources may
+    /// be charged on a miner-local record, an identity may not — a stale
+    /// CID would route this VM's ticket to, and attribute another guest's
+    /// frames from, whoever the kernel really gave it to.
+    async fn reconcile_handle_with_libvirt(&self, handle: &mut CvmHandle) -> bool {
         let vm = handle.vm_id.as_str().to_string();
         let facts = match self.driver.domain_xml(&handle.domain_id).await {
             Ok(xml) => match adopt::parse_domain_facts(&xml) {
@@ -1367,19 +1828,28 @@ impl CvmLifecycle {
                 Err(err) => {
                     eprintln!(
                         "hippius-miner-agent: re-adopt: vm={vm} domain XML unparseable ({err}) — \
-                         adopting the snapshot's recorded resources unchecked"
+                         adopting the snapshot's recorded resources unchecked; cid {} UNVERIFIED \
+                         (ticket push + relay wait until the live XML confirms it)",
+                        handle.cid
                     );
-                    return;
+                    return false;
                 }
             },
             Err(err) => {
                 eprintln!(
                     "hippius-miner-agent: re-adopt: vm={vm} dumpxml failed ({err}) — \
-                     adopting the snapshot's recorded resources unchecked"
+                     adopting the snapshot's recorded resources unchecked; cid {} UNVERIFIED \
+                     (ticket push + relay wait until the live XML confirms it)",
+                    handle.cid
                 );
-                return;
+                return false;
             }
         };
+        // A customer-keys VM whose snapshot carries no (valid) route: rebuild
+        // it from what the live domain was actually started with.
+        if handle.guardian.is_none() && !handle.is_infra() {
+            handle.guardian = self.rebuild_guardian_route(&handle.vm_id, &facts);
+        }
         if facts.vcpus != handle.cpu_count || facts.memory_mib != handle.memory_mb {
             eprintln!(
                 "hippius-miner-agent: re-adopt: vm={vm} SNAPSHOT/XML DISAGREE on resources \
@@ -1389,17 +1859,56 @@ impl CvmLifecycle {
             handle.cpu_count = handle.cpu_count.max(facts.vcpus);
             handle.memory_mb = handle.memory_mb.max(facts.memory_mib);
         }
-        if let Some(cid) = facts.cid {
-            if cid != handle.cid {
-                eprintln!(
-                    "hippius-miner-agent: re-adopt: vm={vm} SNAPSHOT/XML DISAGREE on vsock cid \
-                     (snapshot {}, libvirt {cid}) — reserving the LIVE cid",
-                    handle.cid
-                );
-                handle.cid = cid;
-            }
+        // The XML speaks for THIS VM only if it is the recorded incarnation
+        // (same UUID) and it describes a RUNNING domain — re-read liveness
+        // after the dump, since a domain that stopped meanwhile yields its
+        // inactive config, which proves nothing about the kernel's CID.
+        let same_domain = facts.domain_uuid.as_ref() == Some(&handle.domain_uuid);
+        if !same_domain {
+            eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm} live domain UUID differs from the \
+                 snapshot's — not the recorded incarnation; cid {} UNVERIFIED",
+                handle.cid
+            );
         }
-        if let Some(disk) = facts.writable_disk {
+        let live_after = same_domain && self.domain_running_now(&handle.domain_id).await;
+        if same_domain && !live_after {
+            eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm} domain not running after the XML read — \
+                 cid {} UNVERIFIED",
+                handle.cid
+            );
+        }
+        let cid_verified = match facts.cid {
+            Some(_) if !live_after => false,
+            Some(cid) => {
+                if cid != handle.cid {
+                    eprintln!(
+                        "hippius-miner-agent: re-adopt: vm={vm} SNAPSHOT/XML DISAGREE on vsock cid \
+                         (snapshot {}, libvirt {cid}) — reserving the LIVE cid",
+                        handle.cid
+                    );
+                    handle.cid = cid;
+                }
+                true
+            }
+            // A domain with no vsock device: there is no kernel CID to
+            // confirm. The Infra attestor's placeholder (< MIN_GUEST_CID)
+            // is never reserved; anything else stays unverified.
+            None => {
+                if handle.cid >= crate::vsock::peer::MIN_GUEST_CID {
+                    eprintln!(
+                        "hippius-miner-agent: re-adopt: vm={vm} live XML has NO vsock device — \
+                         cid {} UNVERIFIED",
+                        handle.cid
+                    );
+                }
+                false
+            }
+        };
+        // Another incarnation's disk path must never become this handle's:
+        // §24 `destroy` unlinks it.
+        if let Some(disk) = facts.writable_disk.filter(|_| same_domain) {
             if disk != handle.luks_disk_path {
                 eprintln!(
                     "hippius-miner-agent: re-adopt: vm={vm} SNAPSHOT/XML DISAGREE on the writable \
@@ -1410,6 +1919,7 @@ impl CvmLifecycle {
                 handle.luks_disk_path = disk;
             }
         }
+        cid_verified
     }
 
     /// Pass 2 — account for every live `hippius-tenant-*` domain that no
@@ -1517,6 +2027,8 @@ impl CvmLifecycle {
                 .map(|p| disk_size_gb(p))
                 .unwrap_or(0);
             let cid = facts.cid.unwrap_or(0);
+            // Hashes the boot artifacts — done before the lock.
+            let guardian_route = self.rebuild_guardian_route(&vm_id, &facts);
             {
                 let mut handles = self.lock_handles()?;
                 if handles.contains_key(&vm_id) {
@@ -1550,6 +2062,9 @@ impl CvmLifecycle {
                         cid,
                         // NO TICKET: accounting only, no re-push, no restart.
                         cose_ticket: Vec::new(),
+                        // No sidecar: the route, if any, comes from the
+                        // live cmdline (absent ⇒ the relay refuses this CID).
+                        guardian: guardian_route,
                     },
                 );
             }
@@ -1648,6 +2163,7 @@ impl CvmLifecycle {
                     // `<vsock>` device so the attestor guest can dial the host.
                     cid: config.cid,
                     cose_ticket: Vec::new(),
+                    guardian: None,
                 },
             );
         }
@@ -1717,7 +2233,11 @@ impl CvmLifecycle {
             let xml = config.to_libvirt_xml();
             self.driver.define_domain(&xml).await?;
             match self.driver.create_domain(domain_id).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    // Kernel-bound now — see the tenant `run_domain`.
+                    let _ = self.cids.mark_verified(&config.vm_id, config.cid);
+                    break;
+                }
                 Err(MinerAgentError::VsockCid("cid-in-use"))
                     if attempt < MAX_CID_COLLISION_RETRIES =>
                 {
@@ -1828,6 +2348,13 @@ impl CvmLifecycle {
     }
 
     /// Update a tracked handle's phase (a no-op if it is gone).
+    /// Pin `vm_id`'s phase — for tests that need a phase the mock
+    /// lifecycle only passes through transiently (e.g. `Launching`).
+    #[cfg(test)]
+    pub(crate) fn force_phase_for_tests(&self, vm_id: &VmId, phase: CvmPhase) {
+        self.set_phase(vm_id, phase).unwrap();
+    }
+
     fn set_phase(&self, vm_id: &VmId, phase: CvmPhase) -> Result<()> {
         if let Some(handle) = self.lock_handles()?.get_mut(vm_id) {
             handle.phase = phase;
@@ -1872,7 +2399,37 @@ impl CvmLifecycle {
             .checked_add(u64::from(add_disk_gb))
             .ok_or(MinerAgentError::InsufficientResources)?;
         if self.host.total_disk_gb > 0 && need_disk > self.host.total_disk_gb {
-            return Err(MinerAgentError::InsufficientResources);
+            return Err(MinerAgentError::InsufficientDisk);
+        }
+        Ok(())
+    }
+
+    /// Read-only MEASURED disk-space check (no reservation) — the preflight
+    /// twin of the free-space gate the launch runs when it creates the
+    /// disk (`data_disk` / `golden`, serialised by `disk_space`).
+    ///
+    /// Refuses `InsufficientDisk` when `add_disk_gb` GiB would not fit in
+    /// the free space of `data_disk_root` net of every existing writable
+    /// disk's unwritten sparse tail — BEFORE vali mints + KBS-registers, so
+    /// vali re-places. A VM whose writable disk already exists here (a
+    /// relaunch) needs no new space and is never refused. `0` GiB, or a
+    /// filesystem that can't be measured, never refuses here: the launch
+    /// gate still runs, and fails closed.
+    pub fn check_disk_space(&self, vm_id: &VmId, add_disk_gb: u32) -> Result<()> {
+        if add_disk_gb == 0
+            || data_disk::data_disk_path(&self.data_disk_root, vm_id).exists()
+            || golden::overlay_disk_path(&self.data_disk_root, vm_id).exists()
+        {
+            return Ok(());
+        }
+        let reserved = *disk_space::create_lock();
+        let Ok(headroom) =
+            disk_space::headroom_bytes(reserved, &self.data_disk_root, &self.data_disk_root)
+        else {
+            return Ok(());
+        };
+        if headroom < u64::from(add_disk_gb).saturating_mul(1024 * 1024 * 1024) {
+            return Err(MinerAgentError::InsufficientDisk);
         }
         Ok(())
     }
@@ -1903,6 +2460,78 @@ impl CvmLifecycle {
         check_capacity(&handles, self.host, add_cpu, add_memory_mb, 0)
     }
 
+    /// SEV-ES ASID fail-fast at PREFLIGHT (capacity v2 §2.3) — same
+    /// pre-register rationale as [`Self::check_cpu_mem_budget`]: an
+    /// exhausted ASID pool otherwise fails the launch inside
+    /// `sev_common_kvm_init`, after the KBS registered the VM, where vali
+    /// cannot re-place cleanly.
+    ///
+    /// A TENANT launch is refused `InsufficientResources` when starting
+    /// it would eat into the ASID reserve kept for the host-attestor / a
+    /// migration destination (`used + 1 > capacity - 1`, see
+    /// [`crate::sev_asid::AsidUsage::admits_tenant`]). The Infra
+    /// host-attestor is NEVER refused here — the reserve exists for it.
+    /// An unknown pool (no `misc` controller / no `sev_es` key) never
+    /// gates.
+    pub fn check_asid_budget(&self, profile: DomainProfile) -> Result<()> {
+        if profile.is_infra() {
+            return Ok(());
+        }
+        let reservations = self
+            .asid_reservations
+            .lock()
+            .map_err(|_| MinerAgentError::InsufficientResources)?;
+        self.asid_admits(&reservations, None)
+    }
+
+    /// [`Self::check_asid_budget`] that also RESERVES one ASID for
+    /// `vm_id` until its launch ends ([`Self::release_asid_reservation`])
+    /// or [`ASID_RESERVATION_TTL`] passes — so concurrent preflights at
+    /// the edge of the pool cannot all pass. A repeat for the same
+    /// `vm_id` refreshes its own reservation instead of counting twice.
+    pub fn reserve_asid(&self, vm_id: &VmId, profile: DomainProfile) -> Result<()> {
+        if profile.is_infra() {
+            return Ok(());
+        }
+        let mut reservations = self
+            .asid_reservations
+            .lock()
+            .map_err(|_| MinerAgentError::InsufficientResources)?;
+        let now = std::time::Instant::now();
+        reservations.retain(|_, at| now.duration_since(*at) < ASID_RESERVATION_TTL);
+        self.asid_admits(&reservations, Some(vm_id))?;
+        reservations.insert(vm_id.clone(), now);
+        Ok(())
+    }
+
+    /// Drop `vm_id`'s ASID reservation — its launch ended (the guest now
+    /// holds a real ASID that `misc.current` counts, or it never started).
+    pub fn release_asid_reservation(&self, vm_id: &VmId) {
+        if let Ok(mut reservations) = self.asid_reservations.lock() {
+            reservations.remove(vm_id);
+        }
+    }
+
+    fn asid_admits(
+        &self,
+        reservations: &HashMap<VmId, std::time::Instant>,
+        own: Option<&VmId>,
+    ) -> Result<()> {
+        let usage = self.asids.read();
+        let outstanding = reservations.keys().filter(|k| Some(*k) != own).count();
+        let pending = crate::sev_asid::AsidUsage {
+            capacity: usage.capacity,
+            used: usage
+                .used
+                .saturating_add(u32::try_from(outstanding).unwrap_or(u32::MAX)),
+        };
+        if pending.admits_tenant() {
+            Ok(())
+        } else {
+            Err(MinerAgentError::InsufficientResources)
+        }
+    }
+
     /// Snapshot of `(cid, cose_ticket)` for `vm_id`, if the lifecycle
     /// admitted it. Used by the reboot-watcher (`lifecycle::
     /// reboot_watcher`) to re-push the L1-signed OrderTicket via
@@ -1917,6 +2546,646 @@ impl CvmLifecycle {
             return None;
         }
         Some((h.cid, h.cose_ticket.clone()))
+    }
+
+    /// Register a new ticket re-push task for `vm_id` and return its
+    /// cancellation token. Supersedes (cancels) any task still running for
+    /// the same VM — a fresh `Started` restarts the boot window, and two
+    /// tasks racing the same listener buy nothing.
+    pub fn begin_ticket_push(&self, vm_id: &VmId) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Ok(mut pushes) = self.ticket_pushes.lock() {
+            if let Some(prev) = pushes.insert(vm_id.clone(), token.clone()) {
+                prev.cancel();
+            }
+        } else {
+            // Poisoned: we cannot track the task, so it must not run.
+            token.cancel();
+        }
+        token
+    }
+
+    /// Record that a push of `cose_ticket` to `cid` reached `vm_id`'s
+    /// guest — by the launch or by the reboot-watcher's re-push.
+    pub fn note_ticket_delivered(&self, vm_id: &VmId, cid: u32, cose_ticket: &[u8]) {
+        self.note_ticket_delivery(vm_id, cid, cose_ticket, true);
+    }
+
+    /// Record that the launch's own push of `cose_ticket` to `cid` failed.
+    pub fn note_ticket_push_failed(&self, vm_id: &VmId, cid: u32, cose_ticket: &[u8]) {
+        self.note_ticket_delivery(vm_id, cid, cose_ticket, false);
+    }
+
+    fn note_ticket_delivery(&self, vm_id: &VmId, cid: u32, cose_ticket: &[u8], delivered: bool) {
+        let Ok(mut map) = self.ticket_delivery.lock() else {
+            return;
+        };
+        let entry = map.entry(vm_id.clone()).or_default();
+        if entry.cid != cid || entry.cose_ticket != cose_ticket {
+            *entry = TicketDelivery {
+                cid,
+                cose_ticket: cose_ticket.to_vec(),
+                ..TicketDelivery::default()
+            };
+        }
+        if delivered {
+            entry.delivered = true;
+        } else {
+            entry.launch_push_failed = true;
+        }
+    }
+
+    /// Whether `vm_id`'s current ticket reached its guest (as far as this
+    /// process saw).
+    pub fn ticket_delivered(&self, vm_id: &VmId) -> bool {
+        self.current_delivery(vm_id).is_some_and(|d| d.delivered)
+    }
+
+    /// Whether the reboot-watcher still has a live re-push task for
+    /// `vm_id` (it cancels its own token when it gives up). Unknown reads
+    /// as live, so a caller waiting on it never stops a domain early.
+    pub fn ticket_repush_active(&self, vm_id: &VmId) -> bool {
+        self.ticket_pushes
+            .lock()
+            .map(|p| p.get(vm_id).is_some_and(|t| !t.is_cancelled()))
+            .unwrap_or(true)
+    }
+
+    /// The delivery record for `vm_id`, iff it is about the CID + ticket
+    /// the VM runs on now.
+    fn current_delivery(&self, vm_id: &VmId) -> Option<TicketDelivery> {
+        let (cid, ticket) = {
+            let handles = self.handles.lock().ok()?;
+            let h = handles.get(vm_id)?;
+            (h.cid, h.cose_ticket.clone())
+        };
+        let map = self.ticket_delivery.lock().ok()?;
+        map.get(vm_id)
+            .filter(|d| d.cid == cid && d.cose_ticket == ticket)
+            .cloned()
+    }
+
+    /// Cancel `vm_id`'s ticket re-push task, if any.
+    fn cancel_ticket_push(&self, vm_id: &VmId) {
+        match self.ticket_pushes.lock() {
+            Ok(mut pushes) => {
+                if let Some(token) = pushes.remove(vm_id) {
+                    token.cancel();
+                }
+            }
+            Err(_) => eprintln!(
+                "hippius-miner-agent: lifecycle: ticket_pushes lock poisoned — \
+                 vm {vm_id} re-push not cancelled (the per-attempt ownership guard still holds)"
+            ),
+        }
+    }
+
+    /// Free `vm_id`'s AF_VSOCK CID — AFTER cancelling any ticket re-push
+    /// still aimed at it. The order is the point: once the CID is free the
+    /// next launch may get it, and a push that is still connecting would
+    /// hand this VM's ticket to that new tenant's initramfs (KBS 403, no
+    /// retry — the new VM is bricked).
+    fn release_cid(&self, vm_id: &VmId) {
+        self.cancel_ticket_push(vm_id);
+        // Only once the domain is confirmed down: a stop that fails keeps
+        // the VM, and with it what is known about its ticket.
+        if let Ok(mut map) = self.ticket_delivery.lock() {
+            map.remove(vm_id);
+        }
+        if let Ok(mut checks) = self.cid_checks.lock() {
+            checks.remove(vm_id);
+        }
+        let _ = self.cids.release(vm_id);
+        // A stop/destroy of the VM whose (possibly stale) claim blocked a
+        // survivor frees the CID without any verification verdict.
+        if self.readopt_collided.lock().is_ok_and(|c| !c.is_empty()) {
+            self.readopt_retry_due
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether blocked survivors are waiting for a retry that is due — the
+    /// verify loop runs even with no unverified CID left in that case.
+    pub fn readopt_retry_due(&self) -> bool {
+        self.readopt_retry_due
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Queue `vm_id`'s unverified CID for [`Self::verify_pending_cids`],
+    /// due immediately.
+    fn schedule_cid_check(&self, vm_id: &VmId) {
+        if let Ok(mut checks) = self.cid_checks.lock() {
+            checks.insert(
+                vm_id.clone(),
+                CidCheck {
+                    generation: CID_CHECK_GENERATION
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    failures: 0,
+                    next_at: std::time::Instant::now(),
+                    last_class: "re-adopt",
+                },
+            );
+        }
+    }
+
+    /// Make `vm_id`'s pending CID check due now — the reboot-watcher calls
+    /// this on `Started`: a restarted guest is waiting (bounded) for its
+    /// ticket, which waits on this verification.
+    pub fn expedite_cid_check(&self, vm_id: &VmId) {
+        if let Ok(mut checks) = self.cid_checks.lock() {
+            if let Some(check) = checks.get_mut(vm_id) {
+                check.next_at = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Number of re-adopted CIDs still awaiting confirmation.
+    pub fn unverified_cid_count(&self) -> usize {
+        self.cid_checks.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Try to confirm every unverified re-adoption CID that is due at
+    /// `now` against the live domain XML:
+    ///
+    /// - XML shows the recorded CID → mark it verified.
+    /// - XML shows a DIFFERENT CID → re-key the handle + allocator to the
+    ///   live one (verified).
+    /// - the domain is no longer DEFINED → drop the handle and free the CID.
+    ///   Only "gone", never "shut off": a guest `reboot` passes through
+    ///   shut-off before the reboot-watcher restarts it, and dropping the
+    ///   handle then would strand that legitimate restart.
+    /// - anything else (dumpxml failed, unparseable, no vsock device,
+    ///   libvirt unreachable, re-key collision) → retry after a doubling
+    ///   backoff capped at [`CID_VERIFY_MAX_BACKOFF`].
+    ///
+    /// Logs once per state change, not per attempt. No lock is held across
+    /// an `.await`.
+    pub async fn verify_pending_cids(&self, now: std::time::Instant) -> Vec<(VmId, CidVerdict)> {
+        let due: Vec<VmId> = match self.cid_checks.lock() {
+            Ok(checks) => checks
+                .iter()
+                .filter(|(_, c)| c.next_at <= now)
+                .map(|(vm, _)| vm.clone())
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(due.len());
+        for vm_id in due {
+            let Some(generation) = self
+                .cid_checks
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&vm_id).map(|c| c.generation))
+            else {
+                continue; // dropped since it was listed as due
+            };
+            // `virsh` has no timeout of its own; one hung call must not
+            // stall every other survivor's verification behind it.
+            let verdict = match tokio::time::timeout(
+                CID_VERIFY_ATTEMPT_TIMEOUT,
+                self.verify_one_cid(&vm_id, now),
+            )
+            .await
+            {
+                Ok(verdict) => verdict,
+                Err(_) => {
+                    // Back off from NOW, not from the attempt's start — the
+                    // attempt itself already took the whole timeout.
+                    let now = now.max(std::time::Instant::now());
+                    self.record_cid_failure(&vm_id, generation, "timeout", now);
+                    CidVerdict::Pending
+                }
+            };
+            out.push((vm_id, verdict));
+        }
+        let claim_moved = out
+            .iter()
+            .any(|(_, v)| matches!(v, CidVerdict::Rekeyed | CidVerdict::Dropped));
+        let release_seen = self
+            .readopt_retry_due
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if claim_moved || release_seen {
+            self.retry_collided_readoptions().await;
+        }
+        out
+    }
+
+    /// Back off `vm_id`'s pending check after a failed attempt, logging the
+    /// class only when it changed. `generation` must still be the queued
+    /// one — a check superseded meanwhile is left alone.
+    fn record_cid_failure(
+        &self,
+        vm_id: &VmId,
+        generation: u64,
+        class: &'static str,
+        now: std::time::Instant,
+    ) {
+        let Ok(mut checks) = self.cid_checks.lock() else {
+            return;
+        };
+        let Some(check) = checks.get_mut(vm_id).filter(|c| c.generation == generation) else {
+            return;
+        };
+        check.failures = check.failures.saturating_add(1);
+        let delay = CidCheck::backoff(check.failures);
+        check.next_at = now + delay;
+        if check.last_class != class {
+            eprintln!(
+                "hippius-miner-agent: cid-verify: vm={vm_id} still UNVERIFIED ({class}) — \
+                 retrying with backoff (next in {} s)",
+                delay.as_secs()
+            );
+            check.last_class = class;
+        }
+    }
+
+    async fn verify_one_cid(&self, vm_id: &VmId, now: std::time::Instant) -> CidVerdict {
+        let snapshot = self.lock_handles().ok().and_then(|h| {
+            h.get(vm_id)
+                .map(|h| (h.domain_id.clone(), h.domain_uuid.clone(), h.cid))
+        });
+        let generation = self
+            .cid_checks
+            .lock()
+            .ok()
+            .and_then(|c| c.get(vm_id).map(|c| c.generation));
+        let (Some((domain_id, uuid, held)), Some(generation)) = (snapshot, generation) else {
+            // Stopped / destroyed meanwhile — its CID went with it.
+            self.forget_cid_check(vm_id);
+            return CidVerdict::Dropped;
+        };
+        let current = CheckIdentity {
+            generation,
+            uuid: &uuid,
+            held,
+        };
+        let class = match self.domain_liveness(&domain_id).await {
+            DomainLiveness::Live => match self.read_live_cid(&domain_id, &uuid).await {
+                Ok(live) if live == held => {
+                    if self.commit_verified(vm_id, &current) {
+                        eprintln!(
+                            "hippius-miner-agent: cid-verify: vm={vm_id} cid={held} VERIFIED \
+                             against the live domain XML — ticket push + relay resume"
+                        );
+                        return CidVerdict::Verified;
+                    }
+                    "superseded"
+                }
+                Ok(live) => {
+                    if self.commit_rekey(vm_id, &current, live) {
+                        eprintln!(
+                            "hippius-miner-agent: cid-verify: vm={vm_id} RE-KEYED cid {held} → \
+                             {live} (the live domain XML wins; the recorded cid is burned)"
+                        );
+                        return CidVerdict::Rekeyed;
+                    }
+                    "rekey-refused"
+                }
+                Err(class) => class,
+            },
+            // Not running: its XML is the INACTIVE config and proves nothing
+            // about which CID the kernel holds. Gone only if undefined — a
+            // guest `reboot` passes through shut-off before the
+            // reboot-watcher restarts it, and dropping the handle then would
+            // strand that legitimate restart.
+            DomainLiveness::Down => match self.tenant_domain_defined(vm_id).await {
+                Some(false) => {
+                    if self.commit_drop(vm_id, &current) {
+                        eprintln!(
+                            "hippius-miner-agent: cid-verify: vm={vm_id} domain no longer \
+                             defined — handle DROPPED, cid {held} freed"
+                        );
+                        return CidVerdict::Dropped;
+                    }
+                    "superseded"
+                }
+                Some(true) => "not-running",
+                None => "libvirt-unreachable",
+            },
+            DomainLiveness::Unknown => "libvirt-unreachable",
+        };
+        self.record_cid_failure(vm_id, generation, class, now);
+        CidVerdict::Pending
+    }
+
+    fn forget_cid_check(&self, vm_id: &VmId) {
+        if let Ok(mut checks) = self.cid_checks.lock() {
+            checks.remove(vm_id);
+        }
+    }
+
+    /// The vsock CID of the RUNNING domain `domain_id`, read from its XML
+    /// and bracketed by liveness: the domain must be live after the read
+    /// too, so the XML described the running QEMU and not an inactive
+    /// config. Its UUID must match the handle's — a same-name domain
+    /// re-created meanwhile is a different guest.
+    async fn read_live_cid(
+        &self,
+        domain_id: &DomainId,
+        uuid: &DomainUuid,
+    ) -> std::result::Result<u32, &'static str> {
+        let xml = self
+            .driver
+            .domain_xml(domain_id)
+            .await
+            .map_err(|_| "dumpxml")?;
+        let facts = adopt::parse_domain_facts(&xml).map_err(|_| "unparseable")?;
+        match facts.domain_uuid.as_ref() {
+            Some(u) if u == uuid => {}
+            Some(_) => return Err("uuid-mismatch"),
+            None => return Err("no-uuid"),
+        }
+        let live = facts.cid.ok_or("no-vsock")?;
+        if !self.domain_running_now(domain_id).await {
+            return Err("not-running");
+        }
+        Ok(live)
+    }
+
+    /// Whether `virsh domstate` DIRECTLY reports `domain_id` running — the
+    /// standard for "this XML describes a running QEMU". Stricter than
+    /// [`Self::domain_liveness`], whose `list_domains` fallback reports
+    /// any listed domain `Live` whatever its state: fine for "is it still
+    /// there", not proof that the XML is the live config.
+    async fn domain_running_now(&self, domain_id: &DomainId) -> bool {
+        matches!(
+            self.driver.query_domain_state(domain_id).await,
+            Ok(DomainState::Running
+                | DomainState::Blocked
+                | DomainState::Paused
+                | DomainState::Shutdown
+                | DomainState::PmSuspended)
+        )
+    }
+
+    /// Whether the check a verification attempt started from is still the
+    /// one in force: same generation queued, same handle (UUID) holding the
+    /// same CID. Called with the handle lock held (lock order: handles →
+    /// cid_checks, as everywhere else).
+    fn check_is_current(
+        &self,
+        handles: &HashMap<VmId, CvmHandle>,
+        vm_id: &VmId,
+        current: &CheckIdentity<'_>,
+    ) -> bool {
+        let handle_same = handles
+            .get(vm_id)
+            .is_some_and(|h| &h.domain_uuid == current.uuid && h.cid == current.held);
+        handle_same
+            && self.cid_checks.lock().is_ok_and(|c| {
+                c.get(vm_id)
+                    .is_some_and(|c| c.generation == current.generation)
+            })
+    }
+
+    fn commit_verified(&self, vm_id: &VmId, current: &CheckIdentity<'_>) -> bool {
+        let Ok(handles) = self.lock_handles() else {
+            return false;
+        };
+        if !self.check_is_current(&handles, vm_id, current) {
+            return false;
+        }
+        if !matches!(self.cids.mark_verified(vm_id, current.held), Ok(true)) {
+            return false;
+        }
+        self.forget_cid_check(vm_id);
+        true
+    }
+
+    /// Move `vm_id`'s handle + allocator mapping from the held CID to
+    /// `live`, under the handle lock so no push reads a half-moved pair.
+    fn commit_rekey(&self, vm_id: &VmId, current: &CheckIdentity<'_>, live: u32) -> bool {
+        let Ok(mut handles) = self.lock_handles() else {
+            return false;
+        };
+        if !self.check_is_current(&handles, vm_id, current) {
+            return false;
+        }
+        if self.cids.rekey_verified(vm_id, current.held, live).is_err() {
+            return false;
+        }
+        if let Some(handle) = handles.get_mut(vm_id) {
+            handle.cid = live;
+        }
+        self.forget_cid_check(vm_id);
+        true
+    }
+
+    /// The domain of an unverified re-adoption is gone: stop tracking it.
+    /// The sidecar goes too — its only purpose was re-adopting a live
+    /// domain, and an undefined one can never be restarted from it.
+    fn commit_drop(&self, vm_id: &VmId, current: &CheckIdentity<'_>) -> bool {
+        {
+            let Ok(mut handles) = self.lock_handles() else {
+                return false;
+            };
+            if !self.check_is_current(&handles, vm_id, current) {
+                return false;
+            }
+            handles.remove(vm_id);
+            // Still under the handle lock: a relaunch of the same vm_id
+            // cannot re-take the allocator entry between the remove and the
+            // release and then have its fresh mapping released by us.
+            self.release_cid(vm_id);
+        }
+        adopt::forget(&self.state_disk_root, vm_id.as_str());
+        true
+    }
+
+    /// Where `vm_id`'s ticket should go right now: its CURRENT CID and
+    /// whether to deliver there, wait, or stop. A re-push task resolves
+    /// this every attempt rather than trusting the CID it saw at `Started`
+    /// — a re-adopted CID can be re-keyed to the live one, and a launch's
+    /// CID can be re-allocated after an orphan collision.
+    pub fn ticket_push_target(&self, vm_id: &VmId, cose_ticket: &[u8]) -> (TicketPushState, u32) {
+        let cid = match self.handles.lock() {
+            Ok(handles) => match handles.get(vm_id) {
+                Some(h) => h.cid,
+                None => return (TicketPushState::Abort, 0),
+            },
+            Err(_) => return (TicketPushState::Abort, 0),
+        };
+        (self.ticket_push_state(vm_id, cid, cose_ticket), cid)
+    }
+
+    /// Whether `cose_ticket` may be pushed to `cid` on behalf of `vm_id`
+    /// right now: the VM is tracked and `Running`, its handle still holds
+    /// exactly this `cid` and this ticket, and the CID allocator agrees
+    /// `cid` belongs to `vm_id`.
+    ///
+    /// The ownership guard every ticket push re-checks before each connect
+    /// and before the write ([`crate::vsock::ticket_push::TicketPusher::
+    /// push_guarded`]). A CID is only an address: after a stop it is free
+    /// and the next launch may take it, so "the CID I captured when I
+    /// started pushing" is NOT "this VM's guest".
+    pub fn ticket_push_current(&self, vm_id: &VmId, cid: u32, cose_ticket: &[u8]) -> bool {
+        self.ticket_push_state(vm_id, cid, cose_ticket) == TicketPushState::Deliver
+    }
+
+    /// [`Self::ticket_push_current`], distinguishing a VM that is still
+    /// `Launching` on this CID + ticket (`Wait`) from one that will never
+    /// own them again (`Abort`).
+    ///
+    /// `Launching` is not deliverable: the CID is only SELECTED there — a
+    /// `create_domain` that finds an orphan qemu still bound to it burns it
+    /// and re-allocates — so the guest behind it is not yet provably this
+    /// VM's. The libvirt `Started` event of a fresh launch fires in that
+    /// phase, which is why its re-push task waits rather than gives up.
+    pub fn ticket_push_state(&self, vm_id: &VmId, cid: u32, cose_ticket: &[u8]) -> TicketPushState {
+        let phase = {
+            let Ok(handles) = self.handles.lock() else {
+                return TicketPushState::Abort;
+            };
+            match handles.get(vm_id) {
+                Some(h)
+                    if h.cid == cid
+                        && !h.cose_ticket.is_empty()
+                        && h.cose_ticket == cose_ticket =>
+                {
+                    h.phase
+                }
+                _ => return TicketPushState::Abort,
+            }
+        };
+        let owner = match self.cids.owner_of(cid) {
+            Ok(owner) => owner,
+            Err(_) => return TicketPushState::Abort,
+        };
+        match (owner, phase) {
+            (CidOwner::Verified(o), CvmPhase::Running) if &o == vm_id => TicketPushState::Deliver,
+            (CidOwner::Verified(o), CvmPhase::Launching) if &o == vm_id => TicketPushState::Wait,
+            // A re-adopted VM whose CID the live XML has not confirmed yet:
+            // not deliverable, not hopeless — verification may confirm or
+            // re-key it.
+            (CidOwner::Unverified(o), CvmPhase::Running) if &o == vm_id => TicketPushState::Wait,
+            // A fresh launch whose `create_domain` has not yet marked its CID
+            // verified — the libvirt `Started` event can beat that mark.
+            (CidOwner::Unverified(o), CvmPhase::Launching) if &o == vm_id => TicketPushState::Wait,
+            _ => TicketPushState::Abort,
+        }
+    }
+
+    /// Rebuild a customer-keys VM's [`guardian::GuardianRoute`] from its
+    /// LIVE domain XML, for a re-adoption whose snapshot has none (an
+    /// orphan, a pre-route or a damaged snapshot).
+    ///
+    /// Only when the live `<cmdline>` carries a customer-keys binding
+    /// (`hippius.key_mode=split|customer`): the endpoint is the MEASURED
+    /// `hippius.guardian_ep=` token, DECODED from its hex (the route, like
+    /// the order, holds the plain canonical string), and the recipe is
+    /// recomputed from the
+    /// domain's actual `<loader>` / `<kernel>` / `<initrd>` / `<cmdline>`
+    /// and `<vcpu>` — never from anything the miner merely recorded. Any
+    /// failure is logged loudly and yields `None`: a route is never
+    /// invented, and without one the relay refuses the CID.
+    fn rebuild_guardian_route(
+        &self,
+        vm_id: &VmId,
+        facts: &adopt::DomainFacts,
+    ) -> Option<guardian::GuardianRoute> {
+        let fail = |why: &str| {
+            eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm_id} customer-keys VM WITHOUT a guardian \
+                 route ({why}) — the guardian relay will REFUSE it until it is relaunched"
+            );
+            None
+        };
+        let Some(boot) = facts.boot.as_ref() else {
+            // No direct-boot block: nothing to read a key mode from. Only
+            // worth a line if the snapshot said nothing either — which is
+            // every M0 VM, so stay quiet.
+            return None;
+        };
+        let binding = match hippius_types::guardian::GuardianBinding::from_cmdline(&boot.cmdline) {
+            Ok(None) => return None, // M0: no guardian, nothing to rebuild.
+            Ok(Some(b)) => b,
+            Err(_) => return fail("live cmdline refused by the guardian grammar"),
+        };
+        let endpoint = binding.endpoint.to_wire();
+        if guardian::check_order_guardian(&boot.cmdline, Some(&endpoint)).is_err() {
+            return fail("live guardian endpoint not dialable");
+        }
+        let inputs = guardian::RecipeInputs {
+            ovmf: boot.ovmf.clone(),
+            kernel: boot.kernel.clone(),
+            initrd: boot.initrd.clone(),
+            cmdline: boot.cmdline.clone(),
+            vcpus: u32::from(facts.vcpus),
+        };
+        let route = match self.digest.recipe(&inputs) {
+            Ok(recipe) => guardian::GuardianRoute { endpoint, recipe },
+            Err(_) => return fail("recipe could not be recomputed from the live artifacts"),
+        };
+        if route.validate().is_err() {
+            return fail("rebuilt route failed validation");
+        }
+        eprintln!(
+            "hippius-miner-agent: re-adopt: vm={vm_id} guardian route REBUILT from the live \
+             domain (endpoint {})",
+            route.endpoint
+        );
+        Some(route)
+    }
+
+    /// Resolve a guardian-relay connection's source CID to the VM that
+    /// owns it NOW and that VM's [`guardian::GuardianRoute`].
+    ///
+    /// The CID is only an address: after a stop it is freed and the next
+    /// launch may take it, so nothing about a CID is cached across
+    /// connections. Every connection re-reads, under ONE `handles` lock
+    /// (taken before the allocator's, the order `launch` uses), that:
+    ///
+    /// - the allocator holds the CID **verified** for a VM (a fresh
+    ///   allocation stays unverified until `create_domain` proves the
+    ///   domain was built on it; a re-adoption until the live XML
+    ///   confirms it) — `cid-unverified` / `unknown-cid` otherwise;
+    /// - that VM's handle still records exactly this CID, is a tenant, and
+    ///   is `Launching` or `Running` — `cid-not-current` otherwise;
+    /// - it was launched with a guardian — `no-guardian` otherwise.
+    ///
+    /// Stops and launches change the handle and the allocator under the
+    /// same lock, so a replaced domain's route can never be returned for
+    /// its successor's CID.
+    pub fn guardian_route_for_cid(
+        &self,
+        cid: u32,
+    ) -> std::result::Result<guardian::RouteBinding, &'static str> {
+        let handles = self.handles.lock().map_err(|_| "cid-lookup")?;
+        let vm_id = match self.cids.owner_of(cid).map_err(|_| "cid-lookup")? {
+            CidOwner::Verified(vm_id) => vm_id,
+            CidOwner::Unverified(_) => return Err("cid-unverified"),
+            CidOwner::Unknown => return Err("unknown-cid"),
+        };
+        let handle = handles.get(&vm_id).ok_or("cid-not-current")?;
+        let live = matches!(handle.phase, CvmPhase::Launching | CvmPhase::Running);
+        if handle.cid != cid || handle.is_infra() || !live {
+            return Err("cid-not-current");
+        }
+        let route = handle.guardian.clone().ok_or("no-guardian")?;
+        Ok(guardian::RouteBinding {
+            domain: handle.domain_uuid.as_str().to_string(),
+            vm_id,
+            route,
+        })
+    }
+
+    /// Whether the reboot-watcher may `virsh start` `vm_id` after a
+    /// `Stopped` event: only a tracked CVM in `Running` with a cached
+    /// ticket — i.e. one whose QEMU exited on its own (in-guest reboot).
+    ///
+    /// NOT `Stopping`: `stop` flips the phase to `Stopping` BEFORE it
+    /// issues `virsh destroy`, so every agent-initiated stop (a §24
+    /// force-stop included) produces a `Stopped` event while the handle
+    /// still exists. Gating on the ticket alone let the watcher race
+    /// that stop and restart the very domain being torn down (observed
+    /// live: a destroyed tenant came back within ~30 s).
+    pub fn restart_eligible(&self, vm_id: &VmId) -> bool {
+        let Ok(handles) = self.handles.lock() else {
+            return false;
+        };
+        handles
+            .get(vm_id)
+            .is_some_and(|h| h.phase == CvmPhase::Running && !h.cose_ticket.is_empty())
     }
 
     /// The on-host path of `vm_id`'s writable LUKS2 + dm-integrity data
@@ -1975,6 +3244,38 @@ fn assert_infra_measurement_pin(
     Ok(())
 }
 
+/// Refuse a relaunch whose per-VM disks are not on this host.
+///
+/// The same paths the launch then boots from: the anti-rollback state
+/// disk always; the golden overlay upper (`/dev/vda`, which golden mode
+/// derives into `luks_disk_path`) or the legacy data disk (`/dev/vde`,
+/// only when the order carries one). The legacy `/dev/vda` is NOT
+/// checked — it is the order-supplied image the launch preflight stages,
+/// not a disk this agent creates.
+///
+/// `try_exists`, not `exists`: an absent file (`Ok(false)`) is the only
+/// verdict that means "this host does not hold the VM". A metadata error
+/// (EIO, EACCES, a storage mount not up yet after a reboot) proves
+/// nothing either way, so it is its own RETRIABLE refusal — reading it as
+/// "missing" would make vali give up on a healthy VM.
+fn check_relaunch_disks(config: &QemuConfig) -> Result<()> {
+    require_disk(&config.state_disk_path, "state-disk")?;
+    if config.golden {
+        require_disk(&config.luks_disk_path, "overlay")?;
+    } else if let Some(data_disk) = &config.data_disk_path {
+        require_disk(data_disk, "data-disk")?;
+    }
+    Ok(())
+}
+
+fn require_disk(path: &std::path::Path, which: &'static str) -> Result<()> {
+    match path.try_exists() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(MinerAgentError::RelaunchDisksMissing(which)),
+        Err(_) => Err(MinerAgentError::RelaunchDisksUnreadable(which)),
+    }
+}
+
 /// Refuse a launch that would overcommit the host CPU or memory
 /// budget. Every sum is `checked_add` on `u64`, so an accounting
 /// overflow fails closed (`InsufficientResources`) rather than
@@ -2022,7 +3323,7 @@ fn check_capacity(
     // total_disk_gb == 0 disables the disk reservation (cpu/mem still
     // apply) — back-compat for configs without `cvm_disk_gb_budget`.
     if host.total_disk_gb > 0 && need_disk > host.total_disk_gb {
-        return Err(MinerAgentError::InsufficientResources);
+        return Err(MinerAgentError::InsufficientDisk);
     }
     Ok(())
 }
@@ -2045,6 +3346,184 @@ mod tests {
             },
         )
         .with_state_disk_root(dir.to_path_buf())
+    }
+
+    fn facts_with_cmdline(cmdline: &str) -> adopt::DomainFacts {
+        adopt::DomainFacts {
+            vcpus: 2,
+            memory_mib: 512,
+            cid: Some(7),
+            writable_disk: None,
+            domain_uuid: None,
+            boot: Some(adopt::BootFacts {
+                ovmf: "/x/ovmf".into(),
+                kernel: "/x/vmlinuz".into(),
+                initrd: "/x/initrd".into(),
+                cmdline: cmdline.into(),
+            }),
+        }
+    }
+
+    /// H1b: a route rebuilt from the live domain XML holds the DECODED
+    /// endpoint (the plain string the relay dials), never the hex token
+    /// the cmdline carries; a live cmdline in the old plain spelling
+    /// rebuilds nothing.
+    #[test]
+    fn a_rebuilt_guardian_route_decodes_the_measured_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(dir.path());
+        let vm = VmId::new("g-rebuild").unwrap();
+        let pk = "ab".repeat(32);
+        for ep in ["100.64.0.1:7443", "guardian.example.cc:443"] {
+            let cmdline = format!(
+                "console=hvc0 hippius.key_mode=customer hippius.guardian_pk={pk} \
+                 hippius.guardian_ep={}",
+                hex::encode(ep)
+            );
+            let route = lc
+                .rebuild_guardian_route(&vm, &facts_with_cmdline(&cmdline))
+                .unwrap();
+            assert_eq!(route.endpoint, ep);
+            assert_eq!(route.recipe.cmdline, cmdline);
+            route.validate().unwrap();
+        }
+        let plain = format!(
+            "console=hvc0 hippius.key_mode=customer hippius.guardian_pk={pk} \
+             hippius.guardian_ep=100.64.0.1:7443"
+        );
+        assert!(lc
+            .rebuild_guardian_route(&vm, &facts_with_cmdline(&plain))
+            .is_none());
+        assert!(lc
+            .rebuild_guardian_route(&vm, &facts_with_cmdline("console=hvc0"))
+            .is_none());
+    }
+
+    /// A route is served only for a verified CID whose handle is a tenant,
+    /// records that very CID, is `Launching`/`Running`, and has a guardian.
+    #[test]
+    fn a_guardian_route_needs_a_live_tenant_handle_on_that_exact_cid() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(dir.path());
+        let vm = VmId::new("g-1").unwrap();
+        let route = guardian::GuardianRoute {
+            endpoint: "100.64.0.1:7443".into(),
+            recipe: hippius_types::guardian::LaunchRecipe {
+                ovmf_sha384: vec![1; 48],
+                kernel_sha256: vec![2; 32],
+                initrd_sha256: vec![3; 32],
+                cmdline: "c".into(),
+                vcpus: 1,
+                vcpu_type: "EpycGenoa".into(),
+                guest_features: 1,
+            },
+        };
+        let cid = lc.cids.allocate(&vm).unwrap();
+        assert!(lc.cids.mark_verified(&vm, cid).unwrap());
+        let put = |phase: CvmPhase, profile: DomainProfile, handle_cid: u32| {
+            lc.handles.lock().unwrap().insert(
+                vm.clone(),
+                CvmHandle {
+                    vm_id: vm.clone(),
+                    profile,
+                    domain_id: DomainId::new("hippius-tenant-g-1").unwrap(),
+                    domain_uuid: DomainUuid::generate().unwrap(),
+                    phase,
+                    launch_digest: [0u8; LAUNCH_DIGEST_LEN],
+                    cpu_count: 1,
+                    memory_mb: 512,
+                    data_disk_size_gb: 0,
+                    luks_disk_path: std::path::PathBuf::new(),
+                    cid: handle_cid,
+                    cose_ticket: vec![1],
+                    guardian: Some(route.clone()),
+                },
+            );
+        };
+        for phase in [CvmPhase::Launching, CvmPhase::Running] {
+            put(phase, DomainProfile::Tenant, cid);
+            let b = lc.guardian_route_for_cid(cid).unwrap();
+            assert_eq!((b.vm_id, b.route), (vm.clone(), route.clone()));
+        }
+        for phase in [
+            CvmPhase::Pending,
+            CvmPhase::LaunchPrep,
+            CvmPhase::Stopping,
+            CvmPhase::Stopped,
+            CvmPhase::Failed,
+        ] {
+            put(phase, DomainProfile::Tenant, cid);
+            assert_eq!(
+                lc.guardian_route_for_cid(cid).unwrap_err(),
+                "cid-not-current",
+                "{phase:?}"
+            );
+        }
+        // The Infra attestor never gets a guardian route.
+        put(CvmPhase::Running, DomainProfile::Infra, cid);
+        assert_eq!(
+            lc.guardian_route_for_cid(cid).unwrap_err(),
+            "cid-not-current"
+        );
+        // The handle moved to another CID (re-keyed): the old one is stale.
+        put(CvmPhase::Running, DomainProfile::Tenant, cid + 1);
+        assert_eq!(
+            lc.guardian_route_for_cid(cid).unwrap_err(),
+            "cid-not-current"
+        );
+        // No handle at all for the allocator's owner.
+        lc.handles.lock().unwrap().clear();
+        assert_eq!(
+            lc.guardian_route_for_cid(cid).unwrap_err(),
+            "cid-not-current"
+        );
+    }
+
+    #[test]
+    fn the_asid_gate_refuses_tenants_but_never_the_host_attestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = crate::sev_asid::AsidUsage {
+            capacity: 99,
+            used: 98,
+        };
+        let lc = reclaim_lifecycle(dir.path())
+            .with_asid_source(Arc::new(crate::sev_asid::FixedAsidSource(full)));
+        assert!(matches!(
+            lc.check_asid_budget(DomainProfile::Tenant),
+            Err(MinerAgentError::InsufficientResources)
+        ));
+        assert!(lc.check_asid_budget(DomainProfile::Infra).is_ok());
+        let unknown = reclaim_lifecycle(dir.path()).with_asid_source(Arc::new(
+            crate::sev_asid::FixedAsidSource(crate::sev_asid::AsidUsage::default()),
+        ));
+        assert!(unknown.check_asid_budget(DomainProfile::Tenant).is_ok());
+    }
+
+    #[test]
+    fn asid_reservations_stop_concurrent_preflights_at_the_pool_edge() {
+        // 99 capacity, 96 in use: tenants may reach 98 (one kept back).
+        let dir = tempfile::tempdir().unwrap();
+        let usage = crate::sev_asid::AsidUsage {
+            capacity: 99,
+            used: 96,
+        };
+        let lc = reclaim_lifecycle(dir.path())
+            .with_asid_source(Arc::new(crate::sev_asid::FixedAsidSource(usage)));
+        let vm = |n: &str| crate::VmId::new(n).unwrap();
+        lc.reserve_asid(&vm("a"), DomainProfile::Tenant).unwrap(); // 97
+        lc.reserve_asid(&vm("b"), DomainProfile::Tenant).unwrap(); // 98
+        assert!(matches!(
+            lc.reserve_asid(&vm("c"), DomainProfile::Tenant),
+            Err(MinerAgentError::InsufficientResources)
+        ));
+        // A repeat for the same VM refreshes, it does not count twice.
+        lc.reserve_asid(&vm("b"), DomainProfile::Tenant).unwrap();
+        // The attestor is never gated, and takes no reservation.
+        lc.reserve_asid(&vm("attestor"), DomainProfile::Infra)
+            .unwrap();
+        // A finished launch frees its promise.
+        lc.release_asid_reservation(&vm("a"));
+        lc.reserve_asid(&vm("c"), DomainProfile::Tenant).unwrap();
     }
 
     #[tokio::test]
@@ -2076,7 +3555,10 @@ mod tests {
 
         // No handle: the VM was already stopped, exactly as §24 leaves it.
         assert!(lifecycle.list().await.unwrap().is_empty());
-        lifecycle.destroy(&vm).await.expect("destroy must succeed");
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
 
         assert!(!overlay.exists(), "the overlay must be reclaimed");
         assert!(!state.exists(), "the state disk must be reclaimed");
@@ -2115,11 +3597,80 @@ mod tests {
             std::fs::write(staging.join(name), b"old-scheme-artifact").unwrap();
         }
 
-        lifecycle.destroy(&vm).await.expect("destroy must succeed");
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
 
         assert!(
             !staging.exists(),
             "a VM staged under the OLD scheme became unreclaimable by §24"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_reclaims_the_vm_backup_work_dir_and_nothing_beside_it() {
+        // Seen live 2026-09-24: a test VM's `backup/<vm_id>` survived its §24.
+        // The work dir is the ONLY leftover here, so this also proves it
+        // counts as a footprint (no early "nothing to reclaim" bail), and
+        // that a sibling VM's work dir and the backup root are untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = reclaim_lifecycle(dir.path());
+        let vm = VmId::new("tenant-backed-up").unwrap();
+
+        // Literal paths, not `backup_dir()`: a test that derives the path
+        // the way the code does would follow any change to it.
+        let root = dir.path().join("backup");
+        let work = root.join("tenant-backed-up");
+        let restore = work.join("restore");
+        std::fs::create_dir_all(&restore).unwrap();
+        std::fs::write(work.join("inflight.json"), b"{}").unwrap();
+        std::fs::write(restore.join("0000.full.raw"), b"piece").unwrap();
+        let sibling = root.join("tenant-other");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("inflight.json"), b"{}").unwrap();
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
+
+        assert!(
+            work.symlink_metadata().is_err(),
+            "the VM's backup work dir was stranded"
+        );
+        assert!(root.is_dir(), "the backup ROOT must never be removed");
+        assert!(
+            sibling.join("inflight.json").exists(),
+            "another VM's backup work dir must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_unlinks_a_symlinked_backup_work_dir_as_a_link() {
+        // A per-VM backup entry that is a SYMLINK is removed as a link;
+        // what it points at is never walked.
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = reclaim_lifecycle(dir.path());
+        let vm = VmId::new("tenant-linked").unwrap();
+
+        let target = dir.path().join("shared");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.img"), b"shared").unwrap();
+        let root = dir.path().join("backup");
+        std::fs::create_dir_all(&root).unwrap();
+        let work = root.join("tenant-linked");
+        std::os::unix::fs::symlink(&target, &work).unwrap();
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
+
+        assert!(work.symlink_metadata().is_err(), "the link must be removed");
+        assert!(
+            target.join("keep.img").exists(),
+            "the link target must be untouched"
         );
     }
 
@@ -2140,7 +3691,10 @@ mod tests {
         assert!(!staging.exists(), "precondition: the link dangles");
         assert!(staging.symlink_metadata().is_ok());
 
-        lifecycle.destroy(&vm).await.expect("destroy must succeed");
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
 
         assert!(
             staging.symlink_metadata().is_err(),
@@ -2231,7 +3785,7 @@ mod tests {
         // No handle, no files anywhere: nothing to reclaim, so libvirt is
         // never consulted and the destroy succeeds.
         lifecycle
-            .destroy(&vm)
+            .destroy(&vm, None)
             .await
             .expect("a misrouted destroy must stay a no-op, dark libvirt or not");
     }
@@ -2292,7 +3846,7 @@ mod tests {
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"POSSIBLY LIVE GUEST DATA").unwrap();
 
-        let err = lifecycle.destroy(&vm).await.unwrap_err();
+        let err = lifecycle.destroy(&vm, None).await.unwrap_err();
         assert!(
             matches!(err, MinerAgentError::Destroy("domain-still-up")),
             "an unknowable domain must fail closed, not be assumed down"
@@ -2317,6 +3871,7 @@ mod tests {
         let domain =
             crate::lifecycle::libvirt_driver::DomainId::new("hippius-tenant-tenant-live").unwrap();
         driver.seed_domain(domain, DomainState::Running);
+        let driver_probe = driver.clone();
 
         let lifecycle = CvmLifecycle::new(
             driver,
@@ -2335,9 +3890,153 @@ mod tests {
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"LIVE GUEST DATA").unwrap();
 
-        let err = lifecycle.destroy(&vm).await.unwrap_err();
+        let err = lifecycle.destroy(&vm, None).await.unwrap_err();
         assert!(matches!(err, MinerAgentError::Destroy("domain-still-up")));
         assert!(overlay.exists(), "a live guest's disk must NOT be unlinked");
+        assert_eq!(
+            driver_probe.undefine_count(),
+            0,
+            "a live guest's domain must NOT be undefined"
+        );
+    }
+
+    // ── §24 destroy drops the libvirt record ────────────────────────────
+
+    /// A lifecycle over a caller-held mock driver, roots under `dir`.
+    fn reclaim_lifecycle_with(
+        driver: std::sync::Arc<dyn crate::lifecycle::libvirt_driver::LibvirtDriver>,
+        dir: &std::path::Path,
+    ) -> CvmLifecycle {
+        CvmLifecycle::new(
+            driver,
+            std::sync::Arc::new(crate::lifecycle::launch_digest::MockLaunchDigest::fixed(
+                [0u8; 48],
+            )),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 0,
+            },
+        )
+        .with_state_disk_root(dir.to_path_buf())
+    }
+
+    fn tenant_domain(vm: &VmId) -> DomainId {
+        DomainId::new(&format!("hippius-tenant-{}", vm.as_str())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn destroy_undefines_the_domain_after_reclaiming_its_disks() {
+        // A domain that was already shut off when §24 ran stayed defined
+        // forever: only a clean `stop` undefined, and destroy never did.
+        let dir = tempfile::tempdir().unwrap();
+        let driver =
+            std::sync::Arc::new(crate::lifecycle::libvirt_driver::MockLibvirtDriver::new());
+        let vm = VmId::new("tenant-shutoff").unwrap();
+        driver.seed_domain(tenant_domain(&vm), DomainState::ShutOff);
+        let lifecycle = reclaim_lifecycle_with(driver.clone(), dir.path());
+        let overlay = lifecycle.golden_overlay_path(&vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"ciphertext").unwrap();
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
+
+        assert!(!overlay.exists(), "the overlay must be reclaimed");
+        assert_eq!(driver.undefine_count(), 1, "the record must be undefined");
+        assert_eq!(
+            driver.defined_count().unwrap(),
+            0,
+            "no stale definition left"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_undefines_a_shut_off_domain_whose_disks_are_already_gone() {
+        // Seen in production: an earlier destroy
+        // reclaimed every file but left the shut-off definition. With
+        // nothing on disk the early no-op return used to strand it.
+        let dir = tempfile::tempdir().unwrap();
+        let driver =
+            std::sync::Arc::new(crate::lifecycle::libvirt_driver::MockLibvirtDriver::new());
+        let vm = VmId::new("tenant-bare-def").unwrap();
+        driver.seed_domain(tenant_domain(&vm), DomainState::ShutOff);
+        let lifecycle = reclaim_lifecycle_with(driver.clone(), dir.path());
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("destroy must succeed");
+
+        assert_eq!(driver.undefine_count(), 1);
+        assert_eq!(driver.defined_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn destroy_on_a_host_without_the_vm_never_undefines() {
+        // The misroute no-op stays pure: no files and no domain here ⇒ no
+        // libvirt mutation at all.
+        let dir = tempfile::tempdir().unwrap();
+        let driver =
+            std::sync::Arc::new(crate::lifecycle::libvirt_driver::MockLibvirtDriver::new());
+        let lifecycle = reclaim_lifecycle_with(driver.clone(), dir.path());
+        let vm = VmId::new("tenant-not-here").unwrap();
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("a misrouted destroy is a no-op");
+
+        assert_eq!(driver.undefine_count(), 0);
+        assert_eq!(driver.destroy_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_undefine_failure_does_not_fail_the_destroy() {
+        // Data death already happened; failing here would pin the VM in
+        // Decommissioning for a leftover libvirt record.
+        struct UndefineFails(crate::lifecycle::libvirt_driver::MockLibvirtDriver);
+        #[async_trait::async_trait]
+        impl crate::lifecycle::libvirt_driver::LibvirtDriver for UndefineFails {
+            async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+                self.0.define_domain(xml).await
+            }
+            async fn create_domain(&self, id: &DomainId) -> Result<()> {
+                self.0.create_domain(id).await
+            }
+            async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
+                self.0.destroy_domain(id, graceful).await
+            }
+            async fn undefine_domain(&self, _id: &DomainId) -> Result<()> {
+                Err(MinerAgentError::LibvirtDriver("undefine"))
+            }
+            async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+                self.0.query_domain_state(id).await
+            }
+            async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+                self.0.list_domains().await
+            }
+            async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+                self.0.domain_xml(id).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let inner = crate::lifecycle::libvirt_driver::MockLibvirtDriver::new();
+        let vm = VmId::new("tenant-undef-err").unwrap();
+        inner.seed_domain(tenant_domain(&vm), DomainState::ShutOff);
+        let lifecycle =
+            reclaim_lifecycle_with(std::sync::Arc::new(UndefineFails(inner)), dir.path());
+        let overlay = lifecycle.golden_overlay_path(&vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"ciphertext").unwrap();
+
+        lifecycle
+            .destroy(&vm, None)
+            .await
+            .expect("an undefine error must not fail the destroy");
+        assert!(!overlay.exists(), "the reclaim still happened");
     }
 
     #[test]
@@ -2390,9 +4089,10 @@ mod tests {
         let handles = HashMap::new();
         // 128 GiB requested against a 64 GiB declared budget → reject
         // BEFORE the (sparse) disk is even created.
+        // Its own class — a full disk is not a full host.
         assert!(matches!(
             check_capacity(&handles, host, 1, 1024, 128),
-            Err(MinerAgentError::InsufficientResources)
+            Err(MinerAgentError::InsufficientDisk)
         ));
         // Exactly at the budget is admitted.
         assert!(check_capacity(&handles, host, 1, 1024, 64).is_ok());
@@ -2411,5 +4111,17 @@ mod tests {
         };
         let handles = HashMap::new();
         assert!(check_capacity(&handles, host, 1, 1024, 1_000_000).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cid_check_tests {
+    use super::*;
+
+    #[test]
+    fn cid_check_backoff_doubles_then_caps() {
+        let secs: Vec<u64> = (1..=10).map(|n| CidCheck::backoff(n).as_secs()).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 80, 120, 120, 120, 120, 120]);
+        assert_eq!(CidCheck::backoff(u32::MAX), CID_VERIFY_MAX_BACKOFF);
     }
 }

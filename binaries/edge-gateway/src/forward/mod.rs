@@ -47,7 +47,7 @@ pub use kbs_forward::ReqwestForwardClient;
 pub use miner_forward::{
     MinerForward, MinerForwardError, MinerForwardResponse, MockMinerForward, OrderKind,
     RecordedMinerForward, RecordedStatusForward, ReqwestMinerForward, MAX_MINER_ORDER_BODY,
-    MAX_MINER_RESPONSE_BYTES,
+    MAX_MINER_RESPONSE_BYTES, MAX_MULTIPART_ORDER_BODY, MAX_MULTIPART_STATUS_RESPONSE_BYTES,
 };
 
 use crate::stages::envelope::ValidatedEnvelope;

@@ -1,0 +1,41 @@
+{
+  "disk_mode": "golden_verity_overlay",
+  "rootfs_img_path": "/work/out/golden-x.rootfs.img",
+  "rootfs_img_sha256": "fa2b05ae8c7ba6396a43de0385b980e71fd8ec5a5c108c9f3c618e62cece263a",
+  "rootfs_img_size_bytes": 4096,
+  "rootfs_verity_path": "/work/out/golden-x.rootfs.verity",
+  "rootfs_verity_sha256": "9198745c7b15b5736678c6c8ed0947a88e815db56f9d96a3ac874c675d8b3efe",
+  "rootfs_verity_size_bytes": 8192,
+  "verity_root_hash": "abababababababababababababababababababababababababababababababab",
+  "verity_salt": "0000000000000000000000000000000000000000000000000000000000000000",
+  "verity_uuid": "00000000-0000-0000-0000-000000000000",
+  "verity_hash_alg": "sha256",
+  "verity_data_block_size": 4096,
+  "verity_hash_block_size": 4096,
+  "base_image_url": "https://example.invalid/base.img",
+  "base_image_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "kbs_url": "vsock://2:19266",
+  "kernel_sha256": "8c59d24901a52d06309a37b57859c868bee30b6f5d67b0228eaf0404f41bae0b",
+  "initrd_sha256": "1398b3a99cf2ddfe9a4aebc2ed47eb995646ed51633713ded11d952c71a17ac0",
+  "initrd_rebuild": {
+    "source_bake_id": "fixture-bake",
+    "source_location": "s3://hippius-compute-images/golden/fixture-bake",
+    "source_initrd_sha256": "1560afe0daf208a5390732df6a8bf939046941fdf5891b79dec495f482fe7908",
+    "source_measurement_sha256": "bd0af2ab41c1b5d536ccf2830dde8f6000df3eb0164e743993d63176ddfc1385",
+    "repo_commit": "0123456789abcdef0123456789abcdef01234567",
+    "source_date_epoch": 86400,
+    "kernel_version": "6.12.99+deb13-amd64",
+    "family": "debian",
+    "inputs_sha256": {
+      "hippius-golden-boot": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-golden-hook": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-golden-overlay.sh": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-luks-hook": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-luks-keyscript": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-net-teardown": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hippius-release-core.sh": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "tool": "scripts/tenant-initrd-rebuild.sh",
+    "tool_sha256": "fe007f91c77f074aa1d8d203efd977a600153f63459c38e2d39f26e3cecbddaa"
+  }
+}

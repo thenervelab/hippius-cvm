@@ -1,0 +1,39 @@
+---
+# needrestart: never restart the miner-agent or libvirt after an apt
+# run. Tasks file imported by 06-miner-bootstrap.yml play "02".
+#
+# The hypervisor blacklist (unattended-upgrades.yml) stops QEMU/libvirt
+# themselves from being upgraded unattended, but not a library they map:
+# when unattended-upgrades upgrades e.g. libc or OpenSSL, needrestart
+# (Ubuntu mode under apt: restart without asking) restarts every service
+# still mapping the old copy, the miner-agent included, mid-day; a host
+# carrying an exclusion ran the same upgrade with its agent untouched.
+# Tenant CVMs survive an agent restart, but the agent drops
+# its orders socket, vsock relays and in-flight work for the duration.
+#
+# Every other service keeps its automatic restart. Restarting the
+# excluded ones stays an operator action.
+#
+# Apply alone, one host at a time:
+#   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+#     --limit <miner> --tags miner_needrestart --check --diff
+
+- name: Install the needrestart service exclusions
+  tags: [miner_needrestart]
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/miner-tasks/files/needrestart-50-hippius.conf"
+    dest: /etc/needrestart/conf.d/50-hippius.conf
+    owner: root
+    group: root
+    mode: "0644"
+    # needrestart evals conf.d/*.conf as Perl and dies on a parse error,
+    # which would fail every later apt run that calls it.
+    validate: /usr/bin/perl -c %s
+
+# Hand-placed on some miners before this play existed; 50-hippius.conf
+# carries the same rule.
+- name: Remove the superseded hand-placed agent exclusion
+  tags: [miner_needrestart]
+  ansible.builtin.file:
+    path: /etc/needrestart/conf.d/90-hippius-miner-agent.conf
+    state: absent

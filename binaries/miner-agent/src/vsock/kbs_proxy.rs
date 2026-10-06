@@ -38,14 +38,28 @@
 //! Each destination is a separate [`KbsBackend`] so an absent `[lifecycle]`
 //! config simply means the stopped-ack path is refused (`no-vali-backend`)
 //! — never an SSRF into an unconfigured host.
+//!
+//! ## Custody-lease paths
+//!
+//! The guest custody daemon's bind/renew/rekey
+//! ([`hippius_types::kbs_vsock::CUSTODY_PATHS`]) go to the KBS like the
+//! release exchange, but behind their own switch (`[kbs].custody_relay`,
+//! default off ⇒ answered locally `503 custody-disabled`, never
+//! forwarded) and a per-VM token bucket ([`CustodyRelayGate`]). The
+//! answers are real [`KbsProxyResponse`]s rather than dropped
+//! connections so the daemon sees a definite "retry later"; any non-200
+//! leaves its state unchanged, so a local answer can never suspend or
+//! power off a guest.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use hippius_types::custody::retry_reason;
 use hippius_types::kbs_vsock::{
-    is_allowed_path, is_lifecycle_path, KbsProxyRequest, KbsProxyResponse, MAX_REQUEST_BYTES,
-    MAX_RESPONSE_BYTES,
+    is_allowed_path, is_custody_path, is_lifecycle_path, split_query, KbsProxyRequest,
+    KbsProxyResponse, CUSTODY_PATHS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 use serde_bytes::ByteBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -83,6 +97,134 @@ pub struct ProxyBackends {
     /// open: absent ⇒ no reporting; a send error never affects the
     /// release exchange (see [`super::vm_progress`]).
     pub progress: Option<Arc<dyn VmProgressSink>>,
+    /// The custody-lease relay gate. `None` ⇒ `[kbs].custody_relay` is
+    /// off: custody paths are answered locally `503 custody-disabled`
+    /// and never reach the KBS.
+    pub custody: Option<Arc<CustodyRelayGate>>,
+}
+
+/// Custody requests a single VM may burst before the bucket empties.
+///
+/// A healthy daemon renews once per interval (minutes), every 60 s while
+/// suspended, plus a bind per boot / daemon restart / KBS restart and one
+/// rekey per resume — a handful per minute at the very worst. 12 absorbs
+/// a boot where the bind retries on a flaky KDS plus the first renews.
+pub const CUSTODY_BURST: u32 = 12;
+
+/// One custody token is refilled per this interval (6 per minute): above
+/// every honest cadence, far below what would let one tenant turn the
+/// relay into a KBS load generator. The global
+/// `MAX_INFLIGHT_GUEST_CONNS` cap still applies on top.
+pub const CUSTODY_REFILL_EVERY: Duration = Duration::from_secs(10);
+
+/// Most VMs tracked at once. A host runs far fewer VMs than this; the
+/// bound only stops the map from growing without limit.
+pub const CUSTODY_MAX_TRACKED_VMS: usize = 1024;
+
+/// Per-VM token bucket for the custody paths.
+///
+/// Keyed by `vm_id`, not by vsock CID: CIDs are recycled across VMs, and
+/// per-CID state is exactly what let a dead VM's ticket reach the next
+/// owner of its CID (#1126). A bucket idle long enough to have refilled
+/// completely is indistinguishable from a fresh one, so it is dropped —
+/// that is the eviction bound, and it costs nothing in enforcement.
+///
+/// The guardian relay reuses it with its own rate
+/// ([`CustodyRelayGate::with_rate`]).
+pub struct CustodyRelayGate {
+    buckets: Mutex<HashMap<String, Bucket>>,
+    burst: u32,
+    refill_every: Duration,
+}
+
+struct Bucket {
+    tokens: u32,
+    refilled_at: Instant,
+}
+
+impl Bucket {
+    /// Credit the whole intervals elapsed since `refilled_at`, capped at
+    /// the burst. The remainder carries over so a steady caller is not
+    /// shortchanged by rounding.
+    fn refill(&mut self, now: Instant, burst: u32, refill_every: Duration) {
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let whole = elapsed.as_secs() / refill_every.as_secs().max(1);
+        if whole == 0 {
+            return;
+        }
+        let credited = u32::try_from(whole).unwrap_or(u32::MAX);
+        self.tokens = self.tokens.saturating_add(credited).min(burst);
+        self.refilled_at = if self.tokens == burst {
+            now
+        } else {
+            self.refilled_at + refill_every * credited
+        };
+    }
+}
+
+impl Default for CustodyRelayGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CustodyRelayGate {
+    pub fn new() -> Self {
+        Self::with_rate(CUSTODY_BURST, CUSTODY_REFILL_EVERY)
+    }
+
+    /// A gate with its own burst and refill interval (whole seconds; a
+    /// sub-second interval is treated as one second).
+    pub fn with_rate(burst: u32, refill_every: Duration) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            burst,
+            refill_every,
+        }
+    }
+
+    /// Take one custody token for `vm_id` at `now`. `false` ⇒ the VM is
+    /// over its rate and the request must be answered locally.
+    pub fn try_acquire(&self, vm_id: &str, now: Instant) -> bool {
+        // A poisoned lock means another relay task panicked mid-update;
+        // refuse (the guest retries) rather than relay unmetered.
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return false;
+        };
+        if !buckets.contains_key(vm_id) && buckets.len() >= CUSTODY_MAX_TRACKED_VMS {
+            // Drop every bucket that would be FULL if refilled now — it
+            // is indistinguishable from a fresh one.
+            buckets.retain(|_, b| {
+                let mut probe = Bucket {
+                    tokens: b.tokens,
+                    refilled_at: b.refilled_at,
+                };
+                probe.refill(now, self.burst, self.refill_every);
+                probe.tokens < self.burst
+            });
+            if buckets.len() >= CUSTODY_MAX_TRACKED_VMS {
+                // Every tracked VM is actively draining its bucket. Refuse
+                // the newcomer rather than evict a live bucket (which would
+                // hand that VM a fresh burst).
+                return false;
+            }
+        }
+        let bucket = buckets.entry(vm_id.to_string()).or_insert(Bucket {
+            tokens: self.burst,
+            refilled_at: now,
+        });
+        bucket.refill(now, self.burst, self.refill_every);
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
+    }
+
+    /// Number of VMs currently tracked (tests / diagnostics).
+    pub fn tracked(&self) -> usize {
+        self.buckets.lock().map(|b| b.len()).unwrap_or(0)
+    }
 }
 
 /// Production [`KbsBackend`] — a `reqwest` client with built-in roots
@@ -208,6 +350,24 @@ where
     if !is_allowed_path(&req.path) {
         return KbsProxyOutcome::Refused("path-forbidden");
     }
+    // Custody paths: gated and rate-limited, and ANSWERED locally when
+    // refused (the daemon needs a definite non-200, not a hang-up).
+    let custody_path = custody_path_component(&req.path);
+    if let Some(path) = custody_path {
+        let Some(gate) = backends.custody.as_deref() else {
+            return answer_locally(&mut stream, path, 503, retry_reason::DISABLED).await;
+        };
+        // Custody is per-VM state: a CID the agent cannot attribute (held
+        // on an unconfirmed re-adoption record) gets a retryable answer,
+        // never a shared bucket. The daemon retries; once the CID is
+        // verified it is attributed.
+        let Some(vm_id) = vm_id else {
+            return answer_locally(&mut stream, path, 503, retry_reason::UNAVAILABLE).await;
+        };
+        if !gate.try_acquire(vm_id, Instant::now()) {
+            return answer_locally(&mut stream, path, 429, "rate-limited").await;
+        }
+    }
     // Route by path: the stopped-ack ingress goes to vali, everything
     // else (the KBS paths) to the KBS. The miner NEVER decodes the body
     // either way (§5.6) — it forwards opaque bytes + the verbatim query.
@@ -265,7 +425,50 @@ where
         return KbsProxyOutcome::Refused("write");
     }
     let _ = stream.shutdown().await;
-    KbsProxyOutcome::Forwarded { status }
+    match custody_path {
+        Some(path) => KbsProxyOutcome::CustodyForwarded { path, status },
+        None => KbsProxyOutcome::Forwarded { status },
+    }
+}
+
+/// The `'static` custody path component `path` names, if any — lets the
+/// outcome carry it into the log line without echoing request bytes.
+fn custody_path_component(path: &str) -> Option<&'static str> {
+    if !is_custody_path(path) {
+        return None;
+    }
+    let (component, _query) = split_query(path);
+    CUSTODY_PATHS.iter().copied().find(|p| *p == component)
+}
+
+/// Answer a custody request from the agent itself with `status` and a
+/// closed-vocabulary `class` body — nothing reaches the KBS.
+async fn answer_locally<S>(
+    stream: &mut S,
+    path: &'static str,
+    status: u16,
+    class: &'static str,
+) -> KbsProxyOutcome
+where
+    S: AsyncWrite + Unpin,
+{
+    let resp = KbsProxyResponse {
+        status,
+        body: ByteBuf::from(class.as_bytes().to_vec()),
+    };
+    let mut frame = Vec::new();
+    if ciborium::ser::into_writer(&resp, &mut frame).is_err() {
+        return KbsProxyOutcome::Refused("encode");
+    }
+    if write_framed(stream, &frame).await.is_err() {
+        return KbsProxyOutcome::Refused("write");
+    }
+    let _ = stream.shutdown().await;
+    KbsProxyOutcome::CustodyAnswered {
+        path,
+        status,
+        class,
+    }
 }
 
 /// Outcome of one proxied connection — a static classifier for the log
@@ -276,6 +479,15 @@ pub enum KbsProxyOutcome {
     Forwarded { status: u16 },
     /// Dropped before/at forward; carries a static class.
     Refused(&'static str),
+    /// A custody path forwarded to the KBS; carries the path and status.
+    CustodyForwarded { path: &'static str, status: u16 },
+    /// A custody path answered by the agent itself (relay off, or the VM
+    /// over its rate) — never forwarded.
+    CustodyAnswered {
+        path: &'static str,
+        status: u16,
+        class: &'static str,
+    },
 }
 
 async fn read_framed<R>(reader: &mut R, max: usize) -> Result<Vec<u8>, &'static str>
@@ -320,6 +532,22 @@ fn log_proxy(cid: u32, outcome: &KbsProxyOutcome) {
         }
         KbsProxyOutcome::Refused(class) => {
             eprintln!("hippius-miner-agent: kbs-proxy: cid={cid} refused {class}");
+        }
+        KbsProxyOutcome::CustodyForwarded { path, status } => {
+            eprintln!(
+                "hippius-miner-agent: kbs-proxy: cid={cid} custody path={path} \
+                 forwarded status={status}"
+            );
+        }
+        KbsProxyOutcome::CustodyAnswered {
+            path,
+            status,
+            class,
+        } => {
+            eprintln!(
+                "hippius-miner-agent: kbs-proxy: cid={cid} custody path={path} \
+                 answered status={status} {class}"
+            );
         }
     }
 }
@@ -371,8 +599,16 @@ pub async fn run_kbs_proxy_listener(
                 // Only a CID the agent assigned to a live tenant CVM.
                 // Capture the resolved vm_id so a successful KBS release
                 // can be attributed to it in the boot-progress side-channel.
-                let vm_id = match allocator.vm_id_for_cid(src_cid) {
-                    Ok(Some(vm_id)) => vm_id,
+                let vm_id = match allocator.owner_of(src_cid) {
+                    Ok(crate::vsock::CidOwner::Verified(vm_id)) => Some(vm_id),
+                    // Held on an unconfirmed re-adoption record: the guest
+                    // behind it may not be that VM, so nothing is ATTRIBUTED
+                    // to it — but the release is still forwarded. The KBS
+                    // authorises on the SNP attestation + the L1 ticket, not
+                    // on this CID, and the golden initramfs never retries a
+                    // refused release: refusing here would brick a guest the
+                    // agent restarted under mid-boot.
+                    Ok(crate::vsock::CidOwner::Unverified(_)) => None,
                     _ => {
                         log_proxy(src_cid, &KbsProxyOutcome::Refused("unknown-cid"));
                         drop(stream);
@@ -383,7 +619,8 @@ pub async fn run_kbs_proxy_listener(
                 conns.spawn(async move {
                     let _permit = permit;
                     let outcome =
-                        handle_kbs_proxy_conn(stream, backends.as_ref(), Some(vm_id.as_str())).await;
+                        handle_kbs_proxy_conn(stream, backends.as_ref(), vm_id.as_ref().map(|v| v.as_str()))
+                            .await;
                     log_proxy(src_cid, &outcome);
                 });
             }
@@ -443,6 +680,7 @@ mod tests {
             kbs,
             vali: None,
             progress: None,
+            custody: None,
         }
     }
 
@@ -452,6 +690,7 @@ mod tests {
             kbs,
             vali: Some(vali),
             progress: None,
+            custody: None,
         }
     }
 
@@ -465,6 +704,7 @@ mod tests {
             kbs,
             vali: None,
             progress: Some(progress),
+            custody: None,
         }
     }
 
@@ -694,6 +934,7 @@ mod tests {
             kbs: Arc::new(PanicBackend),
             vali: Some(vali),
             progress: Some(sink.clone()),
+            custody: None,
         };
         let (outcome, _) = exchange_with_vm(&req, backends, Some("vm-eol")).await;
         assert_eq!(outcome, KbsProxyOutcome::Forwarded { status: 202 });
@@ -715,5 +956,197 @@ mod tests {
         };
         let (outcome, _) = exchange(&req, kbs_only(Arc::new(PanicBackend))).await;
         assert_eq!(outcome, KbsProxyOutcome::Refused("no-vali-backend"));
+    }
+
+    // --- custody-lease paths ---
+
+    fn custody_req(path: &str) -> KbsProxyRequest {
+        KbsProxyRequest {
+            path: path.to_string(),
+            body: ByteBuf::from(vec![0xa1u8, 0x01, 0x02]),
+        }
+    }
+
+    fn with_custody(kbs: Arc<dyn KbsBackend>, vali: Arc<dyn KbsBackend>) -> ProxyBackends {
+        ProxyBackends {
+            kbs,
+            vali: Some(vali),
+            progress: None,
+            custody: Some(Arc::new(CustodyRelayGate::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_paths_are_answered_locally_503_when_the_relay_is_off() {
+        for path in CUSTODY_PATHS {
+            // Relay off (`custody: None`): NEITHER backend may be touched,
+            // and the guest gets a definite 503, not a hang-up.
+            let (outcome, resp) = exchange_with_vm(
+                &custody_req(path),
+                both(Arc::new(PanicBackend), Arc::new(PanicBackend)),
+                Some("vm-c"),
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                KbsProxyOutcome::CustodyAnswered {
+                    path,
+                    status: 503,
+                    class: retry_reason::DISABLED,
+                }
+            );
+            let resp = resp.unwrap();
+            assert_eq!(resp.status, 503);
+            assert_eq!(resp.body.into_vec(), b"custody-disabled".to_vec());
+        }
+    }
+
+    #[tokio::test]
+    async fn non_custody_paths_are_unaffected_by_the_custody_switch() {
+        // Same release request, relay off vs on: identical forward.
+        for backends in [
+            |kbs| both(kbs, Arc::new(PanicBackend)),
+            |kbs| with_custody(kbs, Arc::new(PanicBackend)),
+        ] {
+            let kbs = Arc::new(StubBackend::new(200, vec![7u8; 4]));
+            let (outcome, resp) = exchange_with_vm(
+                &custody_req("/v1/kbs/release"),
+                backends(kbs.clone()),
+                Some("vm-c"),
+            )
+            .await;
+            assert_eq!(outcome, KbsProxyOutcome::Forwarded { status: 200 });
+            assert_eq!(resp.unwrap().body.into_vec(), vec![7u8; 4]);
+            assert_eq!(
+                kbs.seen.lock().unwrap().as_ref().unwrap().0,
+                "/v1/kbs/release"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_paths_are_forwarded_to_the_kbs_verbatim_when_the_relay_is_on() {
+        for path in CUSTODY_PATHS {
+            let kbs = Arc::new(StubBackend::new(200, vec![9u8; 8]));
+            let req = custody_req(path);
+            let (outcome, resp) = exchange_with_vm(
+                &req,
+                with_custody(kbs.clone(), Arc::new(PanicBackend)),
+                Some("vm-c"),
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                KbsProxyOutcome::CustodyForwarded { path, status: 200 }
+            );
+            let resp = resp.unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.into_vec(), vec![9u8; 8]);
+            // KBS (not vali), same path, opaque body.
+            let seen = kbs.seen.lock().unwrap().clone().unwrap();
+            assert_eq!(seen.0, *path);
+            assert_eq!(seen.1, req.body.to_vec());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unattributed_custody_request_is_answered_503_without_a_forward() {
+        // A CID held on an unconfirmed re-adoption record reaches the proxy
+        // with no vm_id. Custody is per-VM state: it must neither be
+        // forwarded nor charged to a shared bucket — a definite, retryable
+        // local 503.
+        for path in CUSTODY_PATHS {
+            let (outcome, resp) = exchange_with_vm(
+                &custody_req(path),
+                with_custody(Arc::new(PanicBackend), Arc::new(PanicBackend)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                KbsProxyOutcome::CustodyAnswered {
+                    path,
+                    status: 503,
+                    class: retry_reason::UNAVAILABLE,
+                }
+            );
+            assert_eq!(resp.unwrap().status, 503);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vm_over_its_custody_rate_is_answered_429_without_a_forward() {
+        let gate = Arc::new(CustodyRelayGate::new());
+        let now = Instant::now();
+        for _ in 0..CUSTODY_BURST {
+            assert!(gate.try_acquire("vm-c", now));
+        }
+        let backends = ProxyBackends {
+            kbs: Arc::new(PanicBackend),
+            vali: None,
+            progress: None,
+            custody: Some(gate),
+        };
+        let (outcome, resp) = exchange_with_vm(
+            &custody_req(hippius_types::kbs_vsock::KBS_CUSTODY_RENEW_PATH),
+            backends,
+            Some("vm-c"),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            KbsProxyOutcome::CustodyAnswered {
+                path: hippius_types::kbs_vsock::KBS_CUSTODY_RENEW_PATH,
+                status: 429,
+                class: "rate-limited",
+            }
+        );
+        assert_eq!(resp.unwrap().status, 429);
+    }
+
+    #[test]
+    fn custody_buckets_are_per_vm_and_refill_one_token_per_interval() {
+        let gate = CustodyRelayGate::new();
+        let t0 = Instant::now();
+        for _ in 0..CUSTODY_BURST {
+            assert!(gate.try_acquire("vm-a", t0));
+        }
+        assert!(!gate.try_acquire("vm-a", t0), "burst exhausted");
+        // Another VM is untouched by vm-a's exhaustion.
+        assert!(gate.try_acquire("vm-b", t0));
+        // Just under one interval: still empty.
+        assert!(!gate.try_acquire("vm-a", t0 + CUSTODY_REFILL_EVERY - Duration::from_millis(1)));
+        // One interval: exactly one token back, not more.
+        let t1 = t0 + CUSTODY_REFILL_EVERY;
+        assert!(gate.try_acquire("vm-a", t1));
+        assert!(!gate.try_acquire("vm-a", t1));
+        // A long idle refills to the burst, never beyond it.
+        let t2 = t1 + CUSTODY_REFILL_EVERY * 1000;
+        for _ in 0..CUSTODY_BURST {
+            assert!(gate.try_acquire("vm-a", t2));
+        }
+        assert!(!gate.try_acquire("vm-a", t2));
+    }
+
+    #[test]
+    fn custody_tracking_is_bounded_and_evicts_only_refilled_buckets() {
+        let gate = CustodyRelayGate::new();
+        let t0 = Instant::now();
+        for i in 0..CUSTODY_MAX_TRACKED_VMS {
+            assert!(gate.try_acquire(&format!("vm-{i}"), t0));
+        }
+        assert_eq!(gate.tracked(), CUSTODY_MAX_TRACKED_VMS);
+        // Every tracked bucket is still draining: a newcomer is refused
+        // rather than evicting a live bucket, and the map does not grow.
+        assert!(!gate.try_acquire("vm-new", t0));
+        assert_eq!(gate.tracked(), CUSTODY_MAX_TRACKED_VMS);
+        // Each tracked VM spent ONE token, so one refill interval makes
+        // every bucket full again — indistinguishable from a fresh one —
+        // and they are all dropped for the newcomer. Not a moment before.
+        let almost = t0 + CUSTODY_REFILL_EVERY - Duration::from_millis(1);
+        assert!(!gate.try_acquire("vm-new", almost));
+        let later = t0 + CUSTODY_REFILL_EVERY;
+        assert!(gate.try_acquire("vm-new", later));
+        assert_eq!(gate.tracked(), 1);
     }
 }

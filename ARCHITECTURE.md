@@ -1,7 +1,7 @@
 # Hippius DePIN compute control plane — architecture (reconciled + hardened)
 
 Status: **design of record, no code yet**. Reconciles the original cahier des
-charges (Gemini DePIN spec) with the deployed infra and every locked decision,
+charges (DePIN spec) with the deployed infra and every locked decision,
 then hardened with the findings of an independent security review (see issue
 #1 comments). The live tracking issue is in this repo.
 
@@ -815,12 +815,24 @@ out of that ticket. This sub-section pins HOW the COSE bytes reach
 the agent.
 
 **Rule: per-launch tenant data may never ride a §22-measured surface.**
-The kernel cmdline and any QEMU `-fw_cfg` blob both fold into the
-AMD-SP `snp_launch_digest`. Per-launch ticket bytes there would
-explode the §22 allowlist (one entry per launch — operationally
-untenable at marketplace scale). The ticket therefore flows through
-a **runtime, measurement-neutral channel**: AF_VSOCK push from the
-host (miner-agent) to the guest (initramfs agent).
+The kernel cmdline folds into the AMD-SP `snp_launch_digest` (with
+`kernel-hashes=on`, so do the kernel and initrd it names). Per-launch
+ticket bytes there would explode the §22 allowlist (one entry per
+launch — operationally untenable at marketplace scale). The ticket
+therefore flows through a **runtime, measurement-neutral channel**:
+AF_VSOCK push from the host (miner-agent) to the guest (initramfs
+agent).
+
+**Corollary — arbitrary host-added `-fw_cfg` blobs and SMBIOS strings
+are NOT measured.** Only the kernel-hashes table (kernel/initrd/cmdline)
+and the OVMF image are in the launch digest; any other `-fw_cfg opt/...`
+entry or SMBIOS OEM string the untrusted miner adds is fetched by the
+guest AFTER launch and never reaches `snp_launch_digest`. That is why a
+guest must not trust these surfaces: systemd's native credential import
+(`io.systemd.credential:*` via SMBIOS type 11 / fw_cfg — root ssh keys,
+`tmpfiles.extra`, `fstab.extra`) is disabled with the measured cmdline
+token `systemd.import_credentials=no`, and cloud-init is pinned to the
+tmpfs seed (see `scripts/tenant-image-bake.sh` M0 hardening).
 
 **Channel.** AF_VSOCK; host CID `2` (ABI-reserved); guest CID
 assigned by `binaries/miner-agent/src/vsock/peer.rs::CidAllocator`

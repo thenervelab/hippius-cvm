@@ -7,7 +7,7 @@ healthy was `orchestration.effects.poll_domain_running` — which asks the
 miner whether a **libvirt domain** is Live. That is a statement about a
 QEMU process, not about the guest inside it.
 
-Proved live on miner-2 (2026-08-12): a golden VM whose §22 measurement
+Proved live in production (2026-08-12): a golden VM whose §22 measurement
 had been evicted from the allowlist rebooted, its KEK release was refused
 (403), it never unlocked its LUKS overlay and never left the initramfs.
 The libvirt domain stayed `running` the whole time, so vali reported
@@ -31,9 +31,9 @@ exist, and only one is universal across the live fleet:
     Measured on the live fleet 2026-08-12:
 
         p1-liveness-1        live-attestations = 66,     age  ~30 s
-        realtenant-ubuntu-1  live-attestations =  0,     NEVER
+        tenant-vm-1          live-attestations =  0,     NEVER
 
-    `realtenant-ubuntu-1` is a REAL tenant on a pre-keepalive image.
+    `tenant-vm-1` is a REAL tenant on a pre-keepalive image.
     Gating health on keepalive freshness alone would flag it broken —
     a false positive far worse than the bug, because it would drive an
     automated relaunch of a perfectly healthy tenant.
@@ -43,7 +43,7 @@ exist, and only one is universal across the live fleet:
     keepalive image. Measured on the same fleet, the same minute:
 
         p1-liveness-1        served-receipts =    460,   age 14 s
-        realtenant-ubuntu-1  served-receipts = 30 690,   age 47 s
+        tenant-vm-1          served-receipts = 30 690,   age 47 s
 
     Both live tenant VMs emit it, on a ~60 s cadence. It IS universal
     across the fleet as it stands today.

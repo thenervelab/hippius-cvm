@@ -1,5 +1,5 @@
 //! Per-VM monotonic boot counter — Phase 1 of audit follow-up
-//! Codex #2 (LUKS + dm-integrity is not anti-rollback).
+//! Review #2 (LUKS + dm-integrity is not anti-rollback).
 //!
 //! The threat: dm-integrity hmac-sha256 prevents a miner from inventing
 //! NEW valid plaintext sectors, but it does NOT prevent replaying OLD
@@ -56,6 +56,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::error::{KbsError, Result};
+use crate::rollback::{
+    decide_arm, ArmRollbackOutcome, LastRollback, RollbackArm, RollbackClear, RollbackRows,
+    CLEAR_BY_BOOT, CLEAR_DISARMED, CLEAR_EXPIRED,
+};
 
 /// Largest counter [`BootCounterStore::seed`] will accept.
 ///
@@ -386,6 +390,276 @@ pub trait BootCounterStore: Send + Sync {
     /// release path ONLY after `check_only` has already refused, so the
     /// normal path is byte-identical when nothing is armed.
     fn resync_armed(&self, vm_id: &str) -> Result<bool>;
+
+    // ── authorized rollback (A2) — see `crate::rollback` ─────────────
+    //
+    // The arms live in THIS store, behind the SAME lock as the counters,
+    // so the one operation that must be atomic — consume the arm and
+    // commit the counter — is one critical section by construction
+    // (`commit_rollback`). The defaults make a store that does not
+    // implement them fail CLOSED: no arm is ever reported, and every
+    // mutator errors.
+
+    /// The VM's arm (EXPIRED ones included — callers check expiry) and
+    /// its last consumed rollback. Pure read.
+    fn rollback_state(&self, _vm_id: &str) -> Result<(Option<RollbackArm>, Option<LastRollback>)> {
+        Ok((None, None))
+    }
+
+    /// Store `arm` unless [`crate::rollback::decide_arm`] refuses it
+    /// (a live arm, not a rollback against the CURRENT `stored`, or the
+    /// rate limit), all decided under the counter lock. A refusal writes
+    /// nothing.
+    fn arm_rollback(
+        &self,
+        _arm: RollbackArm,
+        _min_interval_s: u64,
+        _now_unix: u64,
+    ) -> Result<ArmRollbackOutcome> {
+        Err(rollback_unsupported())
+    }
+
+    /// Remove `vm_id`'s arm iff it carries `restore_id`. `Ok(None)` when
+    /// there was none (idempotent). The rate-limit memory is kept. With
+    /// `note_at_unix`, the removal is recorded as the VM's `last_clear`
+    /// (`rollback-disarmed`) in the SAME write; `None` for an arm taken
+    /// back before it was ever reported armed.
+    fn disarm_rollback(
+        &self,
+        _vm_id: &str,
+        _restore_id: &str,
+        _note_at_unix: Option<u64>,
+    ) -> Result<Option<RollbackArm>> {
+        Err(rollback_unsupported())
+    }
+
+    /// Remove `vm_id`'s arm whatever its id (lifecycle transitions),
+    /// recording `reason` as its `last_clear` in the same write.
+    fn clear_rollback_arm(
+        &self,
+        _vm_id: &str,
+        _reason: &str,
+        _now_unix: u64,
+    ) -> Result<Option<RollbackArm>> {
+        Ok(None)
+    }
+
+    /// Remove every arm expired at `now_unix`, recording each as its
+    /// VM's `last_clear` (`rollback-expired`) — one write for all of
+    /// them. Returns them for audit.
+    fn purge_expired_rollback_arms(&self, _now_unix: u64) -> Result<Vec<RollbackArm>> {
+        Ok(Vec::new())
+    }
+
+    /// The VM's last arm that left WITHOUT a consume, and why (`GET
+    /// …/rollback` `last_clear`, so vali can tell a normal boot from an
+    /// expiry, a disarm or a fence). Every clear records it atomically
+    /// with the removal itself.
+    fn rollback_last_clear(&self, _vm_id: &str) -> Result<Option<RollbackClear>> {
+        Ok(None)
+    }
+
+    /// The authorized-rollback COMMIT: under the counter lock, re-check
+    /// that `vm_id` still holds the unexpired arm `restore_id` and that
+    /// `value == stored + 1`, then run `apply_stamp` (step (i), the stamp
+    /// store's rollback — it must succeed first), then durably consume
+    /// the arm (recording [`LastRollback`]) BEFORE committing the
+    /// counter to `value` (step (ii)). Any resync arm is cleared too, as
+    /// by [`BootCounterStore::commit`].
+    ///
+    /// Persist order and failures: the arms file is written before the
+    /// counter file, so a failure between them leaves the arm CONSUMED
+    /// and the counter unmoved — the operator re-arms; an arm can never
+    /// outlive the release that used it. When `apply_stamp` fails nothing
+    /// in this store changes.
+    fn commit_rollback(
+        &self,
+        _vm_id: &str,
+        _restore_id: &str,
+        _value: u64,
+        _now_unix: u64,
+        _apply_stamp: &mut dyn FnMut(&RollbackArm) -> Result<()>,
+    ) -> Result<RollbackArm> {
+        Err(rollback_unsupported())
+    }
+
+    /// Run `f` with `vm_id`'s committed counter while holding the store
+    /// lock, so what `f` reads elsewhere (the stamp store) is consistent
+    /// with it: no rollback commit — which holds this lock across its
+    /// stamp and counter writes — can land in between. Lock order:
+    /// counter, then whatever `f` takes.
+    fn with_counter_locked(&self, vm_id: &str, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        f(self.get(vm_id)?)
+    }
+
+    /// [`BootCounterStore::commit`], reporting the rollback arm a normal
+    /// commit cleared (a VM that booted normally after being armed must
+    /// not keep a one-shot rollback permission; `commit` clears it, and
+    /// this variant tells the release path so it can audit it).
+    fn commit_reporting(&self, vm_id: &str, value: u64) -> Result<Option<RollbackArm>> {
+        self.commit(vm_id, value)?;
+        Ok(None)
+    }
+
+    /// [`Self::commit_reporting`] with `guard` evaluated UNDER the store
+    /// lock, after the monotonic check and before any write. The release
+    /// path uses it to refuse a normal commit if an authorized rollback
+    /// touched the stamp since the release read it — a rollback's stamp
+    /// step runs under this same lock, so the two cannot interleave.
+    /// With `clear_at_unix`, a rollback arm the commit clears is recorded
+    /// as the VM's `last_clear` (`rollback-cleared-by-boot`) in the same
+    /// write that removes it.
+    fn commit_reporting_guarded(
+        &self,
+        vm_id: &str,
+        value: u64,
+        _clear_at_unix: Option<u64>,
+        guard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<RollbackArm>> {
+        guard()?;
+        self.commit_reporting(vm_id, value)
+    }
+}
+
+fn rollback_unsupported() -> KbsError {
+    KbsError::Policy("rollback arms are not supported by this boot-counter store".into())
+}
+
+fn lock_poisoned() -> KbsError {
+    KbsError::Policy("boot-counter lock poisoned".into())
+}
+
+// Shared in-memory transitions of the rollback rows, used by BOTH store
+// impls so the file store and the test double cannot disagree.
+
+fn rb_arm(
+    rows: &mut Rows,
+    arm: RollbackArm,
+    min_interval_s: u64,
+    now_unix: u64,
+) -> ArmRollbackOutcome {
+    let stored = rows.counters.get(&arm.vm_id).copied().unwrap_or(0);
+    if let Some(verdict) = decide_arm(&rows.rollback, stored, &arm, min_interval_s, now_unix) {
+        return verdict;
+    }
+    let h = rows.rollback.history.entry(arm.vm_id.clone()).or_default();
+    h.last_event_at_unix = h.last_event_at_unix.max(now_unix);
+    rows.rollback.arms.insert(arm.vm_id.clone(), arm.clone());
+    ArmRollbackOutcome::Armed(arm)
+}
+
+fn rb_note_clear(rows: &mut Rows, vm_id: &str, restore_id: &str, reason: &str, now_unix: u64) {
+    rows.rollback
+        .history
+        .entry(vm_id.to_string())
+        .or_default()
+        .last_clear = Some(RollbackClear {
+        restore_id: restore_id.to_string(),
+        reason: reason.to_string(),
+        at_unix: now_unix,
+    });
+}
+
+fn rb_last_clear(rows: &Rows, vm_id: &str) -> Option<RollbackClear> {
+    rows.rollback
+        .history
+        .get(vm_id)
+        .and_then(|h| h.last_clear.clone())
+}
+
+fn rb_disarm(
+    rows: &mut Rows,
+    vm_id: &str,
+    restore_id: &str,
+    note_at_unix: Option<u64>,
+) -> Option<RollbackArm> {
+    if rows.rollback.arms.get(vm_id)?.restore_id != restore_id {
+        return None;
+    }
+    let arm = rows.rollback.arms.remove(vm_id)?;
+    if let Some(now) = note_at_unix {
+        rb_note_clear(rows, vm_id, restore_id, CLEAR_DISARMED, now);
+    }
+    Some(arm)
+}
+
+/// Remove `vm_id`'s arm whatever its id; record `reason` when one went.
+fn rb_clear(rows: &mut Rows, vm_id: &str, reason: &str, now_unix: u64) -> Option<RollbackArm> {
+    let arm = rows.rollback.arms.remove(vm_id)?;
+    rb_note_clear(rows, vm_id, &arm.restore_id, reason, now_unix);
+    Some(arm)
+}
+
+fn rb_purge(rows: &mut Rows, now_unix: u64) -> Vec<RollbackArm> {
+    let expired: Vec<String> = rows
+        .rollback
+        .arms
+        .iter()
+        .filter(|(_, a)| a.is_expired(now_unix))
+        .map(|(k, _)| k.clone())
+        .collect();
+    expired
+        .iter()
+        .filter_map(|k| rb_clear(rows, k, CLEAR_EXPIRED, now_unix))
+        .collect()
+}
+
+/// Re-validate the arm under the lock; returns it (still stored).
+fn rb_check_for_commit(
+    rows: &Rows,
+    vm_id: &str,
+    restore_id: &str,
+    value: u64,
+    now_unix: u64,
+) -> Result<RollbackArm> {
+    let arm = rows.rollback.arms.get(vm_id).cloned().ok_or_else(|| {
+        KbsError::Policy(format!(
+            "rollback-commit: vm_id={vm_id} has no live arm (consumed, disarmed or cleared \
+             since the release was admitted) — fail closed"
+        ))
+    })?;
+    if arm.restore_id != restore_id {
+        return Err(KbsError::Policy(format!(
+            "rollback-commit: vm_id={vm_id} arm was replaced ({} != {restore_id}) — fail closed",
+            arm.restore_id
+        )));
+    }
+    if arm.is_expired(now_unix) {
+        return Err(KbsError::Policy(format!(
+            "rollback-commit: vm_id={vm_id} arm {restore_id} expired — fail closed"
+        )));
+    }
+    let stored = rows.counters.get(vm_id).copied().unwrap_or(0);
+    // EXACTLY stored + 1: the arm path moves the counter the way one
+    // normal boot does, never further.
+    if Some(value) != stored.checked_add(1) {
+        return Err(KbsError::Policy(format!(
+            "rollback-commit: vm_id={vm_id} value={value} != stored+1 (stored={stored}) \
+             (concurrent advance) — fail closed"
+        )));
+    }
+    Ok(arm)
+}
+
+fn rb_consume(rows: &mut Rows, arm: &RollbackArm, value: u64, now_unix: u64) {
+    rows.rollback.arms.remove(&arm.vm_id);
+    let h = rows.rollback.history.entry(arm.vm_id.clone()).or_default();
+    h.last_event_at_unix = h.last_event_at_unix.max(now_unix);
+    h.consumed_restore_ids.push(arm.restore_id.clone());
+    let excess = h
+        .consumed_restore_ids
+        .len()
+        .saturating_sub(crate::rollback::MAX_CONSUMED_IDS);
+    h.consumed_restore_ids.drain(..excess);
+    h.last_rollback = Some(LastRollback {
+        restore_id: arm.restore_id.clone(),
+        manifest_sha256_hex: arm.manifest_sha256_hex.clone(),
+        from_counter: arm.from_counter,
+        to_counter: value,
+        stamp: arm.to_stamp,
+        consumed_at_unix: now_unix,
+        requested_by: arm.requested_by.clone(),
+    });
 }
 
 /// Both durable maps this store owns, behind ONE lock.
@@ -401,6 +675,10 @@ struct Rows {
     /// `vm_id`s carrying a one-shot resync arm. A `BTreeSet` so the
     /// serialised bytes are deterministic.
     armed: BTreeSet<String>,
+    /// Authorized-rollback arms + per-VM rate-limit memory
+    /// (`crate::rollback`). Behind the SAME lock so the arm consume and
+    /// the counter commit are one critical section.
+    rollback: RollbackRows,
 }
 
 /// File-backed [`BootCounterStore`]. The on-disk format is a JSON
@@ -419,9 +697,15 @@ struct Rows {
 /// to be the safe move. With a sibling file, an older binary simply
 /// ignores it and behaves as it always did: strict, fail-closed. The
 /// only thing lost across a rollback is the ability to CONSUME an arm.
+///
+/// The authorized-rollback arms (`crate::rollback`) follow the same
+/// rule, in a THIRD sibling (`<stem>-rollback-arms.json`, a JSON object
+/// `{arms, history}`): an older binary ignores it and simply cannot
+/// consume an arm, which fails closed.
 pub struct FileBootCounterStore {
     path: PathBuf,
     resync_path: PathBuf,
+    rollback_path: PathBuf,
     cache: Mutex<Rows>,
 }
 
@@ -431,11 +715,21 @@ impl FileBootCounterStore {
     /// operator-facing config key exists to be forgotten in one
     /// environment and not another.
     fn resync_path_for(path: &std::path::Path) -> PathBuf {
+        Self::sibling_path(path, "resync")
+    }
+
+    /// Sibling path holding the rollback arms: `boot-counters.json`
+    /// ⇒ `boot-counters-rollback-arms.json`.
+    fn rollback_path_for(path: &std::path::Path) -> PathBuf {
+        Self::sibling_path(path, "rollback-arms")
+    }
+
+    fn sibling_path(path: &std::path::Path, suffix: &str) -> PathBuf {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("boot-counter");
-        let sibling = format!("{stem}-resync.json");
+        let sibling = format!("{stem}-{suffix}.json");
         match path.parent() {
             Some(dir) => dir.join(sibling),
             None => PathBuf::from(sibling),
@@ -462,11 +756,55 @@ impl FileBootCounterStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
             Err(e) => return Err(KbsError::Vault(format!("boot-counter resync read: {e}"))),
         };
+        // Same discipline for the rollback arms: absent ⇒ none, corrupt ⇒
+        // refuse to open rather than start with a set we cannot vouch for.
+        let rollback_path = Self::rollback_path_for(&path);
+        let rollback = match fs::read(&rollback_path) {
+            Ok(bytes) => serde_json::from_slice::<RollbackRows>(&bytes)
+                .map_err(|e| KbsError::Vault(format!("boot-counter rollback decode: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RollbackRows::default(),
+            Err(e) => return Err(KbsError::Vault(format!("boot-counter rollback read: {e}"))),
+        };
         Ok(Self {
             path,
             resync_path,
-            cache: Mutex::new(Rows { counters, armed }),
+            rollback_path,
+            cache: Mutex::new(Rows {
+                counters,
+                armed,
+                rollback,
+            }),
         })
+    }
+
+    /// Run `f` over the rows and persist the ROLLBACK part if `f`
+    /// changed it — all-or-nothing like the other two files: on a failed
+    /// write the in-memory rollback rows are restored, so memory and the
+    /// file always agree. A no-op writes nothing.
+    fn mutate_rollback_locked<T>(
+        &self,
+        rows: &mut Rows,
+        f: impl FnOnce(&mut Rows) -> T,
+    ) -> Result<T> {
+        let before = rows.rollback.clone();
+        let out = f(rows);
+        if rows.rollback == before {
+            return Ok(out);
+        }
+        let bytes = match serde_json::to_vec(&rows.rollback) {
+            Ok(b) => b,
+            Err(e) => {
+                rows.rollback = before;
+                return Err(KbsError::Vault(format!(
+                    "boot-counter rollback encode: {e}"
+                )));
+            }
+        };
+        if let Err(e) = Self::atomic_write(&self.rollback_path, &bytes, "boot-counter rollback") {
+            rows.rollback = before;
+            return Err(e);
+        }
+        Ok(out)
     }
 
     /// Write `vm_id -> value` through to disk, keeping the in-memory
@@ -556,7 +894,7 @@ impl FileBootCounterStore {
 
     /// tmp + fsync + rename, so a crash between the write and the
     /// rename leaves the live file byte-identical to what it was.
-    fn atomic_write(path: &std::path::Path, bytes: &[u8], what: &str) -> Result<()> {
+    pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8], what: &str) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| KbsError::Vault(format!("{what}: no parent dir")))?;
@@ -611,10 +949,21 @@ impl BootCounterStore for FileBootCounterStore {
     }
 
     fn commit(&self, vm_id: &str, value: u64) -> Result<()> {
-        let mut rows = self
-            .cache
-            .lock()
-            .map_err(|_| KbsError::Policy("boot-counter lock poisoned".into()))?;
+        self.commit_reporting(vm_id, value).map(|_| ())
+    }
+
+    fn commit_reporting(&self, vm_id: &str, value: u64) -> Result<Option<RollbackArm>> {
+        self.commit_reporting_guarded(vm_id, value, None, &mut || Ok(()))
+    }
+
+    fn commit_reporting_guarded(
+        &self,
+        vm_id: &str,
+        value: u64,
+        clear_at_unix: Option<u64>,
+        guard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<RollbackArm>> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
         let stored = rows.counters.get(vm_id).copied().unwrap_or(0);
         if value <= stored {
             return Err(KbsError::Policy(format!(
@@ -622,12 +971,21 @@ impl BootCounterStore for FileBootCounterStore {
                  (concurrent advance) — fail closed"
             )));
         }
-        // Disarm FIRST: see the trait doc. If the counter write then
-        // fails the arm is gone and the counter unmoved, so the operator
-        // re-arms — rather than an arm outliving the release it was
-        // minted for.
+        guard()?;
+        // Disarm FIRST (both kinds): see the trait doc. If the counter
+        // write then fails the arm is gone and the counter unmoved, so
+        // the operator re-arms — rather than an arm outliving the
+        // release it was minted for. A rollback arm is cleared by a
+        // NORMAL boot for the same reason: it was minted for one
+        // specific release, and a VM that booted another way since is
+        // no longer in the state the arm was granted for.
+        let cleared = self.mutate_rollback_locked(&mut rows, |r| match clear_at_unix {
+            Some(now) => rb_clear(r, vm_id, CLEAR_BY_BOOT, now),
+            None => r.rollback.arms.remove(vm_id),
+        })?;
         self.set_armed_and_persist_locked(&mut rows, vm_id, false)?;
-        self.insert_and_persist_locked(&mut rows, vm_id, value)
+        self.insert_and_persist_locked(&mut rows, vm_id, value)?;
+        Ok(cleared)
     }
 
     fn get(&self, vm_id: &str) -> Result<u64> {
@@ -692,6 +1050,87 @@ impl BootCounterStore for FileBootCounterStore {
             .map_err(|_| KbsError::Policy("boot-counter lock poisoned".into()))?;
         Ok(rows.armed.contains(vm_id))
     }
+
+    fn rollback_state(&self, vm_id: &str) -> Result<(Option<RollbackArm>, Option<LastRollback>)> {
+        let rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_state(&rows, vm_id))
+    }
+
+    fn with_counter_locked(&self, vm_id: &str, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        let rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        f(rows.counters.get(vm_id).copied().unwrap_or(0))
+    }
+
+    fn arm_rollback(
+        &self,
+        arm: RollbackArm,
+        min_interval_s: u64,
+        now_unix: u64,
+    ) -> Result<ArmRollbackOutcome> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        self.mutate_rollback_locked(&mut rows, |r| rb_arm(r, arm, min_interval_s, now_unix))
+    }
+
+    fn disarm_rollback(
+        &self,
+        vm_id: &str,
+        restore_id: &str,
+        note_at_unix: Option<u64>,
+    ) -> Result<Option<RollbackArm>> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        self.mutate_rollback_locked(&mut rows, |r| rb_disarm(r, vm_id, restore_id, note_at_unix))
+    }
+
+    fn clear_rollback_arm(
+        &self,
+        vm_id: &str,
+        reason: &str,
+        now_unix: u64,
+    ) -> Result<Option<RollbackArm>> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        self.mutate_rollback_locked(&mut rows, |r| rb_clear(r, vm_id, reason, now_unix))
+    }
+
+    fn purge_expired_rollback_arms(&self, now_unix: u64) -> Result<Vec<RollbackArm>> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        self.mutate_rollback_locked(&mut rows, |r| rb_purge(r, now_unix))
+    }
+
+    fn rollback_last_clear(&self, vm_id: &str) -> Result<Option<RollbackClear>> {
+        let rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_last_clear(&rows, vm_id))
+    }
+
+    fn commit_rollback(
+        &self,
+        vm_id: &str,
+        restore_id: &str,
+        value: u64,
+        now_unix: u64,
+        apply_stamp: &mut dyn FnMut(&RollbackArm) -> Result<()>,
+    ) -> Result<RollbackArm> {
+        let mut rows = self.cache.lock().map_err(|_| lock_poisoned())?;
+        let arm = rb_check_for_commit(&rows, vm_id, restore_id, value, now_unix)?;
+        // (i) the stamp store — under THIS lock, after the arm was
+        // re-validated, so no stale or concurrent release can lower the
+        // stamp for an arm that is no longer live.
+        apply_stamp(&arm)?;
+        // (ii) consume (persisted first), then the counter.
+        self.mutate_rollback_locked(&mut rows, |r| rb_consume(r, &arm, value, now_unix))?;
+        self.set_armed_and_persist_locked(&mut rows, vm_id, false)?;
+        self.insert_and_persist_locked(&mut rows, vm_id, value)?;
+        Ok(arm)
+    }
+}
+
+fn rb_state(rows: &Rows, vm_id: &str) -> (Option<RollbackArm>, Option<LastRollback>) {
+    (
+        rows.rollback.arms.get(vm_id).cloned(),
+        rows.rollback
+            .history
+            .get(vm_id)
+            .and_then(|h| h.last_rollback.clone()),
+    )
 }
 
 /// In-memory test double. Mirrors [`FileBootCounterStore`]'s semantics
@@ -724,10 +1163,21 @@ impl BootCounterStore for InMemoryBootCounterStore {
     }
 
     fn commit(&self, vm_id: &str, value: u64) -> Result<()> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| KbsError::Policy("boot-counter lock poisoned".into()))?;
+        self.commit_reporting(vm_id, value).map(|_| ())
+    }
+
+    fn commit_reporting(&self, vm_id: &str, value: u64) -> Result<Option<RollbackArm>> {
+        self.commit_reporting_guarded(vm_id, value, None, &mut || Ok(()))
+    }
+
+    fn commit_reporting_guarded(
+        &self,
+        vm_id: &str,
+        value: u64,
+        clear_at_unix: Option<u64>,
+        guard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<RollbackArm>> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
         let stored = g.counters.get(vm_id).copied().unwrap_or(0);
         if value <= stored {
             return Err(KbsError::Policy(format!(
@@ -735,11 +1185,17 @@ impl BootCounterStore for InMemoryBootCounterStore {
                  (concurrent advance)"
             )));
         }
-        // A successful commit consumes any arm — same contract as the
-        // file-backed store, or the double would hide a missing disarm.
+        guard()?;
+        // A successful commit consumes any arm (resync AND rollback) —
+        // same contract as the file-backed store, or the double would
+        // hide a missing disarm.
         g.armed.remove(vm_id);
+        let cleared = match clear_at_unix {
+            Some(now) => rb_clear(&mut g, vm_id, CLEAR_BY_BOOT, now),
+            None => g.rollback.arms.remove(vm_id),
+        };
         g.counters.insert(vm_id.to_string(), value);
-        Ok(())
+        Ok(cleared)
     }
 
     fn get(&self, vm_id: &str) -> Result<u64> {
@@ -797,6 +1253,73 @@ impl BootCounterStore for InMemoryBootCounterStore {
             .lock()
             .map_err(|_| KbsError::Policy("boot-counter lock poisoned".into()))?;
         Ok(g.armed.contains(vm_id))
+    }
+
+    fn rollback_state(&self, vm_id: &str) -> Result<(Option<RollbackArm>, Option<LastRollback>)> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_state(&g, vm_id))
+    }
+
+    fn with_counter_locked(&self, vm_id: &str, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        f(g.counters.get(vm_id).copied().unwrap_or(0))
+    }
+
+    fn arm_rollback(
+        &self,
+        arm: RollbackArm,
+        min_interval_s: u64,
+        now_unix: u64,
+    ) -> Result<ArmRollbackOutcome> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_arm(&mut g, arm, min_interval_s, now_unix))
+    }
+
+    fn disarm_rollback(
+        &self,
+        vm_id: &str,
+        restore_id: &str,
+        note_at_unix: Option<u64>,
+    ) -> Result<Option<RollbackArm>> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_disarm(&mut g, vm_id, restore_id, note_at_unix))
+    }
+
+    fn clear_rollback_arm(
+        &self,
+        vm_id: &str,
+        reason: &str,
+        now_unix: u64,
+    ) -> Result<Option<RollbackArm>> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_clear(&mut g, vm_id, reason, now_unix))
+    }
+
+    fn purge_expired_rollback_arms(&self, now_unix: u64) -> Result<Vec<RollbackArm>> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_purge(&mut g, now_unix))
+    }
+
+    fn rollback_last_clear(&self, vm_id: &str) -> Result<Option<RollbackClear>> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(rb_last_clear(&g, vm_id))
+    }
+
+    fn commit_rollback(
+        &self,
+        vm_id: &str,
+        restore_id: &str,
+        value: u64,
+        now_unix: u64,
+        apply_stamp: &mut dyn FnMut(&RollbackArm) -> Result<()>,
+    ) -> Result<RollbackArm> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        let arm = rb_check_for_commit(&g, vm_id, restore_id, value, now_unix)?;
+        apply_stamp(&arm)?;
+        rb_consume(&mut g, &arm, value, now_unix);
+        g.armed.remove(vm_id);
+        g.counters.insert(vm_id.to_string(), value);
+        Ok(arm)
     }
 }
 
@@ -1696,5 +2219,401 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         let parsed: HashMap<String, u64> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.get("vm-z").copied(), Some(1));
+    }
+
+    // ── authorized rollback (A2) arms ────────────────────────────────
+
+    /// Every clear records its reason in the SAME write as the removal:
+    /// expiry (one write for all), disarm, lifecycle, normal boot — and it
+    /// survives a reopen. A take-back (`note_at_unix: None`) records none.
+    #[test]
+    fn every_arm_clear_records_last_clear_atomically_and_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot-counters.json");
+        let reason = |s: &FileBootCounterStore, vm: &str| {
+            s.rollback_last_clear(vm)
+                .unwrap()
+                .map(|c| (c.restore_id, c.reason, c.at_unix))
+        };
+        {
+            let s = FileBootCounterStore::open(&path).unwrap();
+            for vm in ["vm-e", "vm-d", "vm-l", "vm-b", "vm-t"] {
+                s.seed(vm, 5).unwrap();
+                s.arm_rollback(rb_arm_for(vm, "r", 3, 100), 1800, 100)
+                    .unwrap();
+            }
+            let purged = s.purge_expired_rollback_arms(100_000).unwrap();
+            assert_eq!(purged.len(), 5, "every arm expired");
+        }
+        let s = FileBootCounterStore::open(&path).unwrap();
+        assert_eq!(
+            reason(&s, "vm-e"),
+            Some(("r".into(), CLEAR_EXPIRED.into(), 100_000))
+        );
+        for vm in ["vm-d", "vm-l", "vm-b", "vm-t"] {
+            s.arm_rollback(rb_arm_for(vm, "r2", 3, 200_000), 1800, 200_000)
+                .unwrap();
+        }
+        s.disarm_rollback("vm-d", "r2", Some(200_001))
+            .unwrap()
+            .unwrap();
+        s.clear_rollback_arm("vm-l", "rollback-lifecycle-activate", 200_002)
+            .unwrap()
+            .unwrap();
+        s.commit_reporting_guarded("vm-b", 6, Some(200_003), &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        s.disarm_rollback("vm-t", "r2", None).unwrap().unwrap();
+        drop(s);
+        let s = FileBootCounterStore::open(&path).unwrap();
+        assert_eq!(
+            reason(&s, "vm-d"),
+            Some(("r2".into(), CLEAR_DISARMED.into(), 200_001))
+        );
+        assert_eq!(
+            reason(&s, "vm-l"),
+            Some(("r2".into(), "rollback-lifecycle-activate".into(), 200_002))
+        );
+        assert_eq!(
+            reason(&s, "vm-b"),
+            Some(("r2".into(), CLEAR_BY_BOOT.into(), 200_003))
+        );
+        assert_eq!(
+            reason(&s, "vm-t"),
+            Some(("r".into(), CLEAR_EXPIRED.into(), 100_000)),
+            "a take-back records nothing new"
+        );
+    }
+
+    fn rb_arm_for(vm: &str, restore_id: &str, from_counter: u64, now: u64) -> RollbackArm {
+        RollbackArm {
+            vm_id: vm.into(),
+            restore_id: restore_id.into(),
+            manifest_sha256_hex: "ab".repeat(32),
+            new_gen: 2,
+            dest: "aa".into(),
+            from_counter,
+            to_stamp: 1,
+            checkpoint_sha256_hex: "cd".repeat(32),
+            armed_at_unix: now,
+            expires_at_unix: now + 600,
+            requested_by: "tenant:1".into(),
+            armed_by: String::new(),
+        }
+    }
+
+    #[test]
+    fn rollback_arms_live_in_a_sibling_file_and_the_counter_file_keeps_its_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot-counters.json");
+        {
+            let s = FileBootCounterStore::open(&path).unwrap();
+            s.seed("vm-1", 5).unwrap();
+            assert!(matches!(
+                s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                    .unwrap(),
+                ArmRollbackOutcome::Armed(_)
+            ));
+        }
+        // An OLDER binary decodes the counter file strictly as
+        // `{vm_id: u64}` — it must still do so with an arm pending.
+        let counters: HashMap<String, u64> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(counters.get("vm-1"), Some(&5));
+        assert!(dir.path().join("boot-counters-rollback-arms.json").exists());
+        // The arm survives a restart.
+        let s = FileBootCounterStore::open(&path).unwrap();
+        assert_eq!(s.rollback_state("vm-1").unwrap().0.unwrap().restore_id, "r");
+        assert_eq!(s.get("vm-1").unwrap(), 5);
+    }
+
+    #[test]
+    fn a_corrupt_rollback_arms_file_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("boot-counters-rollback-arms.json"),
+            b"{nope",
+        )
+        .unwrap();
+        assert!(FileBootCounterStore::open(dir.path().join("boot-counters.json")).is_err());
+    }
+
+    #[test]
+    fn a_failed_arm_write_leaves_no_arm_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot-counters.json");
+        let s = FileBootCounterStore::open(&path).unwrap();
+        s.seed("vm-1", 5).unwrap();
+        let blocker = dir.path().join(".boot-counters-rollback-arms.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(s
+            .arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+            .is_err());
+        assert!(s.rollback_state("vm-1").unwrap().0.is_none());
+        fs::remove_dir(&blocker).unwrap();
+        // …and the failed attempt did not start the rate-limit clock.
+        assert!(matches!(
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 101), 1800, 101)
+                .unwrap(),
+            ArmRollbackOutcome::Armed(_)
+        ));
+    }
+
+    #[test]
+    fn commit_rollback_consumes_once_and_commits_stored_plus_one_in_both_stores() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            let mut applied = 0;
+            let arm = s
+                .commit_rollback("vm-1", "r", 6, 101, &mut |_| {
+                    applied += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(arm.restore_id, "r");
+            assert_eq!(applied, 1);
+            assert_eq!(s.get("vm-1").unwrap(), 6);
+            let (live, last) = s.rollback_state("vm-1").unwrap();
+            assert!(live.is_none());
+            assert_eq!(last.unwrap().to_counter, 6);
+            // Second use: refused, and the stamp step does NOT run.
+            let mut applied2 = 0;
+            assert!(s
+                .commit_rollback("vm-1", "r", 7, 102, &mut |_| {
+                    applied2 += 1;
+                    Ok(())
+                })
+                .is_err());
+            assert_eq!(applied2, 0);
+            assert_eq!(s.get("vm-1").unwrap(), 6);
+        });
+    }
+
+    #[test]
+    fn commit_rollback_refuses_a_non_monotonic_value_and_an_expired_arm_before_the_stamp_step() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            let mut ran = false;
+            assert!(s
+                .commit_rollback("vm-1", "r", 5, 101, &mut |_| {
+                    ran = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(s
+                .commit_rollback("vm-1", "r", 6, 700, &mut |_| {
+                    ran = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(s
+                .commit_rollback("vm-1", "other", 6, 101, &mut |_| {
+                    ran = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(
+                !ran,
+                "the stamp must never be lowered for an arm that does not commit"
+            );
+            assert_eq!(s.get("vm-1").unwrap(), 5);
+            assert!(s.rollback_state("vm-1").unwrap().0.is_some());
+        });
+    }
+
+    #[test]
+    fn commit_rollback_commits_exactly_stored_plus_one_never_a_skip() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            let mut ran = false;
+            assert!(s
+                .commit_rollback("vm-1", "r", 7, 101, &mut |_| {
+                    ran = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(!ran);
+            assert_eq!(s.get("vm-1").unwrap(), 5);
+        });
+    }
+
+    #[test]
+    fn a_consumed_restore_id_is_never_armed_again() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            s.commit_rollback("vm-1", "r", 6, 101, &mut |_| Ok(()))
+                .unwrap();
+            // Long after the rate limit, the SAME id is refused…
+            assert_eq!(
+                s.arm_rollback(rb_arm_for("vm-1", "r", 3, 10_000), 1800, 10_000)
+                    .unwrap(),
+                ArmRollbackOutcome::RestoreIdConsumed
+            );
+            assert!(s.rollback_state("vm-1").unwrap().0.is_none());
+            // …a fresh one is not.
+            assert!(matches!(
+                s.arm_rollback(rb_arm_for("vm-1", "r2", 3, 10_000), 1800, 10_000)
+                    .unwrap(),
+                ArmRollbackOutcome::Armed(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn a_failed_stamp_step_leaves_the_arm_and_the_counter_alone() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            assert!(s
+                .commit_rollback("vm-1", "r", 6, 101, &mut |_| Err(KbsError::Policy(
+                    "stamp store down".into()
+                )))
+                .is_err());
+            assert_eq!(s.get("vm-1").unwrap(), 5);
+            assert!(s.rollback_state("vm-1").unwrap().0.is_some());
+            assert!(s.rollback_state("vm-1").unwrap().1.is_none());
+        });
+    }
+
+    #[test]
+    fn two_racing_commits_of_one_arm_consume_it_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(FileBootCounterStore::open(dir.path().join("bc.json")).unwrap());
+        s.seed("vm-1", 5).unwrap();
+        s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+            .unwrap();
+        let applied = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                let applied = Arc::clone(&applied);
+                std::thread::spawn(move || {
+                    s.commit_rollback("vm-1", "r", 6, 101, &mut |_| {
+                        applied.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .is_ok()
+                })
+            })
+            .collect();
+        let wins = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(wins, 1);
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(s.get("vm-1").unwrap(), 6);
+    }
+
+    #[test]
+    fn a_normal_commit_clears_the_rollback_arm_and_reports_it() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "r", 3, 100), 1800, 100)
+                .unwrap();
+            let cleared = s.commit_reporting("vm-1", 6).unwrap();
+            assert_eq!(cleared.unwrap().restore_id, "r");
+            assert!(s.rollback_state("vm-1").unwrap().0.is_none());
+            assert!(s.commit_reporting("vm-1", 7).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn purge_removes_only_expired_arms() {
+        for_each_store(|s| {
+            s.seed("vm-1", 5).unwrap();
+            s.seed("vm-2", 5).unwrap();
+            s.arm_rollback(rb_arm_for("vm-1", "a", 3, 100), 1800, 100)
+                .unwrap();
+            s.arm_rollback(rb_arm_for("vm-2", "b", 3, 400), 1800, 400)
+                .unwrap();
+            let purged = s.purge_expired_rollback_arms(700).unwrap();
+            assert_eq!(purged.len(), 1);
+            assert_eq!(purged[0].vm_id, "vm-1");
+            assert!(s.rollback_state("vm-2").unwrap().0.is_some());
+        });
+    }
+
+    /// PROPERTY: over any interleaving of arm / disarm / clear / purge /
+    /// normal commit / rollback commit (with arbitrary values), the counter
+    /// never decreases and no arm is ever consumed twice. Deterministic
+    /// pseudo-random driver (xorshift), both store impls.
+    #[test]
+    fn property_counter_never_decreases_and_no_arm_is_consumed_twice() {
+        let total_consumed = std::sync::atomic::AtomicUsize::new(0);
+        for seed in 1..=12u64 {
+            for_each_store(|s| {
+                let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut rnd = |n: u64| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x % n
+                };
+                s.seed("vm", 3).unwrap();
+                let mut last = s.get("vm").unwrap();
+                let mut consumed: BTreeSet<String> = BTreeSet::new();
+                let mut next_id = 0u64;
+                let mut now = 1_000u64;
+                for _ in 0..150 {
+                    now += rnd(400);
+                    match rnd(7) {
+                        0 | 1 => {
+                            next_id += 1;
+                            let stored = s.get("vm").unwrap();
+                            let a = rb_arm_for("vm", &format!("r{next_id}"), rnd(stored + 2), now);
+                            let _ = s.arm_rollback(a, rnd(2) * 600, now);
+                        }
+                        2 => {
+                            let id = format!("r{}", rnd(next_id + 1));
+                            let _ = s.disarm_rollback("vm", &id, Some(1));
+                        }
+                        3 => {
+                            let _ = s.clear_rollback_arm("vm", "rollback-lifecycle-activate", 1);
+                            let _ = s.purge_expired_rollback_arms(now);
+                        }
+                        4 => {
+                            let v = s.get("vm").unwrap() + rnd(3);
+                            let _ = s.commit_reporting("vm", v.saturating_sub(1));
+                        }
+                        _ => {
+                            let id = s
+                                .rollback_state("vm")
+                                .unwrap()
+                                .0
+                                .map(|a| a.restore_id)
+                                .unwrap_or_else(|| format!("r{}", rnd(next_id + 1)));
+                            let v = s.get("vm").unwrap() + rnd(2);
+                            if let Ok(arm) = s.commit_rollback("vm", &id, v, now, &mut |_| Ok(())) {
+                                assert!(
+                                    consumed.insert(arm.restore_id.clone()),
+                                    "arm {} consumed twice",
+                                    arm.restore_id
+                                );
+                                total_consumed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let now_counter = s.get("vm").unwrap();
+                    assert!(
+                        now_counter >= last,
+                        "counter decreased {last} -> {now_counter}"
+                    );
+                    last = now_counter;
+                }
+            });
+        }
+        // Not vacuous: the driver really did consume arms.
+        assert!(total_consumed.load(std::sync::atomic::Ordering::Relaxed) > 10);
     }
 }

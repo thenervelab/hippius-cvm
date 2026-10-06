@@ -489,7 +489,7 @@ async fn main() -> ExitCode {
     // Both listeners share ONE deadline (`SHUTDOWN_GRACE` from now) —
     // sequentially-counted timeouts would let two slow drains exceed
     // the Deployment's 45 s `terminationGracePeriodSeconds` and have
-    // the kubelet SIGKILL the pod mid-drain (codex r1 Medium).
+    // the kubelet SIGKILL the pod mid-drain (review r1 Medium).
     let _ = shutdown_tx.send(true);
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     match tokio::time::timeout_at(deadline, miner_task).await {
@@ -693,7 +693,7 @@ fn start_order_signing() -> Result<Option<Arc<OrderSigner>>, &'static str> {
         // an empty hex pin is malformed). The chart omits the env
         // var entirely when the Helm value is empty, so seeing an
         // empty value here means manual interference — fail closed.
-        // (codex r1 medium.)
+        // (review r1 medium.)
         Ok(_) => return Err(order_signing::OrderSigningError::ExpectedPubkeyHex.class()),
         Err(_) => None,
     };

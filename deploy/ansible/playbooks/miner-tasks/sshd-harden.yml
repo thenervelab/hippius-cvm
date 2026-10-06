@@ -1,0 +1,102 @@
+---
+# Host sshd hardening — key-only auth on the miner's public SSH port.
+# Tasks file imported by 06-miner-bootstrap.yml play "08".
+#
+# Play 07 leaves 22/tcp open to the Internet on the assumption that auth
+# is key-only. Provider images do not always make it so: some ship
+# `50-cloud-init.conf` with `PasswordAuthentication yes`, which sorts
+# before Ubuntu's `60-cloudimg-settings.conf` and therefore wins (sshd
+# keeps the first value it reads), and some also set
+# `PermitRootLogin yes` in sshd_config. A public miner with password
+# auth on sees thousands of failed password attempts a day.
+#
+# The drop-in is named 00-* so it sorts first and wins over both.
+# PermitRootLogin stays `prohibit-password` rather than `no`: some
+# miners are operated as root over a key.
+#
+# LOCKOUT SAFETY. Before running this on a host, confirm the account
+# Ansible connects as has a working key in authorized_keys, and keep the
+# current session open until a NEW key-based login has succeeded.
+# `MaxAuthTries 3` counts every public key the client offers: a client
+# whose agent holds more than two other keys fails before reaching the
+# right one — use `IdentitiesOnly yes` with an explicit identity file.
+#
+# Reload, not restart. Ubuntu 24.04+ runs sshd socket-activated:
+# ssh.socket owns the listening port and ssh.service is the daemon it
+# started. SIGHUP (what `reload` sends, after its own `sshd -t`)
+# re-executes the daemon with the new configuration, which is all an
+# authentication change needs; established sessions are not touched.
+# Only a Port / ListenAddress change would need ssh.socket regenerated,
+# and this file changes neither. The miner-agent is never touched.
+#
+# Apply alone, one host at a time:
+#   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+#     --limit <miner> --tags miner_sshd_harden --check --diff
+
+- name: Harden sshd (drop-in, rolled back if the full config is refused)
+  tags: [miner_sshd_harden]
+  block:
+    - name: Install the sshd hardening drop-in
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/miner-tasks/files/00-hippius-host-harden.conf"
+        dest: /etc/ssh/sshd_config.d/00-hippius-host-harden.conf
+        owner: root
+        group: root
+        mode: "0644"
+        # Checks the drop-in on its own before it is moved into place.
+        validate: /usr/sbin/sshd -t -f %s
+      register: miner_sshd_dropin
+      notify: reload ssh
+
+    # `validate:` only sees the drop-in. This checks the configuration
+    # sshd will actually load. A refused config must not stay on disk:
+    # the next socket activation or reboot would start no daemon at all.
+    - name: Check the full sshd configuration
+      ansible.builtin.command:
+        cmd: /usr/sbin/sshd -t
+      changed_when: false
+      when: miner_sshd_dropin is changed and not ansible_check_mode
+  rescue:
+    # Only a file this run wrote. When `validate:` refuses, nothing was
+    # written and the previous drop-in (if any) stays.
+    - name: Remove the drop-in the full sshd configuration refused
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-hippius-host-harden.conf
+        state: absent
+      when: miner_sshd_dropin is changed
+
+    - name: Fail the run (the running sshd was not reloaded)
+      ansible.builtin.fail:
+        msg: >-
+          `sshd -t` refused the hardening drop-in or the configuration with
+          it in place. A drop-in this run wrote was removed; ssh was NOT
+          reloaded. Inspect /etc/ssh/sshd_config and
+          /etc/ssh/sshd_config.d/ on this host.
+
+# The property itself, read from what sshd would load: catches a host
+# whose sshd_config sets a keyword before its Include line, which the
+# drop-in cannot override. Skipped under --check (the file is not there).
+- name: Read the effective sshd settings
+  tags: [miner_sshd_harden]
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -T
+  register: miner_sshd_effective
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Assert sshd is key-only
+  tags: [miner_sshd_harden]
+  ansible.builtin.assert:
+    that:
+      - "'passwordauthentication no' in miner_sshd_effective.stdout_lines"
+      - "'kbdinteractiveauthentication no' in miner_sshd_effective.stdout_lines"
+      - "'permitrootlogin without-password' in miner_sshd_effective.stdout_lines
+        or 'permitrootlogin prohibit-password' in miner_sshd_effective.stdout_lines"
+      - "'maxauthtries 3' in miner_sshd_effective.stdout_lines"
+      - "'logingracetime 30' in miner_sshd_effective.stdout_lines"
+    fail_msg: >-
+      sshd's effective configuration still differs from the hardening
+      drop-in: a keyword is set before the Include line in
+      /etc/ssh/sshd_config, or in a file sorting before 00-. ssh was not
+      reloaded by this run; fix the host and re-run.
+  when: not ansible_check_mode

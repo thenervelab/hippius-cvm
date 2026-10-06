@@ -258,6 +258,16 @@ pub enum AgentError {
     /// resolve / the connect was refused". Fail-closed and terminal.
     #[error("network-failed")]
     Network(&'static str),
+
+    /// Customer-held keys: the guardian leg (`hippius-guest-release`
+    /// only) failed in a way the guest does not retry — a malformed
+    /// relay URL, a request that cannot be built, or the signed
+    /// terminal `erased`. Every retryable guardian failure (relay down,
+    /// unsigned or unverifiable answer, a non-terminal denial) is
+    /// waited out inside the leg and never becomes this error.
+    /// `Display` emits only the fixed `"guardian-failed"` tag.
+    #[error("guardian-failed")]
+    Guardian(&'static str),
 }
 
 impl AgentError {
@@ -280,6 +290,7 @@ impl AgentError {
             AgentError::Eol(_) => "eol-failed",
             AgentError::Network(_) => "network-failed",
             AgentError::Verity(_) => "verity-failed",
+            AgentError::Guardian(_) => "guardian-failed",
         }
     }
 
@@ -305,7 +316,8 @@ impl AgentError {
             | AgentError::Hardening(s)
             | AgentError::Eol(s)
             | AgentError::Network(s)
-            | AgentError::Verity(s) => Some(*s),
+            | AgentError::Verity(s)
+            | AgentError::Guardian(s) => Some(*s),
             // `Todo(Stage)` and `Guest(GuestError)` carry non-`&str`
             // payloads (a `Stage` enum and a domain-error type
             // respectively). Their family name from `class()` already
@@ -533,7 +545,7 @@ pub fn run(
     // §21 step 7: ship ticket + report + nonce to the KBS, get a
     // signed+wrapped release response back. A KBS denial is terminal.
     // The legacy `pipeline::run` path predates Phase 2A boot-counter
-    // CAS (Codex audit #2) and does not yet read/write the counter
+    // CAS (Review audit #2) and does not yet read/write the counter
     // file; pass `None` so KBS short-circuits the check exactly as
     // pre-Phase-2A wire requests did.
     let signed = kbs_client::release(
@@ -571,6 +583,8 @@ pub fn run(
         // (`--volume-stamp-ctx-out` / `--confirm-volume-stamp`).
         expected_volume_stamp: _,
         volume_stamp_token: _,
+        // Always `None` here: this legacy path attests stamp protocol v1.
+        volume_stamp_transition: _,
     } = verify::verify_and_unwrap(
         &signed,
         keys,
@@ -580,6 +594,10 @@ pub fn run(
         &cfg.pinned_kbs_vk,
         &cfg.pinned_kbs_kid,
     )?;
+
+    // `verify_and_unwrap` is the `hippius` (M0) gate: it never returns
+    // without a KEK, so this is a restatement, not a new failure path.
+    let luks = luks.ok_or(AgentError::Verify("no-luks"))?;
 
     // §21 step 12b: unlock the LUKS volume — `luks` is moved in and
     // wiped by `Zeroizing` Drop inside the stage scope (the unlocker's

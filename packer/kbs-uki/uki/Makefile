@@ -1,6 +1,6 @@
 # `packer/kbs-uki/uki/Makefile` — UKI build orchestrator.
 #
-# Reproducibility discipline (codex+gemini review applied):
+# Reproducibility discipline (review applied):
 #   - SOURCE_DATE_EPOCH derived from the LAST commit timestamp under
 #     `packer/kbs-uki/` (path-scoped — see the `SOURCE_DATE_EPOCH ?=`
 #     line below for the rationale).
@@ -92,8 +92,8 @@ OVMF_SHA256 := $(shell awk -F'= ' '/^OVMF_SHA256/{print $$2}' $(OVMF_LOCK))
 # §22 allowlist in lockstep.
 #
 # SNP_VCPU_TYPE folds the host silicon's cpu_sig into the VMSA, so it is
-# PER-GENERATION: the default `EpycGenoa` measures a Genoa host (miner-1)
-# digest; for a Turin host (miner-2/miner-3, EPYC 9255) build with
+# PER-GENERATION: the default `EpycGenoa` measures a Genoa host
+# digest; for a Turin host (e.g. EPYC 9255) build with
 # `make SNP_VCPU_TYPE=EpycTurin`. The launch-time authority is the
 # miner-agent (host-CPUID-derived); this only pre-pins the matching §22
 # allowlist measurement (re-attest per generation).
@@ -161,7 +161,7 @@ uki: docker-build measure
 
 # Run the build twice into ISOLATED output / fetched / build dirs
 # and refuse to exit 0 unless every emitted byte is identical. PR-F2
-# review (codex) flagged that sharing FETCHED/BUILD between runs
+# review (review) flagged that sharing FETCHED/BUILD between runs
 # would weaken the audit; full isolation is the only honest check.
 uki-reproducible-check: docker-build
 	@set -e; \
@@ -247,7 +247,7 @@ assemble: initramfs rootfs
 		$(IMAGE_VERSION)
 
 # Mount the signing key + cert at fixed inner paths so the script
-# doesn't need to translate host paths. This is the codex-review fix
+# doesn't need to translate host paths. This is the review-review fix
 # for the `/repo/$(patsubst …)` bug that broke external prod-key
 # overrides.
 sign: assemble

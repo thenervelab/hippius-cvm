@@ -6,16 +6,21 @@
 //! - alternative front-doors (gRPC, in-process) can target the same trait.
 
 use ed25519_dalek::SigningKey;
+use hippius_types::custody::{CustodyBindRequest, CustodyRekeyRequest, CustodyRenewRequest};
 use hippius_types::host_attestor::{HostEnrollment, SignedHostAttestorCert};
-use hippius_types::live_attestation::SignedLiveAttestation;
+use hippius_types::live_attestation::{GuestComponents, GuestResources, SignedLiveAttestation};
 use hippius_types::release::{SignedDenial, SignedResponse};
 use kbs_core::boot_counter::BootCounterStore;
+use kbs_core::custody::{CustodyDeps, CustodyReply, CustodyRuntime};
 use kbs_core::error::Result;
 use kbs_core::evidence::EvidenceSink;
 use kbs_core::host_attestor::{
     process_host_attestation, HostAttestationDeps, HostAttestationRequest,
 };
 use kbs_core::keepalive::{process_keepalive, KeepaliveDeps, KeepaliveRequest};
+use kbs_core::keepalive_binding::{
+    self, BindingMode, InMemoryKeepaliveBindings, KeepaliveBindingStore,
+};
 use kbs_core::lifecycle::VmStateStore;
 use kbs_core::live_attestation::{LiveAttestationSink, LiveAttestationStateStore};
 use kbs_core::persist::KbsNonceStore;
@@ -64,7 +69,7 @@ pub trait KbsService: Send + Sync {
     /// KBS-signed denial (the protocol's negative-acknowledgement form —
     /// the caller MUST treat both as legitimate protocol outcomes).
     ///
-    /// `submitted_boot_counter` (audit follow-up Codex #2): when
+    /// `submitted_boot_counter` (audit follow-up Review #2): when
     /// `Some(n)`, the release path verifies `n == stored + 1` and
     /// advances the store before reading Vault. `None` short-
     /// circuits the check for backward compat with pre-Phase-2A
@@ -98,6 +103,8 @@ pub trait KbsService: Send + Sync {
         kbs_nonce: &[u8; NONCE_LEN],
         epoch: u64,
         expiry_unix: u64,
+        resources: Option<&GuestResources>,
+        components: Option<&GuestComponents>,
         now_unix: u64,
     ) -> Result<SignedLiveAttestation>;
 
@@ -144,6 +151,42 @@ pub trait KbsService: Send + Sync {
     /// bad/absent token or a `value` that is not exactly `stored + 1`
     /// refuses fail-closed WITHOUT touching the store.
     fn process_volume_stamp_confirm(&self, vm_id: &str, value: u64, token: &[u8]) -> Result<u64>;
+
+    /// The stamp-protocol-v2 confirm: the guest names the TIMELINE it
+    /// stamped (the `target` of its release's `volume_stamp_transition`),
+    /// and only the token minted for that timeline, while it is still the
+    /// VM's current one, advances the stamp
+    /// (`kbs_core::volume_stamp::confirm_timeline`). The default refuses —
+    /// an implementation without timelines can confirm nothing on one.
+    fn process_volume_stamp_confirm_timeline(
+        &self,
+        vm_id: &str,
+        value: u64,
+        _token: &[u8],
+        _timeline: &[u8; 32],
+    ) -> Result<u64> {
+        Err(kbs_core::error::KbsError::Policy(format!(
+            "volume-stamp confirm: vm_id={vm_id} value={value} — this KBS has no timelines, \
+             fail closed"
+        )))
+    }
+
+    /// `POST /v1/kbs/custody/bind` (see `kbs_core::custody`). The default
+    /// is custody switched off — every implementation that does not wire
+    /// a `CustodyRuntime` answers 404 `custody-disabled`.
+    fn process_custody_bind(&self, _req: &CustodyBindRequest, _now_unix: u64) -> CustodyReply {
+        CustodyReply::disabled()
+    }
+
+    /// `POST /v1/kbs/custody/renew`.
+    fn process_custody_renew(&self, _req: &CustodyRenewRequest, _now_unix: u64) -> CustodyReply {
+        CustodyReply::disabled()
+    }
+
+    /// `POST /v1/kbs/custody/rekey`.
+    fn process_custody_rekey(&self, _req: &CustodyRekeyRequest, _now_unix: u64) -> CustodyReply {
+        CustodyReply::disabled()
+    }
 }
 
 /// Reference implementation. Each kbs-core trait lives behind an `Arc<dyn
@@ -191,7 +234,7 @@ pub struct DefaultKbsService {
     /// discipline.
     pub compute_pallet_instance: [u8; 32],
     /// Per-VM monotonic boot counter (Phase 1 of audit follow-up
-    /// Codex #2 — anti-rollback for valid-old-ciphertext replay).
+    /// Review #2 — anti-rollback for valid-old-ciphertext replay).
     /// Today the release path ONLY advances the counter when the
     /// guest submits `submitted_boot_counter: Some(_)` in the
     /// `ReleaseRequest`. Until Phase 2 wires the guest to read +
@@ -206,6 +249,11 @@ pub struct DefaultKbsService {
     /// zero-behavior-change rollout, then flipped on once every staging
     /// path wraps and no legacy plaintext KEK is in use.
     pub require_wrapped_kek: bool,
+    /// §6 — when `true`, the release path REFUSES a userdata that is not
+    /// Vault-Transit-wrapped at rest (the userdata counterpart of
+    /// [`Self::require_wrapped_kek`]). Default `false`; set via
+    /// [`Self::with_require_wrapped_userdata`] from KBS config.
+    pub require_wrapped_userdata: bool,
     /// Anti-rollback for the guest-keyed overlay — the per-`vm_id`
     /// CONFIRMED volume stamp (`kbs_core::volume_stamp`). The release
     /// path only READS it (and mints the next-advance token); this
@@ -226,6 +274,30 @@ pub struct DefaultKbsService {
     /// kbs-server`'s `wiring.rs`, and every caller of `new` must supply
     /// its result explicitly.
     pub max_unconfirmed_releases: Option<u64>,
+    /// Guest custody lease (`kbs_core::custody`). `None` ⇒ the three
+    /// custody routes answer 404 `custody-disabled` (the default; set via
+    /// [`Self::with_custody`] when `[custody] enabled = true`).
+    pub custody: Option<Arc<CustodyRuntime>>,
+    /// The release-time guest bindings keepalives are checked against
+    /// (`kbs_core::keepalive_binding`). EVERY successful release records
+    /// one, whatever [`Self::keepalive_binding_mode`] says — so switching
+    /// the mode on later needs no reboot for VMs released since.
+    pub keepalive_bindings: Arc<dyn KeepaliveBindingStore>,
+    /// `Off` (default) ⇒ legacy v1 keepalive bodies; `Record` / `Enforce`
+    /// ⇒ bound v2 bodies. Set via [`Self::with_keepalive_binding`].
+    pub keepalive_binding_mode: BindingMode,
+    /// `enforce` grace window close time (`EnforceGrace`); `None` ⇒ strict.
+    pub keepalive_grace_closes_at_unix: Option<u64>,
+    /// The ADMIN audit chain the release path writes authorized-rollback
+    /// events to (`kbs_core::rollback`): consume-intent (MANDATORY — an
+    /// arm-admitted release is refused if it cannot be written, or if
+    /// this is `None`), consume, refused, cleared-by-boot, commit-failed.
+    /// The SAME `Arc` the admin router appends to —
+    /// a second `FileAdminAuditSink::open` over the same directory would
+    /// block on its exclusive lock. `None` until the admin listener is
+    /// wired ([`Self::set_rollback_audit`]); with no admin listener no
+    /// arm can be created, so there is nothing to record.
+    pub rollback_audit: Option<Arc<kbs_core::admin_audit::FileAdminAuditSink>>,
     /// Monotonic counter; every `GC_EVERY_N_ISSUANCES` issuances we
     /// sweep the nonce store for expired markers. Not user-tunable —
     /// production ops gets this for free.
@@ -285,8 +357,45 @@ impl DefaultKbsService {
             volume_stamp,
             max_unconfirmed_releases,
             require_wrapped_kek: false,
+            require_wrapped_userdata: false,
+            custody: None,
+            keepalive_bindings: Arc::new(InMemoryKeepaliveBindings::default()),
+            keepalive_binding_mode: BindingMode::Off,
+            keepalive_grace_closes_at_unix: None,
+            rollback_audit: None,
             issuance_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Share the admin router's audit chain with the release path so the
+    /// authorized-rollback events it owns are recorded in the SAME
+    /// hash chain as the arm that authorised them.
+    pub fn set_rollback_audit(&mut self, audit: Arc<kbs_core::admin_audit::FileAdminAuditSink>) {
+        self.rollback_audit = Some(audit);
+    }
+
+    /// Set the keepalive binding mode (KBS config `[keepalive] binding`).
+    #[must_use]
+    pub fn with_keepalive_binding(mut self, mode: BindingMode) -> Self {
+        self.keepalive_binding_mode = mode;
+        self
+    }
+
+    /// Open `enforce`'s post-restart grace window until `closes_at_unix`
+    /// (see `kbs_core::keepalive_binding::EnforceGrace`).
+    #[must_use]
+    pub fn with_keepalive_grace(mut self, closes_at_unix: Option<u64>) -> Self {
+        self.keepalive_grace_closes_at_unix = closes_at_unix;
+        self
+    }
+
+    /// Use `store` for the keepalive binding records — in production the
+    /// file-backed store in the state dir, SHARED with the admin listener
+    /// (which seeds it after a pod restart). Default: in-memory.
+    #[must_use]
+    pub fn with_keepalive_bindings(mut self, store: Arc<dyn KeepaliveBindingStore>) -> Self {
+        self.keepalive_bindings = store;
+        self
     }
 
     /// KEK-HSM RA-08a/F2 — opt into fail-closed enforcement of "KEK
@@ -297,6 +406,79 @@ impl DefaultKbsService {
     pub fn with_require_wrapped_kek(mut self, require: bool) -> Self {
         self.require_wrapped_kek = require;
         self
+    }
+
+    /// §6 — opt into fail-closed enforcement of "userdata ciphertext at
+    /// rest" (refuse a non-`vault:` userdata at release). Same shape and
+    /// same staged-rollout reason as [`Self::with_require_wrapped_kek`].
+    #[must_use]
+    pub fn with_require_wrapped_userdata(mut self, require: bool) -> Self {
+        self.require_wrapped_userdata = require;
+        self
+    }
+
+    /// Switch the guest custody lease on, sharing `runtime` with the admin
+    /// router (its report and policy routes read and write the same one).
+    #[must_use]
+    pub fn with_custody(mut self, runtime: Arc<CustodyRuntime>) -> Self {
+        self.custody = Some(runtime);
+        self
+    }
+
+    fn custody_deps<'a>(&'a self, runtime: &'a CustodyRuntime) -> CustodyDeps<'a> {
+        CustodyDeps {
+            l1_keyring: self.l1_keyring.as_ref(),
+            attn: self.attn.as_ref(),
+            offline_allowlist: self.offline_allowlist.as_ref(),
+            launch_policy: &self.launch_policy,
+            vm_states: self.vm_states.as_ref(),
+            kbs_nonce_store: self.kbs_nonce_store.as_ref(),
+            vault_auth: self.vault_auth.as_ref(),
+            vault_kv: self.vault_kv.as_ref(),
+            kbs_attestation: &self.kbs_attestation,
+            kbs_auth_pubkey: self.kbs_auth_pubkey.as_ref(),
+            kbs_signing_key: &self.kbs_signing_key,
+            kbs_kid: self.kbs_kid.as_ref(),
+            audit: self.audit.as_ref(),
+            boot_counter: self.boot_counter.as_ref(),
+            require_wrapped_kek: self.require_wrapped_kek,
+            runtime,
+        }
+    }
+}
+
+impl DefaultKbsService {
+    /// After a SUCCESSFUL release: record the guest it released to as the
+    /// only guest allowed to keepalive for that `vm_id`, at the position
+    /// the release committed (`vm_generation`, `boot_counter` from the
+    /// response it just signed). The release already verified this exact
+    /// report, so re-reading it here only extracts `(chip_id, report_id)`.
+    ///
+    /// Never fails the release (it is already committed). A failure is
+    /// audited, and `record_after_release` has POISONED the VM: the stale
+    /// record (naming the previous guest) is dropped and its keepalives
+    /// are refused in `Record` and `Enforce` alike until its next release
+    /// or an admin seed. If the signed response itself does not verify
+    /// there is no trustworthy `vm_id` to poison, so that case is audited
+    /// only.
+    fn record_keepalive_binding(&self, signed: &SignedResponse, raw_snp_report: &[u8]) {
+        let recorded = keepalive_binding::record_after_release(
+            self.keepalive_bindings.as_ref(),
+            &self.kbs_signing_key.verifying_key(),
+            signed,
+            raw_snp_report,
+        );
+        if let Err(e) = recorded {
+            self.audit.record(
+                false,
+                None,
+                None,
+                &format!(
+                    "keepalive-binding not recorded after release (the VM is poisoned: its \
+                     keepalives are refused until its next release): {e}"
+                ),
+            );
+        }
     }
 }
 
@@ -328,7 +510,7 @@ impl KbsService for DefaultKbsService {
             raw_snp_report,
             kbs_nonce,
             now_unix,
-            // Phase 2A of audit follow-up Codex #2: the transport
+            // Phase 2A of audit follow-up Review #2: the transport
             // now decodes the field from `ReleaseRequestBody` and
             // forwards it here. `None` is the pre-Phase-2A wire
             // shape — kbs-core short-circuits the boot-counter
@@ -357,8 +539,14 @@ impl KbsService for DefaultKbsService {
             volume_stamp: self.volume_stamp.as_ref(),
             max_unconfirmed_releases: self.max_unconfirmed_releases,
             require_wrapped_kek: self.require_wrapped_kek,
+            require_wrapped_userdata: self.require_wrapped_userdata,
+            rollback_audit: self.rollback_audit.as_deref(),
         };
-        process_release(&req, &deps)
+        let outcome = process_release(&req, &deps);
+        if let Ok(signed) = &outcome {
+            self.record_keepalive_binding(signed, raw_snp_report);
+        }
+        outcome
     }
 
     fn process_keepalive(
@@ -369,6 +557,8 @@ impl KbsService for DefaultKbsService {
         kbs_nonce: &[u8; NONCE_LEN],
         epoch: u64,
         expiry_unix: u64,
+        resources: Option<&GuestResources>,
+        components: Option<&GuestComponents>,
         now_unix: u64,
     ) -> Result<SignedLiveAttestation> {
         let req = KeepaliveRequest {
@@ -379,6 +569,8 @@ impl KbsService for DefaultKbsService {
             now_unix,
             epoch,
             expiry_unix,
+            resources,
+            components,
         };
         let deps = KeepaliveDeps {
             attn: self.attn.as_ref(),
@@ -392,6 +584,10 @@ impl KbsService for DefaultKbsService {
             audit: self.audit.as_ref(),
             chain_genesis: self.compute_chain_genesis,
             pallet_instance: self.compute_pallet_instance,
+            bindings: self.keepalive_bindings.as_ref(),
+            binding_mode: self.keepalive_binding_mode,
+            grace_closes_at_unix: self.keepalive_grace_closes_at_unix,
+            vm_states: self.vm_states.as_ref(),
         };
         process_keepalive(&req, &deps)
     }
@@ -433,5 +629,44 @@ impl KbsService for DefaultKbsService {
         // provision or rotate.
         let mac_key = kbs_core::volume_stamp::stamp_mac_key(&self.kbs_signing_key.to_bytes());
         kbs_core::volume_stamp::confirm(self.volume_stamp.as_ref(), &mac_key, vm_id, value, token)
+    }
+
+    fn process_volume_stamp_confirm_timeline(
+        &self,
+        vm_id: &str,
+        value: u64,
+        token: &[u8],
+        timeline: &[u8; 32],
+    ) -> Result<u64> {
+        let mac_key = kbs_core::volume_stamp::stamp_mac_key(&self.kbs_signing_key.to_bytes());
+        kbs_core::volume_stamp::confirm_timeline(
+            self.volume_stamp.as_ref(),
+            &mac_key,
+            vm_id,
+            value,
+            token,
+            timeline,
+        )
+    }
+
+    fn process_custody_bind(&self, req: &CustodyBindRequest, now_unix: u64) -> CustodyReply {
+        match &self.custody {
+            Some(rt) => kbs_core::custody::process_bind(req, now_unix, &self.custody_deps(rt)),
+            None => CustodyReply::disabled(),
+        }
+    }
+
+    fn process_custody_renew(&self, req: &CustodyRenewRequest, now_unix: u64) -> CustodyReply {
+        match &self.custody {
+            Some(rt) => kbs_core::custody::process_renew(req, now_unix, &self.custody_deps(rt)),
+            None => CustodyReply::disabled(),
+        }
+    }
+
+    fn process_custody_rekey(&self, req: &CustodyRekeyRequest, now_unix: u64) -> CustodyReply {
+        match &self.custody {
+            Some(rt) => kbs_core::custody::process_rekey(req, now_unix, &self.custody_deps(rt)),
+            None => CustodyReply::disabled(),
+        }
     }
 }

@@ -1,0 +1,175 @@
+{{- if eq (toString .Values.guestReport.enabled) "true" }}
+---
+# Guest upgrade / rollout alerts (docs/design/guest-component-rollout.md,
+# "Detection and metrics"; gauges pushed by the `guest-report` CronJob,
+# `apps.orchestration.guest_report`). Same routing as the golden re-bake
+# alerts: a `severity` label, the Alertmanager default route.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-guest-upgrade
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-guest-upgrade
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-guest-upgrade
+      interval: 5m
+      rules:
+        - alert: GuestRolloutPaused
+          expr: hippius_guest_rollout_state{state="paused"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: "guest rollout {{`{{ $labels.rollout }}`}} (release {{`{{ $labels.release }}`}}) is paused"
+            description: |
+              The rollout stopped itself (a canary not done, a failed or blocked job,
+              too many rollbacks, a refused admission, the release withdrawn) or an
+              operator paused it. `vali_guest_rollout status {{`{{ $labels.rollout }}`}}`
+              says why; resume, or abort.
+        - alert: GuestUpgradeFailed
+          # The per-state count is the fallback until a report carrying the
+          # per-outcome gauge has been pushed (a vali image before it).
+          expr: |
+            hippius_guest_upgrade_failures_24h{state=~"failed|upgrade_blocked"} > 0
+              or (
+                hippius_guest_upgrade_outcomes_24h{state=~"failed|upgrade_blocked"} > 0
+                  unless on() count(hippius_guest_upgrade_failures_24h) > 0
+              )
+          for: 5m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: {{`"{{ $value }} guest upgrade(s) ended {{ $labels.state }}{{ if $labels.outcome }} ({{ $labels.outcome }}, suspect {{ $labels.suspect }}){{ end }} in the last 24 h"`}}
+            description: |
+              A guest upgrade could not complete nor roll back (`failed`), or rolling
+              back is forbidden by the VM's floor (`upgrade_blocked`). `outcome` says
+              why: health-failed / health-latched / guest-restarted point at our
+              release (suspect=release); no-sample / measurement-mismatch /
+              dispatch-failed / stop-timeout / resources-mismatch may be a miner
+              obstructing it (suspect=miner). Runbook:
+              docs/operator/guest-upgrade-recovery.md.
+        - alert: GuestUpgradeTenantVmDown
+          expr: hippius_guest_vm_upgrade_stuck{tenant="yes", power!="running"} > 0
+          for: 10m
+          labels:
+            severity: critical
+            component: guest-upgrade
+          annotations:
+            summary: "tenant VM {{`{{ $labels.vm }}`}} is {{`{{ $labels.power }}`}} after guest upgrade {{`{{ $labels.upgrade_job }}`}} ({{`{{ $labels.state }}`}}, {{`{{ $labels.outcome }}`}})"
+            description: |
+              A tenant's VM is down: its guest upgrade failed and the floor forbids
+              booting the previous release. Restore service first
+              (`vali_guest_upgrade --vm-id {{`{{ $labels.vm }}`}} --recover
+              start-on-target --operator ... --reason ... --apply`), then diagnose
+              (outcome {{`{{ $labels.outcome }}`}}, suspect {{`{{ $labels.suspect }}`}}).
+              Runbook: docs/operator/guest-upgrade-recovery.md.
+        - alert: GuestUpgradeVmNeedsOperator
+          expr: hippius_guest_vm_upgrade_stuck > 0
+          for: 30m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: "{{`{{ $labels.vm }}`}} needs an operator after guest upgrade {{`{{ $labels.upgrade_job }}`}} ({{`{{ $labels.state }}`}}, {{`{{ $labels.outcome }}`}}, power {{`{{ $labels.power }}`}})"
+            description: |
+              The VM's latest guest upgrade ended upgrade_blocked / failed (or still
+              parks). It stays here until a retry replaces it — a VM started with
+              `--recover start-on-target` runs an unverified release. Runbook:
+              docs/operator/guest-upgrade-recovery.md.
+        - alert: GuestUpgradeOverdue
+          expr: hippius_guest_upgrade_overdue_seconds > 0
+          for: 30m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: "guest upgrade {{`{{ $labels.upgrade_job }}`}} ({{`{{ $labels.vm }}`}}) is stuck in {{`{{ $labels.state }}`}}"
+            description: |
+              The job is past its state's deadline and holds the VM: a parking job
+              whose domain the miner never reports DOWN, or an open attempt whose
+              dispatch has not settled. Look at the miner; `vali_guest_upgrade
+              --release-parked` only once the domain is known down.
+        - alert: GuestVmBehindSecurityRelease
+          expr: time() - hippius_guest_vm_behind_since_seconds{lag="security"} > {{ mul .Values.guestReport.securityDeadlineHours 3600 }}
+          for: 30m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: "{{`{{ $labels.vm }}`}} runs below the newest guest security epoch for over {{ .Values.guestReport.securityDeadlineHours }} h"
+            description: |
+              A release that fixes a security flaw has had a build for the VM's base
+              for longer than the rollout deadline of an epoch raise.
+        - alert: GuestVmBehindRelease
+          expr: time() - hippius_guest_vm_behind_since_seconds{lag="release"} > {{ mul .Values.guestReport.releaseDeadlineDays 86400 }}
+          for: 1h
+          labels:
+            severity: info
+            component: guest-upgrade
+          annotations:
+            summary: "{{`{{ $labels.vm }}`}} is behind the newest guest release for over {{ .Values.guestReport.releaseDeadlineDays }} days"
+            description: |
+              A newer guest components release has had a build for the VM's base for
+              longer than the default rollout deadline.
+        - alert: GuestLiveOnStoppedVm
+          expr: hippius_guest_live_on_stopped == 1
+          for: 5m
+          labels:
+            severity: critical
+            component: guest-upgrade
+          annotations:
+            summary: "{{`{{ $labels.vm }}`}} attests live although its miner {{`{{ $labels.node }}`}} completed a stop order"
+            description: |
+              T4: a KBS-verified live attestation of the VM, verified minutes after a
+              completed power stop, shows the miner kept the domain running. Two
+              guests on one disk can corrupt the tenant's data. Investigate the miner
+              and quarantine it.
+        - alert: GuestSupersededGuestRunning
+          expr: hippius_guest_superseded_attestations_24h > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: guest-upgrade
+          annotations:
+            summary: "a superseded guest of {{`{{ $labels.vm }}`}} still attests on {{`{{ $labels.node }}`}}"
+            description: |
+              T4: {{`{{ $value }}`}} live attestation(s) in the last 24 h of a launch a later
+              accepted launch of the VM superseded — the miner kept an earlier guest
+              running next to the current one (two guests on one disk). Investigate the
+              miner and quarantine it.
+        - alert: GuestKbsSupersededGuest
+          expr: hippius_guest_kbs_superseded_refusals_24h > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: guest-upgrade
+          annotations:
+            summary: "the KBS refused {{`{{ $value }}`}} keepalive(s) of a superseded guest of {{`{{ $labels.vm }}`}} ({{`{{ $labels.reason }}`}})"
+            description: |
+              T4: the VM's OWN earlier guest (its identity checked against the KBS's
+              release records) still runs and asks for live attestations, well after
+              the VM's last launch hand-over. It earns nothing, but two guests may
+              share the disk. The audit names the VM, not the miner: check which
+              host(s) ran the VM since that hand-over before any action. Alert only
+              — no automatic penalty.
+        - alert: GuestReportStale
+          expr: |
+            (time() - hippius_guest_report_timestamp_seconds > 10800)
+              or absent(hippius_guest_report_timestamp_seconds)
+          for: 10m
+          labels:
+            severity: warning
+            component: guest-upgrade
+          annotations:
+            summary: "guest upgrade report has not run for 3h"
+            description: |
+              The hourly guest-report CronJob has not pushed for 3h, so the
+              hippius-guest-upgrade alerts are blind.
+{{- end }}

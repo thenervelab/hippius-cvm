@@ -3,13 +3,15 @@
 #
 # Run order:
 #   00 preflight         READ-ONLY, fail-closed sanity checks
-#   01 SEV-SNP cmdline   GRUB tokens — reboots ONLY if the line changed
+#   01 SEV-SNP cmdline   GRUB tokens — reboots ONLY if the line changed;
+#                        retires hippius-smt-off, asserts no CPU offline
 #   02 libvirt + qemu    tenant-CVM hypervisor stack
 #   03 networking        libvirt `default` NAT network for tenant VMs
 #   04 NetBird agent     join the NetBird `miner` group via setup key
 #   05 miner-agent       install the binary + systemd unit + identity
 #   06 mTLS mount point  create the dir; the operator pushes the certs
 #   07 host firewall     UFW default-deny INPUT + narrow public surface
+#   08 host sshd         key-only auth (drop-in), `systemctl reload ssh`
 #
 # This playbook is a SEPARATE trust profile from the cc-node playbooks
 # (`site.yml` / 00-05): it is intentionally NOT wired into `site.yml`.
@@ -33,7 +35,7 @@
   gather_facts: true
   become: true
   tasks:
-    - name: Assert host is a supported Ubuntu (24.04 or 25.10)
+    - name: Assert host is a supported Ubuntu release
       ansible.builtin.assert:
         that:
           - ansible_distribution == "Ubuntu"
@@ -41,10 +43,48 @@
         fail_msg: >-
           Miner bootstrap supports Ubuntu {{ miner_supported_ubuntu_versions | join(' / ') }}
           — detected {{ ansible_distribution }} {{ ansible_distribution_version }}.
-          Both 24.04 and 25.10 are validated. The NetBird apt repo
-          (pkgs.netbird.io/debian) and the agent source-build are
-          codename-independent. Add the version to
-          `miner_supported_ubuntu_versions` (group_vars) if validated.
+          A release qualifies only if its distro libvirt/QEMU can launch a
+          SEV-SNP guest (libvirt >= {{ miner_min_libvirt_version }}, QEMU >=
+          {{ miner_min_qemu_version }}); 24.04 cannot. See
+          `miner_supported_ubuntu_versions` in group_vars/miner_nodes.yml.
+
+    # The OS check above is a proxy; this is the property itself. Read what
+    # apt WOULD install (or has installed) before play 02 installs it, so a
+    # host whose distro hypervisor cannot boot an SNP guest is refused here
+    # rather than at its first tenant launch.
+    - name: Read the libvirt / QEMU versions apt resolves to
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          for pkg in libvirt-daemon-system qemu-system-x86; do
+            v=$(apt-cache policy "$pkg" | awk '/Installed:/{i=$2} /Candidate:/{c=$2} END{print (i != "" && i != "(none)") ? i : c}')
+            # 1:10.2.1+ds-1ubuntu3.2 -> 10.2.1
+            echo "$pkg=$(echo "$v" | sed -E 's/^[0-9]+://; s/^([0-9]+(\.[0-9]+)*).*/\1/')"
+          done
+        executable: /bin/bash
+      register: miner_hv_resolved
+      changed_when: false
+      # Read-only: run it under --check too, or the assert below sees
+      # no output and fails every --check run.
+      check_mode: false
+
+    - name: Assert the distro hypervisor can launch a SEV-SNP guest
+      ansible.builtin.assert:
+        that:
+          # An empty / "(none)" answer (unknown package, empty apt lists)
+          # must fail with this message, not a version() type error.
+          - miner_hv_libvirt is match('^[0-9]')
+          - miner_hv_qemu is match('^[0-9]')
+          - miner_hv_libvirt is version(miner_min_libvirt_version, '>=')
+          - miner_hv_qemu is version(miner_min_qemu_version, '>=')
+        fail_msg: >-
+          libvirt {{ miner_hv_libvirt }} / QEMU {{ miner_hv_qemu }} cannot boot a
+          SEV-SNP guest (need libvirt >= {{ miner_min_libvirt_version }} and QEMU
+          >= {{ miner_min_qemu_version }}): every `<launchSecurity type='sev-snp'>`
+          domain the miner-agent renders would be refused. Upgrade the OS.
+      vars:
+        miner_hv_libvirt: "{{ (miner_hv_resolved.stdout_lines | select('match', '^libvirt-daemon-system=') | first).split('=')[1] }}"
+        miner_hv_qemu: "{{ (miner_hv_resolved.stdout_lines | select('match', '^qemu-system-x86=') | first).split('=')[1] }}"
 
     - name: Assert host CPU is AMD x86_64 (SEV-SNP needs AMD EPYC)
       ansible.builtin.assert:
@@ -108,6 +148,7 @@
     - name: Assert system + data NVMe devices from host_vars are block devices
       ansible.builtin.stat:
         path: "{{ item }}"
+        follow: true   # host_vars name disks by /dev/disk/by-id symlinks
       loop: "{{ (nvme_system_devices | default([])) + (nvme_data_devices | default([])) }}"
       register: miner_nvme_stat
 
@@ -144,7 +185,7 @@
       # promises: on any host where play 04 had run, re-running this
       # bootstrap failed closed forever. The safety property is
       # unchanged — a member of an array carrying /, /boot, /boot/efi
-      # or swap is still refused, which is the §K2 cc-1 near-miss this
+      # or swap is still refused, which is the control-plane near-miss this
       # assertion exists for. An UNMOUNTED raid member is refused too:
       # an unassembled array is unidentifiable, so it fails closed.
       ansible.builtin.shell:
@@ -188,6 +229,7 @@
       register: miner_disk_check
       changed_when: false
       failed_when: "'OK' not in miner_disk_check.stdout"
+      check_mode: false
 
     # NetBird's OWN install script writes a legacy one-line source at
     # `/etc/apt/sources.list.d/netbird.list` pinned to
@@ -265,6 +307,8 @@
   hosts: miner_nodes
   become: true
   tasks:
+    - name: Retire the runtime SMT-off unit (breaks SNP DF_FLUSH)
+      ansible.builtin.import_tasks: miner-tasks/smt-runtime-off-retire.yml
     - name: Apply the SEV-SNP GRUB cmdline
       ansible.builtin.import_tasks: miner-tasks/snp-kernel.yml
   handlers:
@@ -285,6 +329,10 @@
   tasks:
     - name: Install the tenant-CVM hypervisor stack
       ansible.builtin.import_tasks: miner-tasks/libvirt-install.yml
+    - name: Keep unattended-upgrades off the hypervisor stack
+      ansible.builtin.import_tasks: miner-tasks/unattended-upgrades.yml
+    - name: Keep needrestart off the miner-agent and libvirt
+      ansible.builtin.import_tasks: miner-tasks/needrestart.yml
 
 # ── 03 — Tenant CVM networking ──────────────────────────────────────
 - name: "03 — Tenant CVM networking bridge"
@@ -325,3 +373,18 @@
   tasks:
     - name: Apply the UFW host firewall
       ansible.builtin.import_tasks: miner-tasks/host-firewall.yml
+
+# ── 08 — Host sshd hardening ────────────────────────────────────────
+- name: "08 — Host sshd hardening (key-only auth)"
+  hosts: miner_nodes
+  become: true
+  tasks:
+    - name: Harden the host sshd
+      ansible.builtin.import_tasks: miner-tasks/sshd-harden.yml
+  handlers:
+    # `reloaded` also starts ssh.service if socket activation has not
+    # started it yet. Reload only: never restart sshd from here.
+    - name: reload ssh
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded

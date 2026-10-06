@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
 use crate::flavor::Flavor;
+use crate::guardian::KeyMode;
 
 /// The only OrderTicket schema version this control plane accepts (§6).
 ///
@@ -73,6 +74,42 @@ pub struct OrderTicket {
     /// this single signed identifier.
     pub flavor: Flavor,
     pub lifecycle_perms: Vec<String>,
+    /// Who holds this VM's disk key (customer-held keys, see
+    /// [`crate::guardian`]). Signed like every other field, so the KBS can
+    /// trust it: it decides whether the release carries a KEK at all.
+    ///
+    /// Absent ⇒ [`KeyMode::Hippius`] (M0). A minter that emits no
+    /// `key_mode` produces exactly the bytes it always did, so every M0
+    /// ticket is unchanged on the wire; `default` makes such a ticket
+    /// decode to `None`. A verifier built before this field existed
+    /// refuses any ticket that carries it (`deny_unknown_fields`) — an old
+    /// KBS or guest can never be handed an M1/M2 ticket it would misread.
+    ///
+    /// Present ⇒ it must be `split` or `customer`: M0 has exactly ONE
+    /// encoding (the absent key). An explicit `hippius` or a CBOR `null`
+    /// would be a second, semantically-equal M0 ticket with different
+    /// signed bytes, so both are refused at decode, for every verifier
+    /// (KBS, guest, vali's ticket-validator) at once.
+    ///
+    /// Read it through [`OrderTicket::key_mode`], which applies the
+    /// default.
+    #[serde(default, deserialize_with = "present_key_mode")]
+    pub key_mode: Option<KeyMode>,
+}
+
+/// `key_mode` when the key is present: `split` or `customer`, nothing
+/// else. `null` fails here (a `KeyMode` is never null) and `hippius` is
+/// refused explicitly; an absent key never reaches this function.
+fn present_key_mode<'de, D>(d: D) -> Result<Option<KeyMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match KeyMode::deserialize(d)? {
+        KeyMode::Hippius => Err(serde::de::Error::custom(
+            "key_mode=hippius must be omitted (absent means hippius)",
+        )),
+        mode => Ok(Some(mode)),
+    }
 }
 
 impl OrderTicket {
@@ -81,5 +118,10 @@ impl OrderTicket {
     }
     pub fn allowed_userdata_digest(&self) -> &[u8] {
         self.allowed_userdata_digest.as_ref()
+    }
+    /// The effective key mode: the signed `key_mode`, absent ⇒
+    /// [`KeyMode::Hippius`].
+    pub fn key_mode(&self) -> KeyMode {
+        self.key_mode.unwrap_or(KeyMode::Hippius)
     }
 }

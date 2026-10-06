@@ -55,9 +55,24 @@ def _intent(**overrides) -> dict:
     return body
 
 
+# A reversible stand-in for Vault Transit, so a test can assert BOTH that
+# what was staged is ciphertext AND which plaintext it wraps.
+def _fake_ct(plaintext: bytes) -> bytes:
+    return b"vault:v1:" + plaintext.hex().encode("ascii")
+
+
+def _fake_pt(ciphertext: bytes) -> bytes:
+    return bytes.fromhex(ciphertext.removeprefix(b"vault:v1:").decode())
+
+
 @pytest.fixture
 def stub_vault_put(monkeypatch):
-    """Capture `put_kv` calls + return a fake version."""
+    """Capture `put_kv` calls + return a fake version.
+
+    Also stubs Transit: intake now WRAPS the userdata working copy before
+    staging it (`launch.stage_userdata_working_copy`), so a `put_kv`-only
+    stub would fail on the first Transit round-trip.
+    """
     calls = []
 
     def fake_put(mount, path, value, *, cas=None):
@@ -67,6 +82,13 @@ def stub_vault_put(monkeypatch):
         return vault_kv.VaultWriteResult(version=7)
 
     monkeypatch.setattr(launch_jobs.vault_kv, "put_kv", fake_put)
+    monkeypatch.setattr(launch_jobs.vault_kv, "ensure_transit_key", lambda name: None)
+    monkeypatch.setattr(
+        launch_jobs.vault_kv, "transit_encrypt", lambda name, pt: _fake_ct(pt)
+    )
+    monkeypatch.setattr(
+        launch_jobs.vault_kv, "transit_decrypt", lambda name, ct: _fake_pt(ct)
+    )
     return calls
 
 
@@ -143,9 +165,37 @@ def test_launch_post_enqueues_job(root_client, stub_vault_put) -> None:
     assert job.state == LaunchJobState.QUEUED.value
     assert job.phase == LaunchPhase.QUEUED.value
     assert job.userdata_vault_version == 7
-    # The userdata was staged to Vault (one put), with the real bytes.
+    # The userdata was staged to Vault (one put) — Transit-WRAPPED. The
+    # plaintext cloud-init (SSH keys, tokens, the NetBird key the launch
+    # substitutes into it) never reaches Vault storage in the clear, and
+    # §24 destroys the key that opens it.
     assert len(stub_vault_put) == 1
-    assert stub_vault_put[0][2] == _USERDATA.encode("utf-8")
+    _mount, path, staged = stub_vault_put[0]
+    # Its OWN path: the intake template, not the working copy
+    # `launch_on_miner` keeps in version lockstep with the canonical copy.
+    assert path.endswith("/userdata-intake")
+    assert staged.startswith(b"vault:"), staged[:32]
+    assert b"ssh_pwauth" not in staged
+    assert _fake_pt(staged) == _USERDATA.encode("utf-8")
+
+
+def test_launch_post_wraps_the_working_copy_under_the_key_vali_may_open(
+    root_client, stub_vault_put, monkeypatch
+) -> None:
+    """TWO per-VM Transit keys, deliberately. The canonical userdata the
+    ticket binds is wrapped under `kek-<vm_id>`, which vali may encrypt
+    with and NEVER decrypt — only the attested KBS opens it. This working
+    copy is wrapped under `ud-<vm_id>`, which vali may open, because the
+    NetBird substitution and the §6 digest re-derivation still need the
+    plaintext after intake. Wrapping it under the KEK key instead would
+    strand both."""
+    keys: list[str] = []
+    monkeypatch.setattr(
+        launch_jobs.vault_kv, "transit_encrypt", lambda name, pt: keys.append(name) or _fake_ct(pt)
+    )
+    resp = root_client.post(LAUNCH_URL, _intent(), format="json")
+    assert resp.status_code == 202, resp.content
+    assert keys == ["ud-vm-api-1"], keys
 
 
 def test_launch_post_normalizes_kv_data_prefix_on_kek_path(
@@ -180,6 +230,63 @@ def test_launch_post_userdata_never_touches_the_db(root_client, stub_vault_put) 
     assert "userdata" not in job.spec_json
 
 
+def test_launch_post_rejects_a_vault_prefixed_userdata(root_client, stub_vault_put) -> None:
+    """`vault:` is the discriminator for "already Transit ciphertext"
+    wherever a staged userdata is read back — a caller must not be able to
+    set it. The userdata here also carries the NetBird placeholder, so the
+    `vault:` guard is the only thing that can reject it."""
+    resp = root_client.post(
+        LAUNCH_URL,
+        _intent(userdata="vault:v1:deadbeef\n# {{NETBIRD_SETUP_KEY}}\n"),
+        format="json",
+    )
+    assert resp.status_code == 400, resp.content
+    assert LaunchJob.objects.count() == 0
+
+
+@pytest.mark.parametrize("bad", [59, 86401, 30 * 86400])
+def test_launch_post_bounds_the_ticket_lifetime(root_client, stub_vault_put, bad) -> None:
+    """The minted ticket authorizes releasing this VM's KEK + userdata to
+    whoever attests, so its lifetime is a security parameter — an
+    unbounded `expiry_seconds` let a caller mint one redeemable for a
+    year."""
+    resp = root_client.post(LAUNCH_URL, _intent(expiry_seconds=bad), format="json")
+    assert resp.status_code == 400, resp.content
+    assert "expiry_seconds" in resp.json()["error"]
+    assert LaunchJob.objects.count() == 0
+
+
+@pytest.mark.parametrize("ok", [60, 3600, 86400])
+def test_launch_post_accepts_the_lifetime_boundaries(root_client, stub_vault_put, ok) -> None:
+    """Both ends inclusive — a bound that rejects its own endpoints is a
+    different bound from the documented one."""
+    resp = root_client.post(
+        LAUNCH_URL, _intent(vm_id=f"vm-exp-{ok}", expiry_seconds=ok), format="json"
+    )
+    assert resp.status_code == 202, resp.content
+
+
+def test_launch_post_refuses_a_decommissioned_vm_id(root_client, stub_vault_put) -> None:
+    """§24 crypto-erased that vm_id: its Transit keys are destroyed and its
+    KV blobs deleted. Staging fresh secrets under it recreates exactly the
+    material the erase removed — and a second decommission is refused for
+    an already-Destroyed VM, so nothing can reach it again."""
+    from apps.lifecycle.models import Vm, VmState
+
+    Vm.objects.create(
+        vm_id="vm-api-1",
+        tenant_id="t-api",
+        lease_id="lease-1",
+        state=VmState.DESTROYED,
+        generation=1,
+    )
+    resp = root_client.post(LAUNCH_URL, _intent(), format="json")
+    assert resp.status_code == 409, resp.content
+    assert LaunchJob.objects.count() == 0
+    # …and nothing was staged before the refusal.
+    assert stub_vault_put == []
+
+
 def test_launch_post_missing_required_field_is_400(root_client, stub_vault_put) -> None:
     body = _intent()
     del body["luks_header_sha256_hex"]
@@ -209,6 +316,18 @@ def test_launch_post_bad_netbird_template_is_400(root_client, stub_vault_put) ->
     )
     assert resp.status_code == 400
     assert "NETBIRD_SETUP_KEY" in resp.json()["error"]
+
+
+def test_launch_post_custom_netbird_hostname_is_400(root_client, stub_vault_put) -> None:
+    # The peer is persistent and revoked BY NAME: a name vali did not choose
+    # would be a peer nothing ever deletes.
+    resp = root_client.post(
+        LAUNCH_URL,
+        _intent(netbird_hostname_template="hippius-tenant-{vm_id}-x"),
+        format="json",
+    )
+    assert resp.status_code == 400
+    assert "netbird_hostname_template" in resp.json()["error"]
 
 
 def test_launch_post_netbird_opt_out_skips_placeholder_check(
@@ -264,7 +383,7 @@ def _stub_secrets(monkeypatch) -> None:
     )
 
 
-def _ok_launch_vm(spec, decided_by, *, on_phase=None):
+def _ok_launch_vm(spec, decided_by, *, on_phase=None, queued_for_s=0.0):
     """A stub `launch_vm` that mimics the in-process placing→dispatching
     progress callbacks the real one fires, then accepts."""
     if on_phase is not None:
@@ -274,7 +393,7 @@ def _ok_launch_vm(spec, decided_by, *, on_phase=None):
         ok=True,
         outcome="miner-accepted",
         vm_id=spec.vm_id,
-        miner_id="miner-1",
+        miner_id="miner-a",
         miner_node_id="0" * 64,
         ticket_id="tk-1",
         placement_id="pl-1",
@@ -291,7 +410,7 @@ def test_worker_runs_and_records_success(root_client, stub_vault_put, monkeypatc
     job = LaunchJob.objects.get(vm_id="vm-api-1")
     assert job.state == LaunchJobState.SUCCEEDED.value
     assert job.phase == LaunchPhase.LAUNCHED.value
-    assert job.miner_id == "miner-1"
+    assert job.miner_id == "miner-a"
     assert job.result_json["ticket_id"] == "tk-1"
     assert job.finished_at is not None
 
@@ -328,7 +447,7 @@ def test_worker_records_failure(root_client, stub_vault_put, monkeypatch) -> Non
     monkeypatch.setattr(
         launch_jobs.launch,
         "launch_vm",
-        lambda spec, decided_by, on_phase=None: launch.LaunchResult(
+        lambda spec, decided_by, on_phase=None, queued_for_s=0.0: launch.LaunchResult(
             ok=False, outcome="no-eligible-miner", vm_id=spec.vm_id
         ),
     )
@@ -350,7 +469,7 @@ def test_worker_dispatch_raise_fails_the_job_not_stuck_running(
     _queue_job(stub_vault_put, root_client)
     _stub_secrets(monkeypatch)
 
-    def raise_unavailable(spec, decided_by, on_phase=None):
+    def raise_unavailable(spec, decided_by, on_phase=None, queued_for_s=0.0):
         raise order_dispatch.OrderDispatchUnavailable("edge-order: peer unreachable")
 
     monkeypatch.setattr(launch_jobs.launch, "launch_vm", raise_unavailable)
@@ -418,21 +537,25 @@ def test_worker_never_reads_the_plaintext_kek(
 
     read_paths: list[str] = []
 
+    read_versions: list = []
+
     def spy_get_kv(mount, path, **kw):
         read_paths.append(path)
-        return _USERDATA.encode()
+        read_versions.append(kw.get("version"))
+        return _fake_ct(_USERDATA.encode())
 
     monkeypatch.setattr(launch_jobs.vault_kv, "get_kv", spy_get_kv)
 
     captured: dict = {}
 
-    def fake_launch_vm(spec, decided_by, on_phase=None):
+    def fake_launch_vm(spec, decided_by, on_phase=None, queued_for_s=0.0):
         captured["kek_bytes"] = spec.kek_bytes
+        captured["userdata"] = spec.userdata
         return launch.LaunchResult(
             ok=True,
             outcome="miner-accepted",
             vm_id=spec.vm_id,
-            miner_id="miner-1",
+            miner_id="miner-a",
             miner_node_id="0" * 64,
             ticket_id="tk-1",
             placement_id="pl-1",
@@ -446,8 +569,15 @@ def test_worker_never_reads_the_plaintext_kek(
     assert captured["kek_bytes"] is None
     # The worker never read a luks-kek path back out of Vault.
     assert not any(p.endswith("/luks-kek") for p in read_paths), read_paths
-    # It DID read the userdata transport path (the one legitimate read).
-    assert any("userdata-pending" in p for p in read_paths), read_paths
+    # It DID read the userdata working copy (the one legitimate read) —
+    # and unwrapped it, since the NetBird substitution downstream needs
+    # the plaintext.
+    assert any("userdata-intake" in p for p in read_paths), read_paths
+    # …at the version the row PINNED, never "latest": a second POST for
+    # the same vm_id would otherwise change the bytes this queued job
+    # consumes between intake and launch.
+    assert read_versions == [7], read_versions
+    assert captured["userdata"] == _USERDATA.encode("utf-8")
 
 
 def test_claim_one_is_atomic(root_client, stub_vault_put) -> None:
@@ -649,6 +779,10 @@ def stub_golden_transit(monkeypatch):
     monkeypatch.setattr(launch_jobs.vault_kv, "ensure_transit_key", fake_ensure)
     monkeypatch.setattr(
         launch_jobs.vault_kv, "transit_datakey_wrapped", fake_datakey
+    )
+    # Intake also wraps the userdata working copy under `ud-<vm_id>`.
+    monkeypatch.setattr(
+        launch_jobs.vault_kv, "transit_encrypt", lambda name, pt: _fake_ct(pt)
     )
     return calls
 
@@ -863,6 +997,94 @@ def test_resolve_image_bad_charset_rejected() -> None:
     assert exc.value.category == "bad-field"
 
 
+def _guest_build(release: int, *, bake_initrd: str = "3" * 64, initrd: str = "4d" * 32):
+    from apps.orchestration.models import GuestComponentRelease, GuestInitrdBuild
+
+    rel, _ = GuestComponentRelease.objects.get_or_create(
+        version=release,
+        defaults={"commit": "c" * 40, "security_epoch": 1, "squashfs_sha256": "d" * 64},
+    )
+    return GuestInitrdBuild.objects.create(
+        release=rel,
+        source_bake_id="gb-ubuntu",
+        family="initramfs-tools",
+        kernel_sha256="2" * 64,
+        rootfs_img_sha256="a1" * 32,
+        rootfs_verity_sha256="b2" * 32,
+        verity_root_hash="c3" * 32,
+        base_initrd_sha256=bake_initrd,
+        release_cpio_sha256="e" * 64,
+        initrd_sha256=initrd,
+        s3_bucket="hippius-compute-images",
+        s3_key_prefix=f"tenant/golden-ubuntu-gr{release}/",
+        measurement={},
+    )
+
+
+def test_resolve_image_boots_the_images_blessed_guest_release() -> None:
+    """Phase 7: an image with a blessed guest release launches the bake's
+    kernel + dm-verity base with the release's build of its initrd."""
+    from apps.images.models import GoldenImage
+
+    _make_golden_bake(bake_id="gb-ubuntu")
+    _bless_golden_image("ubuntu", "gb-ubuntu")
+    build = _guest_build(2)
+    GoldenImage.objects.filter(image_name="ubuntu").update(guest_release=2)
+    intent = {"image": "ubuntu"}
+    launch_jobs._resolve_bake(intent)
+    assert (intent["s3_key_prefix"], intent["initrd_sha256_hex"]) == (
+        build.s3_key_prefix,
+        build.initrd_sha256,
+    )
+    assert intent["kernel_sha256_hex"] == "2" * 64, "the bake's kernel"
+    assert intent["verity_root_hash_hex"] == "c3" * 32, "the bake's dm-verity base"
+    assert "_image_guest_release" not in intent
+
+
+def test_a_withdrawn_guest_build_fails_the_image_launch_closed() -> None:
+    from django.utils import timezone
+
+    from apps.images.models import GoldenImage
+    from apps.orchestration.models import GuestInitrdBuild
+
+    _make_golden_bake(bake_id="gb-ubuntu")
+    _bless_golden_image("ubuntu", "gb-ubuntu")
+    build = _guest_build(2)
+    GoldenImage.objects.filter(image_name="ubuntu").update(guest_release=2)
+    GuestInitrdBuild.objects.filter(pk=build.pk).update(withdrawn_at=timezone.now())
+    with pytest.raises(launch_jobs.LaunchIntentError) as exc:
+        launch_jobs._resolve_bake({"image": "ubuntu"})
+    assert exc.value.category == "conflict"
+
+
+def test_a_caller_cannot_pick_the_artifacts_or_the_guest_release() -> None:
+    from apps.images.models import GoldenImage
+
+    _make_golden_bake(bake_id="gb-ubuntu")
+    _bless_golden_image("ubuntu", "gb-ubuntu")
+    _guest_build(2)
+    GoldenImage.objects.filter(image_name="ubuntu").update(guest_release=2)
+    with pytest.raises(launch_jobs.LaunchIntentError):
+        launch_jobs._resolve_bake({"image": "ubuntu", "initrd_sha256_hex": "f" * 64})
+    # A spoofed private key is dropped: the bare image resolves to its bake.
+    GoldenImage.objects.filter(image_name="ubuntu").update(guest_release=None)
+    intent = {"image": "ubuntu", "_image_guest_release": 2}
+    launch_jobs._resolve_bake(intent)
+    assert intent["initrd_sha256_hex"] == "3" * 64
+    assert "_image_guest_release" not in intent
+
+
+@pytest.mark.parametrize(
+    "field", ["rootfs_img_sha256_hex", "verity_root_hash_hex", "kernel_sha256_hex", "disk_mode"]
+)
+def test_a_launch_by_image_takes_no_caller_artifact(field: str) -> None:
+    _make_golden_bake(bake_id="gb-ubuntu")
+    _bless_golden_image("ubuntu", "gb-ubuntu")
+    with pytest.raises(launch_jobs.LaunchIntentError) as exc:
+        launch_jobs._resolve_bake({"image": "ubuntu", field: "f" * 64})
+    assert exc.value.category == "bad-field"
+
+
 def test_resolve_image_noop_without_image() -> None:
     intent = {"s3_bucket": "x"}
     launch_jobs._resolve_bake(intent)
@@ -925,3 +1147,158 @@ def test_launch_post_image_and_bake_id_conflict_is_400(
     assert resp.status_code == 400, resp.content
     assert "mutually exclusive" in resp.json()["error"]
     assert LaunchJob.objects.count() == 0
+
+
+# ─── Region constraint (region) ──────────────────────────────────────
+
+
+def test_launch_post_region_defaults_to_unconstrained(root_client, stub_vault_put) -> None:
+    resp = root_client.post(LAUNCH_URL, _intent(), format="json")
+    assert resp.status_code == 202, resp.content
+    job = LaunchJob.objects.get(job_id=resp.json()["job_id"])
+    assert job.spec_json["region"] == ""
+
+
+def test_launch_post_uppercases_the_region(root_client, stub_vault_put) -> None:
+    """`fr` and `FR` are one region; `MinerLocation.region` is uppercase and
+    the gate compares with `==`."""
+    resp = root_client.post(LAUNCH_URL, _intent(region="fr"), format="json")
+    assert resp.status_code == 202, resp.content
+    job = LaunchJob.objects.get(job_id=resp.json()["job_id"])
+    assert job.spec_json["region"] == "FR"
+
+
+@pytest.mark.parametrize("bad", ["FRA", "F1", "France", "F", 12, " "])
+def test_launch_post_rejects_a_malformed_region(root_client, stub_vault_put, bad) -> None:
+    """Shape-checked at intake: an unparseable region would otherwise match
+    no miner and surface minutes later as a fleet-wide `no-miner-in-region`
+    — a capacity problem that is really a typo."""
+    resp = root_client.post(LAUNCH_URL, _intent(vm_id="vm-region", region=bad), format="json")
+    if bad == " ":
+        # Whitespace-only is "nothing asked", same as omitted.
+        assert resp.status_code == 202, resp.content
+        assert LaunchJob.objects.get(job_id=resp.json()["job_id"]).spec_json["region"] == ""
+        return
+    assert resp.status_code == 400, (bad, resp.content)
+    assert resp.json()["category"] == "bad-field"
+    assert "region" in resp.json()["error"]
+    assert LaunchJob.objects.count() == 0
+
+
+def test_region_survives_into_the_launch_spec() -> None:
+    """The worker builds `LaunchSpec(**spec_json, …)`; the field must exist
+    there, and a spec WITHOUT it (every pre-region job) must still build."""
+    spec = launch_jobs._build_spec_json(_intent(region="de"))
+    assert launch.LaunchSpec(**spec, kek_bytes=None, userdata=b"x").region == "DE"
+    old = {k: v for k, v in spec.items() if k != "region"}
+    assert launch.LaunchSpec(**old, kek_bytes=None, userdata=b"x").region == ""
+
+
+def test_launch_threads_the_region_into_placement(monkeypatch) -> None:
+    """End to end through the real scheduler: a region nobody is detected
+    in fails the launch `no-miner-in-region` — it never places elsewhere."""
+    from apps.scheduler import chain
+    from apps.scheduler.tests.factories import make_dispatchable_identity, make_miner, make_snapshot
+
+    make_dispatchable_identity(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    spec = launch.LaunchSpec(
+        **launch_jobs._build_spec_json(_intent(vm_id="vm-region-e2e", region="FR")),
+        kek_bytes=None,
+        userdata=b"#cloud-config\n",
+    )
+    from apps.identity.models import PrincipalScope, ServiceClient
+
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    result = launch.launch_vm(spec, actor)
+    assert result.ok is False
+    assert result.outcome == "no-miner-in-region"
+
+
+def test_launch_post_refuses_a_flavor_above_the_offered_maximum(
+    root_client, stub_vault_put, settings
+) -> None:
+    """In the catalogue is not for sale: 4xlarge is refused at intake with
+    its own category, and no job is created (so nothing is minted or
+    placed) — even on a fleet whose hardware could hold it."""
+    settings.VALI_SCHEDULER_MAX_FLAVOR = "2xlarge"
+    resp = root_client.post(LAUNCH_URL, _intent(vm_id="vm-big", flavor="4xlarge"), format="json")
+    assert resp.status_code == 400, resp.content
+    assert resp.json()["category"] == "flavor-not-offered"
+    assert "2xlarge" in resp.json()["error"]
+    assert LaunchJob.objects.count() == 0
+
+
+def test_launch_post_accepts_the_largest_offered_flavor(root_client, stub_vault_put) -> None:
+    resp = root_client.post(LAUNCH_URL, _intent(vm_id="vm-2xl", flavor="2xlarge"), format="json")
+    assert resp.status_code == 202, resp.content
+
+
+def test_4xlarge_is_offered_by_default(root_client, stub_vault_put) -> None:
+    """No cap unless one is configured: the whole grid is for sale."""
+    resp = root_client.post(LAUNCH_URL, _intent(vm_id="vm-4xl", flavor="4xlarge"), format="json")
+    assert resp.status_code == 202, resp.content
+
+
+def test_a_refused_golden_launch_writes_nothing_to_vault(
+    root_client, monkeypatch, settings
+) -> None:
+    """A golden launch (image-based, no `kek_vault_path`) provisions its
+    overlay KEK in Vault early. An above-cap flavor must be refused BEFORE
+    that — otherwise the Transit key and the KV entry are stranded under a
+    vm_id with no `Vm` row, where §24 never looks."""
+    settings.VALI_SCHEDULER_MAX_FLAVOR = "2xlarge"
+    touched: list[str] = []
+
+    def fail(*_a: object, **_k: object) -> None:
+        touched.append("vault")
+        raise AssertionError("Vault touched for a refused launch")
+
+    monkeypatch.setattr(launch_jobs, "_provision_golden_overlay_kek", fail)
+    monkeypatch.setattr(vault_kv, "put_kv", fail)
+    body = _intent(vm_id="vm-gold-big", flavor="4xlarge")
+    body.pop("kek_vault_path")
+    body["image"] = "ubuntu"
+    resp = root_client.post(LAUNCH_URL, body, format="json")
+    assert resp.status_code == 400, resp.content
+    assert resp.json()["category"] == "flavor-not-offered"
+    assert touched == []
+    assert LaunchJob.objects.count() == 0
+
+
+def test_the_cap_is_validated_when_the_app_loads(settings) -> None:
+    from django.apps import apps
+    from django.core.exceptions import ImproperlyConfigured
+
+    settings.VALI_SCHEDULER_MAX_FLAVOR = "huge"
+    with pytest.raises(ImproperlyConfigured, match="not a flavor"):
+        apps.get_app_config("orchestration").ready()
+
+
+def test_intake_serializes_with_the_vm_row_lock(root_client, stub_vault_put, monkeypatch) -> None:
+    """Intake accepts an ACTIVE vm_id; the job it creates becomes that VM's
+    launch record once it succeeds. It takes the Vm row lock BEFORE creating
+    the job, so a writer deciding under that lock (`vali_swap_vm_initrd`)
+    either sees the job or precedes it."""
+    from apps.lifecycle.models import Vm
+
+    from .factories import make_vm
+
+    make_vm("vm-api-1")
+    events: list[str] = []
+    real_lock = Vm.objects.select_for_update
+    real_create = LaunchJob.objects.create
+
+    def lock(*a, **k):
+        events.append("lock-vm")
+        return real_lock(*a, **k)
+
+    def create(*a, **k):
+        events.append("create-job")
+        return real_create(*a, **k)
+
+    monkeypatch.setattr(Vm.objects, "select_for_update", lock)
+    monkeypatch.setattr(LaunchJob.objects, "create", create)
+    resp = root_client.post(LAUNCH_URL, _intent(), format="json")
+    assert resp.status_code == 202, resp.content
+    assert events == ["lock-vm", "create-job"]

@@ -1,0 +1,72 @@
+{
+  "_comment": "net-policy order vectors: ticket-validator encode-order output (body_hex) and net-policy-digest (content_sha256) per payload, all under the same order_id/target/issued_at. The edge-gateway and miner-agent tests sign and decode body_hex. Drift = a wire change; do not update silently.",
+  "order_id": "np-7",
+  "target_miner_id": "cc-test-miner",
+  "issued_at_unix": 1770000000,
+  "cases": [
+    {
+      "name": "full",
+      "payload": {
+        "revision": 7,
+        "not_after_unix": 1770086400,
+        "region": "AU",
+        "mode": "local",
+        "enforce": false,
+        "local_action": "count",
+        "uplink_hint": "eth0",
+        "infra": [
+          {
+            "ip": "1.1.1.1",
+            "proto": "udp",
+            "port": 51820
+          }
+        ],
+        "region_miners": [
+          "8.8.4.4",
+          "8.8.8.8"
+        ],
+        "nb_control": [
+          {
+            "ip": "9.9.9.9",
+            "proto": "tcp",
+            "port": 443
+          },
+          {
+            "ip": "149.112.112.112",
+            "proto": "udp",
+            "port": 3478
+          }
+        ],
+        "dns_limit_pps": 20,
+        "smtp_allowed_vms": [
+          "tenant-2"
+        ],
+        "vm_caps": {
+          "tenant-1": 100,
+          "tenant-2": 250
+        }
+      },
+      "body_hex": "a6646b696e646a6e65742d706f6c69637966646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164ad646d6f6465656c6f63616c65696e66726181a362697067312e312e312e3164706f727419ca6c6570726f746f6375647066726567696f6e62415567656e666f726365f467766d5f63617073a26874656e616e742d3118646874656e616e742d3218fa687265766973696f6e076a6e625f636f6e74726f6c82a362697067392e392e392e3964706f72741901bb6570726f746f63746370a36269706f3134392e3131322e3131322e31313264706f7274190d966570726f746f637564706b75706c696e6b5f68696e7464657468306c6c6f63616c5f616374696f6e65636f756e746d646e735f6c696d69745f707073146d726567696f6e5f6d696e6572738267382e382e342e3467382e382e382e386e6e6f745f61667465725f756e69781a6981600070736d74705f616c6c6f7765645f766d73816874656e616e742d32686f726465725f6964646e702d376e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572",
+      "content_sha256": "3b4668ab7a5a55b7e53a78e8fcbca74431bc2947354643f1e0100c83f01d14ec"
+    },
+    {
+      "name": "minimal",
+      "payload": {
+        "revision": 1,
+        "not_after_unix": 1770086400,
+        "region": "FR",
+        "mode": "local",
+        "enforce": false,
+        "local_action": "count",
+        "infra": [],
+        "region_miners": [],
+        "nb_control": [],
+        "dns_limit_pps": 20,
+        "smtp_allowed_vms": [],
+        "vm_caps": {}
+      },
+      "body_hex": "a6646b696e646a6e65742d706f6c69637966646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164ac646d6f6465656c6f63616c65696e6672618066726567696f6e62465267656e666f726365f467766d5f63617073a0687265766973696f6e016a6e625f636f6e74726f6c806c6c6f63616c5f616374696f6e65636f756e746d646e735f6c696d69745f707073146d726567696f6e5f6d696e657273806e6e6f745f61667465725f756e69781a6981600070736d74705f616c6c6f7765645f766d7380686f726465725f6964646e702d376e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572",
+      "content_sha256": "3593442e40f39b466ec1cd0552991c6947c34544c6afcce27d2928f59c17edeb"
+    }
+  ]
+}

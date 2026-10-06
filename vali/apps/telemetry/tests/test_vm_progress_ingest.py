@@ -37,7 +37,7 @@ pytestmark = pytest.mark.django_db
 
 INGEST_URL = reverse("telemetry_vm_progress")
 
-MINER_ID = "miner-1"
+MINER_ID = "miner-a"
 PEER_ID = f"hippius-miner:{MINER_ID}"
 VM_ID = "vm-boot-1"
 DOMAIN = "HIPPIUS_VM_PROGRESS_V1"
@@ -62,6 +62,7 @@ class FakeVmProgressVerifier:
         self.miner_id = MINER_ID
         self.vm_id = VM_ID
         self.milestone = "booting"
+        self.reason: str | None = None
         self.timestamp_unix: int | None = None
         self.schema_version = 1
         self.fail_category = "signature_invalid"
@@ -88,6 +89,7 @@ class FakeVmProgressVerifier:
             vm_id=self.vm_id,
             milestone=self.milestone,
             timestamp_unix=ts,
+            reason=self.reason,
         )
 
 
@@ -211,9 +213,7 @@ def _post(
     extra: dict[str, Any] = {}
     if peer_id is not None:
         extra["HTTP_X_HIPPIUS_PEER_ID"] = peer_id
-    return APIClient().post(
-        INGEST_URL, data=body, content_type="application/cbor", **extra
-    )
+    return APIClient().post(INGEST_URL, data=body, content_type="application/cbor", **extra)
 
 
 # ─── happy path ──────────────────────────────────────────────────────
@@ -242,9 +242,7 @@ def test_advances_boot_phase_on_valid_milestone(
     assert vm.boot_phase_at is not None
     # The verifier saw the raw envelope + the miner's registered key
     # (`MinerIdentity.pubkey_hex`), not the source's `verifying_key`.
-    assert fake_verifier.calls == [
-        (b"signed-vm-progress-cbor", bytes.fromhex("ab" * 32))
-    ]
+    assert fake_verifier.calls == [(b"signed-vm-progress-cbor", bytes.fromhex("ab" * 32))]
 
 
 def test_hyphen_wire_milestone_maps_to_underscore_choice(
@@ -614,7 +612,7 @@ def test_host_binding_wins_over_a_stale_placement(
     # placement still names the SOURCE. The host binding must take
     # precedence: the source (which no longer holds the domain) is refused
     # even though the stale placement still names it.
-    source = _make_miner(miner_id="miner-1", chain_node_id="node-source")
+    source = _make_miner(miner_id="miner-a", chain_node_id="node-source")
     assert source.chain_node_id == "node-source"
     vm = _make_vm(host="miner-dest")
     _make_placement(vm, miner_node_id="node-source")
@@ -751,3 +749,284 @@ def test_untracked_vm_stays_benign_for_a_non_hosting_miner(
     assert resp.status_code == 200, resp.content
     assert resp.json()["tracked"] is False
     assert Vm.objects.filter(vm_id="vm-no-row").count() == 0
+
+
+# ─── zombie gate ─────────────────────────────────────────────────────
+
+
+def _erased_decommission(vm: Vm) -> None:
+    import secrets
+
+    from apps.identity.models import PrincipalScope, ServiceClient
+    from apps.orchestration.models import DecommissionJob, DecommissionState
+
+    DecommissionJob.objects.create(
+        job_id=secrets.token_hex(16),
+        vm=vm,
+        state=DecommissionState.CRYPTO_ERASING.value,
+        phase_started_at=timezone.now(),
+        kek_erased_at=timezone.now(),
+        decided_by=ServiceClient.objects.create(
+            scope=PrincipalScope.OPERATOR.value, name="op-zombie"
+        ),
+    )
+
+
+def test_progress_for_an_erased_vm_is_refused_and_pins_the_reporting_miner(
+    settings,
+) -> None:
+    from apps.lifecycle.models import ZombieObservation
+
+    settings.VALI_ZOMBIE_ERASE_GRACE_S = 0
+    _make_miner(chain_node_id="cc" * 32)
+    vm = _make_vm(state=VmState.DECOMMISSIONING)
+    _erased_decommission(vm)
+
+    resp = _post()
+
+    assert resp.status_code == 410
+    assert resp.json()["category"] == "vm-not-live"
+    vm.refresh_from_db()
+    assert vm.boot_phase == ""  # the milestone was not recorded
+    row = ZombieObservation.objects.get(vm_id=VM_ID)
+    # Signed by the reporting miner's own key over its own mTLS leg.
+    assert (row.miner_id, row.miner_node_id, row.attribution) == (
+        MINER_ID,
+        "cc" * 32,
+        "peer",
+    )
+
+
+def test_progress_for_a_decommissioning_vm_before_its_erase_is_unaffected() -> None:
+    from apps.lifecycle.models import ZombieObservation
+
+    _make_miner()
+    _make_vm(state=VmState.DECOMMISSIONING)  # no erase recorded
+    resp = _post()
+    assert resp.status_code != 410
+    assert not ZombieObservation.objects.exists()
+
+
+# ─── customer-held keys: awaiting-guardian (display-only) ────────────
+
+
+def _await(fake: FakeVmProgressVerifier, reason: str) -> None:
+    fake.milestone = "awaiting-guardian"
+    fake.reason = reason
+
+
+@pytest.mark.parametrize("mode", ["split", "customer"])
+def test_awaiting_guardian_is_recorded_for_an_m1_m2_vm(
+    fake_verifier: FakeVmProgressVerifier, mode: str
+) -> None:
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode=mode)
+    _await(fake_verifier, "unreachable")
+
+    resp = _post()
+
+    assert resp.status_code == 200, resp.content
+    # Not a boot_phase step: nothing advanced, the phase is untouched.
+    assert resp.json() == {
+        "ok": True,
+        "vm_id": VM_ID,
+        "boot_phase": "",
+        "tracked": True,
+        "advanced": False,
+    }
+    vm.refresh_from_db()
+    assert vm.boot_phase == ""
+    assert vm.guardian_wait_reason == "unreachable"
+    assert vm.guardian_wait_since is not None
+    assert vm.guardian_wait_at == vm.guardian_wait_since
+
+
+def test_awaiting_guardian_for_an_m0_vm_is_ignored(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    """M0 has no guardian: a miner reporting one records nothing (so it
+    can never hold back a timer for an M0 VM)."""
+    _make_miner()
+    vm = _make_vm()
+    _await(fake_verifier, "timeout")
+
+    resp = _post()
+
+    assert resp.status_code == 200, resp.content
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == ""
+    assert vm.guardian_wait_at is None
+
+
+def test_a_wait_keeps_its_since_and_takes_the_latest_reason(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="split")
+    _await(fake_verifier, "unreachable")
+    _post()
+    vm.refresh_from_db()
+    since = vm.guardian_wait_since
+    _await(fake_verifier, "refused:awaiting-approval")
+    _post()
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == "refused:awaiting-approval"
+    assert vm.guardian_wait_since == since
+    assert vm.guardian_wait_at >= since
+
+
+def test_a_stale_wait_starts_a_new_since(fake_verifier: FakeVmProgressVerifier) -> None:
+    from datetime import timedelta
+
+    _make_miner()
+    vm = _make_vm()
+    old = timezone.now() - timedelta(hours=2)
+    Vm.objects.filter(pk=vm.pk).update(
+        key_mode="split",
+        guardian_wait_reason="timeout",
+        guardian_wait_since=old,
+        guardian_wait_at=old,
+    )
+    _await(fake_verifier, "timeout")
+    _post()
+    vm.refresh_from_db()
+    assert vm.guardian_wait_since > old
+
+
+@pytest.mark.parametrize(
+    ("milestone", "clears"),
+    [("kek-released", True), ("running", True), ("booting", False)],
+)
+def test_a_later_milestone_clears_the_wait_but_keeps_its_last_report(
+    fake_verifier: FakeVmProgressVerifier, milestone: str, clears: bool
+) -> None:
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="customer")
+    _await(fake_verifier, "unreachable")
+    _post()
+    vm.refresh_from_db()
+    at = vm.guardian_wait_at
+    fake_verifier.milestone, fake_verifier.reason = milestone, None
+    _post()
+    vm.refresh_from_db()
+    assert (vm.guardian_wait_reason == "") is clears
+    assert (vm.guardian_wait_since is None) is clears
+    # The last report stays: a timer credits the time spent waiting.
+    assert vm.guardian_wait_at == at
+
+
+def test_the_vm_status_shows_awaiting_guardian(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    from apps.lifecycle.views import _serialize_vm
+
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="split")
+    vm.refresh_from_db()
+    assert _serialize_vm(vm)["guardian_wait"] is None
+    _await(fake_verifier, "refused:release-not-pinned")
+    _post()
+    vm.refresh_from_db()
+    wait = _serialize_vm(vm)["guardian_wait"]
+    assert wait["boot"] == "awaiting-guardian"
+    assert wait["reason"] == "refused:release-not-pinned"
+    assert wait["since"] == vm.guardian_wait_since.isoformat()
+    assert wait["terminal"] is False
+    assert _serialize_vm(vm)["key_mode"] == "split"
+
+
+def test_the_verifier_body_pairs_reason_and_milestone() -> None:
+    base = {
+        "schema_version": 1,
+        "domain": DOMAIN,
+        "miner_id": "m",
+        "vm_id": "vm-1",
+        "timestamp_unix": 1,
+    }
+    ok = verifier._vm_progress_body({**base, "milestone": "booting"})
+    assert ok.reason is None
+    ok = verifier._vm_progress_body({**base, "milestone": "awaiting-guardian", "reason": "timeout"})
+    assert ok.reason == "timeout"
+    for bad in (
+        {**base, "milestone": "awaiting-guardian"},
+        {**base, "milestone": "booting", "reason": "timeout"},
+        {**base, "milestone": "awaiting-guardian", "reason": 3},
+    ):
+        with pytest.raises(verifier.VerifierUnavailable):
+            verifier._vm_progress_body(bad)
+
+
+def _at(fake: FakeVmProgressVerifier, milestone: str, ts: int, reason: str | None = None):
+    fake.milestone, fake.reason, fake.timestamp_unix = milestone, reason, ts
+    assert _post().status_code == 200
+
+
+def test_a_late_wait_report_never_re_arms_a_cleared_wait(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    """Delivery can reorder: a wait report signed BEFORE the kek-released
+    that cleared it, delivered after, is dropped (it would otherwise pause
+    timers for a guest that is already up)."""
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="split")
+    t0 = int(time.time()) - 100
+    _at(fake_verifier, "awaiting-guardian", t0, "unreachable")
+    _at(fake_verifier, "kek-released", t0 + 10)
+    _at(fake_verifier, "awaiting-guardian", t0 + 5, "timeout")  # late
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == ""
+    # A NEW wait, signed after the clear (the next boot), is recorded.
+    _at(fake_verifier, "awaiting-guardian", t0 + 20, "unreachable")
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == "unreachable"
+
+
+def test_a_late_clearing_milestone_does_not_hide_a_newer_wait(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="customer")
+    t0 = int(time.time()) - 100
+    _at(fake_verifier, "awaiting-guardian", t0 + 20, "unreachable")
+    _at(fake_verifier, "running", t0 + 10)  # an earlier boot's, delivered late
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == "unreachable"
+    # …but it still moves the clearing watermark: an even older report drops.
+    _at(fake_verifier, "awaiting-guardian", t0 + 5, "timeout")
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == "unreachable"
+
+
+def test_an_older_wait_report_does_not_overwrite_a_newer_one(
+    fake_verifier: FakeVmProgressVerifier,
+) -> None:
+    _make_miner()
+    vm = _make_vm()
+    Vm.objects.filter(pk=vm.pk).update(key_mode="split")
+    t0 = int(time.time()) - 100
+    _at(fake_verifier, "awaiting-guardian", t0 + 10, "refused:awaiting-approval")
+    _at(fake_verifier, "awaiting-guardian", t0, "unreachable")
+    vm.refresh_from_db()
+    assert vm.guardian_wait_reason == "refused:awaiting-approval"
+
+
+@pytest.mark.parametrize(
+    ("mode", "phrase"), [("customer", "§24 decommission"), ("split", "§24 crypto-erase")]
+)
+def test_the_zombie_refusal_never_calls_an_m2_decommission_a_crypto_erase(
+    settings, mode: str, phrase: str
+) -> None:
+    settings.VALI_ZOMBIE_ERASE_GRACE_S = 0
+    _make_miner(chain_node_id="cc" * 32)
+    vm = _make_vm(state=VmState.DECOMMISSIONING)
+    Vm.objects.filter(pk=vm.pk).update(key_mode=mode)
+    _erased_decommission(vm)
+    resp = _post()
+    assert resp.status_code == 410
+    assert resp.json()["error"] == f"vm is past its {phrase}"

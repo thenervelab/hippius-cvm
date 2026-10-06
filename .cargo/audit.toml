@@ -19,4 +19,19 @@ ignore = [
     # it is not exploitable here. No fixed `rsa` release exists yet — revisit
     # when `rsa` ships a patch or `sev` drops the dependency.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0285 — rustls 0.23.40: TLS 1.3 handshake messages
+    # incorrectly accepted across encryption-level boundaries (CVSS 5.3,
+    # medium). Fixed in rustls >=0.23.45. NOT a lockfile bump: rustls is a
+    # dependency of `hippius-agent-initramfs` (via reqwest, the client
+    # that talks to the KBS), which is folded into the tenant UKI and thus
+    # into the SEV-SNP launch measurement. Bumping it changes the
+    # measurement, breaks the pinned KAT (test_vectors/uki/
+    # tenant-measurement.json) and requires a new §22 allowlist entry that
+    # must OVERLAP the current epoch or every running tenant loses its
+    # key at the roll. That is the scheduled-rebake + measurement-
+    # promotion pipeline tracked in #1079; this advisory is its first
+    # concrete trigger. Exposure meanwhile is narrow: the affected client
+    # speaks to the KBS inside the attested NetBird overlay, not to the
+    # public internet. Allowed 2026-09-18; remove with the rustls bump.
+    "RUSTSEC-2026-0285",
 ]

@@ -264,9 +264,9 @@ mod tests {
         // KEK-HSM Phase 3: the cap token attaches the ONE fixed templated
         // policy + `entity_alias=<vm_id>` (the per-VM scope) — never a
         // broker-authored ACL. Short-TTL, num_uses-bounded, no default.
-        let b = token_create_body(TEMPLATED_CAP_POLICY, "smoke-p2b-003", 60);
+        let b = token_create_body(TEMPLATED_CAP_POLICY, "smoke-001", 60);
         assert_eq!(b["policies"], serde_json::json!(["kbs-cap-templated"]));
-        assert_eq!(b["entity_alias"], serde_json::json!("smoke-p2b-003"));
+        assert_eq!(b["entity_alias"], serde_json::json!("smoke-001"));
         assert_eq!(b["no_default_policy"], serde_json::json!(true));
         assert_eq!(b["renewable"], serde_json::json!(false));
         assert_eq!(b["ttl"], serde_json::json!("60s"));

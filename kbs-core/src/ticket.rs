@@ -32,6 +32,34 @@ pub fn verify_order_ticket(
     keyring: &dyn L1Keyring,
     now_unix: u64,
 ) -> Result<(OrderTicket, Vec<u8>)> {
+    verify_order_ticket_inner(cose_bytes, keyring, Some(now_unix))
+}
+
+/// [`verify_order_ticket`] WITHOUT the `issue_time`/`expiry` window —
+/// every other check (canonical CBOR, EdDSA signature under an
+/// allowlisted L1 kid, schema) is identical.
+///
+/// For the custody-lease bind ONLY (`crate::custody`). A bind re-presents
+/// the ticket its boot was released under, possibly days later (daemon
+/// restart, KBS restart), and tickets expire after 24 h. What the bind
+/// takes from the ticket is identity — the measurement set, the placement,
+/// the Vault paths — while what AUTHORISES it is the live lifecycle state
+/// (`Active{gen, host, lease}` + the committed boot counter), which the
+/// bind checks separately. The release path must keep using
+/// [`verify_order_ticket`]: there the expiry bounds replay of a ticket
+/// against a fresh boot.
+pub fn verify_order_ticket_ignoring_expiry(
+    cose_bytes: &[u8],
+    keyring: &dyn L1Keyring,
+) -> Result<(OrderTicket, Vec<u8>)> {
+    verify_order_ticket_inner(cose_bytes, keyring, None)
+}
+
+fn verify_order_ticket_inner(
+    cose_bytes: &[u8],
+    keyring: &dyn L1Keyring,
+    now_unix: Option<u64>,
+) -> Result<(OrderTicket, Vec<u8>)> {
     // §22/§20: the wire bytes themselves must be deterministic — a
     // non-canonical outer wrapper would survive a payload-only check.
     assert_canonical(cose_bytes)?;
@@ -87,13 +115,15 @@ pub fn verify_order_ticket(
     let ticket: OrderTicket = ciborium::de::from_reader(payload.as_slice())
         .map_err(|e| KbsError::Ticket(format!("ticket decode: {e}")))?;
 
-    if now_unix >= ticket.expiry {
-        return Err(KbsError::Ticket("expired".into()));
-    }
-    if now_unix < ticket.issue_time {
-        return Err(KbsError::Ticket(
-            "not yet valid (issue_time in future)".into(),
-        ));
+    if let Some(now_unix) = now_unix {
+        if now_unix >= ticket.expiry {
+            return Err(KbsError::Ticket("expired".into()));
+        }
+        if now_unix < ticket.issue_time {
+            return Err(KbsError::Ticket(
+                "not yet valid (issue_time in future)".into(),
+            ));
+        }
     }
     for m in &ticket.allowed_measurements {
         let bytes: &[u8] = m.as_ref();
@@ -116,6 +146,9 @@ pub fn verify_order_ticket(
             ticket.v
         )));
     }
+    // Customer-held keys: a present `key_mode` other than split/customer
+    // (explicit `hippius`, CBOR `null`) already failed the decode above —
+    // see `OrderTicket::key_mode`. M0 has exactly one encoding.
     if ticket.nonce().len() != 32 {
         return Err(KbsError::Ticket("nonce must be 32 bytes".into()));
     }
@@ -246,6 +279,59 @@ mod tests {
         assert_eq!(t.luks_vault_ref.version, 3);
     }
 
+    /// `ticket_payload()` with a `key_mode` text entry added (canonical).
+    fn payload_with_key_mode(mode: &str) -> Vec<u8> {
+        payload_with_key_mode_value(Value::Text(mode.into()))
+    }
+
+    /// `ticket_payload()` with a `key_mode` entry of any CBOR value.
+    fn payload_with_key_mode_value(value: Value) -> Vec<u8> {
+        let Value::Map(mut entries) =
+            ciborium::de::from_reader::<Value, _>(ticket_payload().as_slice()).unwrap()
+        else {
+            panic!("ticket payload is a map")
+        };
+        entries.push((Value::Text("key_mode".into()), value));
+        to_canonical_vec(&Value::Map(entries)).unwrap()
+    }
+
+    #[test]
+    fn key_mode_is_optional_signed_and_closed_vocabulary() {
+        use hippius_types::guardian::KeyMode;
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let kid = b"l1-kid".to_vec();
+        let ks = OneKey {
+            kid: kid.clone(),
+            vk: sk.verifying_key(),
+        };
+        // An M0 ticket — every ticket minted today — carries no key_mode
+        // and reads as `hippius`.
+        let (t, _) = verify_order_ticket(&signed(&sk, &kid, ticket_payload()), &ks, 1500).unwrap();
+        assert_eq!(t.key_mode, None);
+        assert_eq!(t.key_mode(), KeyMode::Hippius);
+        for (wire, mode) in [("split", KeyMode::Split), ("customer", KeyMode::Customer)] {
+            let cose = signed(&sk, &kid, payload_with_key_mode(wire));
+            let (t, _) = verify_order_ticket(&cose, &ks, 1500).unwrap();
+            assert_eq!(t.key_mode, Some(mode));
+            assert_eq!(t.key_mode(), mode);
+        }
+        // M0 has one encoding: an explicit `hippius` is refused, and so is
+        // a CBOR `null` (which a plain `Option` would read as absent).
+        let explicit = signed(&sk, &kid, payload_with_key_mode("hippius"));
+        let err = verify_order_ticket(&explicit, &ks, 1500).unwrap_err();
+        assert!(err.to_string().contains("must be omitted"), "{err}");
+        let null = signed(&sk, &kid, payload_with_key_mode_value(Value::Null));
+        assert!(
+            verify_order_ticket(&null, &ks, 1500).is_err(),
+            "null key_mode"
+        );
+        // Anything else is a decode failure, never a default.
+        for bad in ["Customer", "", "none", "m2"] {
+            let cose = signed(&sk, &kid, payload_with_key_mode(bad));
+            assert!(verify_order_ticket(&cose, &ks, 1500).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn expired_is_denied() {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
@@ -256,6 +342,27 @@ mod tests {
         };
         let cose = signed(&sk, &kid, ticket_payload());
         assert!(verify_order_ticket(&cose, &ks, 2000).is_err());
+    }
+
+    #[test]
+    fn ignoring_expiry_skips_only_the_time_window() {
+        // CLAIM: the custody variant accepts an expired ticket, and still
+        // refuses a ticket signed by a key outside the keyring.
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let kid = b"l1-kid".to_vec();
+        let ks = OneKey {
+            kid: kid.clone(),
+            vk: sk.verifying_key(),
+        };
+        let cose = signed(&sk, &kid, ticket_payload());
+        assert!(verify_order_ticket(&cose, &ks, 2000).is_err());
+        let (t, got_kid) = verify_order_ticket_ignoring_expiry(&cose, &ks).unwrap();
+        assert_eq!(got_kid, kid);
+        assert_eq!(t.expiry, 2000);
+
+        let rogue = SigningKey::from_bytes(&[43u8; 32]);
+        let forged = signed(&rogue, &kid, ticket_payload());
+        assert!(verify_order_ticket_ignoring_expiry(&forged, &ks).is_err());
     }
 
     #[test]

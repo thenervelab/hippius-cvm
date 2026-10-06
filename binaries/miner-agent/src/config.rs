@@ -43,6 +43,10 @@ pub struct Config {
     /// Optional: a config without the table uses the built-in defaults.
     #[serde(default)]
     pub heartbeat: HeartbeatSection,
+    /// `[backup]` — live VM backup tuning. Optional: a config without
+    /// the table uses the built-in defaults.
+    #[serde(default)]
+    pub backup: BackupSection,
     /// `[kbs]` — the KBS-over-vsock proxy (the tenant guest relays its
     /// §21 release exchange through the agent instead of reaching the
     /// KBS over the network). Optional: absent ⇒ the proxy is off and
@@ -120,6 +124,17 @@ pub struct KbsSection {
     /// public ACME cert + an external DNS zone. Absent ⇒ webpki roots
     /// only (public cert required).
     pub ca_cert: Option<PathBuf>,
+
+    /// Relay the guest custody-lease paths
+    /// (`hippius_types::kbs_vsock::CUSTODY_PATHS`) to the KBS. Default
+    /// OFF: a custody request is then answered locally with `503
+    /// custody-disabled` and never forwarded, which the guest daemon
+    /// treats as "retry, change nothing". Turn it on only once the KBS
+    /// serves the custody routes — until then a forward would only reach
+    /// a 404. When on, custody requests are rate-limited per VM on top of
+    /// the proxy's global connection cap (see `vsock::kbs_proxy`).
+    #[serde(default)]
+    pub custody_relay: bool,
 }
 
 /// `[lifecycle]` — host-side vali ingress the vsock proxy forwards the
@@ -223,12 +238,14 @@ pub struct HostSection {
     /// Total MiB of RAM allotted to tenant CVMs.
     pub cvm_memory_mb_budget: u64,
     /// Total GiB of tenant DATA disk the host commits to (the operator's
-    /// declared disk capacity). The scheduler uses it for placement and
-    /// the miner reserves against it so concurrent launches can't
-    /// over-commit. Optional — defaults to 0, which DISABLES the disk
-    /// reservation (cpu/mem budgets still apply + the per-create statvfs
-    /// backstop still rejects a genuinely full mount). Set it to the
-    /// real free capacity of `[storage].data_disk_root`.
+    /// declared disk capacity). The miner reserves against it so
+    /// concurrent launches can't over-commit, and declares it in the `v4`
+    /// heartbeat (`[heartbeat] schema_disk`), where vali may only use it to
+    /// LOWER its own disk ledger. Optional — defaults to 0, which DISABLES
+    /// the budget reservation (cpu/mem budgets still apply, and the
+    /// measured free-space gate still rejects a genuinely full mount). Set
+    /// it to the capacity of `[storage].data_disk_root` the operator is
+    /// prepared to sell, leaving headroom for staging and backups.
     #[serde(default)]
     pub cvm_disk_gb_budget: u64,
     /// When `true`, a graceful agent shutdown (SIGTERM — `systemctl
@@ -239,13 +256,9 @@ pub struct HostSection {
     /// tenants instead of tearing every VM down.
     ///
     /// Default `false` preserves the historical "stop every CVM on
-    /// shutdown" behaviour. **Caveat until startup re-adoption ships:**
-    /// after a restart the agent's in-memory handle map is empty, so a
-    /// left-running CVM is UNTRACKED — its data-disk still counts
-    /// against the host on disk but not in the cpu/mem budget, and a
-    /// guest `reboot` won't get its OrderTicket re-pushed. Enable this
-    /// on miners where surviving an agent restart matters more than
-    /// that gap (the follow-up re-adopts running domains at startup).
+    /// shutdown" behaviour. Startup re-adoption (`readopt_running`)
+    /// restores tracking of the CVMs left running, so every deployed
+    /// miner sets this — the Ansible template renders it `true`.
     #[serde(default)]
     pub skip_shutdown_teardown: bool,
 }
@@ -272,6 +285,29 @@ pub struct HeartbeatSection {
     /// to a sibling of the identity key under `/var/lib/hippius-miner`.
     #[serde(default = "default_heartbeat_sequence_path")]
     pub sequence_path: PathBuf,
+    /// Emit the `v3` heartbeat (capacity v2): the ordinary body plus the
+    /// `[host]` CPU/memory budgets and the SEV-ES ASID pool, which vali
+    /// uses as down-only clamps. Default `false` — the fleet keeps
+    /// emitting `v1` until vali (whose verifier must accept `v3` FIRST)
+    /// is live. The preflight ASID gate does NOT depend on this flag.
+    #[serde(default)]
+    pub schema_capacity: bool,
+    /// Emit the `v4` heartbeat instead: the `v3` body plus the disk
+    /// declarations (`[host] cvm_disk_gb_budget` and a `statvfs` of the
+    /// data + staging filesystems), which vali uses as down-only clamps on
+    /// its committed-disk ledger. Requires `schema_capacity` (`v4` is a
+    /// superset of `v3`). Default `false`: vali's verifier must accept
+    /// `v4` FIRST.
+    #[serde(default)]
+    pub schema_disk: bool,
+    /// Emit the `v5` heartbeat instead: the `v4` body plus the SEV-SNP
+    /// host-health report (`snp_enabled`, `cpus_offline`,
+    /// `snp_launches_since_boot`, `df_flush_failures` — see
+    /// [`crate::host_health`]), which vali only alerts on. Requires
+    /// `schema_disk` (`v5` is a superset of `v4`). Default `false`: vali's
+    /// verifier must accept `v5` FIRST.
+    #[serde(default)]
+    pub schema_host_health: bool,
 }
 
 impl Default for HeartbeatSection {
@@ -280,6 +316,9 @@ impl Default for HeartbeatSection {
             interval_secs: default_heartbeat_interval_secs(),
             max_pending: default_heartbeat_max_pending(),
             sequence_path: default_heartbeat_sequence_path(),
+            schema_capacity: false,
+            schema_disk: false,
+            schema_host_health: false,
         }
     }
 }
@@ -294,6 +333,31 @@ fn default_heartbeat_max_pending() -> usize {
 
 fn default_heartbeat_sequence_path() -> PathBuf {
     PathBuf::from("/var/lib/hippius-miner/heartbeat.seq")
+}
+
+/// `[backup]` — live VM backup tuning.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// HOST budget for the QEMU copies of backups, bytes/s: every job gets
+    /// an equal share per run slot (`backup::job_speed`), so concurrent
+    /// runs never exceed it together. `0` leaves them uncapped. Default
+    /// 384 MiB/s — 192 MiB/s per job (see
+    /// `backup::DEFAULT_HOST_SPEED_BYTES_PER_SEC` for why).
+    #[serde(default = "default_backup_host_speed")]
+    pub host_speed_bytes_per_sec: u64,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            host_speed_bytes_per_sec: default_backup_host_speed(),
+        }
+    }
+}
+
+fn default_backup_host_speed() -> u64 {
+    crate::backup::DEFAULT_HOST_SPEED_BYTES_PER_SEC
 }
 
 /// `[identity]` — where the self-generated miner identity lives.
@@ -442,6 +506,19 @@ impl Config {
             return Err(MinerAgentError::ConfigInvalid("heartbeat.max_pending"));
         }
         require_absolute(&self.heartbeat.sequence_path, "heartbeat.sequence_path")?;
+        // `v4` extends `v3`: the disk declarations ride on a body that
+        // already carries the capacity ones.
+        if self.heartbeat.schema_disk && !self.heartbeat.schema_capacity {
+            return Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_disk-requires-schema_capacity",
+            ));
+        }
+        // `v5` extends `v4` the same way.
+        if self.heartbeat.schema_host_health && !self.heartbeat.schema_disk {
+            return Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_host_health-requires-schema_disk",
+            ));
+        }
 
         // `[kbs]` / `[lifecycle]` are optional. When present, the vsock
         // proxy forwards over the host's network to these HTTPS bases —
@@ -700,6 +777,19 @@ cvm_memory_mb_budget = 16384
     }
 
     #[test]
+    fn kbs_custody_relay_defaults_off_and_parses_when_set() {
+        // Absent ⇒ OFF: an existing miner config keeps refusing the
+        // custody paths locally after the upgrade.
+        let without = format!("{VALID}\n[kbs]\nendpoint = \"https://kbs.hippius.network\"\n");
+        assert!(!parse(&without).unwrap().kbs.unwrap().custody_relay);
+        let with = format!(
+            "{VALID}\n[kbs]\nendpoint = \"https://kbs.hippius.network\"\n\
+             custody_relay = true\n"
+        );
+        assert!(parse(&with).unwrap().kbs.unwrap().custody_relay);
+    }
+
+    #[test]
     fn plaintext_lifecycle_vali_url_is_rejected() {
         // A typo'd plaintext vali reach must fail fast at load — the §25
         // ack hop must not silently downgrade.
@@ -717,6 +807,45 @@ cvm_memory_mb_budget = 16384
             parse(&bad),
             Err(MinerAgentError::ConfigParse { .. })
         ));
+    }
+
+    /// The `[host]` section of a config file, header line excluded, up to
+    /// the next table header or Jinja block.
+    fn host_section(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip_while(|l| l.trim() != "[host]")
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with('[') && !l.trim_start().starts_with("{%"))
+            .collect()
+    }
+
+    #[test]
+    fn deployed_and_example_configs_keep_cvms_across_an_agent_restart() {
+        // 2026-09-21: an Ansible re-render had silently dropped this key
+        // (it was only ever hand-added), so `systemctl stop` on one host
+        // tore down every tenant domain. The template is what every miner
+        // actually runs — pin the key in it, inside `[host]`.
+        let sources = [
+            (
+                "ansible template",
+                include_str!(
+                    "../../../deploy/ansible/playbooks/miner-tasks/templates/miner-agent-config.toml.j2"
+                ),
+            ),
+            (
+                "shipped example",
+                include_str!("../examples/miner-agent-config.toml.example"),
+            ),
+        ];
+        for (name, text) in sources {
+            let host = host_section(text);
+            assert!(!host.is_empty(), "{name}: no [host] section");
+            assert!(
+                host.iter()
+                    .any(|l| l.trim() == "skip_shutdown_teardown = true"),
+                "{name}: [host] must set `skip_shutdown_teardown = true`"
+            );
+        }
     }
 
     #[test]
@@ -889,6 +1018,19 @@ cvm_memory_mb_budget = 16384
     }
 
     #[test]
+    fn the_backup_speed_defaults_and_is_overridable() {
+        // `VALID` carries no `[backup]` — existing configs keep parsing.
+        assert_eq!(
+            parse(VALID).unwrap().backup.host_speed_bytes_per_sec,
+            384 << 20
+        );
+        let cfg = format!("{VALID}\n[backup]\nhost_speed_bytes_per_sec = 0\n");
+        assert_eq!(parse(&cfg).unwrap().backup.host_speed_bytes_per_sec, 0);
+        let cfg = format!("{VALID}\n[backup]\nspeed_bytes_per_sec = 1\n");
+        assert!(parse(&cfg).is_err(), "unknown key refused");
+    }
+
+    #[test]
     fn an_explicit_heartbeat_table_is_honoured() {
         let cfg = format!(
             "{VALID}\n[heartbeat]\ninterval_secs = 30\nmax_pending = 8\n\
@@ -901,6 +1043,58 @@ cvm_memory_mb_budget = 16384
             c.heartbeat.sequence_path,
             PathBuf::from("/var/lib/hippius-miner/hb.seq")
         );
+    }
+
+    #[test]
+    fn schema_disk_defaults_false_and_requires_schema_capacity() {
+        assert!(!parse(VALID).unwrap().heartbeat.schema_disk);
+        assert!(!HeartbeatSection::default().schema_disk);
+        let cfg = format!("{VALID}\n[heartbeat]\nschema_capacity = true\nschema_disk = true\n");
+        assert!(parse(&cfg).unwrap().heartbeat.schema_disk);
+        let cfg = format!("{VALID}\n[heartbeat]\nschema_disk = true\n");
+        assert!(matches!(
+            parse(&cfg),
+            Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_disk-requires-schema_capacity"
+            ))
+        ));
+    }
+
+    #[test]
+    fn schema_host_health_defaults_false_and_requires_schema_disk() {
+        assert!(!parse(VALID).unwrap().heartbeat.schema_host_health);
+        assert!(!HeartbeatSection::default().schema_host_health);
+        let cfg = format!(
+            "{VALID}\n[heartbeat]\nschema_capacity = true\nschema_disk = true\nschema_host_health = true\n"
+        );
+        assert!(parse(&cfg).unwrap().heartbeat.schema_host_health);
+        let cfg =
+            format!("{VALID}\n[heartbeat]\nschema_capacity = true\nschema_host_health = true\n");
+        assert!(matches!(
+            parse(&cfg),
+            Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_host_health-requires-schema_disk"
+            ))
+        ));
+    }
+
+    #[test]
+    fn schema_capacity_defaults_false_and_parses_true() {
+        // Absent table AND absent key both mean `false` — the fleet keeps
+        // emitting v1 until vali accepts v3.
+        assert!(!parse(VALID).unwrap().heartbeat.schema_capacity);
+        assert!(!HeartbeatSection::default().schema_capacity);
+        let cfg = format!("{VALID}\n[heartbeat]\ninterval_secs = 30\n");
+        assert!(!parse(&cfg).unwrap().heartbeat.schema_capacity);
+        let cfg = format!("{VALID}\n[heartbeat]\nschema_capacity = true\n");
+        assert!(parse(&cfg).unwrap().heartbeat.schema_capacity);
+    }
+
+    #[test]
+    fn an_unknown_heartbeat_key_is_still_rejected() {
+        // `deny_unknown_fields` survives the new key — a typo fails loudly.
+        let cfg = format!("{VALID}\n[heartbeat]\nschema_capacityy = true\n");
+        assert!(parse(&cfg).is_err());
     }
 
     #[test]

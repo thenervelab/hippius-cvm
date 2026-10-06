@@ -24,7 +24,7 @@
 //! field of the signed body, so a cross-scheme replay produces
 //! different bytes and fails verification.
 //!
-//! ## Schema (`v1`) — fixed, fail-closed
+//! ## Schema (`v1` / `v2` / `v3` / `v4` / `v5`) — fixed, fail-closed
 //!
 //! Every field is mandatory. [`MinerHeartbeat::validate`] runs on both
 //! the encode and (caller-side) decode paths; [`canonical`] rejects a
@@ -66,6 +66,60 @@ pub const SCHEMA_VERSION: u8 = 1;
 /// BOTH versions; a `v1` heartbeat is byte-identical to before.
 pub const SCHEMA_VERSION_GRACEFUL_EXIT: u8 = 2;
 
+/// The `schema_version` of a `v3` heartbeat — the full `v2` body
+/// (`graceful_exit_requested` included) PLUS four `u32` capacity
+/// declarations: `cvm_cpu_budget`, `cvm_memory_mb_budget`,
+/// `asid_capacity`, `asid_used` (capacity v2 §2.3/§2.4). `0` in any of
+/// them means "the host could not read it / unknown".
+///
+/// The miner is UNTRUSTED: vali uses these only as DOWN-ONLY clamps on
+/// its own trusted bound, so a miner inflating them gains nothing and
+/// deflating them only throttles itself.
+///
+/// Graceful exit: a `v3` body carries the flag like `v2` does, and a
+/// verifier MUST honour it on both. The miner-agent nevertheless keeps
+/// emitting its graceful-exit heartbeat as `v2`
+/// ([`MinerHeartbeat::graceful_exit`]) — a leaving miner has no use for
+/// capacity declarations, and a `v2` exit stays understood by a vali
+/// that predates `v3`.
+///
+/// `v3` is OPT-IN (the miner-agent's `[heartbeat] schema_capacity`);
+/// vali MUST accept it before any miner emits it.
+pub const SCHEMA_VERSION_CAPACITY: u8 = 3;
+
+/// The `schema_version` of a `v4` heartbeat — the full `v3` body PLUS the
+/// four `u32` GiB disk declarations of [`DiskDeclaration`]
+/// (`cvm_disk_gb_budget`, `data_disk_total_gb`, `data_disk_available_gb`,
+/// `staging_disk_available_gb`). `0` in any of them = unknown.
+///
+/// Disk cannot be attested by SNP, so — exactly like `v3` — vali uses
+/// these only as DOWN-ONLY clamps on its own committed-disk ledger: an
+/// inflated figure buys a miner launches it then fails (`insufficient-disk`,
+/// counted against it), a deflated one only throttles itself.
+///
+/// `v4` is OPT-IN (the miner-agent's `[heartbeat] schema_disk`); vali's
+/// verifier MUST accept it before any miner emits it.
+pub const SCHEMA_VERSION_DISK: u8 = 4;
+
+/// The `schema_version` of a `v5` heartbeat — the full `v4` body PLUS the
+/// four host-health fields of [`HostHealthDeclaration`] (`snp_enabled`,
+/// `cpus_offline`, `snp_launches_since_boot`, `df_flush_failures`).
+///
+/// They exist to see SEV-SNP ASID recycling break before it does: the
+/// kernel recycles a destroyed guest's ASID only through `SNP_DF_FLUSH`,
+/// which the firmware refuses (`WBINVD_REQUIRED`) while a CPU it counted
+/// at `SNP_INIT` is offline. A host in that state launches roughly one
+/// ASID pool's worth of guests after boot, then refuses every new one
+/// until it reboots.
+///
+/// Observability only — vali alerts on them and never lets them change
+/// placement, so a miner misreporting them can only hide its own fault
+/// from the operator.
+///
+/// `v5` is OPT-IN (the miner-agent's `[heartbeat] schema_host_health`);
+/// vali's verifier MUST accept it before any miner emits it.
+pub const SCHEMA_VERSION_HOST_HEALTH: u8 = 5;
+
 /// Anti-skew window, in seconds. vali rejects a heartbeat whose
 /// `timestamp_unix` is more than this far from its own clock — in
 /// either direction.
@@ -96,6 +150,11 @@ pub enum HeartbeatError {
     SignatureLength,
     /// The canonical-CBOR encode failed.
     Encode,
+    /// A `v3` capacity declaration was self-contradictory
+    /// (`asid_used > asid_capacity` with a known, non-zero capacity), or a
+    /// `v4` disk declaration was (`data_disk_available_gb >
+    /// data_disk_total_gb` with a known, non-zero total).
+    Capacity,
 }
 
 impl core::fmt::Display for HeartbeatError {
@@ -114,6 +173,7 @@ impl HeartbeatError {
             HeartbeatError::MinerId => "heartbeat-miner-id",
             HeartbeatError::SignatureLength => "heartbeat-signature-length",
             HeartbeatError::Encode => "heartbeat-encode",
+            HeartbeatError::Capacity => "heartbeat-capacity",
         }
     }
 }
@@ -175,6 +235,28 @@ pub struct MinerHeartbeat {
     /// rejects a `v1` body whose flag is `true`. Only a `v2` heartbeat
     /// ([`SCHEMA_VERSION_GRACEFUL_EXIT`]) encodes it.
     pub graceful_exit_requested: bool,
+    /// `v3`-only: the vCPU budget the miner's own preflight gate admits
+    /// tenant CVMs against (`[host] cvm_cpu_budget`). `0` = unknown.
+    /// Never in a `v1`/`v2` body ([`validate`](Self::validate) rejects a
+    /// non-zero value there).
+    pub cvm_cpu_budget: u32,
+    /// `v3`-only: the memory budget (MiB) of the miner's own preflight
+    /// gate (`[host] cvm_memory_mb_budget`). `0` = unknown.
+    pub cvm_memory_mb_budget: u32,
+    /// `v3`-only: SEV-ES ASIDs the host kernel exposes
+    /// (`misc.capacity sev_es`). `0` = unknown.
+    pub asid_capacity: u32,
+    /// `v3`-only: SEV-ES ASIDs in use (`misc.current sev_es`). `0` =
+    /// unknown or none in use. Never above a non-zero `asid_capacity`.
+    pub asid_used: u32,
+    /// `v4`/`v5` disk declarations. All zero (= absent) in a
+    /// `v1`/`v2`/`v3` body ([`validate`](Self::validate) rejects a
+    /// non-zero value there).
+    pub disk: DiskDeclaration,
+    /// `v5`-only host-health report. All zero / `false` (= absent) in
+    /// every earlier body ([`validate`](Self::validate) rejects anything
+    /// else there).
+    pub host_health: HostHealthDeclaration,
 }
 
 impl MinerHeartbeat {
@@ -182,11 +264,16 @@ impl MinerHeartbeat {
     /// [`canonical`](Self::canonical) so a signature over an impossible
     /// value can never be produced; a decoder MUST run it too.
     pub fn validate(&self) -> Result<()> {
-        // Accept BOTH wire versions — `v1` (the frozen 10-field
-        // baseline) and `v2` (the 11-field graceful-exit-flag form).
-        // Any other value fails closed, exactly as `v1`-only did.
+        // Accept the five wire versions — `v1` (the frozen 10-field
+        // baseline), `v2` (the 11-field graceful-exit-flag form), `v3`
+        // (`v2` + the four capacity declarations), `v4` (`v3` + the four
+        // disk declarations) and `v5` (`v4` + the four host-health
+        // fields). Any other value fails closed.
         if self.schema_version != SCHEMA_VERSION
             && self.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
+            && self.schema_version != SCHEMA_VERSION_CAPACITY
+            && self.schema_version != SCHEMA_VERSION_DISK
+            && self.schema_version != SCHEMA_VERSION_HOST_HEALTH
         {
             return Err(HeartbeatError::SchemaVersion);
         }
@@ -197,6 +284,34 @@ impl MinerHeartbeat {
         if self.schema_version == SCHEMA_VERSION && self.graceful_exit_requested {
             return Err(HeartbeatError::SchemaVersion);
         }
+        // Same rule for the capacity declarations: they are `v3`/`v4`
+        // wire fields only, so a `v1`/`v2` body carrying any of them
+        // non-zero would never round-trip through its own canonical map.
+        if !self.carries_capacity_keys() && self.has_capacity_fields() {
+            return Err(HeartbeatError::SchemaVersion);
+        }
+        // …the disk declarations are `v4`/`v5`-only…
+        if !self.carries_disk_keys() && self.disk != DiskDeclaration::default() {
+            return Err(HeartbeatError::SchemaVersion);
+        }
+        // …and the host-health report is `v5`-only.
+        if self.schema_version != SCHEMA_VERSION_HOST_HEALTH
+            && self.host_health != HostHealthDeclaration::default()
+        {
+            return Err(HeartbeatError::SchemaVersion);
+        }
+        // A known ASID capacity bounds the in-use count. (`capacity == 0`
+        // is "unknown", so `asid_used` is unconstrained there.)
+        if self.asid_capacity != 0 && self.asid_used > self.asid_capacity {
+            return Err(HeartbeatError::Capacity);
+        }
+        // Likewise a known data-fs size bounds its free space (`statvfs`
+        // `f_bavail <= f_blocks`).
+        if self.disk.data_disk_total_gb != 0
+            && self.disk.data_disk_available_gb > self.disk.data_disk_total_gb
+        {
+            return Err(HeartbeatError::Capacity);
+        }
         if self.domain != DOMAIN {
             return Err(HeartbeatError::Domain);
         }
@@ -204,6 +319,27 @@ impl MinerHeartbeat {
             return Err(HeartbeatError::MinerId);
         }
         Ok(())
+    }
+
+    /// `true` for the versions whose canonical map carries the four
+    /// capacity keys (`v3` and its supersets `v4` and `v5`).
+    fn carries_capacity_keys(&self) -> bool {
+        self.schema_version == SCHEMA_VERSION_CAPACITY || self.carries_disk_keys()
+    }
+
+    /// `true` for the versions whose canonical map carries the four disk
+    /// keys (`v4` and its superset `v5`).
+    fn carries_disk_keys(&self) -> bool {
+        self.schema_version == SCHEMA_VERSION_DISK
+            || self.schema_version == SCHEMA_VERSION_HOST_HEALTH
+    }
+
+    /// `true` when any `v3`-only capacity field is non-zero.
+    fn has_capacity_fields(&self) -> bool {
+        self.cvm_cpu_budget != 0
+            || self.cvm_memory_mb_budget != 0
+            || self.asid_capacity != 0
+            || self.asid_used != 0
     }
 
     /// Deterministic-CBOR encoding of the to-be-signed body — the
@@ -222,7 +358,10 @@ impl MinerHeartbeat {
         // every prior build (the `heartbeat_kat` vector is unchanged).
         // `v2` adds the 11th key, which the canonical encoder places at
         // the end. The `schema_version` value is the ONLY change to a
-        // shared field's encoding between the two versions.
+        // shared field's encoding between the two versions. `v3` is the
+        // `v2` map plus the four capacity keys (the encoder sorts them in),
+        // `v4` is the `v3` map plus the four disk keys, and `v5` is the
+        // `v4` map plus the four host-health keys.
         let mut entries = vec![
             (
                 Value::Text("cpu_load_1m_centi".into()),
@@ -230,11 +369,71 @@ impl MinerHeartbeat {
             ),
             (Value::Text("domain".into()), Value::Text(DOMAIN.into())),
         ];
-        if self.schema_version == SCHEMA_VERSION_GRACEFUL_EXIT {
+        if self.schema_version == SCHEMA_VERSION_GRACEFUL_EXIT || self.carries_capacity_keys() {
             entries.push((
                 Value::Text("graceful_exit_requested".into()),
                 Value::Bool(self.graceful_exit_requested),
             ));
+        }
+        if self.carries_capacity_keys() {
+            entries.extend([
+                (
+                    Value::Text("asid_capacity".into()),
+                    Value::Integer(self.asid_capacity.into()),
+                ),
+                (
+                    Value::Text("asid_used".into()),
+                    Value::Integer(self.asid_used.into()),
+                ),
+                (
+                    Value::Text("cvm_cpu_budget".into()),
+                    Value::Integer(self.cvm_cpu_budget.into()),
+                ),
+                (
+                    Value::Text("cvm_memory_mb_budget".into()),
+                    Value::Integer(self.cvm_memory_mb_budget.into()),
+                ),
+            ]);
+        }
+        if self.carries_disk_keys() {
+            entries.extend([
+                (
+                    Value::Text("cvm_disk_gb_budget".into()),
+                    Value::Integer(self.disk.cvm_disk_gb_budget.into()),
+                ),
+                (
+                    Value::Text("data_disk_total_gb".into()),
+                    Value::Integer(self.disk.data_disk_total_gb.into()),
+                ),
+                (
+                    Value::Text("data_disk_available_gb".into()),
+                    Value::Integer(self.disk.data_disk_available_gb.into()),
+                ),
+                (
+                    Value::Text("staging_disk_available_gb".into()),
+                    Value::Integer(self.disk.staging_disk_available_gb.into()),
+                ),
+            ]);
+        }
+        if self.schema_version == SCHEMA_VERSION_HOST_HEALTH {
+            entries.extend([
+                (
+                    Value::Text("cpus_offline".into()),
+                    Value::Integer(self.host_health.cpus_offline.into()),
+                ),
+                (
+                    Value::Text("df_flush_failures".into()),
+                    Value::Integer(self.host_health.df_flush_failures.into()),
+                ),
+                (
+                    Value::Text("snp_enabled".into()),
+                    Value::Bool(self.host_health.snp_enabled),
+                ),
+                (
+                    Value::Text("snp_launches_since_boot".into()),
+                    Value::Integer(self.host_health.snp_launches_since_boot.into()),
+                ),
+            ]);
         }
         entries.extend([
             (
@@ -309,8 +508,107 @@ impl MinerHeartbeat {
             memory_available_mib,
             domain: DOMAIN.into(),
             graceful_exit_requested: true,
+            cvm_cpu_budget: 0,
+            cvm_memory_mb_budget: 0,
+            asid_capacity: 0,
+            asid_used: 0,
+            disk: DiskDeclaration::default(),
+            host_health: HostHealthDeclaration::default(),
         }
     }
+
+    /// Upgrade an ordinary (`v1`) heartbeat to `v3`, attaching the
+    /// miner's capacity declarations. Every other field is preserved;
+    /// `graceful_exit_requested` is left as-is (an ordinary heartbeat
+    /// carries `false`).
+    pub fn with_capacity(mut self, capacity: CapacityDeclaration) -> Self {
+        self.schema_version = SCHEMA_VERSION_CAPACITY;
+        self.cvm_cpu_budget = capacity.cvm_cpu_budget;
+        self.cvm_memory_mb_budget = capacity.cvm_memory_mb_budget;
+        self.asid_capacity = capacity.asid_capacity;
+        self.asid_used = capacity.asid_used;
+        self
+    }
+
+    /// Upgrade an ordinary (`v1`) heartbeat to `v4`: the `v3` capacity
+    /// declarations plus the disk declarations. Every other field is
+    /// preserved, like [`with_capacity`](Self::with_capacity).
+    pub fn with_disk(self, capacity: CapacityDeclaration, disk: DiskDeclaration) -> Self {
+        let mut hb = self.with_capacity(capacity);
+        hb.schema_version = SCHEMA_VERSION_DISK;
+        hb.disk = disk;
+        hb
+    }
+
+    /// Upgrade an ordinary (`v1`) heartbeat to `v5`: the `v4` capacity and
+    /// disk declarations plus the host-health report. Every other field is
+    /// preserved, like [`with_capacity`](Self::with_capacity).
+    pub fn with_host_health(
+        self,
+        capacity: CapacityDeclaration,
+        disk: DiskDeclaration,
+        host_health: HostHealthDeclaration,
+    ) -> Self {
+        let mut hb = self.with_disk(capacity, disk);
+        hb.schema_version = SCHEMA_VERSION_HOST_HEALTH;
+        hb.host_health = host_health;
+        hb
+    }
+}
+
+/// The four `v3` capacity declarations, as the miner-agent reads them.
+/// `0` in any field = unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapacityDeclaration {
+    /// `[host] cvm_cpu_budget` of the miner's own preflight gate.
+    pub cvm_cpu_budget: u32,
+    /// `[host] cvm_memory_mb_budget` of the miner's own preflight gate.
+    pub cvm_memory_mb_budget: u32,
+    /// `misc.capacity sev_es`.
+    pub asid_capacity: u32,
+    /// `misc.current sev_es`.
+    pub asid_used: u32,
+}
+
+/// The four `v4` disk declarations, in GiB (rounded down). `0` in any
+/// field = unknown / undeclared. All are miner self-reports — vali only
+/// ever lets them LOWER its own disk ledger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskDeclaration {
+    /// `[host] cvm_disk_gb_budget` — the tenant disk the operator
+    /// declares, and the budget the miner's own gates reserve against.
+    pub cvm_disk_gb_budget: u32,
+    /// `statvfs` size of the filesystem holding the per-VM writable disks
+    /// (`[storage] data_disk_root`).
+    pub data_disk_total_gb: u32,
+    /// `statvfs` space available to the agent on that filesystem, raw
+    /// (`f_bavail`). The per-VM disks are sparse, so this is NOT net of the
+    /// space they have been promised but not yet written.
+    pub data_disk_available_gb: u32,
+    /// `statvfs` space available on the filesystem holding the agent's
+    /// staging / image cache (`/var/lib/hippius-miner`). Equal to
+    /// `data_disk_available_gb` when both live on one filesystem.
+    pub staging_disk_available_gb: u32,
+}
+
+/// The four `v5` host-health fields. Miner self-reports, used by vali only
+/// to alert: none of them moves placement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostHealthDeclaration {
+    /// `kvm_amd` has SEV-SNP enabled (`/sys/module/kvm_amd/parameters/sev_snp`).
+    /// `false` also when it cannot be read.
+    pub snp_enabled: bool,
+    /// Present CPUs that are offline (`present` minus `online`, `/sys/devices/system/cpu`).
+    /// Non-zero next to `snp_enabled` = `SNP_DF_FLUSH` fails, so the host
+    /// stops launching SNP guests once its ASID pool is used up.
+    pub cpus_offline: u32,
+    /// SNP guest starts the agent has issued since the host booted (each
+    /// one may draw a fresh ASID). `0` = none, or unknown. A lower bound:
+    /// counting starts with the first agent that had the counter this boot.
+    pub snp_launches_since_boot: u32,
+    /// Kernel `DF_FLUSH failed` lines since boot. Non-zero = the host
+    /// refuses every new SNP guest until it reboots.
+    pub df_flush_failures: u32,
 }
 
 /// Signed heartbeat envelope.
@@ -413,6 +711,39 @@ mod tests {
             memory_available_mib: 131_072,
             domain: DOMAIN.into(),
             graceful_exit_requested: false,
+            cvm_cpu_budget: 0,
+            cvm_memory_mb_budget: 0,
+            asid_capacity: 0,
+            asid_used: 0,
+            disk: DiskDeclaration::default(),
+            host_health: HostHealthDeclaration::default(),
+        }
+    }
+
+    fn host_health() -> HostHealthDeclaration {
+        HostHealthDeclaration {
+            snp_enabled: true,
+            cpus_offline: 24,
+            snp_launches_since_boot: 97,
+            df_flush_failures: 3,
+        }
+    }
+
+    fn disk() -> DiskDeclaration {
+        DiskDeclaration {
+            cvm_disk_gb_budget: 3_000,
+            data_disk_total_gb: 3_500,
+            data_disk_available_gb: 2_900,
+            staging_disk_available_gb: 400,
+        }
+    }
+
+    fn capacity() -> CapacityDeclaration {
+        CapacityDeclaration {
+            cvm_cpu_budget: 44,
+            cvm_memory_mb_budget: 120_000,
+            asid_capacity: 99,
+            asid_used: 2,
         }
     }
 
@@ -563,10 +894,297 @@ mod tests {
     }
 
     #[test]
+    fn v3_canonical_is_v2_plus_the_four_capacity_keys() {
+        let hb = sample().with_capacity(capacity());
+        assert_eq!(hb.schema_version, SCHEMA_VERSION_CAPACITY);
+        assert!(!hb.graceful_exit_requested);
+        let bytes = hb.canonical().unwrap();
+        assert_canonical(&bytes).unwrap();
+        assert_eq!(
+            canonical_keys(&bytes),
+            vec![
+                "domain",
+                "miner_id",
+                "sequence",
+                "asid_used",
+                "asid_capacity",
+                "cvm_cpu_budget",
+                "schema_version",
+                "timestamp_unix",
+                "vm_count_total",
+                "memory_total_mib",
+                "vm_count_running",
+                "cpu_load_1m_centi",
+                "cvm_memory_mb_budget",
+                "memory_available_mib",
+                "graceful_exit_requested",
+            ],
+        );
+    }
+
+    #[test]
+    fn v3_with_all_capacity_unknown_still_carries_the_keys() {
+        // The version, not the values, decides the wire shape.
+        let hb = sample().with_capacity(CapacityDeclaration::default());
+        assert!(hb.validate().is_ok());
+        assert_eq!(canonical_keys(&hb.canonical().unwrap()).len(), 15);
+    }
+
+    #[test]
+    fn v3_may_carry_the_graceful_exit_flag() {
+        let mut hb = sample().with_capacity(capacity());
+        hb.graceful_exit_requested = true;
+        assert!(hb.validate().is_ok());
+        let v: Value = ciborium::de::from_reader(hb.canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        assert!(entries.iter().any(|(k, v)| {
+            matches!(k, Value::Text(t) if t == "graceful_exit_requested") && *v == Value::Bool(true)
+        }));
+    }
+
+    #[test]
+    fn v1_and_v2_bodies_with_any_capacity_field_are_rejected() {
+        let setters: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.cvm_cpu_budget = 1,
+            |h| h.cvm_memory_mb_budget = 1,
+            |h| h.asid_capacity = 1,
+            |h| h.asid_used = 1,
+        ];
+        for set in setters {
+            let mut v1 = sample();
+            set(&mut v1);
+            assert_eq!(v1.validate(), Err(HeartbeatError::SchemaVersion));
+            assert!(v1.canonical().is_err());
+            let mut v2 = MinerHeartbeat::graceful_exit("m".into(), 1, 1, 0, 0, 0, 0, 0);
+            set(&mut v2);
+            assert_eq!(v2.validate(), Err(HeartbeatError::SchemaVersion));
+        }
+    }
+
+    #[test]
+    fn asid_used_above_a_known_capacity_is_rejected_at_the_exact_boundary() {
+        let mut hb = sample().with_capacity(capacity());
+        hb.asid_capacity = 99;
+        hb.asid_used = 99;
+        assert!(hb.validate().is_ok(), "used == capacity is legal");
+        hb.asid_used = 100;
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+        assert!(hb.canonical().is_err());
+        // Unknown capacity (0) leaves `asid_used` unconstrained.
+        hb.asid_capacity = 0;
+        assert!(hb.validate().is_ok());
+    }
+
+    #[test]
+    fn v3_capacity_fields_are_all_signed() {
+        let base = sample().with_capacity(capacity()).canonical().unwrap();
+        let mutate: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.cvm_cpu_budget += 1,
+            |h| h.cvm_memory_mb_budget += 1,
+            |h| h.asid_capacity += 1,
+            |h| h.asid_used += 1,
+        ];
+        for m in mutate {
+            let mut h = sample().with_capacity(capacity());
+            m(&mut h);
+            assert_ne!(
+                base,
+                h.canonical().unwrap(),
+                "a field escaped the signature"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_canonical_is_v3_plus_the_four_disk_keys() {
+        let hb = sample().with_disk(capacity(), disk());
+        assert_eq!(hb.schema_version, SCHEMA_VERSION_DISK);
+        let bytes = hb.canonical().unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v3_keys = canonical_keys(&sample().with_capacity(capacity()).canonical().unwrap());
+        let v4_keys = canonical_keys(&bytes);
+        let disk_keys = [
+            "cvm_disk_gb_budget",
+            "data_disk_total_gb",
+            "data_disk_available_gb",
+            "staging_disk_available_gb",
+        ];
+        assert_eq!(v4_keys.len(), 19);
+        for k in disk_keys {
+            assert!(v4_keys.iter().any(|x| x == k), "missing {k}");
+        }
+        let stripped: Vec<String> = v4_keys
+            .into_iter()
+            .filter(|k| !disk_keys.contains(&k.as_str()))
+            .collect();
+        assert_eq!(stripped, v3_keys, "v4 must not move a v3 key");
+    }
+
+    #[test]
+    fn v4_with_all_disk_unknown_still_carries_the_keys() {
+        let hb = sample().with_disk(capacity(), DiskDeclaration::default());
+        assert!(hb.validate().is_ok());
+        assert_eq!(canonical_keys(&hb.canonical().unwrap()).len(), 19);
+    }
+
+    #[test]
+    fn v1_v2_v3_bodies_with_any_disk_field_are_rejected() {
+        let setters: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.disk.cvm_disk_gb_budget = 1,
+            |h| h.disk.data_disk_total_gb = 1,
+            |h| h.disk.data_disk_available_gb = 1,
+            |h| h.disk.staging_disk_available_gb = 1,
+        ];
+        for set in setters {
+            for mut hb in [
+                sample(),
+                MinerHeartbeat::graceful_exit("m".into(), 1, 1, 0, 0, 0, 0, 0),
+                sample().with_capacity(capacity()),
+            ] {
+                set(&mut hb);
+                assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
+                assert!(hb.canonical().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn v4_data_available_above_a_known_total_is_rejected_at_the_exact_boundary() {
+        let mut d = disk();
+        d.data_disk_total_gb = 100;
+        d.data_disk_available_gb = 100;
+        assert!(sample().with_disk(capacity(), d).validate().is_ok());
+        d.data_disk_available_gb = 101;
+        let hb = sample().with_disk(capacity(), d);
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+        assert!(hb.canonical().is_err());
+        // Unknown total (0) leaves `available` unconstrained.
+        d.data_disk_total_gb = 0;
+        assert!(sample().with_disk(capacity(), d).validate().is_ok());
+    }
+
+    #[test]
+    fn v4_disk_and_capacity_fields_are_all_signed() {
+        let base = sample().with_disk(capacity(), disk()).canonical().unwrap();
+        let mutate: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.disk.cvm_disk_gb_budget += 1,
+            |h| h.disk.data_disk_total_gb += 1,
+            |h| h.disk.data_disk_available_gb += 1,
+            |h| h.disk.staging_disk_available_gb += 1,
+            |h| h.cvm_cpu_budget += 1,
+            |h| h.asid_used += 1,
+        ];
+        for m in mutate {
+            let mut h = sample().with_disk(capacity(), disk());
+            m(&mut h);
+            assert_ne!(
+                base,
+                h.canonical().unwrap(),
+                "a field escaped the signature"
+            );
+        }
+    }
+
+    const HOST_HEALTH_KEYS: [&str; 4] = [
+        "cpus_offline",
+        "df_flush_failures",
+        "snp_enabled",
+        "snp_launches_since_boot",
+    ];
+
+    #[test]
+    fn v5_canonical_is_v4_plus_the_four_host_health_keys() {
+        let hb = sample().with_host_health(capacity(), disk(), host_health());
+        assert_eq!(hb.schema_version, SCHEMA_VERSION_HOST_HEALTH);
+        let bytes = hb.canonical().unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v4_keys = canonical_keys(&sample().with_disk(capacity(), disk()).canonical().unwrap());
+        let v5_keys = canonical_keys(&bytes);
+        assert_eq!(v5_keys.len(), 23);
+        for k in HOST_HEALTH_KEYS {
+            assert!(v5_keys.iter().any(|x| x == k), "missing {k}");
+        }
+        let stripped: Vec<String> = v5_keys
+            .into_iter()
+            .filter(|k| !HOST_HEALTH_KEYS.contains(&k.as_str()))
+            .collect();
+        assert_eq!(stripped, v4_keys, "v5 must not move a v4 key");
+    }
+
+    #[test]
+    fn v5_with_a_healthy_host_still_carries_the_keys() {
+        let hb = sample().with_host_health(capacity(), disk(), HostHealthDeclaration::default());
+        assert!(hb.validate().is_ok());
+        assert_eq!(canonical_keys(&hb.canonical().unwrap()).len(), 23);
+    }
+
+    #[test]
+    fn earlier_bodies_with_any_host_health_field_are_rejected() {
+        let setters: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.host_health.snp_enabled = true,
+            |h| h.host_health.cpus_offline = 1,
+            |h| h.host_health.snp_launches_since_boot = 1,
+            |h| h.host_health.df_flush_failures = 1,
+        ];
+        for set in setters {
+            for mut hb in [
+                sample(),
+                MinerHeartbeat::graceful_exit("m".into(), 1, 1, 0, 0, 0, 0, 0),
+                sample().with_capacity(capacity()),
+                sample().with_disk(capacity(), disk()),
+            ] {
+                set(&mut hb);
+                assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
+                assert!(hb.canonical().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn v5_keeps_the_v4_coherence_rules() {
+        let mut d = disk();
+        d.data_disk_total_gb = 100;
+        d.data_disk_available_gb = 101;
+        let hb = sample().with_host_health(capacity(), d, host_health());
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+        let mut c = capacity();
+        c.asid_used = c.asid_capacity + 1;
+        let hb = sample().with_host_health(c, disk(), host_health());
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+    }
+
+    #[test]
+    fn v5_host_health_fields_are_all_signed() {
+        let base = sample()
+            .with_host_health(capacity(), disk(), host_health())
+            .canonical()
+            .unwrap();
+        let mutate: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.host_health.snp_enabled = false,
+            |h| h.host_health.cpus_offline += 1,
+            |h| h.host_health.snp_launches_since_boot += 1,
+            |h| h.host_health.df_flush_failures += 1,
+            |h| h.disk.data_disk_total_gb += 1,
+            |h| h.asid_used += 1,
+        ];
+        for m in mutate {
+            let mut h = sample().with_host_health(capacity(), disk(), host_health());
+            m(&mut h);
+            assert_ne!(
+                base,
+                h.canonical().unwrap(),
+                "a field escaped the signature"
+            );
+        }
+    }
+
+    #[test]
     fn wrong_schema_version_rejected() {
-        // An UNKNOWN version (neither 1 nor 2) still fails closed.
+        // An UNKNOWN version (not 1 through 5) still fails closed.
         let mut hb = sample();
-        hb.schema_version = 3;
+        hb.schema_version = 6;
         assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
         assert!(hb.canonical().is_err());
     }
@@ -713,6 +1331,7 @@ mod tests {
                 "heartbeat-signature-length",
             ),
             (HeartbeatError::Encode, "heartbeat-encode"),
+            (HeartbeatError::Capacity, "heartbeat-capacity"),
         ] {
             assert_eq!(err.as_str(), class);
             assert_eq!(err.to_string(), class);

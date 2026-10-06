@@ -40,7 +40,12 @@ RemainAfterExit=yes
 ExecStart=/sbin/hippius-golden-mount
 StandardOutput=kmsg+console
 StandardError=kmsg+console
-TimeoutStartSec=300
+# No start timeout. This unit spans the KBS release, the first-boot wipe of
+# the whole per-VM upper (disk_gb / write rate: minutes to tens of minutes
+# on large flavors) and mkfs; a fixed 300 s powered large first boots off
+# mid-wipe. A bound buys nothing against the host, which can always just
+# not run the VM, and every step inside fails closed on its own.
+TimeoutStartSec=infinity
 FailureAction=poweroff-force
 
 [Install]

@@ -12,6 +12,13 @@
 //! | `GET  /v1/relay/{vm_id}/snapshot`   | `poll_snapshot`        |
 //! | `GET  /v1/relay/{vm_id}/source-ack` | `poll_source_ack` (§25 M2) |
 //! | `GET  /v1/relay/{vm_id}/domain-state` | reboot-recovery liveness probe |
+//! | `GET  /v1/relay/{vm_id}/backup`     | backup `poll_backup` (run status + live probe) |
+//! | `GET  /v1/relay/{vm_id}/restore`    | staged-restore status poll |
+//!
+//! The `backup` and `restore` ORDERS themselves are not relayed here:
+//! vali dispatches them through the generic `/v1/edge/order` inner router
+//! (kinds `backup` / `restore`), like `migrate-activate`. Only their
+//! unsigned status reads live here.
 //!
 //! These mirror the launch/stop order-dispatch path EXACTLY (the
 //! [`crate::listeners::inner_router`] `/v1/edge/order` flow): the Edge
@@ -25,7 +32,7 @@
 //! ## Why the relay carries BOTH `node_id` and `miner_addr`
 //!
 //! The miner-agent binds every signed order to a specific host
-//! (`OrderBody::target_miner_id == self.miner_id`, the gemini-r1
+//! (`OrderBody::target_miner_id == self.miner_id`, the review-r1
 //! cross-miner-replay gate). Routing needs the miner's NetBird socket
 //! address. The launch/stop path resolves BOTH in vali
 //! (`MinerIdentity.miner_id` + `.netbird_ip`) and the Edge re-validates
@@ -393,6 +400,64 @@ async fn handle_domain_state(
     }
 }
 
+/// `GET /v1/relay/{vm_id}/backup` — relay vali's backup poll to the miner
+/// hosting the VM. Like the other unsigned polls, the routing target rides
+/// the `x-hippius-target-addr` header (CGNAT-validated here); the miner's
+/// status JSON (or `404` when it has no domain for the VM) comes
+/// back verbatim. No side effect and no secret — the report carries sizes,
+/// hashes and ETags, never a presigned URL.
+async fn handle_backup_status(
+    State(state): State<RelayRouterState>,
+    Path(vm_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let vm_id = match validate_vm_id(&vm_id) {
+        Ok(v) => v,
+        Err(class) => return relay_reject(&vm_id, "backup-status", StatusCode::BAD_REQUEST, class),
+    };
+    let target = match parse_target_addr_header(&headers) {
+        Ok(a) => a,
+        Err(class) => return relay_reject(&vm_id, "backup-status", StatusCode::BAD_REQUEST, class),
+    };
+    match state.forward.forward_backup_status(target, &vm_id).await {
+        Ok(resp) => relay_miner_response(&vm_id, "backup-status", target, resp),
+        Err(err) => {
+            log_relay(&vm_id, "backup-status", Some(target), None, err.class());
+            map_forward_error(&err)
+        }
+    }
+}
+
+/// `GET /v1/relay/{vm_id}/restore` — relay vali's staged-restore poll to
+/// the miner named by `x-hippius-target-addr` (CGNAT-validated here). The
+/// miner's status JSON (or `404` when it knows no restore of the VM) comes
+/// back verbatim, capped like the backup poll. No side effect, no secret.
+async fn handle_restore_status(
+    State(state): State<RelayRouterState>,
+    Path(vm_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let vm_id = match validate_vm_id(&vm_id) {
+        Ok(v) => v,
+        Err(class) => {
+            return relay_reject(&vm_id, "restore-status", StatusCode::BAD_REQUEST, class)
+        }
+    };
+    let target = match parse_target_addr_header(&headers) {
+        Ok(a) => a,
+        Err(class) => {
+            return relay_reject(&vm_id, "restore-status", StatusCode::BAD_REQUEST, class)
+        }
+    };
+    match state.forward.forward_restore_status(target, &vm_id).await {
+        Ok(resp) => relay_miner_response(&vm_id, "restore-status", target, resp),
+        Err(err) => {
+            log_relay(&vm_id, "restore-status", Some(target), None, err.class());
+            map_forward_error(&err)
+        }
+    }
+}
+
 /// Build the canonical-CBOR `OrderBody`, sign it, and forward the
 /// `SignedOrder` to the source miner. The shared tail of the quiesce +
 /// snapshot-trigger handlers.
@@ -589,9 +654,8 @@ fn log_relay(
 /// Attach the §25 M1 relay routes to an existing axum `Router`. Called
 /// by [`crate::listeners::inner_router::build_inner_router`] so the
 /// relay shares the inner listener's NetworkPolicy gate + slow-loris
-/// bounds. The `DefaultBodyLimit` is applied by the inner router (its
-/// cap is larger than [`MAX_RELAY_BODY`], so a relay body is always
-/// within it).
+/// bounds. The relay bodies are capped at [`MAX_RELAY_BODY`] here: the
+/// inner router's own cap is sized for multipart orders (2 MiB).
 pub fn relay_routes() -> axum::Router<RelayRouterState> {
     use axum::routing::get;
     use axum::routing::post;
@@ -603,6 +667,9 @@ pub fn relay_routes() -> axum::Router<RelayRouterState> {
         )
         .route("/v1/relay/:vm_id/source-ack", get(handle_source_ack))
         .route("/v1/relay/:vm_id/domain-state", get(handle_domain_state))
+        .route("/v1/relay/:vm_id/backup", get(handle_backup_status))
+        .route("/v1/relay/:vm_id/restore", get(handle_restore_status))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_RELAY_BODY))
 }
 
 #[cfg(test)]

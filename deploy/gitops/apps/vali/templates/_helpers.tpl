@@ -167,3 +167,64 @@ NOTHING.
       key: token
 {{- end }}
 {{- end -}}
+
+{{/*
+Live VM backups (`apps.backup`). Renders NOTHING unless
+`vmBackup.credentials.enabled` — so the chart change is inert for every
+image until someone opts in. The backup bucket has its OWN object-level
+key (Secret `vmBackup.credentials.secretName`, default `vali-backup-s3`:
+AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / ENDPOINT_URL / BUCKET), never
+the shared `vali-s3` images key. Every ref is `optional` so a pod still
+starts when the Secret is absent; vali then refuses backup work loudly
+(`backup-unavailable`). `vmBackup.enabled` additionally turns the backup
+tick on (VALI_BACKUP_ENABLED); `vmBackup.restoreEnabled` opens
+`POST /v1/vm/<id>/restore` (VALI_RESTORE_ENABLED), and
+`vmBackup.failoverManualEnabled` `POST /v1/vm/<id>/failover`
+(VALI_FAILOVER_MANUAL_ENABLED), and `vmBackup.restoreRollbackEnabled` restores
+of points of an earlier boot (VALI_RESTORE_ROLLBACK_ENABLED).
+*/}}
+{{- define "vali.backupEnv" -}}
+{{- if .Values.vmBackup.credentials.enabled }}
+{{- $secret := .Values.vmBackup.credentials.secretName }}
+- name: VALI_BACKUP_S3_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: AWS_ACCESS_KEY_ID
+      optional: true
+- name: VALI_BACKUP_S3_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: AWS_SECRET_ACCESS_KEY
+      optional: true
+- name: VALI_BACKUP_S3_ENDPOINT_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: ENDPOINT_URL
+      optional: true
+- name: VALI_BACKUP_BUCKET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: BUCKET
+      optional: true
+{{- if .Values.vmBackup.enabled }}
+- name: VALI_BACKUP_ENABLED
+  value: "true"
+{{- end }}
+{{- if .Values.vmBackup.restoreEnabled }}
+- name: VALI_RESTORE_ENABLED
+  value: "true"
+{{- end }}
+{{- if .Values.vmBackup.failoverManualEnabled }}
+- name: VALI_FAILOVER_MANUAL_ENABLED
+  value: "true"
+{{- end }}
+{{- if .Values.vmBackup.restoreRollbackEnabled }}
+- name: VALI_RESTORE_ROLLBACK_ENABLED
+  value: "true"
+{{- end }}
+{{- end }}
+{{- end }}

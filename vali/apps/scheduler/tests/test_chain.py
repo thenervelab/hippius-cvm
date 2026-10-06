@@ -194,7 +194,7 @@ def test_rpc_url_is_passed_via_env_not_argv(
 
 def _payload(**overrides: object) -> dict:
     """The `ok` envelope with no miners, plus overrides."""
-    return {"tag": "ok", "current_epoch": 2702, "miners": [], **overrides}
+    return {"tag": "ok", "current_epoch": 5002, "miners": [], **overrides}
 
 
 def test_the_pallet_live_gate_ships_disabled() -> None:
@@ -240,14 +240,14 @@ def test_pallet_live_false_logs_error_and_still_returns_the_snapshot(
         snapshot = chain.read_miner_status()
 
     assert snapshot.pallet_live is False
-    assert snapshot.current_epoch == 2702
+    assert snapshot.current_epoch == 5002
     assert logged.call_count == 1, "exactly one ERROR per call"
     # The message must name the failure precisely — an operator reading
     # it should not need this diff to understand what is wrong.
     rendered = logged.call_args.args[0] % logged.call_args.args[1:]
     assert "metadata" in rendered
     assert "ComputeScoring" in rendered
-    assert "2702" in rendered
+    assert "5002" in rendered
 
 
 def test_pallet_live_true_logs_no_error(

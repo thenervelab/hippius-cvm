@@ -192,8 +192,9 @@ spec:
         - ports:
             - port: "8001"
               protocol: TCP
-    {{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
-    # ── synthetic-monitor (apps.synthetic) egress ──
+    {{- $syntheticEgress := or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") (eq (toString .Values.guestReport.enabled) "true") }}
+    {{- if $syntheticEgress }}
+    # ── synthetic-monitor (apps.synthetic) + golden re-bake egress ──
     # (1) the vali public API on the listen port — the light vali_api
     #     /healthz probe + the full tier's real /v1/vm/launch + §24 calls;
     # (2) the observability Pushgateway on :9091 — where BOTH tiers PUSH
@@ -209,6 +210,18 @@ spec:
         - ports:
             - port: "{{ .Values.config.listenPort }}"
               protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: observability
+            k8s:app.kubernetes.io/name: prometheus-pushgateway
+      toPorts:
+        - ports:
+            - port: "9091"
+              protocol: TCP
+    {{- else if .Values.schedulerReeval.enabled }}
+    # The scheduler re-eval loop pushes its disk and SEV-SNP host-health
+    # gauges to the Pushgateway too; without the features above nothing
+    # else opens that port.
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: observability
@@ -249,7 +262,7 @@ spec:
         - ports:
             - port: "443"  # s3.hippius.com — presign + cp
               protocol: TCP
-            - port: "8200" # vault.hippius.network — KV v2 PUT/GET
+            - port: "8200" # Vault (vault.example.com) — KV v2 PUT/GET
               protocol: TCP
     {{- end }}
 ---
