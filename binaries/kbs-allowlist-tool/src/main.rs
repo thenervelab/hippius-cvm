@@ -91,7 +91,7 @@ struct ManifestEntry {
     accepted_kbs_response_kids_hex: Vec<String>,
     /// §22 trust class of THIS measurement — the stable snake_case wire
     /// string the KBS'`AllowlistEntry.class` decodes (`tenant` /
-    /// `host_attestor`). Absent ⇒ the `tenant` default (byte-identical to
+    /// `host_attestor` / `cdn_node`). Absent ⇒ the `tenant` default (byte-identical to
     /// every already-signed legacy manifest). A `host_attestor` measurement
     /// (the blackbox host-attestor chantier) MUST carry this so the KBS
     /// `class_of` gate namespaces it apart from tenant guest images —
@@ -162,15 +162,18 @@ fn parse_measurement(hex_str: &str) -> Result<[u8; MEASUREMENT_LEN], Error> {
 /// The KBS'`AllowlistEntry.class` serde-defaults to `Tenant` when the key
 /// is absent, so a `tenant` (or unset) class emits NOTHING — that keeps the
 /// canonical CBOR byte-identical to every already-signed legacy manifest
-/// (no golden/KAT drift). A `host_attestor` class emits the explicit
-/// `class` text key so the KBS `class_of` gate namespaces it. Any other
+/// (no golden/KAT drift). A `host_attestor` or `cdn_node` class emits the
+/// explicit `class` text key so the KBS `class_of` gate namespaces it.
+/// `cdn_node` needs a KBS that knows the class (an older one rejects the
+/// whole artifact), so vali writes it only after that KBS is live. Any other
 /// value is a fail-closed abort (a typo must never silently widen trust).
 fn resolve_class_wire(class: &Option<String>) -> Result<Option<&'static str>, Error> {
     match class.as_deref().map(str::trim) {
         None | Some("") | Some("tenant") => Ok(None),
         Some("host_attestor") => Ok(Some("host_attestor")),
+        Some("cdn_node") => Ok(Some("cdn_node")),
         Some(other) => Err(Error::Manifest(format!(
-            "class {other:?}: must be \"tenant\" or \"host_attestor\""
+            "class {other:?}: must be \"tenant\", \"host_attestor\" or \"cdn_node\""
         ))),
     }
 }
@@ -585,6 +588,30 @@ mod tests {
         al.install(&cose).expect("install");
         assert_eq!(al.class_of(&host), Some(AllowlistClass::HostAttestor));
         // An absent class back-fills to Tenant (byte-identical to legacy).
+        assert_eq!(al.class_of(&tenant), Some(AllowlistClass::Tenant));
+    }
+
+    #[test]
+    fn cdn_node_class_round_trips() {
+        use kbs_core::allowlist::{InMemoryHwm, InstalledAllowlist};
+        use kbs_core::snp::{AllowlistClass, MeasurementAllowlist};
+
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new([5u8; 32]);
+        let sk = SigningKey::from_bytes(&seed);
+        let cdn = [4u8; 48];
+        let tenant = [9u8; 48];
+        let manifest = manifest_with(
+            1,
+            vec![
+                classed_entry(&cdn, Some("cdn_node")),
+                classed_entry(&tenant, None),
+            ],
+        );
+        let body = body_value(&manifest).expect("body");
+        let cose = sign(&seed, &body).expect("sign");
+        let al = InstalledAllowlist::new(sk.verifying_key(), Box::new(InMemoryHwm::default()));
+        al.install(&cose).expect("install");
+        assert_eq!(al.class_of(&cdn), Some(AllowlistClass::CdnNode));
         assert_eq!(al.class_of(&tenant), Some(AllowlistClass::Tenant));
     }
 

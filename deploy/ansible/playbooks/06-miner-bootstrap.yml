@@ -357,6 +357,8 @@
   tasks:
     - name: Install the miner-agent
       ansible.builtin.import_tasks: miner-tasks/miner-agent-install.yml
+    - name: Install the guest network policy boot loader
+      ansible.builtin.import_tasks: miner-tasks/net-policy-loader.yml
 
 # ── 06 — mTLS cert mount point ──────────────────────────────────────
 - name: "06 — mTLS cert mount point (operator pushes the content)"

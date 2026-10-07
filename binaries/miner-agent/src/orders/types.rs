@@ -290,10 +290,37 @@ pub struct LaunchOrder {
     /// deploy BEFORE vali.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_ep: Option<String>,
+    /// The guest NIC's network settings ([`NetSpec`]). Not measured, not
+    /// part of the L1 ticket.
+    ///
+    /// `serde(default)` ⇒ `None` = today's NIC (an auto-named tap, no cap,
+    /// no filter), and encoded ONLY when set: a body without it is
+    /// byte-identical to before, and an agent too old to know the key
+    /// refuses one that carries it at decode (`deny_unknown_fields`), so
+    /// agents deploy before vali.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetSpec>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// How a tenant NIC is wired (`docs/design/egress-and-bandwidth.md`
+/// §6.1, §7). Present at all, the tap gets the deterministic name
+/// `hvt<cid>` and libvirt's `clean-traffic` filter (no MAC, IP or ARP
+/// spoofing; the IP is learned from the DHCP lease).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetSpec {
+    /// Bandwidth cap in Mbit/s, each direction. Absent ⇒ no cap until
+    /// the host's `net-policy` sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_mbps: Option<u32>,
+    /// `<port isolated='yes'/>`: no L2 traffic with the host's other
+    /// isolated guests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub isolate: bool,
 }
 
 /// A request to stop a running tenant CVM.
@@ -541,6 +568,11 @@ pub struct MigrateActivateOrder {
     /// carries it. Encoded only when set (agents deploy before vali).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_ep: Option<String>,
+    /// The guest NIC's settings — see [`LaunchOrder::net`]; carried by
+    /// [`Self::into_launch_order`], so a migrated VM is capped from its
+    /// first packet on the destination. Encoded only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetSpec>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -999,6 +1031,7 @@ impl MigrateActivateOrder {
             // into that path.
             require_existing_disks: false,
             guardian_ep: self.guardian_ep,
+            net: self.net,
         }
     }
 }
@@ -1031,6 +1064,7 @@ mod tests {
             cose_ticket: ByteBuf::new(),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         };
         assert_eq!(order.vm_id().as_str(), "tenant-1");
     }
@@ -1055,6 +1089,7 @@ mod tests {
             cose_ticket: ByteBuf::from(vec![1u8]),
             require_existing_disks,
             guardian_ep: None,
+            net: None,
         };
         let encode = |o: &LaunchOrder| {
             let mut buf = Vec::new();
@@ -1070,6 +1105,56 @@ mod tests {
         let relaunch = encode(&order(true));
         let back: LaunchOrder = ciborium::de::from_reader(relaunch.as_slice()).unwrap();
         assert!(back.require_existing_disks);
+
+        // `net` likewise: absent ⇒ not encoded, set ⇒ round-trips, and
+        // its defaults are not encoded either.
+        assert!(!first.windows(3).any(|w| w == b"net"));
+        let mut with_net = order(false);
+        with_net.net = Some(NetSpec {
+            cap_mbps: Some(250),
+            isolate: true,
+        });
+        let back: LaunchOrder = ciborium::de::from_reader(encode(&with_net).as_slice()).unwrap();
+        assert_eq!(back.net, with_net.net);
+        with_net.net = Some(NetSpec {
+            cap_mbps: None,
+            isolate: false,
+        });
+        let bytes = encode(&with_net);
+        assert!(!bytes.windows(7).any(|w| w == b"isolate"));
+        assert!(!bytes.windows(8).any(|w| w == b"cap_mbps"));
+        let back: LaunchOrder = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.net, with_net.net);
+    }
+
+    /// An unknown key inside `net` is refused like one at the top level.
+    #[test]
+    fn net_spec_denies_unknown_fields() {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("vlan".into()),
+                ciborium::value::Value::Integer(1.into()),
+            )]),
+            &mut buf,
+        )
+        .unwrap();
+        assert!(ciborium::de::from_reader::<NetSpec, _>(buf.as_slice()).is_err());
+    }
+
+    /// The §25 destination keeps the source's NIC settings.
+    #[test]
+    fn into_launch_order_carries_net() {
+        let mut activate = activate_order_with("quiet", 10);
+        assert_eq!(activate.net, None);
+        activate.net = Some(NetSpec {
+            cap_mbps: Some(100),
+            isolate: true,
+        });
+        assert_eq!(
+            activate.into_launch_order().net.unwrap().cap_mbps,
+            Some(100)
+        );
     }
 
     #[test]
@@ -1163,6 +1248,7 @@ mod tests {
                 staged_restore_id: String::new(),
                 guardian_ep: None,
                 settle_by_unix: 0,
+                net: None,
             },
         };
         let mut buf = Vec::new();
@@ -1244,6 +1330,7 @@ mod tests {
             staged_restore_id: String::new(),
             guardian_ep: None,
             settle_by_unix: 0,
+            net: None,
         }
     }
 
@@ -1523,6 +1610,7 @@ mod tests {
             cose_ticket: ByteBuf::from(vec![1u8, 2, 3]),
             require_existing_disks: true,
             guardian_ep: guardian_ep.map(String::from),
+            net: None,
         }
     }
 

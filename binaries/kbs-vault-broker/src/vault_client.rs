@@ -40,6 +40,10 @@ use crate::vault_auth::{
 /// absorbs a retried read without granting an open-ended credential.
 const TOKEN_NUM_USES: u64 = 6;
 
+/// Extra `num_uses` per cdn-fleet version: one KV read + one
+/// `transit/decrypt/cdn-fleet`.
+const TOKEN_USES_PER_FLEET_VERSION: u64 = 2;
+
 /// The FIXED, operator-created, TEMPLATED per-VM capability policy
 /// (KEK-HSM Phase 3 / RA-KBS-M2). The broker attaches THIS one policy to
 /// every cap token (never writes a per-VM ACL) and scopes it via
@@ -131,6 +135,9 @@ pub struct HttpVaultTokenMinter {
     auth: VaultAuth,
     ttl_secs: u64,
     token_role: String,
+    /// `vault.cdn_fleet_policy`: the fixed policy attached when a scope
+    /// carries the cdn-fleet leg. `None` ⇒ such a scope is refused.
+    cdn_fleet_policy: Option<String>,
 }
 
 impl HttpVaultTokenMinter {
@@ -147,8 +154,69 @@ impl HttpVaultTokenMinter {
             auth,
             ttl_secs,
             token_role: token_role.to_string(),
+            cdn_fleet_policy: None,
         }
     }
+
+    /// Attach `policy` to every cap whose scope carries the cdn-fleet leg
+    /// (`vault.cdn_fleet_policy`). Without it such a scope is refused.
+    #[must_use]
+    pub fn with_cdn_fleet_policy(mut self, policy: Option<String>) -> Self {
+        self.cdn_fleet_policy = policy;
+        self
+    }
+}
+
+/// What a cap token for `scope` carries: its policies, its entity alias,
+/// and its `num_uses`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenGrant {
+    pub policies: Vec<String>,
+    pub entity_alias: Option<String>,
+    pub num_uses: u64,
+}
+
+/// Decide the grant for `scope`.
+///
+/// - A tenant scope gets the templated per-VM policy, bound to its vm_id.
+/// - The cdn-fleet leg adds `cdn_fleet_policy` (the fixed, operator-made
+///   `kbs-cap-cdn-fleet`), plus two uses per version. With no policy
+///   configured the leg is refused: this broker does not serve it.
+/// - A fleet-only scope (`BrokerScope::fleet_only`, the KBS admin
+///   public-key route) gets the cdn-fleet policy alone and no alias.
+///
+/// The broker cannot see WHY the KBS asks for the leg — the KBS, attested
+/// and measurement-pinned above, is what checks the cdn_node class and
+/// the ticket's perms before asking.
+pub fn token_grant(
+    scope: &BrokerScope,
+    cdn_fleet_policy: Option<&str>,
+) -> Result<TokenGrant, BrokerError> {
+    let mut grant = TokenGrant {
+        policies: Vec::new(),
+        entity_alias: None,
+        num_uses: 0,
+    };
+    if !scope.is_fleet_only() {
+        grant.policies.push(TEMPLATED_CAP_POLICY.to_string());
+        grant.entity_alias = Some(scope.vm_id.clone());
+        grant.num_uses = TOKEN_NUM_USES;
+    }
+    if let Some(versions) = &scope.cdn_fleet_versions {
+        let policy = cdn_fleet_policy.ok_or_else(|| {
+            BrokerError::BadRequest(
+                "cdn-fleet scope refused: this broker has no vault.cdn_fleet_policy".into(),
+            )
+        })?;
+        grant.policies.push(policy.to_string());
+        let uses = (versions.len() as u64).saturating_mul(TOKEN_USES_PER_FLEET_VERSION);
+        grant.num_uses = grant.num_uses.saturating_add(uses);
+        if scope.is_fleet_only() {
+            // The same slack the tenant budget carries for a retried read.
+            grant.num_uses = grant.num_uses.saturating_add(2);
+        }
+    }
+    Ok(grant)
 }
 
 /// The `auth/token/create/<role>` JSON body for a scoped child token.
@@ -159,17 +227,22 @@ impl HttpVaultTokenMinter {
 /// release paths — per-VM scope with NO broker-authored ACL. `vm_id` is
 /// charset-locked by `BrokerScope::validate` ([a-z0-9-]), so it is a safe
 /// alias name.
-pub fn token_create_body(policy: &str, entity_alias: &str, ttl_secs: u64) -> serde_json::Value {
-    serde_json::json!({
-        "policies": [policy],
-        "entity_alias": entity_alias,
+pub fn token_create_body(grant: &TokenGrant, ttl_secs: u64) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "policies": grant.policies,
         "no_default_policy": true,
         "renewable": false,
         "ttl": format!("{ttl_secs}s"),
         "explicit_max_ttl": format!("{ttl_secs}s"),
-        "num_uses": TOKEN_NUM_USES,
+        "num_uses": grant.num_uses,
         "type": "service",
-    })
+    });
+    // A fleet-only cap is bound to no VM: no alias at all, so the
+    // templated policy (which it does not carry anyway) resolves nothing.
+    if let Some(alias) = &grant.entity_alias {
+        body["entity_alias"] = serde_json::json!(alias);
+    }
+    body
 }
 
 impl VaultTokenMinter for HttpVaultTokenMinter {
@@ -187,6 +260,7 @@ impl VaultTokenMinter for HttpVaultTokenMinter {
         // so a broker RCE can no longer author `read secret/*` (the
         // forge-everything path). `vm_id` is charset-locked by
         // `BrokerScope::validate`, so it is a safe alias name.
+        let grant = token_grant(scope, self.cdn_fleet_policy.as_deref())?;
         let token_url = format!("{}/v1/auth/token/create/{}", self.address, self.token_role);
         // The broker's OWN credential is resolved per call (#94): a
         // short-lived jwt-login token when a role is configured, else the
@@ -200,11 +274,7 @@ impl VaultTokenMinter for HttpVaultTokenMinter {
                 .agent
                 .post(&token_url)
                 .set("X-Vault-Token", broker_token)
-                .send_json(token_create_body(
-                    TEMPLATED_CAP_POLICY,
-                    &scope.vm_id,
-                    self.ttl_secs,
-                ))
+                .send_json(token_create_body(&grant, self.ttl_secs))
                 .map_err(|e| CallFailure {
                     status: http_status(&e),
                     error: BrokerError::VaultMint(format!("token create: {}", classify(&e))),
@@ -264,12 +334,74 @@ mod tests {
         // KEK-HSM Phase 3: the cap token attaches the ONE fixed templated
         // policy + `entity_alias=<vm_id>` (the per-VM scope) — never a
         // broker-authored ACL. Short-TTL, num_uses-bounded, no default.
-        let b = token_create_body(TEMPLATED_CAP_POLICY, "smoke-001", 60);
+        let grant = token_grant(&scope(), None).unwrap();
+        let b = token_create_body(&grant, 60);
         assert_eq!(b["policies"], serde_json::json!(["kbs-cap-templated"]));
         assert_eq!(b["entity_alias"], serde_json::json!("smoke-001"));
         assert_eq!(b["no_default_policy"], serde_json::json!(true));
         assert_eq!(b["renewable"], serde_json::json!(false));
         assert_eq!(b["ttl"], serde_json::json!("60s"));
         assert_eq!(b["num_uses"], serde_json::json!(TOKEN_NUM_USES));
+    }
+
+    fn scope() -> BrokerScope {
+        BrokerScope {
+            vm_id: "smoke-001".into(),
+            luks_path: "hippius-compute/kbs/tenants/smoke-001/luks-kek".into(),
+            luks_version: 1,
+            userdata_path: "hippius-compute/kbs/tenants/smoke-001/userdata".into(),
+            userdata_version: 1,
+            lifecycle_path: None,
+            lifecycle_version: None,
+            cdn_fleet_versions: None,
+        }
+    }
+
+    #[test]
+    fn a_tenant_token_never_carries_the_fleet_policy() {
+        // Whether or not this broker is configured for the fleet.
+        for policy in [None, Some("kbs-cap-cdn-fleet")] {
+            let g = token_grant(&scope(), policy).unwrap();
+            assert_eq!(g.policies, vec!["kbs-cap-templated".to_string()]);
+        }
+    }
+
+    #[test]
+    fn the_fleet_leg_adds_the_fleet_policy_and_its_uses() {
+        let s = BrokerScope {
+            cdn_fleet_versions: Some(vec![1, 2]),
+            ..scope()
+        };
+        let g = token_grant(&s, Some("kbs-cap-cdn-fleet")).unwrap();
+        assert_eq!(
+            g.policies,
+            vec![
+                "kbs-cap-templated".to_string(),
+                "kbs-cap-cdn-fleet".to_string()
+            ]
+        );
+        assert_eq!(g.entity_alias.as_deref(), Some("smoke-001"));
+        assert_eq!(g.num_uses, TOKEN_NUM_USES + 4);
+    }
+
+    #[test]
+    fn the_fleet_leg_is_refused_without_a_configured_policy() {
+        let s = BrokerScope {
+            cdn_fleet_versions: Some(vec![1]),
+            ..scope()
+        };
+        assert!(token_grant(&s, None).is_err());
+        assert!(token_grant(&BrokerScope::fleet_only(vec![1]), None).is_err());
+    }
+
+    #[test]
+    fn a_fleet_only_token_has_no_tenant_leg_and_no_alias() {
+        let g = token_grant(&BrokerScope::fleet_only(vec![3]), Some("kbs-cap-cdn-fleet")).unwrap();
+        assert_eq!(g.policies, vec!["kbs-cap-cdn-fleet".to_string()]);
+        assert_eq!(g.entity_alias, None);
+        assert_eq!(g.num_uses, 4);
+        let b = token_create_body(&g, 30);
+        assert!(b.get("entity_alias").is_none());
+        assert_eq!(b["policies"], serde_json::json!(["kbs-cap-cdn-fleet"]));
     }
 }

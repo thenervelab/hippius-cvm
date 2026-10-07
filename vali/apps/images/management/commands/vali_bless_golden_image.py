@@ -87,6 +87,21 @@ class Command(BaseCommand):
             help="Operator identity recorded on the audit field.",
         )
         parser.add_argument(
+            "--restricted-tenant",
+            default=None,
+            help=(
+                "Only this tenant may launch the image or see it in the catalog. "
+                "Required for a cdn-node bake, and must then be VALI_CDN_TENANT_ID. "
+                "Omitted: a re-bless keeps the image's restriction, a first bless "
+                "opens it to every tenant."
+            ),
+        )
+        parser.add_argument(
+            "--unrestrict",
+            action="store_true",
+            help="Lift the image's tenant restriction: every tenant may launch it.",
+        )
+        parser.add_argument(
             "--seed-defaults",
             action="store_true",
             help=(
@@ -97,9 +112,15 @@ class Command(BaseCommand):
 
     def handle(self, *args: Any, **opts: Any) -> None:
         if opts["seed_defaults"]:
-            if opts["image_name"] or opts["bake_id"]:
+            if (
+                opts["image_name"]
+                or opts["bake_id"]
+                or opts["restricted_tenant"] is not None
+                or opts["unrestrict"]
+            ):
                 raise CommandError(
-                    "--seed-defaults takes no image_name/bake_id positionals"
+                    "--seed-defaults takes no image_name/bake_id positionals and no "
+                    "--restricted-tenant / --unrestrict"
                 )
             blessed = [
                 self._bless(name, bake_id, distro, opts["blessed_by"])
@@ -112,16 +133,37 @@ class Command(BaseCommand):
             raise CommandError(
                 "image_name and bake_id are required (or pass --seed-defaults)"
             )
+        if opts["unrestrict"] and opts["restricted_tenant"] is not None:
+            raise CommandError("--restricted-tenant and --unrestrict are exclusive")
         distro = opts["distro"] or opts["image_name"]
         summary = self._bless(
-            opts["image_name"], opts["bake_id"], distro, opts["blessed_by"]
+            opts["image_name"],
+            opts["bake_id"],
+            distro,
+            opts["blessed_by"],
+            restricted_tenant=(
+                ""
+                if opts["unrestrict"]
+                else None
+                if opts["restricted_tenant"] is None
+                else str(opts["restricted_tenant"]).strip()
+            ),
         )
         self.stdout.write(json.dumps(summary))
 
     def _bless(
-        self, image_name: str, bake_id: str, distro: str, blessed_by: str
+        self,
+        image_name: str,
+        bake_id: str,
+        distro: str,
+        blessed_by: str,
+        *,
+        restricted_tenant: str | None = None,
     ) -> dict[str, Any]:
-        """Validate the bake is a Succeeded golden bake, then upsert the row."""
+        """Validate the bake is a Succeeded golden bake, then upsert the row.
+        `restricted_tenant=None` keeps the image's current restriction (none
+        for a new image); `""` lifts it."""
+        from apps.common.cdn import cdn_tenant_id
         from apps.images.models import GoldenImage
         from apps.tenant_bake.models import (
             TenantBake,
@@ -160,6 +202,49 @@ class Command(BaseCommand):
                 )
             )
             sys.exit(EXIT_BAKE_NOT_BLESSABLE)
+        # CDN plan I3: a cdn-node bake is blessed only under the reserved
+        # name `cdn-node`, and nothing else is.
+        if (bake.profile == "cdn-node") != (image_name == "cdn-node"):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"bake {bake_id!r} (profile={bake.profile!r}) cannot be blessed as "
+                    f"{image_name!r}: the cdn-node profile and the image name 'cdn-node' "
+                    "go together"
+                )
+            )
+            sys.exit(EXIT_BAKE_NOT_BLESSABLE)
+        previous = GoldenImage.objects.filter(image_name=image_name).first()
+        if restricted_tenant is None:
+            restricted_tenant = previous.restricted_tenant if previous is not None else ""
+        # CDN plan N2: the cdn-node image is the CDN fleet's alone — it holds
+        # the fleet's keys once released.
+        if bake.profile == "cdn-node" and (
+            not cdn_tenant_id() or restricted_tenant != cdn_tenant_id()
+        ):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"bake {bake_id!r} is a cdn-node bake: bless it with "
+                    f"--restricted-tenant set to VALI_CDN_TENANT_ID ({cdn_tenant_id()!r}), "
+                    f"not {restricted_tenant!r}"
+                )
+            )
+            sys.exit(EXIT_BAKE_NOT_BLESSABLE)
+        # One bake, one audience: a bake blessed under two names with two
+        # restrictions would be refused for one name or open by the other.
+        others = (
+            GoldenImage.objects.filter(bake_id=bake_id)
+            .exclude(image_name=image_name)
+            .exclude(restricted_tenant=restricted_tenant)
+            .values_list("image_name", flat=True)
+        )
+        if others:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"bake {bake_id!r} is blessed as {sorted(others)} with another tenant "
+                    "restriction — one bake has one restriction"
+                )
+            )
+            sys.exit(EXIT_BAKE_NOT_BLESSABLE)
         # A Succeeded golden bake must carry its shared dm-verity artifacts
         # (the DB CHECK enforces this, but assert defensively so a malformed
         # row can never enter the catalog).
@@ -176,13 +261,21 @@ class Command(BaseCommand):
             )
             sys.exit(EXIT_BAKE_NOT_BLESSABLE)
 
-        previous = GoldenImage.objects.filter(image_name=image_name).first()
         defaults: dict[str, Any] = {
             "distro": distro,
             "bake_id": bake_id,
             "blessed_at": timezone.now(),
             "blessed_by": blessed_by,
+            "restricted_tenant": restricted_tenant,
         }
+        if previous is not None and previous.restricted_tenant != restricted_tenant:
+            widened = "" if restricted_tenant else " — every tenant may now launch it"
+            self.stderr.write(
+                self.style.WARNING(
+                    f"image={image_name}: restricted tenant {previous.restricted_tenant!r} → "
+                    f"{restricted_tenant!r}{widened}"
+                )
+            )
         if (
             previous is not None
             and previous.bake_id != bake_id
@@ -212,4 +305,5 @@ class Command(BaseCommand):
             "bake_id": obj.bake_id,
             "created": created,
             "blessed_at": obj.blessed_at.isoformat(),
+            "restricted_tenant": obj.restricted_tenant,
         }

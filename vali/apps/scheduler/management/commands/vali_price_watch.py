@@ -221,6 +221,8 @@ class Command(BaseCommand):
                 capacity_by_node=cap,
                 load_by_node=load,
                 family_load_by_node=fam,
+                max_family_per_node=service.cdn_family_cap(family),
+                **service.cdn_edge_arguments(family, intent.vm_id),
                 max_epoch_lag=service.max_epoch_lag(),
                 excluded=frozenset({intent.node_id}),
                 # Gate (f) — the suggestion is the ONLY region guard on this
@@ -246,6 +248,8 @@ class Command(BaseCommand):
                 cvm_capability_by_node=service.cvm_capability_by_node(),
                 # Never recommend a miner still running a crypto-erased VM.
                 zombie_quarantined=service.zombie_quarantined_node_ids(),
+                # Gate (i) — no edge-region miner without a fresh net-policy ack.
+                net_policy_unready=service.net_policy_unready_node_ids(),
                 cordoned=service.cordoned_node_ids(),
                 # Capacity v2 — recommend only a miner the VM's flavor fits
                 # (an unknown class counts as the reference slot).

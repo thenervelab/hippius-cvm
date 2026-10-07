@@ -94,6 +94,11 @@ pub trait VmStateStore {
 /// launch the VM's current one right away (see `admin::process_admin_register`).
 pub const SUPERSEDE_PERM: &str = "supersede";
 
+/// OrderTicket `lifecycle_perms` entry: vali registered this VM as a CDN
+/// node. Required, together with a `cdn_node`-class measurement, for the
+/// release to carry cdn-fleet material (`crate::snp::check_release_class`).
+pub const CDN_NODE_PERM: &str = "cdn-node";
+
 /// The launch a VM's KBS row stands for: its launch measurement, and the
 /// `issue_time` of the ticket that established it.
 ///

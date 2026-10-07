@@ -99,6 +99,7 @@ VALI_SIDE_OUTCOMES = {
     "netbird-bad-userdata",
     "netbird-mint-failure",
     "customer-keys-cmdline-refused",
+    "cdn-role-refused",
     "vault-failure",
     "lifecycle-keygen-failure",
     "launch-digest-recompute-failure",

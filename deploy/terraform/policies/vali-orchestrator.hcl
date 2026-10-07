@@ -167,3 +167,37 @@ path "transit/datakey/wrapped/ud-*" {
 path "transit/datakey/wrapped/kek-*" {
   capabilities = ["update"]
 }
+
+# The CDN CA (`vali/apps/cdn/ca.py`). Its Ed25519 private key is the Transit
+# key `cdn-ca`, created out of band by an operator, non-exportable and
+# without plaintext backup:
+#   vault write transit/keys/cdn-ca type=ed25519 exportable=false allow_plaintext_backup=false
+# vali may only have Transit SIGN with it (the CA certificate and each
+# 7-day node certificate) and READ its public metadata (each version's
+# public key, and the exportable flags vali refuses to sign under). It is
+# deliberately NOT granted create/update on `transit/keys/cdn-ca` or its
+# `/config` (that could flip `exportable`, which Vault never flips back),
+# nor `transit/export`, `transit/backup` or `/rotate`: rotating the CA is an
+# operator act. A vali RCE can get certificates signed while it lasts; it
+# cannot take the CA key away.
+path "transit/sign/cdn-ca" {
+  capabilities = ["update"]
+}
+path "transit/keys/cdn-ca" {
+  capabilities = ["read"]
+}
+
+# CDN fleet keyring (CDN K2, `kbs-core/src/cdn_fleet.rs`). vali mints a
+# new fleet key version by asking Transit to GENERATE it and return ONLY
+# the ciphertext, then stores that ciphertext once at
+# `kbs/cdn-fleet/v<N>`. It never holds a plaintext fleet key: no decrypt,
+# no `datakey/plaintext`, and no `transit/encrypt/cdn-fleet` either, so it
+# cannot wrap a key of its own choosing. `create` without `update` or
+# `read` makes each version write-once (KV-v2 checks `update` on an
+# existing path, so a `cas=0` rewrite is refused twice over).
+path "transit/datakey/wrapped/cdn-fleet" {
+  capabilities = ["update"]
+}
+path "secret/data/hippius-compute/kbs/cdn-fleet/*" {
+  capabilities = ["create"]
+}

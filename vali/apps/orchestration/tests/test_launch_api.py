@@ -1302,3 +1302,14 @@ def test_intake_serializes_with_the_vm_row_lock(root_client, stub_vault_put, mon
     resp = root_client.post(LAUNCH_URL, _intent(), format="json")
     assert resp.status_code == 202, resp.content
     assert events == ["lock-vm", "create-job"]
+
+
+def test_resolve_bake_refuses_a_cdn_node_bake() -> None:
+    """CDN plan I3 — no launch uses a cdn-node image until the CDN launch
+    role exists (V2/V3)."""
+    bake = _make_succeeded_bake()
+    bake.profile = "cdn-node"
+    bake.save(update_fields=["profile"])
+    with pytest.raises(launch_jobs.LaunchIntentError) as exc:
+        launch_jobs._resolve_bake({"bake_id": "bake-1"})
+    assert exc.value.category == "image-restricted"

@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use hippius_miner_agent::orders::NetSpec;
 use hippius_miner_agent::snp_config::{install_for_tests, SnpCpuConfig};
 use hippius_miner_agent::{DomainUuid, QemuConfig, VmId};
 
@@ -125,6 +126,7 @@ fn kat_config() -> QemuConfig {
         memory_mb: 2048,
         golden: false,
         cid: 5,
+        net: None,
     }
 }
 
@@ -167,4 +169,79 @@ fn validate_then_render_is_consistent() {
         cfg.domain_name().unwrap().as_str(),
         "hippius-tenant-kat-cvm"
     );
+}
+
+/// [`EXPECTED_XML`] with a `net` spec: only the `<interface>` differs.
+const EXPECTED_NET_INTERFACE: &str = "\
+    <interface type='network'>
+      <source network='default'/>
+      <target dev='hvt5'/>
+      <model type='virtio'/>
+      <bandwidth>
+        <inbound average='30517' peak='30517' burst='305'/>
+        <outbound average='30517' peak='30517' burst='305'/>
+      </bandwidth>
+      <port isolated='yes'/>
+      <filterref filter='clean-traffic'>
+        <parameter name='CTRL_IP_LEARNING' value='dhcp'/>
+        <parameter name='DHCPSERVER' value='192.168.122.1'/>
+      </filterref>
+    </interface>
+";
+
+const LEGACY_INTERFACE: &str = "\
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+";
+
+#[test]
+fn domain_xml_with_net_matches_known_answer() {
+    let mut cfg = kat_config();
+    cfg.net = Some(NetSpec {
+        cap_mbps: Some(250),
+        isolate: true,
+    });
+    assert_eq!(
+        cfg.to_libvirt_xml(),
+        EXPECTED_XML.replace(LEGACY_INTERFACE, EXPECTED_NET_INTERFACE),
+        "the net-spec <interface> changed — if intentional, re-pin \
+         EXPECTED_NET_INTERFACE"
+    );
+    assert!(EXPECTED_XML.contains(LEGACY_INTERFACE));
+}
+
+#[test]
+fn net_without_cap_or_isolation_keeps_the_tap_name_and_filter() {
+    let mut cfg = kat_config();
+    cfg.cid = 65_535;
+    cfg.net = Some(NetSpec {
+        cap_mbps: None,
+        isolate: false,
+    });
+    let xml = cfg.to_libvirt_xml();
+    // IFNAMSIZ - 1 = 15: the largest CID still fits.
+    assert!(xml.contains("<target dev='hvt65535'/>"), "{xml}");
+    assert!(xml.contains("<filterref filter='clean-traffic'>"), "{xml}");
+    assert!(!xml.contains("<bandwidth>"), "{xml}");
+    assert!(!xml.contains("<port isolated"), "{xml}");
+}
+
+#[test]
+fn validate_bounds_the_net_cap() {
+    for (cap, ok) in [
+        (Some(1), true),
+        (Some(100_000), true),
+        (None, true),
+        (Some(0), false),
+        (Some(100_001), false),
+    ] {
+        let mut cfg = kat_config();
+        cfg.net = Some(NetSpec {
+            cap_mbps: cap,
+            isolate: true,
+        });
+        assert_eq!(cfg.validate().is_ok(), ok, "{cap:?}");
+    }
 }

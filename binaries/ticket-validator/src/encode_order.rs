@@ -58,6 +58,14 @@
 //! the order the plain string (and is required when the cmdline carries
 //! one). Emitted only when set.
 //!
+//! ### `launch` / `migrate-activate` — optional `net`
+//!
+//! The guest NIC's settings, `{"cap_mbps": 250, "isolate": true}`
+//! (both keys optional; mirrors `NetSpec`). Absent or null ⇒ not emitted,
+//! so the body is byte-identical to one without it. `cap_mbps` absent or
+//! null and `isolate: false` are not emitted inside it either, as the
+//! miner-agent's serde would not emit them.
+//!
 //! ### `stop`
 //!
 //! `{"vm_id": "tenant-1", "graceful": true}`
@@ -368,7 +376,55 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
         ));
     }
     push_guardian_ep(&mut entries, guardian_ep);
+    push_net(&mut entries, net_field(obj)?);
     Ok(Value::Map(entries))
+}
+
+/// Highest cap the miner-agent accepts (`netpolicy::MAX_VM_CAP_MBPS`).
+const MAX_NET_CAP_MBPS: u64 = 100_000;
+
+/// The optional `net` spec — mirrors `LaunchOrder::net` /
+/// `MigrateActivateOrder::net`. Absent / null ⇒ `None`, and then not
+/// emitted. Present, it must be an object with no key but `cap_mbps`
+/// (an integer in `1..=100000`, or null) and `isolate` (a bool): this
+/// bridge copies only the keys it lists, so an unknown key is refused
+/// (`bad-net`) rather than silently dropped. An agent too old to know
+/// `net` refuses a body that carries it (`deny_unknown_fields`):
+/// miner-agents deploy before vali.
+fn net_field(obj: &serde_json::Map<String, Json>) -> Result<Option<Value>, &'static str> {
+    let net = match obj.get("net") {
+        None | Some(Json::Null) => return Ok(None),
+        Some(v) => v.as_object().ok_or("bad-net")?,
+    };
+    if net.keys().any(|k| k != "cap_mbps" && k != "isolate") {
+        return Err("bad-net");
+    }
+    let mut entries = Vec::new();
+    match net.get("cap_mbps") {
+        None | Some(Json::Null) => {}
+        Some(v) => {
+            let cap = v
+                .as_u64()
+                .filter(|c| (1..=MAX_NET_CAP_MBPS).contains(c))
+                .ok_or("bad-net-cap")?;
+            entries.push((Value::Text("cap_mbps".into()), Value::Integer(cap.into())));
+        }
+    }
+    match net.get("isolate") {
+        None => {}
+        Some(v) => {
+            if v.as_bool().ok_or("bad-net")? {
+                entries.push((Value::Text("isolate".into()), Value::Bool(true)));
+            }
+        }
+    }
+    Ok(Some(Value::Map(entries)))
+}
+
+fn push_net(entries: &mut Vec<(Value, Value)>, net: Option<Value>) {
+    if let Some(net) = net {
+        entries.push((Value::Text("net".into()), net));
+    }
 }
 
 /// Customer-held keys: the optional `guardian_ep` — the ONE destination
@@ -622,6 +678,7 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
         entries.push((Value::Text("rootfs_hash_path".into()), Value::Text(p)));
     }
     push_guardian_ep(&mut entries, guardian_ep);
+    push_net(&mut entries, net_field(obj)?);
     // Staged restore — emitted only when set, so every other activation
     // stays byte-identical and an older agent is never sent the key.
     if let Some(rid) = staged_restore_id {
@@ -3079,6 +3136,18 @@ mod tests {
         require_existing_disks: bool,
         #[serde(default)]
         guardian_ep: Option<String>,
+        #[serde(default)]
+        net: Option<WireNet>,
+    }
+
+    /// The miner-agent's `NetSpec`, `deny_unknown_fields`.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct WireNet {
+        #[serde(default)]
+        cap_mbps: Option<u32>,
+        #[serde(default)]
+        isolate: bool,
     }
 
     #[derive(serde::Deserialize)]
@@ -3237,6 +3306,94 @@ mod tests {
             build(&args("a", "migrate-activate"), dropped.as_bytes()).unwrap_err(),
             "guardian-ep-missing"
         );
+    }
+
+    #[test]
+    fn launch_carries_net_into_the_miner_shape() {
+        let decode = |extra: &str| {
+            let json = launch_json_with("console=hvc0", extra);
+            let bytes = build(&args("n", "launch"), json.as_bytes()).unwrap();
+            assert_canonical(&bytes).unwrap();
+            let back: WireLaunchBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            (bytes, back.payload.net)
+        };
+        let (_, net) = decode("\"net\": {\"cap_mbps\": 250, \"isolate\": true},");
+        assert_eq!(
+            net,
+            Some(WireNet {
+                cap_mbps: Some(250),
+                isolate: true
+            })
+        );
+        // Defaults are not encoded, as the miner's serde would not.
+        let (bytes, net) = decode("\"net\": {\"cap_mbps\": null, \"isolate\": false},");
+        assert_eq!(
+            net,
+            Some(WireNet {
+                cap_mbps: None,
+                isolate: false
+            })
+        );
+        for key in [&b"isolate"[..], b"cap_mbps"] {
+            assert!(!bytes.windows(key.len()).any(|w| w == key));
+        }
+    }
+
+    #[test]
+    fn a_launch_without_net_is_byte_identical() {
+        let plain = build(&args("g", "launch"), launch_payload()).unwrap();
+        assert!(!launch_payload_has_key(&plain, "net"));
+        let null = launch_json_with("console=hvc0", "\"net\": null,");
+        assert_eq!(build(&args("g", "launch"), null.as_bytes()).unwrap(), plain);
+    }
+
+    #[test]
+    fn a_bad_net_is_refused() {
+        for (extra, want) in [
+            ("\"net\": 1,", "bad-net"),
+            ("\"net\": {\"cap_mbps\": 1, \"vlan\": 2},", "bad-net"),
+            ("\"net\": {\"isolate\": \"yes\"},", "bad-net"),
+            ("\"net\": {\"cap_mbps\": 0},", "bad-net-cap"),
+            ("\"net\": {\"cap_mbps\": 100001},", "bad-net-cap"),
+            ("\"net\": {\"cap_mbps\": 2.5},", "bad-net-cap"),
+            ("\"net\": {\"cap_mbps\": -1},", "bad-net-cap"),
+        ] {
+            let json = launch_json_with("console=hvc0", extra);
+            assert_eq!(
+                build(&args("n", "launch"), json.as_bytes()).unwrap_err(),
+                want,
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_activate_carries_net() {
+        let base = String::from_utf8(migrate_activate_payload().to_vec()).unwrap();
+        let with = base.replacen('{', "{ \"net\": {\"cap_mbps\": 100, \"isolate\": true},", 1);
+        let bytes = build(&args("a", "migrate-activate"), with.as_bytes()).unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v: Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let Value::Map(top) = v else { panic!() };
+        let Some((_, Value::Map(payload))) =
+            top.iter().find(|(k, _)| k.as_text() == Some("payload"))
+        else {
+            panic!()
+        };
+        let net = payload
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("net"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            net,
+            // Canonical order: the shorter key first.
+            Some(Value::Map(vec![
+                (Value::Text("isolate".into()), Value::Bool(true)),
+                (Value::Text("cap_mbps".into()), Value::Integer(100.into())),
+            ]))
+        );
+        let plain = build(&args("a", "migrate-activate"), migrate_activate_payload()).unwrap();
+        assert!(!launch_payload_has_key(&plain, "net"));
     }
 
     fn net_policy_vector() -> Json {

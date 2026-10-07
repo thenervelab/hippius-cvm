@@ -223,6 +223,10 @@ pub struct WiredKbs {
     /// The release audit sink the service appends through — shared with
     /// the admin router's read-only `GET /v1/admin/audit?log=release`.
     pub release_audit: Arc<FileAuditSink>,
+    /// `[cdn_fleet] enabled`: the admin fleet public-key publisher, over
+    /// the release path's own broker + Vault client + response key.
+    /// `None` ⇒ the route answers 404.
+    pub cdn_fleet: Option<Arc<dyn kbs_transport::cdn_fleet::CdnFleetPublisher>>,
 }
 
 /// When `enforce`'s post-restart grace window closes, counted from the
@@ -734,6 +738,11 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
     // §6 — opt into fail-closed refusal of a non-`vault:` (plaintext)
     // userdata at rest, from `[require_wrapped_userdata]` config.
     .with_require_wrapped_userdata(cfg.require_wrapped_userdata)
+    // Refuse a host_attestor-class measurement on release, from
+    // `[allowlist] enforce_release_class` (default off).
+    .with_enforce_release_class(cfg.allowlist.enforce_release_class)
+    // CDN fleet keyring, from `[cdn_fleet] enabled` (default off).
+    .with_cdn_fleet(cfg.cdn_fleet.enabled)
     // Keepalives bound to the guest the KBS released to, from
     // `[live_attestation] keepalive_binding` (default `off`).
     .with_keepalive_binding(cfg.live_attestation.keepalive_binding_mode())
@@ -744,6 +753,16 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         Some(rt) => service.with_custody(Arc::clone(rt)),
         None => service,
     };
+    let cdn_fleet: Option<Arc<dyn kbs_transport::cdn_fleet::CdnFleetPublisher>> =
+        if cfg.cdn_fleet.enabled {
+            eprintln!(
+                "kbs-server: cdn-fleet keyring ENABLED — cdn_node-class releases with the \
+                 cdn-node perm carry the fleet keys"
+            );
+            Some(Arc::new(service.cdn_fleet_publisher()))
+        } else {
+            None
+        };
 
     Ok(WiredKbs {
         service,
@@ -755,6 +774,7 @@ pub fn build_service(cfg: &Config, vault_token: Zeroizing<String>) -> Result<Wir
         custody,
         keepalive_bindings,
         release_audit: audit,
+        cdn_fleet,
     })
 }
 
@@ -778,6 +798,7 @@ pub fn build_admin_state(
     custody: Option<Arc<kbs_core::custody::CustodyRuntime>>,
     keepalive_bindings: Arc<dyn kbs_core::keepalive_binding::KeepaliveBindingStore>,
     release_audit: Arc<FileAuditSink>,
+    cdn_fleet: Option<Arc<dyn kbs_transport::cdn_fleet::CdnFleetPublisher>>,
 ) -> Result<AdminState, Error> {
     let admin_cfg = cfg
         .admin
@@ -866,5 +887,6 @@ pub fn build_admin_state(
         // by `GET /v1/admin/audit?log=release` (a second
         // `FileAuditSink::open` would block on the exclusive lock).
         release_audit: Some(release_audit),
+        cdn_fleet,
     })
 }

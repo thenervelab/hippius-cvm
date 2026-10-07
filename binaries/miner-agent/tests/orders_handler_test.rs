@@ -366,6 +366,7 @@ fn launch_payload(vm: &str) -> LaunchOrder {
         cose_ticket: ByteBuf::from(ticket_medium()),
         require_existing_disks: false,
         guardian_ep: None,
+        net: None,
     }
 }
 
@@ -1208,6 +1209,7 @@ fn activate_payload(vm: &str, get_url: &str) -> MigrateActivateOrder {
         staged_restore_id: String::new(),
         guardian_ep: None,
         settle_by_unix: 0,
+        net: None,
     }
 }
 

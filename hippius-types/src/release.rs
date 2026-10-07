@@ -282,6 +282,14 @@ pub struct KbsResponse {
     /// was before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_stamp_transition: Option<VolumeStampTransition>,
+    /// CDN nodes only: the cdn-fleet X25519 secret keys, one per version
+    /// the ticket names (`secret_type = "cdn-fleet"`, `secret_version` =
+    /// the fleet key version), each HPKE-wrapped to the attested guest.
+    /// The KBS sends it only when the measurement is `cdn_node`-class AND
+    /// the ticket carries the `cdn-node` perm. Absent from every other
+    /// release (never CBOR `null`), so those stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_fleet: Option<Vec<WrappedSecret>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

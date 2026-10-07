@@ -59,7 +59,8 @@ pub use guardian::{
 pub use lifecycle::{sign_stopped_ack, verify_stopped_ack};
 pub use release::{
     verify_and_unwrap_release, verify_and_unwrap_release_attested,
-    verify_and_unwrap_release_for_mode, AttestedStampProtocol, ExpectedRelease, UnwrappedSecrets,
+    verify_and_unwrap_release_for_mode, AttestedStampProtocol, ExpectedRelease, FleetKey,
+    UnwrappedSecrets,
 };
 pub use served_receipt::{
     sign_served_receipt, verify_receipt_in_aggregate_window, verify_served_receipt,

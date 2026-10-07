@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Integration tests: the real OpenResty build against a mock agent and a
+mock S3 origin (CDN plan I2).
+
+    OPENRESTY_PREFIX=/opt/openresty python3 -I test_dataplane.py
+
+The mock agent pushes control documents over the Unix control socket and
+collects metering datagrams; the mock origin serves objects and checks
+every request: method, headers, path and an independent SigV4
+verification. Standard library only (plus the `openssl` CLI for test
+certificates).
+"""
+
+import base64
+import datetime
+import gzip
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+PREFIX = os.environ.get("OPENRESTY_PREFIX", "/opt/openresty")
+NGINX = os.path.join(PREFIX, "nginx", "sbin", "nginx")
+
+ACCESS = "AKTESTCDNNODE"
+# A test-only value for the mock origin; not a credential anywhere.
+SIGNING_MATERIAL = "test-signing-material-for-the-mock-origin"
+REGION = "us-east-1"
+EMPTY = hashlib.sha256(b"").hexdigest()
+
+TEXT = ("hello from the origin\n" * 64).encode()
+OBJECTS = {
+    "/media/site/a/b.txt": (TEXT, "text/plain"),
+    "/media/site/a/c.txt": (b"c-object", "text/plain"),
+    "/media/site/img/x.png": (b"\x89PNG-bytes", "image/png"),
+    "/media/site/img/x.png.bak": (b"backup", "image/png"),
+    "/media/site/bad.bin": (b"blocked", "application/octet-stream"),
+    "/private/k/doc.txt": (b"private-object", "text/plain"),
+    "/media/site/a%20b.txt": (b"spaced", "text/plain"),
+    "/media/site/cookie.txt": (b"with-cookie", "text/plain"),
+    "/media/site/accel.txt": (b"accel-object", "text/plain"),
+    "/media/site/big.bin": (bytes(range(256)) * (3 * 4096 + 7), "application/octet-stream"),
+    "/media/site/empty.txt": (b"", "text/plain"),
+}
+ERROR_PATH = "/media/site/err.txt"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ── mock S3 origin ───────────────────────────────────────────────────
+
+
+def _hmac(key, msg):
+    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+
+def _q(v):
+    return urllib.parse.quote(v, safe="-_.~")
+
+
+def verify_presigned(method, path, query, headers):
+    """Independent check of a presigned (query-string) SigV4 GET; returns a
+    reason string on failure, None on success."""
+    params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+    sig = params.pop("X-Amz-Signature", None)
+    if not sig or params.get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256":
+        return "no-signature"
+    cred = params.get("X-Amz-Credential", "").split("/")
+    if len(cred) != 5 or cred[0] != ACCESS or cred[2] != REGION or cred[3] != "s3":
+        return "credential"
+    if params.get("X-Amz-SignedHeaders") != "host":
+        return "signed-headers"
+    amz_date = params.get("X-Amz-Date", "")
+    signed_at = datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+    if datetime.datetime.now(datetime.timezone.utc) > signed_at + datetime.timedelta(seconds=int(params["X-Amz-Expires"])):
+        return "expired"
+    canon_q = "&".join(f"{_q(k)}={_q(v)}" for k, v in sorted(params.items()))
+    creq = "\n".join([method, path, canon_q, f"host:{headers.get('host', '')}\n", "host", "UNSIGNED-PAYLOAD"])
+    scope = f"{amz_date[:8]}/{REGION}/s3/aws4_request"
+    sts = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(creq.encode()).hexdigest()])
+    k = _hmac(("AWS4" + SIGNING_MATERIAL).encode(), amz_date[:8])
+    for part in (REGION, "s3", "aws4_request"):
+        k = _hmac(k, part)
+    want = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, sig):
+        return "signature"
+    return None
+
+
+class Origin(BaseHTTPRequestHandler):
+    log = []
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        entry = {"method": self.command, "path": path, "query": query, "headers": headers}
+        bucket = path.split("/")[1] if path.count("/") >= 1 else ""
+        if query:
+            entry["sig"] = verify_presigned("GET", path, query, headers)
+        elif bucket == "private":
+            entry["sig"] = "missing"
+        Origin.log.append(entry)
+        if entry.get("sig"):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.endswith("/reset.txt"):
+            # Drop the connection without an answer: nginx logs an
+            # upstream error naming the upstream URL.
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if path == ERROR_PATH:
+            body = b"<Error><Code>AccessDenied</Code><BucketName>media</BucketName></Error>"
+            self.send_response(403)
+            self.send_header("Cache-Control", "max-age=3600")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        obj = OBJECTS.get(path)
+        if obj is None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body, ctype = obj
+        rng = self.headers.get("Range")
+        if rng and not body:
+            # S3: a ranged GET on an empty object is 416.
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if rng and rng.startswith("bytes="):
+            start, _, end = rng[6:].partition("-")
+            start = int(start)
+            end = min(int(end) if end else len(body) - 1, len(body) - 1)
+            total = len(body)
+            body = body[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        if path.endswith("/accel.txt"):
+            self.send_header("X-Accel-Redirect", "/.well-known/hippius-attestation")
+        self.send_header("Cache-Control", "max-age=3600")
+        if path.endswith("/cookie.txt"):
+            self.send_header("Set-Cookie", "origin=1")
+        self.send_header("x-amz-request-id", "REQ123")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# ── harness ──────────────────────────────────────────────────────────
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("localhost", timeout=10)
+        self.unix_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self.unix_path)
+
+
+def openssl_cert(work, name, sans):
+    cert = os.path.join(work, f"{name}.pem")
+    key = os.path.join(work, f"{name}.key")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+         "-nodes", "-days", "30", "-subj", f"/CN={sans[0]}", "-keyout", key, "-out", cert,
+         "-addext", "subjectAltName=" + ",".join("DNS:" + s for s in sans)],
+        check=True, capture_output=True)
+    with open(cert) as c, open(key) as k:
+        return c.read(), k.read(), cert
+
+
+class DataPlane(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.mkdtemp(prefix="cdn-dataplane-")
+        w = cls.work
+        for d in ("tmp", "cache", "run", "agent"):
+            os.makedirs(os.path.join(w, d))
+
+        cls.origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        threading.Thread(target=cls.origin.serve_forever, daemon=True).start()
+        origin_host = f"127.0.0.1:{cls.origin.server_address[1]}"
+
+        cls.wild_chain, cls.wild_key, wild_file = openssl_cert(w, "wild", ["*.cdn.hippius.com"])
+        cls.img_chain, cls.img_key, img_file = openssl_cert(w, "img", ["img.example.com", "dl.example.com"])
+        cls.cafile = os.path.join(w, "ca.pem")
+        with open(cls.cafile, "w") as f:
+            f.write(cls.wild_chain + cls.img_chain)
+
+        cls.http_port, cls.https_port = free_port(), free_port()
+        cls.ctl = os.path.join(w, "run", "ctl.sock")
+        cls.meter_path = os.path.join(w, "agent", "meter.sock")
+        cls.meter = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        cls.meter.bind(cls.meter_path)
+        cls.meter.settimeout(0.2)
+        cls.records = []
+        cls.stop = threading.Event()
+        threading.Thread(target=cls._collect, daemon=True).start()
+
+        with open(os.path.join(w, "origin.conf"), "w") as f:
+            f.write(f'map $host $hippius_s3_scheme {{ default "http"; }}\n'
+                    f'map $host $hippius_s3_host {{ default "{origin_host}"; }}\n')
+        render = os.path.join(ROOT, "render.sh")
+        subprocess.run([render, "cache", os.path.join(w, "cache.conf"), os.path.join(w, "cache"), "64m", "8m"], check=True)
+        subprocess.run([render, "placeholder", os.path.join(w, "run", "ph.pem"), os.path.join(w, "run", "ph.key")], check=True)
+        subprocess.run([
+            render, "conf", os.path.join(ROOT, "nginx.conf.in"), os.path.join(w, "nginx.conf"),
+            f"PREFIX={PREFIX}", f"PID={w}/nginx.pid", f"TEMP_DIR={w}/tmp",
+            f"LUA_DIR={ROOT}/lua", "DOCS_DICT_SIZE=32m", f"METER_SOCKET={cls.meter_path}",
+            f"CACHE_DIR={w}/cache", f"S3_REGION={REGION}", "RESOLVER=127.0.0.1",
+            f"CACHE_CONF={w}/cache.conf", f"ORIGIN_CONF={w}/origin.conf", "RATE_PER_IP=1000r/s",
+            f"CTL_SOCKET={cls.ctl}", "CTL_MAX_BODY=16m", f"LISTEN_HTTP=127.0.0.1:{cls.http_port}",
+            f"LISTEN_HTTPS=127.0.0.1:{cls.https_port}", f"PLACEHOLDER_CERT={w}/run/ph.pem",
+            f"PLACEHOLDER_KEY={w}/run/ph.key", "BURST_PER_IP=2000", "CONN_PER_IP=512",
+            f"CA_BUNDLE={cls.cafile}",
+        ], check=True)
+        cls.start_nginx()
+
+    @classmethod
+    def start_nginx(cls):
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = os.path.join(PREFIX, "luajit", "lib")
+        cls.err_path = os.path.join(cls.work, "nginx.err")
+        cls.err = open(cls.err_path, "ab")
+        cls.nginx = subprocess.Popen(
+            [NGINX, "-e", "stderr", "-p", cls.work, "-c", os.path.join(cls.work, "nginx.conf"),
+             "-g", "daemon off;"], env=env, stderr=cls.err)
+        for _ in range(100):
+            if os.path.exists(cls.ctl):
+                try:
+                    socket.create_connection(("127.0.0.1", cls.https_port), 1).close()
+                    return
+                except OSError:
+                    pass
+            time.sleep(0.05)
+        raise RuntimeError("nginx did not start")
+
+    @classmethod
+    def stop_nginx(cls):
+        cls.nginx.terminate()
+        cls.nginx.wait(10)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stop.set()
+        cls.stop_nginx()
+        cls.origin.shutdown()
+        shutil.rmtree(cls.work, ignore_errors=True)
+
+    @classmethod
+    def _collect(cls):
+        while not cls.stop.is_set():
+            try:
+                cls.records.append(json.loads(cls.meter.recv(4096)))
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+
+    # ── helpers ──
+
+    def put(self, name, doc):
+        conn = UnixHTTPConnection(self.ctl)
+        body = doc if isinstance(doc, (bytes, str)) else json.dumps(doc)
+        conn.request("PUT", f"/v1/{name}", body=body, headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        return r.status
+
+    def config(self, **over):
+        c = {
+            "revision": 10, "compression": ["gzip"], "fleet_wildcard": "*.cdn.hippius.com",
+            "draining": False,
+            "zones": {
+                "z1": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "site/"},
+                       "shield_region": "FR", "settings": {}, "secrets": []},
+                "z2": {"state": "paused", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
+                       "settings": {}, "secrets": []},
+                "z3": {"state": "active", "serving": False, "refusal": "origin-kind-not-supported",
+                       "origin": {"type": "http", "host": "169.254.169.254"}, "shield_region": None,
+                       "settings": {}, "secrets": []},
+                "z4": {"state": "suspended", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
+                       "settings": {}, "secrets": []},
+                "zp": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "private", "prefix": "k/"},
+                       "shield_region": None, "settings": {}, "secrets": ["s3_credentials"]},
+                "zr": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
+                       "settings": {}, "secrets": []},
+            },
+            "hostnames": {
+                "img.example.com": "z1", "z1.cdn.hippius.com": "z1", "dl.example.com": "zp",
+                "paused.cdn.hippius.com": "z2", "refused.cdn.hippius.com": "z3",
+                "susp.cdn.hippius.com": "z4", "root.cdn.hippius.com": "zr",
+            },
+            "purges": {"z1": {"zone_generation": 1, "prefixes": {}}},
+            "blocks": [{"kind": "path", "value": "/bad.bin", "zone_id": "z1"},
+                       {"kind": "prefix", "value": "/forbidden/"}],
+            "acme_http01": {"tok_ABC-1": "tok_ABC-1.thumbprint_x"},
+            "peers": [],
+        }
+        c.update(over)
+        return c
+
+    def push_all(self, health_ready=True, **over):
+        self.assertEqual(self.put("secrets", {"zones": {"zp": {"s3_credentials": json.dumps(
+            {"access_key_id": ACCESS, "secret_access_key": SIGNING_MATERIAL})}}}), 204)
+        self.assertEqual(self.put("certs", {"default": "*.cdn.hippius.com", "certs": {
+            "*.cdn.hippius.com": {"chain_pem": self.wild_chain, "key_pem": self.wild_key, "not_after": 0},
+            "img.example.com": {"chain_pem": self.img_chain, "key_pem": self.img_key, "not_after": 0},
+            "dl.example.com": {"chain_pem": self.img_chain, "key_pem": self.img_key, "not_after": 0},
+        }}), 204)
+        self.assertEqual(self.put("config", self.config(**over)), 204)
+        self.assertEqual(self.put("health", {"ready": health_ready, "at": int(time.time())}), 204)
+
+    def https(self, sni, path, host=None, headers=None, method="GET"):
+        ctx = ssl.create_default_context(cafile=self.cafile)
+        raw = socket.create_connection(("127.0.0.1", self.https_port), 5)
+        s = ctx.wrap_socket(raw, server_hostname=sni)
+        hdrs = {"Host": host or sni, "Connection": "close"}
+        hdrs.update(headers or {})
+        req = f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdrs.items()) + "\r\n"
+        s.sendall(req.encode())
+        r = http.client.HTTPResponse(s)
+        r.begin()
+        body = r.read()
+        s.close()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, body
+
+    def http(self, host, path, method="GET"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=5)
+        conn.request(method, path, headers={"Host": host})
+        r = conn.getresponse()
+        body = r.read()
+        conn.close()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, body
+
+    def origin_hits(self, path):
+        return [e for e in Origin.log if e["path"] == path]
+
+    def records_for(self, status, zone=None, wait=1.0):
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            found = [r for r in self.records if r["status"] == status and r.get("zone") == zone]
+            if found:
+                return found
+            time.sleep(0.05)
+        return []
+
+    # ── tests (run in name order; the "a" test seeds the documents) ──
+
+    def test_a_control_socket_contract(self):
+        self.assertEqual(self.put("health", {"ready": True, "at": int(time.time())}), 409,
+                         "empty shared memory asks for a resync")
+        self.assertEqual(self.put("config", "{not json"), 400)
+        self.assertEqual(self.put("config", self.config(revision="x")), 400)
+        self.assertEqual(self.put("nonsense", "{}"), 404)
+        conn = UnixHTTPConnection(self.ctl)
+        conn.request("GET", "/v1/config")
+        self.assertEqual(conn.getresponse().status, 405)
+        conn.close()
+        self.push_all()
+
+    def test_b_cache_miss_then_hit_and_clean_origin_request(self):
+        st, h, body = self.https("img.example.com", "/a/b.txt?x=1&evil=2",
+                                 headers={"X-Evil": "1", "Cookie": "s=1", "Authorization": "Basic Zm9v"})
+        self.assertEqual(st, 200)
+        self.assertEqual(body, TEXT)
+        self.assertEqual(h.get("x-cache"), "MISS")
+        self.assertNotIn("x-amz-request-id", h)
+        st, h, body = self.https("img.example.com", "/a/b.txt?other=3")
+        self.assertEqual((st, h.get("x-cache"), body), (200, "HIT", TEXT), "query is not part of the key")
+        hits = self.origin_hits("/media/site/a/b.txt")
+        self.assertEqual(len(hits), 1)
+        sent = hits[0]["headers"]
+        self.assertEqual(hits[0]["method"], "GET")
+        self.assertEqual(hits[0]["query"], "", "the client query string reached the origin")
+        for forbidden in ("x-evil", "cookie", "authorization", "accept-encoding", "user-agent"):
+            self.assertNotIn(forbidden, sent, f"client header {forbidden} reached the origin")
+        # A response with Set-Cookie is never cached, and the cookie
+        # never reaches the client.
+        for _ in range(2):
+            st, h, _ = self.https("img.example.com", "/cookie.txt")
+            self.assertEqual((st, h.get("x-cache")), (200, "MISS"))
+            self.assertNotIn("set-cookie", h)
+        # Another hostname of the same zone shares the cached object.
+        st, h, _ = self.https("z1.cdn.hippius.com", "/a/b.txt")
+        self.assertEqual((st, h.get("x-cache")), (200, "HIT"))
+
+    def test_c_private_bucket_is_sigv4_signed(self):
+        st, _, body = self.https("dl.example.com", "/doc.txt")
+        self.assertEqual((st, body), (200, b"private-object"))
+        hit = self.origin_hits("/private/k/doc.txt")[0]
+        self.assertIsNone(hit.get("sig"), hit.get("sig"))
+        self.assertIn("X-Amz-Signature=", hit["query"])
+        self.assertIn("X-Amz-Expires=86400", hit["query"])
+        self.assertNotIn("authorization", hit["headers"])
+
+    def test_d_gzip(self):
+        st, h, body = self.https("img.example.com", "/a/b.txt", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(st, 200)
+        self.assertEqual(h.get("content-encoding"), "gzip")
+        self.assertEqual(gzip.decompress(body), TEXT)
+        self.assertEqual(h.get("vary"), "Accept-Encoding")
+        # Compression off for the node: identity even when asked.
+        self.push_all(compression=[])
+        st, h, body = self.https("img.example.com", "/a/b.txt", headers={"Accept-Encoding": "gzip"})
+        self.assertNotIn("content-encoding", h)
+        self.assertEqual(body, TEXT)
+        self.push_all()
+
+    def test_e_purge_generations(self):
+        self.https("img.example.com", "/a/c.txt")
+        self.https("img.example.com", "/img/x.png")
+        self.assertEqual(self.https("img.example.com", "/a/c.txt")[1].get("x-cache"), "HIT")
+        # Prefix purge of /a/ misses /a/c.txt but leaves /img/x.png cached.
+        self.push_all(purges={"z1": {"zone_generation": 1, "prefixes": {"/a/": 1}}})
+        self.assertEqual(self.https("img.example.com", "/a/c.txt")[1].get("x-cache"), "MISS")
+        self.assertEqual(self.https("img.example.com", "/img/x.png")[1].get("x-cache"), "HIT")
+        # An exact-path purge is exact: a sibling sharing the prefix keeps
+        # its cached copy.
+        self.https("img.example.com", "/img/x.png.bak")
+        self.push_all(purges={"z1": {"zone_generation": 1, "prefixes": {"/a/": 1}, "paths": {"/img/x.png": 1}}})
+        self.assertEqual(self.https("img.example.com", "/img/x.png")[1].get("x-cache"), "MISS")
+        self.assertEqual(self.https("img.example.com", "/img/x.png.bak")[1].get("x-cache"), "HIT")
+        # Zone purge.
+        self.push_all(purges={"z1": {"zone_generation": 2, "prefixes": {"/a/": 1}, "paths": {"/img/x.png": 1}}})
+        self.assertEqual(self.https("img.example.com", "/a/c.txt")[1].get("x-cache"), "MISS")
+        self.assertEqual(self.https("img.example.com", "/a/c.txt")[1].get("x-cache"), "HIT")
+        # The backend's interim form: an exact path sent in `prefixes`
+        # (no trailing "/") purges that path.
+        self.push_all(purges={"z1": {"zone_generation": 2, "prefixes": {"/a/": 1, "/a/c.txt": 4},
+                                     "paths": {"/img/x.png": 1}}})
+        self.assertEqual(self.https("img.example.com", "/a/c.txt")[1].get("x-cache"), "MISS")
+
+    def test_f_refusals_never_reach_the_origin(self):
+        before = len(Origin.log)
+        cases = [
+            (self.https("paused.cdn.hippius.com", "/a/b.txt"), 503),
+            (self.https("refused.cdn.hippius.com", "/latest/meta-data/"), 503),
+            (self.https("susp.cdn.hippius.com", "/a/b.txt"), 403),
+            (self.https("img.example.com", "/bad.bin"), 451),
+            (self.https("img.example.com", "/forbidden/x"), 451),
+            (self.https("img.example.com", "/a/b.txt", method="POST"), 405),
+            (self.https("root.cdn.hippius.com", "/"), 404),
+            (self.https("img.example.com", "/a/b.txt", host="dl.example.com"), 421),
+            (self.https("nowhere.cdn.hippius.com", "/a/b.txt"), 421),
+            (self.http("unknown.example.net", "/a/b.txt"), 421),
+            (self.http("127.0.0.1", "/a/b.txt"), 400),
+        ]
+        for (st, _, _), want in cases:
+            self.assertEqual(st, want)
+        for path in ("/a/%2e%2e/%2e%2e/private/k/doc.txt", "/a/..%2f..%2fprivate/k/doc.txt",
+                     "/a%5c..%5cb", "/a/%00b"):
+            st, _, _ = self.https("img.example.com", path)
+            self.assertNotEqual(st, 200, path)
+        self.assertEqual([e["path"] for e in Origin.log[before:]], [],
+                         "a refused request contacted the origin")
+        # Encoded names still work.
+        st, _, body = self.https("img.example.com", "/a%20b.txt")
+        self.assertEqual((st, body), (200, b"spaced"))
+
+    def test_fa_encoded_feed_paths_block_and_purge(self):
+        self.assertEqual(self.https("img.example.com", "/a%20b.txt")[0], 200)
+        self.assertEqual(self.https("img.example.com", "/a%20b.txt")[1].get("x-cache"), "HIT")
+        self.push_all(purges={"z1": {"zone_generation": 1, "paths": {"/a%20b.txt": 7}}})
+        self.assertEqual(self.https("img.example.com", "/a%20b.txt")[1].get("x-cache"), "MISS",
+                         "an encoded purge key purges the decoded path")
+        blocks = self.config()["blocks"] + [{"kind": "path", "value": "/a%20b.txt", "zone_id": "z1"}]
+        self.push_all(blocks=blocks)
+        self.assertEqual(self.https("img.example.com", "/a%20b.txt")[0], 451)
+        # A prefix block must be directory-aligned, and an origin prefix
+        # must end with "/": both documents are refused whole.
+        # A block or purge key that is not a request path is skipped, not
+        # fatal: the rest of the document still applies.
+        odd = self.config(blocks=[{"kind": "prefix", "value": "/a"},
+                                  {"kind": "path", "value": "/%2e%2e/x"},
+                                  {"kind": "path", "value": "/bad.bin", "zone_id": "z1"}],
+                          purges={"z1": {"zone_generation": 1, "prefixes": {"/a%00/": 9, "/no-slash": 9},
+                                         "paths": {"/a%5cb": 9, "/%2e%2e/x": 9}}})
+        self.assertEqual(self.put("config", odd), 204)
+        self.assertEqual(self.https("img.example.com", "/bad.bin")[0], 451)
+        z = self.config()["zones"]
+        z["z1"]["origin"]["prefix"] = "site"
+        self.assertEqual(self.put("config", self.config(zones=z)), 400)
+        self.push_all()
+
+    def test_fb_origin_errors_are_generic_and_never_cached(self):
+        for _ in range(2):
+            st, h, body = self.https("img.example.com", "/err.txt")
+            self.assertEqual(st, 403)
+            self.assertEqual(body, b"403\n")
+            self.assertNotEqual(h.get("x-cache"), "HIT")
+        self.assertEqual(len(self.origin_hits(ERROR_PATH)), 2)
+
+    def test_fc_origin_cannot_steer_nginx(self):
+        st, h, body = self.https("img.example.com", "/accel.txt")
+        self.assertEqual((st, body), (200, b"accel-object"))
+        self.assertNotIn("x-accel-redirect", h)
+
+    def test_fd_ranges_fill_only_the_slices_they_cover(self):
+        big = OBJECTS["/media/site/big.bin"][0]
+        time.sleep(0.5)
+        n0 = len(self.records)
+        st, h, body = self.https("img.example.com", "/big.bin", headers={"Range": "bytes=0-0"})
+        self.assertEqual((st, body), (206, big[:1]))
+        hits = self.origin_hits("/media/site/big.bin")
+        self.assertEqual([e["headers"].get("range") for e in hits], ["bytes=0-1048575"])
+        deadline = time.time() + 2
+        while len(self.records) == n0 and time.time() < deadline:
+            time.sleep(0.05)
+        rec = self.records[n0:][0]
+        self.assertLess(rec["bytes_out"], 2048, "a one-byte range is not billed as the object")
+        st, _, body = self.https("img.example.com", "/big.bin")
+        self.assertEqual((st, body), (200, big))
+
+    def test_ff_empty_objects_are_served(self):
+        st, h, body = self.https("img.example.com", "/empty.txt")
+        self.assertEqual((st, body), (200, b""))
+        self.assertEqual(h.get("content-length"), "0")
+        # With a client Range, 416 is the right answer.
+        self.assertEqual(self.https("img.example.com", "/empty.txt", headers={"Range": "bytes=0-0"})[0], 416)
+
+    def test_fg_every_slice_carries_a_valid_presigned_url(self):
+        # Slice subrequests skip the Lua phases, so they reuse the main
+        # request's signature: it is a presigned URL valid for a day, not a
+        # header signature bound to a clock-skew window.
+        OBJECTS["/private/k/big.bin"] = OBJECTS["/media/site/big.bin"]
+        time.sleep(0.5)
+        n0 = len(self.records)
+        st, _, body = self.https("dl.example.com", "/big.bin")
+        self.assertEqual((st, body), (200, OBJECTS["/media/site/big.bin"][0]))
+        hits = self.origin_hits("/private/k/big.bin")
+        self.assertEqual(len(hits), 4, [e["headers"].get("range") for e in hits])
+        self.assertTrue(all(e.get("sig") is None for e in hits), [e.get("sig") for e in hits])
+        # bytes_from_origin counts every slice, not just the first.
+        deadline = time.time() + 2
+        while len(self.records) == n0 and time.time() < deadline:
+            time.sleep(0.05)
+        rec = [r for r in self.records[n0:] if r.get("zone") == "zp"][0]
+        self.assertGreaterEqual(rec["bytes_from_origin"], len(OBJECTS["/media/site/big.bin"][0]))
+        self.assertEqual(rec["cache"], "miss")
+
+    def test_fh_presigned_urls_never_reach_a_log(self):
+        before = os.path.getsize(self.err_path)
+        st, _, body = self.https("dl.example.com", "/reset.txt")
+        self.assertEqual(st, 502)
+        self.assertEqual(body, b"502\n")
+        self.assertIn("X-Amz-Signature=", self.origin_hits("/private/k/reset.txt")[0]["query"])
+        time.sleep(0.3)
+        with open(self.err_path, "rb") as f:
+            f.seek(before)
+            logged = f.read()
+        for secret in (b"X-Amz-Signature", b"X-Amz-Credential", b"reset.txt?"):
+            self.assertNotIn(secret, logged)
+
+    def test_fe_bad_credentials_never_reach_a_header(self):
+        self.assertEqual(self.put("secrets", {"zones": {"zp": {"s3_credentials": json.dumps(
+            {"access_key_id": ACCESS, "secret_access_key": SIGNING_MATERIAL,
+             "session_token": "tok\r\nX-Injected: 1"})}}}), 204)
+        before = len(Origin.log)
+        self.assertEqual(self.https("dl.example.com", "/doc.txt")[0], 503)
+        self.assertEqual(len(Origin.log), before)
+        self.push_all()
+
+    def test_g_http_redirects_and_acme(self):
+        st, h, _ = self.http("img.example.com", "/a/b.txt?q=1")
+        self.assertEqual(st, 301)
+        self.assertEqual(h["location"], "https://img.example.com/a/b.txt?q=1")
+        st, h, body = self.http("anything.example.org", "/.well-known/acme-challenge/tok_ABC-1")
+        self.assertEqual((st, body), (200, b"tok_ABC-1.thumbprint_x"))
+        self.assertEqual(self.http("img.example.com", "/.well-known/acme-challenge/nope")[0], 404)
+
+    def test_h_tls_selection(self):
+        # Unknown name: the fleet wildcard default.
+        ctx = ssl.create_default_context(cafile=self.cafile)
+        ctx.check_hostname = False
+        with ctx.wrap_socket(socket.create_connection(("127.0.0.1", self.https_port), 5),
+                             server_hostname="other.test") as s:
+            der = s.getpeercert(binary_form=True)
+        self.assertIn(b"cdn.hippius.com", der)
+        # No default and no match: the handshake is refused.
+        self.assertEqual(self.put("certs", {"default": None, "certs": {
+            "img.example.com": {"chain_pem": self.img_chain, "key_pem": self.img_key, "not_after": 0}}}), 204)
+        with self.assertRaises(ssl.SSLError):
+            ctx.wrap_socket(socket.create_connection(("127.0.0.1", self.https_port), 5),
+                            server_hostname="other.test").close()
+        self.push_all()
+
+    def test_i_health(self):
+        self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 200)
+        self.put("health", {"ready": False, "at": int(time.time())})
+        st, _, body = self.https("health.cdn.hippius.com", "/__hippius/health")
+        self.assertEqual(st, 503)
+        self.assertFalse(json.loads(body)["agent_ready"])
+        self.put("health", {"ready": True, "at": int(time.time()) - 120})
+        self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 503, "stale")
+        os.remove(os.path.join(self.work, "cache", ".hippius-canary"))
+        self.put("health", {"ready": True, "at": int(time.time())})
+        st, _, body = self.https("health.cdn.hippius.com", "/__hippius/health")
+        self.assertEqual(st, 503)
+        self.assertFalse(json.loads(body)["canary"])
+        with open(os.path.join(self.work, "cache", ".hippius-canary"), "w") as f:
+            f.write("hippius-canary\n")
+        self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 200)
+
+    def test_j_attestation(self):
+        self.assertEqual(self.put("attestation", {"format": "sev-snp-report-v1",
+                                                  "spki_sha256_hex": "ab" * 32, "report_b64": "AAAA"}), 204)
+        st, _, body = self.https("z1.cdn.hippius.com", "/.well-known/hippius-attestation")
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(body)["spki_sha256_hex"], "ab" * 32)
+
+    def test_k_metering(self):
+        time.sleep(0.5)  # let earlier datagrams drain (100 ms sender timer)
+        n0 = len(self.records)
+        self.https("img.example.com", "/a/b.txt")
+        deadline = time.time() + 2
+        while len(self.records) == n0 and time.time() < deadline:
+            time.sleep(0.05)
+        new = self.records[n0:]
+        self.assertEqual(len(new), 1, new)
+        r = new[0]
+        self.assertEqual((r["zone"], r["status"], r["cache"]), ("z1", 200, "hit"))
+        self.assertTrue(r["billable"])
+        self.assertGreater(r["bytes_out"], len(TEXT))
+        self.assertEqual(r["client_region"], "XX")
+        self.assertEqual(set(r), {"zone", "client_region", "billable", "bytes_out", "cache",
+                                  "bytes_from_origin", "bytes_from_shield", "status"})
+        paused = self.records_for(503, "z2")
+        self.assertTrue(paused and not paused[-1]["billable"])
+        unknown = self.records_for(421, None)
+        self.assertTrue(unknown and not unknown[-1]["billable"])
+        misses = [r for r in self.records if r.get("cache") == "miss" and r.get("zone") == "z1"]
+        self.assertTrue(misses and misses[0]["bytes_from_origin"] > 0)
+
+    def test_z_restart_empties_shared_memory(self):
+        type(self).stop_nginx()
+        type(self).start_nginx()
+        self.assertEqual(self.put("health", {"ready": True, "at": int(time.time())}), 409)
+        self.push_all()
+        self.assertEqual(self.https("img.example.com", "/a/b.txt")[0], 200)
+
+
+if __name__ == "__main__":
+    if not os.path.exists(NGINX):
+        sys.exit(f"no OpenResty at {PREFIX}")
+    unittest.main(verbosity=2)

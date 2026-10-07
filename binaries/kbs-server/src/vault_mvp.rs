@@ -621,6 +621,7 @@ mod tests {
                 userdata_version: 1,
                 lifecycle_path: None,
                 lifecycle_version: None,
+                cdn_fleet_versions: None,
             },
             u64::MAX,
             Zeroizing::new(b"cap-token".to_vec()),

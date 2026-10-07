@@ -91,6 +91,7 @@ fn make_signed_response(
         expected_volume_stamp: 0,
         volume_stamp_token: None,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -160,6 +161,7 @@ fn make_signed_response_with_lifecycle(
         expected_volume_stamp: 0,
         volume_stamp_token: None,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -179,6 +181,7 @@ fn expected<'a>(digest: &'a [u8; 32]) -> ExpectedRelease<'a> {
         userdata_version: UD_VER,
         expected_allowed_userdata_digest: digest,
         schema_v: SCHEMA_V,
+        cdn_fleet: false,
     }
 }
 
@@ -257,6 +260,7 @@ fn make_signed_response_with_volume_stamp(
         expected_volume_stamp,
         volume_stamp_token,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     sign_response(kbs_sk, &resp).unwrap()
 }
@@ -460,6 +464,7 @@ fn lifecycle_key_wrong_context_fails_closed() {
         expected_volume_stamp: 0,
         volume_stamp_token: None,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     let signed = sign_response(&kbs_sk, &resp).unwrap();
     let exp = expected(&digest);
@@ -626,6 +631,7 @@ fn ud_plaintext_does_not_match_digest_rejected() {
         expected_volume_stamp: 0,
         volume_stamp_token: None,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     let signed = sign_response(&kbs_sk, &resp).unwrap();
     let mut arr = [0u8; 32];
@@ -1019,4 +1025,196 @@ fn a_rollback_style_move_at_e_zero_is_refused() {
         transition(0xa1, 0xa1),
     );
     assert!(open_as(&stay, &kbs_sk, &guest_sk, AttestedStampProtocol::V2).is_ok());
+}
+
+// ── CDN G1: the fleet keyring ───────────────────────────────────────
+
+/// A wrapped fleet key: what the KBS emits for `version`, with every
+/// field overridable so a test can forge one.
+struct Fleet {
+    label_type: &'static str,
+    label_path: String,
+    label_version: u64,
+    ctx_version: u64,
+    secret: [u8; 32],
+}
+
+fn fleet(version: u64, seed: u8) -> Fleet {
+    let mut secret = [seed; 32];
+    kbs_core::cdn_fleet::clamp_in_place(&mut secret);
+    Fleet {
+        label_type: kbs_core::cdn_fleet::CDN_FLEET_SECRET_TYPE,
+        label_path: kbs_core::cdn_fleet::secret_path(version),
+        label_version: version,
+        ctx_version: version,
+        secret,
+    }
+}
+
+/// [`make_signed_response`] plus `cdn_fleet`, each key wrapped under the
+/// KBS's per-version context (as `kbs_core::release` does).
+fn make_signed_response_with_fleet(
+    kbs_sk: &SigningKey,
+    guest_pub: &[u8; 32],
+    keys: &[Fleet],
+) -> SignedResponse {
+    let ud_plain = b"#cloud-config\n";
+    let base = make_signed_response(
+        kbs_sk,
+        guest_pub,
+        b"LUKSKEY-32B-XXXXXXXXXXXXXXXXXXXX",
+        ud_plain,
+    );
+    let mut resp: KbsResponse = ciborium::from_reader(base.body.as_slice()).unwrap();
+    let digest = userdata_digest(
+        TENANT_ID, VM_ID, TICKET_ID, "userdata", UD_PATH, UD_VER, ud_plain,
+    );
+    let wrapped = keys
+        .iter()
+        .map(|k| {
+            let ctx = ReleaseContext {
+                v: SCHEMA_V,
+                ticket_id: TICKET_ID,
+                tenant_id: TENANT_ID,
+                vm_id: VM_ID,
+                vm_generation: VM_GEN,
+                kbs_nonce: &NONCE,
+                measurement: &MEAS,
+                kbs_kid: KBS_KID,
+                secret_type: kbs_core::cdn_fleet::CDN_FLEET_SECRET_TYPE,
+                secret_path: &kbs_core::cdn_fleet::secret_path(k.ctx_version),
+                secret_version: k.ctx_version,
+                allowed_userdata_digest: &digest,
+            };
+            let mut w = hpke_wrap(guest_pub, &k.secret, &ctx).unwrap();
+            w.secret_type = k.label_type.into();
+            w.secret_path = k.label_path.clone();
+            w.secret_version = k.label_version;
+            w
+        })
+        .collect();
+    resp.cdn_fleet = Some(wrapped);
+    sign_response(kbs_sk, &resp).unwrap()
+}
+
+fn open_fleet(keys: &[Fleet], want: bool) -> Result<hippius_guest::UnwrappedSecrets, GuestError> {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let signed = make_signed_response_with_fleet(&kbs_sk, &guest_pk, keys);
+    let digest = userdata_digest(
+        TENANT_ID,
+        VM_ID,
+        TICKET_ID,
+        "userdata",
+        UD_PATH,
+        UD_VER,
+        b"#cloud-config\n",
+    );
+    let mut exp = expected(&digest);
+    exp.cdn_fleet = want;
+    verify_and_unwrap_release(&signed, &kbs_sk.verifying_key(), &guest_sk, &exp)
+}
+
+#[test]
+fn a_cdn_node_unwraps_its_fleet_keyring_in_version_order() {
+    let out = open_fleet(&[fleet(2, 0x22), fleet(1, 0x11)], true).unwrap();
+    let versions: Vec<u32> = out.cdn_fleet.iter().map(|k| k.version).collect();
+    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(**out.cdn_fleet[0].secret, fleet(1, 0x11).secret);
+    assert_eq!(**out.cdn_fleet[1].secret, fleet(2, 0x22).secret);
+    // Debug never shows a secret byte.
+    assert!(!format!("{:?}", out.cdn_fleet[0]).contains("secret"));
+    assert!(format!("{out:?}").contains("cdn_fleet_versions: [1, 2]"));
+}
+
+#[test]
+fn every_other_guest_ignores_the_keyring_even_a_bad_one() {
+    let mut forged = fleet(1, 0x11);
+    forged.label_type = "luks";
+    let out = open_fleet(&[forged], false).unwrap();
+    assert!(out.cdn_fleet.is_empty());
+}
+
+#[test]
+fn a_release_without_a_keyring_gives_an_empty_one() {
+    let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let (guest_sk, guest_pk) = gen_x25519();
+    let ud_plain = b"#cloud-config\nusers:\n  - default";
+    let signed = make_signed_response(
+        &kbs_sk,
+        &guest_pk,
+        b"LUKSKEY-32B-XXXXXXXXXXXXXXXXXXXX",
+        ud_plain,
+    );
+    let digest = userdata_digest(
+        TENANT_ID, VM_ID, TICKET_ID, "userdata", UD_PATH, UD_VER, ud_plain,
+    );
+    let mut exp = expected(&digest);
+    exp.cdn_fleet = true;
+    let out = verify_and_unwrap_release(&signed, &kbs_sk.verifying_key(), &guest_sk, &exp).unwrap();
+    assert!(out.cdn_fleet.is_empty());
+}
+
+#[test]
+fn a_forged_or_malformed_keyring_fails_the_release_closed() {
+    let binding = |r: Result<hippius_guest::UnwrappedSecrets, GuestError>| {
+        matches!(
+            r,
+            Err(GuestError::Binding {
+                field: "cdn_fleet",
+                ..
+            })
+        )
+    };
+    let hpke = |r: Result<hippius_guest::UnwrappedSecrets, GuestError>| {
+        matches!(r, Err(GuestError::Hpke(_)))
+    };
+
+    let mut t = fleet(1, 1);
+    t.label_type = "lifecycle";
+    assert!(binding(open_fleet(&[t], true)), "wrong type");
+
+    let mut p = fleet(1, 1);
+    p.label_path = "hippius-compute/kbs/cdn-fleet/v9".into();
+    assert!(binding(open_fleet(&[p], true)), "path of another version");
+
+    let mut z = fleet(1, 1);
+    z.label_version = 0;
+    z.label_path = kbs_core::cdn_fleet::secret_path(0);
+    assert!(binding(open_fleet(&[z], true)), "version 0");
+
+    let mut big = fleet(1, 1);
+    big.label_version = u64::from(u32::MAX) + 1;
+    big.label_path = kbs_core::cdn_fleet::secret_path(big.label_version);
+    assert!(binding(open_fleet(&[big], true)), "version past u32");
+
+    assert!(
+        binding(open_fleet(&[fleet(1, 1), fleet(1, 2)], true)),
+        "duplicate version"
+    );
+    assert!(
+        binding(open_fleet(
+            &[
+                fleet(1, 1),
+                fleet(2, 1),
+                fleet(3, 1),
+                fleet(4, 1),
+                fleet(5, 1)
+            ],
+            true
+        )),
+        "more than four"
+    );
+
+    // Relabelled: version 1's key presented as version 2 opens under the
+    // wrong context.
+    let mut relabel = fleet(1, 1);
+    relabel.label_version = 2;
+    relabel.label_path = kbs_core::cdn_fleet::secret_path(2);
+    assert!(hpke(open_fleet(&[relabel], true)), "relabelled version");
+
+    // Not the KBS's clamped output.
+    let mut raw = fleet(1, 1);
+    raw.secret = [0xffu8; 32];
+    assert!(binding(open_fleet(&[raw], true)), "unclamped");
 }

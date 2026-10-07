@@ -213,6 +213,7 @@ GOLDEN_DRACUT_MODULE_SRC="${SCRIPT_DIR}/dracut/95hippius-golden"
 # heredoc, so shellcheck + `scripts/dev/keepalive-unit-test.sh` can lint
 # and EXECUTE the exact bytes the guest runs.
 KEEPALIVE_SHIM_SRC="${SCRIPT_DIR}/guest/hippius-keepalive-start"
+CDN_INSTALL_SRC="${SCRIPT_DIR}/cdn-node/install-cdn-node.sh"
 # #289 — init-bottom DHCP/static teardown. Installed into the guest's
 # `/etc/initramfs-tools/scripts/init-bottom/` (NOT hook-copied into
 # DESTDIR — mkinitramfs generates the `ORDER` execution manifest from
@@ -362,6 +363,16 @@ disk_mode="${HCC_BAKE_DISK_MODE:-legacy_luks}"
 # byte-identical to a bake without the flag: no upgrade, same packages as
 # the dated base image ships plus what the bake installs.
 package_refresh="${HCC_BAKE_PKG_REFRESH:-}"
+# Bake profile (CDN plan I3). `standard` is every existing bake, unchanged.
+# `cdn-node` additionally stages the CDN data plane (OpenResty + cdn-agent),
+# removes sshd and bakes the public-IP inbound guard and input firewall —
+# golden_verity_overlay + Debian family only. Its inputs are required
+# with it and refused without it.
+profile="${HCC_BAKE_PROFILE:-standard}"
+cdn_agent_bin=""
+cdn_openresty_tarball=""
+cdn_config_dir=""
+cdn_backend_url=""
 # Pinned verity parameters — IDENTICAL to build-rootfs.sh so the root hash
 # and the `rootfs.verity` bytes are byte-reproducible across same-distro
 # bakes. `veritysetup format`'s salt AND uuid both default to random; the
@@ -811,6 +822,20 @@ Optional:
                           so a new STAMP always rebuilds with current
                           packages. Default: \$HCC_BAKE_PKG_REFRESH, else
                           empty (no upgrade).
+  --profile NAME          standard (default) or cdn-node: the CDN cache
+                          node image (golden_verity_overlay, Debian
+                          family): OpenResty + cdn-agent staged, no
+                          sshd, public-IP inbound guard + input firewall
+                          baked. Default: \$HCC_BAKE_PROFILE, else
+                          standard.
+  --cdn-agent-bin PATH    cdn-node: the hippius-cdn-agent binary.
+  --cdn-openresty-tarball PATH
+                          cdn-node: the OpenResty tree (build-openresty.sh
+                          output; PATH.sha256 must match).
+  --cdn-config-dir PATH   cdn-node: packer/cdn-node/openresty (Lua,
+                          nginx.conf.in, origin.conf, render.sh).
+  --cdn-backend-url URL   cdn-node: the backend base URL baked into the
+                          agent config (https).
   --kbs-url URL           KBS HTTPS base URL baked into the image's
                           kernel cmdline at install time. Default:
                           \$HIPPIUS_KBS_URL, else
@@ -866,6 +891,11 @@ while [[ $# -gt 0 ]]; do
         --distro)               require_arg "$1" "${2-}"; distro="$2";              shift 2;;
         --disk-mode)            require_arg "$1" "${2-}"; disk_mode="$2";           shift 2;;
         --package-refresh)      require_arg "$1" "${2-}"; package_refresh="$2";     shift 2;;
+        --profile)              require_arg "$1" "${2-}"; profile="$2";             shift 2;;
+        --cdn-agent-bin)        require_arg "$1" "${2-}"; cdn_agent_bin="$2";       shift 2;;
+        --cdn-openresty-tarball) require_arg "$1" "${2-}"; cdn_openresty_tarball="$2"; shift 2;;
+        --cdn-config-dir)       require_arg "$1" "${2-}"; cdn_config_dir="$2";      shift 2;;
+        --cdn-backend-url)      require_arg "$1" "${2-}"; cdn_backend_url="$2";     shift 2;;
         --print-plan)           require_arg "$1" "${2-}"; print_plan_osrelease="$2"; shift 2;;
         --kbs-url)              require_arg "$1" "${2-}"; kbs_url="$2";              shift 2;;
         --kek-source)           require_arg "$1" "${2-}"; kek_source="$2";           shift 2;;
@@ -917,6 +947,30 @@ esac
 if [[ -n "${package_refresh}" && ! "${package_refresh}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
     die "--package-refresh must match [A-Za-z0-9._-]{1,64} (got '${package_refresh}') (exit 1)"
 fi
+
+# ── Resolve --profile (CDN plan I3) ─────────────────────────────────
+# Gated here, root-free, like --disk-mode (scripts/dev/cdn-node-profile-test.sh).
+case "${profile}" in
+    standard)
+        if [[ -n "${cdn_agent_bin}${cdn_openresty_tarball}${cdn_config_dir}${cdn_backend_url}" ]]; then
+            die "--cdn-* flags need --profile cdn-node (exit 1)"
+        fi
+        ;;
+    cdn-node)
+        [[ "${disk_mode}" == "golden_verity_overlay" ]] \
+            || die "--profile cdn-node needs --disk-mode golden_verity_overlay (exit 1)"
+        [[ -n "${cdn_agent_bin}" && -x "${cdn_agent_bin}" ]] \
+            || die "--profile cdn-node needs an executable --cdn-agent-bin (exit 1)"
+        [[ -n "${cdn_openresty_tarball}" && -r "${cdn_openresty_tarball}" && -r "${cdn_openresty_tarball}.sha256" ]] \
+            || die "--profile cdn-node needs --cdn-openresty-tarball PATH with PATH.sha256 (exit 1)"
+        [[ -n "${cdn_config_dir}" && -r "${cdn_config_dir}/nginx.conf.in" && -x "${cdn_config_dir}/render.sh" ]] \
+            || die "--profile cdn-node needs --cdn-config-dir with nginx.conf.in and render.sh (exit 1)"
+        [[ "${cdn_backend_url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] \
+            || die "--profile cdn-node needs --cdn-backend-url https://host[:port][/path] (got '${cdn_backend_url}') (exit 1)"
+        [[ -r "${CDN_INSTALL_SRC}" ]] || die "${CDN_INSTALL_SRC}: cdn-node installer missing (exit 1)"
+        ;;
+    *) die "--profile must be standard or cdn-node (got '${profile}') (exit 1)";;
+esac
 
 # ── Resolve the §23 keepalive cadence knobs ─────────────────────────
 # Gated HERE, alongside --disk-mode and ahead of the required-arg checks,
@@ -1137,6 +1191,16 @@ if [[ -n "${stage1_cache_dir}" ]]; then
             # is what tells two refreshes apart: a new stamp is a new key,
             # so a scheduled re-bake always pulls the updates of its day.
             echo "pkg_refresh=${package_refresh:-none}"
+            # Bake profile (CDN plan I3): a cdn-node stage-1 carries the
+            # data plane, so every input that shapes it keys the cache.
+            echo "profile=${profile}"
+            if [[ "${profile}" == "cdn-node" ]]; then
+                sha256sum "${CDN_INSTALL_SRC}" "${cdn_agent_bin}" "${cdn_openresty_tarball}" \
+                    | awk '{print "cdn="$1}'
+                (cd "${cdn_config_dir}" && find . -type f -print0 | LC_ALL=C sort -z \
+                    | xargs -0 sha256sum) | sha256sum | awk '{print "cdn-config="$1}'
+                echo "cdn-backend=${cdn_backend_url}"
+            fi
             # schema marker — bump on any change that alters stage-1
             # bytes but isn't captured by the hashed file list above
             # (the BASH_SOURCE hash already covers this script's logic;
@@ -1764,6 +1828,9 @@ fi
 # chroot path implements; a rhel-family image is detected + reported but
 # the dnf/dracut path is wired in the RHEL-family PRs.
 detect_distro "${MNT_ROOT}/etc/os-release"
+if [[ "${profile}" == "cdn-node" && "${DISTRO_FAMILY}" != "debian" ]]; then
+    die "--profile cdn-node supports the Debian family only (got ${DISTRO_ID}) (exit 3)"
+fi
 
 mount_boot_if_separate "${MNT_ROOT}"
 
@@ -1803,6 +1870,20 @@ if [[ "${disk_mode}" == "golden_verity_overlay" ]]; then
     if [[ "${DISTRO_FAMILY}" == "debian" ]]; then
         sudo install -d -m 0755 "${MNT_ROOT}/etc/initramfs-tools/hooks"
         sudo install -m 0755 "${GOLDEN_HOOK_SRC}" "${MNT_ROOT}/etc/initramfs-tools/hooks/hippius-golden"
+        # cdn-node profile only: the ephemeral-root marker. mkinitramfs
+        # copies /etc/initramfs-tools/conf.d/* into the initrd's
+        # /conf/conf.d/, where the golden overlay library looks for it: with
+        # it, every boot discards the overlay upper before the root is
+        # assembled (a root implant cannot survive a reboot). Standard
+        # golden initrds never carry it. /init sources conf.d files before
+        # it parses the cmdline, so the marker also sets panic=10: a panic in
+        # any initramfs stage reboots instead of opening a console shell.
+        if [[ "${profile}" == "cdn-node" ]]; then
+            sudo install -d -m 0755 "${MNT_ROOT}/etc/initramfs-tools/conf.d"
+            printf '%s\n' '# hippius-bake-managed (cdn-node profile): ephemeral golden root.' 'panic=10' \
+                | sudo tee "${MNT_ROOT}/etc/initramfs-tools/conf.d/hippius-cdn-ephemeral-upper" >/dev/null
+            sudo chmod 0644 "${MNT_ROOT}/etc/initramfs-tools/conf.d/hippius-cdn-ephemeral-upper"
+        fi
     else
         # RHEL/dracut: the golden overlay module (95hippius-golden) that
         # OWNS /sysroot assembly is staged with the other unlock assets in
@@ -2736,6 +2817,14 @@ if [ "${DISTRO_ID}" = "ubuntu" ] && [ -n "${KVER_PKG:-}" ]; then
         "linux-modules-extra-${KVER_PKG}" || true
 fi
 
+# ── cdn-node profile packages (CDN plan I3) ─────────────────────────
+# nftables for the guest input firewall and the inbound guard; openssl
+# for the throwaway TLS placeholder OpenResty needs at each start.
+# Env-gated: every standard bake installs nothing more.
+if [ "${HIPPIUS_PROFILE:-standard}" = "cdn-node" ]; then
+    apt-get install -y --no-install-recommends nftables openssl
+fi
+
 # ── NetBird pre-install (held-curl first-boot fix) ──────────────────
 # Install the NetBird overlay agent HERE, in the measured chroot (which
 # has internet), at the PINNED NETBIRD_VERSION — NOT at first boot. The
@@ -3018,6 +3107,7 @@ sudo chroot "${MNT_ROOT}" /usr/bin/env \
     DISTRO_KERNEL_PKG="${DISTRO_KERNEL_PKG}" \
     NETBIRD_VERSION="${netbird_version}" \
     PKG_REFRESH="${package_refresh}" \
+    HIPPIUS_PROFILE="${profile}" \
     /bin/bash /tmp/hippius-chroot-install.sh
 sudo rm -f "${MNT_ROOT}/tmp/hippius-chroot-install.sh"
 
@@ -3525,6 +3615,42 @@ sudo rm -f "${MNT_ROOT}/tmp/hippius-sshd-effective.sh"
 sudo test ! -e "${MNT_ROOT}/etc/ssh/sshd_config.d/50-hippius-bake-probe.conf" \
     || { echo "FATAL: the sshd -T probe drop-in was left in the image" >&2; exit 3; }
 
+# ── cdn-node profile (CDN plan I3) ───────────────────────────────────
+# A CDN node has no shell for anyone: sshd is purged (the standard gates
+# above ran on the base first, so a standard bake is unaffected), then the
+# data plane is staged by scripts/cdn-node/install-cdn-node.sh while the
+# vfs binds are still up. All of it lands in the dm-verity base, so the
+# measurement covers it; none of it comes from user-data.
+if [[ "${profile}" == "cdn-node" ]]; then
+    log "cdn-node: purging sshd and staging the CDN data plane"
+    sudo chroot "${MNT_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        apt-get purge -y openssh-server openssh-sftp-server \
+        || die "cdn-node: could not purge openssh-server (exit 3)"
+    # Nothing may change the measured software at runtime: no snaps, no
+    # unattended upgrades (the installer masks their units too).
+    for pkg in snapd unattended-upgrades; do
+        if sudo chroot "${MNT_ROOT}" dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q 'ok installed'; then
+            sudo chroot "${MNT_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${pkg}" \
+                || die "cdn-node: could not purge ${pkg} (exit 3)"
+        fi
+    done
+    sudo find "${MNT_ROOT}/etc/ssh" -depth \( -path '*/sshd_config*' -o -name 'ssh_host_*' \) \
+        -delete 2>/dev/null || true
+    for f in /usr/sbin/sshd /usr/lib/systemd/system/ssh.service /usr/lib/systemd/system/ssh.socket \
+             /lib/systemd/system/ssh.service /lib/systemd/system/ssh.socket; do
+        sudo test ! -e "${MNT_ROOT}${f}" || die "cdn-node: ${f} still present after the purge (exit 3)"
+    done
+    sudo test -x "${MNT_ROOT}/usr/sbin/nft" || die "cdn-node: nft missing from the guest (exit 3)"
+    sudo test -x "${MNT_ROOT}/usr/bin/openssl" || die "cdn-node: openssl missing from the guest (exit 3)"
+    # A child bash does not inherit the root `sudo` shim above: as root
+    # (the baker pod, which ships no sudo) the installer writes directly.
+    cdn_sudo=sudo
+    if [[ ${EUID} -eq 0 ]]; then cdn_sudo=""; fi
+    SUDO="${cdn_sudo}" bash "${CDN_INSTALL_SRC}" "${MNT_ROOT}" "${cdn_agent_bin}" \
+        "${cdn_openresty_tarball}" "${cdn_config_dir}" "${cdn_backend_url}" \
+        || die "cdn-node: data-plane staging failed (exit 3)"
+fi
+
 log "chroot install complete; root partition customised"
 
 # ── 5. Unbind + unmount ─────────────────────────────────────────────
@@ -3682,6 +3808,17 @@ if [[ -z "${audit_ok}" ]] && command -v lsinitrd >/dev/null 2>&1; then
 fi
 [[ -n "${audit_ok}" ]] \
     || die "extracted initrd (${initrd_src}) carries NO hippius release core — refusing to ship an unbootable image (exit 3)"
+# cdn-node: the shipped initrd must carry the ephemeral-root marker, or the
+# node would keep a persistent upper with nothing to say so.
+if [[ "${profile}" == "cdn-node" ]]; then
+    cdn_initrd_list="$(lsinitramfs "${WORK_DIR}/initrd.img" 2>/dev/null)" \
+        || die "cdn-node: could not list the extracted initrd (exit 3)"
+    grep -Ex '(\./)?conf/conf\.d/hippius-cdn-ephemeral-upper' <<<"${cdn_initrd_list}" >/dev/null \
+        || die "cdn-node: the extracted initrd lacks the ephemeral-root marker (exit 3)"
+    # A merged-/usr initrd lists /lib/... under usr/lib/.
+    grep -Ex '(\./)?(usr/)?lib/hippius/chown' <<<"${cdn_initrd_list}" >/dev/null \
+        || die "cdn-node: the extracted initrd lacks the chown the ephemeral root needs (exit 3)"
+fi
 
 stage1_cache_store
 

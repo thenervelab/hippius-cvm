@@ -241,6 +241,7 @@ fn mint_signed_response(kbs_sk: &SigningKey, guest_pub: &[u8; 32], vm_id: &str) 
         expected_volume_stamp: 0,
         volume_stamp_token: None,
         volume_stamp_transition: None,
+        cdn_fleet: None,
     };
     kbs_core::crypto::sign_response(kbs_sk, &response).unwrap()
 }

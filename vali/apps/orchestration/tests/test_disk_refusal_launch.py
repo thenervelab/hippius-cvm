@@ -191,3 +191,47 @@ def test_a_legacy_dispatch_failed_still_counts_as_a_start_failure(
     assert row.cvm_fail_streak == 1
     assert row.earned_disk_gb is None
     assert row.earned_vms == 5  # the start-failed halving
+
+
+# ─── edge-mode rules not loaded (C2): re-place, never a host penalty ──
+
+
+def test_a_preflight_net_policy_not_loaded_re_places_without_any_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.orchestration.services import preflight as preflight_svc
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        capacity_earn, "record_event", lambda nid, kind, **_k: seen.append(kind) or True
+    )
+    _earned_mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+
+    def _refuse(*a: object, **k: object) -> None:
+        raise preflight_svc.PreflightRejected("503", classifier="net-policy-not-loaded")
+
+    monkeypatch.setattr(preflight_svc, "dispatch_preflight", _refuse)
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+
+    assert out.disposition == launch.RETRIABLE  # `launch_vm` re-places
+    assert out.registered is False
+    assert seen == []
+    assert cvm_capability.capability_of(node_id(1)) == cvm_capability.UNKNOWN
+
+
+def test_a_launch_net_policy_not_loaded_is_not_a_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _earned_mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=False)
+    _dispatch_answers(monkeypatch, 503, "net-policy-not-loaded")
+
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+
+    assert out.disposition == launch.RETRIABLE
+    row = MinerCapacity.objects.get(miner_node_id=node_id(1))
+    assert row.cvm_fail_streak == 0
+    assert (row.earned_vms, row.earned_vcpus, row.earned_memory_mb) == (10, 20, 81920)

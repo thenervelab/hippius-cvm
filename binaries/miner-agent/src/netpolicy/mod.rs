@@ -1,10 +1,12 @@
 //! Host-wide guest network policy — the `net-policy` order
 //! (`docs/design/egress-and-bandwidth.md` §7).
 //!
-//! This module checks an order's shape, computes its content hash, and
-//! persists it with monotonic replay refusal ([`store`]). It applies
-//! nothing yet: the rules and caps come in a later change, so accepting
-//! a policy has no effect on the host.
+//! This module checks an order's shape, computes its content hash,
+//! persists it with monotonic replay refusal ([`store`]), renders the
+//! local-mode nft rules ([`render`]), keeps them loaded ([`apply`]) and
+//! sets the per-VM caps on the guests' NICs ([`caps`]). Edge-mode rules
+//! come in a later change. With no persisted policy nothing is
+//! installed.
 //!
 //! ## Content hash
 //!
@@ -15,6 +17,10 @@
 //! computes the same value from vali's JSON, and the order response
 //! `applied:<revision>:<content_sha256 hex>` echoes it back as the ack.
 
+pub mod apply;
+pub mod caps;
+pub mod render;
+pub mod snapshot;
 pub mod store;
 
 use std::net::Ipv4Addr;
@@ -26,6 +32,12 @@ use crate::error::{MinerAgentError, Result};
 use crate::lifecycle::VmId;
 use crate::orders::types::{NetEndpoint, NetPolicyOrder};
 
+pub use apply::{
+    GuestTaps, LibvirtGuestTaps, MockNft, NetPolicyEnforcer, NftCommand, NftRunner,
+    DRIFT_CHECK_INTERVAL, RULESET_FILE,
+};
+pub use caps::{IfaceTuner, Rate, VirshTuner, VmCaps};
+pub use render::{SmtpTap, BRIDGE_TABLE, INET_TABLE};
 pub use store::{AppliedNetPolicy, NetPolicyStore, DEFAULT_NET_POLICY_DIR};
 
 /// Longest validity window an order may claim. vali re-signs about every
@@ -73,14 +85,7 @@ pub fn validate(order: &NetPolicyOrder, now: u64) -> Result<()> {
         return Err(invalid("region"));
     }
     if let Some(ifname) = &order.uplink_hint {
-        let ok = (1..=MAX_IFNAME_LEN).contains(&ifname.len())
-            && ifname
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-            && ifname.bytes().any(|b| b.is_ascii_alphanumeric())
-            && !ifname.starts_with('-')
-            && !NOT_AN_UPLINK_PREFIXES.iter().any(|p| ifname.starts_with(p));
-        if !ok {
+        if !is_uplink_name(ifname) {
             return Err(invalid("uplink-hint"));
         }
     }
@@ -120,6 +125,23 @@ pub fn validate(order: &NetPolicyOrder, now: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An interface name safe to render into a ruleset (`IFNAMSIZ`, a
+/// strict charset, no leading `-`).
+pub(crate) fn is_ifname(name: &str) -> bool {
+    (1..=MAX_IFNAME_LEN).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && name.bytes().any(|b| b.is_ascii_alphanumeric())
+        && !name.starts_with('-')
+}
+
+/// [`is_ifname`], and not one of the interfaces that are never the
+/// uplink. Holds for `uplink_hint` and for the default-route interface.
+pub(crate) fn is_uplink_name(name: &str) -> bool {
+    is_ifname(name) && !NOT_AN_UPLINK_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 fn check_endpoints(endpoints: &[NetEndpoint], field: &'static str) -> Result<()> {

@@ -347,6 +347,10 @@ def _refusal(
         return "c2-not-enforced", "a guest upgrade needs launch-digest ENFORCE (its gate does)"
     if vm.state != VmState.ACTIVE:
         return "vm-not-active", f"vm is {vm.state!r}"
+    from apps.cdn.identity import is_cdn_vm
+
+    if is_cdn_vm(vm.vm_id):
+        return "cdn-node", "a CDN node upgrades by replacement, never in place"
     if not vm.host:
         return "no-bound-miner", "vm has no bound miner"
     if build.withdrawn_at is not None or build.release.withdrawn_at is not None:

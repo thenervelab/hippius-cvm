@@ -134,6 +134,7 @@ fn order(vm_id: &str) -> LaunchOrder {
         cose_ticket: serde_bytes::ByteBuf::from(ticket_medium()),
         require_existing_disks: false,
         guardian_ep: None,
+        net: None,
     }
 }
 
@@ -960,6 +961,71 @@ async fn readopt_running_re_tracks_a_survivor() {
     assert_eq!(lc2.cid_allocator().cid_for_vm(&vm).unwrap(), cid);
     // Idempotent — a second sweep changes nothing.
     assert_eq!(lc2.readopt_running().await.unwrap(), 0);
+}
+
+/// Rollout: domains launched before `net` (auto-named tap, no filter)
+/// and after it run side by side, and both survive an agent restart.
+#[tokio::test]
+async fn readopt_tracks_old_and_new_style_domains_side_by_side() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let lc1 = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    let old = lc1.launch(order("cvm-old")).await.unwrap();
+    let mut with_net = order("cvm-new");
+    with_net.net = Some(hippius_miner_agent::orders::NetSpec {
+        cap_mbps: Some(250),
+        isolate: true,
+    });
+    let new = lc1.launch(with_net).await.unwrap();
+    let new_cid = lc1.cid_allocator().cid_for_vm(&new).unwrap().unwrap();
+
+    let xml_of = |vm: &str| {
+        let driver = driver.clone();
+        let id = DomainId::new(&format!("hippius-tenant-{vm}")).unwrap();
+        async move { driver.domain_xml(&id).await.unwrap() }
+    };
+    let old_xml = xml_of("cvm-old").await;
+    assert!(!old_xml.contains("<target dev='hvt"), "{old_xml}");
+    assert!(!old_xml.contains("filterref"), "{old_xml}");
+    assert!(!old_xml.contains("<bandwidth>"), "{old_xml}");
+    let new_xml = xml_of("cvm-new").await;
+    assert!(
+        new_xml.contains(&format!("<target dev='hvt{new_cid}'/>")),
+        "{new_xml}"
+    );
+    assert!(
+        new_xml.contains("<filterref filter='clean-traffic'>"),
+        "{new_xml}"
+    );
+    assert!(new_xml.contains("<port isolated='yes'/>"), "{new_xml}");
+    assert!(new_xml.contains("<inbound average='30517'"), "{new_xml}");
+
+    let lc2 = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    assert_eq!(lc2.readopt_running().await.unwrap(), 2);
+    let mut tracked: Vec<_> = lc2.list().await.unwrap().into_iter().map(|t| t.0).collect();
+    tracked.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(tracked, vec![new.clone(), old]);
+    assert_eq!(lc2.cid_allocator().cid_for_vm(&new).unwrap(), Some(new_cid));
+}
+
+/// A cap outside the miner's bounds is refused before anything is
+/// reserved.
+#[tokio::test]
+async fn a_launch_with_an_out_of_range_cap_is_refused() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = lifecycle(driver.clone(), ok_digest());
+    for cap in [0, 100_001] {
+        let mut o = order("cvm-cap");
+        o.net = Some(hippius_miner_agent::orders::NetSpec {
+            cap_mbps: Some(cap),
+            isolate: false,
+        });
+        assert_eq!(
+            lc.launch(o).await.unwrap_err().to_string(),
+            MinerAgentError::LaunchInput("net-cap").to_string()
+        );
+    }
+    assert_eq!(driver.defined_count().unwrap(), 0);
 }
 
 #[tokio::test]

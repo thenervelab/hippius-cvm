@@ -49,6 +49,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.common.cdn import cdn_backend_url
 from apps.common.schemas import ErrorSerializer
 from apps.identity import scoping
 
@@ -57,6 +58,7 @@ from .models import (
     IN_FLIGHT_STATES,
     TenantBake,
     TenantBakeDiskMode,
+    TenantBakeProfile,
     TenantBakeState,
 )
 from .permissions import IsTenantBakeWorker
@@ -582,9 +584,31 @@ def _parse_create(body: dict[str, Any]) -> dict[str, Any]:
         )
     out["disk_mode"] = disk_mode
 
+    # CDN plan I3 — optional bake profile. Absent ⇒ `standard` (every
+    # existing caller unchanged). `cdn-node` is golden-only and needs the
+    # backend URL the agent config bakes in (VALI_CDN_BACKEND_URL).
+    profile = body.get("profile", TenantBakeProfile.STANDARD.value)
+    if profile not in TenantBakeProfile.values:
+        raise FinalizeError("profile must be 'standard' or 'cdn-node'", CAT_BAD_FIELD)
+    if profile == TenantBakeProfile.CDN_NODE.value:
+        if disk_mode != TenantBakeDiskMode.GOLDEN_VERITY_OVERLAY.value:
+            raise FinalizeError(
+                "profile 'cdn-node' needs disk_mode 'golden_verity_overlay'",
+                CAT_BAD_FIELD,
+            )
+        if not cdn_backend_url():
+            raise FinalizeError(
+                "profile 'cdn-node' needs VALI_CDN_BACKEND_URL set to a bare https origin "
+                "(https://host[:port], no path, no trailing slash)",
+                CAT_BAD_FIELD,
+            )
+    out["profile"] = profile
+    if profile == TenantBakeProfile.CDN_NODE.value:
+        out["cdn_backend_url"] = cdn_backend_url()
+
     # Reject any unknown field — caught early so a typo doesn't
     # silently drop on the floor.
-    allowed = set(required_str) | {"size_gb", "disk_mode"}
+    allowed = set(required_str) | {"size_gb", "disk_mode", "profile"}
     extras = set(body.keys()) - allowed
     if extras:
         raise FinalizeError(
@@ -738,6 +762,7 @@ def _serialize_bake(row: TenantBake) -> dict[str, Any]:
         "s3_output_bucket": row.s3_output_bucket,
         "s3_output_prefix": row.s3_output_prefix,
         "disk_mode": row.disk_mode,
+        "profile": row.profile,
         "state": row.state,
         "requested_by": row.requested_by.name,
         "requested_at": row.requested_at.isoformat() if row.requested_at else None,

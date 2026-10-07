@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from .models import EdgeStatus, PublicIpState
+from .models import EdgeStatus, PublicIpPool, PublicIpState
 
 _EDGE_STATUS = sorted(EdgeStatus.values)
 _IP_STATE = sorted(PublicIpState.values)
+_IP_POOL = sorted(PublicIpPool.values)
 
 
 class NetworkErrorSerializer(serializers.Serializer):
@@ -78,6 +79,12 @@ class EdgeAddressSerializer(serializers.Serializer):
     target_ip = serializers.IPAddressField(
         protocol="IPv4", allow_null=True, help_text="The VM's NetBird address, once known."
     )
+    pool = serializers.ChoiceField(
+        choices=_IP_POOL, help_text="`cdn` addresses go to CDN nodes only."
+    )
+    cap_mbps = serializers.IntegerField(
+        allow_null=True, help_text="A CDN address's own cap, in place of `per_ip_mbps`."
+    )
 
 
 class EdgeCountsSerializer(serializers.Serializer):
@@ -97,11 +104,17 @@ class EdgeSerializer(serializers.Serializer):
         help_text="Bound to a NetBird peer. An unbound edge takes no attachment."
     )
     per_ip_mbps = serializers.IntegerField()
+    egress_ip = serializers.IPAddressField(
+        protocol="IPv4", allow_null=True, help_text="Shared SNAT address of the region's egress."
+    )
     desired_revision = serializers.IntegerField()
     applied_revision = serializers.IntegerField()
     last_seen_at = serializers.DateTimeField(allow_null=True)
     last_report = serializers.DictField()
     counts = EdgeCountsSerializer()
+    counts_by_pool = serializers.DictField(
+        child=EdgeCountsSerializer(), help_text="`counts` per pool (`general`, `cdn`)."
+    )
     addresses = EdgeAddressSerializer(many=True)
 
 
@@ -130,16 +143,72 @@ class EdgePatchRequestSerializer(serializers.Serializer):
     netbird_ip = serializers.IPAddressField(
         protocol="IPv4", required=False, help_text="Re-bind the edge to the peer holding it."
     )
+    egress_ip = serializers.IPAddressField(
+        protocol="IPv4",
+        required=False,
+        allow_null=True,
+        help_text="The region's shared SNAT address; `null` clears it.",
+    )
 
 
 class EdgeAddressesRequestSerializer(serializers.Serializer):
     addresses = serializers.ListField(child=serializers.IPAddressField())
+    pool = serializers.ChoiceField(
+        choices=_IP_POOL,
+        required=False,
+        default="general",
+        help_text="POST only. `cdn` reserves the addresses for CDN nodes.",
+    )
+    cap_mbps = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="POST only; required for `cdn`, refused for `general`: the addresses' own "
+        "cap, in place of the edge's `per_ip_mbps`. Re-posting CDN addresses updates it.",
+    )
 
 
 class DesiredAddressSerializer(serializers.Serializer):
     address = serializers.IPAddressField(protocol="IPv4")
     vm_id = serializers.CharField()
     target_ip = serializers.IPAddressField(protocol="IPv4")
+    vm_region = serializers.CharField(
+        required=False, help_text="Egress feed only, when known: where the holder runs."
+    )
+    epoch = serializers.IntegerField(
+        required=False, min_value=0, help_text="Egress feed only: the binding's epoch."
+    )
+    cap_mbps = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        help_text="Egress feed: the holder's effective cap. A CDN address (`pool`): its own "
+        "cap, in place of `per_ip_mbps`, in either feed.",
+    )
+    smtp_allowed = serializers.BooleanField(
+        required=False,
+        help_text="Egress feed, or any feed while `VALI_FEED_BLOCK_SMTP` is on; present when "
+        "true: port 25 unblocked (exempt from `block_smtp`).",
+    )
+    pool = serializers.ChoiceField(
+        choices=[("cdn", "cdn")],
+        required=False,
+        help_text="CDN addresses only, while `VALI_CDN_ENABLED` is on; `cap_mbps` then "
+        "carries the address's own cap.",
+    )
+
+
+class DesiredEgressVmSerializer(serializers.Serializer):
+    vm_id = serializers.CharField()
+    target_ip = serializers.IPAddressField(protocol="IPv4")
+    vm_region = serializers.CharField()
+    epoch = serializers.IntegerField(min_value=0)
+    class_id = serializers.IntegerField(min_value=0, help_text="The edge's tc class (>= 0x1000).")
+    cap_mbps = serializers.IntegerField(min_value=0)
+
+
+class DesiredEgressSerializer(serializers.Serializer):
+    address = serializers.IPAddressField(protocol="IPv4", help_text="The shared SNAT address.")
+    block_smtp = serializers.BooleanField()
+    vms = DesiredEgressVmSerializer(many=True)
 
 
 class DesiredStateSerializer(serializers.Serializer):
@@ -147,6 +216,51 @@ class DesiredStateSerializer(serializers.Serializer):
     revision = serializers.IntegerField()
     per_ip_mbps = serializers.IntegerField()
     addresses = DesiredAddressSerializer(many=True)
+    egress = DesiredEgressSerializer(
+        required=False,
+        help_text=(
+            "Only for an edge of an `edge`-mode region with an `egress_ip`, while "
+            "`VALI_EGRESS_FEED_ENABLED` is on."
+        ),
+    )
+    block_smtp = serializers.BooleanField(
+        required=False,
+        help_text="Present (true) on every bound edge while `VALI_FEED_BLOCK_SMTP` is on: "
+        "TCP 25 from every public-IP VM is dropped, except addresses with `smtp_allowed`.",
+    )
+
+
+class EgressRegionSerializer(serializers.Serializer):
+    region = serializers.CharField()
+    mode = serializers.ChoiceField(choices=["local", "edge"])
+    routing_enabled = serializers.BooleanField()
+    enforce = serializers.BooleanField()
+    default_cap_mbps = serializers.IntegerField()
+    cap_mbps_by_flavor = serializers.DictField(child=serializers.IntegerField())
+
+
+class EgressRegionListSerializer(serializers.Serializer):
+    regions = EgressRegionSerializer(many=True)
+
+
+class EgressRegionPatchRequestSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=["local", "edge"], required=False)
+    routing_enabled = serializers.BooleanField(required=False)
+    enforce = serializers.BooleanField(required=False)
+
+
+class SmtpRequestSerializer(serializers.Serializer):
+    allowed = serializers.BooleanField()
+    expected_vm_id = serializers.CharField(
+        required=False,
+        help_text="Refuse with `vm-mismatch` unless the address is attached to this VM.",
+    )
+
+
+class SmtpSerializer(serializers.Serializer):
+    address = serializers.IPAddressField(protocol="IPv4")
+    vm_id = serializers.CharField(allow_null=True)
+    smtp_allowed = serializers.BooleanField()
 
 
 class AppliedRequestSerializer(serializers.Serializer):

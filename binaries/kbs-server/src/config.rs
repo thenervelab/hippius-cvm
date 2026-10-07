@@ -81,6 +81,26 @@ pub struct Config {
     /// creates arms.
     #[serde(default)]
     pub rollback: Option<RollbackConfig>,
+    /// `[cdn_fleet]` — the CDN fleet keyring (`kbs_core::cdn_fleet`).
+    /// Absent, or `enabled = false` (the default), ⇒ a CDN node release is
+    /// refused (`cdn-fleet-disabled`) and `POST /v1/admin/cdn-fleet/public`
+    /// answers 404; nothing else changes.
+    #[serde(default)]
+    pub cdn_fleet: CdnFleetConfig,
+}
+
+/// `[cdn_fleet]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdnFleetConfig {
+    /// Release the cdn-fleet keyring to a CDN node whose measurement is
+    /// `cdn_node`-class AND whose ticket carries the `cdn-node` perm, and
+    /// serve the admin public-key route. Needs the broker's
+    /// `vault.cdn_fleet_policy` and the Vault side
+    /// (`deploy/terraform/policies/kbs-cap-cdn-fleet.hcl`, Transit key
+    /// `cdn-fleet`).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[rollback]`.
@@ -278,6 +298,13 @@ pub struct Allowlist {
     /// release fails closed.
     #[serde(default)]
     pub signed_path: Option<PathBuf>,
+    /// `true` ⇒ the release path refuses a `host_attestor`-class
+    /// measurement (`kbs_core::snp::check_release_class`). Default `false`:
+    /// the class was never checked on release before, so flip it only
+    /// after confirming no live VM's measurement is pinned under it. The
+    /// `cdn_node` class rules do not depend on this flag.
+    #[serde(default)]
+    pub enforce_release_class: bool,
 }
 
 /// KBS key material.
@@ -1355,6 +1382,40 @@ compute_pallet_instance_hex = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
             Config::load(f.path()).is_err(),
             "deny_unknown_fields must reject"
         );
+    }
+
+    #[test]
+    fn enforce_release_class_defaults_off_and_parses() {
+        let f = write_tmp(MINIMAL);
+        assert!(
+            !Config::load(f.path())
+                .unwrap()
+                .allowlist
+                .enforce_release_class
+        );
+        let body = MINIMAL.replace(
+            "root_pubkey_hex = \"aa\"",
+            "root_pubkey_hex = \"aa\"\nenforce_release_class = true",
+        );
+        let f = write_tmp(&body);
+        assert!(
+            Config::load(f.path())
+                .unwrap()
+                .allowlist
+                .enforce_release_class
+        );
+    }
+
+    #[test]
+    fn cdn_fleet_defaults_off_and_parses() {
+        let f = write_tmp(MINIMAL);
+        assert!(!Config::load(f.path()).unwrap().cdn_fleet.enabled);
+        let f = write_tmp(&format!("{MINIMAL}\n[cdn_fleet]\nenabled = true\n"));
+        assert!(Config::load(f.path()).unwrap().cdn_fleet.enabled);
+        let f = write_tmp(&format!(
+            "{MINIMAL}\n[cdn_fleet]\nenabled = true\ntypo = 1\n"
+        ));
+        assert!(Config::load(f.path()).is_err(), "deny_unknown_fields");
     }
 
     #[test]

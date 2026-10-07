@@ -581,3 +581,47 @@ def test_command_enabled_rebakes_and_pushes(make_golden_bake, monkeypatch, capsy
     assert 'hippius_golden_rebake_bake_success{distro="ubuntu"} 1' in out
     assert 'hippius_golden_rebake_awaiting_bless{distro="ubuntu"} 1' in out
     assert list(GoldenImage.objects.order_by("image_name").values()) == before
+
+
+@pytest.mark.django_db
+def test_a_rebake_keeps_the_bake_profile(make_golden_bake) -> None:
+    """CDN plan I3 — re-baking a cdn-node golden rebuilds a cdn-node image."""
+    blessed = make_golden_bake("cdn-golden-1", profile="cdn-node")
+    row = rebake._queue(blessed, "cdn-rebake-1", "stamp-1")
+    assert row.profile == "cdn-node"
+    std = make_golden_bake("std-golden-1")
+    assert rebake._queue(std, "std-rebake-1", "stamp-2").profile == "standard"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("backend", "queued"),
+    [("https://api.hippius.com", True), ("https://api.hippius.com/", False), ("", False)],
+)
+def test_a_cdn_node_rebake_needs_a_bare_https_origin(
+    make_golden_bake, settings, backend: str, queued: bool
+) -> None:
+    """The URL is measured into the image: a bad one never gets re-baked."""
+    settings.VALI_CDN_BACKEND_URL = backend
+    bake = make_golden_bake(
+        bake_id="blessed-cdn-node",
+        vm_id="golden-cdn-node-dp",
+        s3_output_prefix="tenant/golden-cdn-node-dp/",
+        profile="cdn-node",
+        finished_at=timezone.now() - timedelta(days=30),
+    )
+    GoldenImage.objects.create(
+        image_name="cdn-node",
+        distro="debian",
+        bake_id=bake.bake_id,
+        blessed_at=timezone.now() - timedelta(days=29),
+        blessed_by="ops",
+        restricted_tenant="hippius-cdn",
+    )
+    outcome = rebake.run_rebake(images=("cdn-node",), stamp=STAMP, timing=_timing(FakeWorker()))
+    rows = _rebake_rows()
+    assert bool(rows) is queued
+    if queued:
+        assert rows[0].cdn_backend_url == backend
+    else:
+        assert outcome.results[0].state == rebake.NOT_RUN

@@ -46,6 +46,7 @@ from datetime import datetime
 
 from django.utils import timezone
 
+from apps.common.cdn import cdn_backend_url
 from apps.images.models import GoldenImage
 from apps.synthetic import metrics
 from apps.tenant_bake.models import (
@@ -215,6 +216,12 @@ def _bake_one(
         result.detail = f"blessed bake {blessed_id!r} is missing or not a golden bake"
         log.error("golden re-bake: %s", result.detail)
         return None
+    if blessed.profile == "cdn-node" and not cdn_backend_url():
+        # Measured into the image: never re-bake it with a bad or missing URL.
+        result.state = NOT_RUN
+        result.detail = "VALI_CDN_BACKEND_URL is not a bare https origin: cdn-node not re-baked"
+        log.error("golden re-bake: %s", result.detail)
+        return None
 
     vm_id = rebake_vm_id(image, stamp)
     if not _VM_ID_RE.match(vm_id):
@@ -314,6 +321,10 @@ def _queue(blessed: TenantBake, vm_id: str, stamp: str) -> TenantBake:
         s3_output_prefix=f"tenant/{vm_id}/",
         disk_mode=TenantBakeDiskMode.GOLDEN_VERITY_OVERLAY.value,
         package_refresh=stamp,
+        # A re-bake rebuilds the same kind of image (CDN plan I3).
+        profile=blessed.profile,
+        # The current backend URL, recorded on the row like the original's.
+        cdn_backend_url=cdn_backend_url() if blessed.profile == "cdn-node" else "",
         state=TenantBakeState.QUEUED.value,
         requested_by=requester,
     )

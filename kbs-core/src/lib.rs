@@ -30,6 +30,7 @@ pub mod audit_read;
 pub mod audit_vm_cert;
 pub mod boot_counter;
 pub mod cbor;
+pub mod cdn_fleet;
 pub mod crypto;
 pub mod custody;
 pub mod error;

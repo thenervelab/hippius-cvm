@@ -15,6 +15,11 @@
 # user-data + the lifecycle SIGNING key to tmpfs) and `hippius-guest/src`
 # (the verify+unwrap library that produces those plaintexts), so a leak
 # of the new lifecycle key is caught in every crate that touches it.
+#
+# CDN I1: `binaries/cdn-agent/src` derives the node key from the
+# lifecycle key and unseals certificate keys and zone secrets, so it is
+# scanned too, with its secret identifiers (`key_pem`, `session_token`,
+# the sealed blobs) added to the list.
 set -euo pipefail
 
 # Each entry is a crate src/ tree that handles release plaintext.
@@ -22,6 +27,7 @@ SRCS=(
   "binaries/agent-initramfs/src"
   "binaries/guest-release/src"
   "hippius-guest/src"
+  "binaries/cdn-agent/src"
 )
 status=0
 
@@ -43,7 +49,7 @@ for SRC in "${SRCS[@]}"; do
   #     same line. Comment lines (`file:NN:   // …`) are excluded — a
   #     commented-out line cannot leak.
   macros='println!|eprintln!|print!|eprint!|panic!|write!|writeln!|format!|log::|info!|warn!|error!|debug!|trace!'
-  secrets='luks|userdata|user_data|plaintext|passphrase|guest_sk|signing_key|lifecycle_key|seed_bytes'
+  secrets='luks|userdata|user_data|plaintext|passphrase|guest_sk|signing_key|lifecycle_key|seed_bytes|key_pem|session_token|sealed_b64|sealed_blob_b64'
   hits="$(grep -rnE --include='*.rs' "(${macros})" "$SRC" \
           | grep -vE ':[0-9]+:[[:space:]]*//' \
           | grep -E "\{(${secrets})[:}]" || true)"

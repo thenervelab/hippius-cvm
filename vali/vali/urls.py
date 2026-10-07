@@ -54,6 +54,7 @@ urlpatterns = [
     path("v1/", include("apps.operator.urls")),
     path("v1/", include("apps.network.urls")),
     path("v1/", include("apps.backup.urls")),
+    path("v1/", include("apps.cdn.urls")),
     # OpenAPI 3 API documentation (drf-spectacular). The schema + docs are
     # unauthenticated *documentation* (they describe the API shape; the
     # endpoints themselves stay auth-gated).

@@ -1382,6 +1382,205 @@ hippius_golden_write_timeline() {
     hippius_golden_write_counter "$1" "$2"
 }
 
+# ── cdn-node ephemeral root (marker-gated; inert on every other initrd) ─
+#
+# For the cdn-node bake profile only. A marker FILE that only a cdn-node
+# bake stages (via /etc/initramfs-tools/conf.d/, which
+# mkinitramfs copies into /conf/conf.d/); every other initrd lacks it and
+# none of the ephemeral steps run. A file, not a variable: a kernel
+# cmdline `key=value` reaches /init's environment, a file does not.
+#
+# With it, every boot discards the upper (and the cdn data the next boot
+# must not trust) BEFORE the overlay is assembled, so nothing a root
+# implant wrote under "/" is ever read again (not even /etc/fstab, which
+# /init consults before any init-bottom script), mounts the data
+# directory nosuid,nodev,noexec, and makes every later initramfs panic()
+# reboot instead of opening a shell on the console.
+HIPPIUS_GOLDEN_EPHEMERAL_MARKER="/conf/conf.d/hippius-cdn-ephemeral-upper"
+# cdn-agent's state directory in data/ (the one entry a cdn node keeps),
+# and its owner: cdn-agent:hippius-cdn, fixed ids from
+# scripts/cdn-node/install-cdn-node.sh.
+HIPPIUS_GOLDEN_CDN_STATE_NAME="cdn"
+HIPPIUS_GOLDEN_CDN_STATE_OWNER="61101:61100"
+# cdn-agent's own limits on what it keeps (binaries/cdn-agent/src/usage.rs):
+# a state file or report of at most 64 MiB, 1440 queued reports, 1 GiB.
+HIPPIUS_GOLDEN_CDN_MAX_FILE=67108864
+HIPPIUS_GOLDEN_CDN_MAX_QUEUED=1440
+HIPPIUS_GOLDEN_CDN_MAX_QUEUE_BYTES=1073741824
+# A real chown, staged by hippius-golden-hook for cdn-node initrds only
+# (Ubuntu's initramfs busybox has no chown applet).
+HIPPIUS_GOLDEN_CHOWN="/lib/hippius/chown"
+# Read to verify the data mount's options. Assigned, never imported from
+# the environment (a cmdline `key=value` could otherwise repoint it).
+HIPPIUS_GOLDEN_PROC_MOUNTS="/proc/mounts"
+# Where the release writes the CDN fleet keyring (CDN G1): the path the
+# agent unit's `LoadCredential=cdn-fleet:` names.
+HIPPIUS_GOLDEN_CDN_FLEET_DIR="/run/hippius/cdn-fleet"
+
+hippius_golden_ephemeral() {
+    [ -f "${HIPPIUS_GOLDEN_EPHEMERAL_MARKER}" ]
+}
+
+# Remove one directory entry (file, symlink, directory) without following
+# a symlink: `rm -rf` on a link removes the link.
+_hippius_golden_rm_entry() {
+    rm -rf "$1" || hippius_die "golden: ephemeral: could not remove ${1##*/}"
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        hippius_die "golden: ephemeral: ${1##*/} survived its removal"
+    fi
+}
+
+# Whether $1 is a directory, not a symlink to one.
+_hippius_golden_plain_dir() {
+    [ -d "$1" ] && [ ! -L "$1" ]
+}
+
+# Copy the bytes of $1 to a new 0600 file $2 if $1 is a regular file (not
+# a symlink, fifo or device) of at most $3 bytes; skip anything else. A
+# copy, never the inode itself: no hardlink, setuid bit, ACL or xattr the
+# old file carried survives. Sets _hgcr_size to the bytes copied (0 when
+# skipped).
+_hippius_golden_copy_regular() {
+    _hgcr_size=0
+    if [ ! -f "$1" ] || [ -L "$1" ]; then
+        return 0
+    fi
+    # The inode's size, not a read: `wc -c` would read a planted sparse
+    # file of any size end to end.
+    _hgcr_len="$(stat -c %s "$1")" \
+        || hippius_die "golden: ephemeral: could not size ${1##*/}"
+    case "${_hgcr_len}" in
+        ''|*[!0-9]*) hippius_die "golden: ephemeral: ${1##*/} has no readable size" ;;
+    esac
+    if [ "${_hgcr_len}" -gt "$3" ]; then
+        hippius_log "golden: ephemeral: WARN ${1##*/} is over ${3} bytes — not kept"
+        return 0
+    fi
+    ( umask 077 && cat "$1" >"$2" ) \
+        || hippius_die "golden: ephemeral: could not copy ${1##*/} into the fresh data directory"
+    _hgcr_size="${_hgcr_len}"
+}
+
+# Discard the upper + workdir, then rebuild data/ from scratch keeping only
+# the agent's billing state. Runs on the guest-keyed volume mounted at
+# HIPPIUS_GOLDEN_UPPER_MNT, before the overlay exists.
+#   - upper/, work/: removed entirely (recreated empty by the caller).
+#   - data/: replaced by a fresh root-owned 0755 directory holding only
+#     cdn/counters.json and the files of cdn/usage-queue/ (unsent usage
+#     reports), each copied if it was a regular file within cdn-agent's own
+#     limits, under fresh 0700 directories owned by cdn-agent. Everything
+#     else goes: OpenResty's cache and the agent's last-known-good feed (a
+#     forged entry would be served or applied), symlinks (a root unit
+#     creating these paths would follow them), and any owner, mode or ACL
+#     a previous boot set.
+# The old data/ is emptied of everything but cdn/counters.json and
+# cdn/usage-queue/ before the copy, so the copy has the cache's space. The swap goes through data.old, synced on
+# both sides: a power cut leaves either data/ or data.old (the next boot
+# takes it back as data/), never neither.
+hippius_golden_discard_upper() {
+    _hgdu_vol="${HIPPIUS_GOLDEN_UPPER_MNT}"
+    _hippius_golden_rm_entry "${_hgdu_vol}/upper"
+    _hippius_golden_rm_entry "${_hgdu_vol}/work"
+
+    _hgdu_data="${_hgdu_vol}/${HIPPIUS_GOLDEN_DATA_NAME}"
+    _hgdu_new="${_hgdu_vol}/${HIPPIUS_GOLDEN_DATA_NAME}.new"
+    _hgdu_prev="${_hgdu_vol}/${HIPPIUS_GOLDEN_DATA_NAME}.old"
+    _hgdu_old="${_hgdu_data}/${HIPPIUS_GOLDEN_CDN_STATE_NAME}"
+    _hgdu_state="${_hgdu_new}/${HIPPIUS_GOLDEN_CDN_STATE_NAME}"
+    # Left by an interrupted boot, or planted.
+    _hippius_golden_rm_entry "${_hgdu_new}"
+    if [ ! -e "${_hgdu_data}" ] && [ ! -L "${_hgdu_data}" ] \
+        && { [ -e "${_hgdu_prev}" ] || [ -L "${_hgdu_prev}" ]; }; then
+        mv "${_hgdu_prev}" "${_hgdu_data}" \
+            || hippius_die "golden: ephemeral: could not take the interrupted swap's data back"
+    fi
+    _hippius_golden_rm_entry "${_hgdu_prev}"
+
+    if _hippius_golden_plain_dir "${_hgdu_data}"; then
+        for _hgdu_e in "${_hgdu_data}"/* "${_hgdu_data}"/.[!.]* "${_hgdu_data}"/..?*; do
+            [ -e "${_hgdu_e}" ] || [ -L "${_hgdu_e}" ] || continue
+            [ "${_hgdu_e}" = "${_hgdu_old}" ] && _hippius_golden_plain_dir "${_hgdu_e}" && continue
+            _hippius_golden_rm_entry "${_hgdu_e}"
+        done
+        if _hippius_golden_plain_dir "${_hgdu_old}"; then
+            for _hgdu_e in "${_hgdu_old}"/* "${_hgdu_old}"/.[!.]* "${_hgdu_old}"/..?*; do
+                [ -e "${_hgdu_e}" ] || [ -L "${_hgdu_e}" ] || continue
+                case "${_hgdu_e##*/}" in counters.json|usage-queue) continue ;; esac
+                _hippius_golden_rm_entry "${_hgdu_e}"
+            done
+        fi
+    fi
+
+    mkdir -m 0755 "${_hgdu_new}" \
+        && mkdir -m 0700 "${_hgdu_state}" "${_hgdu_state}/usage-queue" \
+        || hippius_die "golden: ephemeral: could not create the fresh data directory"
+    if _hippius_golden_plain_dir "${_hgdu_data}" && _hippius_golden_plain_dir "${_hgdu_old}"; then
+        _hippius_golden_copy_regular "${_hgdu_old}/counters.json" "${_hgdu_state}/counters.json" \
+            "${HIPPIUS_GOLDEN_CDN_MAX_FILE}"
+        if _hippius_golden_plain_dir "${_hgdu_old}/usage-queue"; then
+            _hgdu_n=0
+            _hgdu_bytes=0
+            for _hgdu_q in "${_hgdu_old}/usage-queue"/* "${_hgdu_old}/usage-queue"/.[!.]* "${_hgdu_old}/usage-queue"/..?*; do
+                [ "${_hgdu_n}" -lt "${HIPPIUS_GOLDEN_CDN_MAX_QUEUED}" ] || break
+                _hgdu_room=$((HIPPIUS_GOLDEN_CDN_MAX_QUEUE_BYTES - _hgdu_bytes))
+                [ "${_hgdu_room}" -le "${HIPPIUS_GOLDEN_CDN_MAX_FILE}" ] \
+                    || _hgdu_room="${HIPPIUS_GOLDEN_CDN_MAX_FILE}"
+                _hippius_golden_copy_regular "${_hgdu_q}" "${_hgdu_state}/usage-queue/${_hgdu_q##*/}" \
+                    "${_hgdu_room}"
+                if [ -f "${_hgdu_state}/usage-queue/${_hgdu_q##*/}" ]; then
+                    _hgdu_n=$((_hgdu_n + 1))
+                    _hgdu_bytes=$((_hgdu_bytes + _hgcr_size))
+                fi
+            done
+        fi
+    fi
+    # The fresh tree holds only directories and regular files made above.
+    "${HIPPIUS_GOLDEN_CHOWN}" -R "${HIPPIUS_GOLDEN_CDN_STATE_OWNER}" "${_hgdu_state}" \
+        || hippius_die "golden: ephemeral: could not hand the cdn state to cdn-agent"
+    sync
+    if [ -e "${_hgdu_data}" ] || [ -L "${_hgdu_data}" ]; then
+        mv "${_hgdu_data}" "${_hgdu_prev}" \
+            || hippius_die "golden: ephemeral: could not move the old data directory aside"
+    fi
+    mv "${_hgdu_new}" "${_hgdu_data}" \
+        || hippius_die "golden: ephemeral: could not move the fresh data directory into place"
+    sync
+    _hippius_golden_rm_entry "${_hgdu_prev}"
+    hippius_log "golden: ephemeral: the previous boot's upper discarded, data/ rebuilt from the billing state"
+}
+
+# After the overlay + data bind: the data directory must be bound, and
+# nosuid,nodev,noexec. A no-op without the marker.
+hippius_golden_ephemeral_harden() {
+    hippius_golden_ephemeral || return 0
+    hippius_golden_harden_data "$1${HIPPIUS_GOLDEN_DATA_MOUNT}"
+}
+
+# The data directory must be bound, and nosuid,nodev,noexec: it holds the
+# cache and the agent's state, never code. Verified in /proc/mounts.
+hippius_golden_harden_data() {
+    _hghd_dst="$1"
+    _hghd_opts=""
+    while read -r _hghd_src _hghd_mnt _hghd_fs _hghd_o _hghd_rest; do
+        [ "${_hghd_mnt}" = "${_hghd_dst}" ] && _hghd_opts="${_hghd_o}"
+    done < "${HIPPIUS_GOLDEN_PROC_MOUNTS}"
+    [ -n "${_hghd_opts}" ] \
+        || hippius_die "golden: ephemeral: ${HIPPIUS_GOLDEN_DATA_MOUNT} is not bound (a cdn node keeps its cache and state there)"
+    mount -o remount,bind,nosuid,nodev,noexec "${_hghd_dst}" \
+        || hippius_die "golden: ephemeral: could not remount ${HIPPIUS_GOLDEN_DATA_MOUNT} nosuid,nodev,noexec"
+    _hghd_opts=""
+    while read -r _hghd_src _hghd_mnt _hghd_fs _hghd_o _hghd_rest; do
+        [ "${_hghd_mnt}" = "${_hghd_dst}" ] && _hghd_opts="${_hghd_o}"
+    done < "${HIPPIUS_GOLDEN_PROC_MOUNTS}"
+    for _hghd_want in nosuid nodev noexec; do
+        case ",${_hghd_opts}," in
+            *",${_hghd_want},"*) ;;
+            *) hippius_die "golden: ephemeral: ${HIPPIUS_GOLDEN_DATA_MOUNT} is not ${_hghd_want} after the remount (${_hghd_opts})" ;;
+        esac
+    done
+    hippius_log "golden: ephemeral: ${HIPPIUS_GOLDEN_DATA_MOUNT} is nosuid,nodev,noexec"
+}
+
 hippius_golden_mount_overlay() {
     _hgmo_rootmnt="$1"
 
@@ -1423,6 +1622,12 @@ hippius_golden_mount_overlay() {
         hippius_golden_confirm_first_stamp
     else
         hippius_golden_confirm_stamp
+    fi
+
+    # cdn-node: discard the previous boot's upper (and untrusted cdn data)
+    # now — after the anti-rollback gate, before anything in it is read.
+    if hippius_golden_ephemeral; then
+        hippius_golden_discard_upper
     fi
 
     # overlayfs requires upperdir + workdir on the SAME (writable) fs.
@@ -2159,6 +2364,15 @@ hippius_golden_run() {
 
     hippius_parse_cmdline
 
+    # cdn-node (ephemeral marker): from here on an initramfs panic()
+    # reboots instead of opening a root shell on the console, which the
+    # miner owns. `panic` is read by /init's panic(); this function runs in
+    # /init's own shell.
+    if hippius_golden_ephemeral; then
+        panic=10
+        export panic
+    fi
+
     # Verify-BEFORE-network: open + verity/RO-assert the PUBLIC golden
     # lower before any KBS/network contact (no KEK needed — it is an
     # unkeyed Merkle tree). A tampered base fails closed here.
@@ -2170,6 +2384,11 @@ hippius_golden_run() {
     # volume's key-mode token against the measured binding and pick up
     # its share version — still before any KBS or guardian contact.
     hippius_golden_keymode_prepare
+    # A cdn node is M0 only: M1/M2 stage the user-data for the FIRST boot,
+    # and an ephemeral root would come up unconfigured on every later one.
+    if hippius_golden_ephemeral && [ -n "${HIPPIUS_GOLDEN_KEY_MODE:-}" ]; then
+        hippius_die "golden: ephemeral: a cdn-node image boots in key mode M0 only (got ${HIPPIUS_GOLDEN_KEY_MODE}) — fail-closed"
+    fi
 
     _hgrun_kek="$(mktemp -p /run hippius-gold-kek.XXXXXX)"
     chmod 0600 "${_hgrun_kek}"
@@ -2188,6 +2407,12 @@ hippius_golden_run() {
     # for M2's v1 release; M0/M1 refuse without one — see
     # HIPPIUS_GOLDEN_TIMELINE_NAME).
     HIPPIUS_EXTRA_RELEASE_FLAGS="--volume-stamp-expected-out ${HIPPIUS_GOLDEN_STAMP_EXPECTED} --volume-stamp-ctx-out ${HIPPIUS_GOLDEN_STAMP_CTX} --volume-stamp-transition-out ${HIPPIUS_GOLDEN_STAMP_TRANSITION}"
+    # cdn-node (ephemeral marker): the release also writes the CDN fleet
+    # keyring (CDN G1) to the tmpfs directory the agent's `cdn-fleet`
+    # credential reads. Every other image never asks for it.
+    if hippius_golden_ephemeral; then
+        HIPPIUS_EXTRA_RELEASE_FLAGS="${HIPPIUS_EXTRA_RELEASE_FLAGS} --cdn-fleet-dir ${HIPPIUS_GOLDEN_CDN_FLEET_DIR}"
+    fi
     # M1/M2: where the release leaves the sealed share version, and the
     # version this volume's token names. Nothing for M0 (byte-identical
     # command line).
@@ -2218,7 +2443,8 @@ hippius_golden_run() {
     ( hippius_acquire "${_hgrun_kek}" \
         && hippius_golden_open_upper "${_hgrun_kek}" \
         && hippius_golden_mount_overlay "${_hgrun_rootmnt}" \
-        && hippius_golden_install_seed ) || _hgrun_rc=$?
+        && hippius_golden_install_seed \
+        && hippius_golden_ephemeral_harden "${_hgrun_rootmnt}" ) || _hgrun_rc=$?
 
     # §20: ALWAYS shred the KEK — success OR any failure path. H5b: and
     # the staged user-data, which the success path has already moved or

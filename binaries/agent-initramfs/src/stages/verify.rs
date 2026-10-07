@@ -97,12 +97,15 @@ pub fn verify_and_unwrap_for_mode(
         pinned_kbs_kid,
         mode,
         AttestedStampProtocol::V1,
+        false,
     )
 }
 
 /// [`verify_and_unwrap_for_mode`] for a release whose SNP report attested
 /// `attested` — see [`hippius_guest::verify_and_unwrap_release_attested`]:
 /// a v2 attestation accepts only a V2 response with a timeline transition.
+/// `cdn_fleet`: a `cdn-node` guest also unwraps the fleet keyring (CDN G1);
+/// every other guest passes `false` and never touches it.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_unwrap_attested(
     signed: &SignedResponse,
@@ -114,6 +117,7 @@ pub fn verify_and_unwrap_attested(
     pinned_kbs_kid: &[u8],
     mode: KeyMode,
     attested: AttestedStampProtocol,
+    cdn_fleet: bool,
 ) -> Result<UnwrappedSecrets, AgentError> {
     // Reconstruct the pinned KBS verifying key from the UKI-baked bytes.
     let kbs_vk = VerifyingKey::from_bytes(pinned_kbs_vk)
@@ -145,6 +149,7 @@ pub fn verify_and_unwrap_attested(
         userdata_version: order.userdata_vault_ref.version,
         expected_allowed_userdata_digest: &digest,
         schema_v: order.v,
+        cdn_fleet,
     };
 
     // The library performs `verify_strict` + every §6/§7/§19/§20

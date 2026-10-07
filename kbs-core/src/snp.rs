@@ -52,7 +52,13 @@ pub trait AttestationVerifier {
 /// Back-compat: serde defaults to [`AllowlistClass::Tenant`], so every
 /// pre-existing signed manifest — which carries no `class` key — decodes
 /// unchanged as a tenant measurement. Wire form is the stable snake_case
-/// string (`tenant` / `host_attestor`).
+/// string (`tenant` / `host_attestor` / `cdn_node`).
+///
+/// A KBS built before a variant existed rejects the WHOLE artifact that
+/// carries it (`AllowlistEntry` is `deny_unknown_fields` and the enum is
+/// closed), which denies every release. So a new class must be live on
+/// the KBS before any manifest writes it: KBS first, then the allowlist
+/// tool and vali.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllowlistClass {
@@ -61,6 +67,12 @@ pub enum AllowlistClass {
     Tenant,
     /// A blackbox host-attestor measurement.
     HostAttestor,
+    /// One CDN node VM's launch measurement (`docs/design/cdn.md` §5.3).
+    /// vali pins every CDN VM's measurement under this class
+    /// individually — each launch measures differently (nonce, node id,
+    /// family) — so the class, not one shared measurement, is what lets
+    /// the KBS tell a CDN node from a tenant. See [`check_release_class`].
+    CdnNode,
 }
 
 /// The offline KBS allowlist (§6/§7/§22): which measurements are accepted
@@ -78,15 +90,16 @@ pub trait MeasurementAllowlist {
     /// allowlisted at all.
     ///
     /// [`contains`](Self::contains) stays deliberately class-agnostic — a
-    /// measurement of ANY class is still "contained" — so no existing
-    /// verifier behaviour changes. `class_of` is the new PRECISE,
-    /// namespaced check: PR-5 will use it to require a host-attestor
-    /// measurement where a host-attestor is expected (and reject a tenant
-    /// measurement there, and vice-versa). The default returns `None`
-    /// (test stubs that do not track a class); production
+    /// measurement of ANY class is still "contained". `class_of` is the
+    /// PRECISE, namespaced check: host-attestor enrolment requires
+    /// [`AllowlistClass::HostAttestor`], and the release path requires
+    /// the class that matches the ticket's role ([`check_release_class`]).
+    /// The default treats every contained measurement as
+    /// [`AllowlistClass::Tenant`] — what a legacy manifest decodes to,
+    /// and what test stubs that track no class stand for; production
     /// [`crate::allowlist::InstalledAllowlist`] returns the entry's class.
-    fn class_of(&self, _measurement: &[u8; MEASUREMENT_LEN]) -> Option<AllowlistClass> {
-        None
+    fn class_of(&self, measurement: &[u8; MEASUREMENT_LEN]) -> Option<AllowlistClass> {
+        self.contains(measurement).then_some(AllowlistClass::Tenant)
     }
     fn pre_release_validate(&self) -> crate::error::Result<()> {
         Ok(())
@@ -159,6 +172,79 @@ pub fn check_attestation(
         return Err(KbsError::Attestation("REPORT_DATA mismatch".into()));
     }
     Ok(())
+}
+
+/// What a ticket-backed release is FOR, resolved by [`check_release_class`]
+/// from the attested measurement's allowlist class and the ticket's
+/// signed `lifecycle_perms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseRole {
+    /// An ordinary VM: its own disk key, userdata, lifecycle key.
+    Tenant,
+    /// A CDN node: the above plus the cdn-fleet keyring (K2).
+    CdnNode,
+}
+
+/// The release-path class gate. Run right after [`check_attestation`]
+/// (which proved the measurement is allowlisted at all).
+///
+/// The role is decided by TWO signed sources, and both must agree:
+/// - the offline allowlist says the measurement is
+///   [`AllowlistClass::CdnNode`] (signed by the §22 root);
+/// - the OrderTicket carries [`crate::lifecycle::CDN_NODE_PERM`] in
+///   `lifecycle_perms` (signed by L1 — vali registered this VM as a CDN
+///   node).
+///
+/// A disagreement either way is refused: a tenant measurement with the
+/// perm can never reach CDN fleet material, and a CDN measurement without
+/// it can never be used as an ordinary VM (a miner holding a CDN node's
+/// image cannot pair it with some tenant's ticket). Neither shape exists
+/// before the first `cdn_node` pin, so this is inert until then.
+///
+/// What this does NOT defend against: today vali both pins measurements
+/// (it holds the §22 signing seed) and mints tickets, so the two sources
+/// are independent of the miner and the tenant, not of vali. A
+/// compromised vali that pins its own image as `cdn_node` gets the fleet
+/// keys, as it could already get any one VM's KEK. Binding `cdn_node` to
+/// an offline-signed CDN image identity is the follow-up that closes it.
+///
+/// `refuse_host_attestor`: a [`AllowlistClass::HostAttestor`] measurement
+/// listed in a ticket's `allowed_measurements` would otherwise pass a
+/// release — the class was only ever checked at enrolment. Refused when
+/// set (KBS config `[allowlist] enforce_release_class`), which ships off
+/// so the flip can follow a check that no live VM depends on it.
+pub fn check_release_class(
+    offline: &dyn MeasurementAllowlist,
+    measurement: &[u8; MEASUREMENT_LEN],
+    lifecycle_perms: &[String],
+    refuse_host_attestor: bool,
+) -> Result<ReleaseRole> {
+    let wants_cdn = lifecycle_perms
+        .iter()
+        .any(|p| p == crate::lifecycle::CDN_NODE_PERM);
+    match (offline.class_of(measurement), wants_cdn) {
+        (Some(AllowlistClass::Tenant), false) => Ok(ReleaseRole::Tenant),
+        (Some(AllowlistClass::CdnNode), true) => Ok(ReleaseRole::CdnNode),
+        (Some(AllowlistClass::HostAttestor), false) if !refuse_host_attestor => {
+            Ok(ReleaseRole::Tenant)
+        }
+        (Some(AllowlistClass::HostAttestor), _) => Err(KbsError::Attestation(
+            "release-class-mismatch: measurement is host_attestor-class".into(),
+        )),
+        (Some(AllowlistClass::Tenant), true) => Err(KbsError::Attestation(
+            "cdn-perm-class-mismatch: ticket carries the cdn-node perm but the measurement \
+             is not cdn_node-class"
+                .into(),
+        )),
+        (Some(AllowlistClass::CdnNode), false) => Err(KbsError::Attestation(
+            "cdn-class-without-perm: measurement is cdn_node-class but the ticket does not \
+             carry the cdn-node perm"
+                .into(),
+        )),
+        (None, _) => Err(KbsError::Attestation(
+            "measurement not in offline KBS allowlist".into(),
+        )),
+    }
 }
 
 /// §322 keepalive variant of [`check_attestation`] — same crypto
@@ -288,5 +374,74 @@ mod tests {
         let mut r = report([3u8; 64]);
         r.policy = 0b10 | 0b100000;
         assert!(check_attestation(&r, &[vec![7u8; 48]], &All, &[3u8; 64], &policy()).is_err());
+    }
+
+    /// Every measurement is allowlisted under one fixed class.
+    struct Classed(AllowlistClass);
+    impl MeasurementAllowlist for Classed {
+        fn contains(&self, _m: &[u8; MEASUREMENT_LEN]) -> bool {
+            true
+        }
+        fn accepts_l1_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn accepts_kbs_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn class_of(&self, _m: &[u8; MEASUREMENT_LEN]) -> Option<AllowlistClass> {
+            Some(self.0)
+        }
+    }
+
+    fn perms(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn default_class_of_is_tenant_for_contained_and_none_otherwise() {
+        assert_eq!(All.class_of(&[7u8; 48]), Some(AllowlistClass::Tenant));
+        assert_eq!(None_.class_of(&[7u8; 48]), None);
+    }
+
+    #[test]
+    fn release_class_matrix() {
+        use crate::lifecycle::CDN_NODE_PERM;
+        let m = [7u8; 48];
+        let cdn = perms(&[CDN_NODE_PERM]);
+        let none = perms(&[]);
+        let t = Classed(AllowlistClass::Tenant);
+        let c = Classed(AllowlistClass::CdnNode);
+        let h = Classed(AllowlistClass::HostAttestor);
+        for enforce in [false, true] {
+            assert_eq!(
+                check_release_class(&t, &m, &none, enforce).unwrap(),
+                ReleaseRole::Tenant
+            );
+            assert_eq!(
+                check_release_class(&c, &m, &cdn, enforce).unwrap(),
+                ReleaseRole::CdnNode
+            );
+            assert!(check_release_class(&t, &m, &cdn, enforce).is_err());
+            assert!(check_release_class(&c, &m, &none, enforce).is_err());
+            assert!(check_release_class(&h, &m, &cdn, enforce).is_err());
+            assert!(check_release_class(&None_, &m, &none, enforce).is_err());
+        }
+        assert_eq!(
+            check_release_class(&h, &m, &none, false).unwrap(),
+            ReleaseRole::Tenant
+        );
+        assert!(check_release_class(&h, &m, &none, true).is_err());
+    }
+
+    #[test]
+    fn the_cdn_perm_matches_exactly() {
+        // A look-alike perm is not the perm: no prefix, case or padding games.
+        let c = Classed(AllowlistClass::CdnNode);
+        for p in ["cdn-node ", "CDN-NODE", "cdn-node-x", "cdn", ""] {
+            assert!(
+                check_release_class(&c, &[7u8; 48], &perms(&[p]), false).is_err(),
+                "{p:?}"
+            );
+        }
     }
 }

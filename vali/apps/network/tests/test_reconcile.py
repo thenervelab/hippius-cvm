@@ -187,6 +187,8 @@ def test_reconcile_follows_a_changed_overlay_address(fake_netbird: FakeNetbird) 
     _joined(fake_netbird, edge, vm.vm_id, "100.70.0.5")
     edge.refresh_from_db()
     rev = edge.desired_revision
+    ip.refresh_from_db()
+    epoch = ip.epoch
 
     # A relaunch / migration re-enrolled the guest: new peer, new address.
     old_name = f"hippius-tenant-{vm.vm_id}"
@@ -197,6 +199,7 @@ def test_reconcile_follows_a_changed_overlay_address(fake_netbird: FakeNetbird) 
     ip.refresh_from_db()
     edge.refresh_from_db()
     assert ip.target_ip == "100.70.0.77"
+    assert ip.epoch == epoch + 1  # a new (vm, target) binding
     assert edge.desired_revision == rev + 1
     assert fake_netbird.member_ids("hippius-pip-vms-edge-a") == set()
 

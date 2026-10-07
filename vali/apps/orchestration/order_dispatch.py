@@ -238,6 +238,38 @@ def _encode_order_body(
     return body
 
 
+def net_policy_digest(payload_json: bytes) -> str:
+    """The content hash a miner acks for a ``net-policy`` order
+    (``applied:<revision>:<hash>``), from the same JSON ``encode-order
+    --kind net-policy`` reads. Computed by ``hippius-ticket-validator
+    net-policy-digest`` so vali and the miner share one canonical encoding.
+    Raises like [`_encode_order_body`].
+    """
+    binary = _required_setting("VALI_TICKET_VALIDATOR_BIN")
+    timeout = float(getattr(settings, "VALI_TICKET_VALIDATOR_TIMEOUT_S", 2.0))
+    try:
+        completed = subprocess.run(
+            [binary, "net-policy-digest"],
+            input=payload_json,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise OrderDispatchMisconfigured("net-policy-digest: validator binary not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise OrderDispatchError("net-policy-digest: validator timeout") from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise OrderDispatchError(
+            f"net-policy-digest: validator exit {completed.returncode}: {stderr}"
+        )
+    digest = completed.stdout.decode("ascii", errors="replace").strip()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise OrderDispatchError("net-policy-digest: validator produced no digest")
+    return digest
+
+
 def _post_to_edge(
     *,
     body_bytes: bytes,
@@ -502,6 +534,7 @@ def build_launch_payload(
     cose_ticket: bytes,
     data_disk_size_gb: int = 0,
     require_existing_disks: bool = False,
+    net: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a ``launch`` order — mirrors the
     Rust ``LaunchOrder`` shape.
@@ -511,6 +544,10 @@ def build_launch_payload(
     with the ``relaunch-disks-missing`` class instead of creating blank
     per-VM disks. Carried only when True, so a first-launch payload is
     unchanged.
+
+    ``net`` is the guest NIC spec (``apps.network.net_policy.
+    launch_net_spec``). Carried only when set: a miner-agent that predates
+    it refuses the whole order.
 
     ``cose_ticket`` is the byte-exact L1-emitted COSE_Sign1 envelope —
     the same bytes ``apps.orders.models.OrderTicket.cose_blob`` stores.
@@ -555,6 +592,8 @@ def build_launch_payload(
     if require_existing_disks:
         payload["require_existing_disks"] = True
     _add_guardian_ep(payload, cmdline)
+    if net is not None:
+        payload["net"] = net
     return payload
 
 
@@ -619,6 +658,7 @@ def build_migrate_activate_payload(
     snapshot_sha256_hex: str = "",
     settle_by_unix: int = 0,
     staged_restore_id: str = "",
+    net: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a §25 M4 ``migrate-activate`` order —
     mirrors the Rust ``MigrateActivateOrder`` shape.
@@ -700,4 +740,8 @@ def build_migrate_activate_payload(
     # The §25 / restore destination boots the same measured cmdline, so it
     # dials the same guardian (`MigrateActivateOrder.guardian_ep`).
     _add_guardian_ep(payload, cmdline)
+    # The guest NIC spec, so the VM is capped from its first packet on the
+    # destination. Omitted when unset (agents deploy first).
+    if net is not None:
+        payload["net"] = net
     return payload

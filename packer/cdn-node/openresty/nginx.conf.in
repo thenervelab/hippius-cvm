@@ -1,0 +1,223 @@
+# cdn-node OpenResty configuration (CDN plan I2). Rendered by render.sh;
+# every @-delimited placeholder is substituted there. The rendered file is baked into the
+# measured image, so the origin host, the sockets and every limit below
+# are covered by the SNP measurement. Nothing here comes from the feed.
+#
+# The master runs as the unprivileged OpenResty user (systemd grants
+# CAP_NET_BIND_SERVICE), so the control socket it creates is owned by
+# that user: the agent checks this before it pushes any secret.
+
+worker_processes auto;
+pid @PID@;
+error_log stderr warn;
+pcre_jit on;
+
+events {
+    worker_connections 16384;
+}
+
+http {
+    server_tokens off;
+    # No request log on disk (spec §16 decision 5). Metering goes to the
+    # agent over its socket.
+    access_log off;
+    default_type application/octet-stream;
+    include @PREFIX@/nginx/conf/mime.types;
+
+    client_body_temp_path @TEMP_DIR@/client_body;
+    proxy_temp_path @TEMP_DIR@/proxy;
+    fastcgi_temp_path @TEMP_DIR@/fastcgi;
+    uwsgi_temp_path @TEMP_DIR@/uwsgi;
+    scgi_temp_path @TEMP_DIR@/scgi;
+
+    lua_package_path "@LUA_DIR@/?.lua;@PREFIX@/lualib/?.lua;;";
+    lua_package_cpath "@PREFIX@/lualib/?.so;;";
+    lua_shared_dict hippius_docs @DOCS_DICT_SIZE@;
+    lua_socket_log_errors off;
+
+    init_by_lua_block {
+        require("hippius_cdn.settings").set({
+            meter_socket = "@METER_SOCKET@",
+            cache_dir = "@CACHE_DIR@",
+            s3_region = "@S3_REGION@",
+        })
+        require("hippius_cdn.router")
+        require("hippius_cdn.cert")
+        require("hippius_cdn.control")
+        require("hippius_cdn.health")
+    }
+    init_worker_by_lua_block {
+        require("hippius_cdn.meter").start()
+        require("hippius_cdn.health").write_canary()
+    }
+
+    resolver @RESOLVER@ ipv6=off valid=60s;
+    resolver_timeout 5s;
+
+    # proxy_cache_path, sized by `hippius-cdn-agent cache-size` at start.
+    include @CACHE_CONF@;
+
+    # Origin endpoint ($hippius_s3_scheme, $hippius_s3_host).
+    include @ORIGIN_CONF@;
+
+    # Request hygiene. Bodies are never forwarded; headers are bounded.
+    ignore_invalid_headers on;
+    underscores_in_headers off;
+    large_client_header_buffers 4 16k;
+    client_header_timeout 15s;
+    client_body_timeout 15s;
+    send_timeout 60s;
+    keepalive_timeout 65s;
+    keepalive_requests 1000;
+
+    # Only these origin statuses are cached, whatever Cache-Control says:
+    # an origin error never becomes a cached HIT.
+    map $upstream_status $hippius_no_cache {
+        ~^(200|206|301|404)$ 0;
+        default 1;
+    }
+
+    limit_req_zone $binary_remote_addr zone=hippius_perip:32m rate=@RATE_PER_IP@;
+    limit_conn_zone $binary_remote_addr zone=hippius_connip:32m;
+
+    # gzip for text types when the client accepts it and the origin did
+    # not compress. The cache holds the identity body (the origin request
+    # carries no Accept-Encoding), so there is one cached copy per object.
+    gzip on;
+    gzip_proxied any;
+    gzip_vary on;
+    gzip_min_length 256;
+    gzip_comp_level 5;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript
+               application/json application/xml application/rss+xml application/atom+xml
+               application/wasm image/svg+xml application/manifest+json font/ttf font/otf;
+
+    # ── control socket: the agent only ─────────────────────────────────
+    server {
+        listen unix:@CTL_SOCKET@;
+        # Equal buffer and max size: a control document is never spilled
+        # to a temp file (it carries certificate keys and zone secrets).
+        client_max_body_size @CTL_MAX_BODY@;
+        client_body_buffer_size @CTL_MAX_BODY@;
+        client_body_in_single_buffer on;
+        location / {
+            content_by_lua_block { require("hippius_cdn.control").handle() }
+        }
+    }
+
+    # ── customer traffic ───────────────────────────────────────────────
+    server {
+        listen @LISTEN_HTTP@ default_server;
+        listen @LISTEN_HTTPS@ ssl default_server;
+        http2 on;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:hippius_ssl:64m;
+        ssl_session_timeout 1h;
+        # Tickets would need a key shared across workers and rotated;
+        # the session cache covers resumption without one.
+        ssl_session_tickets off;
+        # A placeholder pair the handshake never presents: the Lua below
+        # always replaces it, or refuses the handshake.
+        ssl_certificate @PLACEHOLDER_CERT@;
+        ssl_certificate_key @PLACEHOLDER_KEY@;
+        ssl_certificate_by_lua_block { require("hippius_cdn.cert").serve() }
+
+        client_max_body_size 1k;
+        limit_req zone=hippius_perip burst=@BURST_PER_IP@ nodelay;
+        limit_req_status 429;
+        limit_conn hippius_connip @CONN_PER_IP@;
+        limit_conn_status 429;
+
+        # Subrequests are logged too, so each slice can add the origin bytes
+        # it fetched to the main request's record (they emit nothing).
+        log_subrequest on;
+        log_by_lua_block { require("hippius_cdn.meter").log() }
+
+        location = /__hippius/health {
+            content_by_lua_block { require("hippius_cdn.health").serve() }
+        }
+        location = /__hippius/canary {
+            internal;
+            alias @CACHE_DIR@/.hippius-canary;
+        }
+        location ^~ /.well-known/acme-challenge/ {
+            content_by_lua_block { require("hippius_cdn.health").acme() }
+        }
+        location = /.well-known/hippius-attestation {
+            content_by_lua_block { require("hippius_cdn.health").attestation() }
+        }
+
+        location / {
+            # The origin URL carries a presigned signature, and nginx's
+            # upstream errors and warnings print it ("upstream: ..."). Only
+            # critical messages are logged here; the router logs its own
+            # events at that level with the zone id, never a URL. Metering
+            # still records every 502/504.
+            error_log stderr crit;
+            set $hippius_cache_key "";
+            set $hippius_origin_uri "";
+            set $hippius_origin_bytes 0;
+            access_by_lua_block { require("hippius_cdn.router").access() }
+            header_filter_by_lua_block { require("hippius_cdn.router").header_filter() }
+            body_filter_by_lua_block { require("hippius_cdn.router").body_filter() }
+
+            # 1 MiB slices: a range request fills and serves only the
+            # slices it covers, and a cold seek never pulls (or bills)
+            # the whole object.
+            slice 1m;
+            proxy_cache hippius_cache;
+            proxy_cache_key $hippius_cache_key$slice_range;
+            proxy_cache_methods GET HEAD;
+            proxy_cache_valid 200 206 301 1h;
+            proxy_cache_valid 404 1m;
+            proxy_no_cache $hippius_no_cache;
+            proxy_cache_revalidate on;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 10s;
+            proxy_cache_lock_age 30s;
+            proxy_cache_background_update on;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+
+            # The origin request carries only what is set here.
+            proxy_method GET;
+            proxy_http_version 1.1;
+            proxy_pass_request_headers off;
+            proxy_pass_request_body off;
+            proxy_set_header Host $hippius_s3_host;
+            proxy_set_header Connection "";
+            proxy_set_header Range $slice_range;
+
+            proxy_ssl_server_name on;
+            proxy_ssl_name $hippius_s3_host;
+            proxy_ssl_verify on;
+            proxy_ssl_verify_depth 4;
+            proxy_ssl_trusted_certificate @CA_BUNDLE@;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 30s;
+            proxy_intercept_errors off;
+            proxy_redirect off;
+
+            # Never let the origin steer nginx (internal redirects, rate,
+            # buffering, cache lifetime).
+            proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate
+                                 X-Accel-Buffering X-Accel-Charset;
+            proxy_hide_header X-Accel-Redirect;
+            proxy_hide_header X-Accel-Expires;
+            proxy_hide_header X-Accel-Limit-Rate;
+            proxy_hide_header X-Accel-Buffering;
+            proxy_hide_header X-Accel-Charset;
+            proxy_hide_header Set-Cookie;
+            proxy_hide_header x-amz-request-id;
+            proxy_hide_header x-amz-id-2;
+            proxy_hide_header x-amz-version-id;
+            proxy_hide_header x-amz-server-side-encryption;
+            proxy_hide_header Server;
+            add_header X-Cache $upstream_cache_status always;
+
+            proxy_pass $hippius_s3_scheme://$hippius_s3_host$hippius_origin_uri;
+        }
+    }
+}

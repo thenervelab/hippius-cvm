@@ -58,6 +58,16 @@ Four §23 constraints gate eligibility, all fail-closed:
       closes the door: the VMs already there, their telemetry, recovery,
       power and same-host relaunches never pass through here, so nothing
       about them changes (unlike a `QUARANTINED` miner, which is drained).
+  (i) **Net policy** — a miner of an edge-mode egress region that has not
+      recently acked its current edge-mode `net-policy` order
+      (`apps.network.net_policy.unready_node_ids`) takes no new placement.
+      HARD, no fallback: a guest placed there could leave by the miner's
+      own NAT. Empty, so inert, while every region is local.
+  (j) **CDN local edge** — a CDN node only goes to a miner whose VERIFIED
+      country has an edge for it (no CDN node behind a remote edge, v1):
+      the region of the address it holds, else a region with an attachable
+      edge holding a free CDN address (`service.cdn_edge_arguments`). HARD,
+      no fallback. `None` for every other tenant.
 
 Among the eligible, the winner is chosen by a **composite selection
 score** — NOT by reward weight alone. Ranking by reward weight is a
@@ -346,6 +356,8 @@ def decide_placement(
     max_booting_per_node: int = 0,
     max_booting_by_node: Mapping[str, int] | None = None,
     cordoned: Mapping[str, str] | None = None,
+    net_policy_unready: Mapping[str, str] | None = None,
+    cdn_local_edge: frozenset[str] | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -466,6 +478,13 @@ def decide_placement(
                          operator-cordoned miners
                          (`service.cordoned_node_ids`). HARD, no fallback.
                          `None` ⇒ no gate.
+    - `net_policy_unready`  gate (i): `{lower-case node_id: reason}` of the
+                         edge-region miners without a fresh net-policy ack
+                         (`service.net_policy_unready_node_ids`). HARD, no
+                         fallback. `None` ⇒ no gate.
+    - `cdn_local_edge`   gate (j): the lower-case node_ids a CDN node may
+                         go to (`service.cdn_edge_arguments`). HARD, no
+                         fallback. `None` ⇒ no gate.
 
     Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
     candidate that passed all the others (retry shortly);
@@ -527,6 +546,10 @@ def decide_placement(
     booting_caps = max_booting_by_node or {}
     # Gate (h)'s removals, `{node_id: reason}` — logged and counted.
     cordon_skipped: dict[str, str] = {}
+    # Gate (i)'s removals, `{node_id: reason}`.
+    net_policy_skipped: dict[str, str] = {}
+    # Gate (j)'s removals.
+    cdn_edge_skipped = 0
     for miner in snapshot.miners:
         if miner.node_id in excluded:
             continue
@@ -536,6 +559,14 @@ def decide_placement(
         # (h) operator cordon — no new work, whoever asks.
         if cordoned and miner.node_id.lower() in cordoned:
             cordon_skipped[miner.node_id] = cordoned[miner.node_id.lower()]
+            continue
+        # (i) edge-region miner without a current net-policy ack.
+        if net_policy_unready and miner.node_id.lower() in net_policy_unready:
+            net_policy_skipped[miner.node_id] = net_policy_unready[miner.node_id.lower()]
+            continue
+        # (j) a CDN node only where its edge is local.
+        if cdn_local_edge is not None and miner.node_id.lower() not in cdn_local_edge:
+            cdn_edge_skipped += 1
             continue
         if pinned is not None and miner.node_id not in pinned:
             continue
@@ -712,6 +743,11 @@ def decide_placement(
                 f"{nid} ({why or 'no reason'})" for nid, why in sorted(cordon_skipped.items())
             ),
         )
+    if net_policy_skipped:
+        log.info(
+            "net-policy: skipped %s",
+            ", ".join(f"{nid} ({why})" for nid, why in sorted(net_policy_skipped.items())),
+        )
     booted = ", ".join(
         f"{nid}={n}/{booting_caps.get(nid, max_booting_per_node)}"
         for nid, n in sorted(booting_skipped.items())
@@ -772,12 +808,24 @@ def decide_placement(
             if cordon_skipped
             else ""
         )
+        net_policy_note = (
+            f" ({len(net_policy_skipped)} candidate(s) in an edge-mode egress region "
+            "without a current net-policy ack)"
+            if net_policy_skipped
+            else ""
+        )
+        cdn_note = (
+            f" ({cdn_edge_skipped} candidate(s) removed by the CDN local-edge gate: "
+            "no verified country with an edge for this CDN node)"
+            if cdn_edge_skipped
+            else ""
+        )
         raise PlacementError(
             "no miner satisfies the §23 dispatchability (reachable + "
             "attestable + live) / admission / anti-affinity / "
             "epoch-freshness / stake / observed-SNP-start-capability "
             f"constraints{cvm_note}{region_note}{pin_note}{zombie_note}{disk_note}"
-            f"{cordon_note}",
+            f"{cordon_note}{net_policy_note}{cdn_note}",
             "no-eligible-miner",
         )
 

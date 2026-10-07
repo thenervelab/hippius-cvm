@@ -215,6 +215,7 @@ def _validate_other_dest(vm: Vm, dest_node_id: str, *, source: str | None = None
         service._reject_cvm_incapable_dest(dest_node_id)
         service._reject_zombie_quarantined_dest(dest_node_id)
         service._reject_cordoned_dest(dest_node_id)
+        service._reject_cdn_colocated_dest(vm, dest_node_id)
     except service.StartError as exc:
         raise refuse(exc.message) from exc
     try:

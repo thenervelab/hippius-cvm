@@ -186,3 +186,25 @@ def test_release_zero_is_refused(make_golden_bake) -> None:
     call_command("vali_bless_golden_image", "ubuntu", "gb-1")
     with pytest.raises(CommandError, match=">= 1"):
         call_command("vali_bless_guest_release", "ubuntu", "--release", "0", "--blessed-by", "ops")
+
+
+def test_bless_cdn_node_profile_only_under_its_reserved_name(make_golden_bake) -> None:
+    """CDN plan I3 — a cdn-node bake is never a tenant image, and nothing
+    else may take the name `cdn-node`."""
+    make_golden_bake(bake_id="gb-cdn", profile="cdn-node")
+    make_golden_bake(bake_id="gb-std")
+    for name, bake in (("ubuntu", "gb-cdn"), ("cdn-node", "gb-std")):
+        with pytest.raises(SystemExit) as exc:
+            call_command("vali_bless_golden_image", name, bake)
+        assert exc.value.code == 9
+    assert GoldenImage.objects.count() == 0
+    call_command(
+        "vali_bless_golden_image",
+        "cdn-node",
+        "gb-cdn",
+        "--distro",
+        "ubuntu",
+        "--restricted-tenant",
+        "hippius-cdn",
+    )
+    assert GoldenImage.objects.get(image_name="cdn-node").bake_id == "gb-cdn"

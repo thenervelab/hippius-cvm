@@ -349,11 +349,11 @@ def test_a_deadlocked_attach_runs_again(monkeypatch: pytest.MonkeyPatch) -> None
     real = service._pick_ip
     calls: list[int] = []
 
-    def flaky(vm: object, hint: str) -> PublicIP | None:
+    def flaky(vm: object, hint: str, pool: str) -> PublicIP | None:
         calls.append(1)
         if len(calls) == 1:
             raise _deadlock()
-        return real(vm, hint)  # type: ignore[arg-type]
+        return real(vm, hint, pool)  # type: ignore[arg-type]
 
     monkeypatch.setattr(service, "_pick_ip", flaky)
 
@@ -367,7 +367,7 @@ def test_attach_gives_up_after_repeated_deadlocks(monkeypatch: pytest.MonkeyPatc
     make_edge()
     calls: list[int] = []
 
-    def always(vm: object, hint: str) -> None:
+    def always(vm: object, hint: str, pool: str) -> None:
         calls.append(1)
         raise _deadlock()
 
@@ -382,7 +382,7 @@ def test_other_database_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) 
     make_edge()
     calls: list[int] = []
 
-    def broken(vm: object, hint: str) -> None:
+    def broken(vm: object, hint: str, pool: str) -> None:
         calls.append(1)
         raise OperationalError("connection lost")
 

@@ -907,3 +907,84 @@ def test_finalize_golden_rejects_missing_verity(
         format="json",
     )
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+
+# ─── CDN plan I3 — bake profile ──────────────────────────────────────
+
+
+def test_create_defaults_profile_standard(authed_client: APIClient) -> None:
+    resp = authed_client.post(
+        reverse("tenant_bake_create"), _golden_create_payload("prof-default-1"), format="json"
+    )
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    assert resp.json()["profile"] == "standard"
+    assert TenantBake.objects.get(bake_id=resp.json()["bake_id"]).profile == "standard"
+
+
+def test_create_cdn_node_profile(authed_client: APIClient, settings) -> None:
+    settings.VALI_CDN_BACKEND_URL = "https://api.example.invalid"
+    p = _golden_create_payload("cdn-node-bake-1")
+    p["profile"] = "cdn-node"
+    resp = authed_client.post(reverse("tenant_bake_create"), p, format="json")
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    assert resp.json()["profile"] == "cdn-node"
+    row = TenantBake.objects.get(bake_id=resp.json()["bake_id"])
+    assert row.cdn_backend_url == "https://api.example.invalid"
+
+
+@pytest.mark.parametrize(
+    "mutate,backend",
+    [
+        # Not golden.
+        (lambda p: p.update(profile="cdn-node"), "https://api.example.invalid"),
+        # Golden but no backend URL configured.
+        (lambda p: p.update(profile="cdn-node", disk_mode="golden_verity_overlay"), ""),
+        # Unknown profile.
+        (lambda p: p.update(profile="vpn", disk_mode="golden_verity_overlay"), "https://x.invalid"),
+    ],
+)
+def test_create_refuses_bad_profiles(authed_client: APIClient, settings, mutate, backend) -> None:
+    settings.VALI_CDN_BACKEND_URL = backend
+    p = _create_payload("cdn-bad-1")
+    mutate(p)
+    resp = authed_client.post(reverse("tenant_bake_create"), p, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST, resp.content
+    assert not TenantBake.objects.filter(vm_id="cdn-bad-1").exists()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "https://api.hippius.com/",  # trailing slash: the agent appends /api/cdn/node/...
+        "https://api.hippius.com/api",  # a path
+        "http://api.hippius.com",  # not https
+        "https://API.hippius.com",  # not lower case
+        "https://user@api.hippius.com",  # userinfo
+        "https://api.hippius.com?x=1",  # query
+        "https://api.hippius.com#f",  # fragment
+        " https://api.hippius.com",  # whitespace
+        "https://localhost",  # not a dotted host
+    ],
+)
+def test_a_cdn_node_bake_needs_a_bare_https_origin(
+    authed_client: APIClient, settings, backend: str
+) -> None:
+    """VALI_CDN_BACKEND_URL is measured into the image: anything but a bare
+    origin would bake a wrong URL (a double slash) for the node's life."""
+    settings.VALI_CDN_BACKEND_URL = backend
+    p = _golden_create_payload("cdn-origin-1")
+    p["profile"] = "cdn-node"
+    resp = authed_client.post(reverse("tenant_bake_create"), p, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST, resp.content
+    assert "bare https origin" in resp.content.decode()
+    assert not TenantBake.objects.filter(vm_id="cdn-origin-1").exists()
+
+
+@pytest.mark.parametrize("backend", ["https://api.hippius.com", "https://api.example.test:8443"])
+def test_a_bare_origin_is_accepted(authed_client: APIClient, settings, backend: str) -> None:
+    settings.VALI_CDN_BACKEND_URL = backend
+    p = _golden_create_payload("cdn-origin-ok")
+    p["profile"] = "cdn-node"
+    resp = authed_client.post(reverse("tenant_bake_create"), p, format="json")
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    assert TenantBake.objects.get(bake_id=resp.json()["bake_id"]).cdn_backend_url == backend

@@ -91,7 +91,20 @@ pub struct BrokerScope {
     /// rejects a half-set pair.
     pub lifecycle_path: Option<String>,
     pub lifecycle_version: Option<u64>,
+    /// CDN fleet keyring leg: the cdn-fleet key versions the KBS will read
+    /// and Transit-decrypt. `Some` makes the broker attach its configured
+    /// cdn-fleet policy to the minted token as well; a broker with none
+    /// configured refuses. The KBS asks for it only inside a release that
+    /// passed the `cdn_node` class and perm checks, or for the admin
+    /// public-key route ([`BrokerScope::fleet_only`]). `None` ⇒ the key is
+    /// absent from the wire, which stays byte-identical. Ascending,
+    /// unique, `1..=MAX_CDN_FLEET_VERSIONS` entries, each `>= 1`.
+    pub cdn_fleet_versions: Option<Vec<u64>>,
 }
+
+/// Most cdn-fleet key versions one scope (one release) may carry:
+/// active + pending + retiring, with one spare.
+pub const MAX_CDN_FLEET_VERSIONS: usize = 4;
 
 /// The Vault KV segment name each per-VM secret path MUST end with,
 /// mirroring `vali launch.py` (`{prefix}/{vm_id}/<segment>`) and
@@ -150,7 +163,58 @@ fn validate_scope_path(path: &str, field: &str, vm_id: &str, segment: &str) -> R
 }
 
 impl BrokerScope {
+    /// A scope for the cdn-fleet keyring ALONE (no VM): the KBS admin
+    /// route that derives and signs a fleet public key. Every per-VM
+    /// field is empty, so the broker mints a token with no tenant leg.
+    pub fn fleet_only(versions: Vec<u64>) -> Self {
+        Self {
+            vm_id: String::new(),
+            luks_path: String::new(),
+            luks_version: 0,
+            userdata_path: String::new(),
+            userdata_version: 0,
+            lifecycle_path: None,
+            lifecycle_version: None,
+            cdn_fleet_versions: Some(versions),
+        }
+    }
+
+    /// Whether this is a [`Self::fleet_only`] scope. An old broker's
+    /// `validate` refuses one (empty `vm_id`), which is the fail-closed
+    /// direction.
+    pub fn is_fleet_only(&self) -> bool {
+        self.vm_id.is_empty()
+            && self.luks_path.is_empty()
+            && self.luks_version == 0
+            && self.userdata_path.is_empty()
+            && self.userdata_version == 0
+            && self.lifecycle_path.is_none()
+            && self.lifecycle_version.is_none()
+            && self.cdn_fleet_versions.is_some()
+    }
+
+    fn validate_cdn_fleet(&self) -> Result<()> {
+        let Some(versions) = &self.cdn_fleet_versions else {
+            return Ok(());
+        };
+        if versions.is_empty() || versions.len() > MAX_CDN_FLEET_VERSIONS {
+            return Err(schema(format!(
+                "scope.cdn_fleet_versions must hold 1..={MAX_CDN_FLEET_VERSIONS} versions"
+            )));
+        }
+        if versions.first() == Some(&0) || versions.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(schema(
+                "scope.cdn_fleet_versions must be ascending, unique and >= 1".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_cdn_fleet()?;
+        if self.is_fleet_only() {
+            return Ok(());
+        }
         // `vm_id` is interpolated into the policy NAME + every path suffix
         // check — charset-lock it to the same set vali mints (`[a-z0-9-]`,
         // 1..=64) so it can never carry a path separator or HCL metachar.
@@ -218,6 +282,17 @@ impl BrokerScope {
                 Value::Integer(v.into()),
             ));
         }
+        if let Some(versions) = &self.cdn_fleet_versions {
+            entries.push((
+                Value::Text("cdn_fleet_versions".into()),
+                Value::Array(
+                    versions
+                        .iter()
+                        .map(|v| Value::Integer((*v).into()))
+                        .collect(),
+                ),
+            ));
+        }
         // `to_canonical_vec` re-sorts the map keys, so push-order here is
         // irrelevant to the on-wire bytes.
         Value::Map(entries)
@@ -233,6 +308,10 @@ impl BrokerScope {
             Ok(_) => Some(m.uint("lifecycle_version")?),
             Err(_) => None,
         };
+        let cdn_fleet_versions = match m.get("cdn_fleet_versions") {
+            Ok(_) => Some(m.uint_array("cdn_fleet_versions")?),
+            Err(_) => None,
+        };
         let s = Self {
             vm_id: m.text("vm_id")?,
             luks_path: m.text("luks_path")?,
@@ -241,6 +320,7 @@ impl BrokerScope {
             userdata_version: m.uint("userdata_version")?,
             lifecycle_path,
             lifecycle_version,
+            cdn_fleet_versions,
         };
         s.validate()?;
         Ok(s)
@@ -507,6 +587,22 @@ impl Map {
             _ => Err(schema(format!("field `{key}` must be an integer"))),
         }
     }
+    fn uint_array(&self, key: &str) -> Result<Vec<u64>> {
+        let Value::Array(items) = self.get(key)? else {
+            return Err(schema(format!("field `{key}` must be an array")));
+        };
+        if items.len() > MAX_CDN_FLEET_VERSIONS {
+            return Err(schema(format!("field `{key}` is too long")));
+        }
+        items
+            .iter()
+            .map(|v| match v {
+                Value::Integer(i) => u64::try_from(*i)
+                    .map_err(|_| schema(format!("field `{key}` entries must be u64"))),
+                _ => Err(schema(format!("field `{key}` entries must be integers"))),
+            })
+            .collect()
+    }
     fn bytes(&self, key: &str) -> Result<Vec<u8>> {
         match self.get(key)? {
             Value::Bytes(b) => Ok(b.clone()),
@@ -585,6 +681,7 @@ mod tests {
             userdata_version: 1,
             lifecycle_path: None,
             lifecycle_version: None,
+            cdn_fleet_versions: None,
         }
     }
 
@@ -783,5 +880,60 @@ mod tests {
             vault_token: Vec::new(),
         };
         assert!(r.canonical().is_err());
+    }
+
+    // ── cdn-fleet leg ────────────────────────────────────────────────
+
+    #[test]
+    fn scope_with_cdn_fleet_round_trips_and_absent_is_byte_identical() {
+        let plain = ChallengeRequest { scope: scope() }.canonical().unwrap();
+        let with = ChallengeRequest {
+            scope: BrokerScope {
+                cdn_fleet_versions: Some(vec![1, 2]),
+                ..scope()
+            },
+        };
+        let bytes = with.canonical().unwrap();
+        assert_ne!(bytes, plain);
+        assert_eq!(ChallengeRequest::decode(&bytes).unwrap(), with);
+        // `None` emits no key at all: the pre-CDN wire.
+        let decoded = ChallengeRequest::decode(&plain).unwrap();
+        assert_eq!(decoded.scope.cdn_fleet_versions, None);
+        assert_eq!(decoded.canonical().unwrap(), plain);
+    }
+
+    #[test]
+    fn cdn_fleet_versions_must_be_ascending_unique_bounded_and_nonzero() {
+        for bad in [vec![], vec![0], vec![2, 1], vec![1, 1], vec![1, 2, 3, 4, 5]] {
+            let s = BrokerScope {
+                cdn_fleet_versions: Some(bad.clone()),
+                ..scope()
+            };
+            assert!(s.validate().is_err(), "must reject {bad:?}");
+            assert!(BrokerScope::fleet_only(bad.clone()).validate().is_err());
+        }
+        assert!(BrokerScope::fleet_only(vec![1, 2, 3, 4]).validate().is_ok());
+    }
+
+    #[test]
+    fn fleet_only_scope_round_trips_and_needs_every_vm_field_empty() {
+        let r = RedeemResponse {
+            scope: BrokerScope::fleet_only(vec![3]),
+            cap_expiry_unix: 9,
+            vault_token: b"t".to_vec(),
+        };
+        let bytes = r.canonical().unwrap();
+        let back = RedeemResponse::decode(&bytes).unwrap();
+        assert_eq!(back, r);
+        assert!(back.scope.is_fleet_only());
+        // A half-empty scope is neither a valid tenant scope nor fleet-only.
+        let mut half = BrokerScope::fleet_only(vec![3]);
+        half.luks_version = 1;
+        assert!(!half.is_fleet_only());
+        assert!(half.validate().is_err());
+        // Without the fleet leg an empty scope is just invalid.
+        let mut empty = BrokerScope::fleet_only(vec![3]);
+        empty.cdn_fleet_versions = None;
+        assert!(empty.validate().is_err());
     }
 }

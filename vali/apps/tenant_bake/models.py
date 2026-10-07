@@ -137,6 +137,19 @@ class TenantBakeDiskMode(models.TextChoices):
     GOLDEN_VERITY_OVERLAY = "golden_verity_overlay", "Golden dm-verity overlay"
 
 
+class TenantBakeProfile(models.TextChoices):
+    """What the bake installs on top of the base (CDN plan I3).
+
+    - `standard` (default): every existing bake, unchanged.
+    - `cdn-node`: the CDN cache-node image (OpenResty + cdn-agent, no
+      sshd, the public-IP inbound guard and input firewall baked).
+      Golden only (`tenant-image-bake.sh --profile cdn-node`).
+    """
+
+    STANDARD = "standard", "Standard tenant image"
+    CDN_NODE = "cdn-node", "CDN cache node"
+
+
 # In-flight states for the "one active bake per vm_id" rule —
 # `POST /v1/tenant-bakes` returns 409 if a row with the same `vm_id`
 # is in either of these states. Kept here (not in views) so the
@@ -206,6 +219,18 @@ class TenantBake(models.Model):
     package_refresh = models.CharField(
         max_length=64, blank=True, default="", db_default=""
     )
+    # CDN plan I3 — what the bake installs on top of the base. `standard`
+    # is every pre-I3 bake; `cdn-node` (golden only) stages the CDN data
+    # plane. Carried to the baker as BAKE_PROFILE, copied by re-bakes.
+    profile = models.CharField(
+        max_length=16,
+        choices=TenantBakeProfile.choices,
+        default=TenantBakeProfile.STANDARD,
+        db_default=TenantBakeProfile.STANDARD,
+    )
+    # The backend URL a cdn-node bake wrote into the measured agent config
+    # (VALI_CDN_BACKEND_URL at queue time), kept for audit. "" otherwise.
+    cdn_backend_url = models.CharField(max_length=256, blank=True, default="", db_default="")
     # F6 — the synthetic e2e verdict on this (unblessed) re-bake: True
     # passed, False failed, None not run. A False bake is not a bless
     # candidate (`apps.images.rebake.freshness`).

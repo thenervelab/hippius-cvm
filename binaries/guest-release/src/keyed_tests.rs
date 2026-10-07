@@ -325,6 +325,7 @@ impl HttpClient for FakeKbs {
             expected_volume_stamp: KBS_STAMP_E,
             volume_stamp_token: Some(token),
             volume_stamp_transition: None,
+            cdn_fleet: None,
         };
         let resp = match transition {
             Some((e, t)) => KbsResponse {

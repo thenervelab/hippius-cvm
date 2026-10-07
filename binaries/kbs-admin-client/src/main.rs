@@ -81,6 +81,12 @@ enum Cmd {
     /// 404 — both prove the router was reached). This is the check the
     /// mTLS cutover runbook runs between steps.
     Probe(ProbeArgs),
+    /// `POST /v1/admin/cdn-fleet/public` — have the KBS derive and sign the
+    /// public half of cdn-fleet key `--version`, verify the signature
+    /// against the pinned KBS response key, and print the verified
+    /// `fleet_keys[]` entry as JSON on stdout. Read-only on the KBS side:
+    /// no secret leaves it. Exit 0 only if the signature verifies.
+    CdnFleetPublic(CdnFleetPublicArgs),
 }
 
 /// The mTLS material, shared by every subcommand.
@@ -146,11 +152,33 @@ struct ProbeArgs {
     tls: TlsArgs,
 }
 
+#[derive(clap::Args, Debug)]
+struct CdnFleetPublicArgs {
+    /// Base URL of the KBS admin listener — same rules as `register-vm`.
+    #[arg(long, env = "KBS_ADMIN_URL")]
+    kbs_url: String,
+    /// The cdn-fleet key version (`v<N>` in Vault), 1..=4294967295.
+    #[arg(long)]
+    version: u64,
+    /// The KBS response-signing Ed25519 public key, 32-byte hex, pinned
+    /// out of band (the same key the guest UKI pins). The answer is
+    /// refused unless it verifies under exactly this key.
+    #[arg(long, env = "KBS_RESPONSE_VK_HEX")]
+    kbs_vk_hex: String,
+    /// Request timeout, seconds. The KBS makes a broker round trip and
+    /// a Vault read + Transit decrypt; 15 s is generous.
+    #[arg(long, default_value_t = 15)]
+    timeout_secs: u64,
+    #[command(flatten)]
+    tls: TlsArgs,
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let outcome = match args.cmd {
         Cmd::RegisterVm(rv) => run_register(rv),
         Cmd::Probe(p) => run_probe(p),
+        Cmd::CdnFleetPublic(c) => run_cdn_fleet_public(c),
     };
     match outcome {
         Ok(exit) => exit,
@@ -365,13 +393,70 @@ fn run_probe(args: ProbeArgs) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_cdn_fleet_public(args: CdnFleetPublicArgs) -> Result<ExitCode, CliError> {
+    let pinned: [u8; 32] = hex::decode(args.kbs_vk_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| CliError::Config("--kbs-vk-hex must be 32 bytes of hex".into()))?;
+    if args.version == 0 || args.version > u64::from(u32::MAX) {
+        return Err(CliError::Config(
+            "--version must be in 1..=4294967295".into(),
+        ));
+    }
+    let url = format!(
+        "{}/v1/admin/cdn-fleet/public",
+        args.kbs_url.trim_end_matches('/')
+    );
+    let (agent, transport) = build_agent(
+        &args.kbs_url,
+        &args.tls,
+        Duration::from_secs(args.timeout_secs),
+    )?;
+    eprintln!(
+        "kbs-admin-client: POST {url} version={} ({transport})",
+        args.version
+    );
+    let response = match agent
+        .post(&url)
+        .set("content-type", "application/json")
+        .send_string(&format!("{{\"version\":{}}}", args.version))
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let reason = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["reason"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("(undecodable body: {} bytes)", body.len()));
+            return classify_error_status(status, reason);
+        }
+        Err(ureq::Error::Transport(t)) => return Err(CliError::Network(t.to_string())),
+    };
+    let mut buf = Vec::with_capacity(512);
+    response
+        .into_reader()
+        .take(4096)
+        .read_to_end(&mut buf)
+        .map_err(|e| CliError::Decode(format!("body read: {e}")))?;
+    let verified = hippius_kbs_admin_client::cdn_fleet::verify(&buf, &pinned, args.version)
+        .map_err(CliError::Decode)?;
+    let line =
+        serde_json::to_string(&verified).map_err(|e| CliError::Decode(format!("encode: {e}")))?;
+    println!("{line}");
+    eprintln!(
+        "kbs-admin-client: cdn-fleet v{} public key verified under the pinned KBS key",
+        verified.version
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn classify_error_status(status: u16, reason: String) -> Result<ExitCode, CliError> {
     match status {
         409 => Err(CliError::Conflict {
             ticket_id: None,
             reason,
         }),
-        400 | 401 | 403 | 413 | 415 | 429 => Err(CliError::Terminal { status, reason }),
+        400 | 401 | 403 | 404 | 413 | 415 | 429 => Err(CliError::Terminal { status, reason }),
         500..=599 => Err(CliError::ServerInternal(format!("{status}: {reason}"))),
         _ => Err(CliError::Terminal { status, reason }),
     }

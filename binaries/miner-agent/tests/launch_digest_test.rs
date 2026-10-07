@@ -71,6 +71,7 @@ fn kat_config() -> QemuConfig {
         // The SEV-SNP launch digest is CID-independent — the `<vsock>`
         // device is not a measured launch input.
         cid: MIN_GUEST_CID,
+        net: None,
     }
 }
 

@@ -100,6 +100,20 @@ data:
     {{- if .Values.allowlist.url }}
     signed_path = "/etc/kbs-allowlist/allowlist.cose"
     {{- end }}
+    {{- if .Values.config.allowlistEnforceReleaseClass }}
+    # Refuse a host_attestor-class measurement on the release path. The
+    # cdn_node class rules are unconditional; see values.yaml.
+    enforce_release_class = true
+    {{- end }}
+
+    {{- if .Values.config.cdnFleetEnabled }}
+
+    [cdn_fleet]
+    # CDN K2 — release the cdn-fleet keyring to cdn_node-class releases
+    # whose ticket carries the cdn-node perm, and serve
+    # POST /v1/admin/cdn-fleet/public. Needs the broker's cdnFleetPolicy.
+    enabled = true
+    {{- end }}
 
     [keys]
     signing_key_path = "/etc/kbs-keys/signing.key"

@@ -585,6 +585,8 @@ pub fn run(
         volume_stamp_token: _,
         // Always `None` here: this legacy path attests stamp protocol v1.
         volume_stamp_transition: _,
+        // Always empty: this path never asks for the CDN fleet keyring.
+        cdn_fleet: _,
     } = verify::verify_and_unwrap(
         &signed,
         keys,

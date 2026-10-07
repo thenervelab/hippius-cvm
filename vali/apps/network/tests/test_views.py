@@ -52,7 +52,7 @@ def test_every_network_route_is_root_only_and_operator_scoped() -> None:
     route added under it later is public the moment it exists. Pin the gate
     on every one."""
     routes = _network_routes()
-    assert len(routes) == 7
+    assert len(routes) == 10
     for route, cls in routes:
         assert IsOrchestrationRoot in cls.permission_classes, route
         assert scoping.declared_scope(cls) == scoping.OPERATOR_ONLY, route
@@ -70,6 +70,11 @@ def test_every_network_route_is_root_only_and_operator_scoped() -> None:
         ("get", "/v1/network/edges/edge-a"),
         ("get", "/v1/network/edges/edge-a/desired"),
         ("post", "/v1/network/edges/edge-a/applied"),
+        ("get", "/v1/network/egress-regions"),
+        ("get", "/v1/network/egress-regions/AU"),
+        ("patch", "/v1/network/egress-regions/AU"),
+        ("get", "/v1/network/public-ips/203.0.113.10/smtp"),
+        ("post", "/v1/network/public-ips/203.0.113.10/smtp"),
     ],
 )
 def test_tenant_and_non_root_principals_are_refused(
@@ -214,8 +219,9 @@ def test_availability(root_client: APIClient) -> None:
 
 _EDGE_KEYS = {
     "name", "provider", "region", "status", "netbird_ip", "netbird_peer_id", "bound",
-    "per_ip_mbps",
-    "desired_revision", "applied_revision", "last_seen_at", "last_report", "counts", "addresses",
+    "per_ip_mbps", "egress_ip",
+    "desired_revision", "applied_revision", "last_seen_at", "last_report", "counts",
+    "counts_by_pool", "addresses",
 }
 
 
@@ -247,7 +253,7 @@ def test_create_edge_resolves_the_peer_and_sets_up_routing(
     assert [a["address"] for a in body["addresses"]] == ["203.0.113.10", "203.0.113.11"]
     assert set(body["addresses"][0]) == {
         "address", "state", "vm_id", "attached_at", "released_at", "last_tenant_id",
-        "target_ip",
+        "target_ip", "pool", "cap_mbps",
     }
     assert fake_netbird.routes == {}  # the tick writes NetBird routing
     service.reconcile()

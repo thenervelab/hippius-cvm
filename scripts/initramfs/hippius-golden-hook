@@ -97,3 +97,17 @@ chmod 0644 "${DESTDIR}/lib/hippius/hippius-golden-overlay.sh"
 # BOOT=hippius-golden (from the measured cmdline).
 cp "$BOOT_SRC" "${DESTDIR}/scripts/hippius-golden"
 chmod 0755 "${DESTDIR}/scripts/hippius-golden"
+
+# ── cdn-node ephemeral root: a real chown ───────────────────────────
+# Only when the cdn-node bake staged the ephemeral-root marker (every
+# other initrd is unchanged): the overlay library rebuilds cdn-agent's
+# state directory on each boot and hands it to cdn-agent. Ubuntu's
+# initramfs busybox has no chown applet, so stage coreutils' at a
+# hippius-private path, as for mkfs.ext4 above.
+if [ -f "${CONFDIR:-/etc/initramfs-tools}/conf.d/hippius-cdn-ephemeral-upper" ]; then
+    real_chown="$(readlink -f /usr/bin/chown 2>/dev/null || true)"
+    [ -x "$real_chown" ] || real_chown="$(readlink -f /bin/chown 2>/dev/null || true)"
+    [ -x "$real_chown" ] \
+        || { echo "hippius-golden-hook: chown (coreutils) not found on base; rebake" >&2; exit 1; }
+    copy_exec "$real_chown" /lib/hippius/chown
+fi

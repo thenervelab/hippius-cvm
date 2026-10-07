@@ -555,6 +555,67 @@ def test_orchestration_tick_gets_netbird_without_reboot_recovery() -> None:
     assert "VALI_REBOOT_RECOVERY_ENABLED" not in env
 
 
+def _env_by_workload(docs: list[dict]) -> dict[str, dict[str, str]]:
+    return {
+        label: {e["name"]: e.get("value") for c in _containers(pod) for e in c.get("env") or []}
+        for label, pod in _pod_specs(docs)
+    }
+
+
+@_needs_helm
+def test_net_policy_push_reaches_only_the_orchestration_tick() -> None:
+    """The push runs in the orchestration tick; no other pod gets the
+    net-policy switches, and the egress feed / launch-spec flags stay
+    unset everywhere (their settings.py defaults are off)."""
+    docs = _docs()
+    egress = {"VALI_EGRESS_FEED_ENABLED", "VALI_NET_LAUNCH_SPEC", "VALI_EGRESS_VMS"}
+    assert not egress & set(_configmap_data(docs))
+    for label, env in _env_by_workload(docs).items():
+        assert not egress & set(env), label
+        if label != "Deployment/vali-orchestration-tick":
+            assert not any(k.startswith("VALI_NET_POLICY_") for k in env), label
+    tick = _env_by_workload(docs)["Deployment/vali-orchestration-tick"]
+    assert tick["VALI_NET_POLICY_PUSH"] == "true"
+    assert tick["VALI_NET_POLICY_MINERS"] == "*"
+    assert tick["VALI_NET_POLICY_LOCAL_ACTION"] == "drop"
+
+
+@_needs_helm
+def test_net_policy_push_off_renders_no_miner_list() -> None:
+    tick = _env_by_workload(_docs("--set", "orchestrationTick.netPolicy.push=false"))[
+        "Deployment/vali-orchestration-tick"
+    ]
+    assert tick["VALI_NET_POLICY_PUSH"] == "false"
+    assert "VALI_NET_POLICY_MINERS" not in tick
+    assert "VALI_NET_POLICY_LOCAL_ACTION" not in tick
+
+
+@_needs_helm
+def test_feed_address_region_is_one_shared_value() -> None:
+    """The web pods serve the edge feed and the orchestration tick bumps
+    the edge revisions from the same content: one ConfigMap key, never a
+    per-pod override that could make them disagree."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_FEED_ADDRESS_REGION"] == "true"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_FEED_ADDRESS_REGION" not in env, label
+    off = _configmap_data(_docs("--set", "config.feedAddressRegion=false"))
+    assert off["VALI_FEED_ADDRESS_REGION"] == "false"
+
+
+@_needs_helm
+def test_feed_block_smtp_is_one_shared_value() -> None:
+    """The edge feed's top-level block_smtp is read by the web pods serving
+    the feed and by the orchestration tick bumping the edge revisions: one
+    ConfigMap key, never a per-pod override that could make them disagree."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_FEED_BLOCK_SMTP"] == "true"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_FEED_BLOCK_SMTP" not in env, label
+    off = _configmap_data(_docs("--set", "config.feedBlockSmtp=false"))
+    assert off["VALI_FEED_BLOCK_SMTP"] == "false"
+
+
 @_needs_helm
 def test_the_launch_path_pods_mount_a_cache_volume_big_enough_for_the_cap() -> None:
     """The C2 recompute caches its sha-pinned inputs under
@@ -581,3 +642,70 @@ def test_the_launch_path_pods_mount_a_cache_volume_big_enough_for_the_cap() -> N
         limit = vol["emptyDir"]["sizeLimit"]
         size = int(limit[:-2]) * units[limit[-2:]]
         assert size >= cap + (100 << 20), f"{name}: {limit} leaves no room over the {cap}-byte cap"
+
+
+#: The workloads that read VALI_CDN_BACKEND_URL: the bake POST
+#: (`tenant_bake.views._parse_create`, web), the bake spawner, the scheduled
+#: re-bake (`images.rebake`), the launch path (`cdn.identity.
+#: check_launch_spec`, launch tick) and the CDN reconciler (orchestration
+#: tick).
+_CDN_BACKEND_URL_READERS = (
+    "Deployment/vali",
+    "Deployment/vali-bake-spawner",
+    "Deployment/vali-launch-tick",
+    "Deployment/vali-orchestration-tick",
+    # Rendered only while goldenRebake.enabled (off in values.yaml today).
+    "CronJob/golden-rebake",
+)
+
+
+def _env_from_configmaps(pod: dict) -> set[str]:
+    return {
+        (ref.get("configMapRef") or {}).get("name", "")
+        for c in _containers(pod)
+        for ref in c.get("envFrom") or []
+        if ref.get("configMapRef")
+    }
+
+
+@_needs_helm
+def test_cdn_backend_url_is_one_shared_value() -> None:
+    """It is measured into every cdn-node image and named by every node's
+    user-data: one ConfigMap key every reader takes, never a per-pod value.
+    Empty renders nothing."""
+    docs = _docs("--set", "goldenRebake.enabled=true")
+    # Confirmed by the backend 2026-10-07; a bare origin.
+    assert _configmap_data(docs)["VALI_CDN_BACKEND_URL"] == "https://api.hippius.com"
+    empty = _configmap_data(_docs("--set", "cdn.backendUrl="))
+    assert "VALI_CDN_BACKEND_URL" not in empty
+    pods = dict(_pod_specs(docs))
+    for label in _CDN_BACKEND_URL_READERS:
+        assert label in pods, label
+        assert "vali-config" in _env_from_configmaps(pods[label]), label
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_CDN_BACKEND_URL" not in env, label
+
+    url = "https://backend.example.test"
+    on = _configmap_data(_docs("--set", f"cdn.backendUrl={url}"))
+    assert on["VALI_CDN_BACKEND_URL"] == url
+
+
+@_needs_helm
+def test_the_pinned_kbs_response_key_reaches_the_fleet_mint() -> None:
+    """`vali_cdn_fleet mint` verifies the KBS signature under this pin; it
+    must be the key the guest UKI pins (binaries/agent-initramfs
+    trust_anchors), never a per-pod value, and the CDN flags stay off."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    assert data["VALI_CDN_KBS_RESPONSE_VK_HEX"] == (
+        "24e6a730dc24e1bfba1e6d21d943924d3ab6f311ea0f2e0b3e585458393bc803"
+    )
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_CDN_KBS_RESPONSE_VK_HEX" not in env, label
+    flags = {"VALI_CDN_ENABLED", "VALI_CDN_LAUNCH_ROLE", "VALI_CDN_RECONCILE_ENABLED"}
+    assert not flags & set(data)
+    for label, env in _env_by_workload(docs).items():
+        assert not flags & set(env), label
+    assert "VALI_CDN_KBS_RESPONSE_VK_HEX" not in _configmap_data(
+        _docs("--set", "cdn.kbsResponseVkHex=")
+    )

@@ -206,6 +206,10 @@ NON_NODE_LAUNCH_OUTCOMES: frozenset[str] = frozenset(
         # customer-held keys: the measured cmdline does not carry exactly the
         # VM's pinned guardian binding, or an M1/M2 one would be truncated
         "customer-keys-cmdline-refused",
+        # the CDN role (apps.cdn.identity): a CDN node's vm id launched by
+        # another tenant, or a CDN node's launch while VALI_CDN_LAUNCH_ROLE
+        # is off — vali's own policy, before any host is touched
+        "cdn-role-refused",
         # vali → Vault / lifecycle keygen
         "vault-failure",
         "lifecycle-keygen-failure",

@@ -33,6 +33,30 @@ pub struct VaultScope {
     /// the attested guest. The two move together (path + version).
     pub lifecycle_path: Option<String>,
     pub lifecycle_version: Option<u64>,
+    /// The cdn-fleet key versions this capability must also read and
+    /// Transit-decrypt (`crate::cdn_fleet`). `None` for every non-CDN
+    /// release — the broker scope then stays wire-identical. A scope with
+    /// every per-VM field empty and this set is the fleet-only scope of
+    /// the admin public-key route (`hippius_types::vault_broker::
+    /// BrokerScope::fleet_only`).
+    pub cdn_fleet_versions: Option<Vec<u64>>,
+}
+
+impl VaultScope {
+    /// The cdn-fleet keyring alone, no VM (`crate::cdn_fleet::
+    /// derive_public_key`). Mirrors `BrokerScope::fleet_only`.
+    pub fn fleet_only(versions: Vec<u64>) -> Self {
+        Self {
+            vm_id: String::new(),
+            luks_path: String::new(),
+            luks_version: 0,
+            userdata_path: String::new(),
+            userdata_version: 0,
+            lifecycle_path: None,
+            lifecycle_version: None,
+            cdn_fleet_versions: Some(versions),
+        }
+    }
 }
 
 /// Single-use, short-expiry challenge issued by the Vault-side authenticator.
@@ -185,6 +209,7 @@ mod tests {
             userdata_version: 1,
             lifecycle_path: None,
             lifecycle_version: None,
+            cdn_fleet_versions: None,
         }
     }
     fn rep(meas: u8, tcb: u64, pol: u64) -> VerifiedReport {

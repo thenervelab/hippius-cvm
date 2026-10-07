@@ -1725,3 +1725,36 @@ def test_a_pinned_data_disk_is_measured_and_ordered_whatever_the_flavor(harness)
     (p,) = harness.payloads
     assert p["data_disk_size_gb"] == 40
     assert p["cpu_count"] == 4
+
+
+# ─── egress: the guest NIC spec rides the launch order ───────────────
+
+
+def test_the_launch_order_carries_net_only_under_the_flag(harness, monkeypatch) -> None:
+    from apps.network.models import MinerNetPolicy
+
+    _fix_nonces(monkeypatch)
+    MinerNetPolicy.objects.create(
+        miner=_miner(), revision=1, acked_revision=1, body_sha="s", acked_sha="s"
+    )
+    monkeypatch.setattr(settings, "VALI_NET_LAUNCH_SPEC_MINERS", ["miner-ck"])
+    monkeypatch.setattr(settings, "VALI_NET_LAUNCH_SPEC", False)
+    launch.launch_on_miner(_spec(vm_id="vm-net-off", mode="hippius"), _miner())
+    monkeypatch.setattr(settings, "VALI_NET_LAUNCH_SPEC", True)
+    launch.launch_on_miner(_spec(vm_id="vm-net-on", mode="hippius"), _miner())
+    off, on = harness.payloads
+    assert "net" not in off
+    assert on["net"] == {"cap_mbps": 100, "isolate": True}
+
+
+@_needs_validator
+def test_the_real_encoder_carries_net() -> None:
+    plain = _encode("launch", _launch_payload(_measured("hippius")))
+    assert b"cap_mbps" not in plain
+    payload = _launch_payload(_measured("hippius"))
+    payload["net"] = {"cap_mbps": 250, "isolate": True}
+    with_net = _encode("launch", payload)
+    assert b"cap_mbps" in with_net and b"isolate" in with_net
+    activate = _activate_payload(_measured("hippius"), net={"cap_mbps": 100, "isolate": False})
+    body = _encode("migrate-activate", activate)
+    assert b"cap_mbps" in body and b"isolate" not in body

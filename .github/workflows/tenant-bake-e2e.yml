@@ -13,6 +13,14 @@ name: tenant-bake-e2e
 # LUKS encrypt actually completes per distro and yields a mountable,
 # integrity-protected header.
 #
+# The `cdn-node` leg bakes the CDN cache node image instead (golden
+# dm-verity base, `--profile cdn-node`) and smoke-boots its root under
+# systemd-nspawn: systemd comes up, the input firewall and OpenResty are
+# active, and cdn-agent starts on stub keys (what the KBS release would put
+# in /run/hippius). The real guest path needs SNP + the KBS, which this
+# runner has neither of, so the initramfs is checked for the cdn-node
+# pieces but not booted.
+#
 # Self-maintaining: each leg downloads the (moving) cloud image, computes
 # its sha256 at runtime, and feeds that to the bake's mandatory
 # `--base-image-sha256` gate. The point is to exercise the bake
@@ -78,13 +86,19 @@ jobs:
             label: fedora-43
             url: "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
             family: rhel
+          - id: debian
+            label: cdn-node
+            url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+            family: debian
+            profile: cdn-node
     name: bake ${{ matrix.label || matrix.id }}
     steps:
       - name: Skip if not in requested subset
         id: gate
+        env:
+          want: ${{ github.event.inputs.distros }}
+          me: ${{ matrix.label || matrix.id }}
         run: |
-          want='${{ github.event.inputs.distros }}'
-          me='${{ matrix.label || matrix.id }}'
           if [ -n "$want" ] && ! echo ",$want," | grep -q ",$me,"; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "skip: $me not in '$want'"
@@ -131,7 +145,7 @@ jobs:
           echo "base image sha256=$sha ($(du -h "$dest" | cut -f1))"
 
       - name: Bake (random throwaway KEK, baker:latest)
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && matrix.profile != 'cdn-node'
         run: |
           set -euo pipefail
           docker pull "$IMG"
@@ -154,6 +168,7 @@ jobs:
             --hippius-release-bin /usr/sbin/hippius-guest-release \
             --hippius-vsock-bin /usr/sbin/hippius-vsock-ticket \
             --distro "${{ matrix.id }}" \
+            --kbs-url "vsock://2:19266" \
             --output-dir /out \
             --output-qcow2-gb 10 \
             --kek-source file --kek-file /work/kek.bin \
@@ -163,7 +178,7 @@ jobs:
           cat /mnt/e2e/out/bake.json
 
       - name: Assert artifacts + LUKS2/integrity header
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && matrix.profile != 'cdn-node'
         run: |
           set -uo pipefail   # NOT -e: the asserts handle their own failures
           OUT="/mnt/e2e/out"
@@ -216,3 +231,156 @@ jobs:
           echo "LUKS2 + dm-integrity header verified for ${base}"
 
           echo "E2E BAKE OK: ${{ matrix.label || matrix.id }}"
+
+      - name: Bake cdn-node (golden, baker:latest)
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'cdn-node'
+        run: |
+          set -euo pipefail
+          docker pull "$IMG"
+          # Golden takes no KEK. The backend URL is baked into the agent
+          # config only; nothing here contacts it.
+          docker run --rm --privileged \
+            -v /dev:/dev \
+            -v /mnt/e2e/work:/work \
+            -v /mnt/e2e/out:/out \
+            -v /mnt/e2e/tmp:/tmp \
+            --entrypoint /usr/local/bin/tenant-image-bake.sh \
+            "$IMG" \
+            --base-image-url "file:///work/base.img" \
+            --base-image-sha256 "${{ steps.img.outputs.sha256 }}" \
+            --hippius-release-bin /usr/sbin/hippius-guest-release \
+            --hippius-vsock-bin /usr/sbin/hippius-vsock-ticket \
+            --distro "${{ matrix.id }}" \
+            --kbs-url "vsock://2:19266" \
+            --output-dir /out \
+            --disk-mode golden_verity_overlay \
+            --profile cdn-node \
+            --cdn-agent-bin /usr/sbin/hippius-cdn-agent \
+            --cdn-openresty-tarball /usr/local/share/hippius/cdn-node/openresty.tar.gz \
+            --cdn-config-dir /usr/local/share/hippius/cdn-node/openresty-config \
+            --cdn-backend-url "https://cdn-backend.example.invalid"
+
+      - name: Assert cdn-node artifacts + initrd
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'cdn-node'
+        run: |
+          set -uo pipefail   # NOT -e: the asserts handle their own failures
+          OUT="/mnt/e2e/out"
+          fail() { echo "ASSERT FAIL: $1" >&2; exit 1; }
+          for ext in rootfs.img rootfs.verity vmlinuz initrd.img measurement.json; do
+            f="$(find "$OUT" -maxdepth 1 -name "golden-*.${ext}" | head -1)"
+            [ -s "$f" ] || fail "missing/empty golden artifact: *.${ext}"
+          done
+          m="$(find "$OUT" -maxdepth 1 -name 'golden-*.measurement.json' | head -1)"
+          jq -e '.disk_mode == "golden_verity_overlay"' "$m" >/dev/null || fail "measurement disk_mode != golden_verity_overlay"
+          for k in verity_root_hash rootfs_img_sha256 rootfs_verity_sha256 kernel_sha256 initrd_sha256; do
+            jq -e --arg k "$k" '.[$k] | test("^[0-9a-f]{64}$")' "$m" >/dev/null \
+              || fail "measurement.$k not 64-hex"
+          done
+          # The initrd carries the ephemeral-root marker and its chown (the
+          # bake refuses otherwise; checked again on the shipped bytes).
+          initrd="$(basename "$(find "$OUT" -maxdepth 1 -name 'golden-*.initrd.img' | head -1)")"
+          list=$(docker run --rm -v "$OUT:/out:ro" --entrypoint lsinitramfs "$IMG" "/out/${initrd}") \
+            || fail "lsinitramfs failed on ${initrd}"
+          if ! grep -Ex 'conf/conf\.d/hippius-cdn-ephemeral-upper' <<<"$list" >/dev/null; then
+            fail "initrd lacks the cdn-node ephemeral-root marker"
+          fi
+          # A merged-/usr initrd lists /lib/... under usr/lib/.
+          grep -Ex '(usr/)?lib/hippius/chown' <<<"$list" >/dev/null || fail "initrd lacks /lib/hippius/chown"
+          echo "cdn-node artifacts + initrd OK"
+
+      - name: Boot + unit-start smoke (systemd-nspawn, stub keys)
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'cdn-node'
+        run: |
+          set -uo pipefail   # NOT -e: the asserts handle their own failures
+          fail() { echo "ASSERT FAIL: $1" >&2; dump; exit 1; }
+          M=cdnsmoke
+          in_guest() { sudo systemd-run -M "$M" --quiet --wait --pipe "$@"; }
+          dump() {
+            echo "=== system state: $(sudo systemctl -M "$M" is-system-running 2>&1)"
+            sudo systemctl -M "$M" --no-pager --failed 2>&1 || true
+            for u in hippius-cdn-firewall hippius-cdn-openresty hippius-cdn-agent; do
+              sudo systemctl -M "$M" --no-pager status "$u.service" 2>&1 | head -20 || true
+              in_guest /usr/bin/journalctl --no-pager -u "$u.service" 2>&1 | tail -30 || true
+            done
+            echo "=== nspawn"; tail -40 /mnt/e2e/nspawn.log || true
+          }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq systemd-container squashfs-tools >/dev/null
+
+          ROOT=/mnt/e2e/root
+          img="$(find /mnt/e2e/out -maxdepth 1 -name 'golden-*.rootfs.img' | head -1)"
+          sudo unsquashfs -q -d "$ROOT" "$img" || fail "unsquashfs failed"
+          [ ! -e "$ROOT/usr/sbin/sshd" ] || fail "the cdn-node root ships sshd"
+
+          # Stubs for what the KBS release leaves in /run/hippius on a real
+          # node: the lifecycle key, one fleet key, the node identity. All
+          # throwaway.
+          STUB=/mnt/e2e/run-hippius
+          sudo install -d -m 0700 "$STUB" "$STUB/cdn-fleet"
+          head -c 32 /dev/urandom | sudo tee "$STUB/lifecycle.key" >/dev/null
+          head -c 32 /dev/urandom | sudo tee "$STUB/cdn-fleet/v1.key" >/dev/null
+          printf '{"node_id":"ci-smoke","region":"FR"}\n' | sudo tee "$STUB/cdn-node.json" >/dev/null
+          sudo chmod 0400 "$STUB/lifecycle.key" "$STUB/cdn-fleet/v1.key"
+          sudo chmod 0600 "$STUB/cdn-node.json"
+          # The data volume the initramfs binds on a real node.
+          sudo install -d -m 0755 /mnt/e2e/data
+
+          sudo nohup systemd-nspawn --quiet --boot --private-network --console=passive \
+            --machine "$M" -D "$ROOT" \
+            --bind=/mnt/e2e/data:/var/lib/hippius-data \
+            --bind="$STUB":/run/hippius \
+            >/mnt/e2e/nspawn.log 2>&1 &
+          nspawn_pid=$!
+
+          state=""
+          for _ in $(seq 1 150); do
+            sudo kill -0 "$nspawn_pid" 2>/dev/null || fail "systemd-nspawn exited during boot"
+            state="$(sudo systemctl -M "$M" is-system-running 2>/dev/null || true)"
+            case "$state" in running|degraded) break ;; esac
+            sleep 2
+          done
+          echo "system state after boot: ${state:-<none>}"
+          case "$state" in running|degraded) ;; *) fail "the cdn-node root did not finish booting (${state:-no answer})" ;; esac
+
+          for u in hippius-cdn-firewall hippius-cdn-openresty; do
+            ok=""
+            for _ in $(seq 1 30); do
+              [ "$(sudo systemctl -M "$M" is-active "$u.service" 2>/dev/null)" = active ] && { ok=1; break; }
+              sleep 2
+            done
+            [ -n "$ok" ] || fail "$u.service is not active"
+            echo "$u.service active"
+          done
+
+          # cdn-agent: credentials loaded, keys derived, state dir and
+          # counter epoch set up; it then keeps retrying the (unreachable)
+          # backend, so the unit stays active.
+          ok=""
+          for _ in $(seq 1 30); do
+            log="$(in_guest /usr/bin/journalctl --no-pager -o cat -u hippius-cdn-agent.service 2>/dev/null)"
+            if grep -q 'node key derived, fleet versions \[1\]' <<<"$log" && grep -q 'counter epoch' <<<"$log"; then
+              ok=1; break
+            fi
+            sleep 2
+          done
+          [ -n "$ok" ] || fail "cdn-agent did not start on the stub keys"
+          [ "$(sudo systemctl -M "$M" is-active hippius-cdn-agent.service)" = active ] \
+            || fail "hippius-cdn-agent.service is not active"
+          echo "hippius-cdn-agent.service active (keys derived, counter epoch open)"
+
+          # Up and staying up: no restart of the three units after a settle,
+          # and no failed unit but the one a private network always fails
+          # (nothing configures it, so wait-online times out).
+          sleep 20
+          for u in hippius-cdn-firewall hippius-cdn-openresty hippius-cdn-agent; do
+            n="$(sudo systemctl -M "$M" show -p NRestarts --value "$u.service")"
+            [ "$n" = 0 ] || fail "$u.service restarted ${n} time(s)"
+          done
+          failed="$(sudo systemctl -M "$M" --failed --plain --no-legend 2>/dev/null \
+            | awk '{print $1}' | grep -vx 'systemd-networkd-wait-online.service' || true)"
+          [ -z "$failed" ] || fail "failed units: $(echo "$failed" | tr '\n' ' ')"
+          echo "no restarts, no unexpected failed unit"
+
+          dump
+          sudo machinectl poweroff "$M" || true
+          echo "E2E CDN-NODE SMOKE OK"

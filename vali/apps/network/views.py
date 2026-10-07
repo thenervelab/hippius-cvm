@@ -13,6 +13,9 @@ layer above fetches their desired state here and relays their reports.
   POST|DELETE /v1/network/edges/<name>/addresses
   GET  /v1/network/edges/<name>/desired
   POST /v1/network/edges/<name>/applied
+  GET  /v1/network/egress-regions
+  GET|PATCH /v1/network/egress-regions/<region>
+  GET|POST /v1/network/public-ips/<address>/smtp
 
 Refusals answer `{"error": <stable code>, "detail": <text>}`.
 """
@@ -37,7 +40,7 @@ from apps.orchestration.permissions import IsOrchestrationRoot
 from apps.scheduler.placement import REGION_RE
 
 from . import service
-from .models import EdgeStatus, IngressEdge
+from .models import EdgeStatus, IngressEdge, PublicIpPool
 from .schemas import (
     AppliedRequestSerializer,
     AttachRequestSerializer,
@@ -48,8 +51,13 @@ from .schemas import (
     EdgeListSerializer,
     EdgePatchRequestSerializer,
     EdgeSerializer,
+    EgressRegionListSerializer,
+    EgressRegionPatchRequestSerializer,
+    EgressRegionSerializer,
     NetworkErrorSerializer,
     PublicIpSerializer,
+    SmtpRequestSerializer,
+    SmtpSerializer,
 )
 from .service import NetworkError
 
@@ -67,15 +75,22 @@ _ERROR_STATUS = {
     "edge-not-found": status.HTTP_404_NOT_FOUND,
     "no-public-ip": status.HTTP_404_NOT_FOUND,
     "address-not-found": status.HTTP_404_NOT_FOUND,
+    "region-not-found": status.HTTP_404_NOT_FOUND,
     "no-free-public-ip": status.HTTP_409_CONFLICT,
     "vm-not-live": status.HTTP_409_CONFLICT,
     "edge-exists": status.HTTP_409_CONFLICT,
     "address-taken": status.HTTP_409_CONFLICT,
     "address-unavailable": status.HTTP_409_CONFLICT,
     "address-not-free": status.HTTP_409_CONFLICT,
+    "address-pool-mismatch": status.HTTP_409_CONFLICT,
+    "cdn-vm-uses-cdn-pool": status.HTTP_409_CONFLICT,
     "edge-has-attached-ips": status.HTTP_409_CONFLICT,
     "edge-has-quarantined-ips": status.HTTP_409_CONFLICT,
     "revision-ahead": status.HTTP_409_CONFLICT,
+    "address-not-attached": status.HTTP_409_CONFLICT,
+    "vm-mismatch": status.HTTP_409_CONFLICT,
+    "no-egress-edge": status.HTTP_409_CONFLICT,
+    "egress-in-use": status.HTTP_409_CONFLICT,
     "netbird-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
@@ -117,6 +132,14 @@ def _per_ip_mbps(raw: Any) -> int:
         raise NetworkError(
             "bad-request", f"per_ip_mbps must be an integer in 1..{_MAX_PER_IP_MBPS}"
         )
+    return raw
+
+
+def _cap_mbps(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= _MAX_PER_IP_MBPS:
+        raise NetworkError("bad-request", f"cap_mbps must be an integer in 1..{_MAX_PER_IP_MBPS}")
     return raw
 
 
@@ -200,6 +223,8 @@ class VmPublicIpView(_RootView):
             "most free addresses. A quarantined address never goes to another tenant. "
             "`address` asks for one specific address instead: free, or quarantined from "
             "this tenant, and in the VM's zone — anything else is `address-unavailable`. "
+            "Never a `cdn` address; a CDN node (`VALI_CDN_TENANT_ID`) is refused "
+            "(`cdn-vm-uses-cdn-pool`), its address comes from the CDN fleet. "
             "The address carries "
             "traffic once the VM's NetBird peer is resolved (the next orchestration tick)."
         ),
@@ -213,7 +238,8 @@ class VmPublicIpView(_RootView):
             404: OpenApiResponse(NetworkErrorSerializer, "`vm-not-found`."),
             409: OpenApiResponse(
                 NetworkErrorSerializer,
-                "`no-free-public-ip` / `vm-not-live` / `address-unavailable`.",
+                "`no-free-public-ip` / `vm-not-live` / `address-unavailable` / "
+                "`cdn-vm-uses-cdn-pool`.",
             ),
             **_COMMON,
         },
@@ -264,7 +290,8 @@ class AvailabilityView(_RootView):
     @extend_schema(
         summary="Free public addresses per region",
         description=(
-            "Active edges only. Without `region`, `total_free` counts every region. With "
+            "Active edges and general addresses only (never the `cdn` pool). Without "
+            "`region`, `total_free` counts every region. With "
             "one, it counts what an attach for a VM there can reach: that region and the "
             "rest of its zone (EU, APAC, NA), or that region alone when it has no zone; "
             "`regions` is filtered to `region`."
@@ -378,7 +405,10 @@ class EdgeDetailView(_RootView):
             "`draining` and `disabled` stop new attachments; addresses already "
             "attached keep working. `netbird_ip` re-binds the edge to the NetBird "
             "peer now holding that address — the only way an edge's peer changes "
-            "(after a re-enrolment); the reconcile loop never re-binds on its own."
+            "(after a re-enrolment); the reconcile loop never re-binds on its own. "
+            "`egress_ip` sets the region's shared SNAT address (a public address in "
+            "no edge's pool), `null` clears it; the last egress edge of an `edge`-mode "
+            "region cannot be cleared (`egress-in-use`)."
         ),
         tags=_TAGS,
         parameters=[_EDGE],
@@ -395,7 +425,7 @@ class EdgeDetailView(_RootView):
     def patch(self, request: Request, name: str) -> Response:
         try:
             body = _body(request)
-            unknown = set(body) - {"status", "per_ip_mbps", "provider", "netbird_ip"}
+            unknown = set(body) - {"status", "per_ip_mbps", "provider", "netbird_ip", "egress_ip"}
             if unknown:
                 raise NetworkError("bad-request", f"unknown fields: {sorted(unknown)}")
             with transaction.atomic():
@@ -417,6 +447,12 @@ class EdgeDetailView(_RootView):
                     edge.netbird_ip = service.parse_overlay_address(body["netbird_ip"])
                     edge.netbird_peer_id = service.resolve_edge_peer(edge.netbird_ip).id
                     fields += ["netbird_ip", "netbird_peer_id"]
+                egress_changed = False
+                if "egress_ip" in body:
+                    before = edge.egress_ip
+                    service.set_egress_ip(edge, body["egress_ip"])
+                    egress_changed = edge.egress_ip != before
+                    fields.append("egress_ip")
                 rate_changed = False
                 if "per_ip_mbps" in body:
                     mbps = _per_ip_mbps(body["per_ip_mbps"])
@@ -428,10 +464,15 @@ class EdgeDetailView(_RootView):
                         with transaction.atomic():
                             edge.save(update_fields=[*fields, "updated_at"])
                     except IntegrityError as exc:
+                        if "egress_ip" in body:
+                            raise NetworkError(
+                                "address-taken",
+                                "another edge has this NetBird or egress address",
+                            ) from exc
                         raise NetworkError(
                             "edge-exists", "another edge has this NetBird address"
                         ) from exc
-                if rate_changed:
+                if rate_changed or egress_changed:
                     service.bump_revision(edge.pk)
             if "netbird_ip" in body:
                 service.request_netbird_sync()
@@ -480,6 +521,13 @@ class EdgeAddressesView(_RootView):
 
     @extend_schema(
         summary="Add addresses to an edge's pool",
+        description=(
+            "`pool` (default `general`) says which attach may hand them out: `cdn` "
+            "addresses go to CDN nodes only and need `cap_mbps`, their own rate cap in "
+            "place of the edge's `per_ip_mbps`. An address already on the edge in the "
+            "same pool is left as is (a CDN one takes the new `cap_mbps`); in the other "
+            "pool it is `address-pool-mismatch` — remove it once free, then re-add it."
+        ),
         tags=_TAGS,
         parameters=[_EDGE],
         request=EdgeAddressesRequestSerializer,
@@ -487,16 +535,22 @@ class EdgeAddressesView(_RootView):
             200: EdgeSerializer,
             400: NetworkErrorSerializer,
             404: NetworkErrorSerializer,
-            409: OpenApiResponse(NetworkErrorSerializer, "`address-taken`."),
+            409: OpenApiResponse(
+                NetworkErrorSerializer, "`address-taken` / `address-pool-mismatch`."
+            ),
             **_COMMON,
         },
     )
     def post(self, request: Request, name: str) -> Response:
         try:
             edge = _get_edge(name)
-            addresses = _addresses(_body(request).get("addresses"))
+            body = _body(request)
+            addresses = _addresses(body.get("addresses"))
+            pool = body.get("pool", PublicIpPool.GENERAL)
+            if not isinstance(pool, str):
+                raise NetworkError("bad-request", "pool must be a string")
             try:
-                service.add_addresses(edge, addresses)
+                service.add_addresses(edge, addresses, pool, _cap_mbps(body.get("cap_mbps")))
             except IntegrityError as exc:
                 raise NetworkError("address-taken", "an address was taken concurrently") from exc
         except NetworkError as exc:
@@ -573,3 +627,144 @@ class EdgeAppliedView(_RootView):
         except NetworkError as exc:
             return _refuse(exc)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+_REGION = OpenApiParameter(
+    "region", str, OpenApiParameter.PATH, description="ISO 3166-1 alpha-2 (any case)."
+)
+
+
+class EgressRegionListView(_RootView):
+    http_method_names = ["get", "options"]
+
+    @extend_schema(
+        summary="Egress policy per region",
+        description=(
+            "One entry per region with a policy row; a region not listed is `local`. "
+            "The caps are vali's (`VALI_NET_CAP_*`), the same for every region. For "
+            "display and pricing only: the edges and miners get theirs elsewhere."
+        ),
+        tags=_TAGS,
+        responses={200: EgressRegionListSerializer, **_COMMON},
+    )
+    def get(self, request: Request) -> Response:
+        from .models import EgressRegion
+
+        return Response(
+            {"regions": [service.egress_region_view(r) for r in EgressRegion.objects.all()]}
+        )
+
+
+class EgressRegionDetailView(_RootView):
+    http_method_names = ["get", "patch", "options"]
+
+    @extend_schema(
+        summary="One region's egress policy",
+        tags=_TAGS,
+        parameters=[_REGION],
+        responses={
+            200: EgressRegionSerializer,
+            400: NetworkErrorSerializer,
+            404: NetworkErrorSerializer,
+            **_COMMON,
+        },
+    )
+    def get(self, request: Request, region: str) -> Response:
+        from .models import EgressRegion
+
+        try:
+            row = EgressRegion.objects.filter(region=service.parse_region(region)).first()
+            if row is None:
+                raise NetworkError("region-not-found", "no egress policy for this region")
+        except NetworkError as exc:
+            return _refuse(exc)
+        return Response(service.egress_region_view(row))
+
+    @extend_schema(
+        summary="Create or update a region's egress policy",
+        description=(
+            "Upsert. `mode=edge` needs a bound, active edge with an `egress_ip` in the "
+            "region (`no-egress-edge`). The miners' net policies and the edges' feeds "
+            "follow on the next orchestration tick."
+        ),
+        tags=_TAGS,
+        parameters=[_REGION],
+        request=EgressRegionPatchRequestSerializer,
+        responses={
+            200: EgressRegionSerializer,
+            400: NetworkErrorSerializer,
+            409: OpenApiResponse(NetworkErrorSerializer, "`no-egress-edge`."),
+            **_COMMON,
+        },
+    )
+    def patch(self, request: Request, region: str) -> Response:
+        try:
+            row = service.update_egress_region(service.parse_region(region), _body(request))
+        except NetworkError as exc:
+            return _refuse(exc)
+        return Response(service.egress_region_view(row))
+
+
+class PublicIpSmtpView(_RootView):
+    http_method_names = ["get", "post", "options"]
+
+    @extend_schema(
+        summary="Whether outbound TCP 25 is open for an address's holder",
+        description=(
+            "Reads the flag `POST` sets, for the VM holding this ATTACHED address "
+            "(`address-not-attached` otherwise)."
+        ),
+        tags=_TAGS,
+        parameters=[OpenApiParameter("address", str, OpenApiParameter.PATH)],
+        responses={
+            200: SmtpSerializer,
+            400: OpenApiResponse(NetworkErrorSerializer, "`bad-address`."),
+            404: OpenApiResponse(NetworkErrorSerializer, "`address-not-found`."),
+            409: OpenApiResponse(NetworkErrorSerializer, "`address-not-attached`."),
+            **_COMMON,
+        },
+    )
+    def get(self, request: Request, address: str) -> Response:
+        try:
+            ip = service.get_smtp_allowed(service.parse_public_address(address))
+        except NetworkError as exc:
+            return _refuse(exc)
+        return Response(service.public_ip_smtp_view(ip))
+
+    @extend_schema(
+        summary="Unblock or block outbound TCP 25 for an address's holder",
+        description=(
+            "Port 25 is closed for every VM by default. `allowed: true` opens it for the "
+            "VM holding this ATTACHED address (`address-not-attached` otherwise), on its "
+            "edge and its miner, from their next pass. A detach and re-attach closes it "
+            "again. `expected_vm_id`, if given, must be the address's current holder "
+            "(`vm-mismatch` otherwise, and nothing changes)."
+        ),
+        tags=_TAGS,
+        parameters=[OpenApiParameter("address", str, OpenApiParameter.PATH)],
+        request=SmtpRequestSerializer,
+        responses={
+            200: SmtpSerializer,
+            400: NetworkErrorSerializer,
+            404: OpenApiResponse(NetworkErrorSerializer, "`address-not-found`."),
+            409: OpenApiResponse(
+                NetworkErrorSerializer, "`address-not-attached` / `vm-mismatch`."
+            ),
+            **_COMMON,
+        },
+    )
+    def post(self, request: Request, address: str) -> Response:
+        try:
+            body = _body(request)
+            allowed = body.get("allowed")
+            if not isinstance(allowed, bool):
+                raise NetworkError("bad-request", "allowed must be a boolean")
+            expected_vm_id = body.get("expected_vm_id")
+            if expected_vm_id is not None and not isinstance(expected_vm_id, str):
+                raise NetworkError("bad-request", "expected_vm_id must be a string")
+            ip = service.set_smtp_allowed(
+                service.parse_public_address(address), allowed, expected_vm_id
+            )
+        except NetworkError as exc:
+            return _refuse(exc)
+        return Response(service.public_ip_smtp_view(ip))

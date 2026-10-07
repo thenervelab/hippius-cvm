@@ -591,6 +591,43 @@ mod tests {
     }
 
     #[test]
+    fn cdn_node_class_decodes_alongside_the_others() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let tenant = [1u8; 48];
+        let cdn = [5u8; 48];
+        let host = [7u8; 48];
+        let cose = sign_artifact(
+            &sk,
+            &body_value_with_classes(
+                3,
+                &[
+                    (tenant, None),
+                    (cdn, Some("cdn_node")),
+                    (host, Some("host_attestor")),
+                ],
+            ),
+        );
+        let al = InstalledAllowlist::new(sk.verifying_key(), Box::new(InMemoryHwm::default()));
+        al.install(&cose).unwrap();
+        assert_eq!(al.class_of(&tenant), Some(AllowlistClass::Tenant));
+        assert_eq!(al.class_of(&cdn), Some(AllowlistClass::CdnNode));
+        assert_eq!(al.class_of(&host), Some(AllowlistClass::HostAttestor));
+    }
+
+    #[test]
+    fn unknown_class_rejects_the_whole_artifact() {
+        // Why the deploy order is KBS first: a KBS that does not know a
+        // class refuses the entire manifest, not just the entry.
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let cose = sign_artifact(
+            &sk,
+            &body_value_with_classes(1, &[([1u8; 48], None), ([2u8; 48], Some("cdn_edge"))]),
+        );
+        let al = InstalledAllowlist::new(sk.verifying_key(), Box::new(InMemoryHwm::default()));
+        assert!(al.install(&cose).is_err());
+    }
+
+    #[test]
     fn explicit_and_absent_tenant_class_are_equivalent() {
         // An entry that OMITS `class` and one that spells out `"tenant"`
         // must resolve identically (the serde default is the wire value).
@@ -619,8 +656,16 @@ mod tests {
             serde_json::to_string(&AllowlistClass::HostAttestor).unwrap(),
             "\"host_attestor\""
         );
-        // Round-trip both variants.
-        for c in [AllowlistClass::Tenant, AllowlistClass::HostAttestor] {
+        assert_eq!(
+            serde_json::to_string(&AllowlistClass::CdnNode).unwrap(),
+            "\"cdn_node\""
+        );
+        // Round-trip every variant.
+        for c in [
+            AllowlistClass::Tenant,
+            AllowlistClass::HostAttestor,
+            AllowlistClass::CdnNode,
+        ] {
             let s = serde_json::to_string(&c).unwrap();
             let back: AllowlistClass = serde_json::from_str(&s).unwrap();
             assert_eq!(back, c);

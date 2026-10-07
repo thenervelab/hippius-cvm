@@ -69,7 +69,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use super::kbs_proxy::CustodyRelayGate;
 use super::vm_progress::VmProgressSink;
 use crate::lifecycle::guardian::{
-    endpoint_host_allowed, ip_allowed, is_local_address, RouteBinding,
+    endpoint_host_allowed, ip_allowed, is_local_address, RouteBinding, SMTP_PORT,
 };
 use crate::lifecycle::{CvmLifecycle, VmId};
 
@@ -231,6 +231,10 @@ impl GuardianDialer for ReqwestGuardianDialer {
         // literal here so no code path can dial a host-local address.
         let ep = GuardianEndpoint::parse(endpoint).map_err(|_| DialError::Unreachable)?;
         if !self.allow_host_local && !dialable_host(&ep.host) {
+            return Err(DialError::Unreachable);
+        }
+        // Never SMTP, test escape or not.
+        if ep.port == SMTP_PORT {
             return Err(DialError::Unreachable);
         }
         let url = format!("http://{}{}", ep.to_wire(), path);

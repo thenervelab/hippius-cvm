@@ -227,6 +227,20 @@ struct Cli {
     #[arg(long)]
     lifecycle_key_out: Option<std::path::PathBuf>,
 
+    /// CDN G1 — a `cdn-node` image only: the tmpfs directory that receives
+    /// the CDN fleet keyring (`KbsResponse::cdn_fleet`). Created `0700`,
+    /// one `v<N>.key` per version (the raw 32-byte clamped X25519 secret,
+    /// mode `0400`, root-owned): systemd hands it to the agent as the
+    /// `cdn-fleet` credential directory. Written before the KEK ships;
+    /// a release without a keyring, or any write failure, fails closed.
+    /// Without the flag (every tenant image) the keyring is never even
+    /// unwrapped.
+    ///
+    /// REFUSED (exit `EXIT_USAGE`, before the release exchange) if the
+    /// path is not strictly under `/run/`. See [`check_secret_out_path`].
+    #[arg(long)]
+    cdn_fleet_dir: Option<std::path::PathBuf>,
+
     /// Phase 2A of audit follow-up Review #2 — anti-rollback for
     /// valid-old-ciphertext replay. When set, read the previous
     /// KBS-issued boot counter from this file (newline-stripped
@@ -372,6 +386,7 @@ struct Cli {
         "share_c_version",
         "share_c_version_out",
         "instance_id_out",
+        "cdn_fleet_dir",
     ])]
     confirm_volume_stamp: Option<std::path::PathBuf>,
 
@@ -397,6 +412,7 @@ struct Cli {
         "share_c_version",
         "share_c_version_out",
         "instance_id_out",
+        "cdn_fleet_dir",
     ])]
     integrity_wipe: Option<std::path::PathBuf>,
 }
@@ -574,6 +590,7 @@ fn main() -> ExitCode {
             "--volume-stamp-ctx-out",
             cli.volume_stamp_ctx_out.as_deref(),
         ),
+        ("--cdn-fleet-dir", cli.cdn_fleet_dir.as_deref()),
     ] {
         let Some(path) = path else { continue };
         if let Err(msg) = check_secret_out_path(flag, path) {
@@ -652,6 +669,21 @@ fn main() -> ExitCode {
             // Flag set but the release carried no key (older VM): not an
             // error — log a static class and proceed unsigned-EOL.
             None => eprintln!("hippius-guest-release: lifecycle-key-out: no-key-in-release"),
+        }
+    }
+
+    // CDN G1: the fleet keyring to its tmpfs directory BEFORE the KEK
+    // ships, same fail-closed ordering. A cdn-node image whose release
+    // carried no keyring is refused too: such a node could serve nothing,
+    // and the KBS never releases to a cdn-node without one.
+    if let Some(dir) = cli.cdn_fleet_dir.as_deref() {
+        if kek.cdn_fleet.is_empty() {
+            eprintln!("hippius-guest-release: fail-closed: cdn-fleet-dir:no-keys-in-release");
+            return ExitCode::from(EXIT_RELEASE_FAILED);
+        }
+        if let Err(cls) = write_cdn_fleet(dir, &kek.cdn_fleet) {
+            eprintln!("hippius-guest-release: fail-closed: cdn-fleet-dir:{cls}");
+            return ExitCode::from(EXIT_RELEASE_FAILED);
         }
     }
 
@@ -747,6 +779,65 @@ fn write_secret_0600_at_mode(
     Ok(())
 }
 
+/// CDN G1: write the fleet keyring into `dir`: created `0700` (an
+/// existing entry must be a real directory, never a symlink), one
+/// `v<N>.key` per version, `0400`, created exclusively and never through
+/// a symlink. Returns a `&'static str` classifier on failure (§20), after
+/// removing any key it already wrote: a failed boot leaves none on /run.
+fn write_cdn_fleet(
+    dir: &std::path::Path,
+    keys: &[hippius_guest::FleetKey],
+) -> Result<(), &'static str> {
+    let mut written = Vec::new();
+    let result = write_cdn_fleet_keys(dir, keys, &mut written);
+    if result.is_err() {
+        for path in &written {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+fn write_cdn_fleet_keys(
+    dir: &std::path::Path,
+    keys: &[hippius_guest::FleetKey],
+    written: &mut Vec<std::path::PathBuf>,
+) -> Result<(), &'static str> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Err("not-a-directory"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| "parent-create")?;
+            }
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(|_| "dir-create")?;
+        }
+        Err(_) => return Err("dir-stat"),
+    }
+    for key in keys {
+        let path = dir.join(format!("v{}.key", key.version));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => "key-exists",
+                _ => "key-create",
+            })?;
+        written.push(path);
+        f.write_all(key.secret.as_slice())
+            .map_err(|_| "key-write")?;
+        f.flush().map_err(|_| "key-flush")?;
+    }
+    Ok(())
+}
+
 /// What a successful release hands to `main`: the keyslot key for
 /// stdout and the two secrets that must land on tmpfs BEFORE it ships.
 struct Released {
@@ -755,6 +846,8 @@ struct Released {
     kek: Zeroizing<Vec<u8>>,
     userdata: Zeroizing<Vec<u8>>,
     lifecycle_key: Option<Zeroizing<Vec<u8>>>,
+    /// CDN G1: empty unless `--cdn-fleet-dir` asked for the keyring.
+    cdn_fleet: Vec<hippius_guest::FleetKey>,
 }
 
 /// Everything [`run_with`] talks to, injectable so the whole exchange —
@@ -915,6 +1008,7 @@ fn run_with(
         deps.kbs_kid,
         mode,
         attested,
+        cli.cdn_fleet_dir.is_some(),
     )?;
 
     // 7a. The keyslot key. M0 is the KBS KEK verbatim; M1/M2 derive it
@@ -968,6 +1062,7 @@ fn run_with(
         kek,
         userdata: std::mem::take(&mut secrets.userdata),
         lifecycle_key: secrets.lifecycle_key.take(),
+        cdn_fleet: std::mem::take(&mut secrets.cdn_fleet),
     })
 }
 
@@ -2331,6 +2426,95 @@ mod volume_stamp_ctx_tests {
         assert_eq!(
             decode_confirm_response(&body),
             Err("confirm-response-decode")
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod cdn_fleet_dir_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "hippius-guest-release-fleet-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn key(version: u32, b: u8) -> hippius_guest::FleetKey {
+        hippius_guest::FleetKey {
+            version,
+            secret: Box::new(Zeroizing::new([b; 32])),
+        }
+    }
+
+    #[test]
+    fn the_keyring_lands_0400_in_a_0700_directory() {
+        let root = tmp("ok");
+        let dir = root.join("cdn-fleet");
+        write_cdn_fleet(&dir, &[key(1, 0x11), key(2, 0x22)]).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("v1.key")), 0o400);
+        assert_eq!(std::fs::read(dir.join("v1.key")).unwrap(), vec![0x11; 32]);
+        assert_eq!(std::fs::read(dir.join("v2.key")).unwrap(), vec![0x22; 32]);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn a_symlinked_directory_or_a_planted_key_is_refused() {
+        let root = tmp("bad");
+        let target = root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("cdn-fleet");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(write_cdn_fleet(&link, &[key(1, 1)]), Err("not-a-directory"));
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+
+        let dir = root.join("real");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(root.join("stolen"), dir.join("v1.key")).unwrap();
+        assert_eq!(write_cdn_fleet(&dir, &[key(1, 1)]), Err("key-exists"));
+        assert!(
+            !root.join("stolen").exists(),
+            "never written through a link"
+        );
+
+        // A failure part-way removes the keys already written.
+        let partial = root.join("partial");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("v2.key"), b"planted").unwrap();
+        assert_eq!(
+            write_cdn_fleet(&partial, &[key(1, 1), key(2, 2)]),
+            Err("key-exists")
+        );
+        assert!(
+            !partial.join("v1.key").exists(),
+            "v1 removed after v2 failed"
+        );
+    }
+
+    #[test]
+    fn the_directory_must_be_on_tmpfs() {
+        assert!(
+            check_secret_out_path("--cdn-fleet-dir", Path::new("/run/hippius/cdn-fleet")).is_ok()
+        );
+        assert!(
+            check_secret_out_path("--cdn-fleet-dir", Path::new("/hippius-state/cdn-fleet"))
+                .is_err()
+        );
+        assert!(
+            check_secret_out_path("--cdn-fleet-dir", Path::new("/run/../var/cdn-fleet")).is_err()
         );
     }
 }

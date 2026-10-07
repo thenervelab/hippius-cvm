@@ -225,6 +225,26 @@ pub enum MinerAgentError {
     #[error("net-policy-store/{0}")]
     NetPolicyStore(&'static str),
 
+    /// A `net-policy` order asks for something this agent cannot apply.
+    /// The sub-classifier is `edge-mode` (edge-mode rules are not
+    /// rendered by this agent version).
+    #[error("net-policy-unsupported/{0}")]
+    NetPolicyUnsupported(&'static str),
+
+    /// The persisted net policy could not be installed on the host. The
+    /// sub-classifier is `uplink` (no usable uplink interface), `tap`
+    /// (a tap name or MAC failed its charset check), `nft` (the
+    /// ruleset load failed; the previous one stays in place) or
+    /// `persist` (the loaded ruleset could not be saved for the boot
+    /// loader).
+    #[error("net-policy-apply/{0}")]
+    NetPolicyApply(&'static str),
+
+    /// Launch and migrate-in refused: an edge-mode net policy is
+    /// persisted but its rules are not loaded on this host.
+    #[error("net-policy-not-loaded")]
+    NetPolicyNotLoaded,
+
     /// The heartbeat pusher's mTLS Edge client could not be built
     /// (PR-MA-6) — a bad CA / client cert / key, or a `reqwest`
     /// builder failure. The sub-classifier is `ca`, `client-identity`,

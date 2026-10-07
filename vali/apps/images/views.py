@@ -43,13 +43,23 @@ class ImageListView(APIView):
             "golden-image catalog — the image NAMES `POST /v1/vm/launch` "
             "accepts (launch-by-image), each mapping to the CURRENT blessed "
             "golden `bake_id`. Read-only; the catalog is set only by the "
-            "operator (`vali_bless_golden_image`), never by a tenant."
+            "operator (`vali_bless_golden_image`), never by a tenant. An image "
+            "restricted to one tenant is listed only to a principal confined to "
+            "that tenant."
         ),
         tags=["Images"],
         responses={200: OpenApiResponse(GoldenImageListSerializer, "The catalog.")},
     )
     def get(self, request: Request) -> Response:
-        images = list(GoldenImage.objects.all())
+        # A restricted image (CDN plan N2) is no other tenant's to launch,
+        # so it is not theirs to see either — the upstream API lists this
+        # catalog to its customers as an operator principal.
+        caller = scoping.caller_tenant_id(request)
+        images = [
+            img
+            for img in GoldenImage.objects.all()
+            if not img.restricted_tenant or img.restricted_tenant == caller
+        ]
         # Resolve `is_golden` from the referenced bakes in one query. The
         # operator only blesses Succeeded golden bakes, so this is normally
         # always True; it flips false only if a blessed bake was removed /

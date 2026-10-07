@@ -459,3 +459,24 @@ def test_jwt_job_still_runs_as_the_dedicated_baker_service_account() -> None:
     assert _pod_spec(render_job(_jwt_spec()))["serviceAccountName"] == (
         _sample_spec().service_account
     )
+
+
+def test_render_job_env_profile_only_for_cdn_node() -> None:
+    """CDN plan I3 — a standard bake renders no BAKE_PROFILE (byte-identical
+    env); a cdn-node bake carries the profile and the backend URL."""
+    import dataclasses
+
+    names = lambda m: [e["name"] for e in m["spec"]["template"]["spec"]["containers"][0]["env"]]  # noqa: E731
+    std = render_job(_sample_spec())
+    assert "BAKE_PROFILE" not in names(std)
+    assert "BAKE_CDN_BACKEND_URL" not in names(std)
+    spec = dataclasses.replace(
+        _sample_spec(),
+        disk_mode="golden_verity_overlay",
+        profile="cdn-node",
+        cdn_backend_url="https://api.example.invalid",
+    )
+    container = render_job(spec)["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e for e in container["env"]}
+    assert env["BAKE_PROFILE"]["value"] == "cdn-node"
+    assert env["BAKE_CDN_BACKEND_URL"]["value"] == "https://api.example.invalid"

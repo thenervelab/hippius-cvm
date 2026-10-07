@@ -894,6 +894,7 @@ fn order(vm: &str, ep: Option<&str>) -> LaunchOrder {
         cose_ticket: ByteBuf::from(cose_ticket()),
         require_existing_disks: false,
         guardian_ep: ep.map(String::from),
+        net: None,
     }
 }
 
@@ -1076,6 +1077,20 @@ async fn the_http_dialer_posts_cbor_to_exactly_the_endpoint_and_path() {
         .to_ascii_lowercase()
         .contains("content-type: application/cbor"));
     assert!(req.ends_with("req-bytes"));
+}
+
+/// Port 25 is never dialed, even with the host-local test escape on: a
+/// listener there would have answered.
+#[tokio::test]
+async fn the_http_dialer_never_dials_smtp() {
+    let d = ReqwestGuardianDialer::for_loopback_tests(Duration::from_secs(5));
+    for ep in ["127.0.0.1:25", "guardian.example.com:25"] {
+        assert_eq!(
+            d.post(ep, GUARDIAN_NONCE_PATH, b"x").await,
+            Err(DialError::Unreachable),
+            "{ep}"
+        );
+    }
 }
 
 #[tokio::test]
