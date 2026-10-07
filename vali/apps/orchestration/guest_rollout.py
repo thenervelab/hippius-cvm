@@ -123,7 +123,8 @@ def _base_of(vm: Vm) -> tuple[str, str, str] | None:
 def scope_vms(scope: dict[str, Any]) -> list[Vm]:
     """The active VMs `scope` selects, by id. Each key narrows (callers
     refuse an empty scope: it would select every VM)."""
-    qs = Vm.objects.filter(state=VmState.ACTIVE)
+    # Never a CDN node: it upgrades by replacement (`apps.cdn.reconcile`).
+    qs = Vm.objects.filter(state=VmState.ACTIVE, cdn_node__isnull=True)
     if scope.get("vm_ids"):
         qs = qs.filter(vm_id__in=scope["vm_ids"])
     if scope.get("tenant_ids"):

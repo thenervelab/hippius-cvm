@@ -179,6 +179,36 @@ RUN cargo build --release \
         --bin hippius-agent-tenant-telemetry \
         --bin hippius-agent-keepalive
 
+# CDN I3 — the cdn-node agent (`hippius-cdn-agent`), a rootfs daemon of
+# the cdn-node profile only, on the same glibc floor. A separate,
+# package-scoped (`-p`) invocation AFTER the line above, so the layers and
+# bytes of the three tenant agents are untouched.
+RUN cargo build --release -p hippius-cdn-agent
+
+# ───────────────────────────────────────────────────────────────────
+# Stage 1c — openresty-builder: the cdn-node data plane (CDN plan I2)
+#
+# Builds OpenResty with OpenSSL, PCRE2 and zlib compiled in statically,
+# from the versioned, SHA-256-pinned tarballs in
+# packer/cdn-node/openresty/versions.env, reproducibly (fixed build dir,
+# SOURCE_DATE_EPOCH, normalised tar). The tree needs only glibc from the
+# guest, so it is built on bookworm (glibc 2.36), the floor of every
+# supported base. The cdn-node bake profile (I3) unpacks it into the
+# rootfs; nothing else uses it. Brotli is not built (gzip-only beta).
+# ───────────────────────────────────────────────────────────────────
+FROM --platform=linux/amd64 rust:1.93-slim-bookworm@sha256:5b9332190bb3b9ece73b810cd1f1e9f06343b294ce184bcb067f0747d7d333ea AS openresty-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        build-essential \
+        perl \
+        curl \
+        ca-certificates \
+        binutils \
+    && rm -rf /var/lib/apt/lists/*
+COPY packer/cdn-node/openresty/versions.env packer/cdn-node/openresty/build-openresty.sh /openresty/
+RUN BUILD_ROOT=/build /openresty/build-openresty.sh /out/openresty.tar.gz
+
 # ───────────────────────────────────────────────────────────────────
 # Stage 2 — runtime: the actual k8s Job image
 # ───────────────────────────────────────────────────────────────────
@@ -360,6 +390,19 @@ RUN chmod 0755 /usr/sbin/hippius-agent-tenant-telemetry
 # can lift the (root-readable) telemetry key, kill the VM and bill forever.
 COPY --from=eol-builder /src/target/release/hippius-agent-keepalive /usr/sbin/hippius-agent-keepalive
 RUN chmod 0755 /usr/sbin/hippius-agent-keepalive
+
+# CDN I3 — staged into the rootfs by `tenant-image-bake.sh --profile
+# cdn-node` only (with the OpenResty tree copied below).
+COPY --from=eol-builder /src/target/release/hippius-cdn-agent /usr/sbin/hippius-cdn-agent
+RUN chmod 0755 /usr/sbin/hippius-cdn-agent
+
+# CDN I2 — the cdn-node data plane: the OpenResty tree (with its
+# .sha256) and the Lua + nginx config the cdn-node bake profile (I3)
+# renders and installs. Inert for every other bake.
+COPY --from=openresty-builder /out/openresty.tar.gz /out/openresty.tar.gz.sha256 /usr/local/share/hippius/cdn-node/
+COPY packer/cdn-node/openresty/lua/ /usr/local/share/hippius/cdn-node/openresty-config/lua/
+COPY packer/cdn-node/openresty/nginx.conf.in packer/cdn-node/openresty/origin.conf packer/cdn-node/openresty/render.sh /usr/local/share/hippius/cdn-node/openresty-config/
+COPY scripts/cdn-node/ /usr/local/bin/cdn-node/
 
 WORKDIR /work
 

@@ -70,6 +70,7 @@ fn m0_response() -> KbsResponse {
         expected_volume_stamp: 3,
         volume_stamp_token: Some(secret("volume-stamp-token", "kbs/volume-stamp", 4, 0x70)),
         volume_stamp_transition: None,
+        cdn_fleet: None,
     }
 }
 
@@ -244,4 +245,41 @@ fn a_short_timeline_id_is_refused() {
         target_timeline_id: vec![0; 32],
     };
     assert!(t.ids().is_none());
+}
+
+/// A CDN node's release: the fleet keys ride in `cdn_fleet`, one wrapped
+/// secret per version, and decode on a guest that predates the field
+/// (which ignores it) as well as on the current parser.
+#[test]
+fn a_cdn_body_carries_the_fleet_and_an_older_parser_ignores_it() {
+    let cdn = KbsResponse {
+        cdn_fleet: Some(vec![
+            secret("cdn-fleet", "hippius-compute/kbs/cdn-fleet/v1", 1, 0x80),
+            secret("cdn-fleet", "hippius-compute/kbs/cdn-fleet/v2", 2, 0x90),
+        ]),
+        ..m0_response()
+    };
+    let body = canonical(&cdn);
+    assert_canonical(&body).unwrap();
+    assert_ne!(sha_hex(&body), M0_BODY_SHA256);
+    let back: KbsResponse = ciborium::de::from_reader(body.as_slice()).unwrap();
+    assert_eq!(back, cdn);
+    let old: PreChangeKbsResponse = ciborium::de::from_reader(body.as_slice()).unwrap();
+    assert_eq!(Some(old.luks), m0_response().luks);
+}
+
+/// Every non-CDN release omits the key entirely, which is why the pinned
+/// M0 and V2 vectors above did not move when the field was added.
+#[test]
+fn a_non_cdn_body_omits_the_fleet_key_entirely() {
+    for resp in [m0_response(), v2_response(), m2_response()] {
+        let body = canonical(&resp);
+        let Value::Map(entries) = ciborium::de::from_reader::<Value, _>(body.as_slice()).unwrap()
+        else {
+            panic!("release body is not a map");
+        };
+        assert!(entries
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("cdn_fleet")));
+    }
 }

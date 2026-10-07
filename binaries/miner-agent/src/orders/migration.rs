@@ -2662,6 +2662,7 @@ mod tests {
             staged_restore_id: String::new(),
             guardian_ep: None,
             settle_by_unix: 0,
+            net: None,
         }
     }
 
@@ -3595,6 +3596,7 @@ mod tests {
                 cose_ticket: ByteBuf::from(launch_cose_ticket()),
                 require_existing_disks: false,
                 guardian_ep: None,
+                net: None,
             })
             .await
             .expect("launch should succeed");
@@ -3833,6 +3835,7 @@ mod tests {
                 cose_ticket: ByteBuf::from(launch_cose_ticket()),
                 require_existing_disks: false,
                 guardian_ep: None,
+                net: None,
             })
             .await
             .expect("launch should succeed");
@@ -4113,6 +4116,7 @@ mod tests {
             cose_ticket: ByteBuf::from(launch_cose_ticket()),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         };
         lifecycle
             .launch(order)
@@ -4171,6 +4175,7 @@ mod tests {
             cose_ticket: ByteBuf::from(launch_cose_ticket()),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         }
     }
 
@@ -4282,6 +4287,7 @@ mod tests {
             cose_ticket: ByteBuf::from(launch_cose_ticket()),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         };
         lifecycle
             .launch(order(2))

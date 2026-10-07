@@ -325,6 +325,12 @@ def _resolve_image(intent: dict[str, Any]) -> None:
         raise LaunchIntentError(
             f"image {image!r} is not a known launchable image", "bad-field"
         ) from None
+    # An image restricted to one tenant (CDN plan N2) launches for that
+    # tenant only; `_resolve_bake` re-checks by bake.
+    if golden.restricted_tenant and golden.restricted_tenant != intent.get("tenant_id"):
+        raise LaunchIntentError(
+            f"image {image!r} is restricted to another tenant", "image-restricted"
+        )
     # The catalog decides EVERY artifact of a launch by image: a caller value
     # would survive the fill-only resolution below (and a miner's cache is
     # keyed by sha, so a named rootfs/verity pair already cached elsewhere
@@ -402,6 +408,109 @@ def _apply_guest_release(intent: dict[str, Any], bake: Any, release: int) -> Non
     intent["initrd_sha256_hex"] = build.initrd_sha256
 
 
+def _check_bake_restriction(bake: Any, tenant_id: str, vm_id: str) -> None:
+    """Refuse (`image-restricted`) a launch of `bake` by `tenant_id` when the
+    bake is restricted to another tenant — by image name or by `bake_id`:
+
+    - a cdn-node bake holds the CDN fleet's keys once released (CDN plan
+      I3): only a CDN node's launch boots it — the role check of CDN plan
+      V2 (`apps.cdn.identity`: a node names `vm_id`, the CDN tenant runs
+      it, `VALI_CDN_LAUNCH_ROLE` is on);
+    - a bake blessed as an image restricted to a tenant
+      (`GoldenImage.restricted_tenant`, CDN plan N2) launches for that
+      tenant only, whatever name the launch used."""
+    from apps.cdn import identity as cdn_identity
+    from apps.common.cdn import is_cdn_tenant
+    from apps.images.models import GoldenImage
+    from apps.tenant_bake.models import TenantBakeProfile
+
+    if bake.profile == TenantBakeProfile.CDN_NODE.value and not (
+        cdn_identity.launch_role_enabled()
+        and is_cdn_tenant(tenant_id)
+        and cdn_identity.is_reserved(vm_id)
+    ):
+        raise LaunchIntentError(
+            f"bake {bake.bake_id!r} is a cdn-node image: only a CDN node's launch boots it",
+            "image-restricted",
+        )
+    owners = set(
+        GoldenImage.objects.filter(bake_id=bake.bake_id)
+        .exclude(restricted_tenant="")
+        .values_list("restricted_tenant", flat=True)
+    )
+    if owners - {tenant_id}:
+        raise LaunchIntentError(
+            f"bake {bake.bake_id!r} is restricted to another tenant", "image-restricted"
+        )
+
+
+def _check_artifact_restriction(intent: dict[str, Any]) -> None:
+    """[`_check_bake_restriction`] on every golden bake whose shared base
+    the launch would boot, by the artifacts it ends up with rather than the
+    `bake_id` it named: caller fields win over a bake's (`_resolve_bake`),
+    so a launch could name an open bake — or none — and carry a restricted
+    image's dm-verity base."""
+    from django.db.models import Q
+
+    from apps.tenant_bake.models import TenantBake
+
+    match = Q()
+    for field, key in (
+        ("verity_root_hash", "verity_root_hash_hex"),
+        ("rootfs_img_sha256", "rootfs_img_sha256_hex"),
+        ("rootfs_verity_sha256", "rootfs_verity_sha256_hex"),
+    ):
+        value = intent.get(key)
+        if isinstance(value, str) and value:
+            match |= Q(**{field: value.lower()})
+    if not match:
+        return
+    tenant_id = str(intent.get("tenant_id") or "")
+    vm_id = str(intent.get("vm_id") or "")
+    for bake in TenantBake.objects.filter(match):
+        _check_bake_restriction(bake, tenant_id, vm_id)
+
+
+def _check_cdn_role(intent: dict[str, Any], *, cdn_node: bool) -> None:
+    """The CDN role at intake (`apps.cdn.identity`), before anything is
+    staged. A CDN node's vm id is launched only by the fleet reconciler,
+    in-process, which says so (`cdn_node=True`); never through the HTTP
+    API, whoever calls it (`cdn-node-id-reserved`). Its launch must be
+    allowed to run (`cdn-role-disabled`) and name a cdn-node bake blessed
+    restricted to the CDN tenant (`cdn-node-needs-cdn-image`). The launch
+    re-checks all of it on the final spec, artifacts and user-data included
+    (`launch.launch_on_miner`)."""
+    from apps.cdn import identity as cdn_identity
+    from apps.images.models import GoldenImage
+    from apps.tenant_bake.models import TenantBake, TenantBakeProfile
+
+    vm_id = str(intent.get("vm_id") or "")
+    tenant_id = str(intent.get("tenant_id") or "")
+    reserved = cdn_identity.is_reserved(vm_id)
+    if reserved != cdn_node:
+        raise LaunchIntentError(
+            f"vm id {vm_id!r} is a CDN node's: only the CDN fleet launches it"
+            if reserved
+            else f"no CDN node names vm id {vm_id!r}",
+            "cdn-node-id-reserved",
+        )
+    if not cdn_node:
+        return
+    try:
+        cdn_identity.check_launch(vm_id, tenant_id)
+    except cdn_identity.CdnRoleError as exc:
+        raise LaunchIntentError(exc.detail, exc.code) from exc
+    bake_id = str(intent.get("bake_id") or "")
+    bake = TenantBake.objects.filter(bake_id=bake_id).first() if bake_id else None
+    blessed = GoldenImage.objects.filter(bake_id=bake_id, restricted_tenant=tenant_id).exists()
+    if bake is None or bake.profile != TenantBakeProfile.CDN_NODE.value or not blessed:
+        raise LaunchIntentError(
+            f"vm {vm_id!r} is a CDN node: it boots a cdn-node bake blessed restricted to "
+            f"{tenant_id!r} only",
+            "cdn-node-needs-cdn-image",
+        )
+
+
 def _resolve_bake(intent: dict[str, Any]) -> None:
     """Fill the launch-spec artifact fields from a Succeeded `TenantBake`
     named by `intent['bake_id']`. A no-op when `bake_id` is absent.
@@ -439,6 +548,9 @@ def _resolve_bake(intent: dict[str, Any]) -> None:
             f"bake {bake_id!r} is not Succeeded (state={bake.state!r})",
             "conflict",
         )
+    _check_bake_restriction(
+        bake, str(intent.get("tenant_id") or ""), str(intent.get("vm_id") or "")
+    )
     # bake field → launch-spec field. Empty bake fields are skipped so an
     # older bake missing `luks_header_sha256` falls back to requiring it
     # on the intent (validated downstream).
@@ -587,10 +699,16 @@ def _refuse_held(locked: Any) -> None:
         raise LaunchIntentError(f"vm {locked.vm_id!r} is held by another operation", "conflict")
 
 
-def start_launch(*, intent: dict[str, Any], userdata: bytes, decided_by: Any) -> LaunchJob:
+def start_launch(
+    *, intent: dict[str, Any], userdata: bytes, decided_by: Any, cdn_node: bool = False
+) -> LaunchJob:
     """Validate the intent, stage `userdata` to Vault, and enqueue a
     `LaunchJob`. The KEK is NOT staged here — `intent['kek_vault_path']`
     names where the worker reads it (the bake's path).
+
+    `cdn_node` is the CDN fleet reconciler's, in-process only: it launches
+    the CDN node the intent's `vm_id` names (`_check_cdn_role`). No HTTP
+    caller can set it.
 
     Raises [`LaunchIntentError`] on a bad body / an in-flight launch for
     the same VM / a Vault failure.
@@ -663,6 +781,8 @@ def start_launch(*, intent: dict[str, Any], userdata: bytes, decided_by: Any) ->
         )
 
     _resolve_bake(intent)
+    _check_artifact_restriction(intent)
+    _check_cdn_role(intent, cdn_node=cdn_node)
     binding = _intent_binding(intent)
     # M1/M2: nothing that reaches the measured cmdline may carry a
     # cloud-init `cc:` / `end_cc` marker. Every relaunch or the worker

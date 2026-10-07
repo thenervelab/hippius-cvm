@@ -131,6 +131,18 @@ jobs:
           # golden-bake PR1: the --disk-mode selector gate (legacy_luks
           # default intact; golden_verity_overlay accepted). Root-free.
           bash scripts/dev/disk-mode-test.sh
+          # CDN I3: the cdn-node bake profile gate + its rootfs installer
+          # (users, units, rendered configs, guard, firewall, no sshd).
+          # Root-free; needs python3 (tomllib) only.
+          shellcheck -S warning scripts/cdn-node/install-cdn-node.sh scripts/dev/cdn-node-profile-test.sh
+          bash scripts/dev/cdn-node-profile-test.sh
+          # cdn-node ephemeral root: the marker-gated discard of the golden
+          # upper, data/ scrub + noexec, panic=10 and M0-only in the golden
+          # overlay library; inert without the marker. Root-free.
+          shellcheck -S warning -x scripts/dev/golden-ephemeral-test.sh
+          bash scripts/dev/golden-ephemeral-test.sh
+          # The initramfs shell is not bash: run the library under dash too.
+          dash scripts/dev/golden-ephemeral-test.sh
           # F6: --package-refresh gate, stage-1 cache key, and the gated
           # upgrade in both chroot arms. Root-free.
           bash scripts/dev/package-refresh-test.sh
@@ -518,6 +530,33 @@ jobs:
         run: git diff --exit-code -- Cargo.lock
       - name: dm-verity rootfs reproducibility
         run: bash packer/kbs-uki/uki/scripts/test-build-rootfs.sh
+
+  # The miner-agent's net-policy rulesets, loaded into a real kernel. The
+  # render tests pin the text (`binaries/miner-agent/tests/data/netpolicy/`);
+  # this proves the kernel accepts that text, and that a second load over
+  # the existing tables works (the agent reloads on drift and at start).
+  # Each file runs in its own network namespace, never on the runner's.
+  netpolicy-nft:
+    runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: Install nft
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables
+          nft --version
+      - name: Load each golden ruleset twice in a scratch netns
+        run: |
+          set -eu
+          for f in binaries/miner-agent/tests/data/netpolicy/*.nft; do
+            echo "== $f"
+            sudo unshare --net sh -euc '
+              nft -f "$1"
+              nft -f "$1"
+              nft -s -t list table inet hippius_guest
+              nft -s -t list table bridge hippius_guest_br
+            ' sh "$f"
+          done
 
   sentinel:
     runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}

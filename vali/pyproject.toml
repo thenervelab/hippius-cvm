@@ -33,6 +33,10 @@ dependencies = [
     # presigning. Without it the boto factory raises S3ClientUnavailable
     # at the first snapshot presign and the migration stalls.
     "boto3>=1.34,<2",
+    # Ed25519 + X.509 for the CDN CA (apps.cdn.ca) and the registry-feed
+    # signature. It used to arrive only through google-auth (kubernetes);
+    # the CA builds certificates with it, so it is a direct dependency.
+    "cryptography>=42,<51",
 ]
 
 [project.optional-dependencies]

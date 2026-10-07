@@ -9,6 +9,9 @@ from .views import (
     EdgeDesiredView,
     EdgeDetailView,
     EdgeListView,
+    EgressRegionDetailView,
+    EgressRegionListView,
+    PublicIpSmtpView,
     VmPublicIpView,
 )
 
@@ -31,5 +34,18 @@ urlpatterns = [
         "network/edges/<slug:name>/applied",
         EdgeAppliedView.as_view(),
         name="network_edge_applied",
+    ),
+    path(
+        "network/egress-regions", EgressRegionListView.as_view(), name="network_egress_regions"
+    ),
+    path(
+        "network/egress-regions/<str:region>",
+        EgressRegionDetailView.as_view(),
+        name="network_egress_region",
+    ),
+    path(
+        "network/public-ips/<str:address>/smtp",
+        PublicIpSmtpView.as_view(),
+        name="network_public_ip_smtp",
     ),
 ]

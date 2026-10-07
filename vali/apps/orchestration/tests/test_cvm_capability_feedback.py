@@ -759,3 +759,29 @@ def test_auto_migration_prefers_away_from_a_merely_degraded_destination(
     assert cvm_capability.capability_of(DST_NODE) == cvm_capability.DEGRADED
 
     assert _departing_drain(monkeypatch) == ["node-third"]
+
+
+@pytest.mark.parametrize("cdn_node", [False, True])
+def test_auto_migration_never_enrols_a_cdn_node(monkeypatch, cdn_node: bool) -> None:
+    """A CDN node on a departing miner is replaced by the CDN reconciler,
+    never migrated (CDN plan V3)."""
+    from apps.cdn.models import CdnNode
+    from apps.scheduler.models import Placement, PlacementStatus
+
+    vm = make_vm(generation=5, host="node-src")
+    if cdn_node:
+        CdnNode.objects.create(node_id=vm.vm_id, region="FR", vm=vm)
+    Placement.objects.create(
+        vm=vm,
+        vm_family="tenant-1",
+        owner="user-1",
+        resource_class="small",
+        miner_node_id=SRC_NODE,
+        status=PlacementStatus.BOUND.value,
+        chain_epoch=10,
+        bound_at=timezone.now(),
+        decided_by=make_service_client(),
+    )
+    _mirror(SRC_NODE)
+    _mirror(DST_NODE)
+    assert bool(_departing_drain(monkeypatch)) is not cdn_node

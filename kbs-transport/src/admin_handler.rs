@@ -218,6 +218,10 @@ pub struct AdminState {
     /// log=release` pages from the live index. `None` ⇒ that log answers
     /// 503 `audit-log-unavailable` (the admin chain is always `audit`).
     pub release_audit: Option<Arc<kbs_core::audit::FileAuditSink>>,
+    /// `[cdn_fleet] enabled`: derives + signs fleet public keys for
+    /// `POST /v1/admin/cdn-fleet/public`. `None` ⇒ that route answers 404
+    /// `cdn-fleet-disabled`.
+    pub cdn_fleet: Option<Arc<dyn crate::cdn_fleet::CdnFleetPublisher>>,
 }
 
 /// What the rollback routes need beyond the shared stores.
@@ -250,6 +254,7 @@ impl Clone for AdminState {
             keepalive_bindings: Arc::clone(&self.keepalive_bindings),
             rollback: self.rollback.clone(),
             release_audit: self.release_audit.clone(),
+            cdn_fleet: self.cdn_fleet.clone(),
         }
     }
 }
@@ -292,6 +297,10 @@ pub fn build_admin_router(state: AdminState) -> Router {
         .route("/v1/admin/custody", get(handle_get_custody_report))
         .route("/v1/admin/custody/policy", post(handle_set_custody_policy))
         .route("/v1/admin/allowlist/reload", post(handle_reload_allowlist))
+        .route(
+            "/v1/admin/cdn-fleet/public",
+            post(crate::cdn_fleet::handle_cdn_fleet_public),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_ADMIN_BODY_BYTES))
         // The rollback routes cap their own bodies in `rollback_prologue`
         // (per route, see `MAX_AUTHORIZE_ROLLBACK_BODY_BYTES`), so an
@@ -3109,6 +3118,7 @@ mod tests {
                 ),
                 rollback: Some(rollback),
                 release_audit: None,
+                cdn_fleet: None,
             },
             sk,
             kid,
@@ -4819,6 +4829,7 @@ mod tests {
             ),
             rollback: None,
             release_audit: None,
+            cdn_fleet: None,
         }
     }
 
@@ -6363,5 +6374,124 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         }
+    }
+
+    // ── POST /v1/admin/cdn-fleet/public ─────────────────────────────────
+
+    fn cdn_fleet_request(body: &str, peer: Option<PeerCertInfo>) -> Request {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/admin/cdn-fleet/public")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(p) = peer {
+            builder = builder.extension(p);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn json_body(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cdn_fleet_public_is_404_when_the_class_is_off() {
+        let td = TempDir::new().unwrap();
+        let (state, _sk, _kid) = build_state(&td);
+        let router = build_admin_router(state);
+        let resp = router
+            .oneshot(cdn_fleet_request(r#"{"version":1}"#, Some(vali_peer())))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(resp).await["reason"], "cdn-fleet-disabled");
+    }
+
+    #[tokio::test]
+    async fn cdn_fleet_public_returns_a_signed_key_and_audits_the_call() {
+        use base64::Engine;
+        let td = TempDir::new().unwrap();
+        let (mut state, _sk, _kid) = build_state(&td);
+        let raw = [0x24u8; 32];
+        state.cdn_fleet = Some(Arc::new(crate::cdn_fleet::test_support::publisher(
+            3, raw, [6u8; 32],
+        )));
+        let router = build_admin_router(state);
+
+        // No client identity: refused even on a plaintext listener.
+        let resp = router
+            .clone()
+            .oneshot(cdn_fleet_request(r#"{"version":3}"#, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Bad bodies.
+        for (body, want) in [
+            (r#"{"version":0}"#, "cdn-fleet-bad-version"),
+            (r#"{"version":4294967296}"#, "cdn-fleet-bad-version"),
+            (r#"{"version":3,"x":1}"#, "cdn-fleet-body-decode"),
+            ("not json", "cdn-fleet-body-decode"),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(cdn_fleet_request(body, Some(vali_peer())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json_body(resp).await["reason"], want, "{body}");
+        }
+        // A version that was never minted.
+        let resp = router
+            .clone()
+            .oneshot(cdn_fleet_request(r#"{"version":4}"#, Some(vali_peer())))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = router
+            .oneshot(cdn_fleet_request(r#"{"version":3}"#, Some(vali_peer())))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: crate::cdn_fleet::CdnFleetPublicResponse =
+            serde_json::from_value(json_body(resp).await).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let public: [u8; 32] = b64
+            .decode(&body.x25519_public_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sig: [u8; 64] = b64
+            .decode(&body.kbs_signature_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(body.version, 3);
+        assert_eq!(body.kbs_kid_hex, hex::encode(b"kbs-kid"));
+        assert_eq!(
+            public,
+            kbs_core::cdn_fleet::public_key(&kbs_core::cdn_fleet::clamp(&raw))
+        );
+        let vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        assert_eq!(body.kbs_public_key_hex, hex::encode(vk.to_bytes()));
+        kbs_core::cdn_fleet::verify_public_key(&vk, 3, &public, &sig).unwrap();
+
+        let log = std::fs::read_to_string(td.path().join("audit").join("admin.log")).unwrap();
+        let decoded: Vec<String> = log
+            .lines()
+            .map(|line| {
+                let bytes = hex::decode(line.split(':').nth(1).unwrap()).unwrap();
+                format!(
+                    "{:?}",
+                    ciborium::de::from_reader::<ciborium::value::Value, _>(bytes.as_slice())
+                        .unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(decoded.len(), 7, "one row per call");
+        assert!(decoded.iter().all(|d| d.contains("cdn-fleet-public")));
+        let last = decoded.last().unwrap();
+        assert!(last.contains("version=3"), "{last}");
+        assert!(last.contains("spiffe://hippius.network/vali"), "{last}");
     }
 }

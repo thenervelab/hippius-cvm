@@ -135,6 +135,7 @@ mod tests {
             userdata_version: 1,
             lifecycle_path: None,
             lifecycle_version: None,
+            cdn_fleet_versions: None,
         }
     }
 

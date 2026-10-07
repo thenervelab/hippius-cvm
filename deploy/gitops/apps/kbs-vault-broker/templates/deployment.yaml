@@ -38,7 +38,10 @@ spec:
       runtimeClassName: kata-qemu-snp
       nodeSelector:
         node-role.hippius.network/confidential-compute: "true"
-      # The broker never calls the Kubernetes API — no token to mount.
+      # Its identity at Vault (jwt auth). The broker never calls the
+      # Kubernetes API: the API-audience token is NOT mounted, only the
+      # `vault`-audience projected token below.
+      serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
       automountServiceAccountToken: false
       {{- if .Values.image.pullSecret.enabled }}
       # Authenticated guest-pull (see values.yaml `image.pullSecret`).
@@ -69,47 +72,17 @@ spec:
           args:
             - "/etc/kbs-vault-broker/config.toml"
           env:
-            # ⛔ DO NOT SYNC THIS APP. Syncing it takes the whole platform
-            # down, immediately and completely:
-            #
-            #   `strategy: Recreate` (above, with replicaCount 1) DELETES the
-            #   running broker BEFORE starting its replacement. The
-            #   replacement cannot start, because the Secret named below does
-            #   not exist — CreateContainerConfigError. There is no old pod
-            #   left to fall back to.
-            #
-            #   With no broker there is no scoped Vault capability, so the KBS
-            #   cannot unwrap any tenant KEK. NOTHING unlocks: no VM launch
-            #   completes, no §24 crypto-erase runs, and every running guest
-            #   that needs a re-release is stuck. It stays down until someone
-            #   notices and reverts the sync.
-            #
-            # This is NOT a rollout that fails safely. Do not "just try it".
-            #
-            # Why the reference is dangling, on purpose: #892 replaced this
-            # static-token auth with a projected ServiceAccount JWT
-            # (BROKER_VAULT_JWT_{ROLE,AUTH_PATH,TOKEN_PATH} + a
-            # `serviceAccountToken` volume at /var/run/secrets/vault), which
-            # is what the live Deployment has run since 2026-08-09. #888 then
-            # retired the static token itself: neither `kbs-vault-broker-token`
-            # nor its ExternalSecret exists in the cluster any more, and the
-            # template that used to materialise it
-            # (`external-secret-vault-token.yaml`) was deleted in #975.
-            #
-            # Left pointing at nothing DELIBERATELY, rather than restoring a
-            # template that would quietly recreate a REVOKED credential and
-            # let the broker come up authenticating with it.
-            #
-            # The fix — rewriting this block and re-pinning the image digest
-            # past #892 — is a separate change. It needs the real
-            # broker-image.yml run URL for d1302ca, because `provenance:` in
-            # values.yaml is machine-checked against the Sigstore certificate
-            # by .github/scripts/verify_image_provenance.py.
-            - name: BROKER_VAULT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: kbs-vault-broker-token
-                  key: vault-token
+            # jwt auth to Vault (#892): the broker logs in with the projected
+            # `vault`-audience ServiceAccount token mounted below. No static
+            # token exists any more; before 2026-10-07 this block pointed at
+            # the deleted `kbs-vault-broker-token` Secret, which made a sync
+            # of this app unstartable.
+            - name: BROKER_VAULT_JWT_ROLE
+              value: {{ .Values.vaultAuth.role | quote }}
+            - name: BROKER_VAULT_JWT_AUTH_PATH
+              value: {{ .Values.vaultAuth.authPath | quote }}
+            - name: BROKER_VAULT_JWT_TOKEN_PATH
+              value: {{ printf "%s/token" .Values.vaultAuth.mountPath | quote }}
           ports:
             - name: http
               containerPort: {{ .Values.config.listenPort }}
@@ -162,6 +135,9 @@ spec:
             - name: config
               mountPath: /etc/kbs-vault-broker
               readOnly: true
+            - name: vault-sa-token
+              mountPath: {{ .Values.vaultAuth.mountPath | quote }}
+              readOnly: true
             {{- if .Values.tls.enabled }}
             # RA-KBS-M1 — server-TLS cert + key (broker-tls Secret).
             - name: broker-tls
@@ -183,6 +159,15 @@ spec:
         - name: config
           configMap:
             name: kbs-vault-broker-config
+        # The Vault login credential (jwt auth): a short-lived,
+        # `vault`-audience ServiceAccount token.
+        - name: vault-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.vaultAuth.audience | quote }}
+                  expirationSeconds: {{ .Values.vaultAuth.expirationSeconds }}
         {{- if .Values.tls.enabled }}
         # RA-KBS-M1 — server-TLS cert + key from Vault (broker-tls).
         - name: broker-tls

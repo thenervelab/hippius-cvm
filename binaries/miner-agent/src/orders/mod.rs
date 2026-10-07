@@ -77,8 +77,8 @@ pub use migration::{
 pub use types::{
     BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
     MigrateQuiesceOrder, MigrateSnapshotOrder, NetEndpoint, NetPolicyLocalAction, NetPolicyMode,
-    NetPolicyOrder, NetProto, Order, OrderBody, OrderKind, OrderSubject, PreflightArtifact,
-    RestoreOrder, SignedOrder, StopOrder, TenantPreflightOrder, ORDER_DOMAIN,
+    NetPolicyOrder, NetProto, NetSpec, Order, OrderBody, OrderKind, OrderSubject,
+    PreflightArtifact, RestoreOrder, SignedOrder, StopOrder, TenantPreflightOrder, ORDER_DOMAIN,
 };
 
 /// Default TCP port the orders HTTP server binds (on the NetBird
@@ -174,9 +174,9 @@ pub struct OrderState {
     /// Staged restores (`restore` order + status route). `None` ⇒ the
     /// routes answer `503 restore-disabled`.
     pub restore: Option<Arc<crate::backup::staged::RestoreManager>>,
-    /// The persisted host net policy. `None` ⇒ the `net-policy` route
-    /// answers `503 net-policy-disabled`.
-    pub net_policy: Option<Arc<crate::netpolicy::NetPolicyStore>>,
+    /// The host net policy (persisted and loaded). `None` ⇒ the
+    /// `net-policy` route answers `503 net-policy-disabled`.
+    pub net_policy: Option<Arc<crate::netpolicy::NetPolicyEnforcer>>,
 }
 
 impl OrderState {
@@ -225,9 +225,9 @@ impl OrderState {
         self
     }
 
-    /// Accept `net-policy` orders into `store`.
-    pub fn with_net_policy(mut self, store: Arc<crate::netpolicy::NetPolicyStore>) -> Self {
-        self.net_policy = Some(store);
+    /// Accept `net-policy` orders through `enforcer`.
+    pub fn with_net_policy(mut self, enforcer: Arc<crate::netpolicy::NetPolicyEnforcer>) -> Self {
+        self.net_policy = Some(enforcer);
         self
     }
 
@@ -843,10 +843,10 @@ async fn route_tenant_preflight(State(st): State<OrderState>, body: Bytes) -> Re
 }
 
 /// Host-wide net policy — a signed order naming no VM. Persisted under
-/// the replay rules of [`crate::netpolicy::store`]; the response is the
-/// ack `applied:<revision>:<sha256>`.
+/// the replay rules of [`crate::netpolicy::store`] and loaded; the
+/// response is the ack `applied:<revision>:<sha256>`.
 async fn route_net_policy(State(st): State<OrderState>, body: Bytes) -> Response {
-    let Some(store) = st.net_policy.clone() else {
+    let Some(enforcer) = st.net_policy.clone() else {
         return reject(
             OrderKind::NetPolicy,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -859,7 +859,7 @@ async fn route_net_policy(State(st): State<OrderState>, body: Bytes) -> Response
         body,
         OrderKind::NetPolicy,
         move |_lifecycle, order: NetPolicyOrder| async move {
-            handler::handle_net_policy(&store, clock.now_unix(), order)
+            handler::handle_net_policy(&enforcer, clock.now_unix(), order).await
         },
     )
     .await

@@ -162,10 +162,12 @@ mkdir -p "${OLD_SCRIPTS}"
 find "${REAL_SCRIPTS}" -maxdepth 1 -type f -exec cp {} "${OLD_SCRIPTS}/" \;
 # Remnant patterns per shipped patch. `_hippius_golden_relabel_from`
 # counts by its DEFINITION only: the M0 guard ships it, the data bind calls it.
+# Likewise the data path's two constants: later code that only a fresh bake
+# ships (the cdn-node ephemeral root) uses them.
 remnant_re() {
     case "$(basename "$1")" in
         m0-initramfs-guard.patch) echo 'hippius_golden_harden_root|hippius_golden_has_no_credential_import|hippius_golden_write_masks|_hippius_golden_mask_path|_hippius_golden_relabel_from\(\)|M0 UNTRUSTED-MINER|99-zz-hippius-harden' ;;
-        m1-golden-data-bind.patch) echo 'hippius_golden_bind_data|HIPPIUS_GOLDEN_DATA_|/var/lib/hippius-data' ;;
+        m1-golden-data-bind.patch) echo 'hippius_golden_bind_data|HIPPIUS_GOLDEN_DATA_(NAME|MOUNT)=|/var/lib/hippius-data' ;;
         m2-golden-mask-data-disk.patch) echo 'hippius-data-disk' ;;
         m3-golden-sshd-key-only.patch) echo '00-hippius-harden|HIPPIUS_SSHD_HARDEN|sshd key-only|_hippius_golden_selinux_ctx' ;;
         m4-golden-guest-components.patch) echo 'hippius_golden_mount_components|_hippius_golden_components_|HIPPIUS_GUEST_|hippius_golden_parse_release' ;;

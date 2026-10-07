@@ -466,6 +466,21 @@ def _reject_cordoned_dest(dest_node_id: str) -> None:
         )
 
 
+def _reject_cdn_colocated_dest(vm: Vm, dest_node_id: str) -> None:
+    """Refuse an EXPLICIT destination for the CDN node `vm` that already
+    carries another CDN node (CDN plan N2: one per host), or has no local
+    edge for it (v1: none behind a remote edge); `decide_placement` never
+    sees a destination the API / CLI name."""
+    from apps.scheduler import service as sched
+
+    reason = sched.cdn_colocation_reason(vm.tenant_id, vm.vm_id, dest_node_id)
+    if reason is not None:
+        raise StartError(reason, "dest-has-cdn-node")
+    reason = sched.cdn_edge_reason(vm.tenant_id, vm.vm_id, dest_node_id)
+    if reason is not None:
+        raise StartError(reason, "cdn-no-local-edge")
+
+
 def _reject_disk_full_dest(vm: Vm, dest_node_id: str) -> None:
     """Refuse an EXPLICIT §25 destination with no room for the VM's DATA
     disk, under `VALI_SCHEDULER_DISK_GATE=enforce` (record: logged and
@@ -590,6 +605,7 @@ def start_migration(
     _reject_cvm_incapable_dest(dest_node_id)
     _reject_zombie_quarantined_dest(dest_node_id)
     _reject_cordoned_dest(dest_node_id)
+    _reject_cdn_colocated_dest(vm, dest_node_id)
     _reject_disk_full_dest(vm, dest_node_id)
     # §24/§25 GAP-3 — the EOL nonce is NOT (re-)minted for a migration.
     # For a COLD migration the source guest signs its `stopped{}` ack from
@@ -1272,12 +1288,16 @@ def enroll_departing_miner_migrations() -> int:
     bound = Placement.objects.filter(
         status=PlacementStatus.BOUND, miner_node_id__in=departing
     ).select_related("vm")
+    from apps.cdn.identity import is_cdn_vm
+
     for placement in bound:
         vm = placement.vm
         if vm.state != VmState.ACTIVE:
             continue
         if vm.power_state not in (VmPowerState.RUNNING, VmPowerState.STOPPED):
             continue  # a power op in flight — next tick
+        if is_cdn_vm(vm.vm_id):
+            continue  # replaced by the CDN reconciler, never migrated
         # A STOPPED VM migrates COLD: started on its source for the warm
         # §25, stopped again at the destination (#1150) — but not again right
         # after a cold attempt failed (each one relaunches the guest).
@@ -1313,6 +1333,8 @@ def enroll_departing_miner_migrations() -> int:
                 capacity_by_node=cap,
                 load_by_node=load,
                 family_load_by_node=family,
+                max_family_per_node=sched.cdn_family_cap(placement.vm_family),
+                **sched.cdn_edge_arguments(placement.vm_family, vm.vm_id),
                 max_epoch_lag=sched.max_epoch_lag(),
                 # Exclude the departing source AND every cross-generation
                 # candidate (a cross-gen dest fails the KBS release, §25).
@@ -1340,6 +1362,8 @@ def enroll_departing_miner_migrations() -> int:
                 # Never move a tenant onto a miner still running a VM
                 # whose §24 crypto-erase already ran.
                 zombie_quarantined=sched.zombie_quarantined_node_ids(),
+                # Gate (i) — no edge-region miner without a fresh net-policy ack.
+                net_policy_unready=sched.net_policy_unready_node_ids(),
                 cordoned=sched.cordoned_node_ids(),
                 # Capacity v2 — the destination must fit THIS VM's flavor.
                 # No shadow line: this runs per VM per tick.
@@ -1689,6 +1713,14 @@ def _reboot_recovery_step(vm: Vm, *, now: Any, cutoff: Any) -> bool:
             consecutive_down=0, consecutive_wedged=0
         ).update(consecutive_down=0, consecutive_wedged=0)
         _settle_abandoned_power_marker(vm, now=now, cutoff=cutoff)
+        return False
+
+    # A CDN node is REPLACED, never relaunched (CDN plan V3): its root is
+    # ephemeral and its NetBird enrolment does not survive the reboot. The
+    # CDN reconciler fails it once its guest goes quiet and launches another.
+    from apps.cdn.identity import is_cdn_vm
+
+    if is_cdn_vm(vm.vm_id):
         return False
 
     node_id = effects._bound_miner_id(vm)
@@ -3362,6 +3394,24 @@ def tick_once() -> TickReport:
         public_ip_retargets = reconcile_public_ips().retargeted
     except Exception:  # noqa: BLE001 — the sweep must not break the tick.
         log.exception("public-ip: unhandled error in reconcile")
+
+    # Guest network policy: push each selected miner its `net-policy`
+    # order and record the ack. Inert unless VALI_NET_POLICY_PUSH.
+    try:
+        from apps.network.net_policy import reconcile as reconcile_net_policies
+
+        reconcile_net_policies()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("net-policy: unhandled error in reconcile")
+
+    # The CDN fleet: launch, ready, drain and replace nodes per region.
+    # Inert unless VALI_CDN_ENABLED and VALI_CDN_RECONCILE_ENABLED.
+    try:
+        from apps.cdn.reconcile import reconcile as reconcile_cdn
+
+        reconcile_cdn()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("cdn: unhandled error in reconcile")
 
     # Live VM backups: follow in-flight runs, start the due ones, prune.
     # Inert unless VALI_BACKUP_ENABLED. Lazy import, like the network app.

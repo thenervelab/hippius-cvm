@@ -26,6 +26,12 @@ use std::path::{Component, Path, PathBuf};
 use super::cvm_handle::{DomainUuid, VmId};
 use super::libvirt_driver::DomainId;
 use crate::error::{MinerAgentError, Result};
+use crate::netpolicy::caps::Rate;
+use crate::orders::types::NetSpec;
+
+/// Prefix of a tenant tap's deterministic name, `hvt<cid>`. libvirt
+/// reserves `vnet*` for the names it picks itself.
+pub const TENANT_TAP_PREFIX: &str = "hvt";
 
 /// Filesystem root the miner-agent owns. The per-VM LUKS data disk
 /// must resolve to a path under it — never an arbitrary host path.
@@ -139,6 +145,10 @@ pub struct QemuConfig {
     /// pinned into the libvirt `<vsock>` device; the guest connects
     /// back on it and the miner-agent maps it to this `vm_id`.
     pub cid: u32,
+    /// The NIC settings of the order ([`NetSpec`]). `None` renders
+    /// today's NIC: an auto-named `vnet*` tap, no cap, no filter. Not a
+    /// measured launch input.
+    pub net: Option<NetSpec>,
 }
 
 impl QemuConfig {
@@ -182,6 +192,15 @@ impl QemuConfig {
         // device would make libvirt refuse the domain.
         if self.cid < crate::vsock::peer::MIN_GUEST_CID {
             return Err(MinerAgentError::LaunchInput("cid-reserved"));
+        }
+        if let Some(NetSpec {
+            cap_mbps: Some(mbps),
+            ..
+        }) = self.net
+        {
+            if !(1..=crate::netpolicy::MAX_VM_CAP_MBPS).contains(&mbps) {
+                return Err(MinerAgentError::LaunchInput("net-cap"));
+            }
         }
         validate_input_path(&self.ovmf_path, "ovmf-path")?;
         validate_input_path(&self.kernel_path, "kernel-path")?;
@@ -359,10 +378,7 @@ impl QemuConfig {
              <target dev='vdd' bus='virtio'/>\n    \
              </disk>\n    \
              {data_disk_xml}\
-             <interface type='network'>\n      \
-             <source network='default'/>\n      \
-             <model type='virtio'/>\n    \
-             </interface>\n    \
+             {interface_xml}\
              <serial type='pty'>\n      \
              <target type='isa-serial' port='0'/>\n    \
              </serial>\n    \
@@ -392,7 +408,69 @@ impl QemuConfig {
             rootfs_hash = rootfs_hash,
             state_disk = state_disk,
             data_disk_xml = data_disk_xml,
+            interface_xml = self.interface_xml(),
             cid = self.cid,
+        )
+    }
+
+    /// The guest NIC on the `default` network. Without [`Self::net`] it
+    /// is the historical block, byte for byte. With it (egress design
+    /// §6.1, §7):
+    ///
+    /// - the tap is named `hvt<cid>`, so host rules can key on the
+    ///   bridge port. The CID is unique among the host's live domains and
+    ///   at most 65535, so the name fits `IFNAMSIZ`; a CID re-allocated
+    ///   after a collision renames the tap with it.
+    /// - `clean-traffic` drops frames whose MAC, IP or ARP is not the
+    ///   guest's own; the IP is learned from the DHCP lease, trusting
+    ///   only the `default` network's DHCP server on `virbr0` (the same
+    ///   address the host rules assume). It also drops IPv6.
+    /// - `<bandwidth>` caps both directions at `cap_mbps` from the first
+    ///   packet; the host's `net-policy` re-applies its own cap later.
+    /// - `<port isolated='yes'/>` stops L2 traffic between guests. It
+    ///   only separates isolated ports from each other: a domain launched
+    ///   before this keeps a plain port (and no filter) until it is
+    ///   relaunched, and can still reach these at L2.
+    fn interface_xml(&self) -> String {
+        let Some(net) = &self.net else {
+            return "<interface type='network'>\n      \
+                    <source network='default'/>\n      \
+                    <model type='virtio'/>\n    \
+                    </interface>\n    "
+                .to_string();
+        };
+        let bandwidth = match net.cap_mbps {
+            Some(mbps) => {
+                let rate = Rate::from_mbps(mbps);
+                format!(
+                    "<bandwidth>\n        \
+                     <inbound {attrs}/>\n        \
+                     <outbound {attrs}/>\n      \
+                     </bandwidth>\n      ",
+                    attrs = rate.xml_attrs(),
+                )
+            }
+            None => String::new(),
+        };
+        let isolated = if net.isolate {
+            "<port isolated='yes'/>\n      "
+        } else {
+            ""
+        };
+        format!(
+            "<interface type='network'>\n      \
+             <source network='default'/>\n      \
+             <target dev='{TENANT_TAP_PREFIX}{cid}'/>\n      \
+             <model type='virtio'/>\n      \
+             {bandwidth}\
+             {isolated}\
+             <filterref filter='clean-traffic'>\n        \
+             <parameter name='CTRL_IP_LEARNING' value='dhcp'/>\n        \
+             <parameter name='DHCPSERVER' value='{dhcp_server}'/>\n      \
+             </filterref>\n    \
+             </interface>\n    ",
+            cid = self.cid,
+            dhcp_server = crate::netpolicy::render::GUEST_BRIDGE_ADDR,
         )
     }
 }
@@ -559,6 +637,7 @@ mod tests {
             memory_mb: 2048,
             golden: false,
             cid: 7,
+            net: None,
         }
     }
 

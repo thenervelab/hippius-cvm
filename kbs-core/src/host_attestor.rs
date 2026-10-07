@@ -157,6 +157,11 @@ fn run(req: &HostAttestationRequest, deps: &HostAttestationDeps) -> Result<Signe
                 "measurement is Tenant-class, not a host-attestor measurement".into(),
             ));
         }
+        Some(AllowlistClass::CdnNode) => {
+            return Err(KbsError::Attestation(
+                "measurement is cdn_node-class, not a host-attestor measurement".into(),
+            ));
+        }
         None => {
             return Err(KbsError::Attestation(
                 "measurement not in offline KBS allowlist (host-attestor class required)".into(),
@@ -243,6 +248,22 @@ mod tests {
         }
         fn class_of(&self, _m: &[u8; MEASUREMENT_LEN]) -> Option<AllowlistClass> {
             Some(AllowlistClass::Tenant)
+        }
+    }
+
+    struct CdnNodeClass;
+    impl MeasurementAllowlist for CdnNodeClass {
+        fn contains(&self, _m: &[u8; MEASUREMENT_LEN]) -> bool {
+            true
+        }
+        fn accepts_l1_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn accepts_kbs_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn class_of(&self, _m: &[u8; MEASUREMENT_LEN]) -> Option<AllowlistClass> {
+            Some(AllowlistClass::CdnNode)
         }
     }
 
@@ -436,6 +457,37 @@ mod tests {
             process_host_attestation(&req, &deps),
             Err(KbsError::Attestation(_))
         ));
+        assert!(!audit.records.lock().unwrap()[0].0);
+    }
+
+    /// A CDN node's measurement is no host attestor either: the class
+    /// namespaces are disjoint in every direction.
+    #[test]
+    fn rejects_cdn_node_class_measurement() {
+        let expected_rd = report_data::host_attestor(&NONCE, &SIGNER_PK, NODE_ID).unwrap();
+        let verifier = StubVerifier {
+            report: mk_report(expected_rd),
+        };
+        let allowlist = CdnNodeClass;
+        let signing_key = key();
+        let audit = RecordingAudit::default();
+        let enr = enrollment(SIGNER_PK, NODE_ID);
+        let req = HostAttestationRequest {
+            enrollment: &enr,
+            nonce: &NONCE,
+            now_unix: 1_800_000_000,
+            expiry_unix: 1_800_003_600,
+        };
+        let deps = HostAttestationDeps {
+            attn: &verifier,
+            allowlist: &allowlist,
+            kbs_signing_key: &signing_key,
+            audit: &audit,
+        };
+        match process_host_attestation(&req, &deps) {
+            Err(KbsError::Attestation(m)) => assert!(m.contains("cdn_node-class"), "{m}"),
+            other => panic!("expected a cdn_node-class refusal, got {other:?}"),
+        }
         assert!(!audit.records.lock().unwrap()[0].0);
     }
 

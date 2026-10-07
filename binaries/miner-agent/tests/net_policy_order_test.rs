@@ -1,7 +1,8 @@
 //! `net-policy` order intake over real HTTP: the ticket-validator's
 //! encoded body from `test_vectors/orders/net_policy_v1.json`, signed with
-//! the test Edge key, is accepted and acked; replays are refused, also
-//! by a restarted agent over the same state directory.
+//! the test Edge key, is accepted, loaded (into a fake `nft`) and acked;
+//! replays are refused, also by a restarted agent over the same state
+//! directory; a load failure is not acked.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -19,7 +20,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use hippius_miner_agent::lifecycle::{MockLaunchDigest, MockLibvirtDriver};
-use hippius_miner_agent::netpolicy::NetPolicyStore;
+use hippius_miner_agent::netpolicy::{
+    GuestTaps, MockNft, NetPolicyEnforcer, NetPolicyStore, SmtpTap, VirshTuner, VmCaps,
+};
 use hippius_miner_agent::orders::{
     Clock, EolShutdownAckSigner, IdempotencyStore, MigrationStore, NetPolicyOrder, OrderBody,
     OrderKind, OrderState, OrderVerifier, OrdersServer, ReqwestSnapshotDownloader,
@@ -69,9 +72,25 @@ fn edge_key() -> SigningKey {
     SigningKey::from_bytes(&[42u8; 32])
 }
 
-/// An orders server whose `net-policy` route persists under `dir`
-/// (`None` ⇒ route not wired).
+struct NoTaps;
+
+#[async_trait::async_trait]
+impl GuestTaps for NoTaps {
+    async fn taps(
+        &self,
+        _vms: &[hippius_miner_agent::lifecycle::VmId],
+    ) -> hippius_miner_agent::Result<Vec<SmtpTap>> {
+        Ok(Vec::new())
+    }
+}
+
+/// An orders server whose `net-policy` route persists under `dir` and
+/// loads into a fresh fake `nft` (`None` ⇒ route not wired).
 async fn spawn(dir: Option<&Path>) -> SocketAddr {
+    spawn_with(dir, Arc::new(MockNft::new())).await
+}
+
+async fn spawn_with(dir: Option<&Path>, nft: Arc<MockNft>) -> SocketAddr {
     let sk = edge_key();
     let verifier =
         Arc::new(OrderVerifier::from_hex(&hex::encode(sk.verifying_key().to_bytes())).unwrap());
@@ -98,7 +117,15 @@ async fn spawn(dir: Option<&Path>) -> SocketAddr {
         TaskTracker::new(),
     );
     let state = match dir {
-        Some(dir) => state.with_net_policy(Arc::new(NetPolicyStore::new(dir))),
+        Some(dir) => state.with_net_policy(Arc::new(NetPolicyEnforcer::new(
+            Arc::new(NetPolicyStore::new(dir)),
+            nft,
+            Arc::new(NoTaps),
+            Arc::new(VmCaps::new(
+                Arc::new(MockLibvirtDriver::new()),
+                Arc::new(VirshTuner::new("/nonexistent/virsh".into())),
+            )),
+        ))),
         None => state,
     };
     let server = OrdersServer::bind("127.0.0.1:0".parse().unwrap())
@@ -168,13 +195,26 @@ async fn post(addr: SocketAddr, body: &[u8]) -> (u16, String) {
 #[tokio::test]
 async fn the_encoded_vector_is_accepted_and_acked() {
     let dir = tempfile::tempdir().unwrap();
-    let addr = spawn(Some(dir.path())).await;
+    let nft = Arc::new(MockNft::new());
+    let addr = spawn_with(Some(dir.path()), nft.clone()).await;
     let v = vector();
     let (status, body) = post(addr, &sign_raw(v.body.clone())).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, format!("applied:7:{}", v.content_sha256));
     let stored = NetPolicyStore::new(dir.path()).current().unwrap().unwrap();
     assert_eq!(stored.order().unwrap(), v.payload);
+    // Loaded before the ack, with the vector's uplink hint, and saved
+    // for the boot unit.
+    let live = nft.live().unwrap();
+    assert!(live.contains(&v.content_sha256), "{live}");
+    assert!(
+        live.contains("oifname != { \"eth0\", \"virbr0\" }"),
+        "{live}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("ruleset.nft")).unwrap(),
+        live
+    );
 
     // A re-send under a fresh order id (vali's periodic repair) acks the same.
     let (status, again) = post(addr, &signed_policy("np-7-b", TEST_MINER_ID, &v.payload)).await;
@@ -249,4 +289,41 @@ async fn expired_wrong_miner_and_unwired_are_refused() {
         post(unwired, &sign_raw(v.body)).await,
         (503, "net-policy-disabled".to_string())
     );
+}
+
+#[tokio::test]
+async fn a_load_failure_is_not_acked_and_the_resend_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let nft = Arc::new(MockNft::new());
+    nft.set_fail_apply(true);
+    let addr = spawn_with(Some(dir.path()), nft.clone()).await;
+    let v = vector();
+    assert_eq!(
+        post(addr, &sign_raw(v.body.clone())).await,
+        (500, "net-policy-apply".to_string())
+    );
+    assert_eq!(nft.live(), None);
+
+    nft.set_fail_apply(false);
+    let (status, body) = post(addr, &signed_policy("np-7-r", TEST_MINER_ID, &v.payload)).await;
+    assert_eq!(
+        (status, body),
+        (200, format!("applied:7:{}", v.content_sha256))
+    );
+    assert!(nft.live().is_some());
+}
+
+#[tokio::test]
+async fn an_edge_mode_policy_is_refused_unpersisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let nft = Arc::new(MockNft::new());
+    let addr = spawn_with(Some(dir.path()), nft.clone()).await;
+    let mut edge = vector().payload;
+    edge.mode = hippius_miner_agent::orders::NetPolicyMode::Edge;
+    assert_eq!(
+        post(addr, &signed_policy("np-edge", TEST_MINER_ID, &edge)).await,
+        (422, "net-policy-unsupported".to_string())
+    );
+    assert_eq!(NetPolicyStore::new(dir.path()).current().unwrap(), None);
+    assert!(nft.applied().is_empty());
 }

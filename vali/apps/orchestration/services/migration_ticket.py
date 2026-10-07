@@ -77,6 +77,7 @@ from dataclasses import dataclass
 
 from django.conf import settings
 
+from apps.cdn import identity as cdn_identity
 from apps.orders.models import OrderTicketIntake
 
 from ..effects import EffectError, EffectUnavailable
@@ -532,7 +533,9 @@ def _mint_from(inputs: TicketInputs, *, ticket_id_prefix: str) -> bytes:
             allowed_userdata_digest_hex=digest_hex,
             flavor=inputs.flavor,
             vm_generation=generation,
-            lifecycle_perm=("launch",),
+            # A CDN node's ticket carries `cdn-node` on every re-mint, or
+            # the KBS refuses its `cdn_node`-class measurement.
+            lifecycle_perm=cdn_identity.ticket_perms(("launch",), vm_id),
             expiry_seconds=inputs.expiry_seconds,
             key_mode=inputs.key_mode,
         )

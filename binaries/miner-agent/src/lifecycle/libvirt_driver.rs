@@ -198,6 +198,27 @@ async fn run_virsh(mut cmd: Command, op: &'static str) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|_| MinerAgentError::LibvirtDriver(op))
 }
 
+/// The error for a failed `virsh start`, from its stderr.
+///
+/// `cid-in-use` when the CID the XML pins is taken, which shows up two
+/// ways: QEMU cannot bind the guest CID, or — for a domain whose tap is
+/// named after its CID (`hvt<cid>`, egress design §6.1) — libvirt
+/// cannot create the tap because an orphan QEMU on that CID still holds
+/// it. libvirt creates the tap before it starts QEMU, so the second form
+/// comes first. Both make the lifecycle burn the CID and retry on a
+/// fresh one (and so a fresh tap name). Only these closed-vocabulary
+/// markers are matched; the stderr itself is never surfaced.
+fn classify_start_failure(stderr: &str) -> MinerAgentError {
+    let cid_bound = stderr.contains("set guest cid") && stderr.contains("Address already in use");
+    let tap_taken = stderr.contains(super::qemu_config::TENANT_TAP_PREFIX)
+        && (stderr.contains("Device or resource busy") || stderr.contains("already exists"));
+    if cid_bound || tap_taken {
+        MinerAgentError::VsockCid("cid-in-use")
+    } else {
+        MinerAgentError::LibvirtDriver("create")
+    }
+}
+
 /// Production driver — shells out to `virsh`.
 pub struct VirshDriver {
     /// Absolute path to the `virsh` binary.
@@ -270,11 +291,9 @@ impl LibvirtDriver for VirshDriver {
         if output.status.success() {
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("set guest cid") && stderr.contains("Address already in use") {
-            return Err(MinerAgentError::VsockCid("cid-in-use"));
-        }
-        Err(MinerAgentError::LibvirtDriver("create"))
+        Err(classify_start_failure(&String::from_utf8_lossy(
+            &output.stderr,
+        )))
     }
 
     async fn destroy_domain(&self, id: &DomainId, graceful: bool) -> Result<()> {
@@ -681,6 +700,36 @@ mod tests {
             parse_domain_name("<domain></domain>"),
             Err(MinerAgentError::LibvirtDriver("name-parse"))
         ));
+    }
+
+    #[test]
+    fn a_taken_cid_or_cid_named_tap_is_cid_in_use() {
+        for stderr in [
+            "error: Failed to start domain 'hippius-tenant-a'\nerror: internal error: \
+             qemu unexpectedly closed the monitor: failed to set guest cid: Address already in use",
+            "error: Failed to start domain 'hippius-tenant-a'\nerror: Unable to create tap \
+             device hvt12: Device or resource busy",
+            "error: Failed to start domain 'hippius-tenant-a'\nerror: The hvt12 interface \
+             already exists",
+        ] {
+            assert_eq!(
+                classify_start_failure(stderr).to_string(),
+                MinerAgentError::VsockCid("cid-in-use").to_string(),
+                "{stderr}"
+            );
+        }
+        for stderr in [
+            "error: Failed to start domain 'hippius-tenant-a'\nerror: Unable to create tap \
+             device vnet3: Device or resource busy",
+            "error: referenced filter 'clean-traffic' is missing",
+            "",
+        ] {
+            assert_eq!(
+                classify_start_failure(stderr).to_string(),
+                MinerAgentError::LibvirtDriver("create").to_string(),
+                "{stderr}"
+            );
+        }
     }
 
     #[test]

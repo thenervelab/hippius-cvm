@@ -102,6 +102,7 @@ async fn spawn_admin_listener(
         wired.custody.clone(),
         Arc::clone(&wired.keepalive_bindings),
         Arc::clone(&wired.release_audit),
+        wired.cdn_fleet.clone(),
     )?;
     // The release path records the authorized-rollback events it owns
     // (consume / refused / cleared) in the SAME admin hash chain as the

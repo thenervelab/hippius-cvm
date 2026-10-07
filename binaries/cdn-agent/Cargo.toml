@@ -1,0 +1,78 @@
+[package]
+name = "hippius-cdn-agent"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CDN I1: the cdn-node control agent. Runs inside the measured cdn-node CVM next to OpenResty. Derives the per-VM node credential from the KBS-released lifecycle key, loads the boot-time cdn-fleet keyring, registers with the backend (challenge/response, per-request node signatures), long-polls the zone feed with ETags and a last-known-good snapshot, unseals certificate keys and zone secrets in RAM, pushes them to OpenResty over a local Unix control socket, keeps purge generations monotonic, meters every request into epoch-scoped counters, signs 60 s usage reports, and publishes the readiness bits behind /__hippius/health, and issues and renews certificates with ACME DNS-01 (I4). No log shipping (I5) or HTTP origins (I6) yet: only the interfaces they plug into."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-cdn-agent"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_cdn_agent"
+path = "src/lib.rs"
+
+[dependencies]
+# Node credential. `zeroize` makes `SigningKey` wipe on drop.
+#
+# Feature discipline: the measured guest binaries (agent-initramfs,
+# agent-tenant-telemetry) are built with `cargo build --bin ...` from the
+# workspace root, which unifies features across EVERY workspace member.
+# A feature this crate adds to a shared dependency changes those
+# binaries and therefore the tenant UKI measurement. So no shared crate
+# gets a new feature here: the PKCS#8 encoding is done by hand
+# (`identity::NodeKey::pkcs8_pem`) instead of enabling `pkcs8`/`pem`,
+# `zeroize` has no `serde`, `crypto_box` has no `std`, `toml` keeps only
+# `parse`. Check with `cargo tree --workspace -e features` before adding one.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+# HKDF-SHA256 node-key derivation from the lifecycle seed, the same
+# construction as `hippius-guest::telemetry_key` with its own label.
+hkdf = "0.12"
+sha2 = "0.10"
+# libsodium sealed boxes (`crypto_box_seal`), byte-compatible with the
+# backend's PyNaCl `SealedBox`. Fleet secret keys zeroize on drop.
+crypto_box = { version = "0.9", features = ["seal"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# `OsRng` for the counter epoch and backoff jitter.
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+# Node and served certificates: SAN, validity and SPKI checks.
+x509-parser = "0.16"
+# Checks that an unsealed certificate key matches its leaf (derives the
+# key's SPKI). A subset of the features the workspace already enables.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# I4: ECDSA P-256 for the ACME account key (JWS ES256) and certificate
+# keys, HMAC-SHA256 for the CA's external account binding. Already in the
+# graph through rustls, with exactly these (default) features.
+ring = "0.17"
+# Backend client: blocking + rustls, like the other guest agents. No
+# system OpenSSL, no async runtime in the agent's own code.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+base64 = "0.22"
+hex = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+# Latch SIGTERM/SIGINT so `main` returns and the keys' destructors run.
+signal-hook = "0.3"
+# `statvfs` for the cache size (safe wrapper, no `unsafe` here).
+rustix = { version = "1", features = ["fs"] }
+
+# `/dev/sev-guest` for the TLS-bound attestation report. Target-gated
+# like the other guest agents so dev hosts still build and test against
+# the mock provider.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+sev = { version = "7.1", default-features = false, features = ["snp"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only Ed25519 / P-256 certificates for the node-cert and
+# certificate-store checks.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }

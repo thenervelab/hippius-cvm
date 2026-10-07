@@ -765,6 +765,7 @@ mod tests {
             cose_ticket: serde_bytes::ByteBuf::from(ticket(vm)),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         }
     }
 

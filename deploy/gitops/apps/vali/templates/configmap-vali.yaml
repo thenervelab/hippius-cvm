@@ -50,6 +50,29 @@ data:
   VALI_GEO_REQUIRE_VERIFIED: {{ .Values.config.geoRequireVerified | quote }}
   # Public IPs: how long a released address is held away from other tenants.
   VALI_PUBLIC_IP_QUARANTINE_S: {{ required "config.publicIpQuarantineS is required" .Values.config.publicIpQuarantineS | quote }}
+  # Edge feed: every bound edge's address table carries vm_region + epoch
+  # (pricing by region). Shared here because the web pods serve the feed and
+  # the orchestration tick bumps the edge revisions; both must agree.
+  VALI_FEED_ADDRESS_REGION: {{ .Values.config.feedAddressRegion | default false | quote }}
+  # Edge feed: top-level block_smtp on every bound edge (the edge drops TCP
+  # 25 from every public-IP VM) and smtp_allowed on unblocked addresses.
+  # Shared for the same reason: the web pods serve the feed and the
+  # orchestration tick bumps the edge revisions.
+  VALI_FEED_BLOCK_SMTP: {{ .Values.config.feedBlockSmtp | default false | quote }}
+  {{- with .Values.cdn.backendUrl }}
+  # The CDN backend base URL (CDN plan I3/V2): a cdn-node bake writes it
+  # into the MEASURED agent config, and every CDN node's user-data names
+  # it, so the bake POST (web), the scheduled re-bake, the launch path
+  # (launch tick) and the CDN reconciler (orchestration tick) must read one
+  # value. Shared here, never a per-pod override. Unset: not rendered, and
+  # every cdn-node bake / CDN launch refuses (settings.py default empty).
+  VALI_CDN_BACKEND_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cdn.kbsResponseVkHex }}
+  # The pinned KBS response key `vali_cdn_fleet mint` verifies each fleet
+  # version's public key under (apps.cdn.fleet). Public; not a secret.
+  VALI_CDN_KBS_RESPONSE_VK_HEX: {{ . | quote }}
+  {{- end }}
   # The single `ServiceClient.name` that `IsMinerAdmin` accepts on the
   # miner-register / quarantine endpoints. Seeded by `manage.py
   # vali_identity_seed_miner_admin` — see vali/apps/miners/README.md.

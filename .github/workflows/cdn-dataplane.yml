@@ -1,0 +1,55 @@
+# CDN I2 — the cdn-node data plane (OpenResty + Lua).
+#
+# Builds OpenResty from the pinned, SHA-256-checked sources with the same
+# script the tenant-baker image uses, unpacks it under the runner's temp dir, and
+# runs the data-plane tests against the real binary:
+#   - render.sh guards;
+#   - Lua unit tests (resty CLI): host/path validation, purge prefixes,
+#     cache key, SigV4 (AWS vector), HMAC (RFC 4231), document validation,
+#     metering records, health verdict, certificate selection;
+#   - integration: nginx with a mock agent (control socket + metering
+#     datagrams) and a mock S3 origin that verifies SigV4 independently.
+#
+# Path-filtered to the data plane. Supply chain: actions pinned by commit
+# SHA; sources pinned by version + SHA-256 in versions.env.
+name: cdn-dataplane
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packer/cdn-node/openresty/**"
+      - ".github/workflows/cdn-dataplane.yml"
+  pull_request:
+    paths:
+      - "packer/cdn-node/openresty/**"
+      - ".github/workflows/cdn-dataplane.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dataplane:
+    runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential perl curl ca-certificates openssl python3 shellcheck
+      - name: shellcheck
+        run: |
+          shellcheck -S warning packer/cdn-node/openresty/build-openresty.sh \
+            packer/cdn-node/openresty/render.sh packer/cdn-node/openresty/tests/run.sh
+      - name: Build OpenResty (pinned sources)
+        run: |
+          BUILD_ROOT="/tmp/hippius-openresty-build" \
+            packer/cdn-node/openresty/build-openresty.sh "${RUNNER_TEMP}/openresty.tar.gz"
+      # Unpacked under the runner's temp dir, not "/": the job runs PR code
+      # and needs no root on the runner.
+      - name: Unpack the tree
+        run: |
+          mkdir -p "${RUNNER_TEMP}/or"
+          tar -xzf "${RUNNER_TEMP}/openresty.tar.gz" -C "${RUNNER_TEMP}/or"
+      - name: Data-plane tests
+        run: OPENRESTY_PREFIX="${RUNNER_TEMP}/or/opt/openresty" packer/cdn-node/openresty/tests/run.sh

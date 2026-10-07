@@ -301,7 +301,17 @@ def _bump_epoch_text(text: str, floor: int | None = None) -> tuple[str, int]:
 # attestor security must-have #1). Any other value is refused fail-closed.
 ALLOWLIST_CLASS_TENANT = "tenant"
 ALLOWLIST_CLASS_HOST_ATTESTOR = "host_attestor"
-_VALID_CLASSES = frozenset({ALLOWLIST_CLASS_TENANT, ALLOWLIST_CLASS_HOST_ATTESTOR})
+# A CDN node's launch (CDN plan V2, `apps.cdn.identity`): the KBS releases
+# the CDN fleet keyring only to this class. A KBS that predates the class
+# rejects the whole artifact (`deny_unknown_fields`), so a NEW `cdn_node`
+# pin is refused until `VALI_CDN_LAUNCH_ROLE` is on — which goes on only
+# once a KBS that knows it is live. Entries already in a manifest, or carried
+# forward for a live CDN VM, are always accepted and re-emitted: refusing
+# them would stop every pin fleet-wide.
+ALLOWLIST_CLASS_CDN_NODE = "cdn_node"
+_VALID_CLASSES = frozenset(
+    {ALLOWLIST_CLASS_TENANT, ALLOWLIST_CLASS_HOST_ATTESTOR, ALLOWLIST_CLASS_CDN_NODE}
+)
 
 
 def _append_entry(
@@ -318,9 +328,9 @@ def _append_entry(
 
     `measurement_class` writes the §22 trust class: `tenant` (default)
     OMITS the `class` key (byte-identical to legacy entries + the golden
-    `dev.cose`), while `host_attestor` writes an explicit
-    `class = "host_attestor"` line so the KBS namespaces the measurement
-    out of the tenant set."""
+    `dev.cose`), while `host_attestor` and `cdn_node` write an explicit
+    `class = "…"` line so the KBS namespaces the measurement out of the
+    tenant set."""
     if measurement_class not in _VALID_CLASSES:
         raise EffectError(
             f"pin_measurement: unknown allowlist class {measurement_class!r}"
@@ -337,7 +347,7 @@ def _append_entry(
         + ", ".join(f'"{k}"' for k in kbs_kids)
         + "]"
     )
-    # Emit `class` ONLY for the non-default host-attestor class — a tenant
+    # Emit `class` ONLY for a non-default class — a tenant
     # entry omits it (the KBS back-fills the `Tenant` default), keeping the
     # signed CBOR byte-identical to legacy tenant pins.
     if measurement_class != ALLOWLIST_CLASS_TENANT:
@@ -493,12 +503,15 @@ def _carry_forward_classes() -> dict[str, str]:
     enumerated from a table that also determines the class (the class is
     never guessed and never defaults to `tenant`):
 
-    - TENANT — the measurements recorded for every `lifecycle.Vm` that is
-      not in a dead state, from `MeasurementLedger.launch_digest_hex`
+    - TENANT / CDN_NODE — the measurements recorded for every
+      `lifecycle.Vm` that is not in a dead state, from `MeasurementLedger.launch_digest_hex`
       (whose write is best-effort, so it has holes) UNIONED with the
       latest `LaunchJob.result_json['emit']['measurement_hex']` for that
       `vm_id` (which is how the live measurements were recovered when
-      this bug was diagnosed).
+      this bug was diagnosed). Each keeps the tenant/cdn_node class its
+      pin recorded; one with none is `cdn_node` when a CDN node is bound to
+      the VM (`apps.cdn.identity.is_cdn_vm`, the rule its launch pinned
+      under) and `tenant` otherwise.
     - HOST_ATTESTOR — `telemetry.HostAttestorRelease` rows that are still
       `is_active` (the {current, previous} rolling-update grace window).
       `release_service.admit_release` is the ONLY writer of a
@@ -509,7 +522,8 @@ def _carry_forward_classes() -> dict[str, str]:
 
     Two independent vetoes back the derivation up, both fail-closed: a
     measurement that a live VM claims AND a host-attestor release
-    (active or trimmed) claims, and a measurement whose
+    (active or trimmed) claims — or that both a CDN node's VM and another
+    VM claim — and a measurement whose
     `MeasurementLedger.measurement_class` (the class the pin actually
     used) disagrees with the derived one.
 
@@ -591,6 +605,7 @@ def _query_carry_forward_classes() -> dict[str, str]:
     ledger_model = django_apps.get_model("orchestration", "MeasurementLedger")
     launch_model = django_apps.get_model("orchestration", "LaunchJob")
     release_model = django_apps.get_model("telemetry", "HostAttestorRelease")
+    cdn_node_model = django_apps.get_model("cdn", "CdnNode")
 
     # Live VMs. The state values are lower-case in the DB; normalise
     # rather than trusting the case so a mixed-case row is not silently
@@ -600,8 +615,41 @@ def _query_carry_forward_classes() -> dict[str, str]:
         for vm_id, state in vm_model.objects.values_list("vm_id", "state")
         if str(state or "").strip().lower() not in _DEAD_VM_STATES
     }
+    # The live VMs that are CDN nodes (`apps.cdn.identity.is_cdn_vm`): a node
+    # is BOUND to the VM row, which only a CDN node's launch does. A durable
+    # fact of the VM — no setting or flag moves it.
+    cdn_vm_ids = {
+        node_id
+        for node_id, bound in cdn_node_model.objects.filter(
+            node_id__in=live_vm_ids, vm__isnull=False
+        ).values_list("node_id", "vm__vm_id")
+        if node_id == bound
+    }
+    # A live VM's measurement keeps the tenant/cdn_node class its pin
+    # recorded: a CDN VM pinned `tenant` (before its node was bound) stays
+    # `tenant` — it never asks for the fleet keyring, and reclassing it would
+    # trip the veto below for every pin. Only a measurement with no recorded
+    # class (the ledger write is best-effort) is classed by the binding.
+    recorded: dict[tuple[str, str], str] = {}
+    if live_vm_ids:
+        for vm_id, digest, cls in ledger_model.objects.filter(
+            vm_id__in=live_vm_ids,
+            measurement_class__in=(ALLOWLIST_CLASS_TENANT, ALLOWLIST_CLASS_CDN_NODE),
+        ).values_list("vm_id", "launch_digest_hex", "measurement_class"):
+            measurement = _normalise_measurement(digest)
+            if measurement is not None:
+                recorded[(vm_id, measurement)] = cls
 
     tenant: set[str] = set()
+    cdn: set[str] = set()
+
+    def _carry(vm_id: str, measurement: str) -> None:
+        derived = (
+            ALLOWLIST_CLASS_CDN_NODE if vm_id in cdn_vm_ids else ALLOWLIST_CLASS_TENANT
+        )
+        cls = recorded.get((vm_id, measurement), derived)
+        (cdn if cls == ALLOWLIST_CLASS_CDN_NODE else tenant).add(measurement)
+
     if live_vm_ids:
         current = _current_launch_pins(ledger_model, live_vm_ids)
         rows = ledger_model.objects.filter(vm_id__in=live_vm_ids).values_list(
@@ -613,7 +661,7 @@ def _query_carry_forward_classes() -> dict[str, str]:
                 continue
             if _superseded(current.get(vm_id), measurement, pinned_at):
                 continue
-            tenant.add(measurement)
+            _carry(vm_id, measurement)
 
         # Latest launch job per vm_id that actually carries a measurement
         # (the ledger write is best-effort, so this is the belt to its
@@ -644,7 +692,7 @@ def _query_carry_forward_classes() -> dict[str, str]:
             seen_vm_ids.add(vm_id)
             if (vm_id, measurement) in superseded:
                 continue
-            tenant.add(measurement)
+            _carry(vm_id, measurement)
 
     # EVERY host-attestor release ever admitted, active or not. The
     # ACTIVE ones are carried; the inactive ones still matter as a
@@ -666,15 +714,23 @@ def _query_carry_forward_classes() -> dict[str, str]:
     # A measurement can only be in ONE §22 trust class. An overlap means
     # a host-attestor image is also attributed to a tenant VM — refuse
     # rather than pick one (picking `tenant` is the security regression).
-    overlap = tenant & host_known
+    overlap = (tenant | cdn) & host_known
     if overlap:
         raise EffectError(
             "allowlist carry-forward: measurement "
             f"{sorted(overlap)[0][:16]}… is claimed by BOTH a live VM and a "
             "host-attestor release — refusing to guess its §22 class"
         )
+    overlap = tenant & cdn
+    if overlap:
+        raise EffectError(
+            "allowlist carry-forward: measurement "
+            f"{sorted(overlap)[0][:16]}… is claimed by BOTH a CDN node and "
+            "another VM — refusing to guess its §22 class"
+        )
 
     carried: dict[str, str] = {m: ALLOWLIST_CLASS_TENANT for m in tenant}
+    carried.update({m: ALLOWLIST_CLASS_CDN_NODE for m in cdn})
     carried.update({m: ALLOWLIST_CLASS_HOST_ATTESTOR for m in host_carried})
 
     # Veto: the ledger records the class each pin actually USED. Any row —
@@ -747,6 +803,14 @@ def pin_measurement(
         raise EffectError(
             f"pin_measurement: unknown allowlist class {measurement_class!r}"
         )
+    if measurement_class == ALLOWLIST_CLASS_CDN_NODE:
+        from apps.cdn.identity import launch_role_enabled
+
+        if not launch_role_enabled():
+            raise EffectError(
+                "pin_measurement: a cdn_node pin needs VALI_CDN_LAUNCH_ROLE (a KBS "
+                "that predates the class would reject the whole allowlist)"
+            )
 
     return _install(
         measurement_hex=measurement_hex,

@@ -31,6 +31,7 @@ each one.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -113,6 +114,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "drf_spectacular",
     "apps.identity",
+    "apps.cdn",
     "apps.images",
     "apps.lifecycle",
     "apps.miners",
@@ -481,6 +483,10 @@ VALI_TENANT_BAKE_K8S_ENABLED = (
 # concrete values. See `apps.tenant_bake.k8s_jobs.spec_from_settings`
 # for the per-field meaning.
 VALI_TENANT_BAKE_NAMESPACE = os.environ.get("VALI_TENANT_BAKE_NAMESPACE", "vali")
+# CDN plan I3 — the backend base URL a `profile=cdn-node` bake writes into
+# the measured agent config (`/etc/hippius/cdn-agent.toml`). Empty (the
+# default) refuses every cdn-node bake; standard bakes never read it.
+VALI_CDN_BACKEND_URL = os.environ.get("VALI_CDN_BACKEND_URL", "")
 VALI_TENANT_BAKE_IMAGE = os.environ.get(
     "VALI_TENANT_BAKE_IMAGE",
     # Pinned-by-digest GHCR image. The digest pin defends against
@@ -1598,6 +1604,173 @@ VALI_PUBLIC_IP_NETBIRD_SYNC_S = _env_int("VALI_PUBLIC_IP_NETBIRD_SYNC_S", 30)
 # A tenant VM's peer is refused either way.
 VALI_PUBLIC_IP_EDGE_PEER_GROUP = os.environ.get("VALI_PUBLIC_IP_EDGE_PEER_GROUP", "")
 
+# Guest network policy (`apps.network.net_policy`, egress design §7): the
+# host-wide `net-policy` order each miner gets — guest bandwidth caps,
+# port 25, the edge-mode allowlist. Off by default: while off nothing is
+# pushed. On, only the miners in VALI_NET_POLICY_MINERS get it (explicit
+# miner ids, or `*` for all), so a canary goes first. The agents must carry
+# the net-policy order before any miner is listed.
+VALI_NET_POLICY_PUSH = _env_bool("VALI_NET_POLICY_PUSH", False)
+VALI_NET_POLICY_MINERS = _env_list("VALI_NET_POLICY_MINERS")
+# What the local-mode rules do with a matching packet: `count` or `drop`.
+VALI_NET_POLICY_LOCAL_ACTION = os.environ.get("VALI_NET_POLICY_LOCAL_ACTION", "count")
+# A policy is re-sent this often (drift repair, expiry renewal), and retried
+# this often while its current revision is not acked.
+VALI_NET_POLICY_SYNC_S = _env_int("VALI_NET_POLICY_SYNC_S", 600)
+VALI_NET_POLICY_RETRY_S = _env_int("VALI_NET_POLICY_RETRY_S", 60)
+# A miner whose agent failed to install the rules (500 `net-policy-apply`)
+# gets the SAME revision again, every RETRY_S doubled per failure, capped
+# here.
+VALI_NET_POLICY_APPLY_BACKOFF_MAX_S = _env_int("VALI_NET_POLICY_APPLY_BACKOFF_MAX_S", 1800)
+# An agent that refused an edge-mode policy as unsupported (422
+# `net-policy-unsupported`) is not sent edge mode again for this long. vali
+# sees no agent version, so this is the probe interval after an upgrade;
+# `manage.py vali_net_policy --retry <miner>` re-offers it at once.
+VALI_NET_POLICY_UNSUPPORTED_RETRY_S = _env_int("VALI_NET_POLICY_UNSUPPORTED_RETRY_S", 21600)
+# The policy's own validity (`not_after`). The miner refuses more than 7 days.
+VALI_NET_POLICY_TTL_S = _env_int("VALI_NET_POLICY_TTL_S", 86400)
+# Edge mode: a miner whose ack of its current revision is older than this
+# takes no new placement.
+VALI_NET_POLICY_ACK_STALE_S = _env_int("VALI_NET_POLICY_ACK_STALE_S", 1800)
+# Wall-clock budget of one reconcile pass in the orchestration tick; the
+# miners not reached go first on the next pass.
+VALI_NET_POLICY_TICK_BUDGET_S = _env_float("VALI_NET_POLICY_TICK_BUDGET_S", 120.0)
+# Per-tap DNS budget, packets per second.
+VALI_NET_POLICY_DNS_LIMIT_PPS = _env_int("VALI_NET_POLICY_DNS_LIMIT_PPS", 20)
+# Edge mode only: the infra WireGuard endpoints and the NetBird management /
+# signal / STUN endpoints the miners allow, JSON `[{"ip", "proto", "port"}]`.
+VALI_NET_POLICY_INFRA = json.loads(os.environ.get("VALI_NET_POLICY_INFRA", "[]"))
+VALI_NET_POLICY_NB_CONTROL = json.loads(os.environ.get("VALI_NET_POLICY_NB_CONTROL", "[]"))
+# Per-VM bandwidth cap, Mbit/s, by flavor (§7.1). A `runner-*` flavor takes
+# its base flavor's cap; a flavor not listed takes the default. A VM holding
+# a public IP gets at least VALI_NET_CAP_PUBLIC_IP_MBPS. The xlarge and up
+# values are provisional.
+VALI_NET_CAP_MBPS_BY_FLAVOR = json.loads(
+    os.environ.get(
+        "VALI_NET_CAP_MBPS_BY_FLAVOR",
+        '{"small": 100, "medium": 250, "large": 500, '
+        '"xlarge": 500, "2xlarge": 500, "4xlarge": 500}',
+    )
+)
+VALI_NET_CAP_DEFAULT_MBPS = _env_int("VALI_NET_CAP_DEFAULT_MBPS", 100)
+# Launch, relaunch and §25 orders carry the guest NIC spec (`net`: the cap,
+# a deterministic tap name, libvirt's `clean-traffic` filter, and an
+# isolated bridge port when VALI_NET_LAUNCH_ISOLATE). Off by default. On,
+# only to the miners in VALI_NET_LAUNCH_SPEC_MINERS (explicit ids, or `*`)
+# that have acked a net-policy. List a miner only once it runs an agent
+# that knows `net` (an older one refuses every launch that carries it; a
+# net-policy ack alone does not prove it) and `virsh nwfilter-list` shows
+# `clean-traffic` with a working nwfilter driver (else its launches fail).
+VALI_NET_LAUNCH_SPEC = _env_bool("VALI_NET_LAUNCH_SPEC", False)
+VALI_NET_LAUNCH_SPEC_MINERS = _env_list("VALI_NET_LAUNCH_SPEC_MINERS")
+VALI_NET_LAUNCH_ISOLATE = _env_bool("VALI_NET_LAUNCH_ISOLATE", True)
+VALI_NET_CAP_PUBLIC_IP_MBPS = _env_int("VALI_NET_CAP_PUBLIC_IP_MBPS", 250)
+# Egress feed (`apps.network.egress`, egress design §5.2): an edge of an
+# `edge`-mode region with an `egress_ip` is told which overlay address is
+# which VM (with an epoch and a tc class each), and its address table gains
+# vm_region/epoch/cap_mbps/smtp_allowed. Off by default: while off every
+# edge's feed is exactly what it was.
+VALI_EGRESS_FEED_ENABLED = _env_bool("VALI_EGRESS_FEED_ENABLED", False)
+# The VMs that may be put in an egress feed (comma-separated vm ids, `*` =
+# all), on top of the region's `routing_enabled`. Empty = none, so a canary
+# goes first.
+VALI_EGRESS_VMS = _env_list("VALI_EGRESS_VMS")
+# Every bound edge's address table carries each address's vm_region (when
+# known) and epoch, local-mode edges included, so the backend can price an
+# address's bandwidth by region. Never cap_mbps or smtp_allowed outside
+# egress mode. Off by default: while off every feed is exactly what it was.
+# A flip bumps the revision of the edges it changes.
+VALI_FEED_ADDRESS_REGION = _env_bool("VALI_FEED_ADDRESS_REGION", False)
+# Every bound edge's feed carries a top-level `block_smtp: true` (the edge
+# drops TCP 25 from every public-IP VM), and each address whose port 25 was
+# unblocked carries `smtp_allowed: true`, local-mode edges included. Off by
+# default: while off every feed is exactly what it was. A flip bumps the
+# revision of every bound edge.
+VALI_FEED_BLOCK_SMTP = _env_bool("VALI_FEED_BLOCK_SMTP", False)
+# CDN fleet (docs/design/cdn.md). Off by default: while off no CDN address
+# is attached (`apps.network.service.attach_cdn` refuses) and every edge's
+# feed is exactly what it was — `pool` and the per-address `cap_mbps` of
+# the `cdn` addresses are served only while on (applied per edge by the
+# orchestration tick, with a revision bump). Detach the CDN nodes before
+# turning it off: an attached CDN address is then fed as a plain one.
+VALI_CDN_ENABLED = _env_bool("VALI_CDN_ENABLED", False)
+# The internal tenant every CDN node runs as. Only its VMs take a `cdn`
+# address, and they never take a general one.
+VALI_CDN_TENANT_ID = os.environ.get("VALI_CDN_TENANT_ID", "hippius-cdn").strip()
+# The miner-side bandwidth cap of a CDN node, Mbit/s, in place of
+# VALI_NET_CAP_MBPS_BY_FLAVOR (CDN plan N2); edge mode adds the same tunnel
+# room as a flavor cap. 0 (the default) = no cap. Only while
+# VALI_CDN_ENABLED is on.
+VALI_CDN_NET_CAP_MBPS = _env_int("VALI_CDN_NET_CAP_MBPS", 0)
+# Launching CDN nodes (CDN plan V2, `apps.cdn.identity`): a CDN node's
+# launch carries the `cdn-node` ticket perm, the measured role tokens and a
+# `cdn_node`-class pin. Off by default: while off such a launch refuses
+# (`cdn-role-disabled`) and no `cdn_node` pin is written. Turn on only once
+# the KBS that knows the `cdn_node` class (K1) is live — an older one
+# rejects the whole allowlist. Turning it off later keeps live CDN VMs
+# running and pinned (the carry-forward classes them by their node), but
+# every relaunch of one (reboot recovery, power start, resize) refuses too:
+# a CDN node is replaced, not relaunched.
+VALI_CDN_LAUNCH_ROLE = _env_bool("VALI_CDN_LAUNCH_ROLE", False)
+# The CDN fleet reconciler (CDN plan V3, `apps.cdn.reconcile`), run by the
+# orchestration tick: launches, readies, drains and replaces nodes per
+# `CdnRegion`. Off by default: while off the fleet is frozen as it is.
+VALI_CDN_RECONCILE_ENABLED = _env_bool("VALI_CDN_RECONCILE_ENABLED", False)
+# After the backend's dns-released ack, wait this long before the §24
+# decommission (90 s + 2 × the 60 s record TTL). Without an ack a node is
+# never decommissioned; past VALI_CDN_DRAIN_ACK_TIMEOUT_S vali alerts.
+VALI_CDN_DRAIN_GRACE_S = _env_int("VALI_CDN_DRAIN_GRACE_S", 210)
+VALI_CDN_DRAIN_ACK_TIMEOUT_S = _env_int("VALI_CDN_DRAIN_ACK_TIMEOUT_S", 1800)
+# A ready node whose guest stayed wedged (no in-guest signal) this long
+# fails and is replaced; a node not ready this long after its launch, too.
+VALI_CDN_WEDGED_S = _env_int("VALI_CDN_WEDGED_S", 600)
+VALI_CDN_BOOT_TIMEOUT_S = _env_int("VALI_CDN_BOOT_TIMEOUT_S", 1800)
+# Nodes launching or booting at once, per region.
+VALI_CDN_MAX_PARALLEL_LAUNCH = _env_int("VALI_CDN_MAX_PARALLEL_LAUNCH", 1)
+# A replacement must have been ready this long (so the backend has its
+# record) before the node it replaces drains.
+VALI_CDN_READY_SETTLE_S = _env_int("VALI_CDN_READY_SETTLE_S", 600)
+# After a failed launch in a region, wait this long before the next one.
+VALI_CDN_LAUNCH_BACKOFF_S = _env_int("VALI_CDN_LAUNCH_BACKOFF_S", 600)
+# The reconciler's outage breakers: they compare against the VMs and miners
+# heard from in this window, and the liveness hold lasts at most this long.
+VALI_CDN_BREAKER_CONTROL_WINDOW_S = _env_int("VALI_CDN_BREAKER_CONTROL_WINDOW_S", 86400)
+# 4 h: long, because while held the domain-down and host-gone checks still
+# fail the nodes that are really dead, so a hold mostly protects live ones.
+VALI_CDN_BREAKER_MAX_HOLD_S = _env_int("VALI_CDN_BREAKER_MAX_HOLD_S", 14400)
+# What a node launches: the blessed image name (restricted to the CDN
+# tenant).
+VALI_CDN_IMAGE_NAME = os.environ.get("VALI_CDN_IMAGE_NAME", "cdn-node").strip()
+# The base cmdline of every CDN node's launch, and the only one a CDN launch
+# is accepted with. A node's relaunch must carry the same base cmdline,
+# user-data (VALI_CDN_BACKEND_URL, its region) and image as its launch:
+# changing any of them refuses it — nodes are replaced, not relaunched.
+VALI_CDN_CMDLINE = os.environ.get(
+    "VALI_CDN_CMDLINE",
+    "console=ttyS0,115200 hippius.kbs_url=vsock://2:19266 ds=nocloud;s=/run/cloud-init/seed/",
+)
+# The CDN fleet keyring (`apps.cdn.fleet`, docs/operator/cdn-fleet-keyring.md):
+# the KBS response key vali checks each version's public-key signature
+# under (pinned out of band, 32-byte hex; empty refuses every mint), and
+# where a minted version's ciphertext goes.
+VALI_CDN_KBS_RESPONSE_VK_HEX = os.environ.get("VALI_CDN_KBS_RESPONSE_VK_HEX", "").strip()
+VALI_CDN_FLEET_TRANSIT_KEY = os.environ.get("VALI_CDN_FLEET_TRANSIT_KEY", "cdn-fleet").strip()
+VALI_CDN_FLEET_KV_PREFIX = os.environ.get(
+    "VALI_CDN_FLEET_KV_PREFIX", "hippius-compute/kbs/cdn-fleet"
+).strip()
+# The CDN CA (`apps.cdn.ca`). Its Ed25519 private key is the Vault Transit
+# key named here, created by an operator as non-exportable: vali only ever
+# asks Transit to sign and reads its public half, never the key itself.
+VALI_CDN_CA_TRANSIT_KEY = os.environ.get("VALI_CDN_CA_TRANSIT_KEY", "cdn-ca").strip()
+# Lifetime of the self-signed CA certificate vali makes for a Transit key
+# version, and of a node certificate (renewed at 2/3 of it).
+VALI_CDN_CA_VALIDITY_DAYS = _env_int("VALI_CDN_CA_VALIDITY_DAYS", 1825)
+VALI_CDN_NODE_CERT_DAYS = _env_int("VALI_CDN_NODE_CERT_DAYS", 7)
+# SPIFFE trust domain of the node certificate SAN URI
+# (`spiffe://<domain>/cdn/<region>/<vm_id>/g<generation>`); the cdn-agent
+# bakes the same value.
+VALI_CDN_TRUST_DOMAIN = os.environ.get("VALI_CDN_TRUST_DOMAIN", "hippius.network").strip()
+
 # Live VM backups (`apps.backup`, docs/design/backup-failover.md). Off by
 # default: while off the backup tick does nothing and a new backup policy
 # is refused; existing policies and restore points are kept as they are.
@@ -2140,4 +2313,6 @@ VALI_PUBLIC_API_PATHS = os.environ.get("VALI_PUBLIC_API_PATHS", "")
 # This replaced a HARD anti-affinity exclude that capped a tenant at one VM
 # per miner — three miners meant three concurrent VMs, and 500 would have
 # needed 500 miners.
+#
+# The CDN fleet's one-node-per-host rule does not read it (CDN plan N2).
 VALI_MAX_FAMILY_PER_NODE = os.environ.get("VALI_MAX_FAMILY_PER_NODE", "")

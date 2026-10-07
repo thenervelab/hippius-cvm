@@ -16,7 +16,7 @@ ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
-x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
 hpke = { version = "0.12", default-features = false, features = ["std", "x25519"] }
 sha2 = "0.10"
 hmac = "0.12"

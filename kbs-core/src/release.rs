@@ -29,7 +29,8 @@ use crate::persist::KbsNonceStore;
 use crate::replay::{ReleaseKey, ReleaseStore};
 use crate::report_data::{ct_eq, tenant};
 use crate::snp::{
-    check_attestation, AttestationVerifier, LaunchPolicy, MeasurementAllowlist, VerifiedReport,
+    check_attestation, check_release_class, AttestationVerifier, LaunchPolicy,
+    MeasurementAllowlist, ReleaseRole, VerifiedReport,
 };
 use crate::ticket::{verify_order_ticket, L1Keyring, OrderTicket};
 use crate::vault::{AttestedVaultAuth, KbsAuthEvidence, VaultCapability, VaultKv, VaultScope};
@@ -282,6 +283,16 @@ pub struct Deps<'a> {
     /// ciphertext, so nothing else in the system would notice a staging
     /// path that quietly went back to plaintext.
     pub require_wrapped_userdata: bool,
+    /// `true` ⇒ a `host_attestor`-class measurement is refused on the
+    /// release path (`snp::check_release_class`). The CDN class rules are
+    /// unconditional; only this legacy aliasing is flag-gated, because it
+    /// was never enforced before. KBS config
+    /// `[allowlist] enforce_release_class`, default `false`.
+    pub enforce_release_class: bool,
+    /// `[cdn_fleet] enabled` — whether a CDN node release (class and perm
+    /// agreeing) gets the cdn-fleet keyring. `false` (the default) refuses
+    /// it outright: nothing else in a release changes either way.
+    pub cdn_fleet_enabled: bool,
     /// Hash-chained ADMIN audit log (`crate::admin_audit`), where the
     /// authorized-rollback events the release path owns land: a
     /// `rollback-consume`, a `rollback-refused(<reason>)` for an arm that
@@ -398,13 +409,23 @@ pub fn process_release(
     let mut vid: Option<String> = None;
     let r = run(req, deps, &mut tid, &mut vid);
     match r {
-        Ok((signed, key_mode)) => {
-            deps.audit.record(
-                true,
-                tid.as_deref(),
-                vid.as_deref(),
-                granted_audit_reason(key_mode),
-            );
+        Ok((signed, key_mode, fleet_versions)) => {
+            let reason = match fleet_versions {
+                // A CDN node release names the fleet versions it carried,
+                // so the release chain shows who received which key.
+                Some(versions) => format!(
+                    "{} cdn-fleet={}",
+                    granted_audit_reason(key_mode),
+                    versions
+                        .iter()
+                        .map(|v| format!("v{v}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                None => granted_audit_reason(key_mode).to_string(),
+            };
+            deps.audit
+                .record(true, tid.as_deref(), vid.as_deref(), &reason);
             Ok(signed)
         }
         Err(e) => {
@@ -433,7 +454,7 @@ fn run(
     deps: &Deps,
     tid: &mut Option<String>,
     vid: &mut Option<String>,
-) -> Result<(SignedResponse, KeyMode)> {
+) -> Result<(SignedResponse, KeyMode, Option<Vec<u64>>)> {
     // 0. §22 pre-release allowlist revalidation (the artifact backing
     // every measurement/L1-kid/KBS-kid decision MUST be re-verified
     // before each release; fail-closed).
@@ -474,6 +495,44 @@ fn run(
         &expected_rd,
         deps.launch_policy,
     )?;
+    // 2b. allowlist CLASS × ticket role (`snp::check_release_class`): a
+    // tenant measurement never takes the CDN path and a CDN node's
+    // measurement never takes the tenant one.
+    let role = check_release_class(
+        deps.offline_allowlist,
+        &report.measurement,
+        &ticket.lifecycle_perms,
+        deps.enforce_release_class,
+    )?;
+    // 2c. the cdn-fleet versions the ticket names (`cdn_fleet`). Only a
+    // CDN node may name any, it must name at least one, and the class is
+    // off unless `[cdn_fleet] enabled` — refused loudly rather than
+    // booting a node that holds no fleet key.
+    let fleet_versions = crate::cdn_fleet::versions_from_perms(&ticket.lifecycle_perms)?;
+    let fleet_versions: Option<Vec<u64>> = match role {
+        ReleaseRole::Tenant if !fleet_versions.is_empty() => {
+            return Err(KbsError::Policy(
+                "cdn-fleet-perm-without-role: the ticket names cdn-fleet versions but is not \
+                 a cdn-node ticket"
+                    .into(),
+            ));
+        }
+        ReleaseRole::Tenant => None,
+        ReleaseRole::CdnNode if !deps.cdn_fleet_enabled => {
+            return Err(KbsError::Policy(
+                "cdn-fleet-disabled: this KBS does not release the cdn-fleet keyring \
+                 ([cdn_fleet] enabled = false)"
+                    .into(),
+            ));
+        }
+        ReleaseRole::CdnNode if fleet_versions.is_empty() => {
+            return Err(KbsError::Policy(
+                "cdn-fleet-no-version: a cdn-node ticket must name at least one cdn-fleet version"
+                    .into(),
+            ));
+        }
+        ReleaseRole::CdnNode => Some(fleet_versions),
+    };
 
     // 3. attested CHIP_ID must equal the ticket placement (§8/§23).
     //
@@ -996,6 +1055,7 @@ fn run(
             userdata_version: ticket.userdata_vault_ref.version,
             lifecycle_path: lifecycle_path.clone(),
             lifecycle_version: lifecycle_path.as_ref().map(|_| LIFECYCLE_KEY_VERSION),
+            cdn_fleet_versions: fleet_versions.clone(),
         };
         let challenge = deps.vault_auth.issue_challenge(&scope, req.now_unix)?;
         let ev = KbsAuthEvidence {
@@ -1133,6 +1193,23 @@ fn run(
         // 8. recompute user-data digest (streamed, zeroizing) + ct-compare
         verify_userdata_digest(&ticket, &scope, &userdata)?;
 
+        // 8b. CDN node: read + Transit-unwrap every fleet key the ticket
+        // names, only now that the ticket's userdata binding held.
+        let fleet_secrets: Option<Vec<(u64, Zeroizing<[u8; 32]>)>> = match &fleet_versions {
+            Some(versions) => Some(
+                versions
+                    .iter()
+                    .map(|v| {
+                        Ok((
+                            *v,
+                            crate::cdn_fleet::unwrap_secret(deps.vault_kv, &cap, *v)?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            None => None,
+        };
+
         // 9. lifecycle AGAIN before commit
         let state2 = deps.vm_states.get(&ticket.vm_id)?;
         check_releasable(
@@ -1206,6 +1283,32 @@ fn run(
                 Some(hpke_wrap(&guest_pub, seed, &lc_ctx)?)
             }
             _ => None,
+        };
+        // CDN node: each fleet key bound to its own context — the fleet
+        // version is the `secret_version`, so a node can neither swap two
+        // versions nor take one from another release.
+        let wrapped_fleet: Option<Vec<hippius_types::release::WrappedSecret>> = match &fleet_secrets
+        {
+            Some(secrets) => Some(
+                secrets
+                    .iter()
+                    .map(|(version, secret)| {
+                        let path = crate::cdn_fleet::secret_path(*version);
+                        let fleet_ctx = ctx(
+                            &ticket,
+                            req.kbs_nonce,
+                            &report.measurement,
+                            deps.kbs_kid,
+                            crate::cdn_fleet::CDN_FLEET_SECRET_TYPE,
+                            &path,
+                            *version,
+                            allowed_ud_digest_arr,
+                        );
+                        hpke_wrap(&guest_pub, secret.as_slice(), &fleet_ctx)
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            None => None,
         };
         // Anti-rollback for the guest-keyed overlay: echo the last
         // CONFIRMED volume stamp and mint the single-use token that
@@ -1297,6 +1400,7 @@ fn run(
                     target_timeline_id: target.to_vec(),
                 }
             }),
+            cdn_fleet: wrapped_fleet,
         };
         sign_response(deps.kbs_signing_key, &resp)
     })();
@@ -1638,7 +1742,7 @@ fn run(
             // verifier wants).
             record_evidence_bundle(deps, req, &ticket, &report);
 
-            Ok((signed, key_mode))
+            Ok((signed, key_mode, fleet_versions))
         }
     }
 }
@@ -1791,6 +1895,7 @@ mod tests {
                 userdata_version: 1,
                 lifecycle_path: None,
                 lifecycle_version: None,
+                cdn_fleet_versions: None,
             },
             u64::MAX,
             Zeroizing::new(b"cap-token".to_vec()),
@@ -1983,6 +2088,19 @@ mod tests {
         ticket_id: &str,
         key_mode: Option<KeyMode>,
     ) -> (Vec<u8>, SigningKey, Vec<u8>) {
+        cose_for_perms(plat, gen, ud, luks_path, ticket_id, key_mode, &[])
+    }
+
+    /// [`cose_for_keyed`] with chosen signed `lifecycle_perms`.
+    fn cose_for_perms(
+        plat: &str,
+        gen: u64,
+        ud: &[u8],
+        luks_path: &str,
+        ticket_id: &str,
+        key_mode: Option<KeyMode>,
+        perms: &[&str],
+    ) -> (Vec<u8>, SigningKey, Vec<u8>) {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
         let kid = b"l1".to_vec();
         let digest =
@@ -2002,7 +2120,10 @@ mod tests {
                 Value::Text("lease_id".into()),
                 Value::Text("lease-1".into()),
             ),
-            (Value::Text("lifecycle_perms".into()), Value::Array(vec![])),
+            (
+                Value::Text("lifecycle_perms".into()),
+                Value::Array(perms.iter().map(|p| Value::Text((*p).into())).collect()),
+            ),
             (
                 Value::Text("luks_vault_ref".into()),
                 Value::Map(vec![
@@ -2137,6 +2258,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         // `raw_snp_report` is 1184 B (the SEV-SNP report size) so the
@@ -2330,6 +2453,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let raw_snp_report = vec![0u8; 1184];
@@ -2460,6 +2585,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let raw_snp_report = vec![0u8; 1184];
@@ -2577,6 +2704,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req = ReleaseRequest {
@@ -2620,6 +2749,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req2 = ReleaseRequest {
@@ -2672,6 +2803,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req3 = ReleaseRequest {
@@ -2712,6 +2845,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req4 = ReleaseRequest {
@@ -2852,6 +2987,8 @@ mod tests {
                 max_unconfirmed_releases: None,
                 require_wrapped_kek: false,
                 require_wrapped_userdata: false,
+                enforce_release_class: false,
+                cdn_fleet_enabled: false,
                 rollback_audit: None,
             };
             let req = ReleaseRequest {
@@ -3018,6 +3155,8 @@ mod tests {
             max_unconfirmed_releases: None,
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req = ReleaseRequest {
@@ -3154,6 +3293,8 @@ mod tests {
                 max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
                 require_wrapped_kek: false,
                 require_wrapped_userdata: false,
+                enforce_release_class: false,
+                cdn_fleet_enabled: false,
                 rollback_audit: None,
             };
             let req_i = ReleaseRequest {
@@ -3274,6 +3415,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req_f = ReleaseRequest {
@@ -3434,6 +3577,8 @@ mod tests {
                 max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
                 require_wrapped_kek: false,
                 require_wrapped_userdata: false,
+                enforce_release_class: false,
+                cdn_fleet_enabled: false,
                 rollback_audit: None,
             };
             let req_n = ReleaseRequest {
@@ -3684,6 +3829,8 @@ mod tests {
                 max_unconfirmed_releases: None,
                 require_wrapped_kek: false,
                 require_wrapped_userdata: false,
+                enforce_release_class: false,
+                cdn_fleet_enabled: false,
                 rollback_audit: None,
             };
             let req_i = ReleaseRequest {
@@ -3795,6 +3942,8 @@ mod tests {
             max_unconfirmed_releases: Some(CUSTOM_BOUND),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req1 = ReleaseRequest {
@@ -3835,6 +3984,8 @@ mod tests {
             max_unconfirmed_releases: Some(CUSTOM_BOUND),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req2 = ReleaseRequest {
@@ -3939,6 +4090,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let raw_snp_report = vec![0u8; 1184];
@@ -4034,6 +4187,8 @@ mod tests {
             max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
         };
         let req = ReleaseRequest {
@@ -4226,6 +4381,8 @@ mod tests {
                 max_unconfirmed_releases: self.max_unconfirmed_releases,
                 require_wrapped_kek: self.require_wrapped_kek,
                 require_wrapped_userdata: false,
+                enforce_release_class: false,
+                cdn_fleet_enabled: false,
                 rollback_audit: None,
             }
         }
@@ -5210,6 +5367,8 @@ mod tests {
         // that can deny).
         let armed = Deps {
             require_wrapped_userdata: true,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             rollback_audit: None,
             ..h.deps(&kv)
         };
@@ -5534,6 +5693,8 @@ mod tests {
                     max_unconfirmed_releases: Some(crate::volume_stamp::MAX_UNCONFIRMED_RELEASES),
                     require_wrapped_kek: false,
                     require_wrapped_userdata: false,
+                    enforce_release_class: false,
+                    cdn_fleet_enabled: false,
                     rollback_audit,
                 };
                 let req = ReleaseRequest {
@@ -6821,5 +6982,469 @@ mod tests {
                 .contains("volume-stamp-rollback-raced"));
             assert_eq!(w.bc.get("abc").unwrap(), STORED, "no commit, no key");
         }
+    }
+
+    // ── allowlist class × ticket role (`snp::check_release_class`) ──────
+
+    /// An allowlist whose every measurement carries one fixed class.
+    struct ClassAllowlist(crate::snp::AllowlistClass);
+    impl MeasurementAllowlist for ClassAllowlist {
+        fn contains(&self, _m: &[u8; MEASUREMENT_LEN]) -> bool {
+            true
+        }
+        fn accepts_l1_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn accepts_kbs_kid(&self, _m: &[u8; MEASUREMENT_LEN], _k: &[u8]) -> bool {
+            true
+        }
+        fn class_of(&self, _m: &[u8; MEASUREMENT_LEN]) -> Option<crate::snp::AllowlistClass> {
+            Some(self.0)
+        }
+    }
+
+    /// One fresh release of VM `abc` under `class` with ticket `perms`.
+    /// Returns the outcome and the audited reason.
+    fn release_with_class(
+        class: crate::snp::AllowlistClass,
+        perms: &[&str],
+        enforce_release_class: bool,
+    ) -> (core::result::Result<SignedResponse, SignedDenial>, String) {
+        let r = cdn_release(&CdnCase {
+            class,
+            perms,
+            enforce_release_class,
+            ..CdnCase::default()
+        });
+        (r.out, r.reason)
+    }
+
+    /// Inputs of one [`cdn_release`].
+    struct CdnCase<'a> {
+        class: crate::snp::AllowlistClass,
+        perms: &'a [&'a str],
+        enforce_release_class: bool,
+        cdn_fleet_enabled: bool,
+        /// Raw datakeys staged as `cdn-fleet/v<N>`, Transit-wrapped.
+        fleet: &'a [(u64, [u8; 32])],
+        /// Entries staged verbatim (e.g. a plaintext fleet key).
+        raw_kv: &'a [(&'a str, &'a [u8])],
+    }
+    impl Default for CdnCase<'_> {
+        fn default() -> Self {
+            Self {
+                class: crate::snp::AllowlistClass::CdnNode,
+                perms: &[],
+                enforce_release_class: false,
+                cdn_fleet_enabled: true,
+                fleet: &[],
+                raw_kv: &[],
+            }
+        }
+    }
+    struct CdnOutcome {
+        out: core::result::Result<SignedResponse, SignedDenial>,
+        reason: String,
+        guest_sk: [u8; 32],
+        nonce: [u8; 32],
+        kbs_vk: ed25519_dalek::VerifyingKey,
+    }
+
+    fn cdn_release(case: &CdnCase) -> CdnOutcome {
+        let (pk, guest_sk) = crate::crypto::test_support::gen_x25519();
+        let nonce = [1u8; 32];
+        let mut rd = [0u8; 64];
+        rd[0..32].copy_from_slice(&nonce);
+        rd[32..64].copy_from_slice(&pk);
+        let chip = [0u8; 64];
+        let plat = hex::encode(chip);
+        let ud = b"USERDATA";
+        let (cose, l1, kid) =
+            cose_for_perms(&plat, 5, ud, "kbs/vm/abc/luks", "tk-1", None, case.perms);
+        let kr = Kr(kid, l1.verifying_key());
+        let av = Av { rd, chip };
+        let al = ClassAllowlist(case.class);
+        let lp = LaunchPolicy {
+            min_tcb: 1,
+            required_bits: 0b10,
+            allowed_mask: 0b1101,
+        };
+        let st = OneState(VmState::Active {
+            gen: 5,
+            host: plat.clone(),
+            lease_id: "lease-1".into(),
+        });
+        let rs = InMemoryReleaseStore::default();
+        let ok: fn(&[u8; 48]) -> bool = |_m| true;
+        let va = ChallengeVaultAuth {
+            kbs_measurement_ok: ok,
+            policy: LaunchPolicy {
+                min_tcb: 1,
+                required_bits: 0,
+                allowed_mask: u64::MAX,
+            },
+            challenge_ttl: 60,
+            cap_ttl: 60,
+            challenge_nonce: [2u8; 32],
+        };
+        let mut kvm = HashMap::new();
+        kvm.insert("kbs/vm/abc/luks".to_string(), b"LUKSKEY".to_vec());
+        kvm.insert("kbs/vm/abc/ud".to_string(), ud.to_vec());
+        for (v, raw) in case.fleet {
+            kvm.insert(
+                crate::cdn_fleet::secret_path(*v),
+                test_wrap(crate::cdn_fleet::CDN_FLEET_TRANSIT_KEY, raw),
+            );
+        }
+        for (path, bytes) in case.raw_kv {
+            kvm.insert((*path).to_string(), bytes.to_vec());
+        }
+        let kv = Kv(kvm);
+        let kbs_rep = VerifiedReport {
+            measurement: MEAS,
+            report_data: [0u8; 64],
+            tcb: 5,
+            policy: 0,
+            chip_id: [0u8; 64],
+            chain_pem: Vec::new(),
+        };
+        let kbs_sk = SigningKey::from_bytes(&[9u8; 32]);
+        let audit = Audit::default();
+        let evidence = crate::evidence::MockEvidenceSink::new();
+        let nonce_store = MockNonceStore::default();
+        nonce_store.preissue(nonce);
+        let boot_counter = crate::boot_counter::InMemoryBootCounterStore::default();
+        let volume_stamp = crate::volume_stamp::InMemoryVolumeStampStore::default();
+        let deps = Deps {
+            l1_keyring: &kr,
+            attn: &av,
+            offline_allowlist: &al,
+            launch_policy: &lp,
+            vm_states: &st,
+            release_store: &rs,
+            vault_auth: &va,
+            vault_kv: &kv,
+            kbs_nonce_store: &nonce_store,
+            kbs_attestation: &kbs_rep,
+            kbs_auth_pubkey: b"kbs-channel-pub",
+            kbs_signing_key: &kbs_sk,
+            kbs_kid: b"kbs-kid",
+            audit: &audit,
+            evidence: &evidence,
+            boot_counter: &boot_counter,
+            volume_stamp: &volume_stamp,
+            max_unconfirmed_releases: None,
+            require_wrapped_kek: false,
+            require_wrapped_userdata: false,
+            enforce_release_class: case.enforce_release_class,
+            cdn_fleet_enabled: case.cdn_fleet_enabled,
+            rollback_audit: None,
+        };
+        let raw_snp_report = vec![0u8; 1184];
+        let req = ReleaseRequest {
+            cose_ticket: &cose,
+            raw_snp_report: &raw_snp_report,
+            kbs_nonce: &nonce,
+            now_unix: 200,
+            submitted_boot_counter: None,
+        };
+        let out = process_release(&req, &deps);
+        CdnOutcome {
+            out,
+            reason: audit.last_reason(),
+            guest_sk,
+            nonce,
+            kbs_vk: kbs_sk.verifying_key(),
+        }
+    }
+
+    #[test]
+    fn tenant_class_without_perm_releases_unchanged() {
+        let (out, _) = release_with_class(crate::snp::AllowlistClass::Tenant, &[], true);
+        assert!(out.is_ok(), "an ordinary tenant release must be untouched");
+    }
+
+    #[test]
+    fn tenant_measurement_with_the_cdn_perm_is_refused() {
+        let (out, reason) = release_with_class(
+            crate::snp::AllowlistClass::Tenant,
+            &[crate::lifecycle::CDN_NODE_PERM],
+            false,
+        );
+        assert!(out.is_err());
+        assert!(reason.contains("cdn-perm-class-mismatch"), "{reason}");
+    }
+
+    #[test]
+    fn cdn_measurement_without_the_perm_is_refused() {
+        // The "vice versa": a CDN node's image cannot pose as a tenant VM,
+        // e.g. a miner pairing a CDN measurement with a tenant's ticket.
+        let (out, reason) = release_with_class(crate::snp::AllowlistClass::CdnNode, &[], false);
+        assert!(out.is_err());
+        assert!(reason.contains("cdn-class-without-perm"), "{reason}");
+        // Other perms do not stand in for it.
+        let (out, reason) = release_with_class(
+            crate::snp::AllowlistClass::CdnNode,
+            &[crate::lifecycle::SUPERSEDE_PERM],
+            false,
+        );
+        assert!(out.is_err());
+        assert!(reason.contains("cdn-class-without-perm"), "{reason}");
+    }
+
+    #[test]
+    fn host_attestor_measurement_is_refused_only_when_enforced() {
+        let (out, _) = release_with_class(crate::snp::AllowlistClass::HostAttestor, &[], false);
+        assert!(out.is_ok(), "flag off: today's behaviour");
+        let (out, reason) = release_with_class(crate::snp::AllowlistClass::HostAttestor, &[], true);
+        assert!(out.is_err());
+        assert!(reason.contains("release-class-mismatch"), "{reason}");
+        // With the CDN perm it is refused whatever the flag says.
+        let (out, reason) = release_with_class(
+            crate::snp::AllowlistClass::HostAttestor,
+            &[crate::lifecycle::CDN_NODE_PERM],
+            false,
+        );
+        assert!(out.is_err());
+        assert!(reason.contains("release-class-mismatch"), "{reason}");
+    }
+
+    // ── cdn-fleet keyring release (`crate::cdn_fleet`) ──────────────────
+
+    /// Unwrap the released fleet keys the way the guest will: each under
+    /// the context the KBS bound it to.
+    fn open_fleet(r: &CdnOutcome) -> Vec<(u64, [u8; 32])> {
+        let signed = r.out.as_ref().expect("release granted");
+        let resp = verify_response(&r.kbs_vk, signed).unwrap();
+        let d: [u8; 32] = resp.allowed_userdata_digest.clone().try_into().unwrap();
+        resp.cdn_fleet
+            .as_ref()
+            .expect("cdn_fleet present")
+            .iter()
+            .map(|w| {
+                assert_eq!(w.secret_type, "cdn-fleet");
+                assert_eq!(
+                    w.secret_path,
+                    crate::cdn_fleet::secret_path(w.secret_version)
+                );
+                let c = ReleaseContext {
+                    v: resp.v,
+                    ticket_id: &resp.ticket_id,
+                    tenant_id: &resp.tenant_id,
+                    vm_id: &resp.vm_id,
+                    vm_generation: resp.vm_generation,
+                    kbs_nonce: &r.nonce,
+                    measurement: &MEAS,
+                    kbs_kid: b"kbs-kid",
+                    secret_type: "cdn-fleet",
+                    secret_path: &w.secret_path,
+                    secret_version: w.secret_version,
+                    allowed_userdata_digest: &d,
+                };
+                let pt = crate::crypto::hpke_unwrap(&r.guest_sk, w, &c).unwrap();
+                (w.secret_version, pt.as_slice().try_into().unwrap())
+            })
+            .collect()
+    }
+
+    const CDN: &str = crate::lifecycle::CDN_NODE_PERM;
+
+    #[test]
+    fn cdn_node_gets_exactly_the_named_fleet_keys_clamped() {
+        let k1 = [0x11u8; 32];
+        let k2 = [0x22u8; 32];
+        let k3 = [0x33u8; 32];
+        let r = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v2", "cdn-fleet-v1"],
+            fleet: &[(1, k1), (2, k2), (3, k3)],
+            ..CdnCase::default()
+        });
+        assert_eq!(
+            open_fleet(&r),
+            vec![
+                (1, crate::cdn_fleet::clamp(&k1)),
+                (2, crate::cdn_fleet::clamp(&k2))
+            ],
+            "v3 is staged but not named: it is not released"
+        );
+        assert!(r.reason.ends_with("cdn-fleet=v1,v2"), "{}", r.reason);
+    }
+
+    #[test]
+    fn a_wrapped_fleet_key_opens_only_under_its_own_context() {
+        let r = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v1", "cdn-fleet-v2"],
+            fleet: &[(1, [1u8; 32]), (2, [2u8; 32])],
+            ..CdnCase::default()
+        });
+        let resp = verify_response(&r.kbs_vk, r.out.as_ref().unwrap()).unwrap();
+        let fleet = resp.cdn_fleet.clone().unwrap();
+        let d: [u8; 32] = resp.allowed_userdata_digest.clone().try_into().unwrap();
+        // v2's blob presented as v1 (a version swap): the AEAD refuses.
+        let swapped = ReleaseContext {
+            v: resp.v,
+            ticket_id: &resp.ticket_id,
+            tenant_id: &resp.tenant_id,
+            vm_id: &resp.vm_id,
+            vm_generation: resp.vm_generation,
+            kbs_nonce: &r.nonce,
+            measurement: &MEAS,
+            kbs_kid: b"kbs-kid",
+            secret_type: "cdn-fleet",
+            secret_path: &fleet[0].secret_path,
+            secret_version: 1,
+            allowed_userdata_digest: &d,
+        };
+        assert!(crate::crypto::hpke_unwrap(&r.guest_sk, &fleet[1], &swapped).is_err());
+        // Any other key (a miner relaying the response) opens nothing.
+        let (_, other_sk) = crate::crypto::test_support::gen_x25519();
+        let own = ReleaseContext {
+            secret_path: &fleet[1].secret_path,
+            secret_version: 2,
+            ..swapped
+        };
+        assert!(crate::crypto::hpke_unwrap(&other_sk, &fleet[1], &own).is_err());
+        assert!(crate::crypto::hpke_unwrap(&r.guest_sk, &fleet[1], &own).is_ok());
+    }
+
+    #[test]
+    fn tenant_release_is_byte_identical_and_never_carries_the_fleet() {
+        // A tenant ticket on a KBS with the class enabled and fleet keys
+        // staged: no `cdn_fleet` key on the wire at all.
+        let r = cdn_release(&CdnCase {
+            class: crate::snp::AllowlistClass::Tenant,
+            fleet: &[(1, [1u8; 32])],
+            ..CdnCase::default()
+        });
+        let signed = r.out.as_ref().expect("tenant release granted");
+        let resp = verify_response(&r.kbs_vk, signed).unwrap();
+        assert!(resp.cdn_fleet.is_none());
+        let body: Value = ciborium::de::from_reader(signed.body.as_slice()).unwrap();
+        let Value::Map(entries) = body else {
+            panic!("response body is a map")
+        };
+        assert!(entries
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("cdn_fleet")));
+        assert_eq!(r.reason, "released");
+    }
+
+    #[test]
+    fn tenant_measurement_never_reaches_fleet_material() {
+        // Every way a tenant measurement could ask: refused before Vault.
+        for perms in [
+            &[CDN, "cdn-fleet-v1"][..],
+            &["cdn-fleet-v1"][..],
+            &[CDN][..],
+        ] {
+            let r = cdn_release(&CdnCase {
+                class: crate::snp::AllowlistClass::Tenant,
+                perms,
+                fleet: &[(1, [1u8; 32])],
+                ..CdnCase::default()
+            });
+            assert!(r.out.is_err(), "{perms:?}");
+            assert!(
+                r.reason.contains("cdn-perm-class-mismatch")
+                    || r.reason.contains("cdn-fleet-perm-without-role"),
+                "{perms:?}: {}",
+                r.reason
+            );
+        }
+        // Host-attestor measurements likewise, flag or no flag.
+        let r = cdn_release(&CdnCase {
+            class: crate::snp::AllowlistClass::HostAttestor,
+            perms: &[CDN, "cdn-fleet-v1"],
+            fleet: &[(1, [1u8; 32])],
+            ..CdnCase::default()
+        });
+        assert!(r.out.is_err());
+    }
+
+    #[test]
+    fn cdn_release_refusals() {
+        let k = [(1u64, [1u8; 32])];
+        let cases: [(&[&str], bool, &str); 6] = [
+            (&[CDN, "cdn-fleet-v1"], false, "cdn-fleet-disabled"),
+            (&[CDN], true, "cdn-fleet-no-version"),
+            (&[CDN, "cdn-fleet-v01"], true, "cdn-fleet-perm-malformed"),
+            (
+                &[CDN, "cdn-fleet-v1", "cdn-fleet-v1"],
+                true,
+                "cdn-fleet-perm-duplicate",
+            ),
+            (
+                &[
+                    CDN,
+                    "cdn-fleet-v1",
+                    "cdn-fleet-v2",
+                    "cdn-fleet-v3",
+                    "cdn-fleet-v4",
+                    "cdn-fleet-v5",
+                ],
+                true,
+                "cdn-fleet-too-many-versions",
+            ),
+            // Named but never minted: a hard Vault error, not a node
+            // booting without that key.
+            (&[CDN, "cdn-fleet-v9"], true, "not found"),
+        ];
+        for (perms, enabled, want) in cases {
+            let r = cdn_release(&CdnCase {
+                perms,
+                cdn_fleet_enabled: enabled,
+                fleet: &k,
+                ..CdnCase::default()
+            });
+            assert!(r.out.is_err(), "{perms:?}");
+            assert!(r.reason.contains(want), "{perms:?}: {}", r.reason);
+        }
+    }
+
+    #[test]
+    fn a_plaintext_fleet_key_at_rest_is_refused() {
+        let path = crate::cdn_fleet::secret_path(1);
+        let plain = [7u8; 32];
+        let r = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v1"],
+            raw_kv: &[(&path, &plain)],
+            ..CdnCase::default()
+        });
+        assert!(r.out.is_err());
+        assert!(r.reason.contains("cdn-fleet-not-wrapped"), "{}", r.reason);
+    }
+
+    /// Rotation as vali drives it: pending v2 rides along with active v1,
+    /// then v1 drops out of new tickets. Each release carries exactly the
+    /// versions its own ticket names.
+    #[test]
+    fn rotation_follows_the_ticket() {
+        let k1 = [0xa1u8; 32];
+        let k2 = [0xb2u8; 32];
+        let fleet = [(1, k1), (2, k2)];
+        let before = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v1"],
+            fleet: &fleet,
+            ..CdnCase::default()
+        });
+        let during = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v1", "cdn-fleet-v2"],
+            fleet: &fleet,
+            ..CdnCase::default()
+        });
+        let after = cdn_release(&CdnCase {
+            perms: &[CDN, "cdn-fleet-v2"],
+            fleet: &fleet,
+            ..CdnCase::default()
+        });
+        let c = crate::cdn_fleet::clamp;
+        assert_eq!(open_fleet(&before), vec![(1, c(&k1))]);
+        assert_eq!(open_fleet(&during), vec![(1, c(&k1)), (2, c(&k2))]);
+        assert_eq!(open_fleet(&after), vec![(2, c(&k2))]);
+        // The node derives the same public key the KBS signs for vali.
+        assert_eq!(
+            crate::cdn_fleet::public_key(&open_fleet(&after)[0].1),
+            crate::cdn_fleet::public_key(&c(&k2))
+        );
     }
 }

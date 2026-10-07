@@ -31,7 +31,7 @@ image:
   #     this image back below v2.
   # The app has NO auto-sync, so merging a pin does not roll anything: the
   # roll is a deliberate, separate step.
-  digest: "sha256:5dbe66ae18124ee6b1b77e4df2573ac72207c05503e543b389f611ff91b28f2c"
+  digest: "sha256:b3deb93e08e764d321e07eb69d6878944074b2dddd42e39e0138bfe376373f66"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED, not a comment. `.github/scripts/verify_image_
   # provenance.py` runs `cosign verify` with these exact values as
@@ -52,8 +52,8 @@ image:
     # Fulcio SAN on the signature — workflow AND the git ref it ran on.
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/kbs-image.yml@refs/heads/main"
     # `githubWorkflowSha` on the signing cert — the exact source commit.
-    commitSha: "760465900e8cb2478f2f4b12e34eb1882c715b20"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37291000180/attempts/1"
+    commitSha: "2a420d2bda6314ac0cfa3177ef0fb3882a1be2f0"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37608922471/attempts/1"
     # false ⇒ built from a ref other than refs/heads/main, i.e. from a
     # tree that is NOT in this repo's history.
     mergedSource: true
@@ -384,6 +384,23 @@ config:
   # wrapping landed is gone — such a VM holds plaintext and would be
   # refused (it would not boot). Observable on `GET /v1/admin/config`.
   requireWrappedUserdata: false
+
+  # `[allowlist] enforce_release_class` — refuse a release whose attested
+  # measurement is pinned under the `host_attestor` class (that class was
+  # only ever checked at host-attestor enrolment, so a host-attestor
+  # measurement listed in a ticket would pass a release). Flip to true once
+  # vali's MeasurementLedger shows no live VM pinned as host_attestor. The
+  # `cdn_node` rules (class and the ticket's `cdn-node` perm must agree) do
+  # not depend on this flag.
+  allowlistEnforceReleaseClass: false
+
+  # `[cdn_fleet] enabled` — release the CDN fleet keyring (CDN K2). Off:
+  # a CDN node release is refused (`cdn-fleet-disabled`) and the admin
+  # public-key route answers 404; nothing else changes. Turn on with the
+  # broker's `vault.cdnFleetPolicy`, after the Vault side exists (Transit
+  # key `cdn-fleet`, policy kbs-cap-cdn-fleet, token role), at the first
+  # fleet key mint / CDN canary.
+  cdnFleetEnabled: true
 
   # ⚠️  DEPLOYMENT-SAFETY FUSE — suppressed-confirm anti-rollback bound
   # (`kbs_core::volume_stamp::MAX_UNCONFIRMED_RELEASES`). The Rust field

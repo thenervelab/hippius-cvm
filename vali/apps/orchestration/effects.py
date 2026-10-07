@@ -1528,6 +1528,8 @@ def dispatch_migrate_activate(
     a measured cmdline token.
     """
     # Lazy imports — keep the module import-light for the §24 paths.
+    from apps.network import net_policy
+
     from . import order_dispatch
     from .services import migration_ticket
 
@@ -1603,6 +1605,7 @@ def dispatch_migrate_activate(
         snapshot_sha256_hex=snapshot_sha256_hex,
         settle_by_unix=settle_by_unix,
         staged_restore_id=staged_restore_id,
+        net=net_policy.launch_net_spec(miner_id=miner_id, vm_id=vm.vm_id),
     )
     import json as _json
 

@@ -532,6 +532,10 @@ Before the roll, on top of that runbook:
       old emptyDir. Review `manage.py vali_kbs_audit --breaks --limit 100000000`:
       `torn-tail-truncated` rows are crashes (expected after an OOM kill);
       anything else is investigated BEFORE the roll destroys the chain.
+- [ ] **CDN (K1/K2).** No manifest entry may carry `cdn_node` before a KBS
+      that knows the class is live (an older one rejects the whole
+      artifact). `[cdn_fleet]` holds no state, so there is nothing new to
+      re-seed. Order and rollback: `docs/operator/cdn-fleet-keyring.md`.
 
 ## Follow-ups
 

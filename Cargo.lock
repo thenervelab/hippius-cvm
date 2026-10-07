@@ -942,6 +942,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto_box"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16182b4f39a82ec8a6851155cc4c0cda3065bb1db33651726a29e1951de0f009"
+dependencies = [
+ "aead",
+ "blake2",
+ "crypto_secretbox",
+ "curve25519-dalek",
+ "salsa20",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "crypto_secretbox"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9d6cf87adf719ddf43a805e92c6870a531aedda35ff640442cbaf8674e141e1"
+dependencies = [
+ "aead",
+ "cipher",
+ "generic-array",
+ "poly1305",
+ "salsa20",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1282,7 +1312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1973,6 +2003,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "hippius-cdn-agent"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "clap",
+ "crypto_box",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sev",
+ "sha2 0.10.9",
+ "signal-hook",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "toml",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "hippius-edge-gateway"
 version = "0.0.1"
 dependencies = [
@@ -2072,12 +2131,16 @@ dependencies = [
 name = "hippius-kbs-admin-client"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "ciborium",
  "clap",
+ "ed25519-dalek",
  "hex",
  "hippius-types",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "ureq",
@@ -2785,6 +2848,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http 0.5.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4109,6 +4173,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -4323,7 +4388,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4390,6 +4455,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -5375,7 +5449,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6200,7 +6274,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6459,6 +6533,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

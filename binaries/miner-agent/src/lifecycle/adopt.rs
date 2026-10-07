@@ -309,6 +309,23 @@ pub fn parse_domain_facts(xml: &str) -> Result<DomainFacts> {
     })
 }
 
+/// `(tap, MAC)` of every `<interface>` in a domain XML that names both
+/// (`<target dev='vnet3'/>`, `<mac address='52:54:00:…'/>`). A domain
+/// launched with a [`crate::orders::types::NetSpec`] names its tap
+/// `hvt<cid>` in its definition too, so callers that need the running
+/// tap check the domain is running first; an older domain's auto-named
+/// `vnet*` tap is only in the live XML.
+pub(crate) fn interface_taps(xml: &str) -> Vec<(String, String)> {
+    sections(xml, "interface")
+        .iter()
+        .filter_map(|block| {
+            let dev = tag_attrs(block, "target").and_then(|a| attr(&a, "dev"))?;
+            let mac = tag_attrs(block, "mac").and_then(|a| attr(&a, "address"))?;
+            Some((dev, mac))
+        })
+        .collect()
+}
+
 /// The backing file of the `vda` disk — the per-VM writable volume in
 /// BOTH modes (golden: the overlay upper; legacy: the LUKS root). `vdb`
 /// / `vdc` are the read-only dm-verity base, `vdd` the state disk and
@@ -384,7 +401,7 @@ fn element(xml: &str, tag: &str) -> Option<(String, String)> {
 }
 
 /// The raw attribute text of the first `<tag …>` (or `<tag …/>`).
-fn tag_attrs(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn tag_attrs(xml: &str, tag: &str) -> Option<String> {
     let open = find_open(xml, tag, 0)?;
     let gt = xml.get(open..)?.find('>')? + open;
     Some(xml.get(open + 1 + tag.len()..gt)?.to_string())
@@ -396,7 +413,7 @@ fn section(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// Every `<tag …>…</tag>` slice, in document order.
-fn sections(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn sections(xml: &str, tag: &str) -> Vec<String> {
     let close = format!("</{tag}>");
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -414,7 +431,7 @@ fn sections(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The value of `name='…'` / `name="…"` in an attribute string.
-fn attr(attrs: &str, name: &str) -> Option<String> {
+pub(crate) fn attr(attrs: &str, name: &str) -> Option<String> {
     for quote in ['\'', '"'] {
         let needle = format!("{name}={quote}");
         if let Some(at) = attrs.find(&needle) {
@@ -566,6 +583,24 @@ mod tests {
                 guest_features: 1,
             },
         }
+    }
+
+    /// A route persisted before port 25 was refused does not survive
+    /// re-adoption.
+    #[test]
+    fn a_persisted_smtp_route_fails_validation() {
+        sample_route().validate().unwrap();
+        let ep = "100.64.3.4:25";
+        let mut route = sample_route();
+        route.endpoint = ep.into();
+        route.recipe.cmdline = route
+            .recipe
+            .cmdline
+            .replace(&hex::encode(GUARDIAN_EP), &hex::encode(ep));
+        assert_eq!(
+            route.validate().unwrap_err().to_string(),
+            MinerAgentError::LaunchInput("guardian-ep-forbidden-port").to_string()
+        );
     }
 
     #[test]
@@ -928,5 +963,53 @@ mod tests {
                    <devices><vsock model='virtio'><cid auto='no' address='16'/></vsock></devices>\
                    </domain>";
         assert_eq!(parse_domain_facts(xml).unwrap().cid, Some(16));
+    }
+    #[test]
+    fn interface_taps_reads_the_live_target_and_mac() {
+        let live = "<domain><devices>\
+            <interface type='network'>\
+              <mac address='52:54:00:6b:3c:58'/>\
+              <source network='default' bridge='virbr0'/>\
+              <target dev='vnet3'/>\
+              <model type='virtio'/>\
+            </interface>\
+            <console type='pty'><target type='serial' port='0'/></console>\
+            </devices></domain>";
+        assert_eq!(
+            interface_taps(live),
+            vec![("vnet3".to_string(), "52:54:00:6b:3c:58".to_string())]
+        );
+        // The inactive definition carries no auto-named target.
+        let inactive = live.replace("<target dev='vnet3'/>", "");
+        assert!(interface_taps(&inactive).is_empty());
+    }
+
+    /// A domain launched with a `net` spec, as `virsh dumpxml` prints it:
+    /// the filter, the cap and the isolated port do not hide the tap.
+    #[test]
+    fn interface_taps_reads_a_named_tap_beside_filter_and_bandwidth() {
+        let live = "<domain><devices>\
+            <interface type='network'>\
+              <mac address='52:54:00:6b:3c:59'/>\
+              <source network='default' portid='0b9f' bridge='virbr0'/>\
+              <target dev='hvt12'/>\
+              <model type='virtio'/>\
+              <bandwidth>\
+                <inbound average='12207' peak='12207' burst='122'/>\
+                <outbound average='12207' peak='12207' burst='122'/>\
+              </bandwidth>\
+              <port isolated='yes'/>\
+              <filterref filter='clean-traffic'>\
+                <parameter name='CTRL_IP_LEARNING' value='dhcp'/>\
+                <parameter name='DHCPSERVER' value='192.168.122.1'/>\
+              </filterref>\
+              <alias name='net0'/>\
+              <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>\
+            </interface>\
+            </devices></domain>";
+        assert_eq!(
+            interface_taps(live),
+            vec![("hvt12".to_string(), "52:54:00:6b:3c:59".to_string())]
+        );
     }
 }

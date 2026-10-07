@@ -153,6 +153,7 @@ fn broker_scope(s: &VaultScope) -> BrokerScope {
         // broker grants the third read-only ACL path when present.
         lifecycle_path: s.lifecycle_path.clone(),
         lifecycle_version: s.lifecycle_version,
+        cdn_fleet_versions: s.cdn_fleet_versions.clone(),
     }
 }
 
@@ -237,6 +238,7 @@ mod tests {
             userdata_version: 1,
             lifecycle_path: None,
             lifecycle_version: None,
+            cdn_fleet_versions: None,
         }
     }
 
@@ -369,6 +371,80 @@ mod tests {
         // bytes and records the calls).
         assert_eq!(&rreq.snp_report[..64], &expected_rd);
         assert_eq!(mock.calls.lock().unwrap().as_slice(), &[expected_rd]);
+    }
+
+    /// A fleet-only scope (the admin public-key route) and a release scope
+    /// carrying the fleet leg both reach the broker intact, and a broker
+    /// that answers WITHOUT the leg (an older broker ignores the unknown
+    /// scope key) is refused: the token would not cover the fleet reads.
+    #[test]
+    fn the_cdn_fleet_leg_reaches_the_broker_and_must_be_echoed() {
+        for scope in [
+            VaultScope::fleet_only(vec![2]),
+            VaultScope {
+                cdn_fleet_versions: Some(vec![1, 2]),
+                ..vault_scope()
+            },
+        ] {
+            let challenge_resp = ChallengeResponse {
+                nonce: NONCE,
+                expiry_unix: 1_000,
+            }
+            .canonical()
+            .unwrap();
+            let echoed = RedeemResponse {
+                scope: broker_scope(&scope),
+                cap_expiry_unix: 2_000,
+                vault_token: b"hvs.tok".to_vec(),
+            }
+            .canonical()
+            .unwrap();
+            let mut stripped = broker_scope(&scope);
+            stripped.cdn_fleet_versions = None;
+            let stripped = if stripped.vm_id.is_empty() {
+                // An old broker cannot even decode a fleet-only scope.
+                None
+            } else {
+                Some(
+                    RedeemResponse {
+                        scope: stripped,
+                        cap_expiry_unix: 2_000,
+                        vault_token: b"hvs.tok".to_vec(),
+                    }
+                    .canonical()
+                    .unwrap(),
+                )
+            };
+            let (url, rx) = spawn_broker(vec![(200, challenge_resp.clone()), (200, echoed)]);
+            let mock = Arc::new(MockSelfReport::new());
+            let auth = RemoteBrokerVaultAuth::new(&url, Arc::clone(&mock) as _);
+            let challenge = auth.issue_challenge(&scope, 900).unwrap();
+            let verified = placeholder_report();
+            let ev = KbsAuthEvidence {
+                verified: &verified,
+                challenge: &challenge,
+                scope: &scope,
+                auth_pubkey: &PUBKEY,
+            };
+            let cap = auth.redeem(&ev, 950).unwrap();
+            assert_eq!(cap.scope, scope);
+            let creq = ChallengeRequest::decode(&rx.recv().unwrap().body).unwrap();
+            assert_eq!(creq.scope.cdn_fleet_versions, scope.cdn_fleet_versions);
+
+            if let Some(stripped) = stripped {
+                let (url, _rx) = spawn_broker(vec![(200, challenge_resp), (200, stripped)]);
+                let auth = RemoteBrokerVaultAuth::new(&url, Arc::clone(&mock) as _);
+                let challenge = auth.issue_challenge(&scope, 900).unwrap();
+                let ev = KbsAuthEvidence {
+                    verified: &verified,
+                    challenge: &challenge,
+                    scope: &scope,
+                    auth_pubkey: &PUBKEY,
+                };
+                let e = auth.redeem(&ev, 950).err().expect("refused");
+                assert!(e.to_string().contains("scope-mismatch"), "{e}");
+            }
+        }
     }
 
     #[test]

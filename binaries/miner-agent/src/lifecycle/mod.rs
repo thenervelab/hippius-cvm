@@ -250,6 +250,9 @@ pub struct CvmLifecycle {
     /// at the edge of the pool would all pass. Expire after
     /// [`ASID_RESERVATION_TTL`]; released when the launch ends.
     asid_reservations: Mutex<HashMap<VmId, std::time::Instant>>,
+    /// The net-policy launch latch ([`crate::netpolicy::apply`]). `None`
+    /// ⇒ no gate (tests, and agents without the net-policy route).
+    net_policy_gate: Option<Arc<crate::netpolicy::NetPolicyEnforcer>>,
 }
 
 /// How long a preflight's ASID reservation holds without a launch.
@@ -358,6 +361,7 @@ impl CvmLifecycle {
             readopt_retry_due: std::sync::atomic::AtomicBool::new(false),
             asids: Arc::new(crate::sev_asid::SysfsAsidSource::default()),
             asid_reservations: Mutex::new(HashMap::new()),
+            net_policy_gate: None,
         }
     }
 
@@ -502,6 +506,25 @@ impl CvmLifecycle {
         self
     }
 
+    /// Refuse tenant launches and migrate-in while `enforcer`'s
+    /// edge-mode policy is persisted but not loaded. The infra domain is
+    /// not gated.
+    pub fn with_net_policy_gate(
+        mut self,
+        enforcer: Arc<crate::netpolicy::NetPolicyEnforcer>,
+    ) -> Self {
+        self.net_policy_gate = Some(enforcer);
+        self
+    }
+
+    /// The net-policy launch latch; `Ok` when no gate is wired.
+    pub fn check_net_policy_gate(&self) -> Result<()> {
+        match &self.net_policy_gate {
+            Some(enforcer) => enforcer.check_launch(),
+            None => Ok(()),
+        }
+    }
+
     /// The AF_VSOCK context-id allocator (MA-4). The serve loop hands
     /// this `Arc` to the vsock relay listener so it can resolve an
     /// inbound connection's CID back to the tenant `VmId`.
@@ -535,6 +558,9 @@ impl CvmLifecycle {
     }
 
     async fn launch_inner(&self, order: LaunchOrder) -> Result<VmId> {
+        // Before anything is reserved: covers order launches, relaunches
+        // and the §25 destination's boot.
+        self.check_net_policy_gate()?;
         let vm_id = order.vm_id.clone();
         let domain_uuid = DomainUuid::generate()?;
         // Capture the COSE ticket bytes BEFORE moving the order into the
@@ -637,6 +663,7 @@ impl CvmLifecycle {
             // Placeholder — the real CID is assigned under the lock
             // below, before `to_libvirt_xml` ever runs.
             cid: crate::vsock::peer::MIN_GUEST_CID,
+            net: order.net,
         };
         config.validate()?;
         let domain_id = config.domain_name()?;

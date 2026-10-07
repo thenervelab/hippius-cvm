@@ -774,9 +774,29 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // budget (`[host]` config). Per-VM data/state disk roots come from
     // `[storage]` (default `/var/lib/hippius-miner`) so tenant data can
     // live on a dedicated mount without a code change.
+    //
+    // The host net policy: persisted orders, the nft rules loaded from
+    // them, the per-VM caps set on the guests' NICs, and the launch latch
+    // the lifecycle consults. Inert until vali sends a policy: with none
+    // persisted no table is created and no cap is touched.
+    let driver: Arc<dyn hippius_miner_agent::lifecycle::LibvirtDriver> =
+        Arc::new(VirshDriver::default());
+    let net_policy = Arc::new(hippius_miner_agent::netpolicy::NetPolicyEnforcer::new(
+        Arc::new(hippius_miner_agent::netpolicy::NetPolicyStore::new(
+            hippius_miner_agent::netpolicy::DEFAULT_NET_POLICY_DIR,
+        )),
+        Arc::new(hippius_miner_agent::netpolicy::NftCommand::default()),
+        Arc::new(hippius_miner_agent::netpolicy::LibvirtGuestTaps::new(
+            Arc::clone(&driver),
+        )),
+        Arc::new(hippius_miner_agent::netpolicy::VmCaps::new(
+            Arc::clone(&driver),
+            Arc::new(hippius_miner_agent::netpolicy::VirshTuner::default()),
+        )),
+    ));
     let lifecycle = Arc::new(
         CvmLifecycle::new(
-            Arc::new(VirshDriver::default()),
+            driver,
             Arc::new(SevLaunchDigest),
             HostResources {
                 total_cpus: config.host.cvm_cpu_budget,
@@ -788,7 +808,8 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             config.storage.data_disk_root.clone(),
             config.storage.state_disk_root.clone(),
         )
-        .with_progress_sink(progress.clone()),
+        .with_progress_sink(progress.clone())
+        .with_net_policy_gate(Arc::clone(&net_policy)),
     );
 
     // Re-adopt any tenant CVMs that survived a prior agent lifetime
@@ -801,6 +822,17 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         Ok(0) => {}
         Ok(n) => eprintln!("hippius-miner-agent: serve — re-adopted {n} running tenant CVM(s)"),
         Err(err) => eprintln!("hippius-miner-agent: serve — re-adopt sweep failed: {err}"),
+    }
+
+    // Load the persisted net policy again before orders are served (the
+    // boot unit loaded the last ruleset file; this re-renders it for the
+    // current uplink and taps). A failure is not fatal: the previous
+    // rules stay, the drift loop retries, and an edge-mode policy keeps
+    // launches latched.
+    match net_policy.reconcile().await {
+        Ok(true) => eprintln!("hippius-miner-agent: serve — net policy loaded"),
+        Ok(false) => {}
+        Err(err) => eprintln!("hippius-miner-agent: serve — net policy load failed: {err}"),
     }
 
     // The orders subsystem — verifier (the pinned Edge order key),
@@ -887,13 +919,9 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     )
     .with_backup(Arc::clone(&backup), chain_restorer)
     .with_restore(restore)
-    // `net-policy` orders are persisted (replay-safe across restarts)
-    // and acked; nothing is applied to the host yet.
-    .with_net_policy(Arc::new(
-        hippius_miner_agent::netpolicy::NetPolicyStore::new(
-            hippius_miner_agent::netpolicy::DEFAULT_NET_POLICY_DIR,
-        ),
-    ));
+    // `net-policy` orders are persisted (replay-safe across restarts),
+    // loaded, and acked once loaded.
+    .with_net_policy(Arc::clone(&net_policy));
 
     // Bind the orders HTTP server. `Config::validate` already proved
     // `bind_addr` is a NetBird-mesh address; a bind failure here is a
@@ -1107,6 +1135,8 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // holds its recorded CID UNVERIFIED (no ticket push, no relay) until
     // this loop confirms, re-keys or drops it. Detached: it only ever
     // touches the lifecycle's own bookkeeping.
+    // Keeps the net policy's rules loaded (drift, uplink and tap changes).
+    let _net_policy_task = tokio::spawn(Arc::clone(&net_policy).run(cancel.clone()));
     let _cid_verify_task = tokio::spawn(hippius_miner_agent::lifecycle::cid_verify::run(
         Arc::clone(&lifecycle),
         cancel.clone(),
@@ -1379,6 +1409,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
             // The launch digest is CID-independent — the lowest guest
             // CID is a fine placeholder for the `--digest-only` path.
             cid: MIN_GUEST_CID,
+            net: None,
         };
         let digest = compute_launch_digest(&config)?;
         // stdout: the digest is the §F allowlist measurement — pipe it
@@ -1413,6 +1444,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
         cose_ticket: serde_bytes::ByteBuf::new(),
         require_existing_disks: false,
         guardian_ep: None,
+        net: None,
     };
 
     // The lifecycle is async (`tokio::process` drives `virsh`); a

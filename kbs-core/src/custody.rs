@@ -831,6 +831,16 @@ fn bind_inner(
         deps.launch_policy,
     )
     .map_err(denied)?;
+    // 2b. Allowlist class × ticket role, as at release. Custody is new, so
+    // the host-attestor refusal is on here unconditionally; a CDN node
+    // (class and perm agreeing) may hold a lease like any VM.
+    crate::snp::check_release_class(
+        deps.offline_allowlist,
+        &report.measurement,
+        &ticket.lifecycle_perms,
+        true,
+    )
+    .map_err(denied)?;
 
     // 3. CHIP_ID == ticket placement — same generation-aware truncation as
     //    the release path.
@@ -1020,6 +1030,7 @@ fn vault_scope(vm_id: &str, scope: &CustodyScope, lifecycle_path: Option<String>
         userdata_path: scope.userdata_path.clone(),
         userdata_version: scope.userdata_version,
         lifecycle_version: lifecycle_path.as_ref().map(|_| LIFECYCLE_KEY_VERSION),
+        cdn_fleet_versions: None,
         lifecycle_path,
     }
 }

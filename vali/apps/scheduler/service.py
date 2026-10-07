@@ -533,15 +533,26 @@ def price_by_node(snapshot: chain.ChainSnapshot) -> dict[str, int]:
     return {m.node_id: m.price for m in snapshot.miners if m.price is not None}
 
 
-def max_family_per_node() -> int | None:
-    """Hard ceiling on same-family VMs per host, or `None` for no cap.
+def max_family_per_node(family: str = "") -> int | None:
+    """Hard ceiling on same-family VMs per host for `family` (a tenant id),
+    or `None` for no cap.
 
     `None` is the deliberate default: the RANKING already spreads (see
     `SelectionWeights.spread`), and a numeric cap here is a capacity
     policy, not a safety property. Set `VALI_MAX_FAMILY_PER_NODE` to a
     positive integer to enforce one.
+
+    The CDN fleet is the exception (docs/design/cdn.md, CDN plan N2): one
+    CDN node per host, whatever the setting, while `VALI_CDN_ENABLED` is
+    on — two nodes on one miner would fail together and halve the
+    region's spread for nothing.
     """
     from django.conf import settings
+
+    from apps.common.cdn import cdn_role
+
+    if cdn_role(family):
+        return 1
 
     raw = getattr(settings, "VALI_MAX_FAMILY_PER_NODE", None)
     try:
@@ -549,6 +560,16 @@ def max_family_per_node() -> int | None:
     except (TypeError, ValueError):
         return None
     return n if n > 0 else None
+
+
+def cdn_family_cap(family: str) -> int | None:
+    """The CDN fleet's one-node-per-host cap alone (`1` under `cdn_role`,
+    else `None`), for the placement paths that never applied
+    `VALI_MAX_FAMILY_PER_NODE` — re-placement, auto-migration, the
+    price-watch suggestion — so they change for nobody else."""
+    from apps.common.cdn import cdn_role
+
+    return 1 if cdn_role(family) else None
 
 
 def decision_inputs(
@@ -594,9 +615,121 @@ def decision_inputs(
         committed_cpus[node_id] = committed_cpus.get(node_id, 0) + cpus
         if row["vm_family"] == vm_family:
             family_load[node_id] = family_load.get(node_id, 0) + 1
+    from apps.common.cdn import cdn_role
+
+    if cdn_role(vm_family):
+        # One CDN node per host is a hard rule: count every node a host
+        # carries or is about to, not only the placement ledger.
+        for node_id, n in cdn_node_load(vm_family).items():
+            family_load[node_id] = max(family_load.get(node_id, 0), n)
 
     capacity = _effective_capacity_by_node(load, committed_mb, committed_cpus)
     return capacity, load, family_load
+
+
+def cdn_node_load(tenant_id: str, *, exclude_vm_id: str = "") -> dict[str, int]:
+    """`{chain node_id: CDN nodes on it or headed to it}` for the CDN tenant
+    (CDN plan N2), from vali's own records: each live VM's host
+    (`Vm.host`, else its launch's miner), its `migration_dest` once fenced,
+    and the destination of any §25 / restore job still in flight — which
+    the placement ledger only learns at activation. A host gone dark still
+    counts: the node may come back there. `exclude_vm_id` leaves one VM
+    out (the one being moved)."""
+    from apps.lifecycle.models import Vm
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.effects import _bound_miner_id
+    from apps.orchestration.models import TERMINAL_MIGRATION_STATES, MigrationJob
+
+    rows = Vm.objects.filter(tenant_id=tenant_id).exclude(state=VmState.DESTROYED)
+    if exclude_vm_id:
+        rows = rows.exclude(vm_id=exclude_vm_id)
+    vms = list(rows)
+    if not vms:
+        return {}
+    miners: dict[int, set[str]] = {vm.pk: {_bound_miner_id(vm), vm.migration_dest} for vm in vms}
+    for vm_pk, dest in (
+        MigrationJob.objects.filter(vm_id__in=miners)
+        .exclude(state__in=TERMINAL_MIGRATION_STATES)
+        .values_list("vm_id", "dest_node_id")
+    ):
+        miners[vm_pk].add(dest)
+    chain_by_miner = dict(
+        MinerIdentity.objects.filter(miner_id__in=set().union(*miners.values()) - {""})
+        .exclude(chain_node_id__isnull=True)
+        .values_list("miner_id", "chain_node_id")
+    )
+    load: dict[str, int] = {}
+    for held in miners.values():
+        for node_id in {chain_by_miner.get(m) for m in held} - {None, ""}:
+            load[node_id] = load.get(node_id, 0) + 1
+    return load
+
+
+def cdn_edge_arguments(family: str, vm_id: str = "") -> dict[str, Any]:
+    """Gate (j)'s [`decide_placement`] argument for `family`: under
+    `cdn_role`, the nodes whose VERIFIED country is one the CDN node may run
+    in (`network.service.cdn_edge_regions` — its address's edge region, else
+    a region with a free CDN address on an attachable edge). `{}` — no
+    query — for every other family."""
+    from apps.common.cdn import cdn_role
+
+    if not cdn_role(family):
+        return {}
+    from apps.network.service import cdn_edge_regions
+
+    regions = cdn_edge_regions(vm_id)
+    return {
+        "cdn_local_edge": frozenset(
+            nid for nid, cc in region_by_node(verified_only=True).items() if cc in regions
+        )
+    }
+
+
+def cdn_edge_reason(tenant_id: str, vm_id: str, miner_id: str) -> str | None:
+    """Gate (j) for a miner a caller names: why `miner_id` must not take
+    the CDN node `vm_id`, or `None`. Always `None` outside `cdn_role`."""
+    from apps.common.cdn import cdn_role
+
+    if not cdn_role(tenant_id):
+        return None
+    from apps.network.service import cdn_edge_regions, cdn_host_region
+
+    country = cdn_host_region(miner_id)
+    regions = cdn_edge_regions(vm_id)
+    if country and country in regions:
+        return None
+    return (
+        f"miner {miner_id!r} (verified country {country or 'unknown'}) has no local edge "
+        f"for this CDN node (allowed: {sorted(regions) or 'none'})"
+    )
+
+
+def cdn_dest_reason(tenant_id: str, vm_id: str, miner_id: str) -> str | None:
+    """Every CDN rule for a miner a caller names: one node per host and a
+    local edge."""
+    return cdn_colocation_reason(tenant_id, vm_id, miner_id) or cdn_edge_reason(
+        tenant_id, vm_id, miner_id
+    )
+
+
+def cdn_colocation_reason(tenant_id: str, vm_id: str, miner_id: str) -> str | None:
+    """Why `miner_id` must not take the CDN node `vm_id` — another CDN node
+    is on it or headed to it — or `None`. For the paths that name a miner
+    instead of asking [`decide_placement`] (an explicit §25 or restore
+    destination, `vali_create_vm`). Always `None` outside `cdn_role`."""
+    from apps.common.cdn import cdn_role
+    from apps.miners.models import MinerIdentity
+
+    if not cdn_role(tenant_id):
+        return None
+    node_id = (
+        MinerIdentity.objects.filter(miner_id=miner_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    if node_id and cdn_node_load(tenant_id, exclude_vm_id=vm_id).get(node_id):
+        return f"miner {miner_id!r} already carries a CDN node (one per host)"
+    return None
 
 
 @dataclass(frozen=True)
@@ -702,6 +835,7 @@ def placement_arguments(
     shadow_log: bool = True,
     budgets: dict[str, HostBudget] | None = None,
     boot_gate: bool = False,
+    vm_id: str = "",
 ) -> dict[str, Any]:
     """Every [`decide_placement`] argument EXCEPT `snapshot`, assembled
     from settings + the DB exactly as a real launch assembles them.
@@ -728,7 +862,7 @@ def placement_arguments(
         "capacity_by_node": (inputs := decision_inputs(tenant_id))[0],
         "load_by_node": inputs[1],
         "family_load_by_node": inputs[2],
-        "max_family_per_node": max_family_per_node(),
+        "max_family_per_node": max_family_per_node(tenant_id),
         "max_epoch_lag": max_epoch_lag(),
         "excluded": excluded,
         "dispatchable": dispatchable_node_ids(),
@@ -757,11 +891,15 @@ def placement_arguments(
         "zombie_quarantined": zombie_quarantined_node_ids(),
         # Gate (h) — an operator-cordoned miner takes no new work.
         "cordoned": cordoned_node_ids(),
+        # Gate (i) — an edge-region miner without a fresh net-policy ack.
+        "net_policy_unready": net_policy_unready_node_ids(),
         # Capacity v2 — does THIS flavor fit, in real units (shadow while
         # `VALI_SCHEDULER_RESOURCE_ADMISSION` is off).
         "resource_fit": resource_fit(flavor, shadow_log=shadow_log, budgets=budgets),
         # Gate (g) — concurrent boots per miner (launch path only).
         **(boot_gate_arguments() if boot_gate else {}),
+        # Gate (j) — a CDN node only where its edge is local.
+        **cdn_edge_arguments(tenant_id, vm_id),
     }
 
 
@@ -819,6 +957,16 @@ def cordoned_node_ids() -> dict[str, str]:
             "miner_node_id", "cordon_reason"
         )
     }
+
+
+def net_policy_unready_node_ids() -> dict[str, str]:
+    """`{lower-case node_id: reason}` of the miners gate (i) skips: in an
+    edge-mode egress region without a fresh ack of their edge-mode
+    net-policy. One query, `{}`, while every region is local. Lazy import —
+    the scheduler must not couple to the network app at module load."""
+    from apps.network.net_policy import unready_node_ids
+
+    return unready_node_ids()
 
 
 def zombie_quarantined_node_ids() -> frozenset[str]:

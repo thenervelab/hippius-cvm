@@ -580,6 +580,7 @@ def test_these_rejections_count_against_the_host(classifier) -> None:
         "bad-signature",
         "order-stale",
         "order-wrong-miner",
+        "net-policy-not-loaded",
     ],
 )
 def test_these_rejections_say_nothing_about_the_host(classifier) -> None:

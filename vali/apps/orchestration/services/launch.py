@@ -46,7 +46,9 @@ from typing import Any
 from django.conf import settings
 from django.utils import timezone
 
+from apps.cdn import identity as cdn_identity
 from apps.miners.models import MinerIdentity
+from apps.network import net_policy
 from apps.orchestration import effects, kbs_admin, order_dispatch
 from apps.orchestration.effects import EffectError, EffectUnavailable
 from apps.orchestration.services import (
@@ -966,9 +968,11 @@ def _derive_measured_cmdline(
     validator_nonce_hex: str,
     telemetry_epoch: int,
     eol_nonce_hex: str,
+    cdn_node: bool = False,
 ) -> str:
     """The MEASURED cmdline of a launch of `spec`, from its per-launch
-    inputs. Pure: no Vault, no DB write, no randomness. `launch_on_miner`
+    inputs. `cdn_node` (a CDN node's launch, `apps.cdn.identity`) adds the
+    CDN role tokens. Pure: no Vault, no DB write, no randomness. `launch_on_miner`
     calls it with the real values; `_ensure_vm_row` calls it with
     same-length stand-ins BEFORE it pins a new M1/M2 row (see
     `_refuse_measured_cmdline_before_pin`), so a cmdline that would be
@@ -994,6 +998,17 @@ def _derive_measured_cmdline(
         augmented_cmdline,
         _ACCEPT_MEMORY_CMDLINE_KEY,
         "eager" if guest_resources.accept_memory_eagerly() else None,
+    )
+    # The CDN role (CDN plan V2), forced both ways: a CDN node's guest-release
+    # writes the KBS-released fleet keyring to the measured directory, and a
+    # tenant cmdline never carries either token, whatever its base said.
+    augmented_cmdline = _force_cmdline_token(
+        augmented_cmdline, cdn_identity.CDN_NODE_CMDLINE_KEY, "1" if cdn_node else None
+    )
+    augmented_cmdline = _force_cmdline_token(
+        augmented_cmdline,
+        cdn_identity.CDN_FLEET_DIR_CMDLINE_KEY,
+        cdn_identity.CDN_FLEET_DIR if cdn_node else None,
     )
     if spec.rootfs_sha256_hex:
         augmented_cmdline = _augment_cmdline_with_token(
@@ -1256,6 +1271,16 @@ def launch_on_miner(
             "key_mode=customer holds no Hippius disk KEK — refusing kek_bytes"
         )
     _refuse_miner_for_customer_keys(binding, miner)
+    # The CDN role (`apps.cdn.identity`): a CDN node's launch carries the
+    # role in its ticket, cmdline and pin class. Refused before any row,
+    # secret or pin exists when it must not run, or would boot anything but
+    # the cdn-node image with the node's own user-data.
+    try:
+        cdn_node = cdn_identity.check_launch(spec.vm_id, spec.tenant_id)
+        if cdn_node:
+            cdn_identity.check_launch_spec(spec)
+    except cdn_identity.CdnRoleError as exc:
+        return _terminal("cdn-role-refused", str(exc), EXIT_CONFIG_ERROR)
 
     # ── 0. the control-plane row, BEFORE any effect that can leave a
     #        running domain behind (P9/#18) ─────────────────────────────
@@ -1291,6 +1316,12 @@ def launch_on_miner(
     # so there is no window in which secrets/tickets/domains exist for a
     # vm_id with no row.
     vm_row = _ensure_vm_row(spec)
+    if cdn_node:
+        # The durable fact every later mint and pin reads (`is_cdn_vm`).
+        try:
+            cdn_identity.bind_vm(spec.vm_id, vm_row)
+        except cdn_identity.CdnRoleError as exc:
+            return _terminal("cdn-role-refused", str(exc), EXIT_CONFIG_ERROR)
     # The register gate (step 8) decides this under the row lock at the
     # end; asking the same question here first spares a launch that can
     # never register — above all reboot-recovery of a §25-migrated VM
@@ -1597,6 +1628,7 @@ def launch_on_miner(
         validator_nonce_hex=validator_nonce_hex,
         telemetry_epoch=_current_billing_epoch(),
         eol_nonce_hex=nonce_seed,
+        cdn_node=cdn_node,
     )
     effective_eol_nonce_hex = _extract_cmdline_token(
         augmented_cmdline, _EOL_NONCE_CMDLINE_KEY
@@ -1745,17 +1777,34 @@ def launch_on_miner(
                 measurement_hex = expected_digest
                 recomputed = True
 
+    # A CDN node's measurement is trusted with the fleet keyring: only
+    # vali's own recompute of it is ever ticketed or pinned, never the
+    # miner's report (the C2 WARN mode above) — and it must be pinned.
+    if cdn_node and (not recomputed or not spec.auto_pin_allowlist):
+        return _terminal(
+            "cdn-role-refused",
+            "cdn-node-unverified-digest: a CDN node launches only with vali's own "
+            "launch-digest recompute, pinned (VALI_LAUNCH_DIGEST_ENFORCE)",
+            EXIT_CONFIG_ERROR,
+        )
+
     # ── 6. Allowlist re-pin (optional) ──────────────────────────────
     # The pin also records the digest in the audit ledger (#587 Phase 3,
     # GET /v1/admin/audit/measurements) under its lock: the next pin's
     # carry-forward reads that row, and the live-attestation ingest
     # refuses a VM with none (`vm_liveness.pinned_measurements`). A tenant
-    # launch always pins under the tenant class.
+    # launch always pins under the tenant class, a CDN node's under
+    # `cdn_node` (the KBS releases the fleet keyring to that class only).
     pin_result = None
     if spec.auto_pin_allowlist:
         try:
             pin_result = allowlist_pin.pin_measurement(
                 measurement_hex=measurement_hex,
+                **(
+                    {"measurement_class": allowlist_pin.ALLOWLIST_CLASS_CDN_NODE}
+                    if cdn_node
+                    else {}
+                ),
                 ledger=allowlist_pin.PinLedger(
                     vm_id=spec.vm_id,
                     platform_id=platform_id or "",
@@ -1806,7 +1855,9 @@ def launch_on_miner(
             luks_vault_version=luks_version,
             allowed_userdata_digest_hex=digest_hex,
             flavor=spec.flavor,
-            lifecycle_perm=("launch", _SUPERSEDE_PERM) if supersede else ("launch",),
+            lifecycle_perm=cdn_identity.ticket_perms(
+                ("launch", _SUPERSEDE_PERM) if supersede else ("launch",), spec.vm_id
+            ),
             expiry_seconds=spec.expiry_seconds,
             # The generation the KBS releases this VM's KEK at; the
             # register gate and the entry check compare the Vm row against
@@ -1999,6 +2050,9 @@ def launch_on_miner(
         memory_mb=flavor.memory_mb,
         cose_ticket=cose_ticket,
         require_existing_disks=require_existing_disks,
+        net=net_policy.launch_net_spec(
+            miner_id=miner.miner_id, vm_id=spec.vm_id, flavor=spec.flavor
+        ),
     )
     import json as _json
 
@@ -2562,6 +2616,7 @@ def _place_and_launch(
                     region=spec.region,
                     platform_id=spec.platform_id,
                     boot_gate=True,
+                    vm_id=spec.vm_id,
                 ),
             )
         except PlacementError as exc:
@@ -2946,6 +3001,11 @@ def launch_on_named_miner(
     # identity must leave nothing behind.
     _refuse_miner_for_customer_keys(_spec_binding(spec), miner)
     _refuse_cordoned_miner(miner)
+    from apps.scheduler import service as sched
+
+    reason = sched.cdn_dest_reason(spec.tenant_id, spec.vm_id, miner.miner_id)
+    if reason is not None:
+        raise LaunchConfigError(reason)
     vm = _ensure_vm_row(spec)
     node_id = miner.chain_node_id
     try:

@@ -29,7 +29,13 @@ image:
   # forge-any-policy grant, which is a security regression. Verify the Vault
   # policy before ever rolling this back. Keep this pin honest: it is the
   # contract.
-  digest: "sha256:5b97c6400074f049cf33adb68950dc403c2be97fafabf6536f941691196d981a"
+  # BUMPED 2026-10-07 (sha-2a420d2bda63, CDN K2 #1471) — the broker that
+  # knows `vault.cdn_fleet_policy` and the cdn-fleet scope leg, and the
+  # first PINNED image past #892 (jwt auth to Vault). The live pod had run a
+  # post-#892 build applied out of band; this pin and the jwt block below
+  # make git describe it again. Record the LIVE digest before syncing: it is
+  # the rollback target, and it is not the 83d32f0 value this replaced.
+  digest: "sha256:5e70289e4dd0f51b06406e71da2c4e6d40e3b18372d5f83cbd5ed8214647251a"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -41,16 +47,16 @@ image:
   # Unlike the KBS pin, this one IS a merged-source build and the comment
   # above it is accurate.
   provenance:
-    workflowRef: "https://github.com/thenervelab/hippius-compute/.github/workflows/broker-image.yml@refs/heads/main"
-    commitSha: "83d32f0d68110481d3c0e15d00ff035a026c13ca"
-    runUrl: "https://github.com/thenervelab/hippius-compute/actions/runs/28907887726/attempts/1"
+    workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/broker-image.yml@refs/heads/main"
+    commitSha: "2a420d2bda6314ac0cfa3177ef0fb3882a1be2f0"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37608922446/attempts/1"
     mergedSource: true
   # The image is PUBLIC: the kata-qemu-snp guest pulls it itself
   # IN-GUEST via the CDH (nydus-for-kata-tee) and pull secrets do NOT
   # reach that path — verified live 2026-06-10: the kubelet host pull
   # honoured the regcred, the in-guest CDH blob fetch got 401. The
-  # image carries no secrets — the privileged Vault token arrives via
-  # the BROKER_VAULT_TOKEN env (ExternalSecret), config via ConfigMap.
+  # image carries no secrets — the broker logs in to Vault with its
+  # projected ServiceAccount token (`vaultAuth` below), config via ConfigMap.
   pullSecret:
     # Dormant: pull secrets only apply to the HOST-side resolution for
     # kata-qemu-snp pods (see above). Kept for non-CVM reuse.
@@ -58,6 +64,22 @@ image:
     name: harbor-regcred
     # Vault KV-v2 path holding `dockerconfigjson` (operator-staged).
     vaultPath: hippius-compute/registry/harbor
+
+# How the broker authenticates to Vault (M-k8sauth #94, broker #892): it
+# exchanges a projected `vault`-audience ServiceAccount token at
+# `auth/<authPath>/login` for a short-lived token. The Vault role
+# `kbs-vault-broker` is bound to `system:serviceaccount:kbs:kbs-vault-broker`,
+# audience `vault`, policy `kbs-vault-broker-mint`. There is NO static
+# token any more (#888 revoked it, #975 deleted its ExternalSecret).
+vaultAuth:
+  serviceAccountName: "kbs-vault-broker"
+  role: "kbs-vault-broker"
+  authPath: "jwt"
+  audience: "vault"
+  mountPath: "/var/run/secrets/vault"
+  # Short: the broker re-reads the file on every login, and kubelet
+  # rotates it well before expiry.
+  expirationSeconds: 600
 
 # Single replica: the challenge store is in-memory + single-use — a
 # nonce issued by replica A cannot be redeemed against replica B. One
@@ -159,6 +181,13 @@ vault:
   # authorises the broker to attach a policy outside its own set
   # (Vault's child-policy-subset rule). See README "Operator setup".
   tokenRole: kbs-vault-broker-cap
+  # CDN K2 — the fixed policy (`deploy/terraform/policies/
+  # kbs-cap-cdn-fleet.hcl`) the broker attaches to a cap whose scope
+  # carries the cdn-fleet leg. Empty ⇒ every such scope is refused, so the
+  # fleet keyring is unreachable through the broker. Set it to
+  # `kbs-cap-cdn-fleet` only after the policy exists in Vault and the
+  # token role's `allowed_policies` lists it (README, CDN fleet keyring).
+  cdnFleetPolicy: "kbs-cap-cdn-fleet"
   # ⚠️  DEV-ONLY: skip TLS server-cert verification toward a Vault
   # with a private / self-signed certificate. Same prod-marker guard
   # as the KBS (`tier0` / `prod` / `hippius.network` in vault.address

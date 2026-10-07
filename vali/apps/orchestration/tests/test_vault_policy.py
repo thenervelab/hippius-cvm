@@ -134,3 +134,74 @@ def test_the_working_copy_key_is_fully_wired(path: str) -> None:
 def test_the_working_copy_key_can_be_destroyed_at_decommission() -> None:
     assert "delete" in _policy().get("transit/keys/ud-*", set())
     assert "update" in _policy().get("transit/keys/ud-*/config", set())
+
+
+def _grant_reaches(grant: str, target: str) -> bool:
+    """Vault path matching: `+` is one path segment, a trailing `*` any
+    suffix."""
+    body = grant[:-1] if grant.endswith("*") else grant
+    parts = re.split(r"(\+)", body)
+    pattern = "".join("[^/]+" if part == "+" else re.escape(part) for part in parts)
+    return re.fullmatch(pattern + (".*" if grant.endswith("*") else ""), target) is not None
+
+
+def test_vali_can_sign_with_the_cdn_ca_but_never_take_its_key() -> None:
+    """The CDN CA's private key is the Transit key `cdn-ca` (`apps.cdn.ca`).
+    vali signs with it and reads its public half, nothing more: a grant
+    that can export or back it up, make it exportable (`/config`), rotate,
+    delete or re-create it would let a vali RCE walk away with the CA."""
+    policy = _policy()
+    assert policy.get("transit/sign/cdn-ca") == {"update"}
+    assert policy.get("transit/keys/cdn-ca") == {"read"}
+    forbidden = (
+        "transit/keys/cdn-ca/config",
+        "transit/keys/cdn-ca/rotate",
+        "transit/export/signing-key/cdn-ca",
+        "transit/export/signing-key/cdn-ca/1",
+        "transit/backup/cdn-ca",
+        "transit/restore/cdn-ca",
+        "transit/keys/cdn-ca/import",
+    )
+    for grant, caps in policy.items():
+        for target in forbidden:
+            assert not _grant_reaches(grant, target), (
+                f"the policy grants {sorted(caps)} on {grant!r}, which reaches {target!r}"
+            )
+        if _grant_reaches(grant, "transit/keys/cdn-ca"):
+            assert caps <= {"read"}, f"{grant!r} grants {sorted(caps)} on the CA key itself"
+
+
+def test_grant_matching() -> None:
+    assert _grant_reaches("transit/keys/+/config", "transit/keys/cdn-ca/config")
+    assert _grant_reaches("transit/*", "transit/backup/cdn-ca")
+    assert not _grant_reaches("transit/keys/kek-*", "transit/keys/cdn-ca/config")
+    assert not _grant_reaches("transit/keys/+", "transit/keys/cdn-ca/config")
+
+
+def test_vali_mints_cdn_fleet_keys_without_ever_holding_one() -> None:
+    """CDN K2: vali mints a fleet key version through
+    `transit/datakey/wrapped/cdn-fleet` and stores the ciphertext once.
+    It must never be able to open one (decrypt, datakey/plaintext), wrap a
+    key of its own choosing (encrypt), make the key exportable or back it
+    up, read a stored version back, or overwrite one (update)."""
+    policy = _policy()
+    assert policy.get("transit/datakey/wrapped/cdn-fleet") == {"update"}
+    assert policy.get("secret/data/hippius-compute/kbs/cdn-fleet/*") == {"create"}
+    forbidden = (
+        "transit/decrypt/cdn-fleet",
+        "transit/encrypt/cdn-fleet",
+        "transit/rewrap/cdn-fleet",
+        "transit/datakey/plaintext/cdn-fleet",
+        "transit/keys/cdn-fleet/config",
+        "transit/keys/cdn-fleet/rotate",
+        "transit/export/encryption-key/cdn-fleet",
+        "transit/backup/cdn-fleet",
+        "transit/restore/cdn-fleet",
+    )
+    for grant, caps in policy.items():
+        for target in forbidden:
+            assert not _grant_reaches(grant, target), (
+                f"the policy grants {sorted(caps)} on {grant!r}, which reaches {target!r}"
+            )
+        if _grant_reaches(grant, "secret/data/hippius-compute/kbs/cdn-fleet/v1"):
+            assert caps <= {"create"}, f"{grant!r} grants {sorted(caps)} on a fleet key version"

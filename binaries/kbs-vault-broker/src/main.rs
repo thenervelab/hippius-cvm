@@ -93,7 +93,8 @@ async fn run() -> Result<(), String> {
         auth,
         cfg.vault.child_token_ttl_secs,
         &cfg.vault.token_role,
-    );
+    )
+    .with_cdn_fleet_policy(cfg.vault.cdn_fleet_policy.clone());
     let state = Arc::new(BrokerState {
         verifier,
         challenges: Box::new(InMemoryChallenges::new(cfg.challenge.ttl_secs)),

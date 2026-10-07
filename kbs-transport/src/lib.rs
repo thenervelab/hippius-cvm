@@ -22,6 +22,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod admin_handler;
+pub mod cdn_fleet;
 pub mod handlers;
 pub mod rate_limit;
 pub mod router;

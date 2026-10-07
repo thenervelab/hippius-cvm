@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:c527fcbf72af329d7a0f928f52833e4050646394c7d764493a44f4d14d7cee0d"
+  digest: "sha256:5fba2c486892a3f5ef207b10d36d9bdbf35c3d31e61bbbb4fe7d5cae13c179fc"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "35a334d86a6dfb59617d87884416fbf8647f36de"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37515761634/attempts/1"
+    commitSha: "83a58d81b5b5913e38ed41225b66eb8992ac983b"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37636246027/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -514,6 +514,19 @@ orchestrationTick:
     debouncePolls: 3   # consecutive down polls before a relaunch (debounce)
     maxAttempts: 5     # per-VM relaunch attempt cap
     backoffBaseS: 120  # exponential-backoff base between attempts
+  # Guest network policy push (`apps.network.net_policy.reconcile`, run in
+  # this tick): the host-wide `net-policy` order — guest bandwidth caps,
+  # port 25, the edge-mode allowlist. push "false" (the default when unset)
+  # = nothing pushed, and miners/localAction are not rendered. On, only the
+  # miners listed (comma-separated miner ids, `*` = all) get it. localAction
+  # is what the local-mode rules do with a matching packet: "count" (observe
+  # only) or "drop".
+  # Roll out by canary: one miner in count mode first, then widen the list,
+  # then switch localAction to drop once the counters look sane.
+  netPolicy:
+    push: "true"
+    miners: "*"
+    localAction: "drop"
   resources:
     requests:
       cpu: 50m
@@ -1018,6 +1031,18 @@ config:
   # detach, so only DNS caches still pointing at it remain — raise this for
   # tenants running long DNS TTLs. docs/design/public-ip.md §4.
   publicIpQuarantineS: 3600
+  # Edge feed address table carries each address's vm_region + epoch, local
+  # mode included, so the backend can price bandwidth by region
+  # (VALI_FEED_ADDRESS_REGION, #1454). Never adds cap_mbps / smtp_allowed
+  # outside egress mode. Flipping it bumps the revision of the edges it
+  # changes. ON 2026-10-07.
+  feedAddressRegion: true
+  # Every bound edge's feed carries a top-level block_smtp: true, so the
+  # edge drops outbound TCP 25 from every public-IP VM, local and egress
+  # mode alike; an address whose port 25 was unblocked carries
+  # smtp_allowed: true (VALI_FEED_BLOCK_SMTP, #1465). Flipping it bumps the
+  # revision of every bound edge. ON 2026-10-07: port 25 was open.
+  feedBlockSmtp: true
   syntheticPushgatewayUrl: "http://prometheus-pushgateway.observability.svc.cluster.local:9091"
 
   # ── vali's half of the KBS admin mTLS gate ────────────────────────
@@ -1178,7 +1203,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:a97bd12269f9a64c2ec1d6a8b20ca80975d5161c1423c820cb9e473762f448c2"
+    digest: "sha256:9172322b8fefd5f906786c13effdc423baa0082687904696b864603669d7dd5f"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1193,8 +1218,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "4f935b630dc1fd8512aae49eed5a866c89e622f6"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37205600046/attempts/1"
+      commitSha: "433179f7ea0196da782e692307ed07ae5e36d641"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37621746633/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the
@@ -1447,3 +1472,18 @@ publicApiIngress:
   # working.
   controllerNamespace: ingress-nginx
   controllerName: ingress-nginx
+
+# ── CDN (docs/design/cdn.md) ──────────────────────────────────────────
+cdn:
+  # VALI_CDN_BACKEND_URL in the shared vali-config ConfigMap: measured
+  # into the cdn-node image; changing it = re-bake; backend confirmed
+  # 2026-10-07. A bare https origin (no path, no trailing slash): the
+  # cdn-agent appends /api/cdn/node/... itself, and vali refuses anything
+  # else. Lives in git, never `kubectl set env` (ArgoCD reverts it).
+  backendUrl: "https://api.hippius.com"
+  # VALI_CDN_KBS_RESPONSE_VK_HEX: the KBS response-signing Ed25519 public
+  # key (32-byte hex), pinned out of band — the same key the guest UKI pins
+  # (PINNED_KBS_RESPONSE_VK). `vali_cdn_fleet mint` checks every fleet
+  # version's public-key signature under it. Empty: not rendered, and every
+  # mint refuses.
+  kbsResponseVkHex: "24e6a730dc24e1bfba1e6d21d943924d3ab6f311ea0f2e0b3e585458393bc803"

@@ -305,6 +305,7 @@ CLASSES_NOT_START_CAPABILITY = frozenset(
         "not-yet-wired",  # 501 — miner-agent build skew
         "relaunch-disks-missing",  # 412 — this host lacks the VM's disks
         "relaunch-disks-unreadable",  # 503 — could not stat them (retryable)
+        "net-policy-not-loaded",  # 503 — edge-mode guest rules not loaded yet
         # ── the order never reached the lifecycle at all ──────────────
         # Usually a vali-side minting/clock fault every miner would
         # reject identically — counting it could empty the fleet through

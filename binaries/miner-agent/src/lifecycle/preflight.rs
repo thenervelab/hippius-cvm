@@ -341,6 +341,7 @@ async fn run_inner(order: TenantPreflightOrder, policy: StagePolicy) -> Result<P
         // renders the disk, so the golden flag is inert here.
         golden: false,
         cid: crate::vsock::peer::MIN_GUEST_CID,
+        net: None,
     };
 
     let digest: [u8; LAUNCH_DIGEST_LEN] = compute_launch_digest(&cfg)?;

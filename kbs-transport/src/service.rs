@@ -254,6 +254,13 @@ pub struct DefaultKbsService {
     /// [`Self::require_wrapped_kek`]). Default `false`; set via
     /// [`Self::with_require_wrapped_userdata`] from KBS config.
     pub require_wrapped_userdata: bool,
+    /// `true` ⇒ a `host_attestor`-class measurement is refused on release
+    /// (`Deps::enforce_release_class`). Default `false`; set via
+    /// [`Self::with_enforce_release_class`] from KBS config.
+    pub enforce_release_class: bool,
+    /// `[cdn_fleet] enabled` (`Deps::cdn_fleet_enabled`). Default `false`;
+    /// set via [`Self::with_cdn_fleet`].
+    pub cdn_fleet_enabled: bool,
     /// Anti-rollback for the guest-keyed overlay — the per-`vm_id`
     /// CONFIRMED volume stamp (`kbs_core::volume_stamp`). The release
     /// path only READS it (and mints the next-advance token); this
@@ -358,6 +365,8 @@ impl DefaultKbsService {
             max_unconfirmed_releases,
             require_wrapped_kek: false,
             require_wrapped_userdata: false,
+            enforce_release_class: false,
+            cdn_fleet_enabled: false,
             custody: None,
             keepalive_bindings: Arc::new(InMemoryKeepaliveBindings::default()),
             keepalive_binding_mode: BindingMode::Off,
@@ -415,6 +424,35 @@ impl DefaultKbsService {
     pub fn with_require_wrapped_userdata(mut self, require: bool) -> Self {
         self.require_wrapped_userdata = require;
         self
+    }
+
+    /// Refuse a `host_attestor`-class measurement on release, from KBS
+    /// config `[allowlist] enforce_release_class`.
+    #[must_use]
+    pub fn with_enforce_release_class(mut self, enforce: bool) -> Self {
+        self.enforce_release_class = enforce;
+        self
+    }
+
+    /// Release the cdn-fleet keyring to CDN nodes, from KBS config
+    /// `[cdn_fleet] enabled`.
+    #[must_use]
+    pub fn with_cdn_fleet(mut self, enabled: bool) -> Self {
+        self.cdn_fleet_enabled = enabled;
+        self
+    }
+
+    /// The admin route's fleet public-key publisher, over the SAME broker,
+    /// Vault client, attestation and response key as the release path.
+    pub fn cdn_fleet_publisher(&self) -> crate::cdn_fleet::ServiceCdnFleetPublisher {
+        crate::cdn_fleet::ServiceCdnFleetPublisher {
+            vault_auth: Arc::clone(&self.vault_auth),
+            vault_kv: Arc::clone(&self.vault_kv),
+            kbs_attestation: Arc::clone(&self.kbs_attestation),
+            kbs_auth_pubkey: Arc::clone(&self.kbs_auth_pubkey),
+            kbs_signing_key: Arc::clone(&self.kbs_signing_key),
+            kbs_kid: Arc::clone(&self.kbs_kid),
+        }
     }
 
     /// Switch the guest custody lease on, sharing `runtime` with the admin
@@ -540,6 +578,8 @@ impl KbsService for DefaultKbsService {
             max_unconfirmed_releases: self.max_unconfirmed_releases,
             require_wrapped_kek: self.require_wrapped_kek,
             require_wrapped_userdata: self.require_wrapped_userdata,
+            enforce_release_class: self.enforce_release_class,
+            cdn_fleet_enabled: self.cdn_fleet_enabled,
             rollback_audit: self.rollback_audit.as_deref(),
         };
         let outcome = process_release(&req, &deps);

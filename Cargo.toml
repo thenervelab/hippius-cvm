@@ -12,6 +12,7 @@ members = [
     "binaries/agent-keepalive",
     "binaries/agent-tenant-init",
     "binaries/agent-tenant-telemetry",
+    "binaries/cdn-agent",
     "binaries/edge-gateway",
     "binaries/guest-release",
     "binaries/image-provenance",

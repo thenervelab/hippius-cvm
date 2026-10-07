@@ -351,6 +351,7 @@ mod tests {
             expected_volume_stamp: 0,
             volume_stamp_token: None,
             volume_stamp_transition: None,
+            cdn_fleet: None,
         };
         let signed = sign_response(&sk, &resp).unwrap();
         assert_eq!(verify_response(&sk.verifying_key(), &signed).unwrap(), resp);

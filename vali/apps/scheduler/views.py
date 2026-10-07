@@ -217,6 +217,8 @@ class SchedulerPlaceView(APIView):
                 capacity_by_node=capacity,
                 load_by_node=load,
                 family_load_by_node=family_load,
+                max_family_per_node=service.cdn_family_cap(vm_family),
+                **service.cdn_edge_arguments(vm_family, vm_id),
                 max_epoch_lag=service.max_epoch_lag(),
                 dispatchable=service.dispatchable_node_ids(),
                 # Gate (f) — the region the VM's launch asked for, if any.
@@ -239,6 +241,8 @@ class SchedulerPlaceView(APIView):
                 cvm_capability_by_node=service.cvm_capability_by_node(),
                 # A miner still running a crypto-erased VM takes no new VMs.
                 zombie_quarantined=service.zombie_quarantined_node_ids(),
+                # Gate (i) — no edge-region miner without a fresh net-policy ack.
+                net_policy_unready=service.net_policy_unready_node_ids(),
                 cordoned=service.cordoned_node_ids(),
                 # Capacity v2 — does THIS resource_class fit (with the VM's
                 # own disk when a resize left it another than the flavor's).
@@ -985,6 +989,8 @@ def _replace(
             capacity_by_node=capacity,
             load_by_node=load,
             family_load_by_node=family_load,
+            max_family_per_node=service.cdn_family_cap(failed.vm_family),
+            **service.cdn_edge_arguments(failed.vm_family, vm.vm_id),
             max_epoch_lag=service.max_epoch_lag(),
             excluded=frozenset({failed.miner_node_id}),
             dispatchable=service.dispatchable_node_ids(),
@@ -1005,6 +1011,8 @@ def _replace(
             # NOT landing on a CVM-incapable host matters most.
             cvm_capability_by_node=service.cvm_capability_by_node(),
             zombie_quarantined=service.zombie_quarantined_node_ids(),
+            # Gate (i) — no edge-region miner without a fresh net-policy ack.
+            net_policy_unready=service.net_policy_unready_node_ids(),
             cordoned=service.cordoned_node_ids(),
             resource_fit=service.resource_fit(
                 failed.resource_class,

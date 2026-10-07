@@ -77,6 +77,12 @@ class VaultCasConflict(EffectError):
     loser reads version 1 back instead of overwriting."""
 
 
+class VaultPermissionDenied(EffectError):
+    """Vault answered 403 to a write. On a create-only path (no `update`)
+    that is also how an existing secret answers a rewrite: Vault checks the
+    capability before the check-and-set."""
+
+
 @dataclass(frozen=True)
 class VaultWriteResult:
     """Outcome of one KV v2 put. `version` is the integer Vault assigned
@@ -393,6 +399,8 @@ def put_kv(
     )
     if status == 400 and cas is not None and b"check-and-set" in raw.lower():
         raise VaultCasConflict(f"{label}: check-and-set conflict (cas={cas})")
+    if status == 403:
+        raise VaultPermissionDenied(f"{label}: vault returned HTTP 403")
     if not 200 <= status < 300:
         raise EffectError(f"{label}: vault returned HTTP {status}")
     try:
@@ -789,3 +797,53 @@ def transit_datakey_wrapped(name: str) -> bytes:
     if not isinstance(ct, str) or not ct.startswith("vault:"):
         raise EffectError(f"{label}: response missing data.ciphertext")
     return ct.encode("ascii")
+
+
+def transit_read_key(name: str) -> dict[str, Any]:
+    """GET `transit/keys/<name>`: the key's PUBLIC metadata — its type, its
+    `exportable` / `allow_plaintext_backup` flags and, for an asymmetric
+    key, each version's public key. Never key material: Transit only hands
+    a private key out through `transit/export`, which no vali policy
+    grants. Returns the response's `data` object."""
+    label = "vault-transit-read-key"
+    status, raw = _round_trip("GET", f"/v1/transit/keys/{name}", label=label)
+    if status == 404 or _transit_key_missing(status, raw):
+        raise VaultNotFound(f"{label}: no transit key {name!r}")
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: vault returned HTTP {status}")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError(f"{label}: non-JSON response") from exc
+    data = (parsed or {}).get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict):
+        raise EffectError(f"{label}: response missing data")
+    return data
+
+
+def transit_sign(name: str, message: bytes, *, key_version: int) -> bytes:
+    """Sign `message` with version `key_version` of the Transit key `name`
+    and return the raw signature bytes. For an `ed25519` key Transit signs
+    the message itself (pure Ed25519, no prehash). The response must name
+    the version asked for: a signature by any other version is refused."""
+    label = "vault-transit-sign"
+    body = {
+        "input": base64.b64encode(message).decode("ascii"),
+        "key_version": key_version,
+    }
+    status, raw = _round_trip("POST", f"/v1/transit/sign/{name}", label=label, json_body=body)
+    if not 200 <= status < 300:
+        raise EffectError(f"{label}: vault returned HTTP {status}")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise EffectError(f"{label}: non-JSON response") from exc
+    data = (parsed or {}).get("data") if isinstance(parsed, dict) else None
+    sig = data.get("signature") if isinstance(data, dict) else None
+    prefix = f"vault:v{key_version}:"
+    if not isinstance(sig, str) or not sig.startswith(prefix):
+        raise EffectError(f"{label}: response is not a v{key_version} signature")
+    try:
+        return base64.b64decode(sig[len(prefix) :], validate=True)
+    except (ValueError, TypeError) as exc:
+        raise EffectError(f"{label}: signature is not base64") from exc

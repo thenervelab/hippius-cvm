@@ -11,4 +11,5 @@
 // test (a panic IS the failure report), forbidden in shipped code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod cdn_fleet;
 pub mod mtls;

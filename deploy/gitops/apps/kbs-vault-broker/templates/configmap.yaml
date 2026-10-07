@@ -6,8 +6,8 @@
 # (binaries/kbs-vault-broker/src/config.rs). Every struct is
 # `deny_unknown_fields` — a stray key fails the pod closed.
 #
-# No secret value lives in this ConfigMap. The privileged Vault token
-# is the BROKER_VAULT_TOKEN env var (ExternalSecret); the VEK is a
+# No secret value lives in this ConfigMap. The broker logs in to Vault
+# with a projected ServiceAccount token (jwt auth); the VEK is a
 # mounted Secret file. The launch-policy integers are quoted strings
 # in values.yaml for the same Helm-float64 reason documented in the
 # KBS chart's values.yaml.
@@ -47,6 +47,11 @@ data:
     kv_mount = "{{ .Values.vault.kvMount }}"
     child_token_ttl_secs = {{ .Values.vault.childTokenTtlSecs }}
     token_role = "{{ .Values.vault.tokenRole }}"
+    {{- if .Values.vault.cdnFleetPolicy }}
+    # CDN K2 — the fixed policy attached when the KBS asks for the
+    # cdn-fleet leg (kbs-cap-cdn-fleet.hcl). Absent ⇒ refused.
+    cdn_fleet_policy = "{{ .Values.vault.cdnFleetPolicy }}"
+    {{- end }}
     {{- if .Values.vault.caCertPath }}
     # PROD: verify the Vault server cert against the mounted CA bundle.
     ca_cert_path = "{{ .Values.vault.caCertPath }}"

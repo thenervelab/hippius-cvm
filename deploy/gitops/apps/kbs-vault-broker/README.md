@@ -72,6 +72,15 @@ guest-pull); it carries no secrets.
    to `kbsMeasurementAllowlist` in `values.yaml`. While the list is
    empty the broker starts but **denies every redeem** (fail-closed).
 
+4. **CDN fleet keyring (CDN K2), only when the CDN ships.** Write the
+   fixed policy `deploy/terraform/policies/kbs-cap-cdn-fleet.hcl` as
+   `kbs-cap-cdn-fleet`, add it to the token role's `allowed_policies`
+   (`"kbs-cap-templated,kbs-cap-cdn-fleet"`), then set
+   `vault.cdnFleetPolicy: kbs-cap-cdn-fleet`. That value needs a broker
+   image that knows the key, because an older one refuses to start
+   (`deny_unknown_fields`). While it is empty, every cdn-fleet scope is
+   refused. See `docs/operator/cdn-fleet-keyring.md`.
+
 ## Flip order (#102 PR C final)
 
 1. Broker Healthy + measurement pinned here.

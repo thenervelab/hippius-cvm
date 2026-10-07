@@ -128,6 +128,17 @@ spec:
             # (tick_guest_upgrades). Set on THIS deployment only.
             - name: VALI_GUEST_UPGRADE_ENABLED
               value: {{ .Values.orchestrationTick.guestUpgrade | default "false" | quote }}
+            # Guest network policy push (reconcile in THIS tick). Off unless
+            # orchestrationTick.netPolicy.push; only the listed miners get it.
+            {{- $netPolicy := .Values.orchestrationTick.netPolicy | default dict }}
+            - name: VALI_NET_POLICY_PUSH
+              value: {{ $netPolicy.push | default "false" | quote }}
+            {{- if eq (toString ($netPolicy.push | default "false")) "true" }}
+            - name: VALI_NET_POLICY_MINERS
+              value: {{ $netPolicy.miners | default "" | quote }}
+            - name: VALI_NET_POLICY_LOCAL_ACTION
+              value: {{ $netPolicy.localAction | default "count" | quote }}
+            {{- end }}
             {{- if .Values.orchestrationTick.rebootRecovery.enabled }}
             # Reboot-recovery (service.reboot_recovery_once): relaunch an
             # Active VM that a host reboot powered off, on its SAME alive

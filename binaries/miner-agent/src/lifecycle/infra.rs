@@ -23,9 +23,10 @@
 //! the tenant SNP posture (memfd backing, `launchSecurity type='sev-snp'
 //! kernelHashes='yes'`, the same probed `cbitpos` / `reducedPhysBits` /
 //! policy) but carries **NO `<disk>`** — the UKI's initramfs *is* the
-//! root filesystem — and reaches the outside world over NAT egress (the
-//! `default` libvirt network), never a tenant-style disk/KEK relay. 1
-//! vCPU / 512 MiB.
+//! root filesystem — and **no `<interface>`**: the attestor talks to the
+//! host over vsock only (its initramfs has no network driver), so a NIC
+//! on the shared guest bridge would only give a tenant something to
+//! impersonate. 1 vCPU / 512 MiB.
 //!
 //! ## `<vsock>` device (PR-10b, S1)
 //!
@@ -225,6 +226,7 @@ impl InfraDomainConfig {
             // The launch digest ignores the CID (only OVMF/kernel/initrd/
             // cmdline/vcpus are folded in); carry the real one for parity.
             cid: self.cid,
+            net: None,
         })
     }
 
@@ -280,10 +282,6 @@ impl InfraDomainConfig {
              <policy>{policy}</policy>\n  \
              </launchSecurity>\n  \
              <devices>\n    \
-             <interface type='network'>\n      \
-             <source network='default'/>\n      \
-             <model type='virtio'/>\n    \
-             </interface>\n    \
              <serial type='pty'>\n      \
              <target type='isa-serial' port='0'/>\n    \
              </serial>\n    \
@@ -428,9 +426,13 @@ mod tests {
             xml.contains("<cid auto='no' address='4'/>"),
             "infra vsock must pin the assigned CID: {xml}"
         );
-        // But it IS a confidential SNP guest with NAT egress.
+        // vsock-only: no NIC on the guest bridge.
+        assert!(
+            !xml.contains("<interface"),
+            "infra domain must have no NIC: {xml}"
+        );
+        // But it IS a confidential SNP guest.
         assert!(xml.contains("<launchSecurity type='sev-snp' kernelHashes='yes'>"));
-        assert!(xml.contains("<source network='default'/>"));
         assert!(xml.contains("<policy>0x30000</policy>"));
     }
 

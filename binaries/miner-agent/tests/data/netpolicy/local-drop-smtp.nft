@@ -1,0 +1,50 @@
+# hippius-miner-agent net policy: revision 8, local mode, drop.
+# content sha256 3b4668ab7a5a55b7e53a78e8fcbca74431bc2947354643f1e0100c83f01d14ec. Generated, do not edit.
+table inet hippius_guest
+delete table inet hippius_guest
+table inet hippius_guest {
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "virbr0" meta nfproto ipv6 counter drop comment "guest-ipv6"
+		iifname "virbr0" oifname != { "enp1s0f0", "virbr0" } counter drop comment "guest-not-uplink"
+	}
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		iifname != "virbr0" accept
+		ct direction reply accept
+		meta nfproto ipv6 counter drop comment "guest-host-ipv6"
+		udp dport 67 accept comment "guest-dhcp"
+		ip daddr 192.168.122.1 meta l4proto { tcp, udp } th dport 53 accept comment "guest-dns"
+		counter drop comment "guest-host"
+	}
+}
+table bridge hippius_guest_br
+delete table bridge hippius_guest_br
+table bridge hippius_guest_br {
+	set smtp_allowed {
+		type ifname . ether_addr
+		elements = { "hvt12" . 52:54:00:aa:bb:0c, "vnet7" . 52:54:00:aa:bb:07 }
+	}
+	set dns_pps {
+		type ifname
+		size 4096
+		flags dynamic,timeout
+		timeout 1m
+	}
+	set dns_bytes {
+		type ifname
+		size 4096
+		flags dynamic,timeout
+		timeout 1m
+	}
+	chain prerouting {
+		type filter hook prerouting priority filter - 10; policy accept;
+		iifname "vnet*" jump guest
+		iifname "hvt*" jump guest
+	}
+	chain guest {
+		meta l4proto tcp th dport 25 iifname . ether saddr != @smtp_allowed counter drop comment "guest-smtp"
+		ip daddr 192.168.122.1 meta l4proto { tcp, udp } th dport 53 update @dns_pps { iifname limit rate over 20/second } counter drop comment "guest-dns-pps"
+		ip daddr 192.168.122.1 meta l4proto { tcp, udp } th dport 53 update @dns_bytes { iifname limit rate over 16 kbytes/second } counter drop comment "guest-dns-bytes"
+	}
+}

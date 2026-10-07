@@ -595,6 +595,7 @@ async fn start_with_real_admin_router(
         ),
         rollback: None,
         release_audit: None,
+        cdn_fleet: None,
     };
     let router = kbs_transport::build_admin_router(admin_state);
 
@@ -955,6 +956,7 @@ async fn start_plaintext_admin_router(
         ),
         rollback: None,
         release_audit: None,
+        cdn_fleet: None,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

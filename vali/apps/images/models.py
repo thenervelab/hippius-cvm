@@ -57,6 +57,11 @@ class GoldenImage(models.Model):
     # release exists for the blessed bake); re-blessing another bake clears
     # it.
     guest_release = models.PositiveIntegerField(null=True, blank=True, default=None)
+    # The only tenant that may launch this image, and see it in the catalog
+    # (CDN plan N2: the `cdn-node` image is the CDN fleet's). Blank = every
+    # tenant. Set by `vali_bless_golden_image --restricted-tenant`; a
+    # cdn-node bake is blessed only restricted to `VALI_CDN_TENANT_ID`.
+    restricted_tenant = models.CharField(max_length=256, blank=True, default="", db_default="")
 
     class Meta:
         ordering = ["image_name"]

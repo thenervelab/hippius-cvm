@@ -103,6 +103,11 @@ class JobSpec:
     # BAKE_PACKAGE_REFRESH only when non-empty, so every other bake renders
     # a byte-identical env.
     package_refresh: str = ""
+    # CDN plan I3 bake profile (`TenantBake.profile`). Rendered as
+    # BAKE_PROFILE (+ BAKE_CDN_BACKEND_URL) only for `cdn-node`, so every
+    # standard bake renders a byte-identical env.
+    profile: str = "standard"
+    cdn_backend_url: str = ""
 
     # Vault `jwt` auth (M-k8sauth, #94). Defaulted so an empty role keeps
     # the pre-migration static-token behaviour and no existing caller has
@@ -236,6 +241,13 @@ def render_job(spec: JobSpec) -> dict[str, Any]:
     if spec.package_refresh:
         container_env.append(
             {"name": "BAKE_PACKAGE_REFRESH", "value": spec.package_refresh}
+        )
+    if spec.profile == "cdn-node":
+        container_env.extend(
+            [
+                {"name": "BAKE_PROFILE", "value": spec.profile},
+                {"name": "BAKE_CDN_BACKEND_URL", "value": spec.cdn_backend_url},
+            ]
         )
 
     # Vault `jwt` auth (M-k8sauth, #94) — the Job exchanges its projected
@@ -421,6 +433,8 @@ def spec_from_settings(bake: TenantBake) -> JobSpec:
         s3_output_prefix=bake.s3_output_prefix,
         disk_mode=bake.disk_mode,
         package_refresh=bake.package_refresh,
+        profile=bake.profile,
+        cdn_backend_url=bake.cdn_backend_url,
         namespace=getattr(settings, "VALI_TENANT_BAKE_NAMESPACE", "vali"),
         image=getattr(
             settings,

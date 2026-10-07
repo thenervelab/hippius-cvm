@@ -2038,6 +2038,7 @@ mod tests {
             expected_volume_stamp: 3,
             volume_stamp_token: None,
             volume_stamp_transition: None,
+            cdn_fleet: None,
         };
         let signed = sign_response(&sk, &resp).unwrap();
         assert!(verify_checkpoint(&sk.verifying_key(), &signed.body, &signed.sig).is_err());

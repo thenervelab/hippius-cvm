@@ -193,6 +193,23 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
             ));
             OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "net-policy-store")
         }
+        MinerAgentError::NetPolicyUnsupported(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: net-policy-unsupported-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::UNPROCESSABLE_ENTITY, "net-policy-unsupported")
+        }
+        MinerAgentError::NetPolicyApply(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: net-policy-apply-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "net-policy-apply")
+        }
+        // Launch / migrate-in on a host whose edge-mode rules are not
+        // loaded: retryable elsewhere, like a capacity refusal.
+        MinerAgentError::NetPolicyNotLoaded => {
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "net-policy-not-loaded")
+        }
         // Everything else — a libvirt fault, a poisoned lock, a launch
         // that did not reach running — is an internal failure. The
         // public class stays `dispatch-failed` (no wire-side breaking
@@ -208,17 +225,17 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
     }
 }
 
-/// Dispatch a `net-policy` order: persist it under the replay rules
-/// and answer `applied:<revision>:<content sha256 hex>`. Applies
-/// nothing to the host yet.
-pub fn handle_net_policy(
-    store: &crate::netpolicy::NetPolicyStore,
+/// Dispatch a `net-policy` order: persist it under the replay rules,
+/// load its rules, and only then answer `applied:<revision>:<content
+/// sha256 hex>` ([`crate::netpolicy::apply`]).
+pub async fn handle_net_policy(
+    enforcer: &crate::netpolicy::NetPolicyEnforcer,
     now: u64,
     order: NetPolicyOrder,
 ) -> Result<String, OrderRejection> {
-    store
+    enforcer
         .accept(order, now)
-        .map(|applied| applied.ack())
+        .await
         .map_err(|err| reject_dispatch(&err, "host"))
 }
 
@@ -557,6 +574,9 @@ pub async fn handle_migrate_activate(
     // sees either no activation or the activation, never both at once.
     // A staged restore's cheap preconditions also answer on the order;
     // the background swap re-checks all of them under the same lock.
+    if let Err(err) = lifecycle.check_net_policy_gate() {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     let _restore_lock = crate::backup::staged::restore_lock().await;
     if let Err(class) = check_staged_activate(&lifecycle, &order).await {
         let status = match class {
@@ -787,6 +807,9 @@ pub async fn handle_tenant_preflight(
     order: TenantPreflightOrder,
 ) -> std::result::Result<String, OrderRejection> {
     let vm_id_str = order.vm_id.as_str().to_owned();
+    if let Err(err) = lifecycle.check_net_policy_gate() {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     // DATA-disk capacity fail-fast — BEFORE vali mints + KBS-registers.
     // The attested `hippius.disk_gb=` token in the cmdline is the same
     // size the launch will reserve; rejecting an over-budget disk here
@@ -1192,6 +1215,7 @@ mod tests {
             cose_ticket: serde_bytes::ByteBuf::from(medium_ticket()),
             require_existing_disks: false,
             guardian_ep: None,
+            net: None,
         }
     }
 
@@ -1225,6 +1249,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "launched");
+    }
+
+    /// A lifecycle latched by a persisted policy in `dir` (nothing loaded).
+    fn gated_lifecycle(
+        dir: &std::path::Path,
+        mode: crate::orders::types::NetPolicyMode,
+    ) -> CvmLifecycle {
+        use crate::netpolicy::{MockNft, NetPolicyEnforcer, NetPolicyStore};
+        let mut order = crate::netpolicy::tests::policy(1);
+        order.mode = mode;
+        crate::netpolicy::store::write_record_for_tests(dir, &order);
+        let driver = Arc::new(crate::lifecycle::MockLibvirtDriver::new());
+        lifecycle().with_net_policy_gate(Arc::new(NetPolicyEnforcer::new(
+            Arc::new(NetPolicyStore::new(dir)),
+            Arc::new(MockNft::new()),
+            Arc::new(crate::netpolicy::LibvirtGuestTaps::new(driver.clone())),
+            Arc::new(crate::netpolicy::VmCaps::new(
+                driver,
+                Arc::new(crate::netpolicy::caps::tests::FakeTuner::default()),
+            )),
+        )))
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_edge_policy_refuses_launch_and_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = gated_lifecycle(dir.path(), crate::orders::types::NetPolicyMode::Edge);
+        let rej = handle_launch(&lc, &UnreachableGuestPusher, launch_order("tenant-edge"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (rej.status, rej.class),
+            (StatusCode::SERVICE_UNAVAILABLE, "net-policy-not-loaded")
+        );
+        assert!(lc.list_tenants().await.unwrap().is_empty());
+        let rej = handle_tenant_preflight(&lc, preflight_order("tenant-edge"))
+            .await
+            .unwrap_err();
+        assert_eq!(rej.class, "net-policy-not-loaded");
+    }
+
+    #[tokio::test]
+    async fn a_local_policy_never_gates_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = gated_lifecycle(dir.path(), crate::orders::types::NetPolicyMode::Local);
+        let rej = handle_launch(&lc, &UnreachableGuestPusher, launch_order("tenant-local"))
+            .await
+            .unwrap_err();
+        // Past the gate: the domain is up, only the (unreachable) push failed.
+        assert_eq!(rej.class, "ticket-delivery-failed");
+        assert_eq!(lc.list_tenants().await.unwrap().len(), 1);
     }
 
     #[test]

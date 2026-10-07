@@ -31,6 +31,11 @@ use crate::error::{MinerAgentError, Result};
 /// = SNPActive).
 pub const SNP_GUEST_FEATURES: u64 = 0x1;
 
+/// SMTP. A guardian is never a mail server, and the relay dials from
+/// the miner host, past the guest's TCP 25 drop
+/// (`docs/design/egress-and-bandwidth.md` §6.3).
+pub const SMTP_PORT: u16 = 25;
+
 /// Where the relay may send a VM's guardian traffic, and what it answers
 /// the guest's recipe request with. One per customer-keys VM, held on its
 /// [`super::CvmHandle`] and re-adopted with it.
@@ -105,7 +110,9 @@ impl GuardianRoute {
 /// `guardian-cmdline`, and an endpoint on a loopback / link-local /
 /// unspecified / multicast address fails `guardian-ep-forbidden-address`
 /// — the relay dials FROM the miner host, so such an endpoint would
-/// point guest-originated traffic at the host's own services.
+/// point guest-originated traffic at the host's own services. Port 25
+/// fails `guardian-ep-forbidden-port`: the relay would carry the
+/// guest's mail around the host's port-25 drop.
 ///
 /// The measured token is what the guardian and the guest read; this check
 /// only stops an honest-but-buggy dispatcher from launching a VM that can
@@ -134,6 +141,9 @@ pub fn check_order_guardian(
         return Err(MinerAgentError::LaunchInput(
             "guardian-ep-forbidden-address",
         ));
+    }
+    if parsed.port == SMTP_PORT {
+        return Err(MinerAgentError::LaunchInput("guardian-ep-forbidden-port"));
     }
     Ok(Some(parsed))
 }
@@ -449,6 +459,20 @@ mod tests {
     }
 
     #[test]
+    fn an_smtp_endpoint_is_refused() {
+        for ep in ["8.8.8.8:25", "100.64.0.1:25", "guardian.example.com:25"] {
+            assert_eq!(
+                class(check_order_guardian(&m1(ep), Some(ep))),
+                "guardian-ep-forbidden-port",
+                "{ep}"
+            );
+        }
+        for ep in ["8.8.8.8:465", "8.8.8.8:587", "8.8.8.8:2525", "8.8.8.8:250"] {
+            assert_eq!(class(check_order_guardian(&m1(ep), Some(ep))), "ok", "{ep}");
+        }
+    }
+
+    #[test]
     fn local_addresses_are_detected() {
         assert!(is_local_address("127.0.0.1".parse().unwrap()));
         // TEST-NET-1 / documentation prefix: never assigned to a host.
@@ -478,6 +502,7 @@ mod tests {
             memory_mb: 1024,
             golden: false,
             cid: 3,
+            net: None,
         }
     }
 

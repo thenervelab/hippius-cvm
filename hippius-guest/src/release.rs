@@ -66,6 +66,28 @@ pub struct ExpectedRelease<'a> {
     pub userdata_version: u64,
     pub expected_allowed_userdata_digest: &'a [u8; 32],
     pub schema_v: u32,
+    /// The guest is a `cdn-node` image and takes the fleet keyring
+    /// (`KbsResponse::cdn_fleet`, CDN K2). `false` for every other guest:
+    /// a `cdn_fleet` in the response is then ignored, never unwrapped.
+    pub cdn_fleet: bool,
+}
+
+/// One CDN fleet key (CDN G1): the RFC 7748-clamped X25519 secret of
+/// fleet version `version`, as the KBS released it. Wiped on drop; its
+/// `Debug` shows the version only.
+pub struct FleetKey {
+    pub version: u32,
+    /// Boxed so moving a key (sorting, handing it on) copies a pointer,
+    /// never the secret bytes.
+    pub secret: Box<Zeroizing<[u8; 32]>>,
+}
+
+impl core::fmt::Debug for FleetKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FleetKey")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the guest gets back. Both secrets `Zeroizing` — drop wipes
@@ -117,6 +139,10 @@ pub struct UnwrappedSecrets {
     /// caller accepts its volume only on `expected_timeline` and stamps
     /// `target_timeline` (see the golden overlay's v2 gate).
     pub volume_stamp_transition: Option<([u8; 32], [u8; 32])>,
+    /// CDN G1: the fleet keyring, ascending by version. Empty unless the
+    /// caller asked for it ([`ExpectedRelease::cdn_fleet`]) and the KBS
+    /// released it.
+    pub cdn_fleet: Vec<FleetKey>,
 }
 
 /// The stamp protocol the guest ATTESTED in the SNP report of the release
@@ -157,6 +183,10 @@ impl core::fmt::Debug for UnwrappedSecrets {
             .field(
                 "volume_stamp_transition_present",
                 &self.volume_stamp_transition.is_some(),
+            )
+            .field(
+                "cdn_fleet_versions",
+                &self.cdn_fleet.iter().map(|k| k.version).collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -426,6 +456,13 @@ pub fn verify_and_unwrap_release_attested(
         None => None,
     };
 
+    // CDN G1: the fleet keyring, only for a guest that asked for it.
+    let cdn_fleet = if exp.cdn_fleet {
+        unwrap_cdn_fleet(&resp, exp, guest_x25519_sk)?
+    } else {
+        Vec::new()
+    };
+
     Ok(UnwrappedSecrets {
         luks,
         userdata,
@@ -434,7 +471,89 @@ pub fn verify_and_unwrap_release_attested(
         expected_volume_stamp: resp.expected_volume_stamp,
         volume_stamp_token,
         volume_stamp_transition: transition,
+        cdn_fleet,
     })
+}
+
+/// Unwrap `KbsResponse::cdn_fleet` (CDN K2 release, G1 guest side). Each
+/// key is bound to its own HPKE context: `secret_type = "cdn-fleet"`,
+/// `secret_path` = the per-version KV path the guest re-derives itself,
+/// `secret_version` = the fleet version, plus every release binding. So
+/// a key can be neither relabelled as another version nor lifted from
+/// another release. Absent ⇒ an empty keyring (the caller decides what a
+/// keyless CDN node does). Every check fails the whole release closed:
+/// a malformed keyring is a KBS bug or a forgery.
+fn unwrap_cdn_fleet(
+    resp: &KbsResponse,
+    exp: &ExpectedRelease,
+    guest_x25519_sk: &[u8; 32],
+) -> Result<Vec<FleetKey>> {
+    use kbs_core::cdn_fleet::{secret_path, CDN_FLEET_SECRET_TYPE, MAX_CDN_FLEET_VERSIONS};
+    let Some(wrapped) = resp.cdn_fleet.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let bad = |expected: String, got: String| GuestError::Binding {
+        field: "cdn_fleet",
+        expected,
+        got,
+    };
+    if wrapped.is_empty() || wrapped.len() > MAX_CDN_FLEET_VERSIONS {
+        return Err(bad(
+            format!("1..={MAX_CDN_FLEET_VERSIONS} keys"),
+            format!("{} keys", wrapped.len()),
+        ));
+    }
+    let mut keys: Vec<FleetKey> = Vec::with_capacity(wrapped.len());
+    for w in wrapped {
+        if w.secret_type != CDN_FLEET_SECRET_TYPE {
+            return Err(bad(
+                format!("type={CDN_FLEET_SECRET_TYPE}"),
+                format!("type={}", w.secret_type),
+            ));
+        }
+        let version = u32::try_from(w.secret_version)
+            .ok()
+            .filter(|v| *v >= 1)
+            .ok_or_else(|| {
+                bad(
+                    "version 1..=u32::MAX".into(),
+                    format!("{}", w.secret_version),
+                )
+            })?;
+        if keys.iter().any(|k| k.version == version) {
+            return Err(bad("distinct versions".into(), format!("v{version} twice")));
+        }
+        let want_path = secret_path(w.secret_version);
+        if w.secret_path != want_path {
+            return Err(bad(
+                format!("path={want_path}"),
+                format!("path={}", w.secret_path),
+            ));
+        }
+        let ctx = release_ctx_for(
+            resp,
+            exp,
+            CDN_FLEET_SECRET_TYPE,
+            &w.secret_path,
+            w.secret_version,
+        );
+        let plain = hpke_unwrap(guest_x25519_sk, w, &ctx)
+            .map_err(|e| GuestError::Hpke(format!("cdn-fleet v{version}: {e}")))?;
+        if plain.len() != 32 {
+            return Err(bad("32 bytes".into(), format!("{} bytes", plain.len())));
+        }
+        // Copied straight into its wiped home: no bare stack copy.
+        let mut secret = Box::new(Zeroizing::new([0u8; 32]));
+        secret.copy_from_slice(&plain);
+        // The KBS delivers the RFC 7748-clamped scalar (identical in
+        // libsodium and `crypto_box`); anything else is not its output.
+        if secret[0] & 7 != 0 || secret[31] & 0x80 != 0 || secret[31] & 0x40 == 0 {
+            return Err(bad("an RFC 7748-clamped scalar".into(), "unclamped".into()));
+        }
+        keys.push(FleetKey { version, secret });
+    }
+    keys.sort_by_key(|k| k.version);
+    Ok(keys)
 }
 
 /// The v2 response's `volume_stamp_transition`, checked (see

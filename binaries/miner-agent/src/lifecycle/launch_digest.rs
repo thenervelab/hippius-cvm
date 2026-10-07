@@ -532,6 +532,7 @@ mod tests {
             memory_mb: 1024,
             golden: false,
             cid: 3,
+            net: None,
         }
     }
 }

@@ -25,10 +25,19 @@ from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Count, F, Q
 from django.utils import timezone
 
+from apps.common.cdn import cdn_enabled, is_cdn_tenant
 from apps.lifecycle.models import Vm, VmState
 
 from . import zones
-from .models import EdgeStatus, IngressEdge, PublicIP, PublicIpState
+from .models import (
+    EdgeStatus,
+    EgressMode,
+    EgressRegion,
+    IngressEdge,
+    PublicIP,
+    PublicIpPool,
+    PublicIpState,
+)
 
 log = logging.getLogger("apps.network")
 
@@ -56,6 +65,11 @@ _NOT_PUBLIC = (
 
 #: Edges that may take a new attachment: active AND bound to a NetBird peer.
 ATTACHABLE_EDGES = Q(status=EdgeStatus.ACTIVE) & ~Q(netbird_peer_id="")
+
+
+def is_cdn_vm(vm: Vm) -> bool:
+    """Whether `vm` is a CDN node: it runs as `VALI_CDN_TENANT_ID`."""
+    return is_cdn_tenant(vm.tenant_id)
 
 
 class NetworkError(Exception):
@@ -130,8 +144,10 @@ def public_ip_by_vm(vm_pks: list[Any]) -> dict[Any, dict[str, str]]:
 def edge_view(edge: IngressEdge) -> dict[str, Any]:
     addresses = list(edge.addresses.select_related("vm").order_by("address"))
     counts = {s.value: 0 for s in PublicIpState}
+    by_pool = {p.value: {s.value: 0 for s in PublicIpState} for p in PublicIpPool}
     for ip in addresses:
         counts[ip.state] += 1
+        by_pool[ip.pool][ip.state] += 1
     return {
         "name": edge.name,
         "provider": edge.provider,
@@ -141,11 +157,13 @@ def edge_view(edge: IngressEdge) -> dict[str, Any]:
         "netbird_peer_id": edge.netbird_peer_id,
         "bound": edge.bound,
         "per_ip_mbps": edge.per_ip_mbps,
+        "egress_ip": edge.egress_ip,
         "desired_revision": edge.desired_revision,
         "applied_revision": edge.applied_revision,
         "last_seen_at": _iso(edge.last_seen_at),
         "last_report": edge.last_report,
         "counts": counts,
+        "counts_by_pool": by_pool,
         "addresses": [
             {
                 "address": ip.address,
@@ -155,6 +173,8 @@ def edge_view(edge: IngressEdge) -> dict[str, Any]:
                 "released_at": _iso(ip.released_at),
                 "last_tenant_id": ip.last_tenant_id,
                 "target_ip": ip.target_ip,
+                "pool": ip.pool,
+                "cap_mbps": ip.cap_mbps,
             }
             for ip in addresses
         ],
@@ -256,11 +276,16 @@ def _lock_attachable_edge(edge_pk: int) -> IngressEdge | None:
     return IngressEdge.objects.select_for_update().filter(ATTACHABLE_EDGES, pk=edge_pk).first()
 
 
-def _free_ip_on_best_edge(edges: Any) -> PublicIP | None:
-    """Lock and return one free address on the edge with the most free
-    addresses among `edges`, or `None`."""
+def _free_ip_on_best_edge(edges: Any, pool: str) -> PublicIP | None:
+    """Lock and return one free address of `pool` on the edge with the most
+    free addresses of `pool` among `edges`, or `None`."""
     ranked = (
-        edges.annotate(free=Count("addresses", filter=Q(addresses__state=PublicIpState.FREE)))
+        edges.annotate(
+            free=Count(
+                "addresses",
+                filter=Q(addresses__state=PublicIpState.FREE, addresses__pool=pool),
+            )
+        )
         .filter(free__gt=0)
         .order_by("-free", "name")
     )
@@ -270,7 +295,7 @@ def _free_ip_on_best_edge(edges: Any) -> PublicIP | None:
             continue
         ip = (
             PublicIP.objects.select_for_update(skip_locked=True)
-            .filter(edge=edge, state=PublicIpState.FREE)
+            .filter(edge=edge, state=PublicIpState.FREE, pool=pool)
             .order_by(F("released_at").asc(nulls_first=True), "address")
             .first()
         )
@@ -280,11 +305,18 @@ def _free_ip_on_best_edge(edges: Any) -> PublicIP | None:
 
 
 def _quarantined_from(tenant_id: str) -> Q:
-    """Addresses in quarantine after `tenant_id` released them. Both the
-    recorded tenant AND the previous holder's own tenant must match: a row
-    touched by a process that predates `last_tenant_id` (a rolling deploy)
-    can carry a stale value, never a stale holder."""
-    return Q(state=PublicIpState.QUARANTINED, last_tenant_id=tenant_id, vm__tenant_id=tenant_id)
+    """General addresses in quarantine after `tenant_id` released them.
+    Both the recorded tenant AND the previous holder's own tenant must
+    match: a row touched by a process that predates `last_tenant_id` (a
+    rolling deploy) can carry a stale value, never a stale holder. A CDN
+    address is never reused early: its quarantine always runs in full
+    (docs/design/cdn.md §7.6)."""
+    return Q(
+        state=PublicIpState.QUARANTINED,
+        last_tenant_id=tenant_id,
+        vm__tenant_id=tenant_id,
+        pool=PublicIpPool.GENERAL,
+    )
 
 
 def _own_quarantined_ip(edges: Any, tenant_id: str) -> PublicIP | None:
@@ -323,18 +355,18 @@ def _own_quarantined_ip(edges: Any, tenant_id: str) -> PublicIP | None:
 
 
 def _requested_ip(edges: Any, tenant_id: str, address: str) -> PublicIP:
-    """Lock and return `address` when this tenant may take it now: free, or
-    in quarantine after this tenant released it. Anything else — another
-    tenant's quarantined address, an attached one, one on an edge that
-    takes no attachment or is not among `edges`, one we do not own — is
-    `address-unavailable`."""
+    """Lock and return the general `address` when this tenant may take it
+    now: free, or in quarantine after this tenant released it. Anything
+    else — another tenant's quarantined address, an attached one, a CDN
+    one, one on an edge that takes no attachment or is not among `edges`,
+    one we do not own — is `address-unavailable`."""
     found = (
-        PublicIP.objects.filter(edge__in=edges, address=address)
+        PublicIP.objects.filter(edge__in=edges, address=address, pool=PublicIpPool.GENERAL)
         .values_list("pk", "edge_id")
         .first()
     )
     if found is not None and _lock_attachable_edge(found[1]) is not None:
-        reusable = Q(state=PublicIpState.FREE)
+        reusable = Q(state=PublicIpState.FREE, pool=PublicIpPool.GENERAL)
         if tenant_id:
             reusable |= _quarantined_from(tenant_id)
         # Skips a locked row, as `_own_quarantined_ip` does and for the same
@@ -352,13 +384,15 @@ def _requested_ip(edges: Any, tenant_id: str, address: str) -> PublicIP:
     )
 
 
-def _pick_ip(vm: Vm, region_hint: str) -> PublicIP | None:
-    """Per [`_routable_edge_tiers`]: in each tier, the tenant's own
-    quarantined address first, then a free one. Region beats reuse — a
-    free address near the VM wins over an own address far from it. `None`
-    when nothing in the VM's zone is free: never an edge in another one."""
+def _pick_ip(vm: Vm, region_hint: str, pool: str) -> PublicIP | None:
+    """Per [`_routable_edge_tiers`], an address of `pool`: in each tier, the
+    tenant's own quarantined address first (general pool only, see
+    [`_quarantined_from`]), then a free one. Region beats reuse — a free
+    address near the VM wins over an own address far from it. `None` when
+    nothing in the VM's zone is free: never an edge in another one."""
     for edges in _routable_edge_tiers(vm, region_hint):
-        ip = _own_quarantined_ip(edges, vm.tenant_id) or _free_ip_on_best_edge(edges)
+        own = _own_quarantined_ip(edges, vm.tenant_id) if pool == PublicIpPool.GENERAL else None
+        ip = own or _free_ip_on_best_edge(edges, pool)
         if ip is not None:
             return ip
     return None
@@ -381,16 +415,111 @@ def attach(vm: Vm, region_hint: str = "", address: str = "") -> tuple[PublicIP, 
     and is still quarantined comes back to it before a free one, and a
     quarantined address never goes to another tenant.
     Raises `NetworkError` `vm-not-live` / `no-free-public-ip` /
-    `address-unavailable`. An address on an edge outside the VM's zone
-    (see [`route_scope`]) is never attached, asked for or not.
+    `address-unavailable` / `cdn-vm-uses-cdn-pool`. An address on an edge
+    outside the VM's zone (see [`route_scope`]) is never attached, asked
+    for or not. Only general addresses: a CDN address is never handed to a
+    tenant, and a CDN node takes its address from [`attach_cdn`].
 
     Two attaches walking edges in different orders (their regions differ)
     can each hold an edge the other waits for; the database aborts one,
     and that one runs again from the start.
     """
+    return _attach(vm, region_hint, address, PublicIpPool.GENERAL)
+
+
+def attach_cdn(vm: Vm) -> tuple[PublicIP, bool]:
+    """Attach a CDN address to the CDN node `vm`; `(ip, created)`. In-process
+    only (the CDN fleet), never exposed as is.
+
+    From the CDN pool only, and only on an edge of the very region the node
+    runs in — its host's verified country, `cdn_host_region` — with no zone,
+    hint or launch-region fallback: no CDN node sits behind a remote edge
+    (v1). A quarantined address always serves its full window. Raises
+    `NetworkError` `cdn-disabled` while `VALI_CDN_ENABLED` is off,
+    `not-a-cdn-vm` for a VM that does not run as `VALI_CDN_TENANT_ID`,
+    `cdn-no-local-edge` when the host's country is unknown or no attachable
+    edge there has a free CDN address, `cdn-vm-moving` while a migration or
+    restore is in flight, and `vm-not-live`."""
+    if not cdn_enabled():
+        raise NetworkError("cdn-disabled", "VALI_CDN_ENABLED is off")
+    return _attach(vm, "", "", PublicIpPool.CDN)
+
+
+def cdn_host_region(miner_id: str) -> str:
+    """The VERIFIED country of `miner_id` (fresh geo verdict `verified`,
+    whatever `VALI_GEO_REQUIRE_VERIFIED` says), upper case, or `""`."""
+    if not miner_id:
+        return ""
+    from apps.miners import geo
+
+    country = (
+        geo.placeable_locations(verified_only=True)
+        .filter(miner__miner_id=miner_id)
+        .values_list("country_code", flat=True)
+        .first()
+    )
+    return (country or "").upper()
+
+
+def cdn_edge_regions(vm_id: str = "") -> frozenset[str]:
+    """The regions a CDN node may run in (no CDN node behind a remote edge,
+    v1): the region of the edge serving the address `vm_id` holds, when it
+    holds one — the address follows the node, so the node stays where its
+    edge is — else every region with an attachable edge holding a free CDN
+    address."""
+    held = (
+        PublicIP.objects.filter(state=PublicIpState.ATTACHED, vm__vm_id=vm_id)
+        .values_list("edge__region", flat=True)
+        .first()
+        if vm_id
+        else None
+    )
+    if held is not None:
+        return frozenset({held.upper()})
+    return frozenset(
+        r.upper()
+        for r in IngressEdge.objects.filter(
+            ATTACHABLE_EDGES,
+            addresses__pool=PublicIpPool.CDN,
+            addresses__state=PublicIpState.FREE,
+        ).values_list("region", flat=True)
+    )
+
+
+def _local_cdn_ip(vm: Vm) -> PublicIP:
+    """Lock and return a free CDN address on an edge of `vm`'s host region,
+    or refuse `cdn-no-local-edge`. A node being moved (§25 or restore in
+    flight) is refused `cdn-vm-moving`: its host is still the source, and
+    an address taken there would stay on the source region's edge once the
+    node lands elsewhere."""
+    from apps.orchestration.effects import _bound_miner_id
+    from apps.orchestration.models import TERMINAL_MIGRATION_STATES, MigrationJob
+
+    if (
+        vm.state == VmState.MIGRATING
+        or MigrationJob.objects.filter(vm=vm).exclude(state__in=TERMINAL_MIGRATION_STATES).exists()
+    ):
+        raise NetworkError("cdn-vm-moving", "the node is being moved: attach once it has landed")
+
+    region = cdn_host_region(_bound_miner_id(vm))
+    if not region:
+        raise NetworkError(
+            "cdn-no-local-edge", "the node's host has no verified country: no local edge"
+        )
+    ip = _free_ip_on_best_edge(
+        IngressEdge.objects.filter(ATTACHABLE_EDGES, region=region), PublicIpPool.CDN
+    )
+    if ip is None:
+        raise NetworkError(
+            "cdn-no-local-edge", f"no attachable edge in {region} has a free CDN address"
+        )
+    return ip
+
+
+def _attach(vm: Vm, region_hint: str, address: str, pool: str) -> tuple[PublicIP, bool]:
     for attempt in range(1, _ATTACH_ATTEMPTS + 1):
         try:
-            return _attach_once(vm, region_hint, address)
+            return _attach_once(vm, region_hint, address, pool)
         except OperationalError as exc:
             if not _is_deadlock(exc) or attempt == _ATTACH_ATTEMPTS:
                 raise
@@ -398,23 +527,42 @@ def attach(vm: Vm, region_hint: str = "", address: str = "") -> tuple[PublicIP, 
     raise AssertionError("unreachable")
 
 
-def _attach_once(vm: Vm, region_hint: str, address: str) -> tuple[PublicIP, bool]:
+def _check_pool_holder(vm: Vm, pool: str) -> None:
+    """A CDN node holds a CDN address, everything else a general one."""
+    if pool == PublicIpPool.CDN and not is_cdn_vm(vm):
+        raise NetworkError("not-a-cdn-vm", "only a CDN node takes a CDN address")
+    if pool == PublicIpPool.GENERAL and is_cdn_vm(vm):
+        raise NetworkError("cdn-vm-uses-cdn-pool", "a CDN node takes a CDN address")
+
+
+def _attach_once(
+    vm: Vm, region_hint: str, address: str, pool: str
+) -> tuple[PublicIP, bool]:
+    from . import egress
+
     try:
         with transaction.atomic():
             locked = Vm.objects.select_for_update().get(pk=vm.pk)
+            _check_pool_holder(locked, pool)
             existing = get_attached(locked)
             if existing is not None:
+                if existing.pool != pool:
+                    raise NetworkError(
+                        "address-unavailable", f"the vm holds a {existing.pool} address"
+                    )
                 return existing, False
             if locked.state not in LIVE_VM_STATES:
                 raise NetworkError("vm-not-live", f"vm is {locked.state}")
-            if address:
+            if pool == PublicIpPool.CDN:
+                ip = _local_cdn_ip(locked)
+            elif address:
                 regions, zone = route_scope(locked, region_hint)
                 edges = IngressEdge.objects.filter(
                     ATTACHABLE_EDGES, region__in=set(regions) | zones.countries_in(zone)
                 )
                 ip = _requested_ip(edges, locked.tenant_id, address)
             else:
-                ip = _pick_ip(locked, region_hint)
+                ip = _pick_ip(locked, region_hint, pool)
             if ip is None:
                 raise NetworkError("no-free-public-ip", "no ingress edge has a free address")
             reused = ip.state == PublicIpState.QUARANTINED
@@ -424,6 +572,11 @@ def _attach_once(vm: Vm, region_hint: str, address: str) -> tuple[PublicIP, bool
             ip.released_at = None
             ip.target_ip = None
             ip.last_tenant_id = ""
+            # A new binding: a new epoch, the holder's region, and port 25
+            # closed until it is unblocked for this holder.
+            ip.epoch += 1
+            ip.vm_region = egress.host_regions({locked.host}).get(locked.host, "")
+            ip.smtp_allowed = False
             ip.save(
                 update_fields=[
                     "vm",
@@ -432,13 +585,17 @@ def _attach_once(vm: Vm, region_hint: str, address: str) -> tuple[PublicIP, bool
                     "released_at",
                     "target_ip",
                     "last_tenant_id",
+                    "epoch",
+                    "vm_region",
+                    "smtp_allowed",
                 ]
             )
             bump_revision(ip.edge_id)
+            egress.bump_lease_edge(locked)
     except IntegrityError:
         # A concurrent attach for the same VM won the one-per-VM constraint.
         existing = get_attached(vm)
-        if existing is None:
+        if existing is None or existing.pool != pool:
             raise
         return existing, False
     request_netbird_sync()
@@ -455,6 +612,8 @@ def _attach_once(vm: Vm, region_hint: str, address: str) -> tuple[PublicIP, bool
 def detach(vm: Vm, *, reason: str = "detached") -> PublicIP | None:
     """Release the VM's address into quarantine; `None` when it held none.
     Idempotent. The edge drops the address on its next render."""
+    from . import egress
+
     with transaction.atomic():
         # The VM row first, as `attach` does: attach and detach of one VM
         # are serialised, so an attach can never hand back an address a
@@ -473,6 +632,7 @@ def detach(vm: Vm, *, reason: str = "detached") -> PublicIP | None:
         ip.last_tenant_id = (locked or vm).tenant_id
         ip.save(update_fields=["state", "released_at", "last_tenant_id"])
         bump_revision(ip.edge_id)
+        egress.bump_lease_edge(locked or vm)
     request_netbird_sync()
     log.info(
         "public-ip: released %s from vm=%s on edge=%s (%s)",
@@ -496,13 +656,41 @@ def release_for_destroyed_vm(vm: Vm) -> None:
 # ── edge feed ─────────────────────────────────────────────────────────
 
 
+def cdn_feed_fields(edge: IngressEdge, pool: str, cap_mbps: int | None) -> dict[str, Any]:
+    """What a CDN address adds to its feed entry (`pool`, and its own
+    `cap_mbps` in place of the edge's `per_ip_mbps`) once the reconcile
+    applied `VALI_CDN_ENABLED` to `edge` (`IngressEdge.cdn_feed`); nothing
+    for a general address, or while off — so the feed stays byte-identical
+    to what it was."""
+    if pool != PublicIpPool.CDN or not edge.cdn_feed:
+        return {}
+    return {"pool": PublicIpPool.CDN.value, "cap_mbps": cap_mbps}
+
+
 def desired_state(edge: IngressEdge) -> dict[str, Any]:
     """What the edge must render: attached addresses whose NetBird target
     is known. An address without a target is left out on purpose — the
     edge cannot forward it anywhere, and a guess would be someone else's
     VM. An unbound edge is served no address at all: it has no NetBird
-    peer, so nothing could reach it over the overlay."""
-    edge.refresh_from_db(fields=["desired_revision", "per_ip_mbps", "netbird_peer_id"])
+    peer, so nothing could reach it over the overlay.
+
+    An edge serving its region's egress (`egress.serves_egress`) also gets
+    each address's `vm_region`, `epoch`, `cap_mbps` and `smtp_allowed`, and
+    the `egress` block; every other edge gets [`plain_address_entries`].
+    With `VALI_FEED_BLOCK_SMTP` on, every bound edge also gets a top-level
+    `block_smtp: true`."""
+    from . import egress
+
+    edge.refresh_from_db(
+        fields=[
+            "desired_revision",
+            "per_ip_mbps",
+            "netbird_peer_id",
+            "egress_ip",
+            "region",
+            "cdn_feed",
+        ]
+    )
     if not edge.bound:
         return {
             "edge": edge.name,
@@ -510,20 +698,65 @@ def desired_state(edge: IngressEdge) -> dict[str, Any]:
             "per_ip_mbps": edge.per_ip_mbps,
             "addresses": [],
         }
+    fed = egress.feed(edge)
+    if fed is not None:
+        state: dict[str, Any] = {
+            "edge": edge.name,
+            "revision": edge.desired_revision,
+            "per_ip_mbps": edge.per_ip_mbps,
+            "addresses": fed.addresses,
+            "egress": fed.egress,
+        }
+    else:
+        state = {
+            "edge": edge.name,
+            "revision": edge.desired_revision,
+            "per_ip_mbps": edge.per_ip_mbps,
+            "addresses": plain_address_entries(edge),
+        }
+    if egress.block_smtp_enabled():
+        state["block_smtp"] = True
+    return state
+
+
+def plain_address_entries(edge: IngressEdge) -> list[dict[str, Any]]:
+    """The address table of a bound edge not served egress. With
+    `VALI_FEED_ADDRESS_REGION` on, each entry also carries the address's
+    `vm_region` (when known) and `epoch` — never `cap_mbps`, which would
+    override the edge's `per_ip_mbps`. With `VALI_FEED_BLOCK_SMTP` on, an
+    address whose port 25 is unblocked carries `smtp_allowed: true` (absent
+    when false), else the edge's `block_smtp` would close it too. A CDN
+    address also carries [`cdn_feed_fields`]."""
+    from . import egress
+
+    with_region = egress.address_region_enabled()
+    with_smtp = egress.block_smtp_enabled()
     rows = (
         PublicIP.objects.filter(edge=edge, state=PublicIpState.ATTACHED, target_ip__isnull=False)
         .order_by("address")
-        .values_list("address", "vm__vm_id", "target_ip")
+        .values_list(
+            "address",
+            "vm__vm_id",
+            "target_ip",
+            "vm_region",
+            "epoch",
+            "smtp_allowed",
+            "pool",
+            "cap_mbps",
+        )
     )
-    return {
-        "edge": edge.name,
-        "revision": edge.desired_revision,
-        "per_ip_mbps": edge.per_ip_mbps,
-        "addresses": [
-            {"address": address, "vm_id": vm_id, "target_ip": target}
-            for address, vm_id, target in rows
-        ],
-    }
+    out: list[dict[str, Any]] = []
+    for address, vm_id, target, vm_region, epoch, smtp_allowed, pool, cap in rows:
+        entry: dict[str, Any] = {"address": address, "vm_id": vm_id, "target_ip": target}
+        if with_region:
+            if vm_region:
+                entry["vm_region"] = vm_region
+            entry["epoch"] = egress._feed_epoch(epoch)
+        if with_smtp and smtp_allowed:
+            entry["smtp_allowed"] = True
+        entry.update(cdn_feed_fields(edge, pool, cap))
+        out.append(entry)
+    return out
 
 
 def record_applied(edge: IngressEdge, revision: int, report: dict[str, Any]) -> None:
@@ -554,9 +787,26 @@ def record_applied(edge: IngressEdge, revision: int, report: dict[str, Any]) -> 
 # ── edges and their pool ──────────────────────────────────────────────
 
 
-def add_addresses(edge: IngressEdge, addresses: list[str]) -> None:
-    """Add addresses to an edge's pool. Already there ⇒ no-op; owned by
-    another edge ⇒ `address-taken`."""
+def add_addresses(
+    edge: IngressEdge,
+    addresses: list[str],
+    pool: str = PublicIpPool.GENERAL,
+    cap_mbps: int | None = None,
+) -> None:
+    """Add addresses of `pool` to an edge. A CDN address needs its own
+    `cap_mbps`, a general one takes none (the edge's `per_ip_mbps`).
+    Already there in the same pool ⇒ no-op, except that a CDN address takes
+    the new `cap_mbps` (the edge re-renders when one is attached); there in
+    the other pool ⇒ `address-pool-mismatch` (an address never changes pool
+    in place); owned by another edge ⇒ `address-taken`."""
+    if pool not in PublicIpPool.values:
+        raise NetworkError("bad-request", f"pool must be one of {sorted(PublicIpPool.values)}")
+    if pool == PublicIpPool.CDN and cap_mbps is None:
+        raise NetworkError("bad-request", "a cdn address needs cap_mbps")
+    if pool == PublicIpPool.GENERAL and cap_mbps is not None:
+        raise NetworkError(
+            "bad-request", "a general address takes the edge's per_ip_mbps, not cap_mbps"
+        )
     with transaction.atomic():
         taken = (
             PublicIP.objects.filter(address__in=addresses)
@@ -565,10 +815,33 @@ def add_addresses(edge: IngressEdge, addresses: list[str]) -> None:
         )
         if taken:
             raise NetworkError("address-taken", f"owned by another edge: {sorted(taken)}")
-        have = set(PublicIP.objects.filter(edge=edge).values_list("address", flat=True))
-        PublicIP.objects.bulk_create(
-            [PublicIP(edge=edge, address=a) for a in sorted(set(addresses) - have)]
+        egress_ips = IngressEdge.objects.filter(egress_ip__in=addresses).values_list(
+            "egress_ip", flat=True
         )
+        if egress_ips:
+            raise NetworkError("address-taken", f"an edge's egress address: {sorted(egress_ips)}")
+        have = dict(
+            PublicIP.objects.select_for_update()
+            .filter(edge=edge, address__in=addresses)
+            .values_list("address", "pool")
+        )
+        other = sorted(a for a, p in have.items() if p != pool)
+        if other:
+            raise NetworkError("address-pool-mismatch", f"in another pool: {other}")
+        PublicIP.objects.bulk_create(
+            [
+                PublicIP(edge=edge, address=a, pool=pool, cap_mbps=cap_mbps)
+                for a in sorted(set(addresses) - set(have))
+            ]
+        )
+        if pool == PublicIpPool.CDN and have:
+            stale = PublicIP.objects.filter(edge=edge, address__in=list(have)).exclude(
+                cap_mbps=cap_mbps
+            )
+            served = stale.filter(state=PublicIpState.ATTACHED).exists()
+            stale.update(cap_mbps=cap_mbps)
+            if served:
+                bump_revision(edge.pk)
 
 
 def remove_addresses(edge: IngressEdge, addresses: list[str]) -> None:
@@ -644,13 +917,14 @@ def resolve_edge_peer(netbird_ip: str) -> Any:
 
 
 def availability(region: str = "") -> dict[str, Any]:
-    """Free addresses on edges that can take an attachment (active and
-    bound), per region. Without `region`, `total_free` counts every
-    region. With one, it counts what an attach for a VM in `region` can
-    reach — that region and the rest of its zone, or that region alone
-    when it has no zone — and `regions` is filtered to `region`."""
+    """Free general addresses on edges that can take an attachment (active
+    and bound), per region — the CDN pool is never counted, no tenant can
+    take it. Without `region`, `total_free` counts every region. With one,
+    it counts what an attach for a VM in `region` can reach — that region
+    and the rest of its zone, or that region alone when it has no zone —
+    and `regions` is filtered to `region`."""
     rows = (
-        PublicIP.objects.filter(edge__status=EdgeStatus.ACTIVE)
+        PublicIP.objects.filter(edge__status=EdgeStatus.ACTIVE, pool=PublicIpPool.GENERAL)
         .exclude(edge__netbird_peer_id="")
         .values("edge__region")
         .annotate(
@@ -674,6 +948,142 @@ def availability(region: str = "") -> dict[str, Any]:
     }
 
 
+# ── egress regions and port 25 ────────────────────────────────────────
+
+_REGION_FIELDS = frozenset({"mode", "routing_enabled", "enforce"})
+
+
+def parse_region(raw: Any) -> str:
+    """An ISO 3166-1 alpha-2 code, upper-cased."""
+    code = raw.strip().upper() if isinstance(raw, str) else ""
+    if not (len(code) == 2 and code.isascii() and code.isalpha()):
+        raise NetworkError("bad-region", "region must be an ISO 3166-1 alpha-2 code (e.g. 'AU')")
+    return code
+
+
+def egress_region_view(row: EgressRegion) -> dict[str, Any]:
+    """One entry of `GET /v1/network/egress-regions` (the backend's
+    contract). The caps are vali's settings, the same for every region."""
+    return {
+        "region": row.region,
+        "mode": row.mode,
+        "routing_enabled": row.routing_enabled,
+        "enforce": row.enforce,
+        "default_cap_mbps": int(settings.VALI_NET_CAP_DEFAULT_MBPS),
+        "cap_mbps_by_flavor": {
+            str(k): int(v) for k, v in dict(settings.VALI_NET_CAP_MBPS_BY_FLAVOR).items()
+        },
+    }
+
+
+def _has_egress_edge(region: str, *, exclude_pk: int | None = None) -> bool:
+    edges = IngressEdge.objects.filter(
+        region=region, status=EdgeStatus.ACTIVE, egress_ip__isnull=False
+    ).exclude(netbird_peer_id="")
+    if exclude_pk is not None:
+        edges = edges.exclude(pk=exclude_pk)
+    return edges.exists()
+
+
+def update_egress_region(region: str, body: dict[str, Any]) -> EgressRegion:
+    """Create or update a region's egress policy. `mode=edge` needs a
+    bound, active edge with an `egress_ip` in the region (§4). The miners'
+    policies and the edges' feeds follow on the next tick."""
+    unknown = set(body) - _REGION_FIELDS
+    if unknown:
+        raise NetworkError("bad-request", f"unknown fields: {sorted(unknown)}")
+    if "mode" in body and body["mode"] not in EgressMode.values:
+        raise NetworkError("bad-request", f"mode must be one of {sorted(EgressMode.values)}")
+    for flag in ("routing_enabled", "enforce"):
+        if flag in body and not isinstance(body[flag], bool):
+            raise NetworkError("bad-request", f"{flag} must be a boolean")
+    with transaction.atomic():
+        row, _ = EgressRegion.objects.select_for_update().get_or_create(region=region)
+        for name in sorted(_REGION_FIELDS & set(body)):
+            setattr(row, name, body[name])
+        if row.mode == EgressMode.EDGE and not _has_egress_edge(region):
+            raise NetworkError(
+                "no-egress-edge",
+                f"edge mode needs a bound, active edge with an egress_ip in {region}",
+            )
+        row.save()
+    return row
+
+
+def set_egress_ip(edge: IngressEdge, raw: Any) -> None:
+    """Set (or clear, with `None`) the edge's shared egress address: a
+    public address that is in no edge's pool. Clearing the last egress
+    edge of an edge-mode region is refused — its VMs would lose their exit.
+    Locks the edge; call inside the caller's transaction."""
+    if raw is None:
+        mode = EgressRegion.objects.filter(region=edge.region).values_list("mode", flat=True)
+        if mode.first() == EgressMode.EDGE and not _has_egress_edge(
+            edge.region, exclude_pk=edge.pk
+        ):
+            raise NetworkError(
+                "egress-in-use", f"{edge.region} is in edge mode and this is its egress edge"
+            )
+        edge.egress_ip = None
+        return
+    address = parse_public_address(raw)
+    if PublicIP.objects.filter(address=address).exists():
+        raise NetworkError("address-taken", f"{address} is in an edge's public IP pool")
+    edge.egress_ip = address
+
+
+def public_ip_smtp_view(ip: PublicIP) -> dict[str, Any]:
+    return {
+        "address": ip.address,
+        "vm_id": ip.vm.vm_id if ip.vm else None,
+        "smtp_allowed": ip.smtp_allowed,
+    }
+
+
+def get_smtp_allowed(address: str) -> PublicIP:
+    """The attached address's port-25 state, refused like `set_smtp_allowed`:
+    an unattached row's flag is stale (a re-attach closes it again)."""
+    ip = PublicIP.objects.select_related("vm").filter(address=address).first()
+    if ip is None:
+        raise NetworkError("address-not-found", f"{address} is not one of our addresses")
+    if ip.state != PublicIpState.ATTACHED:
+        raise NetworkError("address-not-attached", f"{address} is {ip.state}")
+    return ip
+
+
+def set_smtp_allowed(
+    address: str, allowed: bool, expected_vm_id: str | None = None
+) -> PublicIP:
+    """Unblock (or block again) outbound TCP 25 for the holder of an
+    attached address. The edge and the holder's miner pick it up on their
+    next pass; a re-attach closes it again. `expected_vm_id`, checked under
+    the row lock, refuses the change if the address now has another holder."""
+    with transaction.atomic():
+        ip = (
+            PublicIP.objects.select_for_update(of=("self",))
+            .select_related("vm")
+            .filter(address=address)
+            .first()
+        )
+        if ip is None:
+            raise NetworkError("address-not-found", f"{address} is not one of our addresses")
+        if ip.state != PublicIpState.ATTACHED:
+            raise NetworkError("address-not-attached", f"{address} is {ip.state}")
+        holder = ip.vm.vm_id if ip.vm else None
+        if expected_vm_id is not None and holder != expected_vm_id:
+            raise NetworkError("vm-mismatch", f"{address} is attached to {holder}")
+        if ip.smtp_allowed != allowed:
+            ip.smtp_allowed = allowed
+            ip.save(update_fields=["smtp_allowed"])
+            bump_revision(ip.edge_id)
+    log.info(
+        "public-ip: %s (vm=%s) port 25 %s",
+        address,
+        ip.vm.vm_id if ip.vm else "-",
+        "unblocked" if allowed else "blocked",
+    )
+    return ip
+
+
 # ── reconcile ─────────────────────────────────────────────────────────
 
 
@@ -683,6 +1093,7 @@ class ReconcileReport:
     unquarantined: int = 0
     retargeted: int = 0
     membership_changes: int = 0
+    egress_changes: int = 0
 
 
 def _quarantine_s() -> float:
@@ -777,7 +1188,7 @@ def _retarget(peers: list[dict[str, Any]]) -> tuple[int, _Members]:
             # detach that raced this pass must not be re-targeted.
             n = PublicIP.objects.filter(
                 pk=ip.pk, state=PublicIpState.ATTACHED, vm_id=ip.vm_id
-            ).update(target_ip=new_target)
+            ).update(target_ip=new_target, epoch=F("epoch") + 1)
             if n:
                 bump_revision(ip.edge_id)
         if n:
@@ -937,12 +1348,29 @@ def _netbird_sync_due() -> bool:
     return bool(cache.add(_NETBIRD_SYNC_KEY, 1, timeout=interval))
 
 
+def _sync_cdn_flag() -> int:
+    """Apply `VALI_CDN_ENABLED` to every edge's `cdn_feed`, bumping the
+    revision of each edge it changes in the same statement — whether or not
+    it serves a CDN address right now, so no concurrent attach or retarget
+    can change its feed between the check and the bump. A flip is rare and
+    a re-render cheap. One query while every edge already matches. Returns
+    the number of edges changed."""
+    flag = cdn_enabled()
+    changed = IngressEdge.objects.exclude(cdn_feed=flag).update(
+        cdn_feed=flag, desired_revision=F("desired_revision") + 1
+    )
+    if changed:
+        log.info("public-ip: VALI_CDN_ENABLED=%s applied — %d edge(s) re-render", flag, changed)
+    return changed
+
+
 def reconcile(*, now: Any = None) -> ReconcileReport:
     """One idempotent pass, run by the orchestration tick.
 
     Database half, every tick: release addresses of VMs that are no longer
-    live, and return quarantined addresses to the pool once past
-    `VALI_PUBLIC_IP_QUARANTINE_S`.
+    live, return quarantined addresses to the pool once past
+    `VALI_PUBLIC_IP_QUARANTINE_S`, and re-render the edges serving a CDN
+    address when `VALI_CDN_ENABLED` flipped.
 
     NetBird half, every `VALI_PUBLIC_IP_NETBIRD_SYNC_S` (or on the next
     tick after an attach/detach): re-read every attached VM's overlay
@@ -955,6 +1383,10 @@ def reconcile(*, now: Any = None) -> ReconcileReport:
     now = now or timezone.now()
     released = _release_destroyed()
     unquarantined = _expire_quarantine(now)
+    try:
+        _sync_cdn_flag()
+    except Exception:  # noqa: BLE001 — retried next pass; the routing half must still run.
+        log.exception("public-ip: applying VALI_CDN_ENABLED to the edges failed")
     retargeted = membership = 0
     # With no edge there is nothing to route, but routing a deleted edge
     # left behind (a pass that raced the delete) must still be collected —
@@ -996,9 +1428,18 @@ def reconcile(*, now: Any = None) -> ReconcileReport:
                 log.warning("public-ip: removed orphaned NetBird %s", gone)
         except effects.EffectError:
             log.exception("public-ip: NetBird garbage collection failed")
+    # Last: it reads the overlay addresses and attachments just refreshed.
+    from . import egress
+
+    try:
+        fed = egress.reconcile()
+    except Exception:  # noqa: BLE001 — the address half above must still report.
+        log.exception("egress: reconcile failed")
+        fed = egress.ReconcileReport()
     return ReconcileReport(
         released=released,
         unquarantined=unquarantined,
         retargeted=retargeted,
         membership_changes=membership,
+        egress_changes=fed.leases + fed.regions + fed.revisions,
     )

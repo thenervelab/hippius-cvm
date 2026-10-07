@@ -382,6 +382,7 @@ def _pick_destination(vm: Vm, placement: Any, to_flavor: str) -> tuple[str | Non
         | _cross_gen_chain_ids(placement.miner_node_id, sched.dispatchable_node_ids()),
         region=sched.launch_region_for_vm(vm.vm_id),
         shadow_log=False,
+        vm_id=vm.vm_id,
     )
     # The destination must hold the VM's REAL disk (its launch disk), not
     # the target flavor's.

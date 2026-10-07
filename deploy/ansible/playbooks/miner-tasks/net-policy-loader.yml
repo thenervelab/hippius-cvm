@@ -1,0 +1,87 @@
+---
+# Guest network policy boot loader. Tasks file imported by
+# 06-miner-bootstrap.yml play "05".
+#
+# The miner-agent renders the guest firewall from the net policy vali
+# pushes (`net-policy` order, docs/design/egress-and-bandwidth.md §6-§7)
+# into its own nft tables, `inet hippius_guest` and
+# `bridge hippius_guest_br`, and writes each ruleset it loads to
+# `/var/lib/hippius-miner/net-policy/ruleset.nft`. After a reboot the
+# kernel has no tables until the agent starts again; this oneshot unit
+# loads the last ruleset first, before libvirt and the agent, so no
+# guest ever runs on an open bridge.
+#
+# Ordering only (Before=), no Requires=/RequiredBy= in either direction:
+# a ruleset that fails to load must not keep libvirt, and with it every
+# running tenant, from starting. The agent loads the policy again at
+# start and every 30 s; in edge mode its launch latch refuses new guests
+# until that succeeds. The file pins the uplink name it was rendered
+# for; after a NIC rename, drop mode blocks guest egress until the agent
+# re-renders it (fail closed).
+#
+# No file (no policy was ever pushed) ⇒ the unit is skipped and nothing
+# is created. The file only creates and replaces the agent's two tables;
+# it never flushes the ruleset, so UFW's, libvirt's and NetBird's tables
+# are untouched. The distribution's `nftables.service` is NOT enabled
+# here: its /etc/nftables.conf starts with `flush ruleset`.
+#
+# Rollback, last resort (vali first sends a higher revision with
+# local_action=count):
+#   systemctl disable hippius-guest-fw
+#   nft delete table inet hippius_guest; nft delete table bridge hippius_guest_br
+#   rm /var/lib/hippius-miner/net-policy/ruleset.nft
+# A running agent re-creates the tables from its persisted policy within
+# 30 s; stop it the usual way (SIGKILL swap, never `systemctl stop`).
+#
+# Apply alone, one host at a time:
+#   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+#     --limit <miner> --tags miner_net_policy --check --diff
+
+# The agent's `DEFAULT_NET_POLICY_DIR`, fixed in the binary (not
+# `miner_agent.state_dir`, which only sizes the unit's ReadWritePaths).
+- name: Locate the agent's net-policy directory
+  tags: [miner_net_policy]
+  ansible.builtin.set_fact:
+    miner_net_policy_dir: /var/lib/hippius-miner/net-policy
+
+- name: Install nft (the agent loads its rules with it)
+  tags: [miner_net_policy]
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+
+- name: Install the guest-firewall boot loader unit
+  tags: [miner_net_policy]
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hippius-guest-fw.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hippius guest network policy (last ruleset the miner-agent loaded)
+      Documentation=file://{{ miner_net_policy_dir }}/ruleset.nft
+      ConditionPathExists={{ miner_net_policy_dir }}/ruleset.nft
+      RequiresMountsFor={{ miner_net_policy_dir }}
+      Before=libvirtd.service virtqemud.service virtnetworkd.service {{ miner_agent.systemd_unit_name }}.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f {{ miner_net_policy_dir }}/ruleset.nft
+
+      [Install]
+      WantedBy=multi-user.target
+  register: miner_guest_fw_unit
+
+- name: Enable the guest-firewall boot loader (runs at the next boot)
+  # Enabled, not started: the running agent already keeps the rules
+  # loaded, and starting it here would only reload the same file.
+  tags: [miner_net_policy]
+  ansible.builtin.systemd:
+    name: hippius-guest-fw
+    enabled: true
+    daemon_reload: "{{ miner_guest_fw_unit is changed }}"
+  # Under --check the unit file above was not written.
+  when: not ansible_check_mode

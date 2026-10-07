@@ -135,6 +135,28 @@ case "${BAKE_DISK_MODE}" in
         ;;
 esac
 
+# ── Bake profile (CDN plan I3) ─────────────────────────────────────
+#
+# BAKE_PROFILE absent or `standard` ⇒ every existing bake, unchanged (no
+# flag passed). `cdn-node` bakes the CDN cache-node image from the data
+# plane this image carries (/usr/sbin/hippius-cdn-agent and
+# /usr/local/share/hippius/cdn-node/), and needs BAKE_CDN_BACKEND_URL
+# (vali's VALI_CDN_BACKEND_URL) and the golden disk mode.
+BAKE_PROFILE="${BAKE_PROFILE:-standard}"
+case "${BAKE_PROFILE}" in
+    standard) ;;
+    cdn-node)
+        if [[ "${BAKE_DISK_MODE}" != "golden_verity_overlay" || -z "${BAKE_CDN_BACKEND_URL:-}" ]]; then
+            log "FATAL: BAKE_PROFILE=cdn-node needs BAKE_DISK_MODE=golden_verity_overlay and BAKE_CDN_BACKEND_URL"
+            exit 64
+        fi
+        ;;
+    *)
+        log "FATAL: BAKE_PROFILE must be standard or cdn-node (got '${BAKE_PROFILE}')"
+        exit 64
+        ;;
+esac
+
 # ── helpers: vali /finalize call wrappers ──────────────────────────
 
 VALI_FINALIZE_URL="${BAKE_VALI_INTERNAL_URL%/}/v1/tenant-bakes/${BAKE_BAKE_ID}/finalize"
@@ -400,6 +422,15 @@ BAKE_ARGS=(
 # unchanged.
 if [[ -n "${BAKE_PACKAGE_REFRESH:-}" ]]; then
     BAKE_ARGS+=(--package-refresh "${BAKE_PACKAGE_REFRESH}")
+fi
+if [[ "${BAKE_PROFILE}" == "cdn-node" ]]; then
+    BAKE_ARGS+=(
+        --profile cdn-node
+        --cdn-agent-bin /usr/sbin/hippius-cdn-agent
+        --cdn-openresty-tarball /usr/local/share/hippius/cdn-node/openresty.tar.gz
+        --cdn-config-dir /usr/local/share/hippius/cdn-node/openresty-config
+        --cdn-backend-url "${BAKE_CDN_BACKEND_URL}"
+    )
 fi
 if [[ "${BAKE_DISK_MODE}" == "golden_verity_overlay" ]]; then
     /usr/local/bin/tenant-image-bake.sh "${BAKE_ARGS[@]}"

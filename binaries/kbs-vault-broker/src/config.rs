@@ -79,6 +79,14 @@ pub struct Vault {
     /// "child policies must be subset of parent". The role is
     /// operator-provisioned next to the broker policy.
     pub token_role: String,
+    /// The fixed, operator-created policy attached to a cap whose scope
+    /// carries the cdn-fleet leg (`kbs-cap-cdn-fleet`,
+    /// `deploy/terraform/policies/`). The token role's `allowed_policies`
+    /// must list it. Absent (the default) ⇒ every cdn-fleet scope is
+    /// refused, so the CDN fleet keyring stays unreachable through this
+    /// broker until the operator opts in.
+    #[serde(default)]
+    pub cdn_fleet_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +158,16 @@ impl Config {
         }
         if self.vault.token_role.is_empty() {
             return Err(BrokerError::Config("vault.token_role must be set".into()));
+        }
+        if let Some(p) = &self.vault.cdn_fleet_policy {
+            let charset_ok = !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !charset_ok || matches!(p.as_str(), "root" | "default" | "kbs-cap-templated") {
+                return Err(BrokerError::Config(format!(
+                    "vault.cdn_fleet_policy {p:?} must be a dedicated [a-z0-9-] policy name"
+                )));
+            }
         }
         if self.challenge.ttl_secs == 0 {
             return Err(BrokerError::Config("challenge.ttl_secs must be > 0".into()));
@@ -257,6 +275,31 @@ mod tests {
             ca_cert_path: None,
             child_token_ttl_secs: 60,
             token_role: "kbs-cap".into(),
+            cdn_fleet_policy: None,
+        }
+    }
+
+    #[test]
+    fn cdn_fleet_policy_defaults_off_and_must_be_a_dedicated_name() {
+        assert!(config_with(base_vault()).validate().is_ok());
+        let with = |p: &str| {
+            config_with(Vault {
+                cdn_fleet_policy: Some(p.into()),
+                ..base_vault()
+            })
+            .validate()
+        };
+        assert!(with("kbs-cap-cdn-fleet").is_ok());
+        for bad in [
+            "",
+            "root",
+            "default",
+            "kbs-cap-templated",
+            "Kbs",
+            "a b",
+            "a\"b",
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
         }
     }
 

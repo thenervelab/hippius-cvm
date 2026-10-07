@@ -103,6 +103,7 @@ fn admin_router(cfg: &Config, w: &WiredKbs) -> axum::Router {
         w.custody.clone(),
         Arc::clone(&w.keepalive_bindings),
         Arc::clone(&w.release_audit),
+        w.cdn_fleet.clone(),
     )
     .unwrap();
     kbs_transport::build_admin_router(state)

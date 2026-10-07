@@ -1126,6 +1126,7 @@ pub(crate) mod tests {
             expected_volume_stamp: 0,
             volume_stamp_token: None,
             volume_stamp_transition: None,
+            cdn_fleet: None,
         };
         crate::crypto::sign_response(sk, &resp).unwrap()
     }

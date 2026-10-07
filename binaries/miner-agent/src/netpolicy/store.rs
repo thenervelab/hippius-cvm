@@ -130,6 +130,11 @@ impl NetPolicyStore {
         Ok(applied)
     }
 
+    /// The directory holding the policy (and the loaded ruleset).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn path(&self) -> PathBuf {
         self.dir.join(POLICY_FILE)
     }
@@ -159,31 +164,54 @@ impl NetPolicyStore {
     /// whose revision a power loss could undo would reopen the replay
     /// window, so every fsync, the directory's included, is fatal.
     fn persist(&self, applied: &AppliedNetPolicy) -> Result<()> {
-        use std::io::Write;
-        let write = || MinerAgentError::NetPolicyStore("write");
-        let bytes = serde_json::to_vec_pretty(applied).map_err(|_| write())?;
-        std::fs::create_dir_all(&self.dir).map_err(|_| write())?;
-        let mut tmp = NamedTempFile::new_in(&self.dir).map_err(|_| write())?;
-        tmp.write_all(&bytes).map_err(|_| write())?;
-        tmp.as_file().sync_all().map_err(|_| write())?;
-        tmp.persist(self.path()).map_err(|_| write())?;
-        self.sync()
+        let bytes = serde_json::to_vec_pretty(applied)
+            .map_err(|_| MinerAgentError::NetPolicyStore("write"))?;
+        write_durable(&self.dir, POLICY_FILE, &bytes).map_err(MinerAgentError::NetPolicyStore)
     }
 
-    /// fsync the directory (the rename) and its parent (the directory's
-    /// own entry, new on the first order).
     fn sync(&self) -> Result<()> {
-        if let Some(parent) = self.dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            sync_dir(parent)?;
-        }
-        sync_dir(&self.dir)
+        sync_dirs(&self.dir).map_err(MinerAgentError::NetPolicyStore)
     }
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+/// Write `order` as the persisted record under `dir`, bypassing the
+/// order checks: a record another agent version could have left.
+#[cfg(test)]
+pub(crate) fn write_record_for_tests(dir: &Path, order: &NetPolicyOrder) {
+    let sha = super::content_sha256_hex(order).unwrap();
+    let record = AppliedNetPolicy::new(order, sha).unwrap();
+    write_durable(dir, POLICY_FILE, &serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+/// Replace `dir/name` with `bytes` durably: temp file → fsync → rename →
+/// directory fsync. The error is the step that failed, `write` or `sync`.
+pub(crate) fn write_durable(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::result::Result<(), &'static str> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).map_err(|_| "write")?;
+    let mut tmp = NamedTempFile::new_in(dir).map_err(|_| "write")?;
+    tmp.write_all(bytes).map_err(|_| "write")?;
+    tmp.as_file().sync_all().map_err(|_| "write")?;
+    tmp.persist(dir.join(name)).map_err(|_| "write")?;
+    sync_dirs(dir)
+}
+
+/// fsync `dir` (the rename) and its parent (the directory's own entry,
+/// new on the first write).
+fn sync_dirs(dir: &Path) -> std::result::Result<(), &'static str> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        sync_dir(parent)?;
+    }
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> std::result::Result<(), &'static str> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
-        .map_err(|_| MinerAgentError::NetPolicyStore("sync"))
+        .map_err(|_| "sync")
 }
 
 #[cfg(test)]
