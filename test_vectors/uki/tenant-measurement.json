@@ -1,12 +1,12 @@
 {
   "measurement_kind": "snp_launch_digest_v1",
-  "measurement_hex": "ce1894c505acb686f4a1ad36fe17e370fd706d0b9c8ce7e6760567f8790f2160862cc8e12b196e05e821997a41c78f98",
+  "measurement_hex": "8650bd946f2cc1c66e110fbed61fc5217823c443326f4aa11b35d9c64a4ab9dbe61264dc080de2b21c49a11274622b1a",
   "components": {
     "kernel_sha256": "6a6419fde155bc1be12f9d2555ad18876cdff111d80c2887c6aa2c5d6cb250ac",
-    "initrd_sha256": "0ad4f469881fb2c6d5b7d1b7509697377c1fc1293777ce049c1427a9d2323fea",
-    "cmdline_sha256": "e2626d9c123b2c08df054c8a2b13da4ac6ef765dcc8e4c941d407d1eec7bea89",
+    "initrd_sha256": "e210fd9fa3995bd94e87cfec1b73a3db1ee58d6470c5fc63c8932c4d324a6711",
+    "cmdline_sha256": "c7c5f967b9ae198ed11ac8b7c8e41f15f67e98c3fc56011070c75682832ed728",
     "ovmf_sha256": "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c",
-    "rootfs_verity_root": "9469d3d62c69b144718a6ebe047761d761b9052c7354b255826545d2822e1512",
+    "rootfs_verity_root": "37438c5ddf4d43a7bf8a071548b92a5e17db6386978de9de3b79ac51e8f8b4e6",
     "snp_launch_config": {
       "vcpus": 1,
       "vcpu_type": "EpycGenoa",
