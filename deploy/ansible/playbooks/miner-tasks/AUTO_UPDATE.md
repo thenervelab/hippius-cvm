@@ -122,8 +122,9 @@ cosign is installed by the play at
   the compiled-in tag), the latest release counts as an upgrade.
 - The updater reads the last 20 releases and takes the highest tag among
   the complete ones. A release missing any of the three files (its
-  workflow failed, or `sbom.yml` created it first and the binary is
-  still building) is passed over instead of stalling the fleet. So is a
+  workflow failed, or it was published empty: `v2026.10.08`, created by
+  a second workflow racing on the tag before releases had one creator)
+  is passed over instead of stalling the fleet. So is a
   tag dated more than two days after its publication: anti-downgrade
   would otherwise pin the host to a mistyped far-future tag for good.
 - A release is skipped until the last of its three files has been

@@ -398,7 +398,14 @@ pub struct CertUpload<'a> {
 #[derive(Debug, Clone, Serialize)]
 pub struct AcmeLeaseRequest<'a> {
     pub hostname_id: &'a str,
+    /// The name being issued: the fleet wildcard, or the custom hostname.
+    /// The backend refuses a fleet lease whose name is not its own
+    /// wildcard (a node baked for another domain), with `name-mismatch`.
+    pub name: &'a str,
 }
+
+/// The backend's code for a lease whose `name` is not the one it issues.
+pub const CODE_LEASE_NAME_MISMATCH: &str = "name-mismatch";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcmeLeaseResponse {

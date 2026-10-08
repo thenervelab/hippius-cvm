@@ -359,8 +359,8 @@ main() {
 
     # The newest release that is complete: a valid tag, not a draft or
     # prerelease, carrying the binary, SHA256SUMS and the attestation. A
-    # release without them (its workflow failed, or sbom.yml created it
-    # first) is passed over rather than stalling the fleet. A tag dated
+    # release without them (its workflow failed, or it was published
+    # empty, as v2026.10.08 was) is passed over rather than stalling. A tag dated
     # more than two days after its publication is ignored: anti-downgrade
     # would otherwise pin the host to a mistyped far-future tag forever.
     # "ready" is when the last of the three files landed; the soak counts

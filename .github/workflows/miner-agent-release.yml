@@ -7,10 +7,20 @@
 #            (scripts/release/build-miner-agent.sh), smoke-tests it
 #   rebuild  builds it again in another checkout directory and fails
 #            unless the bytes are identical
+#   sbom     the signed CycloneDX SBOMs (sbom.yml, called here)
 #   publish  attests build provenance for the binary (Sigstore, keyless),
-#            re-verifies that attestation exactly as a miner will, and
-#            publishes the GitHub Release: the binary, SHA256SUMS,
-#            BUILD-INFO.txt and <binary>.sigstore.json
+#            re-verifies that attestation exactly as a miner will, checks
+#            the SBOM signatures, and publishes the GitHub Release: the
+#            binary, SHA256SUMS, BUILD-INFO.txt, <binary>.sigstore.json and
+#            the SBOMs with their cosign bundles
+#
+# This workflow is the ONLY creator of a release, and it publishes in one
+# move: a draft first, every asset uploaded to it, then `--draft=false` as
+# the last step. Releases are immutable on hippius-cvm: once published a
+# release takes no more assets, so a release published early (v2026.10.08,
+# created empty by sbom.yml on the same tag) is empty for good.
+# scripts/dev/release-creator-test.sh fails if another workflow writes a
+# release.
 #
 # Miners (deploy/ansible/playbooks/miner-tasks/files/hippius-miner-update.sh)
 # accept a release only if cosign verifies that attestation for the identity
@@ -22,7 +32,8 @@
 # from ever publishing there.
 #
 # Supply-chain discipline (§F): every action pinned by commit SHA; only the
-# publish job can write, and only it gets an OIDC token.
+# publish job can write. The publish job (attestation) and the sbom job
+# (SBOM signatures) get an OIDC token.
 
 name: miner-agent-release
 
@@ -115,10 +126,17 @@ jobs:
             exit 1
           fi
 
+  sbom:
+    if: github.repository == 'thenervelab/hippius-cvm'
+    uses: ./.github/workflows/sbom.yml
+    permissions:
+      contents: read
+      id-token: write # keyless cosign signing of the SBOMs
+
   publish:
     if: github.repository == 'thenervelab/hippius-cvm'
     runs-on: ubuntu-24.04
-    needs: [build, rebuild]
+    needs: [build, rebuild, sbom]
     permissions:
       contents: write # create the release
       id-token: write # Sigstore keyless signing of the attestation
@@ -129,6 +147,12 @@ jobs:
         with:
           name: miner-agent-release
           path: dist
+
+      - name: Download the signed SBOMs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom-cyclonedx
+          path: sbom
 
       - name: Check the files are the ones the rebuild matched
         env:
@@ -170,6 +194,24 @@ jobs:
             --certificate-github-workflow-trigger push \
             "dist/$ASSET"
 
+      - name: Verify the SBOM signatures
+        # Signed by the sbom job of THIS run: a reusable workflow's
+        # certificate names the called file at the caller's ref.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          count=$(find sbom -maxdepth 1 -name '*.cdx.json' | wc -l)
+          [ "$count" -gt 0 ] || { echo "::error::no SBOMs in the sbom job's artifact"; exit 1; }
+          for f in sbom/*.cdx.json; do
+            [ -f "$f.cosign.bundle" ] || { echo "::error::$f has no cosign bundle"; exit 1; }
+            cosign verify-blob \
+              --bundle "$f.cosign.bundle" \
+              --certificate-identity "https://github.com/thenervelab/hippius-cvm/.github/workflows/sbom.yml@refs/tags/$TAG" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+          done
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -183,19 +225,30 @@ jobs:
           - \`$ASSET\`: the binary (\`--features snp\`, \`--version\` prints \`$TAG\`)
           - \`SHA256SUMS\`, \`BUILD-INFO.txt\`: digest, toolchain and the exact build command
           - \`$ASSET.sigstore.json\`: GitHub build-provenance attestation of the binary
+          - \`*.cdx.json\` + \`*.cdx.json.cosign.bundle\`: CycloneDX SBOMs of the trusted-computing-base binaries, cosign-signed by this run (docs/sbom.md)
 
           Miners with auto-update on install it once the release is 24 hours old. To verify by hand, see BUILD-INFO.txt or docs/operator/onboarding-a-miner.md ("Auto-update").
           EOF
-          # sbom.yml, on the same tag, also creates the release if it is
-          # not there yet; whichever loses the race adds to the other's.
-          # Never replace a binary. Miners pass over a release until all
-          # three files are attached, and count the 24 h from the last.
-          if ! gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md dist/*; then
-            gh release view "$TAG" >/dev/null
-            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -qxF "$ASSET"; then
-              echo "::error::release $TAG already carries $ASSET; refusing to replace it"
+          # A release that already exists was not made by this run's
+          # draft: published means immutable (never replaced, never added
+          # to); a draft is a run that died before publishing, and drafts
+          # are never served, so it is rebuilt from scratch.
+          if gh release view "$TAG" --json isDraft -q .isDraft >state 2>/dev/null; then
+            if [ "$(cat state)" != "true" ]; then
+              echo "::error::release $TAG is already published; it is immutable, refusing to touch it"
               exit 1
             fi
-            gh release upload "$TAG" dist/*
-            gh release edit "$TAG" --notes-file notes.md
+            echo "::warning::deleting the unpublished draft of $TAG left by an earlier attempt"
+            gh release delete "$TAG" --yes
           fi
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file notes.md dist/* sbom/*
+
+          # Publish only a draft that carries every file.
+          want="$(cd dist && ls; cd ../sbom && ls)"
+          have="$(gh release view "$TAG" --json assets -q '.assets[].name')"
+          missing="$(comm -23 <(sort <<<"$want") <(sort <<<"$have"))"
+          if [ -n "$missing" ]; then
+            echo "::error::the draft of $TAG is missing: $missing"
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false

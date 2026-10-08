@@ -431,6 +431,10 @@ if [[ "${BAKE_PROFILE}" == "cdn-node" ]]; then
         --cdn-config-dir /usr/local/share/hippius/cdn-node/openresty-config
         --cdn-backend-url "${BAKE_CDN_BACKEND_URL}"
     )
+    # Optional: the bake defaults the fleet wildcard (*.c.hipcdn.net).
+    if [[ -n "${BAKE_CDN_FLEET_WILDCARD:-}" ]]; then
+        BAKE_ARGS+=(--cdn-fleet-wildcard "${BAKE_CDN_FLEET_WILDCARD}")
+    fi
 fi
 if [[ "${BAKE_DISK_MODE}" == "golden_verity_overlay" ]]; then
     /usr/local/bin/tenant-image-bake.sh "${BAKE_ARGS[@]}"

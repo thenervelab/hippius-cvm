@@ -1039,8 +1039,8 @@ mod tests {
         let mut s = snapshot(rev);
         let wc = sealed_cert(
             "fleet",
-            "*.cdn.hippius.com",
-            &["*.cdn.hippius.com"],
+            "*.c.hipcdn.net",
+            &["*.c.hipcdn.net"],
             &fleet_public(),
             1,
             30,
@@ -1186,7 +1186,7 @@ mod tests {
         assert_eq!(r.control.last("/v1/config").unwrap()["revision"], 10);
         assert_eq!(
             r.control.last("/v1/certs").unwrap()["default"],
-            "*.cdn.hippius.com"
+            "*.c.hipcdn.net"
         );
 
         let o = r.observed.lock().unwrap().clone();

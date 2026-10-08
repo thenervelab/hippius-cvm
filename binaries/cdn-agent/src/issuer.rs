@@ -78,6 +78,10 @@ const LEASE_RENEW_S: u64 = 4 * 60;
 const AFTER_UPLOAD_S: u64 = 15 * 60;
 /// Another node holds the lease: look again after this (± jitter).
 const LEASE_HELD_S: u64 = 3 * 60;
+/// The backend issues another name than this node's (`name-mismatch`: the
+/// node was baked for another domain, e.g. across a domain move). Not this
+/// node's to issue; it asks again rarely, in case the backend comes back.
+const NOT_OURS_S: u64 = 6 * 3600;
 /// The backend's DNS-01 writes are off (503 `dns01-disabled`). Long: every
 /// attempt costs the CA an order.
 const DNS01_DISABLED_S: u64 = 60 * 60;
@@ -93,7 +97,7 @@ const FALLBACK_AFTER: u32 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     hostname_id: String,
-    /// The order's identifier (`*.cdn.hippius.com` for the fleet).
+    /// The order's identifier (`*.c.hipcdn.net` for the fleet).
     name: String,
     /// The one DNS-01 name the lease allows.
     dns01_name: String,
@@ -520,7 +524,7 @@ impl Issuer {
         let renew_lease =
             job.lease_id.is_some() && now.saturating_sub(job.lease_at) >= LEASE_RENEW_S;
         if job.stage == Stage::Lease || renew_lease {
-            match client.acme_lease(auth, &job.target.hostname_id) {
+            match client.acme_lease(auth, &job.target.hostname_id, &job.target.name) {
                 Ok(l) => {
                     job.lease_id = Some(l.lease_id);
                     job.lease_at = now;
@@ -538,6 +542,12 @@ impl Issuer {
                 }
                 Err(CdnError::BackendStatus(404)) => {
                     return Err(Abort::Wait(BACKOFF_MAX_S, "unknown hostname"))
+                }
+                Err(CdnError::LeaseNameRefused) => {
+                    return Err(Abort::Wait(
+                        NOT_OURS_S,
+                        "the backend issues another name (node baked for another domain), not ours",
+                    ))
                 }
                 Err(e) => return Err(Abort::Other(e.class())),
             }
@@ -917,6 +927,10 @@ mod tests {
 
     /// A backend that grants leases, says INSYNC on the second DNS-01
     /// post, and records uploads.
+    /// `lease_status` for a backend that refuses the lease's name (409
+    /// `name-mismatch`).
+    const NAME_MISMATCH: u16 = 1409;
+
     fn backend(lease_status: u16, dns_status: u16) -> Backend {
         backend_with_uploads(lease_status, dns_status, 0)
     }
@@ -932,6 +946,10 @@ mod tests {
                 200,
                 r#"{"lease_id":"L1","expires_at":"2099-01-01T00:00:00Z"}"#,
             ),
+            // The backend answers a name mismatch with 409, like a held lease.
+            "/api/cdn/node/acme/lease/" if lease_status == NAME_MISMATCH => {
+                Reply::json(409, r#"{"code":"name-mismatch"}"#)
+            }
             "/api/cdn/node/acme/lease/" => Reply::json(lease_status, r#"{"code":"lease-held"}"#),
             "/api/cdn/node/acme/dns01/" if dns_status == 200 => {
                 let n = dns_posts.fetch_add(1, Ordering::SeqCst);
@@ -1196,6 +1214,39 @@ mod tests {
                 .hostname_id,
             "fleet"
         );
+    }
+
+    #[test]
+    fn the_lease_names_what_is_issued_and_a_name_mismatch_backs_off_long() {
+        let ca = FakeCa::start();
+        // The backend issues another domain than the one this node was baked for.
+        let b = backend(NAME_MISMATCH, 200);
+        let mut issuer = Issuer::new(acme_cfg(&ca), "*.cdn.example.test", "FR").unwrap();
+        let now = crate::clock::unix_now();
+        run(&mut issuer, &b, &state(), now, 5);
+        let leases = b.mock.requests_to("/api/cdn/node/acme/lease/");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].json()["hostname_id"], FLEET_ID);
+        assert_eq!(leases[0].json()["name"], "*.cdn.example.test");
+        assert!(ca.mock.requests().is_empty(), "the CA is never touched");
+        assert!(issuer.busy_with().is_none());
+        // Not this node's to issue: no retry loop, not even after the
+        // longest ordinary back-off.
+        run(&mut issuer, &b, &state(), now + BACKOFF_MAX_S * 2, 3);
+        assert_eq!(b.mock.requests_to("/api/cdn/node/acme/lease/").len(), 1);
+        // It asks again, rarely.
+        run(&mut issuer, &b, &state(), now + NOT_OURS_S * 2, 1);
+        assert_eq!(b.mock.requests_to("/api/cdn/node/acme/lease/").len(), 2);
+
+        // A custom hostname's lease names the hostname.
+        let b2 = backend(409, 200);
+        let mut issuer2 = Issuer::new(acme_cfg(&ca), "*.cdn.example.test", "FR").unwrap();
+        let mut s = with_custom("FR");
+        fresh_fleet_cert(&mut s, 90);
+        run(&mut issuer2, &b2, &s, now, 1);
+        let leases = b2.mock.requests_to("/api/cdn/node/acme/lease/");
+        assert_eq!(leases[0].json()["hostname_id"], "h7");
+        assert_eq!(leases[0].json()["name"], "www.example.com");
     }
 
     #[test]

@@ -250,7 +250,7 @@ standard bake is unchanged.
   - The key is zone + zone generation + the generation of every covering
     directory prefix + the exact-path generation + path + the 1 MiB slice
     range.
-  - Only origin statuses 200, 206, 301 and 404 are cached, whatever the
+  - Only origin statuses 200, 206 and 404 are cached, whatever the
     origin's `Cache-Control` says.
   - Any status of 400 or above gets a short generic body: origin error
     XML (bucket, key, access key id) never reaches a client.
@@ -259,7 +259,52 @@ standard bake is unchanged.
   - Different query strings share one object, because the origin never
     sees the query.
   - Hostnames of one zone share objects.
-  - Responses with `Set-Cookie` are not cached, and the cookie is stripped.
+  - The lifetime is the zone's alone: 1 h for 200/206 and 1 min for 404
+    (`settings.default_ttl` and `proxy_cache_valid`) until zone rules are
+    enforced. The origin's `Cache-Control`, `Expires`, `Set-Cookie` and
+    `Vary` are ignored: the S3 gateway marks every private object
+    `private, no-store`, which would make every request a miss. Set-Cookie
+    never reaches a client, so it does not make a response uncacheable.
+  - `Vary` is ignored because the origin request carries no client header,
+    so the origin's answer cannot depend on one. Honouring `Vary: *` or
+    `Vary: Origin` would only stop or split caching. The client sees gzip's
+    own `Vary: Accept-Encoding`.
+  - The client gets `Cache-Control: public, max-age=3600` on a 200/206,
+    computed by the node, never the origin's. It does not count the time
+    the copy already spent at the edge, so a browser or a downstream cache
+    can hold an object up to about 2 h after the origin changed, and a
+    purge cannot reach a copy a browser already holds.
+  - An origin redirect (3xx other than 304) is not followed, never cached,
+    and gets the same generic body as an error: S3's XML body names the
+    bucket and endpoint.
+- **Response headers.** An allowlist: from the origin, a client sees only
+  `Content-Type`, `Content-Length`, `Content-Range`, `Content-Encoding`,
+  `Content-Language`, `Content-Disposition`, `ETag`, `Last-Modified` and
+  `Accept-Ranges`. Every other origin header is dropped (`x-hippius-*`,
+  every `x-amz-*`, `Set-Cookie`, `Expires`, `Vary`, `Location`, `Age`:
+  nginx would replay the origin's value unchanged). The node adds `Cache-Control`, `X-Cache`,
+  `X-Content-Type-Options`, `Content-Security-Policy` (script-capable
+  types only) and gzip's `Vary`. There is no `Server` header.
+- **Content-Type.**
+  - `X-Content-Type-Options: nosniff` is on every response, nginx's own
+    error pages and the node's endpoints included (`more_set_headers` at
+    the http level).
+  - When the origin sends no type, or `application/octet-stream` or
+    `binary/octet-stream`, the type comes from the extension, using the
+    build's `mime.types` (loaded at start).
+  - Security: the fallback only yields types from an allowlist (`image/`,
+    `audio/`, `video/`, `font/`, CSS, plain text, JavaScript, JSON, wasm),
+    never HTML, SVG or any XML type, which browsers render as documents
+    that can run script; anything else is `application/octet-stream`. A
+    type the origin declares is kept.
+  - On the fleet's own names (`<id>` under the fleet wildcard), a response
+    whose final type is script-capable (HTML, any XML type, `text/xsl`,
+    `text/mathml`) carries `Content-Security-Policy: sandbox allow-scripts`:
+    an opaque origin, classic scripts run, no cookies or storage. Zones
+    under one wildcard are same-site with each other, which this guards.
+    Same-host module scripts, fonts and `fetch` become cross-origin there
+    (no CORS is served), so a full web app needs a custom domain, which is
+    never sandboxed.
 - **Compression.** gzip on text types, only when the client accepts it and
   the zone list enables it. The cache always holds the identity body.
 - **Metering.** One JSON datagram per request goes to the agent, in the

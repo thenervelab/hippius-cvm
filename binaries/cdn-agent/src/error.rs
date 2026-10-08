@@ -31,6 +31,11 @@ pub enum CdnError {
     #[error("backend status {0}")]
     BackendStatus(u16),
 
+    /// The backend refused an ACME lease for a name it does not issue
+    /// (`name-mismatch`): this node is baked for another domain.
+    #[error("backend: lease name refused")]
+    LeaseNameRefused,
+
     /// The backend answered an error status with `Retry-After`: wait at
     /// least that long before the next poll.
     #[error("backend status {status}, retry after {retry_after_s} s")]
@@ -94,6 +99,7 @@ impl CdnError {
             | CdnError::Acme(c)
             | CdnError::Shutdown(c) => c,
             CdnError::BackendStatus(_) => "backend-status",
+            CdnError::LeaseNameRefused => "lease-name-refused",
             CdnError::Throttled { .. } => "backend-throttled",
             CdnError::Unauthorized => "unauthorized",
         }
