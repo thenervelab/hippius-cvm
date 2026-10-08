@@ -233,4 +233,49 @@ mod tests {
         assert!(sec["zones"].get("z2").is_none());
         assert_eq!(r.refused.len(), 2);
     }
+
+    /// Contract with the backend: a zone with a private bucket at its root
+    /// and the `s3_credentials` plaintext the backend seals
+    /// (`test_vectors/cdn/s3_credentials.json`, also read by the
+    /// OpenResty router's unit test) serves, and the plaintext reaches
+    /// OpenResty byte for byte.
+    #[test]
+    fn backend_sealed_s3_credentials_pass_through_unchanged() {
+        let raw = include_str!("../../../test_vectors/cdn/s3_credentials.json");
+        let vectors: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let ring = FleetKeyring::from_secrets([(1, [9u8; 32])]);
+        let pk = ring.public_key(1).unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let plain = case["plaintext"].as_str().unwrap();
+            let mut snap = snapshot(10);
+            snap["zones"] = json!([{
+                "zone_id": "zexamplezonea", "state": "active",
+                "origin": {"type": "s3", "bucket": "example-bucket", "prefix": ""},
+                "secrets": [{"name": "s3_credentials", "fleet_key_version": 1,
+                             "sealed_b64": B64.encode(seal_to(&pk, plain.as_bytes()).unwrap())}]
+            }]);
+            snap["hostnames"] = json!([{"hostname_id": "h1", "zone_id": "zexamplezonea",
+                                        "hostname": "zexamplezonea.cdn.hippius.com"}]);
+            snap["purges"] = json!([]);
+            snap["blocks"] = json!([]);
+            let Applied::New(state) = crate::feed::FeedState::default().apply(resp(snap)).unwrap()
+            else {
+                panic!()
+            };
+            let r = render(&state, &ring, &S3OnlyPolicy, &dp(), "*.cdn.hippius.com").unwrap();
+            let cfg: serde_json::Value = serde_json::from_slice(&r.config).unwrap();
+            assert_eq!(
+                cfg["zones"]["zexamplezonea"]["serving"], true,
+                "{}",
+                case["name"]
+            );
+            assert!(r.refused.is_empty(), "{:?}", r.refused);
+            let sec: serde_json::Value = serde_json::from_slice(&r.secrets).unwrap();
+            assert_eq!(
+                sec["zones"]["zexamplezonea"]["s3_credentials"], plain,
+                "{}",
+                case["name"]
+            );
+        }
+    }
 }

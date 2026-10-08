@@ -69,6 +69,7 @@ class FakeHeartbeatVerifier:
         self.declared_capacity: verifier.DeclaredCapacity | None = None
         self.declared_disk: verifier.DeclaredDisk | None = None
         self.declared_host_health: verifier.DeclaredHostHealth | None = None
+        self.agent_version: str | None = None
         self.fail_category = "signature_invalid"
         self.calls: list[tuple[bytes, bytes]] = []
 
@@ -97,6 +98,7 @@ class FakeHeartbeatVerifier:
             declared_capacity=self.declared_capacity,
             declared_disk=self.declared_disk,
             declared_host_health=self.declared_host_health,
+            agent_version=self.agent_version,
         )
 
 
@@ -1128,3 +1130,137 @@ def test_the_reeval_survey_drops_a_miner_that_left_the_active_set(
     # The group is still replaced (empty), so the old series go away.
     assert len(pushed) == 1
     assert node not in pushed[0]
+
+
+# ─── v6 miner-agent release tag → scheduler mirror (observability) ───────
+
+
+def _v6(fake: FakeHeartbeatVerifier, tag: str = "v2026.10.08") -> None:
+    fake.schema_version = 6
+    fake.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 4)
+    fake.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+    fake.declared_host_health = verifier.DeclaredHostHealth(
+        snp_enabled=True, cpus_offline=0, snp_launches_since_boot=7, df_flush_failures=0
+    )
+    fake.agent_version = tag
+
+
+def test_v6_heartbeat_records_the_agent_version(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "d1" * 32
+    _make_bridged_miner(node)
+    _v6(fake_heartbeat_verifier)
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert mc.agent_version == "v2026.10.08"
+    assert mc.agent_version_reported_at is not None
+    # The v5 half of a v6 body still lands.
+    assert _host_health(mc) == (True, 0, 7, 0)
+    assert mc.reported_data_disk_total_gb == 3500
+
+
+@pytest.mark.parametrize("schema_version", [1, 4, 5])
+def test_pre_v6_heartbeat_leaves_the_agent_version_untouched(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, schema_version: int
+) -> None:
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "d2" * 32
+    _make_bridged_miner(node)
+    stamped = timezone.now() - timedelta(minutes=3)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        agent_version="dev", agent_version_reported_at=stamped
+    )
+    fake_heartbeat_verifier.schema_version = schema_version
+    if schema_version == 5:
+        fake_heartbeat_verifier.declared_host_health = verifier.DeclaredHostHealth(
+            snp_enabled=True, cpus_offline=0, snp_launches_since_boot=1, df_flush_failures=0
+        )
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert mc.agent_version == "dev"
+    assert mc.agent_version_reported_at == stamped
+
+
+def test_the_reeval_survey_pushes_the_agent_version_info(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from django.test import override_settings
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.synthetic import metrics
+
+    node = "d3" * 32
+    _make_bridged_miner(node)
+    _v6(fake_heartbeat_verifier)
+    assert _post_heartbeat().status_code == 202
+
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    assert len(pushed) == 1
+    labels = f'{{miner_id="{MINER_ID}",node_id="{node}",version="v2026.10.08"}}'
+    assert f"hippius_miner_agent_version_info{labels} 1" in pushed[0]
+    # The host-health series are still there.
+    assert f'hippius_miner_host_health_reporting{{miner_id="{MINER_ID}",node_id="{node}"}} 1' in (
+        pushed[0]
+    )
+
+
+def test_the_reeval_survey_has_no_version_info_without_a_v6_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from django.test import override_settings
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.synthetic import metrics
+
+    node = "d4" * 32
+    _make_bridged_miner(node)
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    assert len(pushed) == 1
+    assert "hippius_miner_agent_version_info" not in pushed[0]
+    labels = f'{{miner_id="{MINER_ID}",node_id="{node}"}}'
+    assert f"hippius_miner_host_health_reporting{labels} 0" in pushed[0]
+
+
+def test_the_reeval_survey_drops_the_version_info_after_a_downgrade_to_v5(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A miner that stops sending v6 must not keep advertising its old tag."""
+    from django.test import override_settings
+
+    from apps.scheduler.management.commands import vali_scheduler_reeval as reeval
+    from apps.scheduler.models import MinerCapacity
+    from apps.synthetic import metrics
+
+    node = "d5" * 32
+    _make_bridged_miner(node)
+    _v6(fake_heartbeat_verifier)
+    assert _post_heartbeat().status_code == 202
+    fake_heartbeat_verifier.schema_version = 5
+    fake_heartbeat_verifier.agent_version = None
+    fake_heartbeat_verifier.sequence += 1
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert mc.agent_version == "v2026.10.08"  # kept, for the operator
+    assert mc.host_health_reported_at > mc.agent_version_reported_at
+
+    pushed: list[str] = []
+    monkeypatch.setattr(metrics, "push", lambda ms, **_k: pushed.append(ms.render()) or True)
+    with override_settings(VALI_SYNTHETIC_PUSHGATEWAY_URL="http://pgw"):
+        reeval.host_health_survey()
+    assert len(pushed) == 1
+    assert "hippius_miner_agent_version_info" not in pushed[0]

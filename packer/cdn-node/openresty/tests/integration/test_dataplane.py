@@ -40,6 +40,8 @@ ACCESS = "AKTESTCDNNODE"
 # A test-only value for the mock origin; not a credential anywhere.
 SIGNING_MATERIAL = "test-signing-material-for-the-mock-origin"
 REGION = "us-east-1"
+# settings.canary_interval: how often worker 0 re-checks the canary.
+CANARY_TICK = 10
 EMPTY = hashlib.sha256(b"").hexdigest()
 
 TEXT = ("hello from the origin\n" * 64).encode()
@@ -50,6 +52,7 @@ OBJECTS = {
     "/media/site/img/x.png.bak": (b"backup", "image/png"),
     "/media/site/bad.bin": (b"blocked", "application/octet-stream"),
     "/private/k/doc.txt": (b"private-object", "text/plain"),
+    "/private/sub.txt": (b"private-subtoken-object", "text/plain"),
     "/media/site/a%20b.txt": (b"spaced", "text/plain"),
     "/media/site/cookie.txt": (b"with-cookie", "text/plain"),
     "/media/site/accel.txt": (b"accel-object", "text/plain"),
@@ -322,6 +325,10 @@ class DataPlane(unittest.TestCase):
                 "zp": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "private", "prefix": "k/"},
                        "shield_region": None, "settings": {}, "secrets": ["s3_credentials"]},
+                # The prod shape: a private bucket at its root.
+                "zq": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "private", "prefix": ""},
+                       "shield_region": None, "settings": {}, "secrets": ["s3_credentials"]},
                 "zr": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
                        "settings": {}, "secrets": []},
@@ -330,6 +337,7 @@ class DataPlane(unittest.TestCase):
                 "img.example.com": "z1", "z1.cdn.hippius.com": "z1", "dl.example.com": "zp",
                 "paused.cdn.hippius.com": "z2", "refused.cdn.hippius.com": "z3",
                 "susp.cdn.hippius.com": "z4", "root.cdn.hippius.com": "zr",
+                "priv.cdn.hippius.com": "zq",
             },
             "purges": {"z1": {"zone_generation": 1, "prefixes": {}}},
             "blocks": [{"kind": "path", "value": "/bad.bin", "zone_id": "z1"},
@@ -350,6 +358,27 @@ class DataPlane(unittest.TestCase):
         }}), 204)
         self.assertEqual(self.put("config", self.config(**over)), 204)
         self.assertEqual(self.put("health", {"ready": health_ready, "at": int(time.time())}), 204)
+
+    def log_count(self, needle):
+        with open(self.err_path, "rb") as f:
+            return f.read().count(needle.encode())
+
+    def wait_log(self, needle, count, timeout):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.log_count(needle) >= count:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def wait_health(self, status, timeout):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.put("health", {"ready": True, "at": int(time.time())})
+            if self.https("health.cdn.hippius.com", "/__hippius/health")[0] == status:
+                return True
+            time.sleep(0.5)
+        return False
 
     def https(self, sni, path, host=None, headers=None, method="GET"):
         ctx = ssl.create_default_context(cafile=self.cafile)
@@ -433,6 +462,37 @@ class DataPlane(unittest.TestCase):
         self.assertIn("X-Amz-Signature=", hit["query"])
         self.assertIn("X-Amz-Expires=86400", hit["query"])
         self.assertNotIn("authorization", hit["headers"])
+
+    def test_cb_backend_credential_shape(self):
+        zp = {"s3_credentials": json.dumps({"access_key_id": ACCESS, "secret_access_key": SIGNING_MATERIAL})}
+        # The backend seals the SubToken as {"access_key_id", "secret"};
+        # zone zq is the prod shape (a private bucket, empty prefix).
+        backend = json.dumps({"access_key_id": ACCESS, "secret": SIGNING_MATERIAL})
+        self.assertEqual(self.put("secrets", {"zones": {"zp": zp, "zq": {"s3_credentials": backend}}}), 204)
+        st, _, body = self.https("priv.cdn.hippius.com", "/sub.txt")
+        self.assertEqual((st, body), (200, b"private-subtoken-object"))
+        hit = self.origin_hits("/private/sub.txt")[0]
+        self.assertIsNone(hit.get("sig"), hit.get("sig"))
+        # Unusable credentials: 503 before the origin, and the CRIT line
+        # names the field without printing any credential.
+        broken = json.dumps({"access_key_id": ACCESS, "secret_key": SIGNING_MATERIAL})
+        self.assertEqual(self.put("secrets", {"zones": {"zp": zp, "zq": {"s3_credentials": broken}}}), 204)
+        with open(self.err_path, "rb") as f:
+            f.seek(0, 2)
+            offset = f.tell()
+        before = len(Origin.log)
+        for _ in range(3):
+            self.assertEqual(self.https("priv.cdn.hippius.com", "/never.txt")[0], 503)
+        self.assertEqual(len(Origin.log), before)
+        time.sleep(0.2)
+        with open(self.err_path, "rb") as f:
+            f.seek(offset)
+            log = f.read()
+        line = b"zone zq has unusable s3 credentials: secret missing or invalid"
+        self.assertIn(line, log)
+        self.assertNotIn(SIGNING_MATERIAL.encode(), log)
+        self.assertNotIn(ACCESS.encode(), log)
+        self.push_all()
 
     def test_d_gzip(self):
         st, h, body = self.https("img.example.com", "/a/b.txt", headers={"Accept-Encoding": "gzip"})
@@ -633,14 +693,28 @@ class DataPlane(unittest.TestCase):
         self.assertFalse(json.loads(body)["agent_ready"])
         self.put("health", {"ready": True, "at": int(time.time()) - 120})
         self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 503, "stale")
-        os.remove(os.path.join(self.work, "cache", ".hippius-canary"))
+        # Something in the canary's way (here a directory): health fails,
+        # worker 0 logs it once however many checks fail.
+        canary = os.path.join(self.work, "cache", ".hippius-canary")
+        os.remove(canary)
+        os.mkdir(canary)
         self.put("health", {"ready": True, "at": int(time.time())})
         st, _, body = self.https("health.cdn.hippius.com", "/__hippius/health")
         self.assertEqual(st, 503)
         self.assertFalse(json.loads(body)["canary"])
-        with open(os.path.join(self.work, "cache", ".hippius-canary"), "w") as f:
-            f.write("hippius-canary\n")
-        self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 200)
+        self.assertTrue(self.wait_log("canary write failed", 1, CANARY_TICK + 3))
+        time.sleep(CANARY_TICK + 1)
+        self.assertEqual(self.log_count("canary write failed"), 1, "logged once")
+        # Out of the way again: rewritten within one check, recovery logged.
+        os.rmdir(canary)
+        self.assertTrue(self.wait_health(200, CANARY_TICK + 3))
+        self.assertEqual(self.log_count("canary written again"), 1)
+        # Deleted under a healthy node (what nginx's cache loader did when the
+        # canary sat inside the cache tree): back within one check.
+        os.remove(canary)
+        self.assertTrue(self.wait_health(200, CANARY_TICK + 3))
+        with open(canary) as f:
+            self.assertEqual(f.read(), "hippius-canary\n")
 
     def test_j_attestation(self):
         self.assertEqual(self.put("attestation", {"format": "sev-snp-report-v1",
@@ -671,6 +745,59 @@ class DataPlane(unittest.TestCase):
         self.assertTrue(unknown and not unknown[-1]["billable"])
         misses = [r for r in self.records if r.get("cache") == "miss" and r.get("zone") == "z1"]
         self.assertTrue(misses and misses[0]["bytes_from_origin"] > 0)
+
+    def test_x_no_cache_directory_no_start(self):
+        # Without its cache directory nginx does not start (it creates
+        # objects/ there), so systemd's Restart= retries until the volume is
+        # there; it never runs on a half-present cache.
+        cache = os.path.join(self.work, "cache")
+        type(self).stop_nginx()
+        os.rename(cache, cache + ".away")
+        env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(PREFIX, "luajit", "lib"))
+        err_path = os.path.join(self.work, "nocache.err")
+        with open(err_path, "wb") as err:
+            p = subprocess.Popen([NGINX, "-e", "stderr", "-p", self.work, "-c",
+                                  os.path.join(self.work, "nginx.conf"), "-g", "daemon off;"],
+                                 env=env, stderr=err)
+        started = True
+        try:
+            p.wait(timeout=10)
+            started = False
+        except subprocess.TimeoutExpired:
+            p.terminate()  # the master takes its workers down
+            p.wait(10)
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)  # if nginx made one
+            os.rename(cache + ".away", cache)
+            type(self).start_nginx()
+        self.assertFalse(started, "nginx started without its cache directory")
+        self.assertNotEqual(p.returncode, 0)
+        with open(err_path, "rb") as f:
+            self.assertIn(b"objects", f.read())
+
+    def test_y_canary_survives_the_cache_loader(self):
+        # The canary is written at start and left alone by the cache loader
+        # (it starts a minute after nginx and deletes every non-cache file
+        # in the cache tree): same file, same inode, after the loader ran.
+        cache = os.path.join(self.work, "cache")
+        type(self).stop_nginx()
+        os.remove(os.path.join(cache, ".hippius-canary"))
+        type(self).start_nginx()
+        started = time.time()
+        canary = os.path.join(cache, ".hippius-canary")
+        deadline = time.time() + 5
+        while not os.path.exists(canary) and time.time() < deadline:
+            time.sleep(0.05)
+        st = os.stat(canary)
+        first = (st.st_ino, st.st_mtime_ns)
+        self.push_all()
+        self.assertEqual(self.https("img.example.com", "/a/b.txt")[0], 200)
+        time.sleep(max(0.0, started + 70 - time.time()))
+        st = os.stat(canary)
+        self.assertEqual((st.st_ino, st.st_mtime_ns), first, "the canary was deleted and rewritten")
+        self.assertEqual(sorted(os.listdir(cache)), [".hippius-canary", "objects"])
+        self.put("health", {"ready": True, "at": int(time.time())})
+        self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 200)
 
     def test_z_restart_empties_shared_memory(self):
         type(self).stop_nginx()

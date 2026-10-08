@@ -20,8 +20,9 @@
 //! vectors above are untouched by `v3` — adding a schema never moves
 //! an older one. A third pair, `heartbeat_body_v4.cbor` /
 //! `signed_heartbeat_v4.cbor`, freezes the `v4` disk-declaration body,
-//! and a fourth, `heartbeat_body_v5.cbor` / `signed_heartbeat_v5.cbor`,
-//! the `v5` host-health body.
+//! a fourth, `heartbeat_body_v5.cbor` / `signed_heartbeat_v5.cbor`,
+//! the `v5` host-health body, and a fifth, `heartbeat_body_v6.cbor` /
+//! `signed_heartbeat_v6.cbor`, the `v6` agent-version body.
 //!
 //! Regenerate deliberately — see `test_vectors/heartbeat/REGENERATE.md`.
 
@@ -30,8 +31,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use hippius_types::heartbeat::{
     CapacityDeclaration, DiskDeclaration, HostHealthDeclaration, MinerHeartbeat,
-    SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_CAPACITY, SCHEMA_VERSION_DISK,
-    SCHEMA_VERSION_HOST_HEALTH,
+    SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_AGENT_VERSION,
+    SCHEMA_VERSION_CAPACITY, SCHEMA_VERSION_DISK, SCHEMA_VERSION_HOST_HEALTH,
 };
 use std::path::PathBuf;
 
@@ -76,6 +77,14 @@ fn v5_signed_vector_path() -> PathBuf {
     repo_root().join("test_vectors/heartbeat/signed_heartbeat_v5.cbor")
 }
 
+fn v6_body_vector_path() -> PathBuf {
+    repo_root().join("test_vectors/heartbeat/heartbeat_body_v6.cbor")
+}
+
+fn v6_signed_vector_path() -> PathBuf {
+    repo_root().join("test_vectors/heartbeat/signed_heartbeat_v6.cbor")
+}
+
 /// The pinned heartbeat — fixed inputs. DO NOT change without bumping
 /// `test_vectors` and regenerating the committed vectors.
 fn kat_heartbeat() -> MinerHeartbeat {
@@ -100,6 +109,7 @@ fn kat_heartbeat() -> MinerHeartbeat {
         asid_used: 0,
         disk: DiskDeclaration::default(),
         host_health: HostHealthDeclaration::default(),
+        agent_version: String::new(),
     }
 }
 
@@ -157,6 +167,25 @@ fn kat_heartbeat_v5() -> MinerHeartbeat {
         },
     );
     assert_eq!(hb.schema_version, SCHEMA_VERSION_HOST_HEALTH);
+    hb
+}
+
+/// The pinned `v6` heartbeat — the `v5` tuple plus a fixed agent release
+/// tag.
+fn kat_heartbeat_v6() -> MinerHeartbeat {
+    let v5 = kat_heartbeat_v5();
+    let hb = kat_heartbeat().with_agent_version(
+        CapacityDeclaration {
+            cvm_cpu_budget: v5.cvm_cpu_budget,
+            cvm_memory_mb_budget: v5.cvm_memory_mb_budget,
+            asid_capacity: v5.asid_capacity,
+            asid_used: v5.asid_used,
+        },
+        v5.disk,
+        v5.host_health,
+        "v1.2.3".into(),
+    );
+    assert_eq!(hb.schema_version, SCHEMA_VERSION_AGENT_VERSION);
     hb
 }
 
@@ -328,6 +357,59 @@ fn v5_frozen_signed_vector_decodes_and_verifies() {
     let sig = ed25519_dalek::Signature::from_slice(&signed.sig).expect("sig is 64 bytes");
     vk.verify_strict(&signed.body, &sig)
         .expect("the frozen v5 KAT signature must verify under the test key");
+}
+
+#[test]
+fn v6_heartbeat_body_kat_matches_the_frozen_vector() {
+    let produced = kat_heartbeat_v6().canonical().expect("encode v6 KAT body");
+    let expected = std::fs::read(v6_body_vector_path()).expect(
+        "test_vectors/heartbeat/heartbeat_body_v6.cbor missing — run \
+         `cargo test -p hippius-types --test heartbeat_kat \
+         regenerate_v6_vectors -- --ignored --exact`",
+    );
+    assert_eq!(
+        produced, expected,
+        "v6 heartbeat canonical-CBOR body changed"
+    );
+}
+
+#[test]
+fn v6_signed_heartbeat_kat_matches_the_frozen_vector() {
+    let produced = sign(kat_heartbeat_v6())
+        .canonical()
+        .expect("encode v6 KAT envelope");
+    let expected = std::fs::read(v6_signed_vector_path())
+        .expect("test_vectors/heartbeat/signed_heartbeat_v6.cbor missing");
+    assert_eq!(produced, expected, "v6 signed heartbeat envelope changed");
+}
+
+#[test]
+fn v6_frozen_signed_vector_decodes_and_verifies() {
+    let raw = std::fs::read(v6_signed_vector_path()).expect("read signed_heartbeat_v6.cbor");
+    let signed: SignedMinerHeartbeat =
+        ciborium::de::from_reader(raw.as_slice()).expect("decode the frozen v6 envelope");
+    assert_eq!(signed.body, kat_heartbeat_v6().canonical().unwrap());
+    let vk = SigningKey::from_bytes(&KAT_SEED).verifying_key();
+    let sig = ed25519_dalek::Signature::from_slice(&signed.sig).expect("sig is 64 bytes");
+    vk.verify_strict(&signed.body, &sig)
+        .expect("the frozen v6 KAT signature must verify under the test key");
+}
+
+/// `v6` regeneration helper — writes ONLY the `v6` pair.
+///
+/// ```text
+/// cargo test -p hippius-types --test heartbeat_kat \
+///     regenerate_v6_vectors -- --ignored --exact
+/// ```
+#[test]
+#[ignore]
+fn regenerate_v6_vectors() {
+    let body = kat_heartbeat_v6().canonical().expect("encode v6 KAT body");
+    let signed = sign(kat_heartbeat_v6())
+        .canonical()
+        .expect("encode v6 KAT envelope");
+    std::fs::write(v6_body_vector_path(), &body).expect("write heartbeat_body_v6.cbor");
+    std::fs::write(v6_signed_vector_path(), &signed).expect("write signed_heartbeat_v6.cbor");
 }
 
 /// `v5` regeneration helper — writes ONLY the `v5` pair.

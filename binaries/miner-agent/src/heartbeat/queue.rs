@@ -162,6 +162,7 @@ mod tests {
             asid_used: 0,
             disk: hippius_types::heartbeat::DiskDeclaration::default(),
             host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
+            agent_version: String::new(),
         };
         SignedMinerHeartbeat {
             body: h.canonical().unwrap(),

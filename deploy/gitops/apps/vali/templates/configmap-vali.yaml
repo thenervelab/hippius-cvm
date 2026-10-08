@@ -59,6 +59,13 @@ data:
   # Shared for the same reason: the web pods serve the feed and the
   # orchestration tick bumps the edge revisions.
   VALI_FEED_BLOCK_SMTP: {{ .Values.config.feedBlockSmtp | default false | quote }}
+  # The CDN switches (docs/design/cdn.md, apps.cdn). Shared, never per pod:
+  # the web pods (CDN API, edge feed, bake intake), the launch tick (role
+  # check), the orchestration tick (reconciler, feed revisions) and the
+  # scheduler paths (one node per host) must agree.
+  VALI_CDN_ENABLED: {{ .Values.cdn.enabled | default false | quote }}
+  VALI_CDN_LAUNCH_ROLE: {{ .Values.cdn.launchRole | default false | quote }}
+  VALI_CDN_RECONCILE_ENABLED: {{ .Values.cdn.reconcile | default false | quote }}
   {{- with .Values.cdn.backendUrl }}
   # The CDN backend base URL (CDN plan I3/V2): a cdn-node bake writes it
   # into the MEASURED agent config, and every CDN node's user-data names

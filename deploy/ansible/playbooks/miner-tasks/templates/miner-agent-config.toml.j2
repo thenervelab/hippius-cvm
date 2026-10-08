@@ -112,6 +112,12 @@ schema_disk = true
 # Rendered only when enabled — an agent older than the key refuses it.
 schema_host_health = true
 {% endif %}
+{% if miner_heartbeat_schema_agent_version | default(false) | bool %}
+# Agent release tag: emit the v6 heartbeat (v5 + agent_version). Needs
+# schema_host_health, and a vali that accepts v6. Rendered only when
+# enabled — an agent older than the key refuses it.
+schema_agent_version = true
+{% endif %}
 
 {% if miner_kbs_endpoint is defined %}
 [kbs]

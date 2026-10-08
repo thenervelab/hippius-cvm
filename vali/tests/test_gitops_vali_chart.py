@@ -522,6 +522,24 @@ def test_public_ingress_publishes_the_network_prefix() -> None:
 
 
 @_needs_helm
+def test_public_ingress_publishes_the_cdn_prefix() -> None:
+    """The layer above reads the CDN fleet and acks DNS releases through the
+    public hostname — `/v1/cdn` must be served and documented. Safe as a
+    prefix only because every route under it is root-only, which
+    `apps/cdn/tests/test_views.py` pins."""
+    paths = {
+        p.get("path")
+        for doc in _docs()
+        if (doc or {}).get("kind") == "Ingress"
+        for rule in doc["spec"]["rules"]
+        for p in rule["http"]["paths"]
+    }
+    assert "/v1/cdn" in paths
+    public = _configmap_data(_docs()).get("VALI_PUBLIC_API_PATHS", "").split(",")
+    assert "/v1/cdn" in public
+
+
+@_needs_helm
 def test_public_ingress_publishes_the_operator_paths_exactly() -> None:
     """The backend's support views reach vali through the public hostname,
     so each operator read is published — one EXACT path at a time, never
@@ -578,6 +596,35 @@ def test_net_policy_push_reaches_only_the_orchestration_tick() -> None:
     assert tick["VALI_NET_POLICY_PUSH"] == "true"
     assert tick["VALI_NET_POLICY_MINERS"] == "*"
     assert tick["VALI_NET_POLICY_LOCAL_ACTION"] == "drop"
+
+
+@_needs_helm
+def test_the_kbs_audit_ingest_runs_in_the_orchestration_tick_and_is_alerted() -> None:
+    """The ingest only runs where the flag is set: the orchestration tick.
+    Off, vali's copy of the KBS audit chains silently fell ~10k records
+    behind; the lag and staleness alerts make that loud."""
+    docs = _docs()
+    env = _env_by_workload(docs)
+    assert env["Deployment/vali-orchestration-tick"]["VALI_KBS_AUDIT_INGEST_ENABLED"] == "true"
+    for label, workload in env.items():
+        if label != "Deployment/vali-orchestration-tick":
+            assert "VALI_KBS_AUDIT_INGEST_ENABLED" not in workload, label
+    rules = {
+        r["alert"]: r["expr"]
+        for d in docs
+        if d.get("kind") == "PrometheusRule"
+        for g in d["spec"]["groups"]
+        for r in g["rules"]
+        if "alert" in r
+    }
+    assert "hippius_kbs_audit_lag_records" in rules["KbsAuditIngestLagging"]
+    # A catch-up shrinking report over report must not page.
+    assert "offset 1h" in rules["KbsAuditIngestLagging"]
+    assert "hippius_kbs_audit_checked_timestamp_seconds" in rules["KbsAuditIngestStale"]
+    # "Never checked" (0) is not stale: a report pushed before the first run
+    # after a roll must not page; it has its own two-report rule.
+    assert "hippius_kbs_audit_checked_timestamp_seconds > 0" in rules["KbsAuditIngestStale"]
+    assert "== 0" in rules["KbsAuditIngestNeverChecked"]
 
 
 @_needs_helm
@@ -694,7 +741,7 @@ def test_cdn_backend_url_is_one_shared_value() -> None:
 def test_the_pinned_kbs_response_key_reaches_the_fleet_mint() -> None:
     """`vali_cdn_fleet mint` verifies the KBS signature under this pin; it
     must be the key the guest UKI pins (binaries/agent-initramfs
-    trust_anchors), never a per-pod value, and the CDN flags stay off."""
+    trust_anchors), never a per-pod value."""
     docs = _docs()
     data = _configmap_data(docs)
     assert data["VALI_CDN_KBS_RESPONSE_VK_HEX"] == (
@@ -702,10 +749,37 @@ def test_the_pinned_kbs_response_key_reaches_the_fleet_mint() -> None:
     )
     for label, env in _env_by_workload(docs).items():
         assert "VALI_CDN_KBS_RESPONSE_VK_HEX" not in env, label
-    flags = {"VALI_CDN_ENABLED", "VALI_CDN_LAUNCH_ROLE", "VALI_CDN_RECONCILE_ENABLED"}
-    assert not flags & set(data)
     for label, env in _env_by_workload(docs).items():
-        assert not flags & set(env), label
+        assert not {k for k in env if k.startswith("VALI_CDN_")}, label
     assert "VALI_CDN_KBS_RESPONSE_VK_HEX" not in _configmap_data(
         _docs("--set", "cdn.kbsResponseVkHex=")
     )
+
+
+_CDN_SWITCHES = ("VALI_CDN_ENABLED", "VALI_CDN_LAUNCH_ROLE", "VALI_CDN_RECONCILE_ENABLED")
+
+
+@_needs_helm
+def test_the_cdn_switches_are_on_and_shared() -> None:
+    """One shared value per switch: the web pods, the launch tick, the
+    orchestration tick and the scheduler paths read them together."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    for key in _CDN_SWITCHES:
+        assert data[key] == "true", key
+    pods = dict(_pod_specs(docs))
+    for label in (
+        "Deployment/vali",
+        "Deployment/vali-launch-tick",
+        "Deployment/vali-orchestration-tick",
+        "Deployment/vali-scheduler-reeval",
+    ):
+        assert "vali-config" in _env_from_configmaps(pods[label]), label
+
+
+@_needs_helm
+def test_the_cdn_switches_default_off() -> None:
+    sets = ("cdn.enabled=false", "cdn.launchRole=false", "cdn.reconcile=false")
+    off = _configmap_data(_docs(*(arg for s in sets for arg in ("--set", s))))
+    for key in _CDN_SWITCHES:
+        assert off[key] == "false", key

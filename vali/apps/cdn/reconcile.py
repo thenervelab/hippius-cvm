@@ -814,16 +814,21 @@ def reconcile(*, now: dt.datetime | None = None) -> ReconcileReport:
     if not enabled():
         return report
     now = now or timezone.now()
-    try:
-        hold = _liveness_breaker(now=now)
-    except Exception:  # noqa: BLE001 — unknown: act on no liveness verdict.
-        log.exception("cdn: unhandled error in the liveness breaker")
-        hold = True
-    try:
-        hold_unseen = _unseen_breaker(now=now)
-    except Exception:  # noqa: BLE001 — unknown: act on no unseen verdict.
-        log.exception("cdn: unhandled error in the host-unseen breaker")
-        hold_unseen = True
+    # The breakers only guard ready nodes: with none, they are not evaluated
+    # at all — a fleet with no CDN node (no active region yet) logs nothing
+    # about the tenants' telemetry or the miners.
+    hold = hold_unseen = False
+    if CdnNode.objects.filter(state=CdnNodeState.READY).exists():
+        try:
+            hold = _liveness_breaker(now=now)
+        except Exception:  # noqa: BLE001 — unknown: act on no liveness verdict.
+            log.exception("cdn: unhandled error in the liveness breaker")
+            hold = True
+        try:
+            hold_unseen = _unseen_breaker(now=now)
+        except Exception:  # noqa: BLE001 — unknown: act on no unseen verdict.
+            log.exception("cdn: unhandled error in the host-unseen breaker")
+            hold_unseen = True
     for node in CdnNode.objects.exclude(state=CdnNodeState.DESTROYED).select_related("vm"):
         try:
             _advance(node, now=now, report=report, hold_liveness=hold, hold_unseen=hold_unseen)

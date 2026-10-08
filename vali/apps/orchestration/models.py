@@ -1196,13 +1196,20 @@ class KbsAuditCursor(models.Model):
     `broken_at_seq` is the first record of this epoch that did not
     verify. Once set, every later record of the epoch is stored as
     unverified (`chain_ok=False`): nothing is trusted by chaining onto an
-    unverified predecessor. A new epoch (KBS restart) clears it."""
+    unverified predecessor. A new epoch (KBS restart) clears it.
+
+    `head_seq` / `checked_at` are the KBS head of this epoch and when an
+    ingest run last read it to the end of its budget: `head_seq - last_seq`
+    is how far vali is behind, `checked_at` whether the ingest runs at all
+    (the `hippius_kbs_audit_*` gauges of the guest report)."""
 
     log = models.CharField(max_length=16, choices=KbsAuditLog.choices, primary_key=True)
     kbs_epoch = models.CharField(max_length=64)
     last_seq = models.BigIntegerField()
     last_hash = models.CharField(max_length=64)
     broken_at_seq = models.BigIntegerField(null=True, blank=True)
+    head_seq = models.BigIntegerField(null=True, blank=True)
+    checked_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self) -> str:

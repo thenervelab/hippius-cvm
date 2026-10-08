@@ -65,27 +65,72 @@ local function header_safe(v)
     return type(v) == "string" and #v > 0 and #v <= 4096 and not v:find("[^\33-\126]")
 end
 
+-- A zone's `s3_credentials` secret: the JSON the backend sealed,
+-- {"access_key_id": ..., "secret": ...} (the read-only SubToken), with
+-- `secret_access_key` accepted for `secret` and an optional
+-- `session_token`. Returns the normalised table, false when the zone has
+-- none (public bucket), or nil and the reason (a field name, never a
+-- value).
+function M.s3_credentials(zone_secrets)
+    local raw = zone_secrets and zone_secrets.s3_credentials
+    if not raw then
+        return false
+    end
+    local c = cjson.decode(raw)
+    if type(c) ~= "table" then
+        return nil, "s3_credentials is not a JSON object"
+    end
+    if not header_safe(c.access_key_id) then
+        return nil, "access_key_id missing or invalid"
+    end
+    local secret = c.secret_access_key
+    if secret == nil or secret == null then
+        secret = c.secret
+    end
+    if not header_safe(secret) then
+        return nil, "secret missing or invalid"
+    end
+    local token = c.session_token
+    if token == null or token == "" then
+        token = nil
+    end
+    if token ~= nil and not header_safe(token) then
+        return nil, "session_token invalid"
+    end
+    return { access_key_id = c.access_key_id, secret_access_key = secret, session_token = token }
+end
+
+-- One CRIT line per zone and reason a minute (per worker): a busy zone
+-- with broken credentials must not flood the journal.
+local CRED_LOG_EVERY = 60
+local cred_logged = {}
+
+function M.should_log_credentials(zone_id, why, now)
+    local key = zone_id .. "\0" .. why
+    local last = cred_logged[key]
+    if last and now - last < CRED_LOG_EVERY then
+        return false
+    end
+    cred_logged[key] = now
+    return true
+end
+
 -- The origin URI, presigned when the zone has credentials (private
--- bucket) and bare otherwise (public bucket). nil when the credentials
--- are unusable.
+-- bucket) and bare otherwise (public bucket). nil and the reason when the
+-- credentials are unusable.
 local function signed_uri(var, zone_secrets, origin, uri)
-    local creds = zone_secrets and zone_secrets.s3_credentials
-    if not creds then
+    local c, why = M.s3_credentials(zone_secrets)
+    if c == false then
         return uri
     end
-    local c = cjson.decode(creds)
-    if type(c) ~= "table" or not header_safe(c.access_key_id) or not header_safe(c.secret_access_key)
-        or (c.session_token ~= nil and c.session_token ~= null and not header_safe(c.session_token)) then
-        return nil
+    if not c then
+        return nil, why
     end
     local region = origin.region
     if region == nil or region == null then
         region = settings.s3_region
     end
     local token = c.session_token
-    if token == null or token == "" then
-        token = nil
-    end
     return uri .. "?" .. sigv4.presign({
         method = "GET",
         uri = uri,
@@ -160,9 +205,11 @@ function M.access()
         ngx.req.clear_header("Accept-Encoding")
     end
     local secrets = docs.get("secrets")
-    local origin_uri = signed_uri(var, secrets and secrets.doc.zones[zone_id], zone.origin, uri)
+    local origin_uri, why = signed_uri(var, secrets and secrets.doc.zones[zone_id], zone.origin, uri)
     if not origin_uri then
-        ngx.log(ngx.CRIT, "hippius-cdn: zone ", zone_id, " has unusable s3 credentials")
+        if M.should_log_credentials(zone_id, why, ngx.now()) then
+            ngx.log(ngx.CRIT, "hippius-cdn: zone ", zone_id, " has unusable s3 credentials: ", why)
+        end
         return refuse(503)
     end
     var.hippius_origin_uri = origin_uri

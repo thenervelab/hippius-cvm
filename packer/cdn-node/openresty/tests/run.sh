@@ -39,7 +39,7 @@ if "$root/render.sh" cache "$tmp/c.conf" "/cache dir" 10m 2>/dev/null; then
   echo "render.sh accepted a cache dir with a space" >&2; exit 1
 fi
 "$root/render.sh" cache-auto "$tmp/auto.conf" "$tmp" 75 16m
-grep -qE '^proxy_cache_path [^ ]+ levels=1:2 keys_zone=hippius_cache:16m max_size=[1-9][0-9]*k inactive=30d use_temp_path=off;$' "$tmp/auto.conf" \
+grep -qE '^proxy_cache_path [^ ]+/objects levels=1:2 keys_zone=hippius_cache:16m max_size=[1-9][0-9]*k inactive=30d use_temp_path=off;$' "$tmp/auto.conf" \
   || { echo "render.sh cache-auto wrote: $(cat "$tmp/auto.conf")" >&2; exit 1; }
 for bad in 5 95 x; do
   if "$root/render.sh" cache-auto "$tmp/auto.conf" "$tmp" "$bad" 2>/dev/null; then

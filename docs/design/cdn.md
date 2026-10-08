@@ -980,6 +980,13 @@ list. The actions:
   (`backend:objectstore/models.py:141-181`, the `restore_material` pattern),
   with an optional prefix, seals it, and rotates it every 30 days.
   `expires_at` is set to 45 days so a missed rotation is visible.
+- The sealed secret is the zone's `s3_credentials`. Its plaintext is a JSON
+  object `{"access_key_id": str, "secret": str}`, plus `secret_access_key`
+  (the same value, added later; it wins when both are present) and an
+  optional `session_token`. The agent passes it to OpenResty unchanged;
+  the router presigns with it, and refuses with a CRIT line that names the
+  bad field, never a value. `test_vectors/cdn/s3_credentials.json` pins the
+  shape for both.
 - Nodes sign SigV4 requests to `s3.hippius.com`.
 - Creating such a zone needs `cdn:admin` **and** `s3:admin`, because it mints
   a token.

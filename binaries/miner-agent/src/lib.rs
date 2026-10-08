@@ -48,6 +48,7 @@ pub mod image_cache;
 pub mod lifecycle;
 pub mod netpolicy;
 pub mod orders;
+pub mod release;
 pub mod sev_asid;
 pub mod snp_config;
 pub mod vsock;

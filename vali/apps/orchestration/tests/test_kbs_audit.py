@@ -680,6 +680,88 @@ def test_the_page_budget_bounds_one_run(settings, wire: dict[str, Any]) -> None:
     assert len(kbs.calls) == 2
 
 
+def test_a_run_records_the_head_it_saw_so_the_lag_is_known(
+    settings, wire: dict[str, Any]
+) -> None:
+    """A budget-bounded run leaves vali behind the KBS: the cursor keeps
+    the head it saw and when, which the guest report exports as the lag."""
+    settings.VALI_KBS_AUDIT_MAX_PAGES_PER_RUN = 1
+    kbs = FakeKbs(wire["release_epoch_a"])
+    head = kbs.entries[-1]["seq"]
+    before = timezone.now()
+    kbs_audit.ingest_log("release", fetch=kbs)
+    cursor = KbsAuditCursor.objects.get(log="release")
+    assert (cursor.last_seq, cursor.head_seq) == (1, head)
+    assert cursor.checked_at is not None and cursor.checked_at >= before
+    settings.VALI_KBS_AUDIT_MAX_PAGES_PER_RUN = 10
+    kbs_audit.ingest_log("release", fetch=kbs)
+    cursor.refresh_from_db()
+    assert cursor.last_seq == cursor.head_seq == head
+
+
+def test_a_caught_up_run_still_records_that_it_checked(wire: dict[str, Any]) -> None:
+    kbs = FakeKbs(wire["release_epoch_a"])
+    kbs_audit.ingest_log("release", fetch=kbs)
+    first = KbsAuditCursor.objects.get(log="release").checked_at
+    assert kbs_audit.ingest_log("release", fetch=kbs).stored == 0
+    assert KbsAuditCursor.objects.get(log="release").checked_at > first
+
+
+def test_a_run_stopped_by_a_cut_does_not_count_as_checked(wire: dict[str, Any]) -> None:
+    """A run that refuses the chain is not progress: `checked_at` stays,
+    so the staleness alert fires next to the anomaly."""
+    kbs = FakeKbs(wire["release_epoch_a"])
+    kbs_audit.ingest_log("release", fetch=kbs)
+    checked = KbsAuditCursor.objects.get(log="release").checked_at
+    kbs.entries = kbs.entries[:2]
+    assert kbs_audit.ingest_log("release", fetch=kbs).breaks == 1
+    assert KbsAuditCursor.objects.get(log="release").checked_at == checked
+
+
+def test_a_new_epoch_records_its_own_head(wire: dict[str, Any]) -> None:
+    kbs_audit.ingest_log("release", fetch=FakeKbs(wire["release_epoch_a"]))
+    b = FakeKbs(wire["release_epoch_b"])
+    kbs_audit.ingest_log("release", fetch=b)
+    cursor = KbsAuditCursor.objects.get(log="release")
+    assert (cursor.kbs_epoch, cursor.head_seq) == (b.genesis, b.entries[-1]["seq"])
+
+
+def test_a_run_cut_short_in_a_new_epoch_never_keeps_the_old_epochs_head(
+    settings, wire: dict[str, Any]
+) -> None:
+    """After a KBS restart the head starts again near 0: a cursor moved
+    into the new epoch carries that epoch's head even if the run dies on a
+    later page, so the lag is never `old head - new position`."""
+    kbs_audit.ingest_log("release", fetch=FakeKbs(wire["release_epoch_a"]))
+    assert KbsAuditCursor.objects.get(log="release").head_seq == 3
+    settings.VALI_KBS_AUDIT_PAGE_LIMIT = 1
+    b = FakeKbs(wire["release_epoch_b"])
+
+    def dies_after_the_first_new_page(log_name: str, after: int | None, limit: int):
+        if len(b.calls) == 2:
+            raise EffectError("kbs-audit: HTTP 500")
+        return b(log_name, after, limit)
+
+    with pytest.raises(EffectError):
+        kbs_audit.ingest_log("release", fetch=dies_after_the_first_new_page)
+    cursor = KbsAuditCursor.objects.get(log="release")
+    assert (cursor.kbs_epoch, cursor.last_seq) == (b.genesis, 0)
+    assert cursor.head_seq == b.entries[-1]["seq"] == 1
+
+
+def test_an_emptied_log_after_a_restart_is_checked_and_not_behind(
+    wire: dict[str, Any],
+) -> None:
+    kbs = FakeKbs(wire["release_epoch_a"])
+    kbs_audit.ingest_log("release", fetch=kbs)
+    first = KbsAuditCursor.objects.get(log="release").checked_at
+    kbs.entries = []
+    kbs_audit.ingest_log("release", fetch=kbs)
+    cursor = KbsAuditCursor.objects.get(log="release")
+    assert cursor.head_seq == cursor.last_seq == 3
+    assert cursor.checked_at > first
+
+
 # ─── retention ───────────────────────────────────────────────────────
 
 

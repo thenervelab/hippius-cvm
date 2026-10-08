@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:5fba2c486892a3f5ef207b10d36d9bdbf35c3d31e61bbbb4fe7d5cae13c179fc"
+  digest: "sha256:3aa58cf98894708af95624f8136ee11c7c70579b1a0e9a63878bcdab6a6e43b3"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "83a58d81b5b5913e38ed41225b66eb8992ac983b"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37636246027/attempts/1"
+    commitSha: "21c1d5e5f8d470d570fa7edb51c93697d3e6215d"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37667438751/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -486,9 +486,9 @@ orchestrationTick:
   # KBS audit-log ingest (`apps.orchestration.kbs_audit`): copy the KBS's
   # hash-chained release + admin audit logs out of its CVM via
   # `GET /v1/admin/audit`, verify the chain, keep them as KbsAuditEntry rows.
-  # Turn on ONLY after the KBS serving the route is live; a KBS without it
-  # 404s and the ingest skips quietly.
-  kbsAuditIngest: "false"
+  # Needs a KBS serving the route; a KBS without it 404s and the ingest
+  # skips quietly. KbsAuditIngestStale fires while it is off.
+  kbsAuditIngest: "true"
   # Retention of the ingested entries, in days. "0" = keep forever (the
   # copy in vali is the only one that survives a KBS restart); entries
   # flagged as chain breaks are never pruned.
@@ -1203,7 +1203,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:9172322b8fefd5f906786c13effdc423baa0082687904696b864603669d7dd5f"
+    digest: "sha256:6a0462fad67cf19f7fbff304e493a7c56d8374564781bcd5ed162211189d3796"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1218,8 +1218,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "433179f7ea0196da782e692307ed07ae5e36d641"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37621746633/attempts/1"
+      commitSha: "af1d0a046be9131d889c456d0ba2d8e0f7a7bfa0"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37747175080/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the
@@ -1461,6 +1461,14 @@ publicApiIngress:
     # prefix drops either gate. The per-VM half,
     # `/v1/vm/{id}/public-ip`, is already covered by `/v1/vm`.
     - /v1/network
+    # The CDN fleet API (`apps.cdn`): `/v1/cdn/nodes*`, `/v1/cdn/regions*`
+    # and `/v1/cdn/ca.pem`. The layer above reads the fleet (nodes, CA, KBS-
+    # signed fleet keys) to verify node registrations and drive DNS, and
+    # acks DNS releases back. A PREFIX for the same reason as `/v1/network`:
+    # every route under it is `OPERATOR_ONLY` AND root-only (`CdnRootView`),
+    # and `apps/cdn/tests/test_views.py` fails if a route under the prefix
+    # drops either gate.
+    - /v1/cdn
     - /v1/public/docs
     - /v1/public/schema
   # The nginx controller that serves the Ingress above. Named here because
@@ -1475,6 +1483,27 @@ publicApiIngress:
 
 # ── CDN (docs/design/cdn.md) ──────────────────────────────────────────
 cdn:
+  # The CDN switches, ON 2026-10-07 (VALI_CDN_ENABLED / _LAUNCH_ROLE /
+  # _RECONCILE_ENABLED). Order, each step done before this flip:
+  #   1. K1+K2 KBS live with the cdn-fleet keyring enabled (ceremony
+  #      2026-10-07). LAUNCH_ROLE needs it: it writes `cdn_node` allowlist
+  #      entries, which a KBS without the class rejects (every release).
+  #   2. Vault: Transit cdn-ca + cdn-fleet, policies, broker role.
+  #   3. vali pin #1489 (and this PR's #1491 pin: no breaker noise without
+  #      a node); `vali_cdn_ca init` (cdnca-1 active) and
+  #      `vali_cdn_fleet mint` (v1 active); cdn-node blessed restricted to
+  #      hippius-cdn.
+  #   4. THIS flip. With no active CdnRegion the reconciler launches
+  #      nothing and logs nothing.
+  #   5. Then an operator creates the first region (vali_cdn_region create
+  #      FR, PATCH active + desired_nodes=1).
+  # Off again: reconcile=false freezes the fleet; desired_nodes=0 drains it
+  # through the DNS handshake; launchRole=false refuses CDN (re)launches
+  # but keeps live nodes pinned. Turn enabled off only with no CDN node
+  # or address left.
+  enabled: true
+  launchRole: true
+  reconcile: true
   # VALI_CDN_BACKEND_URL in the shared vali-config ConfigMap: measured
   # into the cdn-node image; changing it = re-bake; backend confirmed
   # 2026-10-07. A bare https origin (no path, no trailing slash): the

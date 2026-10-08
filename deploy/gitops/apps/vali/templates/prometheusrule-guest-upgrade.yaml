@@ -172,4 +172,64 @@ spec:
             description: |
               The hourly guest-report CronJob has not pushed for 3h, so the
               hippius-guest-upgrade alerts are blind.
+    # The KBS audit ingest (`apps.orchestration.kbs_audit`, run by the
+    # orchestration tick when orchestrationTick.kbsAuditIngest): vali's copy
+    # is the only one that survives a KBS restart, and the T4 KBS signal
+    # reads it. Gauges pushed by the same guest-report CronJob.
+    - name: hippius-kbs-audit
+      interval: 5m
+      rules:
+        - alert: KbsAuditIngestLagging
+          # One ingest run takes up to PAGE_LIMIT x MAX_PAGES_PER_RUN (2000)
+          # records, once a minute; the keepalives add ~1 per VM per 5 min.
+          # Behind by more than one run's budget AND no closer than the
+          # report before (an hour earlier): not keeping up. A catch-up
+          # after an outage shrinks the lag report over report, and a
+          # first report has nothing to compare with, so neither pages.
+          expr: |
+            hippius_kbs_audit_lag_records > 2000
+              and hippius_kbs_audit_lag_records >= (hippius_kbs_audit_lag_records offset 1h)
+          for: 30m
+          labels:
+            severity: warning
+            component: kbs-audit
+          annotations:
+            summary: "vali is {{`{{ $value }}`}} records behind the KBS {{`{{ $labels.log }}`}} audit chain"
+            description: |
+              The ingest runs but does not catch up. A KBS restart now would lose
+              every record vali has not copied. Look for `kbs-audit` lines in the
+              vali-orchestration-tick logs (rate limit, unreachable KBS, a break that
+              holds the cursor: `vali_kbs_audit --breaks`).
+        - alert: KbsAuditIngestStale
+          # A report is up to 1h old, so 2h = at least one report with no run
+          # in the hour before it. 0 (never checked) is the next rule's.
+          expr: |
+            hippius_kbs_audit_checked_timestamp_seconds > 0
+              and time() - hippius_kbs_audit_checked_timestamp_seconds > 7200
+          for: 10m
+          labels:
+            severity: warning
+            component: kbs-audit
+          annotations:
+            summary: "the KBS {{`{{ $labels.log }}`}} audit chain has not been ingested for 2h"
+            description: |
+              No ingest run read the chain's head: orchestrationTick.kbsAuditIngest is
+              off, the orchestration tick is stuck, or every run stops early (the KBS
+              unreachable, a cut / rewrite / forged genesis: `vali_kbs_audit --breaks`).
+        - alert: KbsAuditIngestNeverChecked
+          # A cursor no run has checked since the head columns appeared
+          # (orchestration 0037). The first report after a vali roll may
+          # catch one before the first run; the gauge holds an hour and the
+          # next report clears it, so 90m = two reports in a row.
+          expr: hippius_kbs_audit_checked_timestamp_seconds == 0
+          for: 90m
+          labels:
+            severity: warning
+            component: kbs-audit
+          annotations:
+            summary: "the KBS {{`{{ $labels.log }}`}} audit chain has never been checked by an ingest run"
+            description: |
+              vali holds part of the chain but no ingest run has read its head since
+              the KbsAuditCursor head columns appeared: orchestrationTick.kbsAuditIngest
+              is off, or every run stops early (`vali_kbs_audit --breaks`).
 {{- end }}

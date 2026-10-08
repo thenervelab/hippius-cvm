@@ -6,6 +6,9 @@ local M = {
     -- The agent pushes health every 5 s; a document older than this
     -- means the agent is gone and the node is not ready.
     health_max_age = 30,
+    -- Worker 0 re-checks (and rewrites if needed) the cache canary this
+    -- often, in seconds.
+    canary_interval = 10,
     -- Default S3 region for SigV4 when a zone's origin names none.
     s3_region = "us-east-1",
     -- Lifetime of the presigned origin URL: covers every slice of one

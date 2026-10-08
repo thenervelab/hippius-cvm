@@ -45,6 +45,11 @@ to the Pushgateway like the golden freshness report:
     recorded stopped by a completed power stop, verified well after the
     stop (past the KBS clock skew and the nonce lifetime): the miner kept
     the domain;
+- the KBS audit ingest (`kbs_audit`), per chain: `hippius_kbs_audit_lag_records
+  {log}` — how many records the KBS head seen by the last run is ahead of
+  what vali holds — and `hippius_kbs_audit_checked_timestamp_seconds{log}` —
+  when an ingest run last read that head (0 = never): a stale one means the
+  ingest does not run;
 - `hippius_guest_report_timestamp_seconds`.
 
 Labels never use `job` or `kind`: the Pushgateway's grouping labels would
@@ -97,6 +102,8 @@ KBS_T4_REASONS: dict[str, str] = {
     "attestation: superseded-guest:": "superseded-guest",
 }
 M_REPORT_TS = "hippius_guest_report_timestamp_seconds"
+M_KBS_AUDIT_LAG = "hippius_kbs_audit_lag_records"
+M_KBS_AUDIT_CHECKED = "hippius_kbs_audit_checked_timestamp_seconds"
 
 #: How far back the T4 detectors look.
 T4_WINDOW_S = 24 * 3600
@@ -351,6 +358,28 @@ def _stuck(ms: metrics.MetricSet) -> None:
         )
 
 
+def _kbs_audit(ms: metrics.MetricSet) -> None:
+    """How far the KBS audit ingest is behind each chain, and when it last
+    read the head. A chain vali never ingested has no cursor and no gauge."""
+    from .models import KbsAuditCursor
+
+    for cursor in KbsAuditCursor.objects.order_by("log"):
+        if cursor.head_seq is not None:
+            ms.gauge(
+                M_KBS_AUDIT_LAG,
+                max(0, cursor.head_seq - cursor.last_seq),
+                help_text="Records of the KBS audit chain past what vali holds, at the head "
+                "the last ingest run saw.",
+                log=cursor.log,
+            )
+        ms.gauge(
+            M_KBS_AUDIT_CHECKED,
+            int(cursor.checked_at.timestamp()) if cursor.checked_at is not None else 0,
+            help_text="Unix ts an ingest run last read the KBS audit chain's head (0 = never).",
+            log=cursor.log,
+        )
+
+
 def report_metrics() -> metrics.MetricSet:
     now = timezone.now()
     ms = metrics.MetricSet()
@@ -430,5 +459,6 @@ def report_metrics() -> metrics.MetricSet:
     _stuck(ms)
     _behind(ms)
     _t4(ms, time.time())
+    _kbs_audit(ms)
     ms.gauge(M_REPORT_TS, metrics.now(), help_text="Unix ts of the last guest upgrade report.")
     return ms

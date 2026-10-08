@@ -60,6 +60,11 @@ pub struct FeedState {
     pub fleet_key_versions: Vec<FleetKeyVersion>,
     pub self_state: SelfState,
     pub peers: Vec<Peer>,
+    /// A snapshot has been applied (or an LKG loaded). Revision 0 is a
+    /// valid snapshot revision, so the revision cannot tell. Not stored
+    /// in the LKG: loading one sets it.
+    #[serde(skip)]
+    pub snapshot_applied: bool,
 }
 
 /// What [`FeedState::apply`] did.
@@ -72,9 +77,9 @@ pub enum Applied {
 }
 
 impl FeedState {
-    /// Whether any revision has been applied.
+    /// Whether no snapshot has been applied yet.
     pub fn is_empty(&self) -> bool {
-        self.revision == 0
+        !self.snapshot_applied
     }
 
     /// Apply a feed response, returning the new state. `self` is left
@@ -114,6 +119,7 @@ impl FeedState {
         };
 
         next.revision = resp.revision;
+        next.snapshot_applied = true;
         for z in resp.zones {
             next.zones.insert(z.zone_id.clone(), z);
         }
@@ -549,7 +555,9 @@ pub fn load_lkg(path: &Path, now: u64, max_age_s: u64) -> Result<Option<(FeedSta
         return Err(CdnError::Feed("lkg-too-old"));
     }
     lkg.state.validate()?;
-    Ok(Some((lkg.state, lkg.saved_at)))
+    let mut state = lkg.state;
+    state.snapshot_applied = true;
+    Ok(Some((state, lkg.saved_at)))
 }
 
 #[cfg(test)]
@@ -599,6 +607,32 @@ pub(crate) mod tests {
             Applied::New(s) => *s,
             Applied::Stale => panic!("unexpected stale"),
         }
+    }
+
+    #[test]
+    fn an_empty_snapshot_at_revision_0_is_a_base() {
+        assert!(FeedState::default().is_empty());
+        let s = applied(
+            &FeedState::default(),
+            json!({"revision": 0, "mode": "snapshot", "self": {"state": "ready", "draining": false}}),
+        );
+        assert_eq!(s.revision, 0);
+        assert!(!s.is_empty(), "a snapshot was applied");
+        // The same snapshot again changes nothing.
+        let again = s
+            .apply(resp(json!({"revision": 0, "mode": "snapshot", "self": {"state": "ready", "draining": false}})))
+            .unwrap();
+        assert!(matches!(again, Applied::Stale));
+        // A delta on top of it applies.
+        let d = applied(
+            &s,
+            json!({"revision": 1, "mode": "delta",
+                   "hostnames": [{"hostname_id": "h1", "hostname": "img.example.com", "zone_id": "z1"}],
+                   "zones": [{"zone_id": "z1", "state": "active", "origin": {"type": "s3", "bucket": "media"}}],
+                   "self": {"state": "ready", "draining": false}}),
+        );
+        assert_eq!(d.revision, 1);
+        assert!(!d.is_empty());
     }
 
     #[test]

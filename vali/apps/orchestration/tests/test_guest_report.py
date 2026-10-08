@@ -336,3 +336,33 @@ def test_the_kbs_signal_is_off_until_enabled() -> None:
         reason="attestation: superseded-guest: the guest released before still runs",
     )
     assert _samples(guest_report.M_KBS_SUPERSEDED) == []
+
+
+def test_the_kbs_audit_lag_and_last_check_are_reported() -> None:
+    from apps.orchestration.models import KbsAuditCursor
+
+    checked = timezone.now() - timedelta(minutes=3)
+    KbsAuditCursor.objects.create(
+        log="release",
+        kbs_epoch="ab" * 32,
+        last_seq=1999,
+        last_hash="cd" * 32,
+        head_seq=11871,
+        checked_at=checked,
+    )
+    KbsAuditCursor.objects.create(
+        log="admin",
+        kbs_epoch="ab" * 32,
+        last_seq=40,
+        last_hash="cd" * 32,
+    )
+    assert _samples(guest_report.M_KBS_AUDIT_LAG) == [({"log": "release"}, 9872)]
+    assert _samples(guest_report.M_KBS_AUDIT_CHECKED) == [
+        ({"log": "admin"}, 0),
+        ({"log": "release"}, int(checked.timestamp())),
+    ]
+
+
+def test_no_kbs_audit_gauge_before_any_ingest() -> None:
+    assert _samples(guest_report.M_KBS_AUDIT_LAG) == []
+    assert _samples(guest_report.M_KBS_AUDIT_CHECKED) == []

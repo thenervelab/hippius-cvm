@@ -13,24 +13,68 @@ local function canary_path()
     return settings.cache_dir .. "/.hippius-canary"
 end
 
--- Worker 0 writes the canary on the cache volume at start. Health then
--- reads it back through nginx: a missing or unreadable volume fails it.
+-- Make sure the canary at `path` holds CANARY_BODY, writing it when it
+-- is missing or wrong. Returns true, or nil and the error.
+function M.ensure_canary(path)
+    local f = io.open(path, "r")
+    if f then
+        local body = f:read("*a")
+        f:close()
+        if body == M.CANARY_BODY then
+            return true
+        end
+    end
+    local w, err = io.open(path, "w")
+    if not w then
+        return nil, err
+    end
+    local ok, werr = w:write(M.CANARY_BODY)
+    local closed, cerr = w:close()
+    if not ok or not closed then
+        return nil, werr or cerr
+    end
+    return true
+end
+
+-- Whether the last check failed (nil before the first one).
+local canary_failing = nil
+
+-- One check, logged only when the outcome changes. `log(level, msg)`.
+function M.canary_tick(path, log)
+    local ok, err = M.ensure_canary(path)
+    if not ok and canary_failing ~= true then
+        log(ngx.ERR, "hippius-cdn: canary write failed: " .. tostring(err))
+    elseif ok and canary_failing == true then
+        log(ngx.WARN, "hippius-cdn: canary written again")
+    end
+    canary_failing = not ok
+    return ok
+end
+
+-- For the unit tests.
+function M.reset_canary_state()
+    canary_failing = nil
+end
+
+-- Worker 0 keeps the canary on the cache volume: at start, then every
+-- canary_interval seconds, so a volume that comes up late or a file that
+-- disappears heals on its own. Health reads it back through nginx: a
+-- missing or unreadable volume fails it.
 function M.write_canary()
     if ngx.worker.id() ~= 0 then
         return
     end
-    ngx.timer.at(0, function(premature)
+    local function tick(premature)
         if premature then
             return
         end
-        local f, err = io.open(canary_path(), "w")
-        if not f then
-            ngx.log(ngx.ERR, "hippius-cdn: canary write failed: ", err)
-            return
-        end
-        f:write(M.CANARY_BODY)
-        f:close()
-    end)
+        M.canary_tick(canary_path(), ngx.log)
+    end
+    ngx.timer.at(0, tick)
+    local ok, err = ngx.timer.every(settings.canary_interval, tick)
+    if not ok then
+        ngx.log(ngx.ERR, "hippius-cdn: canary timer failed: ", err)
+    end
 end
 
 -- The verdict, pure on its inputs (unit-tested).

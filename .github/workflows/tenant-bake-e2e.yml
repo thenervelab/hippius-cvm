@@ -16,8 +16,9 @@ name: tenant-bake-e2e
 # The `cdn-node` leg bakes the CDN cache node image instead (golden
 # dm-verity base, `--profile cdn-node`) and smoke-boots its root under
 # systemd-nspawn: systemd comes up, the input firewall and OpenResty are
-# active, and cdn-agent starts on stub keys (what the KBS release would put
-# in /run/hippius). The real guest path needs SNP + the KBS, which this
+# active, cdn-agent starts on stub keys (what the KBS release would put
+# in /run/hippius), and /__hippius/health answers 200 past nginx's cache
+# loader with a stand-in for the agent. The real guest path needs SNP + the KBS, which this
 # runner has neither of, so the initramfs is checked for the cdn-node
 # pieces but not booted.
 #
@@ -105,6 +106,14 @@ jobs:
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # The cdn-node smoke's in-guest helper (it stands in for the agent).
+      - name: Check out the cdn-node smoke helper
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'cdn-node'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: scripts/dev/cdn-node-health-smoke.py
+          sparse-checkout-cone-mode: false
 
       - name: Log in to GHCR
         if: steps.gate.outputs.run == 'true'
@@ -324,11 +333,15 @@ jobs:
           sudo chmod 0600 "$STUB/cdn-node.json"
           # The data volume the initramfs binds on a real node.
           sudo install -d -m 0755 /mnt/e2e/data
+          SMOKE=/mnt/e2e/smoke
+          sudo install -d -m 0755 "$SMOKE"
+          sudo install -m 0644 "$GITHUB_WORKSPACE/scripts/dev/cdn-node-health-smoke.py" "$SMOKE/"
 
           sudo nohup systemd-nspawn --quiet --boot --private-network --console=passive \
             --machine "$M" -D "$ROOT" \
             --bind=/mnt/e2e/data:/var/lib/hippius-data \
             --bind="$STUB":/run/hippius \
+            --bind-ro="$SMOKE":/run/hippius-smoke \
             >/mnt/e2e/nspawn.log 2>&1 &
           nspawn_pid=$!
 
@@ -380,6 +393,15 @@ jobs:
             | awk '{print $1}' | grep -vx 'systemd-networkd-wait-online.service' || true)"
           [ -z "$failed" ] || fail "failed units: $(echo "$failed" | tr '\n' ' ')"
           echo "no restarts, no unexpected failed unit"
+
+          # /__hippius/health must answer 200, and still after nginx's cache
+          # loader has run (a minute after start; it once deleted a canary
+          # kept inside the cache tree). The agent cannot reach a backend
+          # here and reports not-ready, so it is stopped and the helper
+          # pushes what it would push once the backend has answered.
+          sudo systemctl -M "$M" stop hippius-cdn-agent.service
+          in_guest /usr/bin/python3 -I /run/hippius-smoke/cdn-node-health-smoke.py 75 240 \
+            || fail "/__hippius/health never answered 200"
 
           dump
           sudo machinectl poweroff "$M" || true

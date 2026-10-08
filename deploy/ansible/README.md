@@ -323,6 +323,16 @@ it when `miner_heartbeat_schema_host_health` is true, off by default
 until the fleet runs an agent that knows the key (see
 `group_vars/miner_nodes.yml`).
 
+`miner_heartbeat_schema_agent_version` (renders `[heartbeat]
+schema_agent_version = true`, needs `miner_heartbeat_schema_host_health`)
+moves the agent to the v6 heartbeat: v5 plus `agent_version`, the release
+tag the binary was built from (`dev` for a source build). vali stores it on
+`MinerCapacity` and pushes `hippius_miner_agent_version_info`, so the
+operator can see which hosts run which release. Off by default. Order
+matters: deploy the vali that accepts v6 first (its verifier rejects a v6
+body until then and the host would stop heartbeating), then turn it on per
+host in host_vars.
+
 ### Invariants — do not break
 
 - Miners **never** touch the hippius-compute Vault (`vault_addr` /

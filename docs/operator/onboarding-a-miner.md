@@ -119,6 +119,36 @@ a `host_vars/<YOUR_HOST>.yml`. The eight plays, in order:
 > environment, build the binary elsewhere and drop it at
 > `/usr/local/bin/hippius-miner-agent` before running the play.
 
+### Prebuilt binary
+
+Each public release of
+[`thenervelab/hippius-cvm`](https://github.com/thenervelab/hippius-cvm/releases)
+attaches a `hippius-miner-agent-x86_64-linux-gnu` built from the tagged
+commit with `--features snp`, with `SHA256SUMS`, `BUILD-INFO.txt`
+(toolchain, commit, build host) and, from the first release cut by
+`.github/workflows/miner-agent-release.yml` on, its attestation
+`hippius-miner-agent-x86_64-linux-gnu.sigstore.json`. It links glibc ≥ 2.39 and
+`libcrypto.so.3`, both present on Ubuntu 26.04.
+
+```sh
+TAG=<release tag>
+base=https://github.com/thenervelab/hippius-cvm/releases/download/$TAG
+curl -fLO "$base/hippius-miner-agent-x86_64-linux-gnu"
+curl -fLO "$base/SHA256SUMS"
+sha256sum -c SHA256SUMS          # must print: hippius-miner-agent-x86_64-linux-gnu: OK
+sudo install -m 0755 -o root -g root hippius-miner-agent-x86_64-linux-gnu \
+  /usr/local/bin/hippius-miner-agent
+/usr/local/bin/hippius-miner-agent --version
+```
+
+Install it **before** running play 05. The play skips its source build
+only when `hippius-miner-agent --version` prints `versions.miner_agent`
+(`group_vars/miner_nodes.yml`); otherwise it rebuilds and overwrites
+the binary. A checksum only proves the download matches the release;
+releases from the tag workflow also carry a build-provenance attestation,
+checked in [Verifying a release by hand](#verifying-a-release-by-hand).
+Once installed, [auto-update](#4b-auto-update) keeps it current.
+
 ### Variables you must supply
 
 Per host, in `host_vars/<YOUR_HOST>.yml`:
@@ -183,21 +213,14 @@ copied from an example:
 | `miner_vali_lifecycle_url` | the lifecycle relay address |
 | `edge_order_signing_pubkey` | 64-hex Ed25519 key; the agent `verify_strict`s **every** lifecycle order against it |
 | `image.s3_endpoint` / `image.s3_bucket` | where published UKIs live |
-| `miner_auto_update_s3_base` | the binary auto-update channel — see the warning below |
 | `edge_ca_cert_file` | path on YOUR workstation to the CA that signed the Edge's **server** certificate; defaults to `~/.config/hippius/edge-ca.crt` and is copied to the host by `mtls-cert-mount.yml` |
 | `miner_tenant_ovmf_url` / `_sha256` | the firmware every tenant CVM boots. **Not** the distro `ovmf` package — this exact image is folded into the SNP launch measurement, and the validator recomputes against the copy it pins. A different build measures differently, so the KBS refuses every release on your host. Fetched and digest-verified by play 02; a host without it answers every launch `tenant-preflight/ovmf-missing`. |
 | `miner_kbs_ca_cert_file` / `_src` | CA the agent trusts when dialling the KBS to relay a guest's §21 release. The KBS serves a private certificate by default (internal service on the mesh, not a public ACME endpoint). Leave empty only for a publicly-trusted KBS certificate. |
 | `miner_agent_source_repo` | the git repository play 05 clones and **builds the agent from**. A code-delivery path, not a link — whatever is here is what runs on your confidential host. The play refuses to run on an unfilled placeholder. |
 
-> **Auto-update is off by default, and unsigned if you turn it on.**
-> `miner_auto_update_enabled: false` installs the updater but leaves its
-> timer stopped and disabled; agent upgrades are a manual swap (see
-> `deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md`). With it set to
-> `true` and `miner_auto_update_pubkey: ""`, the host pulls a new agent
-> binary from `miner_auto_update_s3_base` and trusts it on a
-> sha256-over-HTTPS check alone. That is a supply chain you are
-> accepting. Set a pubkey, point the base at storage you control, or
-> freeze the channel with `touch /var/lib/hippius-miner/.no-auto-update`.
+> **Auto-update is on by default.** The host installs each new agent
+> release by itself once it is a day old and verified. See
+> [Auto-update](#4b-auto-update) for how it decides, and how to turn it off.
 
 ---
 
@@ -404,6 +427,72 @@ The agent heartbeats to the Edge every `heartbeat.interval_secs`
 (default 60) with a monotonic sequence persisted at
 `/var/lib/hippius-miner/heartbeat.seq`. vali rejects a non-monotonic
 sequence as replay, so do not restore that file from a backup.
+
+---
+
+## 4b. Auto-update
+
+`miner_auto_update_enabled` is `true` unless you change it. The play
+installs `hippius-miner-update.timer`, which every 30 minutes, plus a
+random delay of up to 6 hours, checks the latest
+[`thenervelab/hippius-cvm` release](https://github.com/thenervelab/hippius-cvm/releases)
+and installs it when all of these hold:
+
+- its tag is newer than the release you run (never a downgrade);
+- its files have been published for at least 24 hours
+  (`miner_auto_update_min_release_age_h`);
+- the binary matches `SHA256SUMS`;
+- its GitHub build-provenance attestation verifies with cosign for the
+  release workflow of `thenervelab/hippius-cvm`, at that exact tag;
+- the binary's `--version` names that tag.
+
+It never stops or restarts the agent: a graceful stop destroys every
+tenant domain on the host. It installs the new binary, then
+`systemctl kill --signal=SIGKILL hippius-miner-agent`; systemd relaunches
+the agent, which re-adopts the running CVMs. It refuses to do even that
+unless `[host] skip_shutdown_teardown = true` is in
+`/etc/hippius-miner/config.toml` (the play renders it). If the relaunched
+agent has not delivered a heartbeat within 5 minutes, the updater swaps
+the previous binary back the same way and never retries that tag.
+
+```sh
+journalctl -t hippius-miner-update -n 50       # what it did and why
+cat /var/lib/hippius-miner/installed-release   # the release it installed
+systemctl list-timers hippius-miner-update.timer
+```
+
+**Turning it off.** Right away, on the box:
+`sudo touch /var/lib/hippius-miner/.no-auto-update`. Durably: set
+`miner_auto_update_enabled: false` in `host_vars/<YOUR_HOST>.yml` and run
+the play with `--tags miner_auto_update`; that stops and disables the
+timer and leaves the agent running. Then upgrade by hand with the swap in
+`deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md`.
+
+### Verifying a release by hand
+
+What the updater checks, step by step. cosign is at
+`/usr/local/libexec/hippius-miner/cosign` on a provisioned host, or get
+it from [sigstore/cosign](https://github.com/sigstore/cosign/releases).
+
+```sh
+TAG=<release tag>
+A=hippius-miner-agent-x86_64-linux-gnu
+base=https://github.com/thenervelab/hippius-cvm/releases/download/$TAG
+curl -fL -O "$base/$A" -O "$base/SHA256SUMS" -O "$base/$A.sigstore.json"
+sha256sum -c SHA256SUMS
+cosign verify-blob-attestation --bundle "$A.sigstore.json" \
+  --type https://slsa.dev/provenance/v1 \
+  --certificate-identity "https://github.com/thenervelab/hippius-cvm/.github/workflows/miner-agent-release.yml@refs/tags/$TAG" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$A"                                    # must print: Verified OK
+chmod +x "$A" && ./"$A" --version         # hippius-miner-agent 0.0.1 ($TAG)
+```
+
+With an authenticated `gh`, `gh attestation verify "$A" --repo
+thenervelab/hippius-cvm` checks the same attestation. The workflow builds
+every release twice and refuses to publish unless the bytes match; to
+check the build yourself, rebuild from the tag with the command in
+`BUILD-INFO.txt` and compare digests.
 
 ---
 
