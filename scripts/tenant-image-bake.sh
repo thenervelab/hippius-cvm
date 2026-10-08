@@ -373,6 +373,7 @@ cdn_agent_bin=""
 cdn_openresty_tarball=""
 cdn_config_dir=""
 cdn_backend_url=""
+cdn_fleet_wildcard=""
 # Pinned verity parameters — IDENTICAL to build-rootfs.sh so the root hash
 # and the `rootfs.verity` bytes are byte-reproducible across same-distro
 # bakes. `veritysetup format`'s salt AND uuid both default to random; the
@@ -836,6 +837,8 @@ Optional:
                           nginx.conf.in, origin.conf, render.sh).
   --cdn-backend-url URL   cdn-node: the backend base URL baked into the
                           agent config (https).
+  --cdn-fleet-wildcard W  cdn-node: the fleet certificate's wildcard baked
+                          into the agent config. Default: *.c.hipcdn.net.
   --kbs-url URL           KBS HTTPS base URL baked into the image's
                           kernel cmdline at install time. Default:
                           \$HIPPIUS_KBS_URL, else
@@ -896,6 +899,7 @@ while [[ $# -gt 0 ]]; do
         --cdn-openresty-tarball) require_arg "$1" "${2-}"; cdn_openresty_tarball="$2"; shift 2;;
         --cdn-config-dir)       require_arg "$1" "${2-}"; cdn_config_dir="$2";      shift 2;;
         --cdn-backend-url)      require_arg "$1" "${2-}"; cdn_backend_url="$2";     shift 2;;
+        --cdn-fleet-wildcard)   require_arg "$1" "${2-}"; cdn_fleet_wildcard="$2";  shift 2;;
         --print-plan)           require_arg "$1" "${2-}"; print_plan_osrelease="$2"; shift 2;;
         --kbs-url)              require_arg "$1" "${2-}"; kbs_url="$2";              shift 2;;
         --kek-source)           require_arg "$1" "${2-}"; kek_source="$2";           shift 2;;
@@ -952,7 +956,7 @@ fi
 # Gated here, root-free, like --disk-mode (scripts/dev/cdn-node-profile-test.sh).
 case "${profile}" in
     standard)
-        if [[ -n "${cdn_agent_bin}${cdn_openresty_tarball}${cdn_config_dir}${cdn_backend_url}" ]]; then
+        if [[ -n "${cdn_agent_bin}${cdn_openresty_tarball}${cdn_config_dir}${cdn_backend_url}${cdn_fleet_wildcard}" ]]; then
             die "--cdn-* flags need --profile cdn-node (exit 1)"
         fi
         ;;
@@ -967,6 +971,9 @@ case "${profile}" in
             || die "--profile cdn-node needs --cdn-config-dir with nginx.conf.in and render.sh (exit 1)"
         [[ "${cdn_backend_url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] \
             || die "--profile cdn-node needs --cdn-backend-url https://host[:port][/path] (got '${cdn_backend_url}') (exit 1)"
+        cdn_fleet_wildcard="${cdn_fleet_wildcard:-*.c.hipcdn.net}"
+        [[ "${cdn_fleet_wildcard}" =~ ^\*(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){2,}$ ]] \
+            || die "--cdn-fleet-wildcard must be *.<domain> in lower case (got '${cdn_fleet_wildcard}') (exit 1)"
         [[ -r "${CDN_INSTALL_SRC}" ]] || die "${CDN_INSTALL_SRC}: cdn-node installer missing (exit 1)"
         ;;
     *) die "--profile must be standard or cdn-node (got '${profile}') (exit 1)";;
@@ -1200,6 +1207,7 @@ if [[ -n "${stage1_cache_dir}" ]]; then
                 (cd "${cdn_config_dir}" && find . -type f -print0 | LC_ALL=C sort -z \
                     | xargs -0 sha256sum) | sha256sum | awk '{print "cdn-config="$1}'
                 echo "cdn-backend=${cdn_backend_url}"
+                echo "cdn-fleet-wildcard=${cdn_fleet_wildcard}"
             fi
             # schema marker — bump on any change that alters stage-1
             # bytes but isn't captured by the hashed file list above
@@ -3723,7 +3731,7 @@ if [[ "${profile}" == "cdn-node" ]]; then
     cdn_sudo=sudo
     if [[ ${EUID} -eq 0 ]]; then cdn_sudo=""; fi
     SUDO="${cdn_sudo}" bash "${CDN_INSTALL_SRC}" "${MNT_ROOT}" "${cdn_agent_bin}" \
-        "${cdn_openresty_tarball}" "${cdn_config_dir}" "${cdn_backend_url}" \
+        "${cdn_openresty_tarball}" "${cdn_config_dir}" "${cdn_backend_url}" "${cdn_fleet_wildcard}" \
         || die "cdn-node: data-plane staging failed (exit 3)"
 fi
 

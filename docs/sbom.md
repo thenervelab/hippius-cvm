@@ -37,7 +37,11 @@ proof) needed to verify it offline.
 - **Every `main` push** — as the `sbom-cyclonedx` workflow artifact on
   the `sbom` workflow run (Actions tab → the run → Artifacts).
 - **Tagged releases (`v*`)** — also attached as assets on the GitHub
-  Release for that tag.
+  Release for that tag. On a tag, `sbom.yml` runs as a job of
+  `miner-agent-release.yml`, which verifies every bundle and publishes
+  them with the binary. Each bundle's certificate names `sbom.yml` at the
+  tag, so pin a release artifact with
+  `--certificate-identity https://github.com/thenervelab/hippius-cvm/.github/workflows/sbom.yml@refs/tags/<tag>`.
 
 ## Why keyless
 

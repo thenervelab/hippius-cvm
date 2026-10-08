@@ -56,6 +56,11 @@ expect_die "needs --cdn-backend-url https" --profile cdn-node --disk-mode golden
 expect_die "needs --cdn-openresty-tarball" --profile cdn-node --disk-mode golden_verity_overlay \
     --cdn-agent-bin "${TMP}/agent" --cdn-openresty-tarball "${TMP}/absent.tar.gz" \
     --cdn-config-dir "${CFG}" --cdn-backend-url https://x.invalid
+expect_die "--cdn-fleet-wildcard must be" --profile cdn-node --disk-mode golden_verity_overlay \
+    "${CDN_OK[@]}" --cdn-fleet-wildcard cdn.example.test
+expect_die "--cdn-fleet-wildcard must be" --profile cdn-node --disk-mode golden_verity_overlay \
+    "${CDN_OK[@]}" --cdn-fleet-wildcard '*.Upper.example'
+expect_die "--cdn-* flags need --profile cdn-node" --cdn-fleet-wildcard '*.c.example.test'
 # A complete cdn-node request passes the gate and dies at the next check.
 run_bake --profile cdn-node --disk-mode golden_verity_overlay "${CDN_OK[@]}"
 if grep -qE 'profile (must|cdn-node needs)|cdn-\* flags' "${TMP}/err" \
@@ -111,6 +116,7 @@ assert c["backend"]["request_signatures"] is True
 assert c["paths"]["control_socket_uid"] == 61102
 assert c["paths"]["metering_socket"] == "/run/cdn-agent/meter.sock"
 assert c["data_plane"]["attestation"] is True
+assert c["identity"]["fleet_wildcard_hostname"] == "*.c.hipcdn.net"
 assert set(c) == {"backend", "identity", "paths", "data_plane"}
 PY
 
@@ -201,6 +207,14 @@ tar -czf "${TMP}/lnk.tar.gz" -C "${TMP}/lnk" opt
 sha256sum "${TMP}/lnk.tar.gz" | awk '{print $1}' > "${TMP}/lnk.tar.gz.sha256"
 expect_install_die "symlink opt/openresty/escape -> /etc" "${R2}" "${TMP}/agent" "${TMP}/lnk.tar.gz" "${CFG}" https://api.example.invalid
 expect_install_die "backend url must be https" "${R2}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG}" 'https://x.invalid/a b'
+expect_install_die "fleet wildcard must be" "${R2}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG}" \
+    https://api.example.invalid 'c.example.test'
+# An explicit wildcard is baked as given.
+R4="${TMP}/root4"; new_root "${R4}"
+SUDO="" bash "${INSTALL}" "${R4}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG}" \
+    https://api.example.invalid '*.cdn.example.test' >/dev/null
+grep -qx 'fleet_wildcard_hostname = "\*.cdn.example.test"' "${R4}${toml}" \
+    && ok "an explicit fleet wildcard is baked" || bad "explicit fleet wildcard"
 R3="${TMP}/root3"; new_root "${R3}"; echo 'intruder:x:61102:61102::/:/bin/sh' >> "${R3}/etc/passwd"
 expect_install_die "already exists in the base image" "${R3}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG}" https://api.example.invalid
 

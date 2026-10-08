@@ -27,7 +27,7 @@ CTL = "/run/cdn/ctl.sock"
 # Seconds after nginx's start at which its cache loader process runs.
 LOADER_AT = 60
 UNIT = "hippius-cdn-openresty.service"
-WILDCARD = "*.cdn.hippius.com"
+WILDCARD = "*.c.hipcdn.net"
 WORK = "/run/cdn-health-smoke"
 
 
@@ -52,8 +52,8 @@ def health() -> tuple[int, str]:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     raw = socket.create_connection(("127.0.0.1", 443), 5)
-    s = ctx.wrap_socket(raw, server_hostname="health.cdn.hippius.com")
-    s.sendall(b"GET /__hippius/health HTTP/1.1\r\nHost: health.cdn.hippius.com\r\nConnection: close\r\n\r\n")
+    s = ctx.wrap_socket(raw, server_hostname="health.c.hipcdn.net")
+    s.sendall(b"GET /__hippius/health HTTP/1.1\r\nHost: health.c.hipcdn.net\r\nConnection: close\r\n\r\n")
     r = http.client.HTTPResponse(s)
     r.begin()
     body = r.read().decode(errors="replace").strip()

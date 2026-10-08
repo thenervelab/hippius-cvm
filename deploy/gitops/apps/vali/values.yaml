@@ -1203,7 +1203,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:6a0462fad67cf19f7fbff304e493a7c56d8374564781bcd5ed162211189d3796"
+    digest: "sha256:869a2e6e8a36e19e8184d96167d99872011e0d8a731247859a88d8d219722fd6"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1218,8 +1218,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "af1d0a046be9131d889c456d0ba2d8e0f7a7bfa0"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37747175080/attempts/1"
+      commitSha: "4f74b68186f48d95080b8168b127ed47b5cd0c49"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37766532511/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the

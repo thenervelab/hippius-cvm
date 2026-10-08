@@ -129,7 +129,7 @@ node_file = "/run/hippius/cdn-node.json"
 lifecycle_key = "/run/credentials/hippius-cdn-agent.service/lifecycle.key"
 fleet_key_dir = "/run/credentials/hippius-cdn-agent.service"
 trust_domain = "hippius.network"
-fleet_wildcard_hostname = "*.cdn.hippius.com"
+fleet_wildcard_hostname = "*.c.hipcdn.net"
 
 [paths]
 state_dir = "/var/lib/hippius-data/cdn"
@@ -196,7 +196,7 @@ each replaces the previous one.
 | Path | Content |
 |---|---|
 | `/v1/secrets` | `{"zones": {zone_id: {name: cleartext}}}` |
-| `/v1/certs` | `{"default": "*.cdn.hippius.com" or null, "certs": {hostname: {"chain_pem", "key_pem", "not_after"}}}` |
+| `/v1/certs` | `{"default": "*.c.hipcdn.net" or null, "certs": {hostname: {"chain_pem", "key_pem", "not_after"}}}` |
 | `/v1/config` | `{"revision", "compression", "fleet_wildcard", "draining", "zones": {zone_id: {"state", "serving", "refusal", "origin", "shield_region", "settings", "secrets"}}, "hostnames": {hostname: zone_id}, "purges": {zone_id: {"zone_generation", "prefixes": {dir_prefix/: gen}, "paths": {exact_path: gen}}}, "blocks", "acme_http01": {token: key_authorization}, "peers"}` |
 | `/v1/health` | `{"ready", "volume_mounted", "fleet_key", "cert_store", "not_draining", "quota_ok", "feed_fresh", "applied_revision", "at"}` |
 | `/v1/attestation` | `{"format": "sev-snp-report-v1", "spki_sha256_hex", "report_b64"}` |

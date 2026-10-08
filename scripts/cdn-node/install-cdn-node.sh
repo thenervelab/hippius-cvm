@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage the cdn-node data plane into a mounted guest rootfs (CDN plan I3).
 #
-#   install-cdn-node.sh <rootfs> <cdn-agent-bin> <openresty.tar.gz> <config-dir> <backend-url>
+#   install-cdn-node.sh <rootfs> <cdn-agent-bin> <openresty.tar.gz> <config-dir> <backend-url> [fleet-wildcard]
 #
 # Called by `tenant-image-bake.sh --profile cdn-node` after the standard
 # customise (and after the sshd gates), while the rootfs is still mounted.
@@ -24,8 +24,12 @@ set -euo pipefail
 SUDO="${SUDO-sudo}"
 die() { echo "install-cdn-node: $*" >&2; exit 3; }
 
-[[ $# -eq 5 ]] || die "usage: install-cdn-node.sh <rootfs> <cdn-agent-bin> <openresty.tar.gz> <config-dir> <backend-url>"
+[[ $# -eq 5 || $# -eq 6 ]] \
+    || die "usage: install-cdn-node.sh <rootfs> <cdn-agent-bin> <openresty.tar.gz> <config-dir> <backend-url> [fleet-wildcard]"
 ROOT="$1"; AGENT_BIN="$2"; OR_TARBALL="$3"; CFG_DIR="$4"; BACKEND_URL="$5"
+# The fleet certificate's name: customer zones are <id>.<suffix>, on a
+# registrable domain of their own (never under hippius.com).
+FLEET_WILDCARD="${6:-*.c.hipcdn.net}"
 
 # Fixed ids, outside Debian's dynamic system range (100-999) and its user
 # range, inside the block Debian leaves for global allocation. Fixed so
@@ -55,6 +59,8 @@ for f in render.sh nginx.conf.in origin.conf lua/hippius_cdn/router.lua; do
 done
 [[ "${BACKEND_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] \
     || die "backend url must be https://host[:port][/path] (got '${BACKEND_URL}')"
+[[ "${FLEET_WILDCARD}" =~ ^\*(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){2,}$ ]] \
+    || die "fleet wildcard must be *.<domain> in lower case (got '${FLEET_WILDCARD}')"
 
 # ── the OpenResty tarball, checked before anything is written ────────
 # Every member is a directory, a regular file or a symlink under
@@ -163,6 +169,7 @@ url = "${BACKEND_URL}"
 request_signatures = true
 
 [identity]
+fleet_wildcard_hostname = "${FLEET_WILDCARD}"
 node_file = "/run/credentials/hippius-cdn-agent.service/cdn-node.json"
 lifecycle_key = "/run/credentials/hippius-cdn-agent.service/lifecycle.key"
 fleet_key_dir = "/run/credentials/hippius-cdn-agent.service"
@@ -506,4 +513,4 @@ for u in ssh.service ssh.socket sshd.service sshd.socket ssh@.service sshd@.serv
     mask "$u"
 done
 
-echo "install-cdn-node: staged (agent uid ${UID_AGENT}, openresty uid ${UID_OPENRESTY}, backend ${BACKEND_URL})"
+echo "install-cdn-node: staged (agent uid ${UID_AGENT}, openresty uid ${UID_OPENRESTY}, backend ${BACKEND_URL}, fleet ${FLEET_WILDCARD})"

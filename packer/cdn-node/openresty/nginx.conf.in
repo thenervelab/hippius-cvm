@@ -18,6 +18,10 @@ events {
 
 http {
     server_tokens off;
+    # No Server header at all (server_tokens only hides the version).
+    more_clear_headers Server;
+    # Every response, nginx's own error pages included: no MIME sniffing.
+    more_set_headers "X-Content-Type-Options: nosniff";
     # No request log on disk (spec §16 decision 5). Metering goes to the
     # agent over its socket.
     access_log off;
@@ -40,7 +44,9 @@ http {
             meter_socket = "@METER_SOCKET@",
             cache_dir = "@CACHE_DIR@",
             s3_region = "@S3_REGION@",
+            mime_types = "@PREFIX@/nginx/conf/mime.types",
         })
+        require("hippius_cdn.mime").load(require("hippius_cdn.settings").mime_types)
         require("hippius_cdn.router")
         require("hippius_cdn.cert")
         require("hippius_cdn.control")
@@ -72,9 +78,9 @@ http {
     keepalive_requests 1000;
 
     # Only these origin statuses are cached, whatever Cache-Control says:
-    # an origin error never becomes a cached HIT.
+    # an origin error or redirect never becomes a cached HIT.
     map $upstream_status $hippius_no_cache {
-        ~^(200|206|301|404)$ 0;
+        ~^(200|206|404)$ 0;
         default 1;
     }
 
@@ -171,7 +177,10 @@ http {
             proxy_cache hippius_cache;
             proxy_cache_key $hippius_cache_key$slice_range;
             proxy_cache_methods GET HEAD;
-            proxy_cache_valid 200 206 301 1h;
+            # 1h is settings.default_ttl (the Cache-Control sent to clients).
+            # An origin redirect is never cached (the router answers it
+            # with a generic body).
+            proxy_cache_valid 200 206 1h;
             proxy_cache_valid 404 1m;
             proxy_no_cache $hippius_no_cache;
             proxy_cache_revalidate on;
@@ -202,9 +211,18 @@ http {
             proxy_redirect off;
 
             # Never let the origin steer nginx (internal redirects, rate,
-            # buffering, cache lifetime).
+            # buffering, cache lifetime). The lifetime is the zone's alone:
+            # the S3 gateway marks every private object "private, no-store",
+            # which would turn the CDN into a pass-through. Set-Cookie never
+            # reaches a client (the router's header allowlist), so it does not
+            # make a response uncacheable either. Vary is ignored because the
+            # origin request carries no client header (proxy_pass_request_headers
+            # off): the origin's answer cannot depend on one, and honouring
+            # "Vary: *" or "Vary: Origin" would only stop or split caching.
+            # The client-facing Vary is gzip's own Accept-Encoding.
             proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate
-                                 X-Accel-Buffering X-Accel-Charset;
+                                 X-Accel-Buffering X-Accel-Charset
+                                 Cache-Control Expires Set-Cookie Vary;
             proxy_hide_header X-Accel-Redirect;
             proxy_hide_header X-Accel-Expires;
             proxy_hide_header X-Accel-Limit-Rate;

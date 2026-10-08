@@ -28,6 +28,11 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/hippius/cdn-agent.toml";
 /// Upper bound on either config file. Both are a few hundred bytes.
 const MAX_CONFIG_LEN: u64 = 64 * 1024;
 
+/// The fleet wildcard when the config names none: customer zones live on
+/// their own registrable domain, never under hippius.com. The cdn-node
+/// bake writes it explicitly (`install-cdn-node.sh`).
+pub const DEFAULT_FLEET_WILDCARD: &str = "*.c.hipcdn.net";
+
 /// Compression codecs the data plane may be told to use.
 ///
 /// Brotli is the hook for a later OpenResty build with `ngx_brotli`: the
@@ -462,7 +467,7 @@ fn resolve_identity(raw: &RawIdentity, node_file: PathBuf) -> Result<IdentityCon
     let fleet_wildcard_hostname = raw
         .fleet_wildcard_hostname
         .clone()
-        .unwrap_or_else(|| "*.cdn.hippius.com".to_string());
+        .unwrap_or_else(|| DEFAULT_FLEET_WILDCARD.to_string());
     if !crate::hostname::is_valid_hostname(&fleet_wildcard_hostname) {
         return Err(CdnError::Config("fleet-wildcard-invalid"));
     }
@@ -705,7 +710,7 @@ pub(crate) mod tests {
         assert_eq!(cfg.backend.url.as_str(), "https://api.example.test/");
         assert_eq!(cfg.data_plane.compression, vec![Compression::Gzip]);
         assert_eq!(cfg.timing.lkg_max_age_s, 86_400);
-        assert_eq!(cfg.identity.fleet_wildcard_hostname, "*.cdn.hippius.com");
+        assert_eq!(cfg.identity.fleet_wildcard_hostname, "*.c.hipcdn.net");
     }
 
     #[test]

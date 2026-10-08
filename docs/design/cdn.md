@@ -19,7 +19,7 @@ Ship a managed CDN, complete at GA:
   - a Hippius S3 bucket, first-class, including private buckets read through
     a signed origin credential;
   - any HTTP(S) origin, such as a customer site or API.
-- **Hostnames:** `<id>.cdn.hippius.com` by default, plus custom domains by
+- **Hostnames:** `<id>.c.hipcdn.net` by default, plus custom domains by
   CNAME (or ALIAS/ANAME at the apex). TLS is automatic through ACME.
   Certificates are issued, stored and renewed inside the CVMs.
 - **GeoDNS on AWS Route 53**, health checked per regional node, with
@@ -72,8 +72,8 @@ The CDN must **not** use it: TLS for CDN hostnames terminates inside the CVMs.
 ## 3. Architecture
 
 ```
-                       Route 53  (cdn.hippius.com, delegated from Cloudflare)
-                       *.cdn  --geo-->  region-oc / region-eu  --failover-->  pool-<region> (A, health-checked per node)
+                       Route 53  (c.hipcdn.net, delegated from hipcdn.net)
+                       *.c    --geo-->  region-oc / region-eu  --failover-->  pool-<region> (A, health-checked per node)
                                    |
  client --TLS--> P (public IP on the region's ingress edge) --DNAT over WireGuard--> cache node CVM (miner)
                                                                                           |  miss
@@ -225,7 +225,7 @@ the second table.
 6. **Hippius controls config.** It could repoint a zone's origin or add a
    hostname. Customer-signed config (the managed k8s envelope pattern,
    `backend:compute/managed_k8s.py:327-367`) is a later phase.
-7. **DNS is AWS.** Route 53 sees the queried names under `cdn.hippius.com`
+7. **DNS is AWS.** Route 53 sees the queried names under `c.hipcdn.net`
    with the resolver's address or its ECS subnet.
 8. **No shell on nodes.** As with managed databases, nodes have no SSH or
    console. Operations see metrics, health and events only.
@@ -382,17 +382,16 @@ the second table.
 
 ### 7.1 Zone and delegation
 
-- **Hosted zone.** A public Route 53 hosted zone for `cdn.hippius.com`.
-- **Delegation.** `hippius.com` stays on Cloudflare.
-  The Cloudflare zone holds the four `NS` records for `cdn` pointing at the
-  zone's Route 53 delegation set. They are DNS-only; Cloudflare does not
-  proxy NS.
-  - Nothing else in the Cloudflare zone may sit at or under `cdn.hippius.com`.
-  - A CI check (`dig +trace`) alerts if the NS set at Cloudflare and Route 53
+- **Domain.** Customer zones are served under `c.hipcdn.net`, a registrable
+  domain of their own (moved from `cdn.hippius.com` on 2026-10-08), so no
+  customer content shares a site with hippius.com and its cookies.
+- **Hosted zone.** `c.hipcdn.net` is a public Route 53 hosted zone,
+  delegated by NS records in the `hipcdn.net` parent zone.
+  - Nothing else in the parent zone may sit at or under `c.hipcdn.net`.
+  - A CI check (`dig +trace`) alerts if the NS set in the parent and Route 53
     disagree.
-- **DNSSEC.** If `hippius.com` is signed at Cloudflare, the delegation stays
-  insecure (no DS) at launch. Route 53 DNSSEC signing (a KMS key) plus a DS
-  at Cloudflare is a later hardening.
+- **DNSSEC.** The delegation stays insecure (no DS) at launch. Route 53
+  DNSSEC signing (a KMS key) plus a DS in the parent is a later hardening.
 - **Staging.** A staging zone `cdn-staging.hippius.com` is delegated the same
   way, for tests.
 
@@ -403,14 +402,14 @@ one wildcard.
 
 | Name | Type / policy | Value | Health |
 |---|---|---|---|
-| `pool-fr.cdn.hippius.com` | A, **multivalue answer**, one record per FR node (`SetIdentifier=node-<id>`) | node public IP | one health check per node |
+| `pool-fr.c.hipcdn.net` | A, **multivalue answer**, one record per FR node (`SetIdentifier=node-<id>`) | node public IP | one health check per node |
 | `pool-nl`, `pool-au` | same | same | same |
-| `region-eu.cdn.hippius.com` | A **alias**, **failover**: PRIMARY → `pool-fr`, SECONDARY → `pool-nl` (→ `pool-au` until NL exists) | Evaluate Target Health = yes | inherited |
-| `region-oc.cdn.hippius.com` | A alias, failover: PRIMARY → `pool-au`, SECONDARY → `region-eu` | ETH = yes | inherited |
-| `*.cdn.hippius.com` | A alias, **geolocation**: continent `OC` → `region-oc`; **Default** → `region-eu` | ETH = yes | inherited |
-| `_acme-challenge.cdn.hippius.com` | TXT | the wildcard order's DNS-01 values | none |
-| `<h>.dcv.cdn.hippius.com` | TXT | DNS-01 value for a delegated custom hostname (§8.3) | none |
-| `health.cdn.hippius.com` | A | unused; it is the Host header the health checks send | none |
+| `region-eu.c.hipcdn.net` | A **alias**, **failover**: PRIMARY → `pool-fr`, SECONDARY → `pool-nl` (→ `pool-au` until NL exists) | Evaluate Target Health = yes | inherited |
+| `region-oc.c.hipcdn.net` | A alias, failover: PRIMARY → `pool-au`, SECONDARY → `region-eu` | ETH = yes | inherited |
+| `*.c.hipcdn.net` | A alias, **geolocation**: continent `OC` → `region-oc`; **Default** → `region-eu` | ETH = yes | inherited |
+| `_acme-challenge.c.hipcdn.net` | TXT | the wildcard order's DNS-01 values | none |
+| `<h>.dcv.c.hipcdn.net` | TXT | DNS-01 value for a delegated custom hostname (§8.3) | none |
+| `health.c.hipcdn.net` | A | unused; it is the Host header the health checks send | none |
 
 - **Why geolocation rather than latency.** AU capacity is a monthly volume
   and AU is priced higher. Latency routing would send Singapore,
@@ -440,7 +439,7 @@ one wildcard.
 - **Configuration:**
   - type **HTTPS**, `EnableSNI=true`;
   - `IPAddress` = node IP, port 443;
-  - `FullyQualifiedDomainName=health.cdn.hippius.com`, served under the
+  - `FullyQualifiedDomainName=health.c.hipcdn.net`, served under the
     fleet wildcard certificate;
   - `ResourcePath=/__hippius/health`;
   - `RequestInterval=30`, `FailureThreshold=3`;
@@ -505,7 +504,7 @@ one wildcard.
 
 | Record | TTL | Why |
 |---|---|---|
-| NS delegation at Cloudflare | 86400 | stable |
+| NS delegation in the parent zone | 86400 | stable |
 | `pool-*` A records | **60 s** | bounds failover time |
 | alias records (`region-*`, wildcard) | n/a: an alias inherits its target's TTL | |
 | TXT challenges | 60 s | short-lived |
@@ -600,8 +599,8 @@ once real query volumes are known.
 
 ### 8.1 Default hostname
 
-- Every zone gets `<id>.cdn.hippius.com`, served immediately under the fleet
-  wildcard certificate `*.cdn.hippius.com`.
+- Every zone gets `<id>.c.hipcdn.net`, served immediately under the fleet
+  wildcard certificate `*.c.hipcdn.net`.
 - That certificate is issued by DNS-01 (§8.4). Its key is generated in a CVM
   and sealed to the fleet key.
 
@@ -609,10 +608,10 @@ once real query volumes are known.
 
 The console shows, for each hostname:
 
-- **Subdomain:** `CNAME www.example.com → <id>.cdn.hippius.com`.
+- **Subdomain:** `CNAME www.example.com → <id>.c.hipcdn.net`.
 - **Apex** (`example.com`), where a CNAME is not allowed:
   - Use **ALIAS / ANAME / CNAME flattening** at the DNS provider, targeting
-    `<id>.cdn.hippius.com`. Cloudflare (CNAME flattening), DNSimple (ALIAS),
+    `<id>.c.hipcdn.net`. Cloudflare (CNAME flattening), DNSimple (ALIAS),
     DNS Made Easy (ANAME) and NS1 (ALIAS) support it.
   - **Route 53 customers cannot do this.** A Route 53 alias only targets AWS
     resources or records in the same zone. They should redirect the apex to
@@ -623,7 +622,7 @@ The console shows, for each hostname:
   - We offer no static anycast IPs, so A records pointing at node IPs are
     unsupported: they break failover and change when nodes move.
 - **Optional, recommended:**
-  - `CNAME _acme-challenge.www.example.com → <h>.dcv.cdn.hippius.com`, where
+  - `CNAME _acme-challenge.www.example.com → <h>.dcv.c.hipcdn.net`, where
     `h` = base32(sha256(hostname))[:16]. This enables DNS-01 (§8.4): wildcard
     custom hostnames, and issuance **before** traffic is moved.
   - the CAA record from §4.3.4.
@@ -634,7 +633,7 @@ The console shows, for each hostname:
 
 - A hostname belongs to at most one live zone (unique index).
 - Claiming it requires **one** of:
-  - the CNAME chain ends at **this** zone's `<id>.cdn.hippius.com`;
+  - the CNAME chain ends at **this** zone's `<id>.c.hipcdn.net`;
   - `TXT _hippius-cdn.<hostname>` = the zone's verification token. This is
     mandatory for apex names, whose flattened A records cannot tell zones
     apart.
@@ -676,7 +675,12 @@ live, with the resolver answers it saw.
   The accounturi is published for CAA pinning.
 - **One issuer per hostname.** The backend grants a lease
   (`POST /api/cdn/node/acme/lease/`, 10 minutes) to one node, by default a
-  node of the zone's shield region. That node:
+  node of the zone's shield region. The request names what will be issued
+  (`{hostname_id, name}`: the fleet wildcard, or the custom hostname). The
+  backend refuses a lease whose name is not the one it issues for that id
+  (its own wildcard, or the claimed hostname) with `name-mismatch`, e.g. a
+  node baked for another domain across a domain move. Such a node logs it and asks again only every 6 hours, never
+  holding the lease. The granted node:
   1. generates the key (ECDSA P-256) in RAM;
   2. creates the order;
   3. completes the challenge;
@@ -695,9 +699,9 @@ live, with the resolver answers it saw.
     host could pass HTTP-01 itself (§4.1). Customers who want issuance
     pinned to DNS use the DCV CNAME plus CAA (§4.3.4).
 - **DNS-01:**
-  - for the fleet wildcard: TXT at `_acme-challenge.cdn.hippius.com`;
+  - for the fleet wildcard: TXT at `_acme-challenge.c.hipcdn.net`;
   - for customer hostnames with the DCV CNAME: TXT at
-    `<h>.dcv.cdn.hippius.com`; this is the only way to get wildcard custom
+    `<h>.dcv.c.hipcdn.net`; this is the only way to get wildcard custom
     hostnames.
 
   The leader asks the backend (`POST /api/cdn/node/acme/dns01/`, value
@@ -920,19 +924,39 @@ generations of the matching purge prefixes (§10.2).
 
 **Defaults:**
 
-- Honour the origin's `Cache-Control` and `Expires`.
-- Do not cache `private`, `no-store` or `Set-Cookie` responses.
+- For an S3 origin, ignore the origin's `Cache-Control`, `Expires`,
+  `Set-Cookie` and `Vary`: the lifetime is the zone's alone. The Hippius S3
+  gateway marks every private object `private, no-store`, so honouring it
+  would make every request a miss. The client gets a `Cache-Control`
+  computed from the zone, and only an allowlist of origin headers (the
+  data-plane README has the list).
 - Requests carrying `Authorization` or a cookie bypass the cache unless a
   rule says otherwise.
-- When the origin says nothing, cache 200/301 for 1 hour and 404 for
-  1 minute.
+- Cache 200/206 for 1 hour and 404 for 1 minute (the zone default until
+  rules are enforced). An origin redirect or error is never cached.
 - `stale-while-revalidate` 60 s, `stale-if-error` 1 day.
 - Maximum object size 10 GB.
+- **Script-capable types are sandboxed on the fleet's names.** On
+  `<id>.c.hipcdn.net` (zones are same-site with each other there), a
+  response whose final type is HTML, any XML (XHTML, SVG, XSLT), `text/xsl`
+  or `text/mathml` carries `Content-Security-Policy: sandbox allow-scripts`:
+  it runs in an opaque origin, so classic scripts run but it cannot read or
+  write cookies or use storage. The opaque origin also makes its same-host
+  module scripts, fonts and `fetch` cross-origin, which the data plane does
+  not answer with CORS: a full web app needs a custom domain, which is not
+  sandboxed. A Public Suffix List entry for `c.hipcdn.net` would make zones
+  separate sites and allow lifting the sandbox. The Content-Type fallback by
+  extension never produces such a type, and every response carries
+  `X-Content-Type-Options: nosniff`. This was decided while zones were
+  served under `cdn.hippius.com` (same-site with hippius.com). The move to
+  the dedicated `c.hipcdn.net` domain is the real fix; the sandbox stays as
+  defence in depth.
 
 **Rules** are ordered. A match is a path prefix, a glob, or an extension
 list. The actions:
 
-- edge TTL: override, or honour the origin;
+- edge TTL: override (`"origin"`, honour the origin, needs the origin's
+  `Cache-Control` back, which an S3 origin no longer passes);
 - browser TTL: rewrites `Cache-Control` towards the client;
 - query string: ignore all, include all (sorted), or include a whitelist;
 - bypass;

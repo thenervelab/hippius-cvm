@@ -183,11 +183,17 @@ impl BackendClient {
         self.empty(json_body(self.http.post(url), upload)?, Some(auth))
     }
 
-    /// I4: take the issuance lease for a hostname.
-    pub fn acme_lease(&self, auth: &NodeAuth<'_>, hostname_id: &str) -> Result<AcmeLeaseResponse> {
+    /// I4: take the issuance lease for a hostname (`name` is what will be
+    /// issued: the fleet wildcard, or the custom hostname).
+    pub fn acme_lease(
+        &self,
+        auth: &NodeAuth<'_>,
+        hostname_id: &str,
+        name: &str,
+    ) -> Result<AcmeLeaseResponse> {
         let url = self.base.join(wire::PATH_ACME_LEASE)?;
         self.json(
-            json_body(self.http.post(url), &AcmeLeaseRequest { hostname_id })?,
+            json_body(self.http.post(url), &AcmeLeaseRequest { hostname_id, name })?,
             Some(auth),
         )
     }
@@ -356,6 +362,9 @@ fn status_error(status: StatusCode, body: &[u8]) -> CdnError {
             "hippius-cdn-agent: backend status {} code {code}",
             status.as_u16()
         );
+        if code == wire::CODE_LEASE_NAME_MISMATCH {
+            return CdnError::LeaseNameRefused;
+        }
     }
     if status == StatusCode::UNAUTHORIZED {
         CdnError::Unauthorized
@@ -572,9 +581,11 @@ mod tests {
         let c = BackendClient::new(&cfg(&mock)).unwrap();
         let tok = SessionToken::for_tests("t");
         let k = key();
-        c.acme_lease(&auth(&tok, &k, true), "h42").unwrap();
+        c.acme_lease(&auth(&tok, &k, true), "h42", "img.example.com")
+            .unwrap();
         let req = &mock.requests()[0];
         assert_eq!(req.json()["hostname_id"], "h42");
+        assert_eq!(req.json()["name"], "img.example.com");
         verify_signed(&mock, req, &k);
     }
 

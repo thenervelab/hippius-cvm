@@ -11,6 +11,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 prefix="${OPENRESTY_PREFIX:-/opt/openresty}"
+export OPENRESTY_PREFIX="$prefix"
 export LD_LIBRARY_PATH="${prefix}/luajit/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "== render.sh guards"

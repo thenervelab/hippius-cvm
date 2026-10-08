@@ -9,6 +9,11 @@ local M = {
     -- Worker 0 re-checks (and rewrites if needed) the cache canary this
     -- often, in seconds.
     canary_interval = 10,
+    -- nginx's mime.types (Content-Type fallback by extension).
+    mime_types = "/opt/openresty/nginx/conf/mime.types",
+    -- Edge and browser lifetime of a 200/206, in seconds: nginx's
+    -- proxy_cache_valid for those statuses, until zone rules set it.
+    default_ttl = 3600,
     -- Default S3 region for SigV4 when a zone's origin names none.
     s3_region = "us-east-1",
     -- Lifetime of the presigned origin URL: covers every slice of one

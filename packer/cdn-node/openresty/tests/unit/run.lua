@@ -7,6 +7,7 @@ local meter = require("hippius_cdn.meter")
 local health = require("hippius_cdn.health")
 local docs = require("hippius_cdn.docs")
 local router = require("hippius_cdn.router")
+local mime = require("hippius_cdn.mime")
 local cert = require("hippius_cdn.cert")
 local settings = require("hippius_cdn.settings")
 local cjson = require("cjson.safe")
@@ -338,6 +339,95 @@ test("unusable-credential CRIT lines are rate-limited per zone and reason", func
     truthy(router.should_log_credentials("zq", "access_key_id missing or invalid", 1030), "another reason")
     truthy(router.should_log_credentials("zp", "secret missing or invalid", 1030), "another zone")
     truthy(router.should_log_credentials("zq", "secret missing or invalid", 1060))
+end)
+
+test("content-type fallback by extension, never to a script-capable type", function()
+    local prefix = os.getenv("OPENRESTY_PREFIX") or "/opt/openresty"
+    mime.load(prefix .. "/nginx/conf/mime.types")
+    local cases = {
+        { "/a.css", nil, "text/css" },
+        { "/a.js", nil, "application/javascript" },
+        { "/a.png", "application/octet-stream", "image/png" },
+        { "/a.JSON", "binary/octet-stream", "application/json" },
+        { "/a.txt", "", "text/plain" },
+        -- Script-capable under *.cdn.hippius.com: never guessed.
+        { "/cdn-test.html", nil, "application/octet-stream" },
+        { "/logo.svg", "binary/octet-stream", "application/octet-stream" },
+        { "/a.xhtml", nil, "application/octet-stream" },
+        { "/feed.xml", nil, "application/octet-stream" },
+        -- Unknown or no extension.
+        { "/a.unknownext", nil, "application/octet-stream" },
+        { "/README", "binary/octet-stream", "application/octet-stream" },
+    }
+    for _, c in ipairs(cases) do
+        eq(mime.fallback(c[1], c[2]), c[3], c[1] .. " / " .. tostring(c[2]))
+    end
+    -- A parameter on a generic declared type does not stop the fallback.
+    eq(mime.fallback("/a.css", "Application/Octet-Stream; charset=utf-8"), "text/css")
+    eq(mime.fallback("/a.css", "  "), "text/css")
+    -- Only allowlisted families come out of the fallback.
+    truthy(mime.fallback_allowed("image/png"))
+    truthy(mime.fallback_allowed("font/woff2"))
+    falsy(mime.fallback_allowed("image/svg+xml"))
+    falsy(mime.fallback_allowed("text/mathml"))
+    falsy(mime.fallback_allowed("application/pdf"))
+    eq(mime.fallback("/a.pdf", nil), "application/octet-stream")
+    -- Entries spanning two lines in mime.types are parsed.
+    local parsed = mime.parse("types {\n    text/css css;\n    application/vnd.example.long\n        pptx docx;\n}\n")
+    eq(parsed.pptx, "application/vnd.example.long")
+    eq(parsed.docx, "application/vnd.example.long")
+    eq(parsed.css, "text/css")
+    -- A declared type is kept, HTML included (the origin's choice).
+    eq(mime.fallback("/cdn-test.html", "text/html; charset=utf-8"), nil)
+    eq(mime.fallback("/a.bin", "image/png"), nil)
+    for _, t in ipairs({ "text/html", "text/html; charset=utf-8", "application/xhtml+xml",
+        "image/svg+xml", "text/xml", "application/xml", "text/xsl", "text/mathml" }) do
+        eq(mime.csp_for(t), "sandbox allow-scripts", t)
+    end
+    for _, t in ipairs({ "text/css", "application/javascript", "image/png", "application/json",
+        "text/plain", "application/octet-stream" }) do
+        eq(mime.csp_for(t), nil, t)
+    end
+    eq(mime.csp_for(nil), nil)
+    -- Only the fleet's own names are sandboxed; custom domains are not.
+    local store = { doc = { fleet_wildcard = "*.c.hipcdn.net" } }
+    truthy(router.on_fleet_domain("zabc.c.hipcdn.net", store))
+    falsy(router.on_fleet_domain("www.example.com", store))
+    falsy(router.on_fleet_domain("a.zabc.c.hipcdn.net", store))
+    falsy(router.on_fleet_domain("zabc.c.hipcdn.net", nil))
+    truthy(mime.script_capable("image/svg+xml"))
+    truthy(mime.script_capable("Text/HTML"))
+    falsy(mime.script_capable("text/css"))
+end)
+
+test("origin header allowlist", function()
+    -- The headers the S3 gateway sent on a private object in production.
+    local origin = {
+        ["Content-Type"] = "text/html", ["Content-Length"] = "10", ["ETag"] = '"e"',
+        ["Last-Modified"] = "x", ["Accept-Ranges"] = "bytes", ["Content-Disposition"] = "inline",
+        ["Cache-Control"] = "private, no-store", ["Expires"] = "0", ["Vary"] = "Origin",
+        ["Server"] = "gw", ["Set-Cookie"] = "a=1", ["Location"] = "https://elsewhere.example/",
+        ["x-hippius-source"] = "s", ["x-hippius-api-time-ms"] = "3", ["x-hippius-ray-id"] = "r",
+        ["x-hippius-body-blake3"] = "b", ["x-hippius-body-blake3-chunk"] = "c",
+        ["x-amz-meta-original-name"] = "n", ["x-amz-request-id"] = "q", ["x-amz-id-2"] = "i",
+        ["Age"] = "5000",
+    }
+    local dropped = {}
+    for _, n in ipairs(router.headers_to_drop(origin, false)) do dropped[n] = true end
+    for _, keep in ipairs({ "Content-Type", "Content-Length", "ETag", "Last-Modified",
+        "Accept-Ranges", "Content-Disposition" }) do
+        falsy(dropped[keep], keep .. " must be kept")
+    end
+    for _, gone in ipairs({ "Cache-Control", "Expires", "Vary", "Server", "Set-Cookie", "Location",
+        "x-hippius-source", "x-hippius-api-time-ms", "x-hippius-ray-id", "x-hippius-body-blake3",
+        "x-hippius-body-blake3-chunk", "x-amz-meta-original-name", "x-amz-request-id", "x-amz-id-2",
+        "Age" }) do
+        truthy(dropped[gone], gone .. " must be dropped")
+    end
+    -- The node's own redirect keeps its Location.
+    local own = {}
+    for _, n in ipairs(router.headers_to_drop({ Location = "https://a/" }, true)) do own[n] = true end
+    falsy(own.Location)
 end)
 
 test("router helpers", function()

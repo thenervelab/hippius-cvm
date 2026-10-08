@@ -7,6 +7,7 @@
 -- the feed's; the feed only names the bucket and prefix.
 local cjson = require("cjson.safe")
 local docs = require("hippius_cdn.docs")
+local mime = require("hippius_cdn.mime")
 local settings = require("hippius_cdn.settings")
 local sigv4 = require("hippius_cdn.sigv4")
 local util = require("hippius_cdn.util")
@@ -192,6 +193,7 @@ function M.access()
     local settings_doc = type(zone.settings) == "table" and zone.settings or {}
     if var.scheme == "http" and settings_doc.redirect_https ~= false then
         ctx.billable = true
+        ctx.redirect = true
         return ngx.redirect("https://" .. host .. var.request_uri, 301)
     end
     local uri = M.origin_uri(zone.origin, path)
@@ -220,25 +222,95 @@ end
 -- Error bodies: an origin error (S3 XML naming the bucket, the key, the
 -- access key id) or nginx's own error page never reaches the client.
 -- Every status >= 400 gets a short generic body instead.
+-- The only response headers a client sees from the origin (lower case).
+-- Everything else the origin sends (x-hippius-*, x-amz-*, Server,
+-- Set-Cookie, Expires, Vary, Age...) is dropped. Cache-Control is ours,
+-- computed below; X-Cache, Vary (gzip) and Date are added after this
+-- filter. Age is not kept: nginx stores and replays the origin's value
+-- unchanged, which would make a fresh copy look stale.
+M.ORIGIN_HEADERS_KEPT = {
+    ["content-type"] = true,
+    ["content-length"] = true,
+    ["content-range"] = true,
+    ["content-encoding"] = true,
+    ["content-language"] = true,
+    ["content-disposition"] = true,
+    ["etag"] = true,
+    ["last-modified"] = true,
+    ["accept-ranges"] = true,
+}
+
+-- Names of the headers to drop from `headers` (a get_headers() table).
+-- `location` stays only on the node's own redirect.
+function M.headers_to_drop(headers, own_redirect)
+    local drop = {}
+    for name in pairs(headers) do
+        local n = name:lower()
+        if not M.ORIGIN_HEADERS_KEPT[n] and not (own_redirect and n == "location") then
+            drop[#drop + 1] = name
+        end
+    end
+    return drop
+end
+
+-- Whether `host` is one of the fleet's own names (<id>.<suffix> under the
+-- fleet wildcard), as opposed to a customer's custom domain.
+function M.on_fleet_domain(host, store)
+    local wildcard = store and store.doc.fleet_wildcard
+    return type(host) == "string" and type(wildcard) == "string"
+        and util.wildcard_of(host) == wildcard
+end
+
 function M.header_filter()
+    -- Slice subrequests never reach the client: the main request is
+    -- filtered once.
+    if ngx.is_subrequest then
+        return
+    end
+    local ctx = ngx.ctx
+    for _, name in ipairs(M.headers_to_drop(ngx.resp.get_headers(0, true), ctx.redirect)) do
+        ngx.header[name] = nil
+    end
+    -- Every response: no MIME sniffing a script-capable type out of a
+    -- customer's bytes.
+    ngx.header["X-Content-Type-Options"] = "nosniff"
     -- An empty object: S3 answers the first slice's ranged GET with 416
     -- and "Content-Range: bytes */0". Without a client Range, that is an
     -- empty 200.
-    if ngx.status == 416 and not ngx.is_subrequest and ngx.var.http_range == nil
+    if ngx.status == 416 and ngx.var.http_range == nil
         and ngx.header["Content-Range"] == "bytes */0" then
         ngx.status = 200
         ngx.header["Content-Range"] = nil
         ngx.header["Content-Length"] = 0
-        ngx.ctx.empty_body = true
+        ngx.header["Content-Type"] = mime.fallback(ngx.var.uri, nil)
+        ngx.header["Cache-Control"] = "public, max-age=" .. settings.default_ttl
+        ctx.empty_body = true
         return
     end
-    if ngx.status >= 400 then
-        ngx.ctx.generic_body = true
+    -- An origin redirect is not followed and its body (S3 XML naming the
+    -- bucket and endpoint) is not passed on: like an error, a generic body,
+    -- never cached. 304 is nginx's answer to a conditional request.
+    local origin_redirect = ngx.status >= 300 and ngx.status < 400 and ngx.status ~= 304
+        and not ctx.redirect
+    if ngx.status >= 400 or origin_redirect then
+        ctx.generic_body = true
         ngx.header["Content-Length"] = nil
         ngx.header["Content-Encoding"] = nil
         ngx.header["Content-Type"] = "text/plain"
         ngx.header["Cache-Control"] = "no-store"
+        return
     end
+    if ctx.redirect then
+        return
+    end
+    local t = mime.fallback(ngx.var.uri, ngx.header["Content-Type"])
+    if t then
+        ngx.header["Content-Type"] = t
+    end
+    if M.on_fleet_domain(ngx.var.host, docs.get("config")) then
+        ngx.header["Content-Security-Policy"] = mime.csp_for(ngx.header["Content-Type"])
+    end
+    ngx.header["Cache-Control"] = "public, max-age=" .. settings.default_ttl
 end
 
 function M.body_filter()

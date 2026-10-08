@@ -118,6 +118,11 @@ jobs:
       # deploy scrub creates on the publishable branch alone.
       - name: Documentation links resolve
         run: bash scripts/dev/docs-links-test.sh
+      # Releases are immutable on the public repo: one workflow creates
+      # them (draft, every asset, then published). v2026.10.08 was
+      # published empty by a second creator racing on the same tag.
+      - name: Only the release workflow writes releases
+        run: bash scripts/dev/release-creator-test.sh --self-test
       # Miner-agent auto-update: the updater against a mocked GitHub API,
       # cosign, systemd and journald. Its systemctl mock fails any
       # stop/restart (a graceful stop destroys every domain on a miner).

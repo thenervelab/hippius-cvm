@@ -58,7 +58,38 @@ OBJECTS = {
     "/media/site/accel.txt": (b"accel-object", "text/plain"),
     "/media/site/big.bin": (bytes(range(256)) * (3 * 4096 + 7), "application/octet-stream"),
     "/media/site/empty.txt": (b"", "text/plain"),
+    # Answered like the production S3 gateway answers a private object
+    # (GATEWAY_HEADERS), with the declared type below (None: no header).
+    "/media/site/gw/cdn-test.html": (b"<p>hi</p>", "text/html"),
+    "/media/site/gw/page.html": (b"<p>no type</p>", None),
+    "/media/site/gw/style.css": (b"p{}", "binary/octet-stream"),
+    "/media/site/gw/app.js": (b"1;", None),
+    "/media/site/gw/data.json": (b"{}", "application/octet-stream"),
+    "/media/site/gw/logo.png": (b"\x89PNG", "application/octet-stream"),
+    "/media/site/gw/logo.svg": (b"<svg/>", "application/octet-stream"),
+    "/media/site/gw/blob.unknownext": (b"??", None),
+    "/media/site/gw/x.xhtml": (b"<html/>", "application/xhtml+xml"),
+    "/media/site/gw/declared.svg": (b"<svg/>", "image/svg+xml"),
+    "/media/site/gw/t.xml": (b"<a/>", "text/xml"),
+    "/media/site/gw/a.xml": (b"<a/>", "application/xml"),
 }
+GATEWAY_HEADERS = [
+    ("Cache-Control", "private, no-store"), ("Expires", "Thu, 01 Jan 1970 00:00:00 GMT"),
+    ("Vary", "Origin"), ("Server", "hippius-s3"), ("Set-Cookie", "gw=1"),
+    ("ETag", '"0123abcd"'), ("Last-Modified", "Wed, 07 Oct 2026 10:00:00 GMT"),
+    ("Accept-Ranges", "bytes"), ("Content-Disposition", "inline"),
+    ("x-hippius-source", "pipeline"), ("x-hippius-api-time-ms", "12"),
+    ("x-hippius-ray-id", "ray-1"), ("x-hippius-body-blake3", "b3"),
+    ("x-hippius-body-blake3-chunk", "b3c"), ("x-amz-meta-original-name", "cdn-test.html"),
+    ("Age", "5000"),
+]
+MOVED_PATH = "/media/site/gw/moved.txt"
+# What a client may see on a 200 (lower case).
+CLIENT_HEADERS = {"content-type", "content-length", "content-range", "content-encoding",
+                  "content-language", "content-disposition", "etag", "last-modified",
+                  "accept-ranges", "x-cache", "cache-control", "x-content-type-options",
+                  "content-security-policy",
+                  "date", "connection", "vary"}
 ERROR_PATH = "/media/site/err.txt"
 
 
@@ -136,6 +167,15 @@ class Origin(BaseHTTPRequestHandler):
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
             return
+        if path == MOVED_PATH:
+            body = b"<Error><Code>PermanentRedirect</Code><Endpoint>s3.internal.example</Endpoint></Error>"
+            self.send_response(301)
+            self.send_header("Location", "https://elsewhere.example/steal")
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == ERROR_PATH:
             body = b"<Error><Code>AccessDenied</Code><BucketName>media</BucketName></Error>"
             self.send_response(403)
@@ -169,8 +209,15 @@ class Origin(BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         else:
             self.send_response(200)
-        self.send_header("Content-Type", ctype)
+        if ctype is not None:
+            self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if "/gw/" in path:
+            for k, v in GATEWAY_HEADERS:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.endswith("/accel.txt"):
             self.send_header("X-Accel-Redirect", "/.well-known/hippius-attestation")
         self.send_header("Cache-Control", "max-age=3600")
@@ -444,15 +491,94 @@ class DataPlane(unittest.TestCase):
         self.assertEqual(hits[0]["query"], "", "the client query string reached the origin")
         for forbidden in ("x-evil", "cookie", "authorization", "accept-encoding", "user-agent"):
             self.assertNotIn(forbidden, sent, f"client header {forbidden} reached the origin")
-        # A response with Set-Cookie is never cached, and the cookie
-        # never reaches the client.
-        for _ in range(2):
+        # Set-Cookie never reaches the client, so the response is cached
+        # like any other.
+        for want in ("MISS", "HIT"):
             st, h, _ = self.https("img.example.com", "/cookie.txt")
-            self.assertEqual((st, h.get("x-cache")), (200, "MISS"))
+            self.assertEqual((st, h.get("x-cache")), (200, want))
             self.assertNotIn("set-cookie", h)
         # Another hostname of the same zone shares the cached object.
         st, h, _ = self.https("z1.cdn.hippius.com", "/a/b.txt")
         self.assertEqual((st, h.get("x-cache")), (200, "HIT"))
+
+    def test_bb_gateway_headers_cache_and_types(self):
+        # The gateway's "private, no-store" does not stop caching: the
+        # lifetime is the zone's.
+        for want in ("MISS", "HIT"):
+            st, h, body = self.https("img.example.com", "/gw/cdn-test.html")
+            self.assertEqual((st, body, h.get("x-cache")), (200, b"<p>hi</p>", want))
+        self.assertEqual(len(self.origin_hits("/media/site/gw/cdn-test.html")), 1)
+        # Only the allowlist reaches the client.
+        self.assertLessEqual(set(h), CLIENT_HEADERS, set(h) - CLIENT_HEADERS)
+        for gone in ("server", "set-cookie", "expires", "age", "x-hippius-source", "x-hippius-api-time-ms",
+                     "x-hippius-ray-id", "x-hippius-body-blake3", "x-hippius-body-blake3-chunk",
+                     "x-amz-meta-original-name"):
+            self.assertNotIn(gone, h)
+        self.assertNotIn("origin", h.get("vary", "").lower())
+        self.assertEqual(h["cache-control"], "public, max-age=3600")
+        self.assertEqual(h["x-content-type-options"], "nosniff")
+        self.assertEqual((h["etag"], h["accept-ranges"], h["content-disposition"]),
+                         ('"0123abcd"', "bytes", "inline"))
+        # Declared HTML is the origin's choice and is kept.
+        self.assertEqual(h["content-type"], "text/html")
+        # No type, or a generic one: by extension, never to HTML or SVG.
+        for path, want in (("/gw/style.css", "text/css"), ("/gw/app.js", "application/javascript"),
+                           ("/gw/data.json", "application/json"), ("/gw/logo.png", "image/png"),
+                           ("/gw/page.html", "application/octet-stream"),
+                           ("/gw/logo.svg", "application/octet-stream"),
+                           ("/gw/blob.unknownext", "application/octet-stream")):
+            st, h, _ = self.https("img.example.com", path)
+            self.assertEqual((st, h.get("content-type")), (200, want), path)
+            self.assertEqual(h.get("x-content-type-options"), "nosniff", path)
+        # nosniff on everything else too: errors, refusals, our endpoints.
+        for host, path in (("img.example.com", "/gw/missing.txt"), ("nope.example.org", "/x"),
+                           ("health.cdn.hippius.com", "/__hippius/health"),
+                           ("img.example.com", "/.well-known/acme-challenge/nope")):
+            st, h, _ = self.https(host, path) if not host.startswith("nope") else self.https(
+                "img.example.com", path, host=host)
+            self.assertEqual(h.get("x-content-type-options"), "nosniff", (host, path, st))
+        st, h, _ = self.http("img.example.com", "/gw/style.css")
+        self.assertEqual((st, h.get("x-content-type-options")), (301, "nosniff"))
+        self.assertTrue(h["location"].startswith("https://img.example.com/"))
+        self.assertNotIn("server", h)
+        # nginx's own error pages (here: no Host) carry nosniff too.
+        with socket.create_connection(("127.0.0.1", self.http_port), 5) as s:
+            s.sendall(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+            raw = b""
+            while chunk := s.recv(4096):
+                raw += chunk
+        head = raw.split(b"\r\n\r\n", 1)[0].lower()
+        self.assertTrue(head.startswith(b"http/1.1 400"), head)
+        self.assertIn(b"x-content-type-options: nosniff", head)
+        self.assertNotIn(b"server:", head)
+
+    def test_bd_script_capable_types_are_sandboxed(self):
+        # On the fleet's domain, declared HTML, XHTML, SVG and XML run in an
+        # opaque origin.
+        for path, ctype in (("/gw/cdn-test.html", "text/html"), ("/gw/x.xhtml", "application/xhtml+xml"),
+                            ("/gw/declared.svg", "image/svg+xml"), ("/gw/t.xml", "text/xml"),
+                            ("/gw/a.xml", "application/xml")):
+            st, h, _ = self.https("z1.cdn.hippius.com", path)
+            self.assertEqual((st, h.get("content-type")), (200, ctype), path)
+            self.assertEqual(h.get("content-security-policy"), "sandbox allow-scripts", path)
+        # Anything else carries no policy, the fallback's octet-stream included.
+        for path in ("/gw/style.css", "/gw/app.js", "/gw/logo.png", "/gw/page.html"):
+            st, h, _ = self.https("z1.cdn.hippius.com", path)
+            self.assertEqual(st, 200, path)
+            self.assertNotIn("content-security-policy", h, path)
+        # A custom domain is the customer's own site: not sandboxed.
+        st, h, _ = self.https("img.example.com", "/gw/cdn-test.html")
+        self.assertEqual((st, h.get("content-type")), (200, "text/html"))
+        self.assertNotIn("content-security-policy", h)
+
+    def test_bc_origin_redirect_is_generic_and_never_cached(self):
+        for _ in range(2):
+            st, h, body = self.https("img.example.com", "/gw/moved.txt")
+            self.assertEqual((st, body), (301, b"301\n"))
+            self.assertNotIn("location", h)
+            self.assertEqual(h.get("cache-control"), "no-store")
+            self.assertEqual(h.get("content-type"), "text/plain")
+        self.assertEqual(len(self.origin_hits(MOVED_PATH)), 2, "an origin redirect was cached")
 
     def test_c_private_bucket_is_sigv4_signed(self):
         st, _, body = self.https("dl.example.com", "/doc.txt")
@@ -616,6 +742,7 @@ class DataPlane(unittest.TestCase):
         st, h, body = self.https("img.example.com", "/empty.txt")
         self.assertEqual((st, body), (200, b""))
         self.assertEqual(h.get("content-length"), "0")
+        self.assertEqual(h.get("content-type"), "text/plain", "S3's 416 type is not passed on")
         # With a client Range, 416 is the right answer.
         self.assertEqual(self.https("img.example.com", "/empty.txt", headers={"Range": "bytes=0-0"})[0], 416)
 
