@@ -210,7 +210,9 @@ RequiresMountsFor=/var/lib/hippius-data
 ConditionPathIsMountPoint=/var/lib/hippius-data
 # No public listener without the input firewall.
 Requires=hippius-cdn-firewall.service
-After=network-online.target systemd-resolved.service hippius-cdn-firewall.service
+# The cache directory comes from tmpfiles (hippius-cdn.conf above), on the
+# data volume the initramfs binds before switch-root.
+After=network-online.target systemd-resolved.service hippius-cdn-firewall.service systemd-tmpfiles-setup.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 

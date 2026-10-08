@@ -279,6 +279,18 @@
       the v5 heartbeat is the v4 body plus the host-health fields, and the
       agent refuses the config otherwise.
 
+- name: Assert the v6 heartbeat is only asked for on top of v5
+  # The agent refuses `schema_agent_version` without `schema_host_health`
+  # and would not start; say so here instead.
+  ansible.builtin.assert:
+    that:
+      - not (miner_heartbeat_schema_agent_version | default(false) | bool)
+        or (miner_heartbeat_schema_host_health | default(false) | bool)
+    fail_msg: >-
+      miner_heartbeat_schema_agent_version needs
+      miner_heartbeat_schema_host_health: the v6 heartbeat is the v5 body
+      plus the agent release tag, and the agent refuses the config otherwise.
+
 - name: Render the miner-agent config
   ansible.builtin.template:
     # Explicit playbook-relative path — unambiguous regardless of the
@@ -420,6 +432,9 @@
       # retries until the mesh address is back.
       After=network-online.target libvirtd.service netbird.service
       Wants=network-online.target libvirtd.service netbird.service
+      # No start-rate limit: Restart= must always bring the agent back,
+      # including after the auto-updater's SIGKILL swap and its rollback.
+      StartLimitIntervalSec=0
 
       [Service]
       Type=simple
@@ -453,28 +468,51 @@
     enabled: true
     daemon_reload: true
 
-- name: "OPERATOR ACTION — restart the agent if it was already running"
+- name: "OPERATOR ACTION — swap the agent if it was already running"
   # The miner-agent lifecycle is operator-controlled (the service is
   # enabled, not started). If this run REPLACED the binary and the
   # operator had already started the service, it keeps running the old
-  # binary until restarted — surface that rather than auto-restarting.
+  # binary until relaunched — surface that rather than auto-restarting.
+  # Never `systemctl restart`: a graceful stop destroys every domain
+  # unless the RUNNING process started with skip_shutdown_teardown.
   ansible.builtin.debug:
     msg: >-
       The miner-agent binary was (re)installed. If the service is
-      already running on this host, restart it to pick up the new
-      binary: systemctl restart {{ miner_agent.systemd_unit_name }}
+      already running on this host, relaunch it on the new binary with
+      `systemctl kill --signal=SIGKILL {{ miner_agent.systemd_unit_name }}`
+      (Restart= brings it back and it re-adopts the running CVMs). Do not
+      use systemctl restart/stop. See miner-tasks/AUTO_UPDATE.md.
   when: miner_agent_build_needed | bool
 
-# ── Auto-update (S3 channel) ────────────────────────────────────────
-# A systemd timer pulls the latest published miner-agent build from
-# Hippius S3 every ~15 min, sha256-verifies it, atomically installs it,
-# and rolls back on an unhealthy restart. The files are always installed;
-# the timer only runs when miner_auto_update_enabled is true (default
-# false — rollouts are a manual canary). Change-detection is sha256,
-# NOT --version (the agent's --version is a static 0.0.1 that is never
-# bumped). See miner-tasks/AUTO_UPDATE.md. Tagged `miner_auto_update` so
-# the switch can be applied alone (`--tags miner_auto_update`) without
-# re-running the rest of the agent install.
+# ── Auto-update (GitHub Releases) ──────────────────────────────────
+# A systemd timer runs /usr/local/bin/hippius-miner-update, which installs
+# the latest release of miner_auto_update_release_repo once it is old
+# enough and verified (sha256, cosign build-provenance attestation, the
+# binary's --version), swaps the agent with SIGKILL — never stop/restart —
+# and rolls back on a missing heartbeat. The files are always installed;
+# the timer only runs when miner_auto_update_enabled is true (the
+# group_vars default). See miner-tasks/AUTO_UPDATE.md. Tagged
+# `miner_auto_update` so the switch can be applied alone
+# (`--tags miner_auto_update`) without re-running the agent install.
+- name: Ensure the cosign directory exists
+  tags: [miner_auto_update]
+  ansible.builtin.file:
+    path: "{{ miner_cosign.path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install cosign (pinned version + digest) for the release attestation
+  tags: [miner_auto_update]
+  ansible.builtin.get_url:
+    url: "https://github.com/sigstore/cosign/releases/download/{{ miner_cosign.version }}/cosign-linux-amd64"
+    dest: "{{ miner_cosign.path }}"
+    checksum: "sha256:{{ miner_cosign.sha256 }}"
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Install the miner-agent auto-update script
   tags: [miner_auto_update]
   ansible.builtin.copy:
@@ -507,12 +545,11 @@
 
 - name: Enable + start the auto-update timer (gated on miner_auto_update_enabled)
   tags: [miner_auto_update]
-  # `daemon_reload` picks up the rendered units. The timer is only
-  # enabled when auto-update is on; when disabled we stop+disable it so a
-  # previously-enabled miner is cleanly frozen. Only the timer: the agent
-  # service (hippius-miner-agent.service) is never stopped here.
+  # `daemon_reload` picks up the rendered units. Disabled: stop + disable
+  # the timer so a previously enabled miner is frozen. Only the timer: the
+  # agent service ({{ miner_agent.systemd_unit_name }}) is never touched.
   ansible.builtin.systemd:
     name: hippius-miner-update.timer
-    enabled: "{{ miner_auto_update_enabled | default(false) | bool }}"
-    state: "{{ 'started' if (miner_auto_update_enabled | default(false) | bool) else 'stopped' }}"
+    enabled: "{{ miner_auto_update_enabled | bool }}"
+    state: "{{ 'started' if (miner_auto_update_enabled | bool) else 'stopped' }}"
     daemon_reload: true

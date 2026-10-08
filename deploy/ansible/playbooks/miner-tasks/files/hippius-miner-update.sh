@@ -1,41 +1,55 @@
 #!/usr/bin/env bash
 # =============================================================================
-# hippius-miner-update.sh — Auto-update hippius-miner-agent from Hippius S3
+# hippius-miner-update — auto-update hippius-miner-agent from GitHub Releases
 #
-# Modelled on arion's `arion-miner-update.sh` (GitHub-release driven), but
-# adapted to Hippius S3 as the distribution channel. A systemd timer fires
-# this oneshot every ~15 min.
+# Modelled on arion's `arion-miner-update.sh`, with three differences that
+# matter on a host carrying tenant CVMs:
 #
-# Flow:
-#   1. Fetch ${S3_BASE}/latest.json  → { "tag", "sha256", "url" }
-#   2. Compare manifest sha256 with the INSTALLED binary's sha256.
-#      Equal → already up to date, exit 0.
-#      (We compare sha256, NOT `--version`: `hippius-miner-agent --version`
-#       prints a STATIC `hippius-miner-agent 0.0.1` — the Cargo crate
-#       version, which is never bumped — so a version compare can't detect
-#       a fresh build. The sha256 changes on every new build, so it is the
-#       real change-detection signal. `tag` is for human-readable logging.)
-#   3. Download the binary, recompute sha256, REQUIRE it to equal the
-#      manifest sha256 before installing (integrity, MANDATORY).
-#   4. OPTIONAL Ed25519 signature verify if UPDATE_PUBKEY is configured and
-#      the manifest ships a `sig` — otherwise skip (sha256-over-HTTPS is the
-#      baseline, matching arion's simplicity).
-#   5. Sanity-run the new binary (`--help`), stop the service, back up the
-#      old binary, atomic install, restart, health-check (is-active AND a
-#      fresh heartbeat delivered). ROLL BACK to the backup on any failure.
+#   - The agent is NEVER stopped or restarted. A graceful stop of
+#     hippius-miner-agent destroys every domain on the host unless the
+#     running process started with `skip_shutdown_teardown = true`. The swap
+#     is: atomic install, then `systemctl kill --signal=SIGKILL`, and
+#     `Restart=` brings the agent back to re-adopt the running CVMs. QEMU
+#     runs in machine.slice, outside the agent's cgroup.
+#   - Every release is verified before it runs: sha256 against SHA256SUMS,
+#     the GitHub build-provenance attestation (cosign, pinned to the release
+#     workflow of thenervelab/hippius-cvm at that exact tag), then the
+#     binary's own `--version` must name the tag.
+#   - The fleet does not move at once: a release younger than
+#     MIN_RELEASE_AGE_H hours is ignored, the timer adds a large random
+#     delay, a tag that failed its health check is never retried, and an
+#     older tag is never installed over a newer one.
 #
-# Install (handled by the Ansible miner-tasks role):
-#   install -m 0755 hippius-miner-update.sh /usr/local/bin/hippius-miner-update
-#   # renders /etc/hippius-miner/auto-update.env with S3_BASE (+ UPDATE_PUBKEY)
-#   systemctl enable --now hippius-miner-update.timer
+# Flow (one run, fired by hippius-miner-update.timer):
+#   1. opt-outs: /var/lib/hippius-miner/.no-auto-update, AUTO_UPDATE_DISABLED
+#   2. GET ${RELEASES_API} (default: the last 20 hippius-cvm releases) and
+#      pick the highest tag among complete releases (binary, SHA256SUMS and
+#      attestation all attached; not a draft or prerelease)
+#   3. tag newer than the installed one? (/var/lib/hippius-miner/installed-
+#      release, or the tag the running binary was built as)
+#   4. no .update-failed-<tag> marker, and the last of its three files was
+#      uploaded at least MIN_RELEASE_AGE_H hours ago
+#   5. download binary + SHA256SUMS + <binary>.sigstore.json
+#   6. sha256 -> cosign verify-blob-attestation -> `--version` == tag
+#   7. preflight: skip_shutdown_teardown = true, Restart= set, agent active,
+#      no QEMU process in the agent's cgroup
+#   8. backup to .bak, atomic install, SIGKILL, wait for the relaunch
+#   9. health: the relaunched process stays up AND logs
+#      `heartbeat-pusher: ... outcome=delivered` within HEALTH_TIMEOUT_S
+#  10. unhealthy -> same SIGKILL swap back to .bak, .update-failed-<tag>
+#      marker, exit 1. Healthy -> record the tag in installed-release.
 #
-# To disable auto-update on a specific miner (e.g. a dev box):
-#   touch /var/lib/hippius-miner/.no-auto-update
-#   # or set AUTO_UPDATE_DISABLED=true in /etc/hippius-miner/auto-update.env
+# Release tags are `vYYYY.MM.DD` or `vYYYY.MM.DD.N` (N = 1..999, a second
+# release the same day). They compare as the integer tuple
+# (YYYY, MM, DD, N), with N = 0 when absent: v2026.10.08 < v2026.10.08.1
+# < v2026.10.09. Anything else is refused.
+#
+# Installed by deploy/ansible/playbooks/miner-tasks/miner-agent-install.yml
+# (tag `miner_auto_update`), configured by /etc/hippius-miner/auto-update.env.
+# See miner-tasks/AUTO_UPDATE.md.
 # =============================================================================
 set -euo pipefail
 
-# ── Config (env file rendered by Ansible) ───────────────────────────────────
 ENV_FILE="${HIPPIUS_MINER_UPDATE_ENV:-/etc/hippius-miner/auto-update.env}"
 # shellcheck source=/dev/null
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
@@ -43,224 +57,478 @@ ENV_FILE="${HIPPIUS_MINER_UPDATE_ENV:-/etc/hippius-miner/auto-update.env}"
 BINARY_PATH="${MINER_BINARY:-/usr/local/bin/hippius-miner-agent}"
 SERVICE_NAME="${MINER_SERVICE:-hippius-miner-agent}"
 STATE_DIR="${MINER_STATE_DIR:-/var/lib/hippius-miner}"
-NO_UPDATE_FLAG="${STATE_DIR}/.no-auto-update"
-# S3_BASE e.g. https://s3.hippius.com/<bucket>/miner-agent  (no trailing slash)
-S3_BASE="${S3_BASE:-}"
-# Optional pinned operator Ed25519 public key (PEM path or 64-hex). Empty = skip sig.
-UPDATE_PUBKEY="${UPDATE_PUBKEY:-}"
+MINER_CONFIG="${MINER_CONFIG:-/etc/hippius-miner/config.toml}"
+RELEASE_REPO="${RELEASE_REPO:-thenervelab/hippius-cvm}"
+RELEASES_API="${RELEASES_API:-https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=20}"
+ASSET_NAME="${ASSET_NAME:-hippius-miner-agent-x86_64-linux-gnu}"
+MIN_RELEASE_AGE_H="${MIN_RELEASE_AGE_H:-24}"
+HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-300}"
+RELAUNCH_TIMEOUT_S="${RELAUNCH_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+COSIGN_BIN="${COSIGN_BIN:-/usr/local/libexec/hippius-miner/cosign}"
+CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
 AUTO_UPDATE_DISABLED="${AUTO_UPDATE_DISABLED:-false}"
+export TUF_ROOT="${TUF_ROOT:-${STATE_DIR}/sigstore-tuf}"
 
-LOG_TAG="hippius-miner-update"
-TMP_DIR="$(mktemp -d)"
+# Not configurable: the attestation must come from GitHub Actions, from the
+# release workflow, built from the tag being installed.
+readonly OIDC_ISSUER="https://token.actions.githubusercontent.com"
+readonly WORKFLOW_PATH=".github/workflows/miner-agent-release.yml"
+readonly PROVENANCE_TYPE="https://slsa.dev/provenance/v1"
+readonly TAG_RE='^v([0-9]{4})\.([0-9]{2})\.([0-9]{2})(\.([1-9][0-9]{0,2}))?$'
 
-cleanup() { rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
-
-log() { echo "[$LOG_TAG] $*" | systemd-cat -t "$LOG_TAG" -p info 2>/dev/null || echo "[$LOG_TAG] $*"; }
-err() { echo "[$LOG_TAG] ERROR: $*" | systemd-cat -t "$LOG_TAG" -p err 2>/dev/null || echo "[$LOG_TAG] ERROR: $*" >&2; }
-
-# ── Pre-flight ──────────────────────────────────────────────────────────────
-if [ -f "$NO_UPDATE_FLAG" ]; then
-    log "Auto-update disabled (.no-auto-update flag present at $NO_UPDATE_FLAG)"
-    exit 0
-fi
-if [ "$AUTO_UPDATE_DISABLED" = "true" ]; then
-    log "Auto-update disabled (AUTO_UPDATE_DISABLED=true)"
-    exit 0
-fi
-if [ -z "$S3_BASE" ]; then
-    err "S3_BASE is not configured (expected in $ENV_FILE) — refusing to run"
-    exit 1
-fi
-if [ ! -x "$BINARY_PATH" ]; then
-    err "Installed binary not found at $BINARY_PATH"
-    exit 1
-fi
-
-sha256_of() { sha256sum "$1" | awk '{print $1}'; }
-
-# ── Fetch the manifest ──────────────────────────────────────────────────────
-MANIFEST="${TMP_DIR}/latest.json"
-MANIFEST_URL="${S3_BASE%/}/latest.json"
-log "Fetching manifest: $MANIFEST_URL"
-if ! curl -sfL --max-time 30 -o "$MANIFEST" "$MANIFEST_URL"; then
-    err "Failed to fetch manifest from $MANIFEST_URL"
-    exit 1
-fi
-if [ ! -s "$MANIFEST" ]; then
-    err "Manifest is empty"
-    exit 1
-fi
-
-# Parse manifest with python3 (always present on the miner image; same
-# approach arion uses for the GitHub asset list).
-read_manifest_field() {
-    MANIFEST="$MANIFEST" python3 -c "
-import json, os, sys
-d = json.load(open(os.environ['MANIFEST']))
-print(d.get(sys.argv[1], ''))
-" "$1" 2>/dev/null || echo ""
-}
-
-MANIFEST_SHA="$(read_manifest_field sha256)"
-MANIFEST_TAG="$(read_manifest_field tag)"
-MANIFEST_URL_FIELD="$(read_manifest_field url)"
-MANIFEST_SIG="$(read_manifest_field sig)"
-
-if [ -z "$MANIFEST_SHA" ]; then
-    err "Manifest is missing the required 'sha256' field"
-    exit 1
-fi
-# Normalise to lowercase hex for the comparison.
-MANIFEST_SHA="$(echo "$MANIFEST_SHA" | tr '[:upper:]' '[:lower:]')"
-log "Manifest tag=${MANIFEST_TAG:-<none>} sha256=${MANIFEST_SHA}"
-
-# ── Change detection: manifest sha256 vs installed binary sha256 ────────────
-INSTALLED_SHA="$(sha256_of "$BINARY_PATH" | tr '[:upper:]' '[:lower:]')"
-log "Installed binary sha256=${INSTALLED_SHA}"
-if [ "$MANIFEST_SHA" = "$INSTALLED_SHA" ]; then
-    log "Already up to date (sha256 match)"
-    exit 0
-fi
-log "New build published — updating (installed ${INSTALLED_SHA:0:12} -> published ${MANIFEST_SHA:0:12}, tag ${MANIFEST_TAG:-<none>})"
-
-# ── Download the new binary ─────────────────────────────────────────────────
-if [ -n "$MANIFEST_URL_FIELD" ]; then
-    DOWNLOAD_URL="$MANIFEST_URL_FIELD"
-elif [ -n "$MANIFEST_TAG" ]; then
-    DOWNLOAD_URL="${S3_BASE%/}/${MANIFEST_TAG}/hippius-miner-agent"
-else
-    err "Manifest has neither 'url' nor 'tag' — cannot locate the binary"
-    exit 1
-fi
-
-NEW_BINARY="${TMP_DIR}/hippius-miner-agent"
-log "Downloading binary: $DOWNLOAD_URL"
-if ! curl -sfL --max-time 180 -o "$NEW_BINARY" "$DOWNLOAD_URL"; then
-    err "Failed to download binary from $DOWNLOAD_URL"
-    exit 1
-fi
-if [ ! -s "$NEW_BINARY" ]; then
-    err "Downloaded binary is empty"
-    exit 1
-fi
-
-# ── Integrity: recompute sha256, REQUIRE match (MANDATORY) ──────────────────
-DOWNLOAD_SHA="$(sha256_of "$NEW_BINARY" | tr '[:upper:]' '[:lower:]')"
-if [ "$DOWNLOAD_SHA" != "$MANIFEST_SHA" ]; then
-    err "sha256 mismatch: manifest=${MANIFEST_SHA} download=${DOWNLOAD_SHA} — refusing to install"
-    exit 1
-fi
-log "sha256 verified: ${DOWNLOAD_SHA}"
-
-# ── Signature (OPTIONAL): Ed25519 over the sha256 hex, if pubkey configured ──
-# We sign the lowercase sha256 hex string (compact, deterministic, and the
-# sha256 already binds the full binary). publish-miner-agent.sh signs the
-# same string. Only enforced when BOTH a pubkey is pinned AND the manifest
-# ships a `sig`; otherwise the sha256-over-HTTPS baseline stands.
-if [ -n "$UPDATE_PUBKEY" ]; then
-    if [ -z "$MANIFEST_SIG" ]; then
-        err "UPDATE_PUBKEY is configured but the manifest carries no 'sig' — refusing (signing required once a key is pinned)"
-        exit 1
-    fi
-    # Resolve the pubkey to a PEM file usable by `openssl pkeyutl`.
-    PUBKEY_PEM="${TMP_DIR}/update.pub.pem"
-    if [ -f "$UPDATE_PUBKEY" ]; then
-        cp "$UPDATE_PUBKEY" "$PUBKEY_PEM"
-    else
-        # Treat as 64-hex raw Ed25519 public key → wrap into a DER/PEM
-        # SubjectPublicKeyInfo (the 12-byte Ed25519 SPKI prefix + the 32 key bytes).
-        if ! printf '%s' "$UPDATE_PUBKEY" | grep -Eq '^[0-9a-fA-F]{64}$'; then
-            err "UPDATE_PUBKEY is neither a readable PEM file nor 64-hex — cannot verify signature"
-            exit 1
-        fi
-        if ! printf '302a300506032b6570032100%s' "$(echo "$UPDATE_PUBKEY" | tr '[:upper:]' '[:lower:]')" \
-                | xxd -r -p \
-                | openssl pkey -pubin -inform DER -out "$PUBKEY_PEM" 2>/dev/null; then
-            err "Failed to materialise Ed25519 pubkey from hex (need openssl + xxd)"
-            exit 1
-        fi
-    fi
-    # The signature is base64 of the raw 64-byte Ed25519 signature over the
-    # sha256-hex string.
-    SIG_BIN="${TMP_DIR}/update.sig"
-    if ! printf '%s' "$MANIFEST_SIG" | base64 -d > "$SIG_BIN" 2>/dev/null; then
-        err "Manifest 'sig' is not valid base64"
-        exit 1
-    fi
-    SHA_MSG="${TMP_DIR}/sha.msg"
-    printf '%s' "$MANIFEST_SHA" > "$SHA_MSG"
-    if openssl pkeyutl -verify -pubin -inkey "$PUBKEY_PEM" \
-            -rawin -in "$SHA_MSG" -sigfile "$SIG_BIN" >/dev/null 2>&1; then
-        log "Ed25519 signature verified against pinned pubkey"
-    else
-        err "Ed25519 signature verification FAILED — refusing to install"
-        exit 1
-    fi
-else
-    log "No UPDATE_PUBKEY configured — skipping signature check (sha256-over-HTTPS baseline)"
-fi
-
-# ── Binary sanity: must run --help before we touch the live service ─────────
-chmod +x "$NEW_BINARY"
-if ! "$NEW_BINARY" --help >/dev/null 2>&1; then
-    # `--version` as a fallback (some builds may gate --help differently).
-    if ! "$NEW_BINARY" --version >/dev/null 2>&1; then
-        err "Downloaded binary failed to run (--help and --version both errored) — refusing to install"
-        exit 1
-    fi
-fi
-log "New binary sanity check passed"
-
-# ── Atomic install with backup + rollback ───────────────────────────────────
+NO_UPDATE_FLAG="${STATE_DIR}/.no-auto-update"
+INSTALLED_FILE="${STATE_DIR}/installed-release"
+# Present from just before the new binary is installed until the update is
+# confirmed healthy or rolled back. Found at startup = an earlier run was
+# cut short (timeout, power loss): roll back before anything else.
+TXN_FILE="${STATE_DIR}/update-in-progress"
 BACKUP_PATH="${BINARY_PATH}.bak"
-RESTART_REF="$(date '+%Y-%m-%d %H:%M:%S')"
+LOG_TAG="hippius-miner-update"
 
-log "Stopping $SERVICE_NAME"
-systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+# Fallbacks go to stderr: stdout of some functions is captured (a PID).
+log() { printf '%s\n' "$*" | systemd-cat -t "$LOG_TAG" -p info 2>/dev/null || printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
+warn() { printf '%s\n' "WARNING: $*" | systemd-cat -t "$LOG_TAG" -p warning 2>/dev/null || printf '[%s] WARNING: %s\n' "$LOG_TAG" "$*" >&2; }
+err() { printf '%s\n' "ERROR: $*" | systemd-cat -t "$LOG_TAG" -p err 2>/dev/null || printf '[%s] ERROR: %s\n' "$LOG_TAG" "$*" >&2; }
+die() { err "$*"; exit 1; }
 
-cp -p "$BINARY_PATH" "$BACKUP_PATH"
-install -m 0755 "$NEW_BINARY" "$BINARY_PATH"
+# ── Tags ─────────────────────────────────────────────────────────────────────
 
-log "Starting $SERVICE_NAME (tag ${MANIFEST_TAG:-<none>})"
-systemctl start "$SERVICE_NAME"
+valid_tag() { [[ "$1" =~ $TAG_RE ]]; }
 
-rollback() {
-    err "Update unhealthy — rolling back to the previous binary"
-    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-    if [ -f "$BACKUP_PATH" ]; then
-        install -m 0755 "$BACKUP_PATH" "$BINARY_PATH"
-    fi
-    systemctl start "$SERVICE_NAME" 2>/dev/null || true
+# "YYYY MM DD N" with base-10 integers (no octal surprise on "08").
+tag_key() {
+    [[ "$1" =~ $TAG_RE ]] || return 1
+    printf '%d %d %d %d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" \
+        "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[5]:-0}))"
 }
 
-# Give the agent time to boot and push its first heartbeat.
-sleep 6
+# Prints -1, 0 or 1 for a < b, a == b, a > b. Both must be valid tags.
+tag_cmp() {
+    local a b i
+    read -r -a a <<<"$(tag_key "$1")"
+    read -r -a b <<<"$(tag_key "$2")"
+    for i in 0 1 2 3; do
+        if [ "${a[i]}" -lt "${b[i]}" ]; then echo -1; return; fi
+        if [ "${a[i]}" -gt "${b[i]}" ]; then echo 1; return; fi
+    done
+    echo 0
+}
 
-# Health check 1: the unit is active.
-if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-    rollback
-    exit 1
-fi
-
-# Health check 2: a fresh heartbeat was delivered since the restart. The
-# agent logs `hippius-miner-agent: heartbeat-pusher: ... outcome=delivered`
-# to the journal. Poll for up to ~30s (heartbeat cadence may exceed 6s).
-HEARTBEAT_OK=false
-for _ in 1 2 3 4 5; do
-    if journalctl -u "$SERVICE_NAME" --since "$RESTART_REF" --no-pager 2>/dev/null \
-            | grep -q 'heartbeat-pusher:.*outcome=delivered'; then
-        HEARTBEAT_OK=true
-        break
+# The tag inside `hippius-miner-agent <crate version> (<tag>)`, if any.
+binary_tag() {
+    local line
+    line="$(timeout 10 "$1" --version 2>/dev/null | head -n1)" || return 0
+    if [[ "$line" =~ ^hippius-miner-agent\ [^\ ]+\ \(([^\)]+)\)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
     fi
-    sleep 6
-done
+}
 
-if [ "$HEARTBEAT_OK" != "true" ]; then
-    err "No delivered heartbeat observed since restart ($RESTART_REF)"
-    rollback
+# The highest release this host is known to run: the recorded tag or the
+# tag compiled into the installed binary. Empty when neither is a release
+# (a source build, or v2026.10.07 which predates the embedded tag).
+installed_tag() {
+    local recorded="" embedded best="" t
+    [ -f "$INSTALLED_FILE" ] && recorded="$(head -n1 "$INSTALLED_FILE" | tr -d '[:space:]')"
+    embedded="$(binary_tag "$BINARY_PATH")"
+    for t in "$recorded" "$embedded"; do
+        valid_tag "$t" || continue
+        if [ -z "$best" ] || [ "$(tag_cmp "$t" "$best")" = 1 ]; then best="$t"; fi
+    done
+    printf '%s\n' "$best"
+}
+
+# ── systemd ──────────────────────────────────────────────────────────────────
+
+unit_prop() { systemctl show -p "$1" --value "$SERVICE_NAME"; }
+
+# Prints the first QEMU process found anywhere in the agent's cgroup tree
+# (nested cgroups included); returns 1 when there is none. `systemctl kill`
+# signals every process of the unit, so a QEMU in there would die with it.
+# QEMU belongs in machine.slice. Returns 2 when the tree cannot be read.
+qemu_in_agent_cgroup() {
+    local cg dir procs pid pname
+    cg="$(unit_prop ControlGroup)"
+    dir="${CGROUP_ROOT}${cg}"
+    [ -n "$cg" ] && [ -r "$dir/cgroup.procs" ] || return 2
+    while read -r procs; do
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            pname="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+            case "$pname" in
+                qemu* | *qemu-system* | *kvm*) printf '%s (%s) in %s\n' "$pid" "$pname" "${procs%/cgroup.procs}"; return 0 ;;
+            esac
+        done <"$procs"
+    done < <(find "$dir" -name cgroup.procs 2>/dev/null)
+    return 1
+}
+
+# The only signal this script ever sends the agent. Never `stop`/`restart`:
+# a graceful shutdown is what tears the domains down. Checked right before
+# every kill, rollback included.
+sigkill_agent() {
+    local found rc=0
+    found="$(qemu_in_agent_cgroup)" || rc=$?
+    case "$rc" in
+        0) err "not sending SIGKILL: QEMU pid $found, inside $SERVICE_NAME's cgroup"; return 1 ;;
+        2) err "not sending SIGKILL: cannot read the cgroup of $SERVICE_NAME"; return 1 ;;
+    esac
+    systemctl kill --signal=SIGKILL "$SERVICE_NAME"
+}
+
+# Waits for systemd to bring the agent back under a PID other than $1.
+# Prints the new PID.
+wait_relaunch() {
+    local old_pid="$1" deadline pid state
+    deadline=$(( $(date +%s) + RELAUNCH_TIMEOUT_S ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep "$POLL_INTERVAL_S"
+        pid="$(unit_prop MainPID)"
+        state="$(unit_prop ActiveState)"
+        if [ "$state" = active ] && [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != "$old_pid" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Healthy = the process systemd relaunched is still the main PID and has
+# delivered a heartbeat since the swap began ($2, epoch seconds). Only lines
+# that PID wrote after $2 count: a heartbeat the old process logged just
+# before the kill, or an earlier process that had the same PID, cannot pass.
+wait_healthy() {
+    local pid="$1" since="$2" deadline
+    deadline=$(( $(date +%s) + HEALTH_TIMEOUT_S ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep "$POLL_INTERVAL_S"
+        if [ "$(unit_prop ActiveState)" != active ] || [ "$(unit_prop MainPID)" != "$pid" ]; then
+            err "agent pid $pid is gone (crashed or restarted by systemd)"
+            return 1
+        fi
+        if journalctl -b --since "@${since}" "_SYSTEMD_UNIT=${SERVICE_NAME}.service" "_PID=${pid}" -o cat --no-pager 2>/dev/null \
+                | grep -q 'heartbeat-pusher:.*outcome=delivered'; then
+            if [ "$(unit_prop ActiveState)" = active ] && [ "$(unit_prop MainPID)" = "$pid" ]; then
+                return 0
+            fi
+        fi
+    done
+    err "no delivered heartbeat from pid $pid within ${HEALTH_TIMEOUT_S}s"
+    return 1
+}
+
+# Running domain UUIDs, sorted. Fails if libvirt cannot be asked.
+running_domains() {
+    local out
+    out="$(virsh -c qemu:///system list --uuid)" || return 1
+    printf '%s\n' "$out" | sed '/^$/d' | sort
+}
+
+# ── Preflight: refuse anything that could take the domains down ─────────────
+
+preflight_swap() {
+    if ! python3 -I -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+sys.exit(0 if cfg.get("host", {}).get("skip_shutdown_teardown") is True else 1)
+' "$MINER_CONFIG" 2>/dev/null; then
+        die "refusing to swap: [host] skip_shutdown_teardown = true is not set in $MINER_CONFIG. Without it any later graceful stop of $SERVICE_NAME (netbird stop, host shutdown) destroys every domain. Re-render the config with play 05, then SIGKILL-swap the agent by hand once (AUTO_UPDATE.md)."
+    fi
+    case "$(unit_prop Restart)" in
+        always | on-failure | on-abnormal | on-abort) ;;
+        *) die "refusing to swap: $SERVICE_NAME has Restart=$(unit_prop Restart); systemd would not relaunch it after SIGKILL" ;;
+    esac
+    if [ "$(unit_prop ActiveState)" != active ]; then
+        die "refusing to swap: $SERVICE_NAME is not active ($(unit_prop ActiveState)); an operator stopped it, leave it alone"
+    fi
+    local found rc=0
+    found="$(qemu_in_agent_cgroup)" || rc=$?
+    case "$rc" in
+        0) die "refusing to swap: QEMU pid $found, inside $SERVICE_NAME's cgroup; SIGKILL would kill it" ;;
+        2) die "refusing to swap: cannot read the cgroup of $SERVICE_NAME" ;;
+    esac
+}
+
+# Installs $1 over the agent binary atomically: a verified, fsynced copy
+# renamed in the same directory. Explicit returns: callers run it in an `||`
+# context, where errexit is off.
+install_binary() {
+    install -m 0755 "$1" "${BINARY_PATH}.new" || return 1
+    sync -- "${BINARY_PATH}.new" || return 1
+    cmp -s "$1" "${BINARY_PATH}.new" || return 1
+    mv -f "${BINARY_PATH}.new" "$BINARY_PATH" || return 1
+    sync -- "$(dirname -- "$BINARY_PATH")"
+}
+
+# Brings the agent up on whatever binary is installed: SIGKILL if it is
+# running, `start` if systemd gave up on it (starting a stopped unit tears
+# nothing down). If systemd does not relaunch it after the kill (start
+# limit), starts it once by hand. Prints the new PID.
+relaunch() {
+    local old_pid
+    old_pid="$(unit_prop MainPID)"
+    if [ "$(unit_prop ActiveState)" = active ] && [ -n "$old_pid" ] && [ "$old_pid" != 0 ]; then
+        sigkill_agent || return 1
+        wait_relaunch "$old_pid" && return 0
+        [ "$(unit_prop ActiveState)" = active ] && return 1
+    fi
+    systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+    systemctl start "$SERVICE_NAME" || return 1
+    wait_relaunch "$old_pid"
+}
+
+# Puts the previous binary back and relaunches the agent on it, then marks
+# $1 failed so it is not retried. The in-progress file is cleared only once
+# the previous binary runs again: if this dies half way, the next run
+# starts over from here before doing anything else.
+rollback() {
+    local tag="$1" reason="$2" pid since
+    err "release $tag unhealthy ($reason): rolling back to the previous binary"
+    [ -f "$BACKUP_PATH" ] \
+        || die "ROLLBACK FAILED: no $BACKUP_PATH to roll back to. Manual intervention needed; never stop or restart $SERVICE_NAME while it hosts domains."
+    install_binary "$BACKUP_PATH" \
+        || die "ROLLBACK FAILED: cannot reinstall $BACKUP_PATH over $BINARY_PATH; the next run retries. Never stop or restart $SERVICE_NAME while it hosts domains."
+    since="$(date +%s)"
+    if ! pid="$(relaunch)"; then
+        die "ROLLBACK FAILED: $SERVICE_NAME did not come back on the previous binary (installed from $BACKUP_PATH); the next run retries. Never stop or restart it while it hosts domains."
+    fi
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >"${STATE_DIR}/.update-failed-${tag}" \
+        || err "cannot write ${STATE_DIR}/.update-failed-${tag}; $tag may be retried"
+    rm -f -- "$TXN_FILE"
+    if wait_healthy "$pid" "$since"; then
+        log "rolled back: $SERVICE_NAME healthy again on the previous binary (pid $pid); $tag will not be retried (remove ${STATE_DIR}/.update-failed-${tag} to retry it)"
+    else
+        err "rolled back, but the previous binary is not healthy either (pid $pid). Manual intervention needed."
+    fi
     exit 1
-fi
+}
 
-log "Update complete: tag ${MANIFEST_TAG:-<none>} sha256 ${MANIFEST_SHA} — service healthy, heartbeat delivered"
-rm -f "$BACKUP_PATH"
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    if [ -f "$NO_UPDATE_FLAG" ]; then
+        log "auto-update disabled ($NO_UPDATE_FLAG present)"
+        exit 0
+    fi
+    if [ "$AUTO_UPDATE_DISABLED" = true ]; then
+        log "auto-update disabled (AUTO_UPDATE_DISABLED=true in $ENV_FILE)"
+        exit 0
+    fi
+    # The repository this host trusts. Its old name still redirects to a
+    # different repository, so an attestation minted under it proves nothing.
+    case "${RELEASE_REPO,,}" in
+        thenervelab/hippius-compute | thenervelab/hippius-compute-internal)
+            die "RELEASE_REPO=$RELEASE_REPO is not the public release repository; refusing" ;;
+    esac
+    [[ "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "RELEASE_REPO '$RELEASE_REPO' is not <owner>/<repo>"
+    [[ "$MIN_RELEASE_AGE_H" =~ ^[0-9]+$ ]] || die "MIN_RELEASE_AGE_H must be a whole number of hours, got '$MIN_RELEASE_AGE_H'"
+
+    mkdir -p "$STATE_DIR"
+    exec 9>"${STATE_DIR}/.update.lock"
+    flock -n 9 || { log "another update run holds the lock; exiting"; exit 0; }
+
+    if [ -f "$TXN_FILE" ]; then
+        local stuck
+        stuck="$(head -n1 "$TXN_FILE" | tr -d '[:space:]')"
+        valid_tag "$stuck" || stuck=unknown
+        err "an earlier run was cut short while swapping to $stuck; restoring the previous binary first"
+        rollback "$stuck" "interrupted mid-swap"
+    fi
+
+    [ -x "$BINARY_PATH" ] || die "installed binary not found at $BINARY_PATH"
+    [ -x "$COSIGN_BIN" ] || die "cosign not found at $COSIGN_BIN; cannot verify a release, refusing to update"
+
+    local tmp
+    tmp="$(mktemp -d "${STATE_DIR}/.update.XXXXXX")"
+    # shellcheck disable=SC2064 # expand now: $tmp is local
+    trap "rm -rf -- '$tmp'" EXIT
+
+    # Every network step is bounded, so a run always ends well inside the
+    # unit's TimeoutStartSec. (A run killed anyway before the swap changes
+    # nothing; one killed during it is recovered by the in-progress file.)
+    fetch() { # <seconds> <out> <url> [curl args]
+        local t="$1" out="$2" url="$3"
+        shift 3
+        curl -fsSL --proto "=https" --proto-redir "=https" --connect-timeout 20 \
+            --retry 2 --max-time "$t" --retry-max-time "$t" "$@" -o "$out" "$url"
+    }
+    fetch 30 "$tmp/release.json" "$RELEASES_API" \
+        -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+        || die "cannot fetch $RELEASES_API"
+
+    # The newest release that is complete: a valid tag, not a draft or
+    # prerelease, carrying the binary, SHA256SUMS and the attestation. A
+    # release without them (its workflow failed, or sbom.yml created it
+    # first) is passed over rather than stalling the fleet. A tag dated
+    # more than two days after its publication is ignored: anti-downgrade
+    # would otherwise pin the host to a mistyped far-future tag forever.
+    # "ready" is when the last of the three files landed; the soak counts
+    # from there, not from when the release object was created.
+    local fields
+    fields="$(python3 -I -c '
+import json, re, sys
+from datetime import datetime, timezone
+
+def ts(s):
+    return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+
+data = json.load(open(sys.argv[1]))
+releases = data if isinstance(data, list) else [data]
+asset, tag_re = sys.argv[2], re.compile(sys.argv[3])
+need = (asset, "SHA256SUMS", asset + ".sigstore.json")
+best = None
+for rel in releases:
+    tag = rel.get("tag_name") or ""
+    m = tag_re.fullmatch(tag)
+    if rel.get("draft") or rel.get("prerelease") or not m:
+        continue
+    assets = {a.get("name"): a for a in rel.get("assets", [])}
+    if not all(n in assets for n in need):
+        print(f"release {tag} is incomplete (needs " + " + ".join(need) + "); passed over", file=sys.stderr)
+        continue
+    try:
+        published = ts(rel["published_at"])
+        tag_day = int(datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc).timestamp())
+        ready = max([published] + [ts(assets[n].get("updated_at") or rel["published_at"]) for n in need])
+    except (KeyError, TypeError, ValueError):
+        print(f"release {tag} has an unreadable date; passed over", file=sys.stderr)
+        continue
+    if tag_day > published + 2 * 86400:
+        print(f"release {tag} is dated after its publication; passed over", file=sys.stderr)
+        continue
+    key = (int(m[1]), int(m[2]), int(m[3]), int(m[5] or 0))
+    if best is None or key > best[0]:
+        best = (key, tag, ready, [assets[n].get("browser_download_url") or "" for n in need])
+if best is None:
+    print("")
+    sys.exit(0)
+print(best[1]); print(best[2])
+for u in best[3]:
+    print(u)
+' "$tmp/release.json" "$ASSET_NAME" "$TAG_RE" 2>"$tmp/select.log")" \
+        || die "cannot parse the release metadata from $RELEASES_API: $(tail -n 1 "$tmp/select.log")"
+    while read -r line; do [ -n "$line" ] && warn "$line"; done <"$tmp/select.log"
+
+    # mapfile, not a chain of `read`s: a short answer (no release) must not
+    # trip errexit on EOF.
+    local f tag ready_s url_bin url_sums url_bundle
+    mapfile -t f <<<"$fields"
+    tag="${f[0]:-}" ready_s="${f[1]:-}" url_bin="${f[2]:-}" url_sums="${f[3]:-}" url_bundle="${f[4]:-}"
+
+    if [ -z "$tag" ]; then
+        log "no complete release at $RELEASES_API yet; nothing to do"
+        exit 0
+    fi
+    valid_tag "$tag" || die "selected release tag '$tag' is not vYYYY.MM.DD[.N]; refusing"
+
+    local installed
+    installed="$(installed_tag)"
+    if [ -n "$installed" ]; then
+        case "$(tag_cmp "$tag" "$installed")" in
+            0) log "up to date ($installed)"; exit 0 ;;
+            -1) warn "newest release $tag is OLDER than installed $installed; downgrade refused"; exit 0 ;;
+        esac
+        log "release $tag is newer than installed $installed"
+    else
+        log "installed release unknown (source build or a release without an embedded tag); $tag counts as an upgrade"
+    fi
+
+    if [ -f "${STATE_DIR}/.update-failed-${tag}" ]; then
+        log "release $tag failed its health check here before; skipping it (remove ${STATE_DIR}/.update-failed-${tag} to retry)"
+        exit 0
+    fi
+
+    [[ "$ready_s" =~ ^[0-9]+$ ]] || die "release $tag has an unreadable publication time"
+    local age_s
+    age_s=$(( $(date -u +%s) - ready_s ))
+    if [ "$age_s" -lt $(( MIN_RELEASE_AGE_H * 3600 )) ]; then
+        log "release $tag has been complete for $(( age_s / 3600 ))h (< MIN_RELEASE_AGE_H=${MIN_RELEASE_AGE_H}h); waiting"
+        exit 0
+    fi
+
+    local u
+    for u in "$url_bin" "$url_sums" "$url_bundle"; do
+        [[ "$u" == https://* ]] || die "release $tag has a non-https download URL '$u'; refusing"
+    done
+    local new="$tmp/$ASSET_NAME"
+    fetch 600 "$new" "$url_bin" || die "cannot download $url_bin"
+    fetch 60 "$tmp/SHA256SUMS" "$url_sums" || die "cannot download $url_sums"
+    fetch 60 "$tmp/bundle.json" "$url_bundle" || die "cannot download $url_bundle"
+
+    # 1. sha256: exactly one SHA256SUMS line for the asset, and it matches.
+    local want got
+    want="$(awk -v n="$ASSET_NAME" '{ f = $2; sub(/^\*/, "", f) } f == n { print tolower($1) }' "$tmp/SHA256SUMS")"
+    [ "$(printf '%s' "$want" | grep -c .)" = 1 ] || die "SHA256SUMS of $tag must list $ASSET_NAME exactly once"
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "SHA256SUMS of $tag has a malformed digest for $ASSET_NAME"
+    got="$(sha256sum "$new" | awk '{ print $1 }')"
+    [ "$got" = "$want" ] || die "sha256 mismatch for $tag: SHA256SUMS=$want download=$got; refusing"
+    log "sha256 OK for $tag: $got"
+
+    # 2. Build provenance: signed by GitHub Actions for the release workflow
+    #    of $RELEASE_REPO, run on a push of exactly this tag, and its subject
+    #    is this binary.
+    local identity="https://github.com/${RELEASE_REPO}/${WORKFLOW_PATH}@refs/tags/${tag}"
+    if ! timeout 300 "$COSIGN_BIN" verify-blob-attestation \
+            --bundle "$tmp/bundle.json" \
+            --type "$PROVENANCE_TYPE" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            --certificate-github-workflow-repository "$RELEASE_REPO" \
+            --certificate-github-workflow-ref "refs/tags/${tag}" \
+            --certificate-github-workflow-trigger push \
+            "$new" >"$tmp/cosign.log" 2>&1; then
+        err "cosign: $(tail -n 3 "$tmp/cosign.log" | tr '\n' ' ')"
+        die "build-provenance attestation of $tag does not verify for $identity; refusing"
+    fi
+    log "attestation OK for $tag ($identity)"
+
+    # 3. The binary names the tag it was released as.
+    chmod 0755 "$new"
+    local new_tag
+    new_tag="$(binary_tag "$new")"
+    [ "$new_tag" = "$tag" ] || die "downloaded binary reports release '${new_tag}', expected '$tag'; refusing"
+    log "binary reports $tag"
+
+    preflight_swap
+
+    local domains_before pid since
+    domains_before="$(running_domains)" || die "refusing to swap: cannot list the running domains (virsh)"
+    if ! { cp -p "$BINARY_PATH" "${BACKUP_PATH}.new" && sync -- "${BACKUP_PATH}.new" && mv -f "${BACKUP_PATH}.new" "$BACKUP_PATH"; }; then
+        die "cannot back up $BINARY_PATH to $BACKUP_PATH; the running agent was not touched"
+    fi
+    if ! { printf '%s\n' "$tag" >"$TXN_FILE" && sync -- "$TXN_FILE"; }; then
+        die "cannot write $TXN_FILE; the running agent was not touched"
+    fi
+    log "swapping $SERVICE_NAME to $tag (backup $BACKUP_PATH, $(printf '%s' "$domains_before" | grep -c .) running domain(s))"
+    install_binary "$new" || rollback "$tag" "cannot install the new binary"
+    since="$(date +%s)"
+    if ! pid="$(relaunch)"; then
+        rollback "$tag" "agent did not relaunch within ${RELAUNCH_TIMEOUT_S}s"
+    fi
+    if ! wait_healthy "$pid" "$since"; then
+        rollback "$tag" "health check failed"
+    fi
+
+    # Domains outlive the agent. One that stopped across the swap means
+    # something is wrong with this release here: put the previous one back.
+    local after lost
+    after="$(running_domains)" || rollback "$tag" "cannot list the running domains after the swap"
+    lost="$(comm -23 <(printf '%s\n' "$domains_before" | sed '/^$/d') <(printf '%s\n' "$after" | sed '/^$/d'))"
+    if [ -n "$lost" ]; then
+        err "domain(s) running before the swap are no longer running: $(printf '%s' "$lost" | tr '\n' ' ')"
+        rollback "$tag" "running domain(s) disappeared across the swap"
+    fi
+
+    # The in-progress file goes first: if power fails right after, the
+    # binary's own compiled-in tag still says what is installed.
+    rm -f -- "$TXN_FILE"
+    printf '%s\n' "$tag" >"${INSTALLED_FILE}.new"
+    mv -f "${INSTALLED_FILE}.new" "$INSTALLED_FILE"
+    log "updated to $tag: $SERVICE_NAME pid $pid healthy, heartbeat delivered"
+}
+
+# Sourced by the tests for the tag helpers; executed for real otherwise.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

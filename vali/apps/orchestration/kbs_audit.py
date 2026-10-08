@@ -456,8 +456,11 @@ def _ingest_page(
     expected_prev: str,
     broken_at: int | None,
     fetched_at: Any,
+    head_seq: int | None = None,
 ) -> _PageOutcome:
-    """Verify and store one page and move the cursor past it — atomically.
+    """Verify and store one page and move the cursor past it — atomically,
+    with the page's `head_seq`: a cursor never pairs one epoch's position
+    with another epoch's head (the lag the guest report exports).
 
     - Every served record is stored (a held identical one is skipped).
     - A record that does not verify is stored `chain_ok=False` with its
@@ -544,6 +547,7 @@ def _ingest_page(
                     "last_seq": out.last.seq,
                     "last_hash": out.last.actual_hash,
                     "broken_at_seq": out.broken_at,
+                    "head_seq": head_seq,
                 },
             )
     return out
@@ -585,6 +589,10 @@ def ingest_log(log_name: str, *, fetch: Fetch = fetch_page) -> IngestResult:
                 "kbs-audit %s: the KBS log is EMPTY but vali holds epoch %s up to seq %d — "
                 "the KBS restarted; its new epoch begins with its first record",
                 log_name, cursor.kbs_epoch[:16], cursor.last_seq,
+            )
+            # Checked, and nothing is waiting: not behind, not stale.
+            KbsAuditCursor.objects.filter(log=log_name).update(
+                head_seq=cursor.last_seq, checked_at=timezone.now()
             )
         return result
 
@@ -642,6 +650,7 @@ def ingest_log(log_name: str, *, fetch: Fetch = fetch_page) -> IngestResult:
     fetched_at = timezone.now()
     while True:
         entries, head_seq = page["entries"], page["head_seq"]
+        head_seen = head_seq
         if not entries:
             if head_seq >= expected_seq:
                 result.breaks += 1
@@ -656,7 +665,7 @@ def ingest_log(log_name: str, *, fetch: Fetch = fetch_page) -> IngestResult:
         out = _ingest_page(
             log_name, genesis, entries,
             expected_seq=expected_seq, expected_prev=expected_prev,
-            broken_at=broken_at, fetched_at=fetched_at,
+            broken_at=broken_at, fetched_at=fetched_at, head_seq=head_seq,
         )
         result.stored += out.stored
         result.breaks += out.breaks
@@ -679,6 +688,11 @@ def ingest_log(log_name: str, *, fetch: Fetch = fetch_page) -> IngestResult:
         budget -= 1
         if page["genesis_hash_hex"] != genesis:
             break  # restarted mid-run: the next run opens the new epoch
+    # The head this run saw of the epoch it ingested, and when: what the
+    # lag / staleness gauges of the guest report read.
+    KbsAuditCursor.objects.filter(log=log_name, kbs_epoch=genesis).update(
+        head_seq=head_seen, checked_at=timezone.now()
+    )
     result.per_log[log_name] = result.stored
     return result
 

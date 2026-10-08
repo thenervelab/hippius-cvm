@@ -152,6 +152,44 @@ test("meter record classification", function()
     eq(n, 8)
 end)
 
+test("canary heals and logs only state changes", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    local path = dir .. "/.hippius-canary"
+    local logged = {}
+    local function log(level, msg) logged[#logged + 1] = { level, msg } end
+    health.reset_canary_state()
+    -- The cache directory is not there yet: fails, logged once.
+    falsy(health.canary_tick(path, log))
+    falsy(health.canary_tick(path, log))
+    eq(#logged, 1, "one failure line")
+    eq(logged[1][1], ngx.ERR)
+    truthy(logged[1][2]:find("canary write failed", 1, true))
+    -- It appears: written, the recovery logged once.
+    truthy(os.execute("mkdir " .. dir))
+    truthy(health.canary_tick(path, log))
+    truthy(health.canary_tick(path, log))
+    eq(#logged, 2, "one recovery line")
+    eq(logged[2][1], ngx.WARN)
+    local f = io.open(path)
+    eq(f:read("*a"), health.CANARY_BODY)
+    f:close()
+    -- Removed (or clobbered) under a healthy node: rewritten, nothing logged.
+    os.remove(path)
+    truthy(health.canary_tick(path, log))
+    f = io.open(path, "w")
+    f:write("x")
+    f:close()
+    truthy(health.canary_tick(path, log))
+    f = io.open(path)
+    eq(f:read("*a"), health.CANARY_BODY)
+    f:close()
+    eq(#logged, 2)
+    os.remove(path)
+    os.remove(dir)
+    health.reset_canary_state()
+end)
+
 test("health verdict", function()
     settings.health_max_age = 30
     truthy((health.verdict({ ready = true, at = 1000 }, 1010, true)))
@@ -240,6 +278,66 @@ test("certs, secrets, health and attestation validation", function()
     truthy(docs.validate("health", cjson.encode({ ready = true, at = 5 })))
     falsy(docs.validate("health", cjson.encode({ ready = "yes", at = 5 })))
     truthy(docs.validate("attestation", cjson.encode({ format = "f", spki_sha256_hex = "aa", report_b64 = "AA==" })))
+end)
+
+test("s3_credentials: the backend's shape, the long name, and named refusals", function()
+    local function creds(t) return { s3_credentials = cjson.encode(t) } end
+    -- What the backend seals (cdn/origin.py): access_key_id + secret.
+    local c = assert(router.s3_credentials(creds({ access_key_id = "hip_sub_1", secret = "s3cr3t" })))
+    eq(c.access_key_id, "hip_sub_1")
+    eq(c.secret_access_key, "s3cr3t")
+    eq(c.session_token, nil)
+    c = assert(router.s3_credentials(creds({ access_key_id = "AK", secret_access_key = "S", session_token = "T" })))
+    eq(c.secret_access_key, "S")
+    eq(c.session_token, "T")
+    c = assert(router.s3_credentials(creds({ access_key_id = "AK", secret = "S", session_token = "" })))
+    eq(c.session_token, nil)
+    -- Both names: the long one wins; a JSON null long name falls back.
+    c = assert(router.s3_credentials(creds({ access_key_id = "AK", secret_access_key = "L", secret = "S" })))
+    eq(c.secret_access_key, "L")
+    c = assert(router.s3_credentials({ s3_credentials = '{"access_key_id":"AK","secret_access_key":null,"secret":"S"}' }))
+    eq(c.secret_access_key, "S")
+    -- A present but invalid long name is refused, not silently replaced.
+    eq(select(2, router.s3_credentials(creds({ access_key_id = "AK", secret_access_key = "", secret = "S" }))),
+        "secret missing or invalid")
+    -- No secret at all: a public bucket.
+    eq(router.s3_credentials(nil), false)
+    eq(router.s3_credentials({}), false)
+    -- Refusals name the field and never carry a value.
+    local cases = {
+        { { s3_credentials = "not json" }, "s3_credentials is not a JSON object" },
+        { creds({ secret = "S" }), "access_key_id missing or invalid" },
+        { creds({ access_key_id = "AK" }), "secret missing or invalid" },
+        { creds({ access_key_id = "AK", secret = "a b" }), "secret missing or invalid" },
+        { creds({ access_key_id = "AK", secret = "S", session_token = 5 }), "session_token invalid" },
+    }
+    for _, case in ipairs(cases) do
+        local ok, why = router.s3_credentials(case[1])
+        eq(ok, nil, case[2])
+        eq(why, case[2])
+    end
+end)
+
+test("s3_credentials: the backend's sealed plaintexts (shared contract vector)", function()
+    local here = debug.getinfo(1, "S").source:sub(2):match("(.*/)") or "./"
+    local f = assert(io.open(here .. "../../../../../test_vectors/cdn/s3_credentials.json"))
+    local vectors = assert(cjson.decode(f:read("*a")))
+    f:close()
+    truthy(#vectors.cases >= 2)
+    for _, case in ipairs(vectors.cases) do
+        local c, why = router.s3_credentials({ s3_credentials = case.plaintext })
+        truthy(c, case.name .. ": " .. tostring(why))
+        eq(c.access_key_id, case.access_key_id, case.name)
+        eq(c.secret_access_key, case.secret_access_key, case.name)
+    end
+end)
+
+test("unusable-credential CRIT lines are rate-limited per zone and reason", function()
+    truthy(router.should_log_credentials("zq", "secret missing or invalid", 1000))
+    falsy(router.should_log_credentials("zq", "secret missing or invalid", 1030))
+    truthy(router.should_log_credentials("zq", "access_key_id missing or invalid", 1030), "another reason")
+    truthy(router.should_log_credentials("zp", "secret missing or invalid", 1030), "another zone")
+    truthy(router.should_log_credentials("zq", "secret missing or invalid", 1060))
 end)
 
 test("router helpers", function()

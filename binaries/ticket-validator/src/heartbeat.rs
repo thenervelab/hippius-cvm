@@ -26,15 +26,18 @@
 //!     graceful_exit_requested[,cvm_cpu_budget,cvm_memory_mb_budget,
 //!     asid_capacity,asid_used[,cvm_disk_gb_budget,data_disk_total_gb,
 //!     data_disk_available_gb,staging_disk_available_gb[,snp_enabled,
-//!     cpus_offline,snp_launches_since_boot,df_flush_failures]]]}}` —
-//!     `graceful_exit_requested` is the `v2`..`v5` flag (always
+//!     cpus_offline,snp_launches_since_boot,df_flush_failures
+//!     [,agent_version]]]]}}` —
+//!     `graceful_exit_requested` is the `v2`..`v6` flag (always
 //!     emitted; `false` for a `v1` body, which never carries the key).
 //!     The four capacity keys are emitted ONLY for a `v3`+ body (raw
 //!     values, `0` = the miner could not read it); a `v1`/`v2` output
 //!     never carries them, so the consumer can tell "no declaration" from
 //!     "declared unknown". The four disk keys (GiB) are emitted ONLY for a
-//!     `v4`/`v5` body, with the same `0` = unknown convention, and the four
-//!     host-health keys ONLY for a `v5` body (raw signed values).
+//!     `v4`+ body, with the same `0` = unknown convention, the four
+//!     host-health keys ONLY for a `v5`/`v6` body (raw signed values), and
+//!     `agent_version` ONLY for a `v6` body (a checked
+//!     `[0-9A-Za-z._-]{1,32}` string).
 //!   - reject → `{"ok":false,"error_class":"<class>"}`
 //! - On a reject the body fields are **never** echoed — even a body
 //!   that decoded cleanly but failed a later gate yields only the
@@ -67,8 +70,9 @@ use ciborium::value::Value;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hippius_types::cbor::assert_canonical;
 use hippius_types::heartbeat::{
-    SignedMinerHeartbeat, DOMAIN, MAX_MINER_ID_LEN, SCHEMA_VERSION, SCHEMA_VERSION_CAPACITY,
-    SCHEMA_VERSION_DISK, SCHEMA_VERSION_GRACEFUL_EXIT, SCHEMA_VERSION_HOST_HEALTH, SIGNATURE_LEN,
+    is_valid_agent_version, SignedMinerHeartbeat, DOMAIN, MAX_MINER_ID_LEN, SCHEMA_VERSION,
+    SCHEMA_VERSION_AGENT_VERSION, SCHEMA_VERSION_CAPACITY, SCHEMA_VERSION_DISK,
+    SCHEMA_VERSION_GRACEFUL_EXIT, SCHEMA_VERSION_HOST_HEALTH, SIGNATURE_LEN,
 };
 use serde::Serialize;
 
@@ -110,12 +114,17 @@ const HEARTBEAT_FIELD_COUNT_V4: usize = HEARTBEAT_FIELD_COUNT_V3 + 4;
 /// `df_flush_failures`).
 const HEARTBEAT_FIELD_COUNT_V5: usize = HEARTBEAT_FIELD_COUNT_V4 + 4;
 
+/// A canonical `v6` body is the `v5` body plus `agent_version`.
+const HEARTBEAT_FIELD_COUNT_V6: usize = HEARTBEAT_FIELD_COUNT_V5 + 1;
+
 /// The exact CBOR-map field count a body of `schema_version` must carry
-/// — 23 for `v5`, 19 for `v4`, 15 for `v3`, 11 for `v2`, 10 for every
-/// other (incl. `v1`). An unknown version gets the `v1` count here and
-/// fails closed at the schema gate after decode.
+/// — 24 for `v6`, 23 for `v5`, 19 for `v4`, 15 for `v3`, 11 for `v2`, 10
+/// for every other (incl. `v1`). An unknown version gets the `v1` count
+/// here and fails closed at the schema gate after decode.
 fn expected_field_count(schema_version: i128) -> usize {
-    if schema_version == i128::from(SCHEMA_VERSION_HOST_HEALTH) {
+    if schema_version == i128::from(SCHEMA_VERSION_AGENT_VERSION) {
+        HEARTBEAT_FIELD_COUNT_V6
+    } else if schema_version == i128::from(SCHEMA_VERSION_HOST_HEALTH) {
         HEARTBEAT_FIELD_COUNT_V5
     } else if schema_version == i128::from(SCHEMA_VERSION_DISK) {
         HEARTBEAT_FIELD_COUNT_V4
@@ -154,6 +163,9 @@ mod error_class {
     /// `data_disk_available_gb > data_disk_total_gb` with a known total —
     /// a self-contradictory declaration.
     pub const CAPACITY_INVALID: &str = "capacity_invalid";
+    /// A `v6` body's `agent_version` was empty, longer than 32 bytes, or
+    /// outside `[0-9A-Za-z._-]`.
+    pub const AGENT_VERSION_INVALID: &str = "agent_version_invalid";
 }
 
 #[derive(clap::Args)]
@@ -221,6 +233,11 @@ struct HeartbeatBody {
     snp_launches_since_boot: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     df_flush_failures: Option<u32>,
+    /// `v6`-only: the miner-agent's release tag. `None` (ABSENT from the
+    /// JSON) for every earlier version; for `v6` the signed string, echoed
+    /// only after [`is_valid_agent_version`] accepts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_version: Option<String>,
 }
 
 /// `verify-heartbeat` entry point.
@@ -337,13 +354,15 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
     //    graceful-exit flag). `decode_body` has already enforced the
     //    version-correct field count, so a `v2`-versioned body with the
     //    `v1` field count (or vice-versa) was rejected `body_decode_failed`
-    //    before this point. `v3` (15 fields), `v4` (19) and `v5` (23)
-    //    likewise. Any version outside {1, 2, 3, 4, 5} fails closed here.
+    //    before this point. `v3` (15 fields), `v4` (19), `v5` (23) and
+    //    `v6` (24) likewise. Any version outside {1, 2, 3, 4, 5, 6} fails
+    //    closed here.
     if body.schema_version != SCHEMA_VERSION
         && body.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
         && body.schema_version != SCHEMA_VERSION_CAPACITY
         && body.schema_version != SCHEMA_VERSION_DISK
         && body.schema_version != SCHEMA_VERSION_HOST_HEALTH
+        && body.schema_version != SCHEMA_VERSION_AGENT_VERSION
     {
         return Err(error_class::WRONG_SCHEMA_VERSION);
     }
@@ -364,6 +383,13 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
     if let (Some(total), Some(available)) = (body.data_disk_total_gb, body.data_disk_available_gb) {
         if total != 0 && available > total {
             return Err(error_class::CAPACITY_INVALID);
+        }
+    }
+    // 11. `v6` agent version — mirrors `MinerHeartbeat::validate`. Only a
+    //     `v6` body ever decodes one (`decode_body`), so `Some` ⇔ `v6`.
+    if let Some(version) = &body.agent_version {
+        if !is_valid_agent_version(version) {
+            return Err(error_class::AGENT_VERSION_INVALID);
         }
     }
     Ok(body)
@@ -413,7 +439,8 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
         u8::try_from(schema_version_raw).map_err(|_| error_class::BODY_DECODE_FAILED)?;
     // The flag is a `v2`+ field. For `v1` it is absent ⇒ `false`; for the
     // others it MUST be present and a CBOR bool.
-    let is_v5 = schema_version == SCHEMA_VERSION_HOST_HEALTH;
+    let is_v6 = schema_version == SCHEMA_VERSION_AGENT_VERSION;
+    let is_v5 = schema_version == SCHEMA_VERSION_HOST_HEALTH || is_v6;
     let is_v4 = schema_version == SCHEMA_VERSION_DISK || is_v5;
     let is_v3 = schema_version == SCHEMA_VERSION_CAPACITY || is_v4;
     let graceful_exit_requested = if schema_version == SCHEMA_VERSION_GRACEFUL_EXIT || is_v3 {
@@ -431,7 +458,7 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
             Ok(None)
         }
     };
-    // The four disk declarations are `v4`/`v5`-only, same discipline.
+    // The four disk declarations are `v4`+ only, same discipline.
     let disk = |key: &str| -> Result<Option<u32>, &'static str> {
         if is_v4 {
             u32_field(&entries, key).map(Some)
@@ -439,7 +466,7 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
             Ok(None)
         }
     };
-    // The four host-health fields are `v5`-only, same discipline.
+    // The four host-health fields are `v5`/`v6`-only, same discipline.
     let host_health = |key: &str| -> Result<Option<u32>, &'static str> {
         if is_v5 {
             u32_field(&entries, key).map(Some)
@@ -449,6 +476,13 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
     };
     let snp_enabled = if is_v5 {
         Some(bool_field(&entries, "snp_enabled")?)
+    } else {
+        None
+    };
+    // `agent_version` is `v6`-only, same discipline (a CBOR text; its
+    // charset/length gate runs in `verify`).
+    let agent_version = if is_v6 {
+        Some(text_field(&entries, "agent_version")?)
     } else {
         None
     };
@@ -478,6 +512,7 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
         cpus_offline: host_health("cpus_offline")?,
         snp_launches_since_boot: host_health("snp_launches_since_boot")?,
         df_flush_failures: host_health("df_flush_failures")?,
+        agent_version,
     })
 }
 
@@ -549,6 +584,7 @@ mod tests {
             asid_used: 0,
             disk: hippius_types::heartbeat::DiskDeclaration::default(),
             host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
+            agent_version: String::new(),
         }
     }
 
@@ -904,6 +940,166 @@ mod tests {
         assert_eq!(
             verify(&signed_envelope(over, &sk), &sk.verifying_key()).unwrap_err(),
             error_class::CAPACITY_INVALID,
+        );
+    }
+
+    fn kat_v6() -> MinerHeartbeat {
+        let v5 = kat_v5();
+        kat_heartbeat().with_agent_version(
+            hippius_types::heartbeat::CapacityDeclaration {
+                cvm_cpu_budget: v5.cvm_cpu_budget,
+                cvm_memory_mb_budget: v5.cvm_memory_mb_budget,
+                asid_capacity: v5.asid_capacity,
+                asid_used: v5.asid_used,
+            },
+            v5.disk,
+            v5.host_health,
+            "v1.2.3".into(),
+        )
+    }
+
+    fn v6_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
+        let v: Value = ciborium::de::from_reader(kat_v6().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        entries
+            .into_iter()
+            .filter_map(|(k, v)| match &k {
+                Value::Text(t) if t == key => value.clone().map(|nv| (k, nv)),
+                _ => Some((k, v)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v6_heartbeat_verifies_and_carries_the_agent_version() {
+        let sk = SigningKey::from_bytes(&[0x61u8; 32]);
+        let envelope = signed_envelope(kat_v6().canonical().unwrap(), &sk);
+        let body = verify(&envelope, &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, 6);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["agent_version"], "v1.2.3");
+        assert_eq!(json["asid_capacity"], 99);
+        assert_eq!(json["data_disk_total_gb"], 3_500);
+        assert_eq!(json["snp_enabled"], true);
+        assert_eq!(json["df_flush_failures"], 3);
+    }
+
+    #[test]
+    fn pre_v6_json_never_carries_the_agent_version() {
+        let sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        for hb in [
+            kat_heartbeat(),
+            kat_graceful_exit(),
+            kat_v3(),
+            kat_v4(),
+            kat_v5(),
+        ] {
+            let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+            let json =
+                serde_json::to_value(verify(&envelope, &sk.verifying_key()).unwrap()).unwrap();
+            assert!(
+                !json.as_object().unwrap().contains_key("agent_version"),
+                "agent_version leaked into a pre-v6 output"
+            );
+        }
+    }
+
+    #[test]
+    fn v6_body_missing_renaming_or_mistyping_agent_version_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x63u8; 32]);
+        let missing = forged_body(v6_entries_with("agent_version", None));
+        assert_eq!(
+            verify(&signed_envelope(missing, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+        let mut renamed = v6_entries_with("agent_version", None);
+        renamed.push((
+            Value::Text("agent_versionX".into()),
+            Value::Text("v1.2.3".into()),
+        ));
+        assert_eq!(
+            verify(
+                &signed_envelope(forged_body(renamed), &sk),
+                &sk.verifying_key()
+            )
+            .unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+        let mistyped = forged_body(v6_entries_with(
+            "agent_version",
+            Some(Value::Integer(123.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(mistyped, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v6_malformed_agent_version_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x64u8; 32]);
+        let long = "x".repeat(33);
+        for bad in [
+            "",
+            long.as_str(),
+            "v1 2",
+            "v1/2",
+            "v1\n",
+            "é",
+            "v1\u{1b}[31m",
+        ] {
+            let body = forged_body(v6_entries_with(
+                "agent_version",
+                Some(Value::Text(bad.into())),
+            ));
+            assert_eq!(
+                verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+                error_class::AGENT_VERSION_INVALID,
+                "{bad:?}"
+            );
+        }
+        let max = forged_body(v6_entries_with(
+            "agent_version",
+            Some(Value::Text("x".repeat(32))),
+        ));
+        assert!(verify(&signed_envelope(max, &sk), &sk.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn v5_body_carrying_agent_version_is_rejected() {
+        // A schema_version 5 body with the v6 key (24 fields) exceeds the
+        // v5 count — never read as a v5 heartbeat.
+        let sk = SigningKey::from_bytes(&[0x65u8; 32]);
+        let body = forged_body(v6_entries_with(
+            "schema_version",
+            Some(Value::Integer(5.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(body, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v6_keeps_the_host_health_and_disk_gates() {
+        let sk = SigningKey::from_bytes(&[0x66u8; 32]);
+        let over = forged_body(v6_entries_with(
+            "data_disk_available_gb",
+            Some(Value::Integer(3_501.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(over, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::CAPACITY_INVALID,
+        );
+        let not_bool = forged_body(v6_entries_with(
+            "snp_enabled",
+            Some(Value::Integer(1.into())),
+        ));
+        assert_eq!(
+            verify(&signed_envelope(not_bool, &sk), &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
         );
     }
 
@@ -1292,8 +1488,8 @@ mod tests {
 
     #[test]
     fn wrong_schema_version_is_rejected() {
-        // A validly-signed 10-field body whose `schema_version` is 6 —
-        // an UNKNOWN version (not v1 through v5). 10 fields matches the
+        // A validly-signed 10-field body whose `schema_version` is 7 —
+        // an UNKNOWN version (not v1 through v6). 10 fields matches the
         // v1-count branch, so the body decodes cleanly and the failure
         // lands on the schema-version gate (not the count gate).
         let sk = SigningKey::from_bytes(&[6u8; 32]);
@@ -1314,7 +1510,7 @@ mod tests {
             (Value::Text("miner_id".into()), Value::Text("m".into())),
             (
                 Value::Text("schema_version".into()),
-                Value::Integer(6.into()),
+                Value::Integer(7.into()),
             ),
             (Value::Text("sequence".into()), Value::Integer(1.into())),
             (

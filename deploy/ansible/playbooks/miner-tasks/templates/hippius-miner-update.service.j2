@@ -1,17 +1,17 @@
 # Managed by Ansible (miner-tasks/miner-agent-install.yml). Do not edit by hand.
-# Oneshot updater for hippius-miner-agent. Fired by hippius-miner-update.timer.
+# Oneshot updater for {{ miner_agent.systemd_unit_name }}, fired by
+# hippius-miner-update.timer. It swaps the agent with SIGKILL and puts the
+# previous binary back if the new one does not deliver a heartbeat, so a
+# failed run leaves the previous binary running and exits non-zero.
 [Unit]
-Description=Hippius miner-agent auto-update (S3 channel)
+Description=Hippius miner-agent auto-update (GitHub Releases)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/hippius-miner-update
-# The updater stops/starts {{ miner_agent.systemd_unit_name }} itself and
-# rolls back on an unhealthy restart, so a failed run leaves the previous
-# binary running — it just exits non-zero (visible via `systemctl status`).
 EnvironmentFile=-/etc/hippius-miner/auto-update.env
-# Network may flap; do not let a transient curl failure mark the unit failed
-# forever — the timer simply retries on the next tick.
-SuccessExitStatus=0
+# Above the script's own bounds (downloads, cosign, relaunch, two health
+# windows). A run killed mid-swap anyway is rolled back by the next one.
+TimeoutStartSec=1h

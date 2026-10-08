@@ -824,6 +824,18 @@ def ingest_heartbeat(
                     **host_health_columns(hb.declared_host_health),
                     host_health_reported_at=now,
                 )
+            # The `v6` miner-agent release tag. UNTRUSTED, observability
+            # only; a pre-v6 heartbeat leaves the stored tag untouched — it
+            # ages out via `agent_version_reported_at`.
+            if hb.agent_version is not None and miner.chain_node_id:
+                from apps.scheduler.models import MinerCapacity
+
+                MinerCapacity.objects.filter(
+                    miner_node_id=miner.chain_node_id
+                ).update(
+                    agent_version=hb.agent_version,
+                    agent_version_reported_at=now,
+                )
     except IngestError:
         raise
     except IntegrityError:

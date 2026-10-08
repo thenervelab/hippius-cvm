@@ -54,7 +54,8 @@ http {
     resolver @RESOLVER@ ipv6=off valid=60s;
     resolver_timeout 5s;
 
-    # proxy_cache_path, sized by `hippius-cdn-agent cache-size` at start.
+    # proxy_cache_path (<cache dir>/objects, sized at start by render.sh
+    # cache-auto). The health canary sits next to it, outside its tree.
     include @CACHE_CONF@;
 
     # Origin endpoint ($hippius_s3_scheme, $hippius_s3_host).

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -273,6 +274,8 @@ HEARTBEAT_ERROR_CLASSES: frozenset[str] = frozenset(
         "miner_id_invalid",
         # `v3` only: `asid_used > asid_capacity` with a known capacity.
         "capacity_invalid",
+        # `v6` only: `agent_version` outside `[0-9A-Za-z._-]{1,32}`.
+        "agent_version_invalid",
     }
 )
 
@@ -304,6 +307,13 @@ HEARTBEAT_HOST_HEALTH_KEYS: tuple[str, ...] = (
     "snp_launches_since_boot",
     "df_flush_failures",
 )
+
+
+# The `v6` `agent_version` (the miner-agent's release tag) — emitted for a
+# `v6` body ONLY, after the binary checked it against this same rule
+# (`hippius_types::heartbeat::is_valid_agent_version`). Re-checked here as
+# defence in depth: the value lands in a DB column and a metric label.
+HEARTBEAT_AGENT_VERSION_RE = re.compile(r"[0-9A-Za-z._-]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -398,6 +408,9 @@ class HeartbeatBody:
     declared_disk: DeclaredDisk | None = None
     # The `v5` host-health report. `None` before `v5`, same discipline.
     declared_host_health: DeclaredHostHealth | None = None
+    # The `v6` miner-agent release tag. UNTRUSTED, observability only.
+    # `None` before `v6`, same discipline.
+    agent_version: str | None = None
 
 
 def verify_heartbeat(*, envelope: bytes, verifying_key: bytes) -> HeartbeatBody:
@@ -1103,6 +1116,22 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
             df_flush_failures=_int("df_flush_failures"),
         )
 
+    def _agent_version(host_health: DeclaredHostHealth | None) -> str | None:
+        # `v6` only, and `v6` is a superset of `v5`: the key without the
+        # host-health report, a non-string, or a value outside the charset
+        # is contract drift.
+        if "agent_version" not in body:
+            return None
+        value = body["agent_version"]
+        if not isinstance(value, str) or not HEARTBEAT_AGENT_VERSION_RE.fullmatch(value):
+            raise VerifierUnavailable("verifier body field 'agent_version' is malformed")
+        if host_health is None:
+            raise VerifierUnavailable(
+                "verifier body carried agent_version without a host-health report"
+            )
+        return value
+
+    host_health = _declared_host_health()
     return HeartbeatBody(
         schema_version=_int("schema_version"),
         domain=_str("domain"),
@@ -1113,7 +1142,8 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
         graceful_exit_requested=_bool_default_false("graceful_exit_requested"),
         declared_capacity=_declared_capacity(),
         declared_disk=_declared_disk(),
-        declared_host_health=_declared_host_health(),
+        declared_host_health=host_health,
+        agent_version=_agent_version(host_health),
     )
 
 

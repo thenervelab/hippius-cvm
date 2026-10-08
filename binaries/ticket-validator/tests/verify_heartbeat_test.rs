@@ -101,6 +101,7 @@ fn kat_heartbeat() -> MinerHeartbeat {
         asid_used: 0,
         disk: hippius_types::heartbeat::DiskDeclaration::default(),
         host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
+        agent_version: String::new(),
     }
 }
 
@@ -281,6 +282,37 @@ fn v5_kat_emits_the_host_health_report() {
     assert_eq!(body["cpus_offline"], 24);
     assert_eq!(body["snp_launches_since_boot"], 97);
     assert_eq!(body["df_flush_failures"], 3);
+}
+
+#[test]
+fn v6_kat_emits_the_agent_version() {
+    // The committed frozen v6 envelope, through the real binary — the
+    // JSON keys the vali consumer reads.
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v6.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v6.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    assert_eq!(run.exit, 0, "stderr: {}", run.stderr);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    let body = &json["body"];
+    assert_eq!(body["schema_version"], 6);
+    assert_eq!(body["agent_version"], "v1.2.3");
+    assert_eq!(body["snp_enabled"], true);
+    assert_eq!(body["df_flush_failures"], 3);
+}
+
+#[test]
+fn v5_kat_carries_no_agent_version() {
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v5.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v5.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    assert!(json["body"].get("agent_version").is_none());
 }
 
 #[test]
@@ -482,11 +514,11 @@ fn over_cap_envelope_is_body_too_large() {
 
 #[test]
 fn wrong_schema_version_is_rejected() {
-    // Version 6 is unknown (not v1 through v5). A 10-field body matches
+    // Version 7 is unknown (not v1 through v6). A 10-field body matches
     // the v1-count branch, so it decodes cleanly and the failure lands
     // on the schema-version gate.
     let sk = SigningKey::from_bytes(&[0x77u8; 32]);
-    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(6.into()))]));
+    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(7.into()))]));
     let run = run_verify_heartbeat(&vk_hex(&sk), &signed_envelope(body, &sk));
     assert_reject(&run, "wrong_schema_version");
 }

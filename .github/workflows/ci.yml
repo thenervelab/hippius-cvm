@@ -118,6 +118,14 @@ jobs:
       # deploy scrub creates on the publishable branch alone.
       - name: Documentation links resolve
         run: bash scripts/dev/docs-links-test.sh
+      # Miner-agent auto-update: the updater against a mocked GitHub API,
+      # cosign, systemd and journald. Its systemctl mock fails any
+      # stop/restart (a graceful stop destroys every domain on a miner).
+      - name: miner-agent auto-update
+        run: |
+          sudo apt-get install -y -q shellcheck
+          shellcheck -S warning deploy/ansible/playbooks/miner-tasks/files/hippius-miner-update.sh scripts/dev/miner-update-test.sh scripts/release/build-miner-agent.sh
+          bash scripts/dev/miner-update-test.sh
       # Multi-OS bake dispatch: shellcheck the bake script + diff the
       # per-distro `--print-plan` decisions against the committed golden
       # (catches a drifted kernel package / family mapping before any

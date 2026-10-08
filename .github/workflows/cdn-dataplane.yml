@@ -19,10 +19,12 @@ on:
     branches: [main]
     paths:
       - "packer/cdn-node/openresty/**"
+      - "test_vectors/cdn/s3_credentials.json"
       - ".github/workflows/cdn-dataplane.yml"
   pull_request:
     paths:
       - "packer/cdn-node/openresty/**"
+      - "test_vectors/cdn/s3_credentials.json"
       - ".github/workflows/cdn-dataplane.yml"
 
 permissions:

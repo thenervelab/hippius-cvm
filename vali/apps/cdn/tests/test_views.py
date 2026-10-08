@@ -89,3 +89,42 @@ def test_command_errors_are_named(fake_transit: FakeTransit) -> None:
     fake_transit.exportable = True
     with pytest.raises(CommandError, match="ca-key-unsafe"):
         call_command("vali_cdn_ca", "init", stdout=StringIO())
+
+
+# ── every route is root-only ──────────────────────────────────────────
+
+
+def _cdn_routes() -> list[tuple[str, type]]:
+    from django.urls import URLPattern, URLResolver, get_resolver
+
+    out: list[tuple[str, type]] = []
+
+    def walk(patterns, prefix: str = "") -> None:
+        for p in patterns:
+            if isinstance(p, URLResolver):
+                walk(p.url_patterns, prefix + str(p.pattern))
+            elif isinstance(p, URLPattern):
+                route = prefix + str(p.pattern)
+                cls = getattr(p.callback, "cls", None)
+                if route.startswith("v1/cdn") and cls is not None:
+                    out.append((route, cls))
+
+    walk(get_resolver().url_patterns)
+    return out
+
+
+def test_every_cdn_route_is_root_only_and_operator_scoped() -> None:
+    """`/v1/cdn` is published as a PREFIX on the public Ingress, so a route
+    added under it later is public the moment it exists. Pin the gate on
+    every one."""
+    from rest_framework.permissions import IsAuthenticated
+
+    from apps.identity import scoping
+    from apps.orchestration.permissions import IsOrchestrationRoot
+
+    routes = _cdn_routes()
+    assert len(routes) == 6
+    for route, cls in routes:
+        assert IsAuthenticated in cls.permission_classes, route
+        assert IsOrchestrationRoot in cls.permission_classes, route
+        assert scoping.declared_scope(cls) == scoping.OPERATOR_ONLY, route

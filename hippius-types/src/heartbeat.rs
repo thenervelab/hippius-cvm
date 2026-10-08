@@ -24,7 +24,7 @@
 //! field of the signed body, so a cross-scheme replay produces
 //! different bytes and fails verification.
 //!
-//! ## Schema (`v1` / `v2` / `v3` / `v4` / `v5`) — fixed, fail-closed
+//! ## Schema (`v1` / `v2` / `v3` / `v4` / `v5` / `v6`) — fixed, fail-closed
 //!
 //! Every field is mandatory. [`MinerHeartbeat::validate`] runs on both
 //! the encode and (caller-side) decode paths; [`canonical`] rejects a
@@ -120,6 +120,35 @@ pub const SCHEMA_VERSION_DISK: u8 = 4;
 /// vali's verifier MUST accept it before any miner emits it.
 pub const SCHEMA_VERSION_HOST_HEALTH: u8 = 5;
 
+/// The `schema_version` of a `v6` heartbeat — the full `v5` body PLUS one
+/// `agent_version` text key: the release tag the miner-agent binary was
+/// built from (`dev` for an untagged build).
+///
+/// Observability only — vali records it to see which hosts run which
+/// agent release (and whether an auto-update landed), and never lets it
+/// change placement. A miner lying about it only misleads the operator
+/// about itself.
+///
+/// `v6` is OPT-IN (the miner-agent's `[heartbeat] schema_agent_version`,
+/// which requires `schema_host_health`). This is miner → vali data, so
+/// vali's verifier (the `ticket-validator` binary in the vali image) MUST
+/// accept it before any miner emits it.
+pub const SCHEMA_VERSION_AGENT_VERSION: u8 = 6;
+
+/// Hard upper bound on the `v6` `agent_version` length, in bytes. Mirrors
+/// the vali `MinerCapacity.agent_version` column (`max_length=32`).
+pub const MAX_AGENT_VERSION_LEN: usize = 32;
+
+/// `true` when `v` is a well-formed `v6` `agent_version`: 1 to
+/// [`MAX_AGENT_VERSION_LEN`] bytes of ASCII `[0-9A-Za-z._-]`. The narrow
+/// charset keeps the value safe to put in a log line or a metric label.
+pub fn is_valid_agent_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= MAX_AGENT_VERSION_LEN
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 /// Anti-skew window, in seconds. vali rejects a heartbeat whose
 /// `timestamp_unix` is more than this far from its own clock — in
 /// either direction.
@@ -155,6 +184,9 @@ pub enum HeartbeatError {
     /// `v4` disk declaration was (`data_disk_available_gb >
     /// data_disk_total_gb` with a known, non-zero total).
     Capacity,
+    /// A `v6` `agent_version` was empty, longer than
+    /// [`MAX_AGENT_VERSION_LEN`], or outside `[0-9A-Za-z._-]`.
+    AgentVersion,
 }
 
 impl core::fmt::Display for HeartbeatError {
@@ -174,6 +206,7 @@ impl HeartbeatError {
             HeartbeatError::SignatureLength => "heartbeat-signature-length",
             HeartbeatError::Encode => "heartbeat-encode",
             HeartbeatError::Capacity => "heartbeat-capacity",
+            HeartbeatError::AgentVersion => "heartbeat-agent-version",
         }
     }
 }
@@ -253,10 +286,14 @@ pub struct MinerHeartbeat {
     /// `v1`/`v2`/`v3` body ([`validate`](Self::validate) rejects a
     /// non-zero value there).
     pub disk: DiskDeclaration,
-    /// `v5`-only host-health report. All zero / `false` (= absent) in
+    /// `v5`/`v6` host-health report. All zero / `false` (= absent) in
     /// every earlier body ([`validate`](Self::validate) rejects anything
     /// else there).
     pub host_health: HostHealthDeclaration,
+    /// `v6`-only: the miner-agent's release tag. Empty (= absent) in every
+    /// earlier body ([`validate`](Self::validate) rejects anything else
+    /// there); in a `v6` body it must pass [`is_valid_agent_version`].
+    pub agent_version: String,
 }
 
 impl MinerHeartbeat {
@@ -264,16 +301,17 @@ impl MinerHeartbeat {
     /// [`canonical`](Self::canonical) so a signature over an impossible
     /// value can never be produced; a decoder MUST run it too.
     pub fn validate(&self) -> Result<()> {
-        // Accept the five wire versions — `v1` (the frozen 10-field
+        // Accept the six wire versions — `v1` (the frozen 10-field
         // baseline), `v2` (the 11-field graceful-exit-flag form), `v3`
         // (`v2` + the four capacity declarations), `v4` (`v3` + the four
-        // disk declarations) and `v5` (`v4` + the four host-health
-        // fields). Any other value fails closed.
+        // disk declarations), `v5` (`v4` + the four host-health fields)
+        // and `v6` (`v5` + `agent_version`). Any other value fails closed.
         if self.schema_version != SCHEMA_VERSION
             && self.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
             && self.schema_version != SCHEMA_VERSION_CAPACITY
             && self.schema_version != SCHEMA_VERSION_DISK
             && self.schema_version != SCHEMA_VERSION_HOST_HEALTH
+            && self.schema_version != SCHEMA_VERSION_AGENT_VERSION
         {
             return Err(HeartbeatError::SchemaVersion);
         }
@@ -294,10 +332,18 @@ impl MinerHeartbeat {
         if !self.carries_disk_keys() && self.disk != DiskDeclaration::default() {
             return Err(HeartbeatError::SchemaVersion);
         }
-        // …and the host-health report is `v5`-only.
-        if self.schema_version != SCHEMA_VERSION_HOST_HEALTH
-            && self.host_health != HostHealthDeclaration::default()
+        // …the host-health report is `v5`/`v6`-only…
+        if !self.carries_host_health_keys() && self.host_health != HostHealthDeclaration::default()
         {
+            return Err(HeartbeatError::SchemaVersion);
+        }
+        // …and `agent_version` is `v6`-only, where it is mandatory and
+        // well-formed.
+        if self.schema_version == SCHEMA_VERSION_AGENT_VERSION {
+            if !is_valid_agent_version(&self.agent_version) {
+                return Err(HeartbeatError::AgentVersion);
+            }
+        } else if !self.agent_version.is_empty() {
             return Err(HeartbeatError::SchemaVersion);
         }
         // A known ASID capacity bounds the in-use count. (`capacity == 0`
@@ -322,16 +368,22 @@ impl MinerHeartbeat {
     }
 
     /// `true` for the versions whose canonical map carries the four
-    /// capacity keys (`v3` and its supersets `v4` and `v5`).
+    /// capacity keys (`v3` and its supersets `v4`, `v5` and `v6`).
     fn carries_capacity_keys(&self) -> bool {
         self.schema_version == SCHEMA_VERSION_CAPACITY || self.carries_disk_keys()
     }
 
     /// `true` for the versions whose canonical map carries the four disk
-    /// keys (`v4` and its superset `v5`).
+    /// keys (`v4` and its supersets `v5` and `v6`).
     fn carries_disk_keys(&self) -> bool {
-        self.schema_version == SCHEMA_VERSION_DISK
-            || self.schema_version == SCHEMA_VERSION_HOST_HEALTH
+        self.schema_version == SCHEMA_VERSION_DISK || self.carries_host_health_keys()
+    }
+
+    /// `true` for the versions whose canonical map carries the four
+    /// host-health keys (`v5` and its superset `v6`).
+    fn carries_host_health_keys(&self) -> bool {
+        self.schema_version == SCHEMA_VERSION_HOST_HEALTH
+            || self.schema_version == SCHEMA_VERSION_AGENT_VERSION
     }
 
     /// `true` when any `v3`-only capacity field is non-zero.
@@ -360,8 +412,9 @@ impl MinerHeartbeat {
         // the end. The `schema_version` value is the ONLY change to a
         // shared field's encoding between the two versions. `v3` is the
         // `v2` map plus the four capacity keys (the encoder sorts them in),
-        // `v4` is the `v3` map plus the four disk keys, and `v5` is the
-        // `v4` map plus the four host-health keys.
+        // `v4` is the `v3` map plus the four disk keys, `v5` is the `v4`
+        // map plus the four host-health keys, and `v6` is the `v5` map plus
+        // `agent_version`.
         let mut entries = vec![
             (
                 Value::Text("cpu_load_1m_centi".into()),
@@ -415,7 +468,7 @@ impl MinerHeartbeat {
                 ),
             ]);
         }
-        if self.schema_version == SCHEMA_VERSION_HOST_HEALTH {
+        if self.carries_host_health_keys() {
             entries.extend([
                 (
                     Value::Text("cpus_offline".into()),
@@ -434,6 +487,12 @@ impl MinerHeartbeat {
                     Value::Integer(self.host_health.snp_launches_since_boot.into()),
                 ),
             ]);
+        }
+        if self.schema_version == SCHEMA_VERSION_AGENT_VERSION {
+            entries.push((
+                Value::Text("agent_version".into()),
+                Value::Text(self.agent_version.clone()),
+            ));
         }
         entries.extend([
             (
@@ -514,6 +573,7 @@ impl MinerHeartbeat {
             asid_used: 0,
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
+            agent_version: String::new(),
         }
     }
 
@@ -552,6 +612,24 @@ impl MinerHeartbeat {
         let mut hb = self.with_disk(capacity, disk);
         hb.schema_version = SCHEMA_VERSION_HOST_HEALTH;
         hb.host_health = host_health;
+        hb
+    }
+
+    /// Upgrade an ordinary (`v1`) heartbeat to `v6`: the `v5` capacity,
+    /// disk and host-health declarations plus the agent's release tag.
+    /// Every other field is preserved, like
+    /// [`with_capacity`](Self::with_capacity). A malformed tag is caught by
+    /// [`validate`](Self::validate), not here.
+    pub fn with_agent_version(
+        self,
+        capacity: CapacityDeclaration,
+        disk: DiskDeclaration,
+        host_health: HostHealthDeclaration,
+        agent_version: String,
+    ) -> Self {
+        let mut hb = self.with_host_health(capacity, disk, host_health);
+        hb.schema_version = SCHEMA_VERSION_AGENT_VERSION;
+        hb.agent_version = agent_version;
         hb
     }
 }
@@ -717,6 +795,7 @@ mod tests {
             asid_used: 0,
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
+            agent_version: String::new(),
         }
     }
 
@@ -1180,11 +1259,116 @@ mod tests {
         }
     }
 
+    fn v6() -> MinerHeartbeat {
+        sample().with_agent_version(capacity(), disk(), host_health(), "v0.42.1".into())
+    }
+
+    #[test]
+    fn v6_canonical_is_v5_plus_agent_version() {
+        let hb = v6();
+        assert_eq!(hb.schema_version, SCHEMA_VERSION_AGENT_VERSION);
+        let bytes = hb.canonical().unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v5_keys = canonical_keys(
+            &sample()
+                .with_host_health(capacity(), disk(), host_health())
+                .canonical()
+                .unwrap(),
+        );
+        let v6_keys = canonical_keys(&bytes);
+        assert_eq!(v6_keys.len(), 24);
+        let stripped: Vec<String> = v6_keys
+            .into_iter()
+            .filter(|k| k != "agent_version")
+            .collect();
+        assert_eq!(stripped, v5_keys, "v6 must not move a v5 key");
+    }
+
+    #[test]
+    fn v6_accepts_the_dev_fallback_and_the_full_charset() {
+        for tag in ["dev", "v1.2.3", "miner-agent_2026.10-rc.1", "A"] {
+            let mut hb = v6();
+            hb.agent_version = tag.into();
+            assert!(hb.validate().is_ok(), "{tag}");
+        }
+        let mut hb = v6();
+        hb.agent_version = "x".repeat(MAX_AGENT_VERSION_LEN);
+        assert!(hb.validate().is_ok());
+    }
+
+    #[test]
+    fn v6_rejects_a_missing_or_malformed_agent_version() {
+        let long = "x".repeat(MAX_AGENT_VERSION_LEN + 1);
+        for bad in [
+            "",
+            long.as_str(),
+            "v1 2",
+            "v1/2",
+            "v1\n",
+            "é",
+            "v1:2",
+            "v1+g",
+        ] {
+            let mut hb = v6();
+            hb.agent_version = bad.into();
+            assert_eq!(hb.validate(), Err(HeartbeatError::AgentVersion), "{bad:?}");
+            assert!(hb.canonical().is_err());
+        }
+    }
+
+    #[test]
+    fn earlier_bodies_with_an_agent_version_are_rejected() {
+        for mut hb in [
+            sample(),
+            MinerHeartbeat::graceful_exit("m".into(), 1, 1, 0, 0, 0, 0, 0),
+            sample().with_capacity(capacity()),
+            sample().with_disk(capacity(), disk()),
+            sample().with_host_health(capacity(), disk(), host_health()),
+        ] {
+            hb.agent_version = "v1.0.0".into();
+            assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
+            assert!(hb.canonical().is_err());
+        }
+    }
+
+    #[test]
+    fn v6_keeps_the_v5_and_v4_coherence_rules() {
+        let mut d = disk();
+        d.data_disk_total_gb = 100;
+        d.data_disk_available_gb = 101;
+        let hb = sample().with_agent_version(capacity(), d, host_health(), "dev".into());
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+        let mut c = capacity();
+        c.asid_used = c.asid_capacity + 1;
+        let hb = sample().with_agent_version(c, disk(), host_health(), "dev".into());
+        assert_eq!(hb.validate(), Err(HeartbeatError::Capacity));
+    }
+
+    #[test]
+    fn v6_fields_are_all_signed() {
+        let base = v6().canonical().unwrap();
+        let mutate: &[fn(&mut MinerHeartbeat)] = &[
+            |h| h.agent_version = "v0.42.2".into(),
+            |h| h.host_health.df_flush_failures += 1,
+            |h| h.disk.data_disk_total_gb += 1,
+            |h| h.asid_used += 1,
+        ];
+        for m in mutate {
+            let mut h = v6();
+            m(&mut h);
+            assert_ne!(
+                base,
+                h.canonical().unwrap(),
+                "a field escaped the signature"
+            );
+        }
+    }
+
     #[test]
     fn wrong_schema_version_rejected() {
-        // An UNKNOWN version (not 1 through 5) still fails closed.
+        // An UNKNOWN version (not 1 through 6) still fails closed.
         let mut hb = sample();
-        hb.schema_version = 6;
+        hb.schema_version = 7;
         assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
         assert!(hb.canonical().is_err());
     }
@@ -1332,6 +1516,7 @@ mod tests {
             ),
             (HeartbeatError::Encode, "heartbeat-encode"),
             (HeartbeatError::Capacity, "heartbeat-capacity"),
+            (HeartbeatError::AgentVersion, "heartbeat-agent-version"),
         ] {
             assert_eq!(err.as_str(), class);
             assert_eq!(err.to_string(), class);

@@ -34,7 +34,9 @@ heartbeat (`host_health_survey`, job `vali-host-health`):
 and `hippius_miner_host_health_reported_timestamp_seconds`, labelled
 `node_id` + `miner_id`, for every ACTIVE registered miner, plus
 `hippius_miner_host_health_reporting` (0 until its first v5 report). The
-`hippius-miner-host-health` PrometheusRule alerts on them.
+`hippius-miner-host-health` PrometheusRule alerts on them. In the same
+push, `hippius_miner_agent_version_info{node_id,miner_id,version} 1` carries
+the release tag of the miner's latest v6 heartbeat (absent before one).
 """
 
 from __future__ import annotations
@@ -42,13 +44,16 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from apps.scheduler import service
 from apps.scheduler.chain import ChainReadUnavailable
+
+if TYPE_CHECKING:
+    from apps.scheduler.models import MinerCapacity
 
 log = logging.getLogger("apps.scheduler.reeval")
 
@@ -96,9 +101,32 @@ M_SNP_LAUNCHES = "hippius_miner_snp_launches_since_boot"
 M_DF_FLUSH_FAILURES = "hippius_miner_df_flush_failures"
 M_HOST_HEALTH_TS = "hippius_miner_host_health_reported_timestamp_seconds"
 M_HOST_HEALTH_REPORTING = "hippius_miner_host_health_reporting"
+M_AGENT_VERSION_INFO = "hippius_miner_agent_version_info"
 
 # The survey must never hold the drain loop up for long on a dead gateway.
 _HOST_HEALTH_PUSH_TIMEOUT_S = 3.0
+
+
+def _reports_current_agent_version(row: MinerCapacity | None) -> bool:
+    """`True` when the miner's LATEST host-health report came with its
+    release tag, i.e. it still sends v6. A v6 ingest stamps
+    `agent_version_reported_at` and `host_health_reported_at` with the same
+    instant; a later v5 heartbeat (flag turned off, agent rolled back)
+    advances only the host-health stamp, and the stale tag stops being
+    advertised.
+
+    The tag is miner-chosen, so each new value is a new `version=` series.
+    That churn is bounded by the active (on-chain registered) miner set and
+    one heartbeat per interval, and at most one series per miner is live at
+    a time (the group is replaced each cycle) — accepted for an
+    observability-only metric."""
+    return (
+        row is not None
+        and bool(row.agent_version)
+        and row.agent_version_reported_at is not None
+        and row.host_health_reported_at is not None
+        and row.agent_version_reported_at >= row.host_health_reported_at
+    )
 
 
 def host_health_survey() -> None:
@@ -120,16 +148,21 @@ def host_health_survey() -> None:
             .exclude(chain_node_id="")
             .values_list("chain_node_id", "miner_id")
         )
-        reports = {
+        rows = {
             row.miner_node_id: row
-            for row in MinerCapacity.objects.filter(
-                miner_node_id__in=active, host_health_reported_at__isnull=False
-            )
+            for row in MinerCapacity.objects.filter(miner_node_id__in=active)
         }
         ms = metrics.MetricSet()
         for nid in sorted(active):
             labels = {"node_id": nid, "miner_id": active[nid]}
-            row = reports.get(nid)
+            capacity_row = rows.get(nid)
+            if _reports_current_agent_version(capacity_row):
+                ms.gauge(M_AGENT_VERSION_INFO, 1.0, version=capacity_row.agent_version, **labels)
+            row = (
+                capacity_row
+                if capacity_row is not None and capacity_row.host_health_reported_at is not None
+                else None
+            )
             ms.gauge(M_HOST_HEALTH_REPORTING, 0.0 if row is None else 1.0, **labels)
             if row is None:
                 continue

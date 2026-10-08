@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hippius_types::heartbeat::{
-    CapacityDeclaration, DiskDeclaration, HostHealthDeclaration, MinerHeartbeat,
-    SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION,
+    is_valid_agent_version, CapacityDeclaration, DiskDeclaration, HostHealthDeclaration,
+    MinerHeartbeat, SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION,
 };
 use tempfile::NamedTempFile;
 
@@ -141,6 +141,10 @@ pub struct HeartbeatBuilder {
     /// the `v5` host-health heartbeat instead (`[heartbeat]
     /// schema_host_health = true`).
     host_health: Option<Arc<dyn HostHealthSource>>,
+    /// When set (with `capacity`, `disk` and `host_health`) AND
+    /// well-formed, [`build`](Self::build) emits the `v6` heartbeat
+    /// carrying it (`[heartbeat] schema_agent_version = true`).
+    agent_version: Option<String>,
 }
 
 /// What a `v3` heartbeat declares: the operator's `[host]` budgets (the
@@ -270,6 +274,7 @@ impl HeartbeatBuilder {
             capacity: None,
             disk: None,
             host_health: None,
+            agent_version: None,
         }
     }
 
@@ -299,6 +304,21 @@ impl HeartbeatBuilder {
         self
     }
 
+    /// Opt into the `v6` heartbeat (`[heartbeat] schema_agent_version =
+    /// true`), carrying `agent_version` (the agent passes its compiled-in
+    /// [`crate::release::RELEASE_TAG`]). `v6` is a superset of `v5`, so
+    /// this takes effect only together with the host-health source (the
+    /// config refuses `schema_agent_version` without `schema_host_health`).
+    ///
+    /// A tag the heartbeat schema would refuse (it comes from the build
+    /// environment, so a hand build could carry anything) degrades the
+    /// heartbeat to `v5` rather than failing every build: liveness must
+    /// never depend on a cosmetic field.
+    pub fn with_agent_version(mut self, agent_version: String) -> Self {
+        self.agent_version = Some(agent_version);
+        self
+    }
+
     /// Sample, stamp, draw `sequence`, encode, and sign — yielding a
     /// signed heartbeat ready for the queue.
     ///
@@ -317,11 +337,21 @@ impl HeartbeatBuilder {
         heartbeat.graceful_exit_requested = false;
         match (&self.capacity, &self.disk, &self.host_health) {
             (Some(capacity), Some(disk), Some(host_health)) => {
-                heartbeat = heartbeat.with_host_health(
-                    capacity.declare(),
-                    disk.declare(),
-                    host_health.read().await,
-                );
+                let (capacity, disk, host_health) =
+                    (capacity.declare(), disk.declare(), host_health.read().await);
+                heartbeat = match self
+                    .agent_version
+                    .as_deref()
+                    .filter(|v| is_valid_agent_version(v))
+                {
+                    Some(version) => heartbeat.with_agent_version(
+                        capacity,
+                        disk,
+                        host_health,
+                        version.to_string(),
+                    ),
+                    None => heartbeat.with_host_health(capacity, disk, host_health),
+                };
             }
             (Some(capacity), Some(disk), None) => {
                 heartbeat = heartbeat.with_disk(capacity.declare(), disk.declare());
@@ -413,6 +443,7 @@ impl HeartbeatBuilder {
             asid_used: 0,
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
+            agent_version: String::new(),
         })
     }
 
@@ -795,6 +826,83 @@ mod tests {
         assert_eq!(snp, Some(ciborium::value::Value::Bool(true)));
     }
 
+    fn v5_builder() -> HeartbeatBuilder {
+        builder(Arc::new(MockMetricsSource::default()))
+            .with_capacity_declaration(declarer(crate::sev_asid::AsidUsage {
+                capacity: 99,
+                used: 4,
+            }))
+            .with_disk_declaration(disk_declarer(DiskReading {
+                data_total_gb: 3_500,
+                data_available_gb: 2_900,
+                staging_available_gb: 400,
+            }))
+            .with_host_health(Arc::new(FixedHostHealth(HostHealthDeclaration {
+                snp_enabled: true,
+                cpus_offline: 0,
+                snp_launches_since_boot: 7,
+                df_flush_failures: 0,
+            })))
+    }
+
+    fn text(map: &[(String, ciborium::value::Value)], key: &str) -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                ciborium::value::Value::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+    }
+
+    #[tokio::test]
+    async fn with_the_agent_version_the_periodic_heartbeat_is_v6() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let b = v5_builder().with_agent_version(crate::release::RELEASE_TAG.to_string());
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(6));
+        assert_eq!(map.len(), 24);
+        assert_eq!(
+            text(&map, "agent_version").as_deref(),
+            Some(crate::release::RELEASE_TAG)
+        );
+        assert_eq!(int(&map, "snp_launches_since_boot"), Some(7));
+        assert_eq!(int(&map, "asid_used"), Some(4));
+    }
+
+    #[tokio::test]
+    async fn without_the_agent_version_the_heartbeat_stays_v5() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let map = body_map(&v5_builder().build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(5));
+        assert_eq!(text(&map, "agent_version"), None);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_release_tag_degrades_to_v5_instead_of_failing() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        for bad in ["", "v1 2", "x".repeat(33).as_str()] {
+            let b = v5_builder().with_agent_version(bad.to_string());
+            let map = body_map(&b.build(&mut seq).await.unwrap().body);
+            assert_eq!(int(&map, "schema_version"), Some(5), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_version_without_the_host_health_source_stays_v4() {
+        // v6 is a superset of v5: no version jump (the config refuses this).
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let b = builder(Arc::new(MockMetricsSource::default()))
+            .with_capacity_declaration(declarer(crate::sev_asid::AsidUsage::default()))
+            .with_disk_declaration(disk_declarer(DiskReading::default()))
+            .with_agent_version("v1.2.3".into());
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(4));
+    }
+
     #[tokio::test]
     async fn the_host_health_source_without_the_disk_declaration_stays_v3() {
         // v5 is a superset of v4: without the disk declarer the builder
@@ -938,6 +1046,7 @@ mod tests {
             asid_used: 0,
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
+            agent_version: String::new(),
         }
     }
 }

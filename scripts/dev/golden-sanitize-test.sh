@@ -54,6 +54,38 @@ make_root() {
     printf 'SHARED-CRED\n'     > "${r}/var/lib/systemd/credential.secret"  # must be REMOVED
     printf 'lease {\n}\n'      > "${r}/var/lib/dhcp/dhclient.leases"   # stale lease — must be CLEARED
     printf 'ts\n'             > "${r}/var/lib/NetworkManager/timestamps"  # runtime state — must be CLEARED
+    # Package-manager indexes and caches (reproducibility).
+    mkdir -p "${r}/var/lib/apt/lists/partial" "${r}/var/cache/apt/archives" "${r}/var/cache/ldconfig" \
+        "${r}/var/cache/dnf/fedora-1234" "${r}/var/cache/libdnf5/updates-5678"
+    printf 'Date: x\n' > "${r}/var/lib/apt/lists/deb.example_dists_trixie-updates_InRelease"
+    printf 'pkgs\n'   > "${r}/var/lib/apt/lists/deb.example_dists_trixie_main_binary-amd64_Packages"
+    : > "${r}/var/lib/apt/lists/lock"
+    printf 'half\n'   > "${r}/var/lib/apt/lists/partial/x"
+    mkdir -p "${r}/var/lib/apt/lists/auxfiles"
+    printf 'aux\n'    > "${r}/var/lib/apt/lists/auxfiles/x"
+    printf 'bin\n'    > "${r}/var/cache/apt/pkgcache.bin"
+    printf 'bin\n'    > "${r}/var/cache/apt/srcpkgcache.bin"
+    printf 'aux\n'    > "${r}/var/cache/ldconfig/aux-cache"
+    printf 'db\n'     > "${r}/var/lib/apt/listchanges"
+    printf 'db\n'     > "${r}/var/lib/apt/listchanges-old"
+    printf 'md\n'     > "${r}/var/cache/dnf/fedora-1234/repomd.xml"
+    printf 'md\n'     > "${r}/var/cache/libdnf5/updates-5678/repomd.xml"
+    mkdir -p "${r}/var/cache/swcatalog/cache" "${r}/var/lib/command-not-found"
+    printf 'xb\n'     > "${r}/var/cache/swcatalog/cache/C-os-catalog.xb"
+    printf 'db\n'     > "${r}/var/lib/command-not-found/commands.db"
+    printf 'md\n'     > "${r}/var/lib/command-not-found/commands.db.metadata"
+    mkdir -p "${r}/var/lib/dnf/repos/baseos-1" "${r}/usr/lib/sysimage/libdnf5" "${r}/etc/dnf/plugins" "${r}/var/lib/rpm"
+    printf 'h\n' > "${r}/var/lib/dnf/history.sqlite"
+    printf 'h\n' > "${r}/var/lib/dnf/history.sqlite-wal"
+    printf 'h\n' > "${r}/usr/lib/sysimage/libdnf5/transaction_history.sqlite"
+    printf 'h\n' > "${r}/usr/lib/sysimage/libdnf5/transaction_history.sqlite-shm"
+    printf 'p\n' > "${r}/usr/lib/sysimage/libdnf5/packages.toml"          # must SURVIVE
+    printf 'w\n' > "${r}/var/lib/dnf/repos/baseos-1/countme"
+    printf 'rpm\n' > "${r}/var/lib/rpm/rpmdb.sqlite"                     # must SURVIVE
+    printf '# Added lock on Wed Oct  7 2026\nkernel-0:6.12-1.*\n' > "${r}/etc/dnf/plugins/versionlock.list"
+    printf 'version = "1.0"\n[[packages]]\nname = "kernel"\ncomment = "Added on 2026-10-07 16:41:33"\n' \
+        > "${r}/etc/dnf/versionlock.toml"
+    printf 'ld\n'     > "${r}/etc/ld.so.cache"                           # must SURVIVE
     # A golden fstab is written EMPTY upstream — mirror that (no swap).
     printf '# hippius-bake-managed (golden_verity_overlay): empty\n' > "${r}/etc/fstab"
     printf '%s' "${r}"
@@ -110,6 +142,47 @@ if [[ -d "${ROOT}/var/lib/NetworkManager" && -z "$(ls -A "${ROOT}/var/lib/Networ
     ok "/var/lib/NetworkManager emptied"
 else
     err "/var/lib/NetworkManager not emptied"
+fi
+# Package indexes and caches gone; apt's lock and partial/ dirs kept
+# empty; the real loader cache stays.
+left="$(cd "${ROOT}/var/lib/apt/lists" && find . -mindepth 1 | LC_ALL=C sort | tr '\n' ' ')"
+if [[ "${left}" == "./lock ./partial " ]]; then
+    ok "apt lists emptied (lock + partial/ kept)"
+else
+    err "apt lists not emptied (left: ${left})"
+fi
+for f in var/cache/apt/pkgcache.bin var/cache/apt/srcpkgcache.bin var/cache/ldconfig/aux-cache \
+         var/lib/apt/listchanges var/lib/apt/listchanges-old; do
+    [[ -e "${ROOT}/${f}" ]] && err "${f} survived the scrub" || ok "${f} removed"
+done
+for f in var/lib/command-not-found/commands.db var/lib/command-not-found/commands.db.metadata; do
+    [[ -e "${ROOT}/${f}" ]] && err "${f} survived the scrub" || ok "${f} removed"
+done
+for d in var/cache/dnf var/cache/libdnf5 var/cache/swcatalog; do
+    if [[ -d "${ROOT}/${d}" && -z "$(ls -A "${ROOT}/${d}")" ]]; then
+        ok "${d} emptied"
+    else
+        err "${d} not emptied"
+    fi
+done
+[[ -d "${ROOT}/var/cache/apt/archives" ]] || err "/var/cache/apt/archives wrongly removed"
+[[ -f "${ROOT}/etc/ld.so.cache" ]] || err "ld.so.cache wrongly removed"
+for f in var/lib/dnf/history.sqlite var/lib/dnf/history.sqlite-wal \
+         usr/lib/sysimage/libdnf5/transaction_history.sqlite \
+         usr/lib/sysimage/libdnf5/transaction_history.sqlite-shm var/lib/dnf/repos/baseos-1/countme; do
+    [[ -e "${ROOT}/${f}" ]] && err "${f} survived the scrub" || ok "${f} removed"
+done
+[[ -f "${ROOT}/usr/lib/sysimage/libdnf5/packages.toml" && -f "${ROOT}/var/lib/rpm/rpmdb.sqlite" ]] \
+    || err "the package state or rpm database was wrongly removed"
+if [[ "$(cat "${ROOT}/etc/dnf/plugins/versionlock.list")" == "kernel-0:6.12-1.*" ]]; then
+    ok "versionlock.list keeps the lock, drops the dated comment"
+else
+    err "versionlock.list not normalised"
+fi
+if grep -q comment "${ROOT}/etc/dnf/versionlock.toml" || ! grep -q 'name = "kernel"' "${ROOT}/etc/dnf/versionlock.toml"; then
+    err "versionlock.toml not normalised"
+else
+    ok "versionlock.toml keeps the lock, drops the dated comment"
 fi
 rm -rf "${ROOT}"
 

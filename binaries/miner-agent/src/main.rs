@@ -71,7 +71,7 @@ const EXIT_FAIL: u8 = 2;
 #[derive(Parser)]
 #[command(
     name = "hippius-miner-agent",
-    version,
+    version = hippius_miner_agent::release::version(),
     about = "Hippius miner-agent — untrusted-host miner daemon (identity self-gen + UKI image fetch)."
 )]
 struct Cli {
@@ -985,6 +985,19 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         heartbeat_builder = heartbeat_builder.with_host_health(Arc::new(
             hippius_miner_agent::host_health::SysHostHealthSource::default(),
         ));
+    }
+    // `v6` agent-version heartbeat — opt-in, and only on top of `v5`. This
+    // is miner → vali data: the vali (and its ticket-validator) that
+    // accepts `v6` must be deployed before an operator turns this on.
+    if config.heartbeat.schema_agent_version {
+        let tag = hippius_miner_agent::release::RELEASE_TAG;
+        if !hippius_types::heartbeat::is_valid_agent_version(tag) {
+            eprintln!(
+                "hippius-miner-agent: heartbeat: release tag is not a valid agent_version, \
+                 emitting v5"
+            );
+        }
+        heartbeat_builder = heartbeat_builder.with_agent_version(tag.to_string());
     }
     let heartbeat_builder = Arc::new(heartbeat_builder);
     let heartbeat_client: Arc<dyn HeartbeatClient> =

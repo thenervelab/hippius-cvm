@@ -143,3 +143,19 @@ fn no_subcommand_is_a_usage_error() {
     let out = Command::new(bin()).output().unwrap();
     assert!(!out.status.success());
 }
+
+#[test]
+fn version_prints_the_crate_version_and_the_embedded_release_tag() {
+    // Play 05 matches `versions.miner_agent` (the crate version) in this
+    // line, and the auto-updater matches the parenthesised release tag.
+    let out = Command::new(bin()).arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim_end(),
+        format!(
+            "hippius-miner-agent {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            hippius_miner_agent::release::RELEASE_TAG
+        )
+    );
+}

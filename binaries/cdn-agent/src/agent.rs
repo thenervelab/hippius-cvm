@@ -418,6 +418,7 @@ impl FeedWorker {
                 .lock()
                 .map_err(|_| CdnError::Control("lock-poisoned"))?;
             o.applied_revision = self.state.revision;
+            o.feed_applied = !self.state.is_empty();
             o.cert_store_loaded = store.default_spki_sha256.is_some();
             o.fleet_key_ok = fleet_key_ok;
             o.draining = self.state.self_state.draining;
@@ -1084,6 +1085,31 @@ mod tests {
             _ => Reply::status(404),
         }
         })
+    }
+
+    #[test]
+    fn a_snapshot_at_revision_0_is_pushed_and_counts_as_applied() {
+        let key = NodeKey::derive(&[7u8; 32]);
+        let mock = happy_backend(node_cert_pem(&key, SAN, 7), snapshot_with_wildcard(0));
+        let mut r = rig(&mock);
+        let now = unix_now();
+        r.worker.step(now).unwrap();
+        assert_eq!(r.control.last("/v1/config").unwrap()["revision"], 0);
+        let o = r.observed.lock().unwrap().clone();
+        assert!(o.feed_applied && o.applied_revision == 0);
+        assert!(crate::health::evaluate(&o, true, now, &r.worker.cfg.timing).feed_fresh);
+        // The next poll asks from revision 0 instead of another snapshot.
+        r.worker.step(now + 1).unwrap();
+        let feeds = mock.requests_to("/api/cdn/node/feed/?since=0");
+        assert_eq!(
+            feeds.len(),
+            1,
+            "{:?}",
+            mock.requests()
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

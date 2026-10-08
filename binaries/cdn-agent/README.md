@@ -206,6 +206,12 @@ an OpenResty restart): the agent then re-pushes everything. Push order
 is secrets, certs, config. `/__hippius/health` returns 200 only when
 `ready` is true **and** the canary object is served.
 
+Secret values are the unsealed plaintext, unchanged. `s3_credentials` is
+the backend's JSON `{"access_key_id", "secret"}` (plus `secret_access_key`,
+which wins when present, and an optional `session_token`); the shape is
+pinned by `test_vectors/cdn/s3_credentials.json`, read by this crate's
+render test and by the OpenResty router's unit test.
+
 A zone with `serving: false` (origin refused, secret unreadable) must be
 answered without contacting any origin. The S3 endpoint is part of the
 OpenResty config, never of the feed.

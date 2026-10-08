@@ -5,8 +5,11 @@
 #       Substitute every @NAME@; fails if one is left unset. The image bake
 #       (I3) renders the production values once; the tests render their own.
 #   render.sh cache <out> <cache_dir> <max_size> [keys_zone_size]
-#       Write the proxy_cache_path include. At node start, OpenResty's
-#       ExecStartPre passes `hippius-cdn-agent cache-size` as max_size.
+#       Write the proxy_cache_path include. The cache itself lives in
+#       <cache_dir>/objects: nginx's cache loader deletes every file in its
+#       tree that is not a cache entry, so the health canary at
+#       <cache_dir>/.hippius-canary must stay outside it. nginx creates
+#       objects/ at start.
 #   render.sh cache-auto <out> <cache_dir> <percent> [keys_zone_size]
 #       The same include, max_size = <percent> (10-90) of the volume that
 #       holds <cache_dir> (statvfs). The cdn-node OpenResty unit's
@@ -46,7 +49,7 @@ case "${1:-}" in
     [[ "$size" =~ ^[0-9]+[kmg]?$ ]] || die "bad max_size: $size"
     [[ "$keys" =~ ^[0-9]+[kmg]?$ ]] || die "bad keys_zone size: $keys"
     [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "bad cache dir: $dir"
-    printf 'proxy_cache_path %s levels=1:2 keys_zone=hippius_cache:%s max_size=%s inactive=30d use_temp_path=off;\n' \
+    printf 'proxy_cache_path %s/objects levels=1:2 keys_zone=hippius_cache:%s max_size=%s inactive=30d use_temp_path=off;\n' \
       "$dir" "$keys" "$size" > "$out"
     ;;
   cache-auto)

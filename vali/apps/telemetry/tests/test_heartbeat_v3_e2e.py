@@ -88,3 +88,16 @@ def test_real_v5_vector_carries_the_host_health_report() -> None:
 
 def test_real_v4_vector_carries_no_host_health_report() -> None:
     assert _verify("signed_heartbeat_v4.cbor").declared_host_health is None
+
+
+def test_real_v6_vector_carries_the_agent_version() -> None:
+    hb = _verify("signed_heartbeat_v6.cbor")
+    assert hb.schema_version == 6
+    assert hb.agent_version == "v1.2.3"
+    assert hb.declared_host_health is not None
+    assert hb.declared_host_health.df_flush_failures == 3
+    assert hb.declared_disk is not None
+
+
+def test_real_v5_vector_carries_no_agent_version() -> None:
+    assert _verify("signed_heartbeat_v5.cbor").agent_version is None

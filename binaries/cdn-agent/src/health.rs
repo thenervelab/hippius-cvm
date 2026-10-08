@@ -24,8 +24,11 @@ use crate::config::TimingConfig;
 /// What the other agent loops have observed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
-    /// The revision OpenResty holds (0 = nothing yet).
+    /// The revision OpenResty holds.
     pub applied_revision: u64,
+    /// OpenResty holds a pushed snapshot. Revision 0 is a valid snapshot
+    /// revision, so `applied_revision` cannot tell.
+    pub feed_applied: bool,
     /// Last time the node knew it was current: a revision applied, a
     /// `304`, a stale delta, or (at boot) the LKG's save time.
     pub confirmed_at: u64,
@@ -63,7 +66,7 @@ pub fn evaluate(o: &Observed, volume_mounted: bool, now: u64, t: &TimingConfig) 
         .pending_since
         .is_none_or(|since| now.saturating_sub(since) <= t.feed_stale_after_s);
     let recent = o.confirmed_at != 0 && now.saturating_sub(o.confirmed_at) <= t.lkg_max_age_s;
-    let feed_fresh = o.applied_revision > 0 && not_stuck && recent;
+    let feed_fresh = o.feed_applied && not_stuck && recent;
     let h = Health {
         ready: false,
         volume_mounted,
@@ -118,6 +121,7 @@ mod tests {
     fn good() -> Observed {
         Observed {
             applied_revision: 9,
+            feed_applied: true,
             confirmed_at: 1_000,
             pending_since: None,
             cert_store_loaded: true,
@@ -153,10 +157,17 @@ mod tests {
             ("quota guard", |o| o.quota_guard = true, true, 1_010, false),
             (
                 "nothing applied",
-                |o| o.applied_revision = 0,
+                |o| o.feed_applied = false,
                 true,
                 1_010,
                 false,
+            ),
+            (
+                "snapshot at revision 0",
+                |o| o.applied_revision = 0,
+                true,
+                1_010,
+                true,
             ),
             (
                 "stuck 299 s",

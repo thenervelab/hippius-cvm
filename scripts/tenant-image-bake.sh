@@ -1528,7 +1528,72 @@ golden_sanitize_base() {
         sudo find "${root}/var/lib/NetworkManager" -mindepth 1 -delete 2>/dev/null || true
     fi
 
-    log "golden: base scrub done (ssh-host-keys/machine-id/cloud-state/logs/random-seed/dhcp/NetworkManager cleared; no swap file/fstab/systemd-unit on shared bytes)"
+    # 8. Package-manager indexes and caches (reproducibility). apt's lists
+    #    hold the mirrors' InRelease files, re-signed (new Date/Valid-Until)
+    #    every few hours, and the binary caches built from them; ldconfig's
+    #    aux-cache and apt-listchanges' databases record build-time state.
+    #    Shipping them made two bakes of the same inputs differ in their
+    #    verity root. Drop them so the base is a function of the installed
+    #    package set only: a guest refreshes its index before installing
+    #    (`apt-get update`, which cloud-init runs itself for `packages:`;
+    #    dnf fetches metadata on demand).
+    local _lists="${root}/var/lib/apt/lists"
+    if [[ -d "${_lists}" ]]; then
+        # Everything, subdirectories (auxfiles/) included, except apt's
+        # lock and the (emptied) partial/ directory.
+        sudo find "${_lists}" -mindepth 1 ! -path "${_lists}/lock" ! -path "${_lists}/partial" \
+            -delete 2>/dev/null || true
+    fi
+    if [[ -d "${root}/var/cache/apt" ]]; then
+        sudo find "${root}/var/cache/apt" -maxdepth 1 -name '*.bin' -delete 2>/dev/null || true
+    fi
+    if [[ -d "${root}/var/lib/apt" ]]; then
+        sudo find "${root}/var/lib/apt" -maxdepth 1 -name 'listchanges*' -delete 2>/dev/null || true
+    fi
+    sudo rm -f "${root}/var/cache/ldconfig/aux-cache" 2>/dev/null || true
+    # Caches apt's update hooks rebuild from the same index (Ubuntu): the
+    # AppStream catalog and command-not-found's database metadata.
+    if [[ -d "${root}/var/cache/swcatalog" ]]; then
+        sudo find "${root}/var/cache/swcatalog" -mindepth 1 -delete 2>/dev/null || true
+    fi
+    if [[ -d "${root}/var/cache/app-info" ]]; then
+        sudo find "${root}/var/cache/app-info" -mindepth 1 -delete 2>/dev/null || true
+    fi
+    if [[ -d "${root}/var/lib/command-not-found" ]]; then
+        sudo find "${root}/var/lib/command-not-found" -maxdepth 1 -name 'commands.db*' -delete 2>/dev/null || true
+    fi
+    local _pmcache
+    for _pmcache in "${root}/var/cache/dnf" "${root}/var/cache/libdnf5" "${root}/var/cache/yum"; do
+        if [[ -d "${_pmcache}" ]]; then
+            sudo find "${_pmcache}" -mindepth 1 -delete 2>/dev/null || true
+        fi
+    done
+    # dnf's own build-time records: the transaction history (dnf4 and dnf5,
+    # with its SQLite side files), the per-repo countme week counters, and
+    # the timestamp each versionlock entry carries in its comment. The
+    # locks themselves stay; the rpm database is untouched.
+    sudo rm -f "${root}"/var/lib/dnf/history.sqlite* \
+        "${root}"/usr/lib/sysimage/libdnf5/transaction_history.sqlite* 2>/dev/null || true
+    if [[ -d "${root}/var/lib/dnf/repos" ]]; then
+        sudo find "${root}/var/lib/dnf/repos" -name countme -type f -delete 2>/dev/null || true
+    fi
+    # Rewritten in place (same inode), never `sed -i`: a renamed copy would
+    # drop the file's SELinux label on the RHEL family.
+    local _lock _pattern _kept
+    for _lock in "${root}/etc/dnf/plugins/versionlock.list" "${root}/etc/dnf/versionlock.toml"; do
+        [[ -f "${_lock}" && ! -L "${_lock}" ]] || continue
+        case "${_lock}" in
+            *.list) _pattern='^#' ;;
+            *)      _pattern='^[[:space:]]*comment[[:space:]]*=' ;;
+        esac
+        # grep exits 1 when every line is a comment; 2 is a read error and
+        # must not empty the lock file.
+        _kept="$(sudo grep -v "${_pattern}" "${_lock}")" || [[ $? -eq 1 ]] \
+            || die "golden: cannot read ${_lock}"
+        printf '%s\n' "${_kept}" | sudo tee "${_lock}" >/dev/null
+    done
+
+    log "golden: base scrub done (ssh-host-keys/machine-id/cloud-state/logs/random-seed/dhcp/NetworkManager/package indexes cleared; no swap file/fstab/systemd-unit on shared bytes)"
 }
 
 # ── Golden dm-verity base builder (golden-bake PR1) ─────────────────
@@ -3308,7 +3373,18 @@ fi
 # for the overlay-root assembly. --no-hostonly keeps the rest generic so
 # it boots on any miner, and --reproducible + SOURCE_DATE_EPOCH make
 # the cpio byte-stable (#284 parity with the apt arm's update-initramfs).
+# Compression: dracut takes zstd when the kernel can unpack it, else the
+# first of pigz / gzip it finds. pigz's multi-threaded output is not byte-
+# stable: two CS10 bakes of the same tree gave the same cpio content but
+# different initrd bytes. So unless the kernel can unpack zstd AND the zstd
+# binary is there (dracut falls back to pigz otherwise), plain gzip.
+dracut_compress=(--compress "gzip -n -9")
+if grep -qs '^CONFIG_RD_ZSTD=y' "/lib/modules/${KVER}/config" "/boot/config-${KVER}" \
+    && command -v zstd >/dev/null 2>&1; then
+    dracut_compress=()
+fi
 dracut --force --reproducible --no-hostonly --no-hostonly-cmdline \
+    "${dracut_compress[@]}" \
     "/boot/initramfs-${KVER}.img" "${KVER}" \
     || { echo "FATAL: dracut initramfs build failed for ${KVER}" >&2; exit 3; }
 

@@ -604,6 +604,73 @@ def test_heartbeat_malformed_host_health_value_raises_unavailable(
         verifier.verify_heartbeat(**_hb_kwargs())
 
 
+def _v6_body(**overrides: object) -> dict[str, object]:
+    return {**_v5_body(), "schema_version": 6, "agent_version": "v2026.10.08", **overrides}
+
+
+def test_heartbeat_v6_body_parses_the_agent_version(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v6_body())
+    hb = verifier.verify_heartbeat(**_hb_kwargs())
+    assert hb.schema_version == 6
+    assert hb.agent_version == "v2026.10.08"
+    assert hb.declared_host_health is not None
+    assert hb.declared_disk is not None
+
+
+@pytest.mark.parametrize("tag", ["dev", "A", "x" * 32, "v1.2.3-rc_1"])
+def test_heartbeat_v6_accepts_the_full_charset(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, tag: str
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v6_body(agent_version=tag))
+    assert verifier.verify_heartbeat(**_hb_kwargs()).agent_version == tag
+
+
+def test_heartbeat_pre_v6_body_has_no_agent_version(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v5_body())
+    assert verifier.verify_heartbeat(**_hb_kwargs()).agent_version is None
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "x" * 33, "v1 2", "v1/2", "v1\n", "é", "v1\x1b[31m", None, 6, True]
+)
+def test_heartbeat_malformed_agent_version_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, bad: object
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v6_body(agent_version=bad))
+    with pytest.raises(verifier.VerifierUnavailable, match="agent_version"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_heartbeat_agent_version_without_host_health_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    body = {**_HEARTBEAT_OK_BODY, "schema_version": 6, "agent_version": "dev"}
+    _stub_heartbeat_body(monkeypatch, body)
+    with pytest.raises(verifier.VerifierUnavailable, match="without a host-health"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_heartbeat_agent_version_invalid_is_a_known_reject(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    # The binary's v6 charset reject is a miner fault (VerifierFailed), not
+    # a contract drift (VerifierUnavailable).
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: _stub_completed(
+            json.dumps({"ok": False, "error_class": "agent_version_invalid"}).encode(), 0
+        ),
+    )
+    with pytest.raises(verifier.VerifierFailed) as exc_info:
+        verifier.verify_heartbeat(**_hb_kwargs())
+    assert exc_info.value.category == "agent_version_invalid"
+
+
 def test_heartbeat_capacity_invalid_is_a_known_reject(
     monkeypatch: pytest.MonkeyPatch, fake_binary: Path
 ) -> None:

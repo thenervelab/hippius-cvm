@@ -308,6 +308,14 @@ pub struct HeartbeatSection {
     /// verifier must accept `v5` FIRST.
     #[serde(default)]
     pub schema_host_health: bool,
+    /// Emit the `v6` heartbeat instead: the `v5` body plus `agent_version`,
+    /// this binary's release tag ([`crate::release::RELEASE_TAG`]), which
+    /// vali only records. Requires `schema_host_health` (`v6` is a superset
+    /// of `v5`). Default `false`: this is miner → vali data, so vali's
+    /// verifier (the `ticket-validator` in the vali image) must accept `v6`
+    /// FIRST.
+    #[serde(default)]
+    pub schema_agent_version: bool,
 }
 
 impl Default for HeartbeatSection {
@@ -319,6 +327,7 @@ impl Default for HeartbeatSection {
             schema_capacity: false,
             schema_disk: false,
             schema_host_health: false,
+            schema_agent_version: false,
         }
     }
 }
@@ -517,6 +526,12 @@ impl Config {
         if self.heartbeat.schema_host_health && !self.heartbeat.schema_disk {
             return Err(MinerAgentError::ConfigInvalid(
                 "heartbeat.schema_host_health-requires-schema_disk",
+            ));
+        }
+        // …and `v6` extends `v5`.
+        if self.heartbeat.schema_agent_version && !self.heartbeat.schema_host_health {
+            return Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_agent_version-requires-schema_host_health",
             ));
         }
 
@@ -1056,6 +1071,25 @@ cvm_memory_mb_budget = 16384
             parse(&cfg),
             Err(MinerAgentError::ConfigInvalid(
                 "heartbeat.schema_disk-requires-schema_capacity"
+            ))
+        ));
+    }
+
+    #[test]
+    fn schema_agent_version_defaults_false_and_requires_schema_host_health() {
+        assert!(!parse(VALID).unwrap().heartbeat.schema_agent_version);
+        assert!(!HeartbeatSection::default().schema_agent_version);
+        let cfg = format!(
+            "{VALID}\n[heartbeat]\nschema_capacity = true\nschema_disk = true\nschema_host_health = true\nschema_agent_version = true\n"
+        );
+        assert!(parse(&cfg).unwrap().heartbeat.schema_agent_version);
+        let cfg = format!(
+            "{VALID}\n[heartbeat]\nschema_capacity = true\nschema_disk = true\nschema_agent_version = true\n"
+        );
+        assert!(matches!(
+            parse(&cfg),
+            Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.schema_agent_version-requires-schema_host_health"
             ))
         ));
     }

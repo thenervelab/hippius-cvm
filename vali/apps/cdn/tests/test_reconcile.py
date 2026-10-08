@@ -982,3 +982,29 @@ def test_a_20_minute_ingest_cut_fails_no_node(fleet_fakes: Fleet) -> None:
     for n in (a, b):
         n.refresh_from_db()
         assert n.state == CdnNodeState.READY
+
+
+@pytest.mark.parametrize("regions", ["none", "inactive"])
+def test_the_reconciler_with_no_active_region_does_nothing(
+    fleet_fakes: Fleet, monkeypatch: pytest.MonkeyPatch, regions: str
+) -> None:
+    """Flags on before any region is active (the rollout order): no launch,
+    no node, no alert — even with a quiet tenant fleet and unseen miners
+    that would trip the breakers."""
+    if regions == "inactive":
+        _region(desired=2, active=False)
+    stale = timezone.now() - dt.timedelta(hours=1)
+    for i in range(4):
+        _tenant_vm(f"tenant-vm-{i}", signal_at=stale)
+    for m in ("miner-a", "miner-b", "miner-c"):
+        _miner(m, seen=stale)
+    logged: list[str] = []
+    for level in ("warning", "error", "critical"):
+        monkeypatch.setattr(
+            reconcile.log, level, lambda msg, *a, _l=level, **k: logged.append(f"{_l}: {msg % a}")
+        )
+    for minutes in (0, 10, 60):
+        assert reconcile.reconcile(now=_later(minutes=minutes)) == reconcile.ReconcileReport()
+    assert fleet_fakes.launches == [] and not CdnNode.objects.exists()
+    assert logged == []
+    assert CdnRevision.objects.get().liveness_hold_since is None

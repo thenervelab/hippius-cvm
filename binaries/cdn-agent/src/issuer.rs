@@ -889,6 +889,7 @@ mod tests {
     fn state() -> FeedState {
         let mut s = FeedState {
             revision: 5,
+            snapshot_applied: true,
             ..FeedState::default()
         };
         s.fleet_key_versions = vec![FleetKeyVersion {
@@ -1032,6 +1033,33 @@ mod tests {
                 r.target
             );
         }
+    }
+
+    #[test]
+    fn an_empty_snapshot_at_revision_0_starts_the_fleet_job() {
+        let ca = FakeCa::start();
+        let b = backend(409, 200);
+        let mut issuer = Issuer::new(acme_cfg(&ca), "*.cdn.example.test", "FR").unwrap();
+        let now = crate::clock::unix_now();
+        // No snapshot yet: nothing to issue against.
+        run(&mut issuer, &b, &FeedState::default(), now, 2);
+        assert!(b.mock.requests().is_empty());
+        // A snapshot at revision 0 with no zone, hostname or certificate.
+        let snap = crate::feed::tests::resp(serde_json::json!({
+            "revision": 0, "mode": "snapshot",
+            "fleet_key_versions": [{"version": 1, "state": "active"}],
+            "self": {"state": "ready", "draining": false}
+        }));
+        let st = match FeedState::default().apply(snap).unwrap() {
+            crate::feed::Applied::New(s) => *s,
+            crate::feed::Applied::Stale => panic!("an empty snapshot must apply"),
+        };
+        assert!(!st.is_empty());
+        assert!(st.hostnames.is_empty() && st.certs.is_empty());
+        run(&mut issuer, &b, &st, now, 1);
+        let leases = b.mock.requests_to("/api/cdn/node/acme/lease/");
+        assert_eq!(leases.len(), 1, "the fleet job asked for its lease");
+        assert_eq!(leases[0].json()["hostname_id"], FLEET_ID);
     }
 
     #[test]

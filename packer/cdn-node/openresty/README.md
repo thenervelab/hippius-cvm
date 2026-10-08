@@ -214,6 +214,15 @@ standard bake is unchanged.
     Slice subrequests skip the Lua phases and reuse the main request's
     URL, so a header signature bound to a clock-skew window could expire
     mid-download; a presigned URL is valid for its stated lifetime.
+  - `s3_credentials` is the plaintext the backend sealed, passed through
+    unchanged by the agent: a JSON object
+    `{"access_key_id": "...", "secret": "..."}` (the zone's read-only
+    SubToken). `secret_access_key` is accepted in place of `secret`, and an
+    optional `session_token` is signed as `X-Amz-Security-Token`. The
+    region is the origin's `region`, else the node's default. Unusable
+    credentials answer 503 without contacting the origin, with a CRIT line
+    that names the field (`access_key_id missing or invalid`, `secret
+    missing or invalid`, ...) and never a value.
   - Only `Host` and the slice `Range` are sent. No client header, body or
     query string reaches the origin.
   - The presigned URL is never logged: there is no access log, metering
@@ -265,7 +274,12 @@ standard bake is unchanged.
 - **Health.** `/__hippius/health` returns 200 only when all of these hold:
   - the agent's `ready` is true;
   - the agent's health document is no older than 30 s;
-  - the canary file that worker 0 wrote on the cache volume reads back.
+  - the canary file on the cache volume reads back. Worker 0 writes
+    `<cache_dir>/.hippius-canary` at start and re-checks it every 10 s,
+    rewriting it when it is missing or wrong. A failure is logged once,
+    and so is the recovery. The cached objects live in `<cache_dir>/objects`,
+    because nginx's cache loader deletes every file in its tree that is
+    not a cache entry, a minute after start.
 - **Other endpoints.** `/.well-known/acme-challenge/<token>` serves the
   feed's key authorisation for any host, over HTTP. `/.well-known/hippius-attestation`
   serves the agent's attestation document.

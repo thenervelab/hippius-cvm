@@ -398,6 +398,12 @@ class MinerCapacity(models.Model):
         null=True, blank=True, default=None
     )
     host_health_reported_at = models.DateTimeField(null=True, blank=True, default=None)
+    # ── miner-agent release tag (v6 heartbeat). UNTRUSTED, observability
+    # only (`hippius_miner_agent_version_info`), never read by placement.
+    # "" = no v6 report yet (`db_default` so the old image's INSERTs, which
+    # omit the column, still satisfy NOT NULL during a roll).
+    agent_version = models.CharField(max_length=32, blank=True, default="", db_default="")
+    agent_version_reported_at = models.DateTimeField(null=True, blank=True, default=None)
     # ── operator placement controls (audited writes only, see
     # `capacity_admin`). `max_booting` overrides
     # `VALI_SCHEDULER_MAX_BOOTING_PER_MINER` for this miner (NULL = the
