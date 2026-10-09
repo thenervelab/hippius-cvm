@@ -316,6 +316,15 @@ class Command(BaseCommand):
             )
         if service._has_active_job(vm):
             return "the VM already has an in-flight orchestration job"
+        # The failed job's destination stopped counting for the VM's
+        # placement group when the job ended: a sibling may be there now.
+        from apps.scheduler import service as sched
+
+        reason = sched.group_dest_reason(
+            vm.tenant_id, vm.placement_group, vm.vm_id, job.dest_node_id
+        )
+        if reason is not None:
+            return reason
         # Never race a restore that is still running on the destination.
         try:
             status = effects.poll_dest_activation(vm, dest_node_id=job.dest_node_id)

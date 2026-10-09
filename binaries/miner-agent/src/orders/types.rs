@@ -78,6 +78,9 @@ pub enum OrderKind {
     /// no VM; replay is refused by a revision persisted on disk
     /// ([`crate::netpolicy`]).
     NetPolicy,
+    /// Set what the agent does when the guest powers itself off
+    /// ([`PowerPolicyOrder`]). Persisted per VM; no relaunch.
+    PowerPolicy,
 }
 
 impl OrderKind {
@@ -95,6 +98,7 @@ impl OrderKind {
             OrderKind::Restore => "restore",
             OrderKind::TenantPreflight => "tenant-preflight",
             OrderKind::NetPolicy => "net-policy",
+            OrderKind::PowerPolicy => "power-policy",
         }
     }
 }
@@ -300,6 +304,55 @@ pub struct LaunchOrder {
     /// agents deploy before vali.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetSpec>,
+    /// What the agent does when this VM's guest powers itself off
+    /// ([`OnGuestPoweroff`]). Persisted per VM at launch
+    /// ([`crate::lifecycle::power_policy`]). Not measured, not part of the
+    /// L1 ticket.
+    ///
+    /// `serde(default)` ⇒ `None` = `restart`, today's behaviour, and
+    /// encoded ONLY when set: a body without it is byte-identical to
+    /// before, and an agent too old to know the key refuses one that
+    /// carries it at decode (`deny_unknown_fields`), so agents deploy
+    /// before vali and vali sends it only to agents that know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_guest_poweroff: Option<OnGuestPoweroff>,
+}
+
+/// What the agent does when a tenant guest powers itself off — the
+/// tenant's per-VM choice. A crash (QEMU killed, a guest reset, a
+/// panic) is restarted whatever this says; see
+/// [`crate::lifecycle::power_policy`] for how the two are told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnGuestPoweroff {
+    /// Start the domain again (the reboot-watcher's historic behaviour).
+    #[default]
+    Restart,
+    /// Leave it stopped and report `stop_reason: guest-poweroff` on the
+    /// `domain-state` probe.
+    Stop,
+}
+
+impl OnGuestPoweroff {
+    /// The wire / on-disk spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnGuestPoweroff::Restart => "restart",
+            OnGuestPoweroff::Stop => "stop",
+        }
+    }
+}
+
+/// Change a running VM's [`OnGuestPoweroff`] in place (the tenant's
+/// `PATCH /v1/vm/<id>/power-policy`). Applies to the current instance:
+/// the agent persists it and the next guest poweroff reads it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerPolicyOrder {
+    /// The CVM the policy applies to.
+    pub vm_id: VmId,
+    /// The new policy.
+    pub on_guest_poweroff: OnGuestPoweroff,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -944,6 +997,12 @@ impl Order for LaunchOrder {
     }
 }
 
+impl Order for PowerPolicyOrder {
+    fn vm_id(&self) -> &VmId {
+        &self.vm_id
+    }
+}
+
 impl Order for StopOrder {
     fn vm_id(&self) -> &VmId {
         &self.vm_id
@@ -1032,6 +1091,7 @@ impl MigrateActivateOrder {
             require_existing_disks: false,
             guardian_ep: self.guardian_ep,
             net: self.net,
+            on_guest_poweroff: None,
         }
     }
 }
@@ -1065,6 +1125,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         };
         assert_eq!(order.vm_id().as_str(), "tenant-1");
     }
@@ -1090,6 +1151,7 @@ mod tests {
             require_existing_disks,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         };
         let encode = |o: &LaunchOrder| {
             let mut buf = Vec::new();
@@ -1611,6 +1673,7 @@ mod tests {
             require_existing_disks: true,
             guardian_ep: guardian_ep.map(String::from),
             net: None,
+            on_guest_poweroff: None,
         }
     }
 

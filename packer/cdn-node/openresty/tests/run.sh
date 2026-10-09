@@ -23,7 +23,7 @@ valid=(PREFIX=/opt/openresty PID=/run/cdn/nginx.pid TEMP_DIR=/run/cdn/tmp LUA_DI
        ORIGIN_CONF=/opt/hippius-cdn/origin.conf RATE_PER_IP=200r/s CTL_SOCKET=/run/cdn/ctl.sock
        CTL_MAX_BODY=256m LISTEN_HTTP=80 LISTEN_HTTPS=443 PLACEHOLDER_CERT=/run/cdn/placeholder.pem
        PLACEHOLDER_KEY=/run/cdn/placeholder.key BURST_PER_IP=400 CONN_PER_IP=256
-       CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt)
+       CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt GEOIP_DB=/opt/hippius-cdn/geoip/dbip-country-lite.mmdb ORIGIN_SOCKET=/run/cdn/origin.sock)
 "$root/render.sh" conf "$root/nginx.conf.in" "$tmp/x.conf" "${valid[@]}"
 if "$root/render.sh" conf "$root/nginx.conf.in" "$tmp/x.conf" PREFIX=/opt/openresty 2>/dev/null; then
   echo "render.sh accepted a config with unset placeholders" >&2; exit 1
@@ -49,9 +49,20 @@ for bad in 5 95 x; do
 done
 echo "ok"
 
+echo "== GeoIP test databases"
+python3 -I "$here/geoip/make_test_mmdb.py" "$tmp/geoip"
+export HIPPIUS_TEST_GEOIP_DIR="$tmp/geoip"
+echo "ok"
+
 echo "== Lua unit tests"
 "${prefix}/bin/resty" --nginx "${prefix}/nginx/sbin/nginx" \
   -I "${prefix}/lualib" -I "$root/lua" "$here/unit/run.lua"
+
+if [ -n "${HIPPIUS_REAL_GEOIP_DB:-}" ]; then
+  echo "== GeoIP against the real database"
+  "${prefix}/bin/resty" --nginx "${prefix}/nginx/sbin/nginx" \
+    -I "${prefix}/lualib" -I "$root/lua" "$here/geoip/real_db_check.lua"
+fi
 
 echo "== integration tests"
 OPENRESTY_PREFIX="$prefix" python3 -I "$here/integration/test_dataplane.py"

@@ -777,12 +777,14 @@ impl LocalTicker {
             .lock()
             .map(|o| o.applied_revision)
             .map_err(|_| CdnError::Counters("lock-poisoned"))?;
-        let report = snap.report(
+        let mut report = snap.report(
             &self.cfg.node.vm_id,
             format_rfc3339(now),
             applied,
             &self.geoip_db,
         );
+        // Best effort: a value that cannot be read is omitted.
+        report.disk = crate::disk::sample(&self.cfg, now);
         self.queue.enqueue(&report)
     }
 
@@ -866,12 +868,15 @@ pub fn run(cfg: Config, shutdown: Shutdown) -> Result<()> {
     let mut start_queue = UsageQueue::open(paths.usage_queue.clone(), DEFAULT_MAX_QUEUED)?;
     match previous {
         Previous::Final(old) => {
-            let report = old.final_report(
+            let mut report = old.final_report(
                 &cfg.node.vm_id,
                 format_rfc3339(now),
                 lkg_revision,
                 &geoip_db,
             );
+            // The backend keeps the latest report's node stats: this one is
+            // newer than any the old epoch sent, so it carries them too.
+            report.disk = crate::disk::sample(&cfg, now);
             start_queue.enqueue(&report)?;
             eprintln!(
                 "{LOG}: closed counter epoch {} at seq {}",
@@ -1469,6 +1474,61 @@ mod tests {
         ));
         assert_eq!(r.worker.applied_revision(), 10);
         assert_eq!(mock.requests_to("/api/cdn/node/usage/").len(), 1);
+    }
+
+    #[test]
+    fn the_usage_report_carries_disk_and_cache_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_strs(crate::config::tests::UID, NODE).unwrap();
+        cfg.paths.state_dir = dir.path().join("cdn");
+        std::fs::create_dir_all(&cfg.paths.state_dir).unwrap();
+        cfg.paths.data_mount = dir.path().to_path_buf();
+        cfg.paths.cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cfg.paths.cache_dir).unwrap();
+        std::fs::write(
+            cfg.paths.cache_dir.join(crate::disk::CACHE_USAGE_FILE),
+            "4096000\n",
+        )
+        .unwrap();
+        let conf = dir.path().join("cache.conf");
+        std::fs::write(&conf, "proxy_cache_path /c/objects levels=1:2 keys_zone=hippius_cache:8m max_size=65536k inactive=30d use_temp_path=off;\n").unwrap();
+        cfg.paths.cache_conf = Some(conf);
+        let paths = StatePaths::new(&cfg.paths.state_dir);
+        let counters = Arc::new(Mutex::new(Counters::fresh()));
+        for (cache, n) in [("hit", 3), ("stale", 1), ("miss", 2), ("bypass", 1)] {
+            for _ in 0..n {
+                let rec = crate::counters::RequestRecord::parse(
+                    format!(r#"{{"zone":"z1","client_region":"FR","billable":true,"bytes_out":1,"status":200,"cache":"{cache}"}}"#).as_bytes(),
+                )
+                .unwrap();
+                counters.lock().unwrap().record(&rec, true);
+            }
+        }
+        let now = crate::clock::unix_now();
+        let mut t = LocalTicker::new(
+            cfg,
+            Arc::clone(&counters),
+            &paths,
+            Arc::new(RecordingControl::default()),
+            Arc::new(Mutex::new(Observed::default())),
+            "dbip-test".into(),
+            now,
+        )
+        .unwrap();
+        t.tick(now + 60).unwrap();
+        let queued = t.queue.pending().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&queued[0]).unwrap()).unwrap();
+        let disk = &body["disk"];
+        assert_eq!(disk["cache_used_bytes"], 4_096_000);
+        assert_eq!(disk["cache_max_bytes"], 65_536 * 1024);
+        assert!(disk["volume_size_bytes"].as_u64().unwrap() > 0);
+        assert!(
+            disk["volume_used_bytes"].as_u64().unwrap()
+                <= disk["volume_size_bytes"].as_u64().unwrap()
+        );
+        // HIT and STALE are hits; MISS and BYPASS are misses.
+        assert_eq!(body["cache"], serde_json::json!({"hits": 4, "misses": 3}));
     }
 
     #[test]

@@ -32,7 +32,10 @@ class BackupInterval(models.IntegerChoices):
 
 
 class FailoverMode(models.TextChoices):
-    """Stored for the failover phase; nothing here acts on it."""
+    """Whether vali fails the VM over on its own when its miner dies
+    (`apps.orchestration.failover_auto`). `manual` (the default) leaves it
+    to an operator; `auto` needs the customer's explicit choice and a region
+    whose backups are local (`apps.backup.service.failover_auto_status`)."""
 
     AUTO = "auto", "Automatic"
     MANUAL = "manual", "Manual"
@@ -46,7 +49,7 @@ class BackupPolicy(models.Model):
     interval_s = models.PositiveIntegerField(choices=BackupInterval.choices)
     retention_days = models.PositiveIntegerField(default=7)
     failover_mode = models.CharField(
-        max_length=16, choices=FailoverMode.choices, default=FailoverMode.AUTO
+        max_length=16, choices=FailoverMode.choices, default=FailoverMode.MANUAL
     )
     #: The next run must be a full: nothing restorable yet, a reboot was
     #: seen, or a failure may have left a hole in the dirty bitmap. Set

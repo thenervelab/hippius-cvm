@@ -120,6 +120,9 @@ REGION_RE = re.compile(r"^[A-Za-z]{2}$")
 # miner — is what emptied the candidate set. Transient: the launch path
 # waits for a boot slot on it instead of failing the job.
 MINERS_BOOTING = "miners-booting"
+#: Gate (k) removed every host that passed all the others: the VM's
+#: placement group already holds each of them. Final, not a retry.
+ANTI_AFFINITY_UNSATISFIABLE = "placement-anti-affinity-unsatisfiable"
 
 # The two `cvm_capability` verdicts this module acts on. Re-declared as
 # plain literals rather than imported so this module stays free of the
@@ -358,6 +361,8 @@ def decide_placement(
     cordoned: Mapping[str, str] | None = None,
     net_policy_unready: Mapping[str, str] | None = None,
     cdn_local_edge: frozenset[str] | None = None,
+    group_occupied: frozenset[str] | None = None,
+    power_policy_capable: frozenset[str] | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -485,12 +490,24 @@ def decide_placement(
     - `cdn_local_edge`   gate (j): the lower-case node_ids a CDN node may
                          go to (`service.cdn_edge_arguments`). HARD, no
                          fallback. `None` ⇒ no gate.
+    - `group_occupied`   gate (k): the lower-case node_ids that already
+                         carry (or are about to carry) a VM of this VM's
+                         placement group (`service.group_arguments`).
+                         HARD, no fallback. `None` ⇒ no gate.
+    - `power_policy_capable`  gate (l): the lower-case node_ids whose agent
+                         supports the guest-poweroff policy
+                         (`orchestration.power_policy.capable_node_ids`),
+                         passed only for an `on_guest_poweroff=stop`
+                         launch. HARD, no fallback to `restart`. `None` ⇒
+                         no gate.
 
     Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
     candidate that passed all the others (retry shortly);
     `no-miner-in-region` when candidates reached gate (f) and it removed
-    every one of them (the fleet is reachable, just not there); otherwise
-    `no-eligible-miner`.
+    every one of them (the fleet is reachable, just not there);
+    `placement-anti-affinity-unsatisfiable` when gate (k) removed every host
+    that passed all the others; `no-miner-supports-power-policy` likewise
+    for gate (l); otherwise `no-eligible-miner`.
     """
     weights = weights or SelectionWeights()
     stake_ok = stake_sufficient_by_node or {}
@@ -537,6 +554,9 @@ def decide_placement(
     # caller never retries a region that was never the problem.
     region_seen = 0
     region_skipped = 0
+    # Gate (l)'s, same rule: its own category only when IT emptied the set.
+    power_seen = 0
+    power_skipped = 0
     zombie_skipped = 0
     disk_skipped = 0
     booting = booting_by_node or {}
@@ -550,6 +570,8 @@ def decide_placement(
     net_policy_skipped: dict[str, str] = {}
     # Gate (j)'s removals.
     cdn_edge_skipped = 0
+    # Gate (k)'s removals: hosts that passed every other gate.
+    group_skipped = 0
     for miner in snapshot.miners:
         if miner.node_id in excluded:
             continue
@@ -594,6 +616,12 @@ def decide_placement(
             region_seen += 1
             if regions.get(miner.node_id) != region:
                 region_skipped += 1
+                continue
+        # (l) guest-poweroff policy `stop` — only an agent that knows it.
+        if power_policy_capable is not None:
+            power_seen += 1
+            if miner.node_id.lower() not in power_policy_capable:
+                power_skipped += 1
                 continue
         # Only on-chain Active miners are ever schedulable (§23).
         if miner.status != MINER_ACTIVE:
@@ -664,6 +692,13 @@ def decide_placement(
         elif not v1_ok:
             # v1: no mirror row ⇒ unknown capacity ⇒ fail closed; else a
             # free slot is required.
+            continue
+        # (k) anti-affinity — a host of this VM's placement group. After
+        # every gate but (g), so it is reported only when it is what
+        # emptied the set; before (g), so waiting for a boot slot on a host
+        # the group holds is never the answer.
+        if group_occupied and miner.node_id.lower() in group_occupied:
+            group_skipped += 1
             continue
         # (g) concurrent boots — LAST, so a node counted here passed every
         # other gate: when this empties the set, waiting is the answer.
@@ -762,6 +797,12 @@ def decide_placement(
                 f"(booting/cap: {booted}); retry once one of them is up",
                 MINERS_BOOTING,
             )
+        if group_skipped:
+            raise PlacementError(
+                f"every eligible miner ({group_skipped}) already carries a VM of this "
+                "VM's placement group (anti-affinity)",
+                ANTI_AFFINITY_UNSATISFIABLE,
+            )
         cvm_note = (
             f" ({cvm_incapable_skipped} candidate(s) removed by the OBSERVED "
             "SNP-start-capability gate: vali watched them fail to start a "
@@ -778,6 +819,13 @@ def decide_placement(
                 f"({region_skipped} reachable candidate(s) are elsewhere or "
                 "not yet verified there — see GET /v1/operator/regions)",
                 "no-miner-in-region",
+            )
+        if power_policy_capable is not None and power_seen and power_skipped == power_seen:
+            raise PlacementError(
+                "no dispatchable miner runs an agent that supports "
+                f"on_guest_poweroff=stop ({power_skipped} reachable candidate(s) "
+                "report an older version, or none)",
+                "no-miner-supports-power-policy",
             )
         region_note = (
             f" (constrained to region {region!r}: {region_skipped} of "

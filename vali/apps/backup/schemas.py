@@ -36,7 +36,13 @@ class BackupPolicyRequestSerializer(serializers.Serializer):
         help_text="How long a superseded chain is kept before it is deleted.",
     )
     failover_mode = serializers.ChoiceField(
-        choices=sorted(FailoverMode.values), required=False, default=FailoverMode.AUTO
+        choices=sorted(FailoverMode.values),
+        required=False,
+        help_text=(
+            "`manual` (default on create) or `auto`. Omitted on an update: the stored mode "
+            "is kept. `auto` is refused (409 `failover-auto-unavailable`) where automatic "
+            "failover is not available for the VM's region."
+        ),
     )
 
 
@@ -46,6 +52,19 @@ class BackupPolicySerializer(serializers.Serializer):
     interval_s = serializers.IntegerField()
     retention_days = serializers.IntegerField()
     failover_mode = serializers.ChoiceField(choices=sorted(FailoverMode.values))
+    failover_auto_eligible = serializers.BooleanField(
+        help_text="Automatic failover would act for this VM now."
+    )
+    failover_auto_blocker = serializers.ChoiceField(
+        choices=["no-point", "region-backups-not-local", "disabled"],
+        allow_null=True,
+        help_text=(
+            "Why it would not: `disabled` (the policy is off), "
+            "`region-backups-not-local` (the VM's region keeps its backups in another "
+            "region; `auto` is refused there), `no-point` (no restorable backup of the "
+            "current boot yet). Null when eligible."
+        ),
+    )
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
 

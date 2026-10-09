@@ -1,0 +1,47 @@
+# CDN GeoIP freshness reminder.
+#
+# The cdn-node image bakes the DB-IP Lite Country database pinned in
+# packer/cdn-node/openresty/geoip.env; it is refreshed by a monthly bump PR
+# (then a tenant-baker pin and a cdn-node re-bake). This job never fails:
+# it raises a warning annotation when the pinned month is more than one
+# month behind the current UTC month, or when the mirror copy of the pinned
+# file is not reachable (DB-IP drops its own copy after two months, and the
+# mirror is then the only source the tenant-baker image can build from).
+name: cdn-geoip-freshness
+
+on:
+  schedule:
+    # Mondays 06:41 UTC.
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: packer/cdn-node/openresty/geoip.env
+          sparse-checkout-cone-mode: false
+      - name: Check the pinned GeoIP month and its mirror
+        run: |
+          set -u
+          # shellcheck disable=SC1091
+          . packer/cdn-node/openresty/geoip.env
+          month="${DBIP_COUNTRY_LITE_MONTH}"
+          now="$(date -u +%Y-%m)"
+          age=$(( (10#${now:0:4} - 10#${month:0:4}) * 12 + 10#${now:5:2} - 10#${month:5:2} ))
+          echo "pinned dbip-country-lite-${month}, current month ${now}: ${age} month(s) behind"
+          if (( age > 1 )); then
+            echo "::warning title=GeoIP database is ${age} months old::Bump packer/cdn-node/openresty/geoip.env to dbip-country-lite-${now} (upload it to the mirror, set month, URLs, sha256), pin the tenant-baker image, re-bake cdn-node."
+          fi
+          code="$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' -r 0-0 "${DBIP_COUNTRY_LITE_MIRROR_URL}" || true)"
+          echo "mirror ${DBIP_COUNTRY_LITE_MIRROR_URL}: HTTP ${code}"
+          case "${code}" in
+            200|206) ;;
+            *) echo "::warning title=GeoIP mirror copy unavailable::${DBIP_COUNTRY_LITE_MIRROR_URL} answered ${code}: once DB-IP drops dbip-country-lite-${month}, the tenant-baker image cannot build." ;;
+          esac

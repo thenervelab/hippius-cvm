@@ -137,6 +137,31 @@ class LaunchIntentSerializer(serializers.Serializer):
             "`GET /v1/scheduler/feasibility?region=`."
         ),
     )
+    placement_group = serializers.RegexField(
+        r"^[a-z0-9-]{1,64}$",
+        required=False,
+        help_text=(
+            "Optional anti-affinity group, namespaced by the tenant: no two "
+            "VMs of one group ever share a miner (active VMs and launches in "
+            "flight). A launch no miner can take under that rule fails with "
+            "`placement-anti-affinity-unsatisfiable`. Fixed for the VM's "
+            "life; restores and failovers keep it."
+        ),
+    )
+    on_guest_poweroff = serializers.ChoiceField(
+        choices=["restart", "stop"],
+        required=False,
+        default="restart",
+        help_text=(
+            "What happens when the guest powers ITSELF off: `restart` (default) "
+            "starts it again; `stop` leaves it stopped (`power_state` `stopped`, "
+            "`stop_reason` `guest-poweroff`). A crash is restarted either way. "
+            "`stop` places the VM only on a miner whose agent supports it; if "
+            "none is eligible the launch fails with "
+            "`no-miner-supports-power-policy` — never a fallback to `restart`. "
+            "Any other value is a 400."
+        ),
+    )
     max_price_per_unit = serializers.IntegerField(
         required=False,
         allow_null=True,
@@ -494,3 +519,38 @@ class GuestRolloutSerializer(serializers.Serializer):
     decided_by = serializers.CharField()
     created_at = serializers.DateTimeField()
     finished_at = serializers.DateTimeField(allow_null=True)
+
+
+class PowerPolicyRequestSerializer(serializers.Serializer):
+    """`PATCH /v1/vm/<vm_id>/power-policy` body."""
+
+    on_guest_poweroff = serializers.ChoiceField(choices=["restart", "stop"])
+
+
+class PowerPolicySerializer(serializers.Serializer):
+    """The guest-poweroff policy of a VM (also on `VmSerializer`)."""
+
+    vm_id = serializers.CharField()
+    on_guest_poweroff = serializers.ChoiceField(
+        choices=["restart", "stop"], help_text="What the tenant asked for."
+    )
+    on_guest_poweroff_effective = serializers.ChoiceField(
+        choices=["restart", "stop"],
+        help_text=(
+            "What the VM's current miner has ACKNOWLEDGED. `restart` until it "
+            "has, and again once the VM moves or its miner stops supporting it."
+        ),
+    )
+    on_guest_poweroff_pending = serializers.BooleanField(
+        help_text="`on_guest_poweroff` differs from `on_guest_poweroff_effective`."
+    )
+    on_guest_poweroff_reason = serializers.ChoiceField(
+        choices=["host-unsupported", "awaiting-ack"],
+        allow_null=True,
+        help_text=(
+            "Why it is pending, else null: `host-unsupported` (the miner's agent "
+            "does not support `stop`), `awaiting-ack` (the order has not been "
+            "acknowledged yet; it is re-sent, and a stopped VM gets it with its "
+            "next start)."
+        ),
+    )

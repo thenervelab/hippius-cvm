@@ -364,6 +364,8 @@ data:
   # hardware verdict (`flavors.max_offered_flavor`; a typo crash-loops vali
   # at start rather than failing every launch).
   VALI_SCHEDULER_MAX_FLAVOR: {{ .Values.scheduler.maxFlavor | quote }}
+  # Guest-poweroff policy — see values.yaml `scheduler.powerPolicyMinAgentVersion`.
+  VALI_POWER_POLICY_MIN_AGENT_VERSION: {{ .Values.scheduler.powerPolicyMinAgentVersion | quote }}
   # Capacity v2 — see values.yaml `scheduler.resourceAdmission`.
   VALI_SCHEDULER_RESOURCE_ADMISSION: {{ .Values.scheduler.resourceAdmission | quote }}
   VALI_SCHEDULER_CPU_OVERCOMMIT: {{ .Values.scheduler.cpuOvercommit | quote }}

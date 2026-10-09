@@ -38,6 +38,7 @@ _ERROR_STATUS = {
     "vm-not-found": status.HTTP_404_NOT_FOUND,
     "no-restore": status.HTTP_404_NOT_FOUND,
     "point-not-restorable": status.HTTP_409_CONFLICT,
+    "no-backup-point": status.HTTP_409_CONFLICT,
     "rollback-unsupported": status.HTTP_409_CONFLICT,
     "rollback-not-accepted": status.HTTP_409_CONFLICT,
     "rollback-no-checkpoint": status.HTTP_409_CONFLICT,
@@ -169,15 +170,46 @@ class MinerNotDeadSerializer(serializers.Serializer):
     )
 
 
+class DeadMinerEvidenceSerializer(serializers.Serializer):
+    heartbeat_silent_s = serializers.IntegerField(allow_null=True)
+    netbird_silent_s = serializers.IntegerField(allow_null=True)
+    edge_unreachable = serializers.BooleanField()
+
+
 class RestoreJobSerializer(serializers.Serializer):
     job_id = serializers.CharField()
     vm_id = serializers.CharField()
     kind = serializers.ChoiceField(choices=["restore", "failover"])
+    failover_id = serializers.CharField(
+        allow_null=True, help_text="The job id, for a failover; null for a restore."
+    )
+    trigger = serializers.ChoiceField(
+        choices=["operator", "auto"],
+        help_text="`auto`: opened by the automatic failover worker.",
+    )
+    outcome = serializers.ChoiceField(
+        choices=["committed", "reverted", "failed", "cancelled"],
+        allow_null=True,
+        help_text="Null while the job runs.",
+    )
+    started_at = serializers.DateTimeField()
+    committed_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text="The commit point: the restored guest's first key release, proven.",
+    )
+    restored_point_at = serializers.DateTimeField(
+        allow_null=True, help_text="When the restored backup point was taken."
+    )
+    dead_miner_evidence = DeadMinerEvidenceSerializer(
+        allow_null=True,
+        help_text="A failover's dead-miner proof (the re-check before the fence when made).",
+    )
     run_id = serializers.CharField(allow_null=True)
     chain_id = serializers.CharField(allow_null=True)
     point_taken_at = serializers.DateTimeField(allow_null=True)
     phase = serializers.ChoiceField(
         choices=[
+            "pending_capacity",
             "staging",
             "stopping",
             "activating",
@@ -188,6 +220,8 @@ class RestoreJobSerializer(serializers.Serializer):
             "reverted",
         ],
         help_text=(
+            "`pending_capacity`: an automatic failover waiting for a destination "
+            "with room (retried every tick). "
             "`verifying`: the restored disk booted, waiting for its key release "
             "to be proven. `settling`: returning to a stopped prior power state. "
             "`reverted`: failed before the point of no return, the original is "
@@ -212,6 +246,26 @@ class RestoreJobSerializer(serializers.Serializer):
     )
     created_at = serializers.DateTimeField()
     finished_at = serializers.DateTimeField(allow_null=True)
+
+
+class RestoreJobListSerializer(serializers.Serializer):
+    jobs = RestoreJobSerializer(many=True)
+
+
+_LIST_DEFAULT = 20
+_LIST_MAX = 100
+
+
+def _limit(raw: Any) -> int:
+    if raw in (None, ""):
+        return _LIST_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if not 1 <= value <= _LIST_MAX:
+        raise RestoreError("bad-request", f"limit must be an integer in 1..{_LIST_MAX}")
+    return value
 
 
 def _refuse(exc: RestoreError) -> Response:
@@ -241,7 +295,7 @@ def _body(request: Request) -> dict[str, Any]:
 def _job(vm: Vm, job_id: str) -> MigrationJob:
     job = (
         MigrationJob.objects.filter(vm=vm, job_id=job_id, kind__in=restore.RESTORE_KINDS)
-        .select_related("vm", "restore_run", "restore_run__chain")
+        .select_related("vm", "restore_run", "restore_run__chain", "authorization")
         .first()
     )
     if job is None:
@@ -323,23 +377,27 @@ class VmRestoreView(_RootView):
         return Response(restore.serialize(job), status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
-        summary="The VM's latest restore",
+        summary="The VM's restores and failovers",
+        description="Newest first; `limit` 1..100 (default 20).",
         tags=_TAGS,
-        parameters=[_VM_ID],
+        parameters=[
+            _VM_ID,
+            OpenApiParameter("limit", int, OpenApiParameter.QUERY, required=False),
+        ],
         responses={
-            200: RestoreJobSerializer,
-            404: OpenApiResponse(RestoreErrorSerializer, "`vm-not-found` / `no-restore`."),
+            200: RestoreJobListSerializer,
+            400: OpenApiResponse(RestoreErrorSerializer, "`bad-request` (limit)."),
+            404: OpenApiResponse(RestoreErrorSerializer, "`vm-not-found`."),
             **_COMMON,
         },
     )
     def get(self, request: Request, vm_id: str) -> Response:
         try:
-            job = restore.latest_job(_get_vm(vm_id))
-            if job is None:
-                raise RestoreError("no-restore", "the vm has never been restored")
+            limit = _limit(request.query_params.get("limit"))
+            jobs = restore.list_jobs(_get_vm(vm_id), limit=limit)
         except RestoreError as exc:
             return _refuse(exc)
-        return Response(restore.serialize(job))
+        return Response({"jobs": [restore.serialize(job) for job in jobs]})
 
 
 class VmRestoreJobView(_RootView):
@@ -485,8 +543,9 @@ class VmFailoverView(_RootView):
             404: OpenApiResponse(RestoreErrorSerializer, "`vm-not-found`."),
             409: OpenApiResponse(
                 MinerNotDeadSerializer,
-                "`miner-not-dead` (with the evidence) / `point-not-restorable` / "
-                "`rollback-unsupported` / `job-in-flight` / `vm-not-restorable` / "
+                "`miner-not-dead` (with the evidence) / `no-backup-point` / "
+                "`point-not-restorable` / `rollback-unsupported` / `job-in-flight` / "
+                "`vm-not-restorable` / "
                 "`no-eligible-miner` / `request-id-conflict`.",
             ),
             503: OpenApiResponse(RestoreErrorSerializer, "`failover-disabled`."),

@@ -49,7 +49,7 @@ from django.utils import timezone
 from apps.cdn import identity as cdn_identity
 from apps.miners.models import MinerIdentity
 from apps.network import net_policy
-from apps.orchestration import effects, kbs_admin, order_dispatch
+from apps.orchestration import effects, kbs_admin, order_dispatch, power_policy
 from apps.orchestration.effects import EffectError, EffectUnavailable
 from apps.orchestration.services import (
     allowlist_pin,
@@ -694,6 +694,9 @@ class LaunchSpec:
     # field would make every such VM unrecoverable. Consumed by gate (f)
     # in `decide_placement` via `service.placement_arguments`.
     region: str = ""
+    # Anti-affinity group (`[a-z0-9-]{1,64}`, validated at intake), stamped
+    # on the Vm row at creation. Defaulted for the same reason as `region`.
+    placement_group: str = ""
     # Customer-held disk keys (`services.customer_keys`). `hippius` (M0)
     # with empty guardian fields is today's launch, byte for byte; `split`
     # (M1) / `customer` (M2) need both guardian fields, validated by the
@@ -703,6 +706,12 @@ class LaunchSpec:
     key_mode: str = "hippius"
     guardian_endpoint: str = ""
     guardian_pubkey: str = ""
+    # Guest-poweroff policy (`apps.orchestration.power_policy`): `restart`
+    # (default — and the only value an old `spec_json` can mean) or `stop`.
+    # `stop` limits placement to miners whose agent knows it (gate (l)) and
+    # rides the launch order; intake writes the key into `spec_json` only
+    # for `stop`. A relaunch passes the VM's CURRENT choice instead.
+    on_guest_poweroff: str = "restart"
 
 
 @dataclass
@@ -1271,6 +1280,18 @@ def launch_on_miner(
             "key_mode=customer holds no Hippius disk KEK — refusing kek_bytes"
         )
     _refuse_miner_for_customer_keys(binding, miner)
+    # The guest-poweroff policy this order carries — refused here, before
+    # any row, secret or pin exists, for a first launch of a `stop` VM onto
+    # a miner whose agent cannot honour it (gate (l) keeps those out; this
+    # backstops every other caller). Never a silent `restart`.
+    try:
+        poweroff_field = power_policy.launch_field(
+            getattr(spec, "on_guest_poweroff", power_policy.RESTART),
+            miner,
+            relaunch=require_existing_disks,
+        )
+    except power_policy.PowerPolicyRefused as exc:
+        return _terminal(exc.reason, exc.detail, EXIT_CONFIG_ERROR)
     # The CDN role (`apps.cdn.identity`): a CDN node's launch carries the
     # role in its ticket, cmdline and pin class. Refused before any row,
     # secret or pin exists when it must not run, or would boot anything but
@@ -2053,6 +2074,7 @@ def launch_on_miner(
         net=net_policy.launch_net_spec(
             miner_id=miner.miner_id, vm_id=spec.vm_id, flavor=spec.flavor
         ),
+        on_guest_poweroff=poweroff_field,
     )
     import json as _json
 
@@ -2198,6 +2220,13 @@ def launch_on_miner(
     # leak into `_bound_miner_id`'s routing.
     if result.ok:
         _bind_vm_host(spec.vm_id, miner.miner_id)
+        if result.classifier != _ALREADY_LAUNCHED:
+            # The miner persisted this order's guest-poweroff policy before
+            # starting the domain (an `already-launched` started nothing, so
+            # it says nothing about the running domain's).
+            power_policy.record_effective(
+                spec.vm_id, poweroff_field or power_policy.RESTART, miner.miner_id
+            )
         if result.classifier == _ALREADY_LAUNCHED:
             # The miner started nothing: the domain running is an EARLIER
             # attempt's (a ticket push that failed, retried inside the
@@ -2617,6 +2646,10 @@ def _place_and_launch(
                     platform_id=spec.platform_id,
                     boot_gate=True,
                     vm_id=spec.vm_id,
+                    power_policy_stop=(
+                        getattr(spec, "on_guest_poweroff", power_policy.RESTART)
+                        == power_policy.STOP
+                    ),
                 ),
             )
         except PlacementError as exc:
@@ -3004,6 +3037,14 @@ def launch_on_named_miner(
     from apps.scheduler import service as sched
 
     reason = sched.cdn_dest_reason(spec.tenant_id, spec.vm_id, miner.miner_id)
+    # The group a row already carries wins: it never changes.
+    from apps.lifecycle.models import Vm
+
+    group = (
+        Vm.objects.filter(vm_id=spec.vm_id).values_list("placement_group", flat=True).first()
+        or spec.placement_group
+    )
+    reason = reason or sched.group_dest_reason(spec.tenant_id, group, spec.vm_id, miner.miner_id)
     if reason is not None:
         raise LaunchConfigError(reason)
     vm = _ensure_vm_row(spec)
@@ -3494,6 +3535,8 @@ def _ensure_vm_row(spec: LaunchSpec) -> Any:
                 "host": "",
                 "lifecycle_vk": bytes(32),
                 "max_price_per_unit": spec.max_price_per_unit,
+                "placement_group": getattr(spec, "placement_group", "") or "",
+                "on_guest_poweroff": getattr(spec, "on_guest_poweroff", power_policy.RESTART),
                 **customer_keys.spec_fields(binding),
             },
         )

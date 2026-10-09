@@ -244,6 +244,7 @@ def make_vm(
     state: str = VmState.ACTIVE,
     golden: bool = True,
     flavor: str = "small",
+    region: str = "",
 ) -> Vm:
     vm = Vm.objects.create(
         vm_id=vm_id,
@@ -256,6 +257,8 @@ def make_vm(
     spec: dict[str, Any] = {"vm_id": vm_id, "flavor": flavor}
     if golden:
         spec["disk_mode"] = "golden_verity_overlay"
+    if region:
+        spec["region"] = region
     LaunchJob.objects.create(
         job_id=secrets.token_hex(8),
         vm_id=vm_id,

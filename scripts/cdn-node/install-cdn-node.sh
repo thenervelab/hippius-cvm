@@ -57,6 +57,17 @@ CONN_PER_IP="256"
 for f in render.sh nginx.conf.in origin.conf lua/hippius_cdn/router.lua; do
     [[ -r "${CFG_DIR}/${f}" ]] || die "${CFG_DIR}/${f} missing"
 done
+# The GeoIP database (packer/cdn-node/openresty/fetch-geoip.sh output):
+# usage is billed per client country, so a node never ships without it.
+GEO_SRC="${CFG_DIR}/geoip"
+[[ -r "${GEO_SRC}/dbip-country-lite.mmdb" && -r "${GEO_SRC}/VERSION" ]] \
+    || die "${GEO_SRC}: GeoIP database missing (fetch-geoip.sh)"
+GEO_VERSION="$(tr -d '[:space:]' < "${GEO_SRC}/VERSION")"
+[[ "${GEO_VERSION}" =~ ^dbip-country-lite-[0-9]{4}-[0-9]{2}$ ]] \
+    || die "${GEO_SRC}/VERSION: not dbip-country-lite-YYYY-MM (got '${GEO_VERSION}')"
+tail -c 131072 "${GEO_SRC}/dbip-country-lite.mmdb" | LC_ALL=C grep -aq 'MaxMind\.com' \
+    || die "${GEO_SRC}/dbip-country-lite.mmdb: not a MaxMind DB"
+GEO_SHA8="$(sha256sum "${GEO_SRC}/dbip-country-lite.mmdb" | cut -c1-8)"
 [[ "${BACKEND_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] \
     || die "backend url must be https://host[:port][/path] (got '${BACKEND_URL}')"
 [[ "${FLEET_WILDCARD}" =~ ^\*(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){2,}$ ]] \
@@ -156,9 +167,25 @@ rendered="$(mktemp)"
     CTL_SOCKET=/run/cdn/ctl.sock CTL_MAX_BODY=256m LISTEN_HTTP=80 LISTEN_HTTPS=443 \
     PLACEHOLDER_CERT=/run/cdn/placeholder.pem PLACEHOLDER_KEY=/run/cdn/placeholder.key \
     BURST_PER_IP="${BURST_PER_IP}" CONN_PER_IP="${CONN_PER_IP}" \
-    CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    GEOIP_DB=/opt/hippius-cdn/geoip/dbip-country-lite.mmdb ORIGIN_SOCKET=/run/cdn/origin.sock
 w /etc/hippius/cdn/nginx.conf 0644 < "${rendered}"
 rm -f "${rendered}"
+
+# ── GeoIP database ───────────────────────────────────────────────────
+# Read-only in the measured base; the agent reports its version with
+# every usage sample (`geoip_db`).
+${SUDO} install -d -m 0755 "${ROOT}/opt/hippius-cdn/geoip"
+${SUDO} install -m 0444 "${GEO_SRC}/dbip-country-lite.mmdb" "${ROOT}/opt/hippius-cdn/geoip/dbip-country-lite.mmdb"
+printf '%s-%s\n' "${GEO_VERSION}" "${GEO_SHA8}" | w /opt/hippius-cdn/geoip/version 0444
+w /opt/hippius-cdn/geoip/NOTICE 0444 <<'EOF'
+IP Geolocation by DB-IP (https://db-ip.com)
+
+dbip-country-lite.mmdb is the DB-IP "IP to Country Lite" database,
+licensed under the Creative Commons Attribution 4.0 International License
+(https://creativecommons.org/licenses/by/4.0/). It is used unmodified, to
+attribute CDN usage to the client's country.
+EOF
 
 # ── agent ────────────────────────────────────────────────────────────
 ${SUDO} install -m 0755 "${AGENT_BIN}" "${ROOT}/usr/sbin/hippius-cdn-agent"
@@ -178,6 +205,8 @@ fleet_key_dir = "/run/credentials/hippius-cdn-agent.service"
 state_dir = "/var/lib/hippius-data/cdn"
 data_mount = "/var/lib/hippius-data"
 cache_dir = "/var/lib/hippius-data/cache"
+geoip_version_file = "/opt/hippius-cdn/geoip/version"
+cache_conf = "/run/cdn/cache.conf"
 control_socket = "/run/cdn/ctl.sock"
 control_socket_uid = ${UID_OPENRESTY}
 metering_socket = "/run/cdn-agent/meter.sock"
@@ -243,6 +272,9 @@ ExecStartPre=/usr/bin/install -d -m 0700 /run/cdn/tmp
 ExecStartPre=/opt/hippius-cdn/render.sh placeholder /run/cdn/placeholder.pem /run/cdn/placeholder.key
 ExecStartPre=/opt/hippius-cdn/render.sh cache-auto /run/cdn/cache.conf /var/lib/hippius-data/cache 75
 ExecStart=/opt/openresty/nginx/sbin/nginx -e stderr -c /etc/hippius/cdn/nginx.conf -g "daemon off;"
+# nginx makes every unix listener 0666; /run/cdn (0750) is what keeps others
+# out. hippius-cdn-socket-perms also brings both sockets to 0660.
+ExecStartPost=/usr/sbin/hippius-cdn-socket-perms
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
@@ -272,6 +304,28 @@ SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+w /usr/sbin/hippius-cdn-socket-perms 0755 <<'EOF'
+#!/bin/sh
+# hippius-bake-managed (cdn-node profile): OpenResty's two unix sockets
+# (control, internal origin) to 0660, owner openresty, group hippius-cdn.
+# nginx binds each one, then chmods it 0666: wait until both read 666 (its
+# chmod is done and cannot come after ours), then set and check 0660.
+set -u
+s="/run/cdn/ctl.sock /run/cdn/origin.sock"
+i=0
+while [ "$i" -lt 200 ]; do
+  # shellcheck disable=SC2086
+  if [ "$(stat -c %a $s 2>/dev/null | tr '\n' ' ')" = "666 666 " ]; then
+    # shellcheck disable=SC2086
+    chmod 0660 $s && [ "$(stat -c %a $s | tr '\n' ' ')" = "660 660 " ] && exit 0
+  fi
+  i=$((i + 1))
+  sleep 0.1
+done
+echo "hippius-cdn-socket-perms: sockets not ready" >&2
+exit 1
 EOF
 
 w /etc/systemd/system/hippius-cdn-agent.service 0644 <<'EOF'
@@ -334,6 +388,74 @@ SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# ── cache usage for the usage reports ────────────────────────────────
+# nginx creates the cache tree 0700 (OpenResty's user only), so the agent
+# cannot measure it: this timer does, as that user and at idle I/O
+# priority, and leaves the figure where the agent (group hippius-cdn)
+# reads it. The agent omits a figure older than 30 minutes.
+w /usr/sbin/hippius-cdn-cache-usage 0755 <<'EOF'
+#!/bin/sh
+# hippius-bake-managed (cdn-node profile): bytes the cache holds, for the
+# agent's usage reports (`disk.cache_used_bytes`).
+set -u
+dir=/var/lib/hippius-data/cache
+out="$dir/.hippius-cache-usage"
+if [ -d "$dir/objects" ]; then
+  # Files nginx evicts during the walk make du exit 1; its total stands.
+  bytes=$(du -s -x -B1 "$dir/objects" 2>/dev/null | cut -f1)
+else
+  bytes=0
+fi
+case "$bytes" in ''|*[!0-9]*) echo "cache usage: no figure" >&2; exit 1 ;; esac
+printf '%s\n' "$bytes" > "$out.new" && mv -f "$out.new" "$out"
+EOF
+w /etc/systemd/system/hippius-cdn-cache-usage.service 0644 <<'EOF'
+# hippius-bake-managed (cdn-node profile).
+[Unit]
+Description=Measure the CDN cache for the usage reports
+RequiresMountsFor=/var/lib/hippius-data
+ConditionPathIsMountPoint=/var/lib/hippius-data
+After=hippius-cdn-openresty.service
+[Service]
+Type=oneshot
+User=openresty
+Group=hippius-cdn
+UMask=0027
+# Low priority: Nice always; the idle I/O class where the block layer
+# honours it (BFQ).
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+ExecStart=/usr/sbin/hippius-cdn-cache-usage
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hippius-data/cache
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+InaccessiblePaths=-/run/netbird.sock -/var/run/netbird.sock -/var/lib/netbird -/etc/netbird -/run/cloud-init -/var/lib/cloud -/run/hippius
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+EOF
+w /etc/systemd/system/hippius-cdn-cache-usage.timer 0644 <<'EOF'
+# hippius-bake-managed (cdn-node profile).
+[Unit]
+Description=Measure the CDN cache every 10 minutes
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=10min
+AccuracySec=1min
+[Install]
+WantedBy=timers.target
 EOF
 
 # ── public-IP inbound guard (baked; the tenant version lives in user-data)
@@ -457,6 +579,7 @@ enable hippius-cdn-firewall.service sysinit.target
 enable hippius-cdn-openresty.service multi-user.target
 enable hippius-cdn-agent.service multi-user.target
 enable hippius-cdn-inbound.timer timers.target
+enable hippius-cdn-cache-usage.timer timers.target
 
 # ── DHCP and redirects from the miner's network ──────────────────────
 # eth0 is the miner's. Take only an address, a gateway and resolvers from

@@ -216,6 +216,7 @@ def _validate_other_dest(vm: Vm, dest_node_id: str, *, source: str | None = None
         service._reject_zombie_quarantined_dest(dest_node_id)
         service._reject_cordoned_dest(dest_node_id)
         service._reject_cdn_colocated_dest(vm, dest_node_id)
+        service._reject_group_colocated_dest(vm, dest_node_id)
     except service.StartError as exc:
         raise refuse(exc.message) from exc
     try:
@@ -670,7 +671,7 @@ def _replay(job: MigrationJob, vm: Vm, *, kind: str | None = None) -> MigrationJ
     pins the replay to the SAME kind the caller is asking for — a
     `restore` request_id reused at `/failover` (or the reverse) is a
     conflict, not a silent cross-kind answer, even though both share the
-    `RESTORE_KINDS` job-shape (and so `cancel`/`sweep`/`latest_job`, which
+    `RESTORE_KINDS` job-shape (and so `cancel`/`sweep`/`list_jobs`, which
     do not care which of the two a caller wanted)."""
     if (
         job.vm_id != vm.pk
@@ -1054,7 +1055,9 @@ def h_verifying(job: MigrationJob) -> Any:
         _mark_running(vm)
         _require_full_backup(vm)
         _abandon_backup_runs(vm)
-        if not service._cas_migration(job, MigrationState.DONE.value, {}):
+        if not service._cas_migration(
+            job, MigrationState.DONE.value, {"committed_at": timezone.now()}
+        ):
             raise EffectError("restore job changed concurrently during its activation")
     return None
 
@@ -1264,6 +1267,8 @@ def fail(job: MigrationJob, reason: str) -> None:
             return
         prefix = "failed-after-commit" if verdict == COMMITTED else "blocked:commit-undecidable"
         _fail_after_commit(job, f"{prefix}:{reason}", why)
+        if verdict == COMMITTED:
+            _stamp_committed(job)
         return
     if state == MigrationState.RESTORE_UNDOING.value:
         vm = Vm.objects.get(id=job.vm_id)
@@ -1353,8 +1358,19 @@ def fail(job: MigrationJob, reason: str) -> None:
             job.source_node_id,
         )
         service._fail_migration(job, reason=f"revert-failed:{reason}")
+        if "revert-raced-commit:" in reason:
+            _stamp_committed(job)
         return
     service._fail_migration(job, reason=reason)
+
+
+def _stamp_committed(job: MigrationJob) -> None:
+    """Record the commit point on a job that failed past it (the restored
+    guest released its key at `new_gen`): `committed_at` says when vali saw
+    the job committed, whatever became of it after."""
+    MigrationJob.objects.filter(id=job.id, committed_at__isnull=True).update(
+        committed_at=timezone.now()
+    )
 
 
 def _undecided_too_long(job: MigrationJob) -> bool:
@@ -1861,9 +1877,8 @@ def start_failover(
         point = backup_service.restore_point(vm)
         if point is None:
             raise RestoreError(
-                "point-not-restorable",
-                "the vm has no backup point from its current boot (a point of an "
-                "earlier boot needs a KBS-authorized rollback, not available yet)",
+                "no-backup-point",
+                "the vm has no backup point from its current boot to fail over to",
             )
         run = point.latest
     else:
@@ -3475,6 +3490,114 @@ def _not_alive_yet(job: MigrationJob) -> bool:
 _TERMINAL_PHASES = frozenset({"done", "failed", "reverted"})
 
 
+def outcome(job: MigrationJob, current: str | None = None) -> str | None:
+    """`null` while the job runs; else `committed` (the restored guest took
+    the key and runs), `reverted`, `cancelled` or `failed` (including a job
+    that committed and then never proved the restored VM runs)."""
+    current = current or phase(job)
+    if current not in _TERMINAL_PHASES:
+        return None
+    if current == "done":
+        return "committed"
+    if current == "reverted":
+        return "reverted"
+    if (
+        job.state == MigrationState.FAILED.value
+        and job.failed_from_state in CANCELLABLE_STATES
+        and (job.reason or "").startswith("cancelled by ")
+    ):
+        return "cancelled"
+    return "failed"
+
+
+def dead_miner_evidence(job: MigrationJob) -> dict[str, Any] | None:
+    """A failover's dead-miner proof, as the contract states it: how long the
+    heartbeat and the NetBird peer had been silent, and whether the Edge
+    could reach the miner — from the re-check right before the fence when
+    there was one, else from the intake. Null for a restore."""
+    if job.kind != MigrationKind.FAILOVER.value or job.authorization is None:
+        return None
+    evidence = job.authorization.evidence if isinstance(job.authorization.evidence, dict) else {}
+    snapshot = evidence.get("recheck") if isinstance(evidence.get("recheck"), dict) else evidence
+    checked = _parse_ts(snapshot.get("checked_at"))
+
+    def silent_s(key: str) -> int | None:
+        seen = _parse_ts(snapshot.get(key))
+        if checked is None:
+            return None
+        if seen is None:
+            return None
+        return max(0, int((checked - seen).total_seconds()))
+
+    return {
+        "heartbeat_silent_s": silent_s("heartbeat_last_seen_at"),
+        "netbird_silent_s": silent_s("netbird_last_seen_at"),
+        "edge_unreachable": snapshot.get("edge") == "unreachable",
+    }
+
+
+def _parse_ts(raw: Any) -> Any:
+    from django.utils.dateparse import parse_datetime
+
+    return parse_datetime(raw) if isinstance(raw, str) else None
+
+
+def node_ref(node_id: str) -> str | None:
+    """An opaque, stable name for a miner: never matchable to its id."""
+    import hashlib
+    import hmac
+
+    if not node_id:
+        return None
+    key = str(settings.SECRET_KEY).encode()
+    digest = hmac.new(key, b"hippius-node-ref:" + node_id.encode(), hashlib.sha256).hexdigest()
+    return f"n-{digest[:10]}"
+
+
+def last_failover_views(vm_pks: Any) -> dict[Any, dict[str, Any]]:
+    """`{vm pk: last_failover_view}` for the VMs that ever failed over: one
+    query for the jobs, one for the source regions."""
+    from apps.miners import geo
+
+    newest: dict[Any, MigrationJob] = {}
+    for job in (
+        MigrationJob.objects.filter(vm_id__in=list(vm_pks), kind=MigrationKind.FAILOVER.value)
+        .select_related("restore_run")
+        .order_by("vm_id", "-started_at")
+    ):
+        newest.setdefault(job.vm_id, job)
+    regions = geo.last_known_countries({job.source_node_id for job in newest.values()})
+    return {pk: last_failover_view(job, regions) for pk, job in newest.items()}
+
+
+def last_failover_view(
+    job: MigrationJob | None, regions: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """`last_failover` on the VM: its newest failover, from the instant it
+    starts until it ends; null when it never failed over. `from_region` is
+    the source's last known country (`regions`, `{miner_id: country}`): a
+    dead miner's location is stale by definition."""
+    from apps.miners import geo
+
+    if job is None:
+        return None
+    if regions is None:
+        regions = geo.last_known_countries({job.source_node_id})
+    current = phase(job)
+    run = job.restore_run
+    return {
+        "failover_id": job.job_id,
+        "at": job.started_at.isoformat(),
+        "trigger": job.trigger,
+        "phase": current,
+        "outcome": outcome(job, current),
+        "from_region": regions.get(job.source_node_id) or None,
+        "to_node_ref": node_ref(job.dest_node_id),
+        "restored_point_at": run.created_at.isoformat() if run is not None else None,
+        "committed_at": job.committed_at.isoformat() if job.committed_at else None,
+    }
+
+
 def serialize(job: MigrationJob) -> dict[str, Any]:
     run = job.restore_run
     current = phase(job)
@@ -3489,6 +3612,13 @@ def serialize(job: MigrationJob) -> dict[str, Any]:
         "job_id": job.job_id,
         "vm_id": job.vm.vm_id,
         "kind": job.kind,
+        "failover_id": job.job_id if job.kind == MigrationKind.FAILOVER.value else None,
+        "trigger": job.trigger,
+        "outcome": outcome(job, current),
+        "started_at": job.started_at.isoformat(),
+        "committed_at": job.committed_at.isoformat() if job.committed_at else None,
+        "restored_point_at": run.created_at.isoformat() if run is not None else None,
+        "dead_miner_evidence": dead_miner_evidence(job),
         "run_id": run.run_id if run is not None else None,
         "chain_id": run.chain.chain_id if run is not None else None,
         "point_taken_at": run.created_at.isoformat() if run is not None else None,
@@ -3544,12 +3674,12 @@ def _rollback_view(job: MigrationJob) -> dict[str, Any] | None:
     }
 
 
-def latest_job(vm: Vm) -> MigrationJob | None:
-    return (
+def list_jobs(vm: Vm, *, limit: int) -> list[MigrationJob]:
+    """The VM's restore and failover jobs, newest first."""
+    return list(
         MigrationJob.objects.filter(vm=vm, kind__in=RESTORE_KINDS)
-        .select_related("vm", "restore_run", "restore_run__chain")
-        .order_by("-started_at")
-        .first()
+        .select_related("vm", "restore_run", "restore_run__chain", "authorization")
+        .order_by("-started_at")[:limit]
     )
 
 
@@ -3560,7 +3690,6 @@ __all__ = [
     "TERMINAL_MIGRATION_STATES",
     "cancel_restore",
     "fail",
-    "latest_job",
     "on_timeout",
     "serialize",
     "start_restore",

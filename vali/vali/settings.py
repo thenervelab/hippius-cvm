@@ -723,6 +723,14 @@ VALI_SCHEDULER_SLOT_REF_CPUS = _env_int("VALI_SCHEDULER_SLOT_REF_CPUS", 4)
 # sizes, independently of whether a host could hold them.
 VALI_SCHEDULER_MAX_FLAVOR = os.environ.get("VALI_SCHEDULER_MAX_FLAVOR", "")
 
+# The first miner-agent release tag (`vYYYY.MM.DD[.N]`) that knows the
+# guest-poweroff policy (`apps.orchestration.power_policy`): only a miner
+# whose v6 heartbeat reports this tag or a later one is sent
+# `on_guest_poweroff` (an older agent refuses the whole order). Empty (the
+# default) = no miner qualifies: `stop` launches fail
+# `no-miner-supports-power-policy`, `PATCH stop` answers 409.
+VALI_POWER_POLICY_MIN_AGENT_VERSION = os.environ.get("VALI_POWER_POLICY_MIN_AGENT_VERSION", "")
+
 # Capacity v2 (`scheduler.capacity_config` documents and validates each
 # knob; the getters there own the defaults — these only carry the env).
 # Resource-true admission is FLAG-FIRST: with RESOURCE_ADMISSION off, v2
@@ -1868,6 +1876,10 @@ VALI_FAILOVER_MANUAL_ENABLED = _env_bool("VALI_FAILOVER_MANUAL_ENABLED", False)
 # A miner is dead for a failover only when its heartbeat AND its NetBird peer
 # have both been silent at least this long, and the Edge cannot reach it.
 VALI_FAILOVER_DEAD_AFTER_S = _env_float("VALI_FAILOVER_DEAD_AFTER_S", 600.0)
+# Automatic failover (docs/design/backup-failover.md §10): the regions
+# whose backups are stored locally. `failover_mode=auto` is refused for a VM
+# of any other region (AU at launch: its backups live in the EU bucket).
+VALI_FAILOVER_AUTO_REGIONS = _env_list("VALI_FAILOVER_AUTO_REGIONS", ["FR", "NL"])
 
 # §25 SOURCE-side reclaim (P9/#15). A migration is a COPY: the source host
 # keeps the tenant's LUKS overlay, the boot-counter state disk and the
@@ -2219,7 +2231,7 @@ VALI_SYNTHETIC_ACK = os.environ.get("VALI_SYNTHETIC_ACK", "")
 # read-only and runs regardless).
 VALI_GOLDEN_REBAKE_ENABLED = _env_bool("VALI_GOLDEN_REBAKE_ENABLED", False)
 VALI_GOLDEN_REBAKE_IMAGES = _env_list(
-    "VALI_GOLDEN_REBAKE_IMAGES", ["ubuntu", "debian", "cs10", "fedora"]
+    "VALI_GOLDEN_REBAKE_IMAGES", ["ubuntu", "debian", "cs10", "fedora", "cdn-node"]
 )
 # Run the synthetic full e2e against each new, unblessed bake.
 VALI_GOLDEN_REBAKE_E2E = _env_bool("VALI_GOLDEN_REBAKE_E2E", False)

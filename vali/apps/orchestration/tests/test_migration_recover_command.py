@@ -270,6 +270,30 @@ def test_redrive_refuses_a_job_with_no_verified_source_ack(
     ).exists()
 
 
+def test_redrive_refuses_a_destination_its_placement_group_took_since(
+    minted, fx: FakeEffects
+):
+    """The failed job's destination stopped counting for the VM's group
+    when the job ended; a sibling that landed there since blocks the
+    re-drive (anti-affinity)."""
+    from apps.miners.models import MinerIdentity
+
+    fx.dest_activation_status = "failed"
+    vm, _job = _dest_activating_stranded()
+    MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    Vm.objects.filter(pk=vm.pk).update(tenant_id="t-g", placement_group="db")
+    sibling = make_vm("vm-sibling", host="node-dst")
+    Vm.objects.filter(pk=sibling.pk).update(tenant_id="t-g", placement_group="db")
+
+    with pytest.raises(SystemExit):
+        call_command(COMMAND, "--vm-id", vm.vm_id, "--commit")
+
+    assert minted == []
+    assert not MigrationJob.objects.filter(
+        state=MigrationState.DEST_ACTIVATING.value
+    ).exists()
+
+
 # ─── 6: never race the destination ───────────────────────────────────
 
 

@@ -860,8 +860,10 @@ Required backend changes:
 - A byte is priced at the **cheaper** of two regions:
   - its **serving region**: the node's region, from vali;
   - its **client GeoIP region**: the region our continent table assigns to
-    the client's IP, using a GeoLite2 country database baked into the image.
-    The database version is reported with the counters.
+    the client's IP, using a country database baked into the image (DB-IP
+    Lite Country, CC BY 4.0, pinned by month and sha256; refreshed by the
+    monthly cdn-node re-bake). The database version is reported with the
+    counters; a private or unknown address is `XX`.
 - This is **not** what Route 53 decided: Route 53 locates the resolver or
   its ECS subnet, not the client. The two usually agree. When they do not,
   the customer still pays the cheaper of the two prices, so the mismatch
@@ -930,10 +932,12 @@ generations of the matching purge prefixes (§10.2).
   would make every request a miss. The client gets a `Cache-Control`
   computed from the zone, and only an allowlist of origin headers (the
   data-plane README has the list).
-- Requests carrying `Authorization` or a cookie bypass the cache unless a
-  rule says otherwise.
-- Cache 200/206 for 1 hour and 404 for 1 minute (the zone default until
-  rules are enforced). An origin redirect or error is never cached.
+- Requests carrying `Authorization` or a cookie bypass the cache only for
+  origins that receive client headers (HTTP origins, later). An S3 origin
+  never receives one from the node, so those requests are cached like any
+  other (backend contract, amended 2026-10-09).
+- Cache 200/206 for 1 hour and 404 for 1 minute (the zone default, which a
+  cache rule overrides). An origin redirect or error is never cached.
 - `stale-while-revalidate` 60 s, `stale-if-error` 1 day.
 - Maximum object size 10 GB.
 - **Script-capable types are sandboxed on the fleet's names.** On
@@ -952,15 +956,31 @@ generations of the matching purge prefixes (§10.2).
   the dedicated `c.hipcdn.net` domain is the real fix; the sandbox stays as
   defence in depth.
 
-**Rules** are ordered. A match is a path prefix, a glob, or an extension
-list. The actions:
+**Rules** are ordered; the first matching rule wins, whole. The
+authoritative semantics are the backend contract's (`cdn-contracts.md` in
+hippius-backend, C.4 "Rules"): matches on the decoded request path, a glob
+without `/` on the file name. The actions:
 
-- edge TTL: override (`"origin"`, honour the origin, needs the origin's
-  `Cache-Control` back, which an S3 origin no longer passes);
-- browser TTL: rewrites `Cache-Control` towards the client;
-- query string: ignore all, include all (sorted), or include a whitelist;
+- edge TTL: seconds, or `"origin"` (the origin's `Cache-Control` /
+  `Expires`, read by the node's internal origin server, so it still
+  applies although the caching location ignores those headers; the S3
+  gateway's blanket `private, no-store` counts as none); 0 means never
+  stored;
+- browser TTL: the client's `max-age` (null: the edge TTL in effect,
+  `no-store` when that is 0 or the cache is bypassed);
+- query string: ignore all, include all, or a whitelist, in the cache key
+  only (never forwarded to the origin);
 - bypass;
-- ignore `Set-Cookie`.
+- ignore `Set-Cookie` (a no-op for S3 origins).
+
+The data-plane README (`packer/cdn-node/openresty/README.md`, Cache rules)
+has how the node applies them.
+
+**Zone limits** (`settings.limits`: `max_mbps`, `max_rps`; 0 = no
+allowance): over a ceiling, new requests get 503 and in-flight responses
+finish. Each node enforces the whole ceiling on its own traffic (no
+coordination), so a zone on N nodes can reach N times it fleet-wide.
+Bandwidth counts body bytes before compression.
 
 ### 10.2 Purge
 

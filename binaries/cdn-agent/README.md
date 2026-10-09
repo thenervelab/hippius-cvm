@@ -235,7 +235,29 @@ other keys:
 
 `zone` is omitted or null for an unknown host. `client_region` is a
 billing region code (upper-case ISO 3166 alpha-2, like vali's regions),
-`XX` until the GeoIP database exists; the backend holds `XX` unbilled. A zone the applied feed
+from the GeoIP database baked into the image (DB-IP Lite Country), `XX`
+when the address is private or unknown; the backend holds `XX` unbilled.
+The report's `geoip_db` is the database version
+(`dbip-country-lite-YYYY-MM-<sha8>`, from `paths.geoip_version_file`).
+
+Each report also carries node stats, optional (the backend stores them;
+billing never depends on them). A value the agent cannot read is omitted,
+and a report is never held back for it:
+- `disk.volume_size_bytes`, `disk.volume_used_bytes`: `statvfs` of
+  `paths.data_mount` (used = total minus free blocks);
+- `disk.cache_max_bytes`: `max_size` from `paths.cache_conf` (OpenResty's
+  generated `proxy_cache_path` include), else the same computation from the
+  volume and `data_plane.cache_fill_percent`;
+- `disk.cache_used_bytes`: the figure `hippius-cdn-cache-usage.timer`
+  writes to `<cache_dir>/.hippius-cache-usage`, omitted once older than
+  30 minutes;
+- `cache.hits`, `cache.misses`: node-wide since the counter epoch began.
+  HIT, STALE, UPDATING and REVALIDATED are hits; MISS, EXPIRED and BYPASS
+  are misses (the per-zone counters leave BYPASS out). They are kept in the
+  counters file with the rest of the epoch.
+
+The whole body, these fields included, is what the request signature
+covers. A zone the applied feed
 does not carry, or a record above 16 GiB, is never billed to anyone
 (counted as unattributed, or dropped). `cache` is
 `$upstream_cache_status` lower-cased. OpenResty decides `billable`

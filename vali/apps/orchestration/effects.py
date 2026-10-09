@@ -536,17 +536,40 @@ def _poll_domain_running_at(vm: Vm, target_addr: str) -> bool | None:
     """Relay one ``domain-state`` GET to ``target_addr``. Folds EVERY
     failure into ``None`` (see the two callers for what that means).
     """
+    return _poll_domain_state_at(vm, target_addr)[0]
+
+
+def poll_domain_state(vm: Vm) -> tuple[bool | None, str]:
+    """[`poll_domain_running`] plus the miner's ``stop_reason`` for a down
+    domain: ``"guest-poweroff"`` when the agent left it stopped because the
+    guest powered itself off under the ``stop`` guest-poweroff policy
+    (`apps.orchestration.power_policy`), else ``""``. Miner-declared: a
+    caller honours it only for a VM whose tenant asked for ``stop``."""
+    try:
+        addr = _source_miner_addr(vm)
+    except (EffectError, EffectUnavailable):
+        return None, ""
+    return _poll_domain_state_at(vm, addr)
+
+
+def _poll_domain_state_at(vm: Vm, target_addr: str) -> tuple[bool | None, str]:
+    """One ``domain-state`` GET: ``(running, stop_reason)``. Every failure
+    is ``(None, "")``; a ``stop_reason`` is only read off a definite down."""
     try:
         status, body = _edge_get_addr(vm, "domain-state", target_addr)
     except (EffectError, EffectUnavailable):
-        return None
+        return None, ""
     if status != 200:
-        return None
+        return None, ""
     try:
-        running = _json(body, label="edge-relay:domain-state").get("running")
+        doc = _json(body, label="edge-relay:domain-state")
     except EffectError:
-        return None
-    return running if isinstance(running, bool) else None
+        return None, ""
+    running = doc.get("running")
+    if not isinstance(running, bool):
+        return None, ""
+    reason = doc.get("stop_reason")
+    return running, (reason if not running and isinstance(reason, str) else "")
 
 
 #: Total budget for a destroy / source-reclaim dispatch, one re-ask

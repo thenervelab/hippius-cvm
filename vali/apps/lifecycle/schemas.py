@@ -29,6 +29,24 @@ class GuardianWaitSerializer(serializers.Serializer):
     )
 
 
+class LastFailoverSerializer(serializers.Serializer):
+    failover_id = serializers.CharField()
+    at = serializers.DateTimeField(help_text="When the failover started.")
+    trigger = serializers.ChoiceField(choices=["operator", "auto"])
+    phase = serializers.CharField(help_text="As `GET /v1/vm/{vm_id}/restore/{job_id}`.")
+    outcome = serializers.ChoiceField(
+        choices=["committed", "reverted", "failed", "cancelled"],
+        allow_null=True,
+        help_text="Null while it runs.",
+    )
+    from_region = serializers.CharField(allow_null=True)
+    to_node_ref = serializers.CharField(
+        allow_null=True, help_text="An opaque, stable reference to the destination miner."
+    )
+    restored_point_at = serializers.DateTimeField(allow_null=True)
+    committed_at = serializers.DateTimeField(allow_null=True)
+
+
 class VmSerializer(serializers.Serializer):
     """A `Vm` row as rendered by `_serialize_vm`.
 
@@ -38,6 +56,10 @@ class VmSerializer(serializers.Serializer):
 
     vm_id = serializers.CharField()
     tenant_id = serializers.CharField()
+    placement_group = serializers.CharField(
+        allow_null=True,
+        help_text="The anti-affinity group the VM was launched in (immutable), or null.",
+    )
     lease_id = serializers.CharField()
     state = serializers.CharField(
         help_text="active | migrating | decommissioning | destroyed."
@@ -162,6 +184,13 @@ class VmSerializer(serializers.Serializer):
             "or suppress it; the guardian's own audit log is the truth."
         ),
     )
+    last_failover = LastFailoverSerializer(
+        allow_null=True,
+        help_text=(
+            "The VM's newest failover off a dead miner, set from the moment it "
+            "starts and updated until it ends; null when it never failed over."
+        ),
+    )
     data_death = serializers.ChoiceField(
         choices=["crypto-erased", "customer-erase-required"],
         allow_null=True,
@@ -188,6 +217,54 @@ class VmSerializer(serializers.Serializer):
     guest_signal_kind = serializers.CharField(
         allow_blank=True,
         help_text="served_receipt | live_attestation, or empty when never.",
+    )
+    power_state = serializers.ChoiceField(
+        choices=["running", "stopping", "stopped", "starting", "off"],
+        help_text=(
+            "Whether the guest is meant to run — a separate axis from `state` "
+            "(a stopped VM stays `active`, keeping its reservation). `off` is "
+            "terminal (destroyed)."
+        ),
+    )
+    power_state_at = serializers.DateTimeField(
+        allow_null=True, help_text="When `power_state` last changed (else null)."
+    )
+    stop_reason = serializers.ChoiceField(
+        choices=["guest-poweroff"],
+        allow_null=True,
+        help_text=(
+            "`guest-poweroff` while the VM is stopped because its guest powered "
+            "itself off under `on_guest_poweroff: stop`; null otherwise (running, "
+            "or stopped through the API)."
+        ),
+    )
+    on_guest_poweroff = serializers.ChoiceField(
+        choices=["restart", "stop"],
+        help_text=(
+            "Requested: what happens when the guest powers ITSELF off — "
+            "`restart` starts it again, `stop` leaves it stopped. A crash is "
+            "restarted either way. Set at launch or with "
+            "PATCH /v1/vm/{vm_id}/power-policy."
+        ),
+    )
+    on_guest_poweroff_effective = serializers.ChoiceField(
+        choices=["restart", "stop"],
+        help_text=(
+            "What the VM's current miner has ACKNOWLEDGED: `restart` until it "
+            "has, and again once the VM moves or its miner stops supporting it."
+        ),
+    )
+    on_guest_poweroff_pending = serializers.BooleanField(
+        help_text="`on_guest_poweroff` differs from `on_guest_poweroff_effective`."
+    )
+    on_guest_poweroff_reason = serializers.ChoiceField(
+        choices=["host-unsupported", "awaiting-ack"],
+        allow_null=True,
+        help_text=(
+            "Why it is pending, else null: `host-unsupported` (the miner's agent "
+            "does not support `stop`), `awaiting-ack` (not acknowledged yet; "
+            "re-sent, and a stopped VM gets it with its next start)."
+        ),
     )
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()

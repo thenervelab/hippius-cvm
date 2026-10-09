@@ -29,6 +29,7 @@ pub mod config;
 pub mod control;
 pub mod counters;
 pub mod csr;
+pub mod disk;
 pub mod error;
 pub mod feed;
 pub mod health;
@@ -51,11 +52,10 @@ mod test_support;
 
 /// Bytes of `proxy_cache_path max_size` for the cache volume at `path`:
 /// `fill_percent` of its total size (spec §5.2; the rest is headroom).
+/// Computed as `render.sh cache-auto` does (whole KiB), see
+/// [`disk::cache_max_computed`].
 pub fn cache_max_size(path: &std::path::Path, fill_percent: u8) -> error::Result<u64> {
-    let st = rustix::fs::statvfs(path).map_err(|_| error::CdnError::Io("statvfs"))?;
-    let total = u128::from(st.f_blocks) * u128::from(st.f_frsize);
-    u64::try_from(total * u128::from(fill_percent) / 100)
-        .map_err(|_| error::CdnError::Io("statvfs-overflow"))
+    disk::cache_max_computed(path, fill_percent).ok_or(error::CdnError::Io("statvfs"))
 }
 
 #[cfg(test)]
@@ -67,7 +67,9 @@ mod tests {
         let full = super::cache_max_size(dir.path(), 100).unwrap();
         let three_quarters = super::cache_max_size(dir.path(), 75).unwrap();
         assert!(full > 0);
-        assert!(three_quarters <= full * 3 / 4 + 1 && three_quarters >= full * 3 / 4 - 1);
+        // Whole KiB, like render.sh: within a KiB of three quarters.
+        assert!(three_quarters <= full * 3 / 4 && three_quarters + 1024 >= full * 3 / 4);
+        assert_eq!(three_quarters % 1024, 0);
         assert!(super::cache_max_size(&dir.path().join("absent"), 75).is_err());
     }
 }

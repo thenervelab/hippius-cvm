@@ -8,7 +8,7 @@ OWN overlay upper — so the running root diverges from the measured golden
 and every VM pays the download. Re-baking on a schedule moves the patch
 into the measured base.
 
-What a run does, per golden image (ubuntu, debian, cs10, fedora):
+What a run does, per golden image (ubuntu, debian, cs10, fedora, cdn-node):
 
 1. Clones the CURRENTLY BLESSED bake's inputs (base image URL + sha,
    size, bucket) into a new golden `TenantBake` row whose
@@ -59,7 +59,9 @@ from apps.tenant_bake.models import (
 
 log = logging.getLogger("apps.images.rebake")
 
-DEFAULT_IMAGES: tuple[str, ...] = ("ubuntu", "debian", "cs10", "fedora")
+# cdn-node too: its monthly re-bake is how a node gets the new GeoIP
+# database (and the distro updates); vali replaces the nodes once blessed.
+DEFAULT_IMAGES: tuple[str, ...] = ("ubuntu", "debian", "cs10", "fedora", "cdn-node")
 REQUESTER_NAME = "vali_scheduled_golden_rebake"
 # The stamp is the vm_id suffix, so it takes the vm_id charset (a subset
 # of what the baker's `--package-refresh` accepts): no case folding, no
@@ -189,7 +191,10 @@ def run_rebake(
             if on_progress is not None:
                 on_progress(outcome)
             continue
-        if e2e is not None:
+        # The synthetic e2e launches the bake as a tenant VM: a cdn-node image
+        # is not one (no node identity, refused for any other tenant). Its
+        # real-boot check is the node replacement after the bless.
+        if e2e is not None and bake.profile != "cdn-node":
             result.e2e_success = bool(e2e(image, bake.bake_id))
             TenantBake.objects.filter(pk=bake.pk).update(rebake_e2e_passed=result.e2e_success)
         if on_progress is not None:

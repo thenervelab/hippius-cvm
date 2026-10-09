@@ -833,8 +833,10 @@ Optional:
   --cdn-openresty-tarball PATH
                           cdn-node: the OpenResty tree (build-openresty.sh
                           output; PATH.sha256 must match).
-  --cdn-config-dir PATH   cdn-node: packer/cdn-node/openresty (Lua,
-                          nginx.conf.in, origin.conf, render.sh).
+  --cdn-config-dir PATH   cdn-node: the data-plane config dir as the
+                          tenant-baker image lays it out (Lua,
+                          nginx.conf.in, origin.conf, render.sh, and
+                          geoip/ from fetch-geoip.sh).
   --cdn-backend-url URL   cdn-node: the backend base URL baked into the
                           agent config (https).
   --cdn-fleet-wildcard W  cdn-node: the fleet certificate's wildcard baked

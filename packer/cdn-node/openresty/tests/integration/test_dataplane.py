@@ -58,6 +58,8 @@ OBJECTS = {
     "/media/site/accel.txt": (b"accel-object", "text/plain"),
     "/media/site/big.bin": (bytes(range(256)) * (3 * 4096 + 7), "application/octet-stream"),
     "/media/site/empty.txt": (b"", "text/plain"),
+    "/media/site/bw.bin": (bytes(range(256)) * 1200, "application/octet-stream"),
+    "/media/site/bw-big.bin": (bytes(range(256)) * 16384, "application/octet-stream"),
     # Answered like the production S3 gateway answers a private object
     # (GATEWAY_HEADERS), with the declared type below (None: no header).
     "/media/site/gw/cdn-test.html": (b"<p>hi</p>", "text/html"),
@@ -72,6 +74,30 @@ OBJECTS = {
     "/media/site/gw/declared.svg": (b"<svg/>", "image/svg+xml"),
     "/media/site/gw/t.xml": (b"<a/>", "text/xml"),
     "/media/site/gw/a.xml": (b"<a/>", "application/xml"),
+}
+# Zone z1's cache rules (feed `settings.rules`), in order: the first
+# matching rule wins, whole (contract C.4). The last one is unusable and
+# must be ignored without failing anything.
+RULES = [
+    {"match": {"path_prefix": "/r/short/"}, "actions": {"edge_ttl": 2, "browser_ttl": 30}},
+    {"match": {"glob": "*.nocache"}, "actions": {"edge_ttl": 0}},
+    {"match": {"extensions": ["dat"]}, "actions": {"bypass": True}},
+    {"match": {"path_prefix": "/r/qs/"}, "actions": {"query_string": {"whitelist": ["v"]}}},
+    {"match": {"path_prefix": "/r/origin/"}, "actions": {"edge_ttl": "origin"}},
+    {"match": {"path_prefix": "/r/"}, "actions": {"edge_ttl": 600, "browser_ttl": None}},
+    {"match": {"regex": ".*"}, "actions": {"edge_ttl": 1}},
+]
+# Objects of the cache-rule test, and the Cache-Control the origin sends
+# (default: max-age=3600).
+for _p in ("short/a.txt", "x.nocache", "clip.dat", "qs/a.txt", "origin/two.txt",
+           "origin/private.txt", "origin/nostore.txt", "other.txt"):
+    OBJECTS["/media/site/r/" + _p] = (b"rule-" + _p.encode(), "text/plain")
+# The origin tries to set its own edge TTL: ignored (the default hour stands).
+OBJECTS["/media/site/accel-expires.txt"] = (b"origin-ttl", "text/plain")
+ORIGIN_CACHE_CONTROL = {
+    "/media/site/r/origin/two.txt": "max-age=2",
+    "/media/site/r/origin/private.txt": "private, no-store",
+    "/media/site/r/origin/nostore.txt": "no-store",
 }
 GATEWAY_HEADERS = [
     ("Cache-Control", "private, no-store"), ("Expires", "Thu, 01 Jan 1970 00:00:00 GMT"),
@@ -220,7 +246,10 @@ class Origin(BaseHTTPRequestHandler):
             return
         if path.endswith("/accel.txt"):
             self.send_header("X-Accel-Redirect", "/.well-known/hippius-attestation")
-        self.send_header("Cache-Control", "max-age=3600")
+        if path.endswith("/accel-expires.txt"):
+            self.send_header("X-Accel-Expires", "1")
+            self.send_header("X-Hippius-TTL", "5")
+        self.send_header("Cache-Control", ORIGIN_CACHE_CONTROL.get(path, "max-age=3600"))
         if path.endswith("/cookie.txt"):
             self.send_header("Set-Cookie", "origin=1")
         self.send_header("x-amz-request-id", "REQ123")
@@ -260,6 +289,10 @@ class DataPlane(unittest.TestCase):
         w = cls.work
         for d in ("tmp", "cache", "run", "agent"):
             os.makedirs(os.path.join(w, d))
+        # The generated test database (tests/geoip/make_test_mmdb.py), copied
+        # so a test can corrupt it.
+        cls.geoip_src = os.path.join(os.environ["HIPPIUS_TEST_GEOIP_DIR"], "geo-24.mmdb")
+        shutil.copy(cls.geoip_src, os.path.join(w, "geoip.mmdb"))
 
         cls.origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
         threading.Thread(target=cls.origin.serve_forever, daemon=True).start()
@@ -296,7 +329,8 @@ class DataPlane(unittest.TestCase):
             f"CTL_SOCKET={cls.ctl}", "CTL_MAX_BODY=16m", f"LISTEN_HTTP=127.0.0.1:{cls.http_port}",
             f"LISTEN_HTTPS=127.0.0.1:{cls.https_port}", f"PLACEHOLDER_CERT={w}/run/ph.pem",
             f"PLACEHOLDER_KEY={w}/run/ph.key", "BURST_PER_IP=2000", "CONN_PER_IP=512",
-            f"CA_BUNDLE={cls.cafile}",
+            f"CA_BUNDLE={cls.cafile}", f"GEOIP_DB={w}/geoip.mmdb",
+            f"ORIGIN_SOCKET={w}/run/origin.sock",
         ], check=True)
         cls.start_nginx()
 
@@ -359,7 +393,7 @@ class DataPlane(unittest.TestCase):
             "zones": {
                 "z1": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "media", "prefix": "site/"},
-                       "shield_region": "FR", "settings": {}, "secrets": []},
+                       "shield_region": "FR", "settings": {"rules": RULES}, "secrets": []},
                 "z2": {"state": "paused", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
                        "settings": {}, "secrets": []},
@@ -376,6 +410,20 @@ class DataPlane(unittest.TestCase):
                 "zq": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "private", "prefix": ""},
                        "shield_region": None, "settings": {}, "secrets": ["s3_credentials"]},
+                # Ceilings (settings.limits): 3 requests a second; 1 Mbit/s; none.
+                "zl": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "site/"}, "shield_region": None,
+                       "settings": {"limits": {"max_mbps": 2000, "max_rps": 3}}, "secrets": []},
+                "zb": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "site/"}, "shield_region": None,
+                       "settings": {"limits": {"max_mbps": 1, "max_rps": 20000}}, "secrets": []},
+                # 12 Mbit/s = 1.5 MB/s: above one 1 MiB slice, below 4 MiB.
+                "zs": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "site/"}, "shield_region": None,
+                       "settings": {"limits": {"max_mbps": 9, "max_rps": 20000}}, "secrets": []},
+                "z0": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "site/"}, "shield_region": None,
+                       "settings": {"limits": {"max_mbps": 2000, "max_rps": 0}}, "secrets": []},
                 "zr": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
                        "settings": {}, "secrets": []},
@@ -385,6 +433,8 @@ class DataPlane(unittest.TestCase):
                 "paused.cdn.hippius.com": "z2", "refused.cdn.hippius.com": "z3",
                 "susp.cdn.hippius.com": "z4", "root.cdn.hippius.com": "zr",
                 "priv.cdn.hippius.com": "zq",
+                "lim.cdn.hippius.com": "zl", "bw.cdn.hippius.com": "zb", "zero.cdn.hippius.com": "z0",
+                "slices.cdn.hippius.com": "zs",
             },
             "purges": {"z1": {"zone_generation": 1, "prefixes": {}}},
             "blocks": [{"kind": "path", "value": "/bad.bin", "zone_id": "z1"},
@@ -579,6 +629,133 @@ class DataPlane(unittest.TestCase):
             self.assertEqual(h.get("cache-control"), "no-store")
             self.assertEqual(h.get("content-type"), "text/plain")
         self.assertEqual(len(self.origin_hits(MOVED_PATH)), 2, "an origin redirect was cached")
+
+    def test_be_zone_cache_rules(self):
+        def get(path):
+            st, h, body = self.https("img.example.com", path)
+            self.assertEqual(st, 200, (path, body))
+            return h.get("x-cache"), h.get("cache-control")
+
+        def hits(path):
+            return len(self.origin_hits("/media/site" + path))
+
+        # The origin's own X-Accel-Expires (and X-Hippius-TTL) is ignored:
+        # still a HIT after its 1 s, with the default hour.
+        self.assertEqual(get("/accel-expires.txt"), ("MISS", "public, max-age=3600"))
+        # edge_ttl 2 + browser_ttl 30: cached, then expired at the edge.
+        self.assertEqual(get("/r/short/a.txt"), ("MISS", "public, max-age=30"))
+        self.assertEqual(get("/r/short/a.txt"), ("HIT", "public, max-age=30"))
+        # The HIT never went through the internal origin server: it fetches
+        # from the origin on every request it handles, and the origin saw one.
+        self.assertEqual(hits("/r/short/a.txt"), 1, "a HIT reached the internal origin server")
+        # Rules see the decoded path, like the cache key: an encoded spelling
+        # gets the same rule and the same entry.
+        self.assertEqual(get("/r/sh%6Frt/a.txt"), ("HIT", "public, max-age=30"))
+        time.sleep(3)
+        # Expired: served stale while a background update refetches it
+        # (proxy_cache_background_update), or refetched outright.
+        self.assertIn(get("/r/short/a.txt")[0], ("STALE", "UPDATING", "EXPIRED", "MISS"),
+                      "the edge TTL of 2 s was not applied")
+        deadline = time.time() + 3
+        while hits("/r/short/a.txt") < 2 and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(hits("/r/short/a.txt"), 2)
+        # edge_ttl 0 (file-name glob) and bypass (extension): every request
+        # goes to the origin, no-store.
+        for path in ("/r/x.nocache", "/r/clip.dat"):
+            for _ in range(2):
+                cache, cc = get(path)
+                self.assertIn(cache, ("BYPASS", "MISS"), path)
+                self.assertEqual(cc, "no-store", path)
+            self.assertEqual(hits(path), 2, path)
+        # Query whitelist ["v"]: v is in the key, other parameters are not;
+        # the origin never sees the query.
+        # The /r/qs/ rule wins whole: its query whitelist, and the default
+        # edge TTL (not the later /r/ rule's 600).
+        self.assertEqual(get("/r/qs/a.txt?v=1"), ("MISS", "public, max-age=3600"))
+        self.assertEqual(get("/r/qs/a.txt?x=9&v=1")[0], "HIT")
+        self.assertEqual(get("/r/qs/a.txt?v=2")[0], "MISS")
+        self.assertEqual(hits("/r/qs/a.txt"), 2)
+        self.assertTrue(all(e["query"] == "" for e in self.origin_hits("/media/site/r/qs/a.txt")))
+        # edge_ttl "origin": the origin's max-age=2 is the edge TTL, and the
+        # client's max-age follows it; "private, no-store" is never cached.
+        self.assertEqual(get("/r/origin/two.txt"), ("MISS", "public, max-age=2"))
+        self.assertEqual(get("/r/origin/two.txt"), ("HIT", "public, max-age=2"))
+        time.sleep(3)
+        self.assertIn(get("/r/origin/two.txt")[0], ("STALE", "UPDATING", "EXPIRED", "MISS"))
+        # The S3 gateway's blanket "private, no-store" counts as no header:
+        # the default hour. Any other no-store is honoured.
+        self.assertEqual(get("/r/origin/private.txt"), ("MISS", "public, max-age=3600"))
+        self.assertEqual(get("/r/origin/private.txt"), ("HIT", "public, max-age=3600"))
+        for _ in range(2):
+            self.assertEqual(get("/r/origin/nostore.txt"), ("MISS", "no-store"))
+        self.assertEqual(hits("/r/origin/nostore.txt"), 2)
+        self.assertEqual(get("/accel-expires.txt"), ("HIT", "public, max-age=3600"))
+        # A later, broader rule: edge_ttl 600, browser_ttl null follows it.
+        self.assertEqual(get("/r/other.txt"), ("MISS", "public, max-age=600"))
+        self.assertEqual(get("/r/other.txt"), ("HIT", "public, max-age=600"))
+        # The unusable rule was ignored (logged), and nothing else changed:
+        # a path no rule matches keeps the defaults.
+        with open(self.err_path, "rb") as f:
+            self.assertIn(b"zone z1: 1 cache rules ignored", f.read())
+        self.assertEqual(get("/a/c.txt")[1], "public, max-age=3600")
+
+    def test_bf_zone_limits_per_node(self):
+        # max_rps 0: no allowance at all, so no Retry-After either.
+        st, h, body = self.https("zero.cdn.hippius.com", "/a/b.txt")
+        self.assertEqual((st, body, h.get("cache-control"), h.get("retry-after")),
+                         (503, b"503\n", "no-store", None))
+        # max_rps 3: a burst of 10 within a second or two gets some 503s,
+        # and never more than 3 per second through.
+        answers = [self.https("lim.cdn.hippius.com", "/a/b.txt") for _ in range(10)]
+        statuses = [a[0] for a in answers]
+        self.assertIn(503, statuses)
+        self.assertLessEqual(statuses.count(200), 6, statuses)
+        refused = next(a for a in answers if a[0] == 503)
+        self.assertEqual((refused[2], refused[1].get("cache-control"), refused[1].get("retry-after")),
+                         (b"503\n", "no-store", "1"))
+        time.sleep(2.1)
+        self.assertEqual(self.https("lim.cdn.hippius.com", "/a/b.txt")[0], 200, "a new second")
+        # max_mbps 1 (125 kB/s): a 300 kB object goes through (in flight
+        # finishes), then new requests get 503 until the window has passed.
+        st, _, body = self.https("bw.cdn.hippius.com", "/bw.bin")
+        self.assertEqual((st, len(body)), (200, len(OBJECTS["/media/site/bw.bin"][0])))
+        st, h, _ = self.https("bw.cdn.hippius.com", "/a/b.txt")
+        self.assertEqual((st, h.get("retry-after")), (503, "2"))
+        time.sleep(2.1)
+        self.assertEqual(self.https("bw.cdn.hippius.com", "/a/b.txt")[0], 200)
+        # Every slice counts, not only the main request's first one: 4 MiB
+        # in 1 MiB slices is over 1.125 MB/s in this second or the last
+        # (even spread over three seconds), where the first slice alone
+        # (1 MiB) would not be.
+        st, _, body = self.https("slices.cdn.hippius.com", "/bw-big.bin")
+        self.assertEqual((st, len(body)), (200, 4 * 1024 * 1024))
+        self.assertEqual(self.https("slices.cdn.hippius.com", "/a/b.txt")[0], 503,
+                         "slice subrequests are not counted against the ceiling")
+        # The refusals are not billable and are logged once.
+        for zone in ("zl", "zb", "zs", "z0"):
+            refused = self.records_for(503, zone=zone)
+            self.assertTrue(refused, zone)
+            self.assertFalse(any(r["billable"] for r in refused), zone)
+        with open(self.err_path, "rb") as f:
+            log = f.read()
+        self.assertIn(b"zone zl over its rps ceiling: 503", log)
+        self.assertIn(b"zone zb over its mbps ceiling: 503", log)
+
+    def test_bg_zone_limits_change_live(self):
+        # A new value through the feed applies to the next request, no reload.
+        z = self.config()["zones"]
+        z["zl"]["settings"]["limits"] = {"max_mbps": 2000, "max_rps": 0}
+        self.assertEqual(self.put("config", self.config(zones=z)), 204)
+        self.assertEqual(self.https("lim.cdn.hippius.com", "/a/b.txt")[0], 503)
+        z["zl"]["settings"]["limits"] = {"max_mbps": 2000, "max_rps": 20000}
+        self.assertEqual(self.put("config", self.config(zones=z)), 204)
+        self.assertEqual([self.https("lim.cdn.hippius.com", "/a/b.txt")[0] for _ in range(8)], [200] * 8)
+        # No limits object at all: the defaults, far above this test.
+        del z["zl"]["settings"]["limits"]
+        self.assertEqual(self.put("config", self.config(zones=z)), 204)
+        self.assertEqual([self.https("lim.cdn.hippius.com", "/a/b.txt")[0] for _ in range(8)], [200] * 8)
+        self.push_all()
 
     def test_c_private_bucket_is_sigv4_signed(self):
         st, _, body = self.https("dl.example.com", "/doc.txt")
@@ -925,6 +1102,64 @@ class DataPlane(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(cache)), [".hippius-canary", "objects"])
         self.put("health", {"ready": True, "at": int(time.time())})
         self.assertEqual(self.https("health.cdn.hippius.com", "/__hippius/health")[0], 200)
+
+    def test_ya_geoip_loaded_and_never_fails_a_request(self):
+        def log_has(needle):
+            with open(self.err_path, "rb") as f:
+                return needle in f.read()
+
+        def region_of_next_request():
+            time.sleep(0.3)
+            n0 = len(self.records)
+            self.assertEqual(self.https("img.example.com", "/a/b.txt")[0], 200)
+            deadline = time.time() + 2
+            while len(self.records) == n0 and time.time() < deadline:
+                time.sleep(0.05)
+            return self.records[n0:][-1]["client_region"]
+
+        def median_ms(n=150):
+            times = []
+            for _ in range(n):
+                t0 = time.perf_counter()
+                self.https("img.example.com", "/a/b.txt")
+                times.append((time.perf_counter() - t0) * 1000)
+            return sorted(times)[n // 2]
+
+        self.assertTrue(log_has(b"hippius-cdn: geoip database loaded: DBIP-Country-Lite"))
+        # The test client is loopback: private, so XX (unit tests cover the
+        # country mapping).
+        self.assertEqual(region_of_next_request(), "XX")
+        with_db = median_ms()
+
+        # A corrupt database: nginx still starts, requests are served, XX.
+        db = os.path.join(self.work, "geoip.mmdb")
+
+        def restore():
+            shutil.copy(self.geoip_src, db)
+            type(self).stop_nginx()
+            type(self).start_nginx()
+            self.push_all()
+        self.addCleanup(restore)
+        with open(db, "wb") as f:
+            f.write(bytes(range(256)) * 8)
+        type(self).stop_nginx()
+        type(self).start_nginx()
+        self.push_all()
+        self.assertTrue(log_has(b"geoip database unavailable, every client region is XX"))
+        self.assertEqual(region_of_next_request(), "XX")
+        without_db = median_ms()
+        # A missing one: the same.
+        os.remove(db)
+        type(self).stop_nginx()
+        type(self).start_nginx()
+        self.push_all()
+        self.assertEqual(region_of_next_request(), "XX")
+
+        print(f"\n     geoip overhead: median {with_db:.3f} ms per request with the database, "
+              f"{without_db:.3f} ms without", file=sys.stderr)
+        # Loose on purpose: request latency on a shared runner is noisy, and the
+        # lookup itself (~2 us) is measured in the Lua unit tests.
+        self.assertLess(with_db, without_db * 1.5 + 2.0, "the GeoIP lookup slows requests down")
 
     def test_z_restart_empties_shared_memory(self):
         type(self).stop_nginx()

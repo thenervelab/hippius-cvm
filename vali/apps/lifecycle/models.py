@@ -268,6 +268,9 @@ class Vm(models.Model):
     # authz boundary (the upstream owns end-user access control). Blank
     # for pre-Phase-2 rows.
     tenant_id = models.CharField(max_length=256, blank=True, default="", db_index=True)
+    # Anti-affinity: never two VMs of one (tenant, group) on a miner
+    # (`scheduler.service.group_nodes`). Set at launch, never changed.
+    placement_group = models.CharField(max_length=64, blank=True, default="")
     state = models.CharField(max_length=32, choices=VmState.choices)
     # `kbs_core::lifecycle::VmState` uses `u64`. Postgres BIGINT is
     # signed — `binaries/ticket-validator` pre-rejects u64 > i64::MAX
@@ -328,6 +331,12 @@ class Vm(models.Model):
     )
     # When `boot_phase` was last advanced. NULL until the first milestone.
     boot_phase_at = models.DateTimeField(null=True, blank=True)
+    # When `running` was INFERRED from a live attestation of the current
+    # launch (`apps.telemetry.vm_liveness`) because nothing else set it. In
+    # practice `running` comes only from a served receipt: the miner-agent
+    # reports `booting` and `kek-released` but never `running`. NULL when a
+    # receipt set it, or nothing did. Observability only.
+    boot_phase_inferred_at = models.DateTimeField(null=True, blank=True)
     # When the VM's CURRENT boot began: the first host bind of a launch, a
     # §25 dest activation, or a reboot-recovery / power-start relaunch. The
     # clock for the boot-stall verdict (`apps.lifecycle.boot_stall`): no
@@ -381,6 +390,44 @@ class Vm(models.Model):
     # `vali_swap_vm_initrd --revert` needs before it rewrites a relaunched
     # VM's recorded boot (`Vm.stopped_by_order`).
     power_stop_ordered_at = models.DateTimeField(null=True, blank=True)
+    # The `power_state_at` of a `stopped` reached because the GUEST powered
+    # itself off and the VM's guest-poweroff policy is `stop`
+    # (`apps.orchestration.power_policy`). Same "current only while it
+    # EQUALS `power_state_at`" rule as `power_stop_ordered_at`: any later
+    # power write makes it stale without clearing it. Read as
+    # `stop_reason: guest-poweroff` (`Vm.stopped_by_guest`).
+    power_stopped_by_guest_at = models.DateTimeField(null=True, blank=True)
+    # When a VM under the `stop` guest-poweroff policy last delivered a
+    # VERIFIED stopped-ack while vali still had it `running` — the ack its
+    # guest's EOL hook signs on any in-guest shutdown. When the miner then
+    # reports the guest powered off, an ack this recent becomes the stop's
+    # `power_stop_proof` (`power_policy.settle_guest_poweroff`), so a §24 of
+    # the stopped VM is a clean, non-quarantining one like after an API stop.
+    power_guest_ack_at = models.DateTimeField(null=True, blank=True)
+    # ── Guest-poweroff policy (`apps.orchestration.power_policy`) ─────
+    # What the miner does when the guest powers ITSELF off: start it again
+    # (`restart`, the historic behaviour) or leave it stopped (`stop`). A
+    # crash is restarted either way. `on_guest_poweroff` is what the tenant
+    # asked for; `_effective` is what a miner ACKNOWLEDGED (a launch that
+    # carried it, or an accepted `power-policy` order), and only for the
+    # host in `_effective_host` — a VM that moved since reads `restart`
+    # there until the new host acknowledges. `db_default`s keep an older
+    # image's INSERTs valid during a roll.
+    on_guest_poweroff = models.CharField(
+        max_length=8,
+        choices=[("restart", "restart"), ("stop", "stop")],
+        default="restart",
+        db_default="restart",
+    )
+    on_guest_poweroff_effective = models.CharField(
+        max_length=8,
+        choices=[("restart", "restart"), ("stop", "stop")],
+        default="restart",
+        db_default="restart",
+    )
+    on_guest_poweroff_effective_host = models.CharField(
+        max_length=256, blank=True, default="", db_default=""
+    )
     # ── In-guest liveness watermark ──────────────────────────────────
     # Wall-clock of the newest signal that could ONLY have come from
     # inside a running guest: a §23 `served_receipt` (universal across
@@ -518,6 +565,9 @@ class Vm(models.Model):
             # (the model Meta had unnamed indexes; 0001 named them).
             models.Index(fields=["state"], name="lifecycle_v_state_idx"),
             models.Index(fields=["host"], name="lifecycle_v_host_idx"),
+            models.Index(
+                fields=["tenant_id", "placement_group"], name="lifecycle_v_tenant_group_idx"
+            ),
         ]
         constraints = [
             # Migrating rows MUST carry the destination and the new
@@ -546,6 +596,16 @@ class Vm(models.Model):
         if fields and "updated_at" not in fields:
             kwargs["update_fields"] = [*fields, "updated_at"]
         super().save(*args, **kwargs)
+
+    @property
+    def stopped_by_guest(self) -> bool:
+        """`stopped` because the guest powered itself off under the `stop`
+        guest-poweroff policy — see `power_stopped_by_guest_at`."""
+        return (
+            self.power_state == VmPowerState.STOPPED
+            and self.power_state_at is not None
+            and self.power_stopped_by_guest_at == self.power_state_at
+        )
 
     @property
     def stopped_by_order(self) -> bool:

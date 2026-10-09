@@ -41,6 +41,7 @@ from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
 from apps.identity import scoping
+from apps.orchestration import power_policy
 from apps.orchestration.effects import EffectError, EffectUnavailable
 from apps.orchestration.permissions import IsOrchestrationRoot
 from apps.orchestration.services import kbs_evidence
@@ -192,13 +193,22 @@ class VmListView(APIView):
             {
                 "vms": [
                     _serialize_vm(
-                        vm, region_by_host, public_ips, backup_states, disks, data_deaths
+                        vm,
+                        region_by_host,
+                        public_ips,
+                        backup_states,
+                        disks,
+                        data_deaths,
+                        last_failovers,
+                        power_policy_hosts,
                     )
                     for region_by_host in [_region_by_host({r.host for r in rows})]
+                    for power_policy_hosts in [power_policy.capable_hosts({r.host for r in rows})]
                     for public_ips in [_public_ip_by_vm(rows)]
                     for backup_states in [_backup_state_by_vm(rows)]
                     for disks in [boot_stall.disk_gb_by_vm_id(r.vm_id for r in rows)]
                     for data_deaths in [_data_death_by_vm(rows)]
+                    for last_failovers in [_last_failover_by_vm(rows)]
                     for vm in rows
                 ],
                 "limit": limit,
@@ -706,6 +716,14 @@ class StoppedAckIngestView(APIView):
         ):
             return _prove_power_stop(vm, raw)
         if (
+            vm is not None
+            and vm.state == VmState.ACTIVE
+            and vm.power_state == VmPowerState.RUNNING
+            and vm.on_guest_poweroff == power_policy.STOP
+            and generation == vm.signing_generation
+        ):
+            return _note_guest_poweroff_ack(vm, raw)
+        if (
             vm is None
             or vm.state not in (VmState.MIGRATING, VmState.DECOMMISSIONING)
             or generation != vm.signing_generation
@@ -736,18 +754,10 @@ class StoppedAckIngestView(APIView):
         )
 
 
-def _prove_power_stop(vm: Vm, raw: bytes) -> Response:
-    """The ack of a guest shutting down for a power-API stop (#1162).
-
-    Verified NOW, while its signed time is inside the skew window — a later
-    §24 of the stopped VM could never verify it (and the row store is GC'd).
-    Only the proof is kept: the `eol_nonce` of the boot that shut down, on
-    `Vm.power_stop_proof`, and only if nothing moved since it was read (a
-    start clears the proof; §24 honours it only while it matches the VM's
-    nonce). Without it, that §24 has no guest left to sign and forces a
-    reclaim that quarantines a healthy miner. The bytes are not stored, so
-    an anonymous junk POST cannot displace the genuine proof.
-    """
+def _verify_boot_ack(vm: Vm, raw: bytes, label: str) -> Response | None:
+    """Verify `raw` as the stopped-ack of `vm`'s CURRENT boot (its
+    `eol_nonce`), now, inside the skew window. `None` when it verifies,
+    else the error response."""
     if not vm.eol_nonce:
         return _error(
             status.HTTP_404_NOT_FOUND,
@@ -768,13 +778,58 @@ def _prove_power_stop(vm: Vm, raw: bytes) -> Response:
             now_unix_max=now + skew,
         )
     except validator.ValidatorFailed as exc:
-        log.info(
-            "power-stop ack rejected: vm_id=%s category=%s", vm.vm_id, exc.category
-        )
+        log.info("%s ack rejected: vm_id=%s category=%s", label, vm.vm_id, exc.category)
         return _error(status.HTTP_400_BAD_REQUEST, exc.message, exc.category)
     except validator.ValidatorUnavailable as exc:
-        log.error("power-stop ack: validator unavailable: %s", exc)
+        log.error("%s ack: validator unavailable: %s", label, exc)
         return _error(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), "internal")
+    return None
+
+
+def _note_guest_poweroff_ack(vm: Vm, raw: bytes) -> Response:
+    """The ack of a `stop`-policy guest shutting down ON ITS OWN, while
+    vali still has it running: verified NOW (a later §24 could not), and
+    only its time kept (`Vm.power_guest_ack_at`). It becomes the stop's
+    proof only if the miner then reports a guest poweroff
+    (`power_policy.settle_guest_poweroff`); an in-guest reboot signs the
+    same ack, and that alone proves nothing."""
+    refused = _verify_boot_ack(vm, raw, "guest-poweroff")
+    if refused is not None:
+        return refused
+    noted = Vm.objects.filter(
+        pk=vm.pk,
+        state=VmState.ACTIVE,
+        power_state=VmPowerState.RUNNING,
+        eol_nonce=vm.eol_nonce,
+    ).update(power_guest_ack_at=timezone.now())
+    if not noted:
+        return _error(
+            status.HTTP_404_NOT_FOUND,
+            "no VM awaiting a stopped-ack for this vm_id/generation",
+            "not-found",
+        )
+    log.info("guest-poweroff ack verified: vm_id=%s", vm.vm_id)
+    return Response(
+        {"ok": True, "vm_id": vm.vm_id, "generation": vm.signing_generation},
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+def _prove_power_stop(vm: Vm, raw: bytes) -> Response:
+    """The ack of a guest shutting down for a power-API stop (#1162).
+
+    Verified NOW, while its signed time is inside the skew window — a later
+    §24 of the stopped VM could never verify it (and the row store is GC'd).
+    Only the proof is kept: the `eol_nonce` of the boot that shut down, on
+    `Vm.power_stop_proof`, and only if nothing moved since it was read (a
+    start clears the proof; §24 honours it only while it matches the VM's
+    nonce). Without it, that §24 has no guest left to sign and forces a
+    reclaim that quarantines a healthy miner. The bytes are not stored, so
+    an anonymous junk POST cannot displace the genuine proof.
+    """
+    refused = _verify_boot_ack(vm, raw, "power-stop")
+    if refused is not None:
+        return refused
     proven = Vm.objects.filter(
         pk=vm.pk,
         state=VmState.ACTIVE,
@@ -1057,6 +1112,12 @@ def _patch_for_transition(
     return patch
 
 
+def _last_failover_by_vm(vms: list[Vm]) -> dict[Any, Any]:
+    from apps.orchestration import restore
+
+    return restore.last_failover_views(vm.pk for vm in vms)
+
+
 def _region_by_host(hosts: set[str]) -> dict[str, str]:
     """`{miner_id: ISO alpha-2}` for the hosts whose DETECTED location the
     scheduler would honour (`geo.placeable_locations`: fresh, verified). One
@@ -1116,14 +1177,16 @@ def _serialize_vm(
     backup_state_by_vm: dict[Any, str] | None = None,
     disk_gb_by_vm_id: dict[str, int] | None = None,
     data_death_by_vm: dict[Any, str] | None = None,
+    last_failover_by_vm: dict[Any, Any] | None = None,
+    power_policy_hosts: set[str] | None = None,
 ) -> dict[str, Any]:
     """Render a `Vm` row as the wire response. `eol_nonce` is OMITTED
     on purpose — clients shouldn't see it; only the guest sees it via
     the EOL command channel, and only once.
 
-    `region_by_host` / `public_ip_by_vm` / `data_death_by_vm` let a list
-    render every row from one query each; a single-VM caller omits them
-    and pays its own.
+    `region_by_host` / `public_ip_by_vm` / `data_death_by_vm` /
+    `power_policy_hosts` let a list render every row from one query each; a
+    single-VM caller omits them and pays its own.
     """
     from . import guardian_wait
 
@@ -1137,9 +1200,12 @@ def _serialize_vm(
         backup_state_by_vm = _backup_state_by_vm([vm])
     if data_death_by_vm is None:
         data_death_by_vm = _data_death_by_vm([vm])
+    if last_failover_by_vm is None:
+        last_failover_by_vm = _last_failover_by_vm([vm])
     return {
         "vm_id": vm.vm_id,
         "tenant_id": vm.tenant_id,
+        "placement_group": vm.placement_group or None,
         "lease_id": vm.lease_id,
         "state": vm.state,
         "generation": vm.generation,
@@ -1212,6 +1278,17 @@ def _serialize_vm(
         # it deleted what it stores, and only `guardian erase <vm>` makes
         # the data cryptographically unrecoverable). Null before §24.
         "data_death": data_death_by_vm.get(vm.pk) or None,
+        # The newest failover, from its start to its end (`restore.last_failover_view`).
+        "last_failover": last_failover_by_vm.get(vm.pk),
+        # The power axis (`services/power.py`): a stopped VM stays `active`.
+        "power_state": vm.power_state,
+        "power_state_at": (
+            vm.power_state_at.isoformat() if vm.power_state_at is not None else None
+        ),
+        # `guest-poweroff` while its guest's own poweroff keeps it stopped.
+        "stop_reason": power_policy.stop_reason(vm),
+        # The guest-poweroff policy: requested, acknowledged, pending, why.
+        **power_policy.view(vm, power_policy_hosts),
         "created_at": vm.created_at.isoformat(),
         "updated_at": vm.updated_at.isoformat(),
     }

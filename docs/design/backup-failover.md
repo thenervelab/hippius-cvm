@@ -352,8 +352,8 @@ every incremental is taken from the newest committed run.
 
 | Method · path | |
 |---|---|
-| `PUT /v1/vm/<id>/backup-policy` | `{interval_s, retention_days?, failover_mode?}`. Golden VMs only. `201` created or re-enabled, `200` updated. |
-| `GET /v1/vm/<id>/backup-policy` | The enabled policy, or `404 no-backup-policy`. |
+| `PUT /v1/vm/<id>/backup-policy` | `{interval_s, retention_days?, failover_mode?}`. Golden VMs only. `201` created or re-enabled, `200` updated. Without `failover_mode`, an update keeps the stored mode and a create is `manual` (§9.1). |
+| `GET /v1/vm/<id>/backup-policy` | The enabled policy, or `404 no-backup-policy`. The policy (here and in `GET .../backups`) reads `failover_mode`, `failover_auto_eligible` and `failover_auto_blocker` (§9.1). |
 | `DELETE /v1/vm/<id>/backup-policy` | Stops new backups. Existing chains are kept for `retention_days`. |
 | `GET /v1/vm/<id>/backups` | `backup_state`, `restore_point`, `stored_bytes` (billing), every unpruned chain with its runs, and `last_failure` (the newest finished run when it failed, pruned chains included). No object keys and no URLs. |
 
@@ -464,15 +464,29 @@ proved it runs, unless the tenant changed its power state in between.
 | Method · path | |
 |---|---|
 | `POST /v1/vm/<id>/restore` | `{run_id, request_id, dest_node_id?, accept_rollback?, on_behalf_of?}` → `202` job. Idempotent on `request_id`. Refusals: `bad-request`, `on-behalf-of-required` (400); `point-not-restorable`, `rollback-unsupported`, `rollback-not-accepted`, `rollback-no-checkpoint`, `rollback-not-capable`, `job-in-flight`, `vm-not-restorable`, `no-eligible-miner`, `request-id-conflict` (409); `rollback-rate-limited` (429, with `retry_after_s`); `restore-disabled`, `restore-unavailable` (503). |
-| `GET /v1/vm/<id>/restore` | The latest restore job, or `404 no-restore`. |
+| `GET /v1/vm/<id>/restore?limit=` | `{"jobs": [...]}`, restores and failovers, newest first. `limit` defaults to 20, at most 100, else `400 bad-request`. Empty list when there is none. |
 | `GET /v1/vm/<id>/restore/<job_id>` | One job. |
 | `POST /v1/vm/<id>/restore/<job_id>/cancel` | Only in `staging` / `stopping`, else `409 not-cancellable`. |
 | `POST /v1/vm/<id>/restore/<job_id>/revert` | `{on_behalf_of: {kind: superuser, id}}` → `202` job (`undo {...}`). Puts the original back after the commit point (§8.5). Idempotent. Refusals: `on-behalf-of-required` (400); `revert-superuser-only` (403); `revert-not-applicable`, `revert-cross-host-unsupported`, `revert-no-checkpoint`, `revert-not-ready`, `rollback-unsupported`, `rollback-not-capable`, `job-in-flight` (409); `rollback-rate-limited` (429); `restore-unavailable` (503). |
 
-A job reads `{job_id, vm_id, kind, run_id, chain_id, point_taken_at, phase,
-pct, reason, reverted, prior_power_state, source_node_id, dest_node_id,
-eta_s, rollback, created_at, finished_at}` with `phase` one of `staging`, `stopping`,
-`activating`, `verifying`, `settling`, `done`, `failed`, `reverted`.
+A job reads `{job_id, vm_id, kind, failover_id, trigger, outcome,
+started_at, committed_at, restored_point_at, dead_miner_evidence, run_id,
+chain_id, point_taken_at, phase, pct, reason, reverted, prior_power_state,
+source_node_id, dest_node_id, eta_s, rollback, undo, created_at,
+finished_at}` with `phase` one of `staging`, `stopping`, `activating`,
+`verifying`, `settling`, `done`, `failed`, `reverted` (and, for an
+automatic failover waiting for a destination, `pending_capacity`, §9.4).
+`kind` is `restore` or `failover`; `failover_id` equals `job_id` for a
+failover and is null otherwise; `trigger` is `operator` or `auto`.
+`outcome` is null while the job runs, then `committed` (the restored guest
+took its key and proved it runs), `reverted`, `cancelled` or `failed`.
+`committed_at` is when vali saw the commit point pass (§8.3), set also on a
+job that failed after it; `reverted` also covers a job undone after its
+commit (an undo in progress reads `activating`, outcome null).
+`restored_point_at` is the instant the restored point was taken. `dead_miner_evidence` is null for a restore;
+for a failover it reads `{heartbeat_silent_s, netbird_silent_s,
+edge_unreachable}`, from the re-check before the fence when there was one,
+else from the intake.
 `verifying` lasts until the restored guest has both released its key (the
 job activates the VM there) and proved it runs (the reclaim gate); one
 that never proves it reads `failed`, its original kept. `finished_at` is
@@ -694,8 +708,75 @@ the destination downloading the chain as it activates.
   job (`kind: failover`), polled like a restore. Without `dest_node_id`,
   vali picks a dispatchable miner of the same SNP generation, in the VM's
   launch region, with room for it. Behind `VALI_FAILOVER_MANUAL_ENABLED`
-  (off). Tenant-triggered and automatic failover are later parts;
-  `failover_mode` on the policy is stored for them.
+  (off). Without a current-boot point: `409 no-backup-point`.
+
+### 9.1 Failover mode
+
+`failover_mode` on the backup policy is `manual` (the default) or `auto`.
+Every policy that existed before the mode had a meaning was moved to
+`manual`. A `PUT` without the field keeps the stored mode; a create without
+it is `manual`. The policy reads:
+
+- `failover_auto_eligible`: whether an automatic failover could run now;
+- `failover_auto_blocker`: null when eligible, else, checked in this order,
+  `disabled` (the policy is off), `region-backups-not-local` (the VM's region
+  is not in `VALI_FAILOVER_AUTO_REGIONS`: its backups are not stored close
+  enough for a restore elsewhere, e.g. AU), `no-point` (no complete
+  current-boot point yet).
+
+The VM's region is its launch region, else its host's region. `PUT
+failover_mode=auto` on a VM whose region is not eligible is refused with
+`409 failover-auto-unavailable` `{code, detail, blocker}`; a missing point
+is not a refusal (the blocker clears with the next backup).
+
+### 9.2 Observability
+
+- The VM wire shape (`GET /v1/vm/<id>/state` and the list) reads
+  `last_failover`: null when the VM never failed over, else its newest
+  failover, from the instant it starts until it ends:
+  `{failover_id, at, trigger, phase, outcome, from_region, to_node_ref,
+  restored_point_at, committed_at}`. `to_node_ref` is an opaque, stable
+  reference to the destination (an HMAC of the miner id), never the id.
+- Prometheus alerts `HippiusAutoFailoverStarted`,
+  `HippiusAutoFailoverFailed` and `HippiusAutoFailoverNoCapacity` (with the
+  automatic worker, §9.4).
+
+### 9.3 Anti-affinity
+
+- `POST /v1/vm/launch` takes an optional `placement_group`,
+  `[a-z0-9-]{1,64}` (else a synchronous `400`, category `bad-field`),
+  namespaced by the tenant.
+- Hard rule: never two VMs of the same (tenant, group) on one miner. A host
+  counts when a live VM of the group runs there (its host, else its
+  launch's miner), is placed there by a launch in flight, or is headed
+  there by a §25 / restore / failover job; a host gone dark still counts.
+  Scheduler gate (k), on every `decide_placement` path (launch, resize,
+  drain, `/place`, `/fail`, price-watch suggestions). An unsatisfiable launch
+  ends `failed` with reason `placement-anti-affinity-unsatisfiable`.
+- Every path that names a destination refuses a host of the group too:
+  §25 `start_migration` (`placement-anti-affinity`), the restore / failover
+  destination check (`no-eligible-miner`), `vali_create_vm`.
+- Echoed on the VM shape (`placement_group`, null when none); immutable: a
+  re-POST for an existing vm_id may omit it, and naming another is a
+  `409 conflict`.
+  An operator failover with no compatible destination left is refused
+  (`no-eligible-miner`), never a violation; the automatic worker waits in
+  `pending_capacity` instead (§9.4).
+
+### 9.4 Automatic failover (contract; a later PR)
+
+- Behind `VALI_FAILOVER_AUTO_ENABLED` (off).
+- A miner is dead when the three-way proof of §9 holds for at least
+  `VALI_FAILOVER_AUTO_AFTER_S`; it is re-checked right before the fence.
+- It applies to VMs with `failover_mode=auto`, a complete current-boot point
+  and an eligible region; a VM not opted in is never touched. One automatic
+  failover job (`trigger: auto`) at a time per dead miner.
+- The destination is in the same region and SNP generation, respects
+  anti-affinity, and its capacity is reserved before the fence. With no
+  room the job waits in `pending_capacity`, retried every tick. A miner
+  back before the fence cancels the job (`outcome: cancelled`).
+- Quarantine, reappearance and reclaim are those of the manual path. Every
+  automatic failover leaves an audit trail.
 
 ## 10. Configuration
 
@@ -726,6 +807,9 @@ the destination downloading the chain as it activates.
 | `VALI_RESTORE_ROLLBACK_MIN_INTERVAL_S` | 1800 s | At most one rollback per VM this often. |
 | `VALI_FAILOVER_MANUAL_ENABLED` | `false` | Opens `POST /v1/vm/<id>/failover`. |
 | `VALI_FAILOVER_DEAD_AFTER_S` | 600 s | How long the heartbeat and the NetBird peer must both be silent. |
+| `VALI_FAILOVER_AUTO_REGIONS` | `FR,NL` | Regions whose VMs may be set to `failover_mode=auto` (§9.1). |
+| `VALI_FAILOVER_AUTO_ENABLED` | `false` | The automatic failover worker (§9.4; a later PR). |
+| `VALI_FAILOVER_AUTO_AFTER_S` | 900 s | How long the dead-miner proof must hold before an automatic failover (§9.4; a later PR). |
 
 ## 11. Limits
 

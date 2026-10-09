@@ -621,6 +621,7 @@ def test_a_rollback_consumed_during_the_revert_blocks_it(
     job = _advance(job)
     assert job.state == MigrationState.FAILED.value and not job.reverted
     assert job.reason == "revert-failed:blocked:revert-raced-commit:kbs-rollback-consumed"
+    assert job.committed_at is not None, "the restored guest committed under the revert"
     assert pwr.started == []
     restore.sweep_rollback_events()
     assert _ev(job).outcome == RollbackOutcome.COMMITTED

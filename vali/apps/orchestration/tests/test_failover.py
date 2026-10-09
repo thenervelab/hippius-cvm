@@ -217,7 +217,7 @@ def test_a_failover_without_a_current_boot_point_is_refused(world: _World) -> No
     world.kill()
     with pytest.raises(restore.RestoreError) as exc:
         _failover(vm)
-    assert exc.value.code == "point-not-restorable"
+    assert exc.value.code == "no-backup-point"
 
 
 def test_a_failover_to_a_named_earlier_boot_point_is_rollback_unsupported(
@@ -287,6 +287,34 @@ def test_the_destination_is_picked_by_generation_region_and_room(
     with pytest.raises(restore.RestoreError) as exc:
         restore._pick_failover_dest(vm, "node-src")
     assert exc.value.code == "no-eligible-miner"
+
+
+def test_a_failover_never_lands_on_a_host_of_the_vms_placement_group(
+    world: _World, monkeypatch
+) -> None:
+    """Anti-affinity holds across a failover: the only other host carries a
+    VM of the group, so there is no destination rather than a violation."""
+    monkeypatch.setattr(restore, "_validate_other_dest", _REAL_VALIDATE)
+    vm = _golden_vm()
+    Vm.objects.filter(pk=vm.pk).update(tenant_id="t-g", placement_group="db")
+    vm.refresh_from_db()
+    MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    monkeypatch.setattr(sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None))
+    monkeypatch.setattr(
+        sched,
+        "host_resources_by_node",
+        lambda: {"d" * 64: sched.HostResources(64 * 1024, 8, 10**6, 64)},
+    )
+    assert restore._pick_failover_dest(vm, "node-src") == "node-dst"
+    sibling = make_vm("vm-sibling", host="node-dst")
+    Vm.objects.filter(pk=sibling.pk).update(tenant_id="t-g", placement_group="db")
+    with pytest.raises(restore.RestoreError) as exc:
+        restore._pick_failover_dest(vm, "node-src")
+    assert exc.value.code == "no-eligible-miner"
+    with pytest.raises(restore.RestoreError, match="anti-affinity"):
+        restore._validate_other_dest(vm, "node-dst", source="node-src")
+    # The VM's own old host never blocks it (it is the VM being moved).
+    assert sched.group_nodes("t-g", "db", exclude_vm_id=vm.vm_id) == {"d" * 64}
 
 
 def test_a_destination_without_disk_room_is_refused(world: _World, monkeypatch) -> None:
@@ -506,6 +534,7 @@ def test_a_failed_after_commit_failover_still_gets_its_stale_domain_stopped(
     job = _advance(job)
     assert job.state == MigrationState.FAILED.value
     assert job.reason.startswith("failed-after-commit") and not job.reverted
+    assert job.committed_at is not None, "it did commit, then failed"
     vm.refresh_from_db()
     assert vm.host == "node-src"
 
@@ -581,7 +610,7 @@ def test_the_failover_route(root_client, authed_client, world: _World) -> None:
     resp = root_client.post(f"/v1/vm/{vm.vm_id}/failover", body, format="json")
     assert resp.status_code == 202 and resp.json()["kind"] == "failover"
     assert resp.json()["phase"] == "activating"
-    latest = root_client.get(f"/v1/vm/{vm.vm_id}/restore").json()
+    latest = root_client.get(f"/v1/vm/{vm.vm_id}/restore").json()["jobs"][0]
     assert latest["job_id"] == resp.json()["job_id"]
     bad = root_client.post(f"/v1/vm/{vm.vm_id}/failover", {"x": 1}, format="json")
     assert bad.status_code == 400

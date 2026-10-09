@@ -3597,6 +3597,7 @@ mod tests {
                 require_existing_disks: false,
                 guardian_ep: None,
                 net: None,
+                on_guest_poweroff: None,
             })
             .await
             .expect("launch should succeed");
@@ -3836,6 +3837,7 @@ mod tests {
                 require_existing_disks: false,
                 guardian_ep: None,
                 net: None,
+                on_guest_poweroff: None,
             })
             .await
             .expect("launch should succeed");
@@ -4117,6 +4119,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         };
         lifecycle
             .launch(order)
@@ -4176,6 +4179,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         }
     }
 
@@ -4288,6 +4292,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         };
         lifecycle
             .launch(order(2))

@@ -11,7 +11,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "${HERE}/../.." && pwd)"
 BAKE="${REPO}/scripts/tenant-image-bake.sh"
 INSTALL="${REPO}/scripts/cdn-node/install-cdn-node.sh"
-CFG="${REPO}/packer/cdn-node/openresty"
+CFG_SRC="${REPO}/packer/cdn-node/openresty"
 
 fail=0
 ok() { echo "cdn-node-profile-test: OK — $*"; }
@@ -19,6 +19,16 @@ bad() { echo "cdn-node-profile-test: FAIL — $*" >&2; fail=1; }
 
 TMP="$(mktemp -d)"
 trap 'find "${TMP}" -mindepth 1 -delete; rmdir "${TMP}"' EXIT
+
+# The data-plane config dir as the tenant-baker image lays it out: the repo
+# files plus the fetched GeoIP database (here a generated test database).
+CFG="${TMP}/openresty-config"
+mkdir -p "${CFG}"
+cp -r "${CFG_SRC}/lua" "${CFG_SRC}/nginx.conf.in" "${CFG_SRC}/origin.conf" "${CFG_SRC}/render.sh" "${CFG}/"
+python3 -I "${CFG_SRC}/tests/geoip/make_test_mmdb.py" "${TMP}/geo" >/dev/null
+mkdir -p "${CFG}/geoip"
+cp "${TMP}/geo/geo-24.mmdb" "${CFG}/geoip/dbip-country-lite.mmdb"
+echo "dbip-country-lite-2026-10" > "${CFG}/geoip/VERSION"
 
 # ── 1. bake-script gate ──────────────────────────────────────────────
 run_bake() {
@@ -102,6 +112,32 @@ has /etc/shadow '^cdn-agent:!\*:' "cdn-agent password locked"
 
 conf=/etc/hippius/cdn/nginx.conf
 if grep -qE '@[A-Z0-9_]+@' "${R}${conf}"; then bad "nginx.conf has unrendered placeholders"; else ok "nginx.conf fully rendered"; fi
+has "${conf}" 'geoip_db = "/opt/hippius-cdn/geoip/dbip-country-lite.mmdb"' "nginx.conf loads the baked GeoIP database"
+# Listeners: the public 80/443 and two unix sockets in /run/cdn, nothing else
+# on TCP (the internal origin server is never reachable over the network).
+listens="$(grep -E '^\s*listen ' "${R}${conf}" | sed -E 's/^\s+//' | LC_ALL=C sort | tr '\n' '|')"
+[[ "${listens}" == "listen 443 ssl default_server;|listen 80 default_server;|listen unix:/run/cdn/ctl.sock;|listen unix:/run/cdn/origin.sock backlog=4096;|" ]] \
+    && ok "listeners: 80/443 and the two unix sockets only" || bad "unexpected listeners: ${listens}"
+has /etc/systemd/system/hippius-cdn-openresty.service '^ExecStartPost=/usr/sbin/hippius-cdn-socket-perms$' "both sockets brought to 0660"
+sh -n "${R}/usr/sbin/hippius-cdn-socket-perms" && ok "socket-perms script parses" || bad "socket-perms script syntax"
+# Run against fake sockets: waits for 666 (nginx's chmod), sets 660.
+sock="${TMP}/sock"; mkdir -p "${sock}"
+python3 -I -c 'import socket,sys
+for n in ("ctl.sock","origin.sock"):
+    s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]+"/"+n)' "${sock}"
+chmod 0666 "${sock}/ctl.sock" "${sock}/origin.sock"
+sed "s#/run/cdn/#${sock}/#g" "${R}/usr/sbin/hippius-cdn-socket-perms" > "${TMP}/sp.sh"
+sh "${TMP}/sp.sh" && [[ "$(stat -c %a "${sock}/ctl.sock") $(stat -c %a "${sock}/origin.sock")" == "660 660" ]] \
+    && ok "socket-perms sets both sockets 0660" || bad "socket-perms result"
+geo="${R}/opt/hippius-cdn/geoip"
+cmp -s "${geo}/dbip-country-lite.mmdb" "${CFG}/geoip/dbip-country-lite.mmdb" \
+    && [[ "$(stat -c %a "${geo}/dbip-country-lite.mmdb")" == 444 ]] \
+    && ok "GeoIP database staged read-only" || bad "GeoIP database staging"
+want_version="dbip-country-lite-2026-10-$(sha256sum "${CFG}/geoip/dbip-country-lite.mmdb" | cut -c1-8)"
+[[ "$(cat "${geo}/version")" == "${want_version}" ]] \
+    && ok "GeoIP version is month + short sha (${want_version})" || bad "GeoIP version: $(cat "${geo}/version")"
+grep -q 'DB-IP' "${geo}/NOTICE" && grep -q 'creativecommons.org/licenses/by/4.0' "${geo}/NOTICE" \
+    && ok "CC BY 4.0 attribution in the image" || bad "GeoIP NOTICE"
 has "${conf}" 'listen unix:/run/cdn/ctl.sock;' "control socket in /run/cdn"
 has "${conf}" 'meter_socket = "/run/cdn-agent/meter.sock"' "metering socket in /run/cdn-agent"
 has "${conf}" 'include /opt/hippius-cdn/origin.conf;' "baked origin endpoint"
@@ -116,6 +152,8 @@ assert c["backend"]["request_signatures"] is True
 assert c["paths"]["control_socket_uid"] == 61102
 assert c["paths"]["metering_socket"] == "/run/cdn-agent/meter.sock"
 assert c["data_plane"]["attestation"] is True
+assert c["paths"]["geoip_version_file"] == "/opt/hippius-cdn/geoip/version"
+assert c["paths"]["cache_conf"] == "/run/cdn/cache.conf"
 assert c["identity"]["fleet_wildcard_hostname"] == "*.c.hipcdn.net"
 assert set(c) == {"backend", "identity", "paths", "data_plane"}
 PY
@@ -176,6 +214,21 @@ for m in ssh.service ssh.socket sshd.service ssh@.service; do
     [[ "$(readlink "${R}/etc/systemd/system/${m}")" == /dev/null ]] && ok "masked ${m}" || bad "not masked: ${m}"
 done
 sh -n "${R}/usr/sbin/hippius-cdn-inbound" && ok "inbound guard parses" || bad "inbound guard syntax"
+sh -n "${R}/usr/sbin/hippius-cdn-cache-usage" && ok "cache-usage script parses" || bad "cache-usage script syntax"
+u=/etc/systemd/system/hippius-cdn-cache-usage.service
+has "$u" '^User=openresty$' "cache usage measured as the OpenResty user"
+has "$u" '^IOSchedulingClass=idle$' "cache usage at idle I/O priority"
+has "$u" '^ReadWritePaths=/var/lib/hippius-data/cache$' "cache usage writes only the cache dir"
+[[ "$(readlink "${R}/etc/systemd/system/timers.target.wants/hippius-cdn-cache-usage.timer")" == ../hippius-cdn-cache-usage.timer ]] \
+    && ok "cache-usage timer enabled" || bad "cache-usage timer not enabled"
+# The script, run against a fake cache: writes the byte count atomically.
+fake="${TMP}/fakecache"; mkdir -p "${fake}/objects/a/bc"; head -c 10000 /dev/zero > "${fake}/objects/a/bc/obj"
+sed "s#^dir=/var/lib/hippius-data/cache\$#dir=${fake}#" "${R}/usr/sbin/hippius-cdn-cache-usage" > "${TMP}/cu.sh"
+sh "${TMP}/cu.sh" && [[ "$(cat "${fake}/.hippius-cache-usage")" =~ ^[0-9]+$ ]] \
+    && (( $(cat "${fake}/.hippius-cache-usage") >= 10000 )) && [[ ! -e "${fake}/.hippius-cache-usage.new" ]] \
+    && ok "cache-usage script writes the byte count" || bad "cache-usage script output"
+rm -r "${fake}/objects"; sh "${TMP}/cu.sh" && [[ "$(cat "${fake}/.hippius-cache-usage")" == 0 ]] \
+    && ok "no objects/ yet: 0" || bad "cache-usage script without objects/"
 has /usr/sbin/hippius-cdn-inbound "tcp dport '\\{ 80, 443 \\}' accept" "guard opens 80/443 only (nft)"
 has /usr/sbin/hippius-cdn-inbound '--dports 80,443' "guard opens 80/443 only (iptables)"
 has /etc/hippius/cdn-input.nft '^        drop$' "input firewall drops the rest"
@@ -215,6 +268,13 @@ SUDO="" bash "${INSTALL}" "${R4}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CF
     https://api.example.invalid '*.cdn.example.test' >/dev/null
 grep -qx 'fleet_wildcard_hostname = "\*.cdn.example.test"' "${R4}${toml}" \
     && ok "an explicit fleet wildcard is baked" || bad "explicit fleet wildcard"
+# No GeoIP database, or a malformed one: refused.
+CFG_NOGEO="${TMP}/cfg-nogeo"; cp -r "${CFG}" "${CFG_NOGEO}"; rm -r "${CFG_NOGEO}/geoip"
+expect_install_die "GeoIP database missing" "${R2}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG_NOGEO}" https://api.example.invalid
+CFG_BADGEO="${TMP}/cfg-badgeo"; cp -r "${CFG}" "${CFG_BADGEO}"; echo "geoip-latest" > "${CFG_BADGEO}/geoip/VERSION"
+expect_install_die "not dbip-country-lite-YYYY-MM" "${R2}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG_BADGEO}" https://api.example.invalid
+CFG_JUNKGEO="${TMP}/cfg-junkgeo"; cp -r "${CFG}" "${CFG_JUNKGEO}"; head -c 4096 /dev/zero > "${CFG_JUNKGEO}/geoip/dbip-country-lite.mmdb"
+expect_install_die "not a MaxMind DB" "${R2}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG_JUNKGEO}" https://api.example.invalid
 R3="${TMP}/root3"; new_root "${R3}"; echo 'intruder:x:61102:61102::/:/bin/sh' >> "${R3}/etc/passwd"
 expect_install_die "already exists in the base image" "${R3}" "${TMP}/agent" "${TMP}/openresty.tar.gz" "${CFG}" https://api.example.invalid
 

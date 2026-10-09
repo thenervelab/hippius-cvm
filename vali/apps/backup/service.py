@@ -506,9 +506,9 @@ def _validate_policy_fields(
             "bad-retention",
             f"retention_days must be an integer in {MIN_RETENTION_DAYS}..{MAX_RETENTION_DAYS}",
         )
-    if failover_mode not in FailoverMode.values:
+    if failover_mode is not None and failover_mode not in FailoverMode.values:
         raise BackupError("bad-failover-mode", "failover_mode must be 'auto' or 'manual'")
-    return int(interval_s), int(retention_days), str(failover_mode)
+    return int(interval_s), int(retention_days), failover_mode
 
 
 def put_policy(
@@ -516,10 +516,15 @@ def put_policy(
     *,
     interval_s: Any,
     retention_days: Any = DEFAULT_RETENTION_DAYS,
-    failover_mode: Any = FailoverMode.AUTO,
+    failover_mode: Any = None,
 ) -> tuple[BackupPolicy, bool]:
     """Create or replace the VM's backup policy. Returns `(policy, created)`
     — `created` is also true when a disabled policy is re-enabled.
+
+    `failover_mode` None keeps the stored mode (`manual` on create): the
+    customer opts in to `auto` explicitly, and an update that does not name
+    it never changes it. `auto` is refused (`failover-auto-unavailable`)
+    where it cannot work (`failover_auto_status`).
 
     A (re-)enabled policy starts with a full at the next tick. Changing only
     the interval or retention of an enabled policy keeps its chain."""
@@ -528,19 +533,27 @@ def put_policy(
     interval, retention, mode = _validate_policy_fields(interval_s, retention_days, failover_mode)
     if vm.state in (VmState.DESTROYED, VmState.DECOMMISSIONING):
         raise BackupError("vm-not-live", "the vm is being or has been destroyed")
+    if mode == FailoverMode.AUTO:
+        blocker = failover_region_blocker(vm)
+        if blocker is not None:
+            raise FailoverAutoUnavailable(blocker)
     plan_parts(source_disk_bytes(vm))  # refuses legacy and oversize VMs
     ensure_bucket()
     with transaction.atomic():
         policy = BackupPolicy.objects.select_for_update().filter(vm=vm).first()
         if policy is None:
             policy = BackupPolicy.objects.create(
-                vm=vm, interval_s=interval, retention_days=retention, failover_mode=mode
+                vm=vm,
+                interval_s=interval,
+                retention_days=retention,
+                failover_mode=mode or FailoverMode.MANUAL,
             )
             return policy, True
         created = not policy.enabled
         policy.interval_s = interval
         policy.retention_days = retention
-        policy.failover_mode = mode
+        if mode is not None:
+            policy.failover_mode = mode
         if created:
             policy.enabled = True
             policy.disabled_at = None
@@ -1947,13 +1960,78 @@ def _prune_chain(chain: BackupChain, now: datetime) -> bool:
 # ─── views' data ─────────────────────────────────────────────────────
 
 
+def failover_auto_regions() -> frozenset[str]:
+    """The regions whose backups are local to them (`VALI_FAILOVER_AUTO_REGIONS`):
+    only there can an automatic failover restore without crossing regions."""
+    raw = getattr(settings, "VALI_FAILOVER_AUTO_REGIONS", ()) or ()
+    return frozenset(str(r).strip().upper() for r in raw if str(r).strip())
+
+
+def vm_region(vm: Vm) -> str:
+    """The region the VM belongs to: the one its launch asked for, else its
+    host's last known location (however old: the host may be the dead miner
+    a failover leaves). `""` when neither is known."""
+    from apps.miners import geo
+    from apps.scheduler import service as sched
+
+    region = sched.launch_region_for_vm(vm.vm_id)
+    if region:
+        return region.upper()
+    if not vm.host:
+        return ""
+    return geo.last_known_countries([vm.host]).get(vm.host, "")
+
+
+class FailoverAutoUnavailable(BackupError):
+    """`failover_mode=auto` refused: automatic failover cannot work for the
+    VM (`blocker`)."""
+
+    def __init__(self, blocker: str) -> None:
+        super().__init__(
+            "failover-auto-unavailable",
+            "automatic failover is not available for this vm's region (its backups are "
+            "not stored there)",
+        )
+        self.blocker = blocker
+
+
+def failover_region_blocker(vm: Vm) -> str | None:
+    """`region-backups-not-local` when the VM's region is not one of
+    `VALI_FAILOVER_AUTO_REGIONS` (or unknown), else None."""
+    region = vm_region(vm)
+    return None if region and region in failover_auto_regions() else "region-backups-not-local"
+
+
+def failover_auto_status(policy: BackupPolicy) -> tuple[bool, str | None]:
+    """`(eligible, blocker)` for automatic failover of the policy's VM:
+    `disabled` (the policy is off), `region-backups-not-local`, `no-point`
+    (no restorable current-boot point), or eligible. The checks are those
+    the automatic worker makes; whether `failover_mode` is `auto` is not one
+    of them (a `manual` VM can be eligible)."""
+    if not policy.enabled:
+        return False, "disabled"
+    blocker = failover_region_blocker(policy.vm)
+    if blocker is not None:
+        return False, blocker
+    if not has_current_boot_point(policy):
+        return False, "no-point"
+    return True, None
+
+
+def has_current_boot_point(policy: BackupPolicy) -> bool:
+    return restore_point(policy.vm, policy) is not None
+
+
 def policy_view(policy: BackupPolicy) -> dict[str, Any]:
+    eligible, blocker = failover_auto_status(policy)
     return {
         "vm_id": policy.vm.vm_id,
         "enabled": policy.enabled,
         "interval_s": policy.interval_s,
         "retention_days": policy.retention_days,
         "failover_mode": policy.failover_mode,
+        "failover_auto_eligible": eligible,
+        "failover_auto_blocker": blocker,
         "created_at": policy.created_at.isoformat(),
         "updated_at": policy.updated_at.isoformat(),
     }

@@ -439,7 +439,9 @@
       [Service]
       Type=simple
       ExecStart={{ miner_agent.install_path }} serve --config {{ miner_agent.config_path }}
-      Restart=on-failure
+      # always, not on-failure: a binary that exits 0 is brought back too
+      # (the agent only exits on a signal; `systemctl stop` never restarts).
+      Restart=always
       RestartSec=10
       User=root
       Group=root

@@ -29,9 +29,9 @@ use hippius_miner_agent::backup::{BackupKind, BackupManager};
 use hippius_miner_agent::lifecycle::{DomainId, DomainState, MockLaunchDigest, MockLibvirtDriver};
 use hippius_miner_agent::orders::{
     BackupOrder, Clock, DestroyOrder, IdempotencyStore, LaunchOrder, MigrateActivateOrder,
-    MigrateOrder, MigrateQuiesceOrder, MigrateSnapshotOrder, MigrationStore, OrderBody, OrderKind,
-    OrderState, OrderVerifier, OrdersServer, RestoreOrder, SignedOrder, SnapshotDownloader,
-    SnapshotUploader, StopOrder, ORDER_DOMAIN,
+    MigrateOrder, MigrateQuiesceOrder, MigrateSnapshotOrder, MigrationStore, OnGuestPoweroff,
+    OrderBody, OrderKind, OrderState, OrderVerifier, OrdersServer, PowerPolicyOrder, RestoreOrder,
+    SignedOrder, SnapshotDownloader, SnapshotUploader, StopOrder, ORDER_DOMAIN,
 };
 use hippius_miner_agent::snp_config::{install_for_tests, SnpCpuConfig};
 use hippius_miner_agent::{CvmLifecycle, HostResources, VmId};
@@ -367,6 +367,7 @@ fn launch_payload(vm: &str) -> LaunchOrder {
         require_existing_disks: false,
         guardian_ep: None,
         net: None,
+        on_guest_poweroff: None,
     }
 }
 
@@ -1703,4 +1704,194 @@ async fn a_stage_carrying_many_part_shas_fits_its_route() {
     let (status, body) = post(addr, "/v1/miner/order/restore", &wire).await;
     // Decoded and validated (the body fit); the tempdir cannot hold it.
     assert_eq!((status, body.as_str()), (507, "insufficient-space"));
+}
+
+// ── guest-poweroff policy ───────────────────────────────────────────
+
+fn power_policy_vector() -> serde_json::Value {
+    serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/power_policy_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Sign raw body bytes as the Edge does (the vector's bodies are vali's).
+fn sign_body(sk: &SigningKey, body: Vec<u8>) -> Vec<u8> {
+    let sig = sk.sign(&body).to_bytes().to_vec();
+    let mut wire = Vec::new();
+    ciborium::ser::into_writer(
+        &SignedOrder {
+            body: ByteBuf::from(body),
+            sig: ByteBuf::from(sig),
+        },
+        &mut wire,
+    )
+    .unwrap();
+    wire
+}
+
+#[test]
+fn the_shared_power_policy_vector_decodes_into_the_agent_types() {
+    let v = power_policy_vector();
+    for case in v["cases"].as_array().unwrap() {
+        let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+        let want = case["payload"]["on_guest_poweroff"].as_str().unwrap();
+        match case["kind"].as_str().unwrap() {
+            "power-policy" => {
+                let o: OrderBody<PowerPolicyOrder> =
+                    ciborium::de::from_reader(body.as_slice()).unwrap();
+                assert_eq!(o.kind, OrderKind::PowerPolicy);
+                assert_eq!(o.payload.vm_id.as_str(), "tenant-1");
+                assert_eq!(o.payload.on_guest_poweroff.as_str(), want);
+            }
+            "launch" => {
+                let o: OrderBody<LaunchOrder> = ciborium::de::from_reader(body.as_slice()).unwrap();
+                assert_eq!(o.kind, OrderKind::Launch);
+                assert_eq!(o.payload.on_guest_poweroff.map(|p| p.as_str()), Some(want));
+            }
+            other => panic!("unexpected kind {other}"),
+        }
+    }
+}
+
+#[test]
+fn a_launch_without_a_policy_encodes_exactly_as_before() {
+    // `skip_serializing_if`: an agent that predates the field still
+    // decodes every launch vali sends a `restart` VM.
+    let mut body = Vec::new();
+    ciborium::ser::into_writer(&launch_payload("tenant-x"), &mut body).unwrap();
+    assert!(!body.windows(17).any(|w| w == b"on_guest_poweroff"));
+}
+
+#[tokio::test]
+async fn power_policy_orders_set_the_policy_of_a_vm_on_this_host() {
+    seed_snp_probe();
+    let root = tempfile::tempdir().unwrap();
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let (addr, sk, lifecycle, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        None,
+        Arc::clone(&driver),
+        Some(root.path()),
+    )
+    .await;
+    let vm = VmId::new("tenant-1").unwrap();
+    let mut launch = launch_payload("tenant-1");
+    launch.on_guest_poweroff = Some(OnGuestPoweroff::Stop);
+    let wire = signed_wire(&sk, "pp-l", OrderKind::Launch, launch);
+    assert_eq!(post(addr, "/v1/miner/order/launch", &wire).await.0, 200);
+    assert_eq!(lifecycle.power_policy(&vm).unwrap(), OnGuestPoweroff::Stop);
+
+    // vali's own body (the shared vector), signed by the Edge: back to
+    // `restart`. (The vector's cases share one order_id, so only one of
+    // them can be applied per server — the rest would be replays.)
+    let v = power_policy_vector();
+    let case = v["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "power-policy-restart")
+        .unwrap();
+    let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+    let wire = sign_body(&sk, body);
+    let applied = (200, "power-policy:restart".to_string());
+    assert_eq!(
+        post(addr, "/v1/miner/order/power-policy", &wire).await,
+        applied
+    );
+    assert_eq!(
+        lifecycle.power_policy(&vm).unwrap(),
+        OnGuestPoweroff::Restart
+    );
+    // A replay is the same answer and changes nothing.
+    assert_eq!(
+        post(addr, "/v1/miner/order/power-policy", &wire).await,
+        applied
+    );
+
+    // A VM this host does not have.
+    let ghost = signed_wire(
+        &sk,
+        "pp-ghost",
+        OrderKind::PowerPolicy,
+        PowerPolicyOrder {
+            vm_id: VmId::new("tenant-ghost").unwrap(),
+            on_guest_poweroff: OnGuestPoweroff::Stop,
+        },
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/power-policy", &ghost).await,
+        (404, "vm-not-found".to_string())
+    );
+    // A power-policy body on another route is refused.
+    let misrouted = signed_wire(
+        &sk,
+        "pp-mis",
+        OrderKind::PowerPolicy,
+        PowerPolicyOrder {
+            vm_id: vm.clone(),
+            on_guest_poweroff: OnGuestPoweroff::Stop,
+        },
+    );
+    assert_eq!(post(addr, "/v1/miner/order/stop", &misrouted).await.0, 400);
+}
+
+#[tokio::test]
+async fn domain_state_reports_a_guest_poweroff_stop() {
+    seed_snp_probe();
+    let root = tempfile::tempdir().unwrap();
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let (addr, sk, lifecycle, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        None,
+        Arc::clone(&driver),
+        Some(root.path()),
+    )
+    .await;
+    let vm = VmId::new("tenant-gp").unwrap();
+    let mut launch = launch_payload("tenant-gp");
+    launch.on_guest_poweroff = Some(OnGuestPoweroff::Stop);
+    let wire = signed_wire(&sk, "gp-l", OrderKind::Launch, launch);
+    assert_eq!(post(addr, "/v1/miner/order/launch", &wire).await.0, 200);
+    let path = "/v1/miner/vm/tenant-gp/domain-state";
+    assert_eq!(
+        get(addr, path).await,
+        (200, r#"{"running":true}"#.to_string())
+    );
+
+    // Settling refuses a domain libvirt still runs.
+    assert!(lifecycle.settle_guest_poweroff(&vm, 1).await.is_err());
+    assert!(!lifecycle.stopped_by_guest(&vm));
+
+    driver.force_all_to_state(DomainState::ShutOff).unwrap();
+    // A plain "down" until the agent decides it was the guest's poweroff.
+    assert_eq!(
+        get(addr, path).await,
+        (200, r#"{"running":false}"#.to_string())
+    );
+    lifecycle
+        .settle_guest_poweroff(&vm, 1_770_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        get(addr, path).await,
+        (
+            200,
+            r#"{"running":false,"stop_reason":"guest-poweroff"}"#.to_string()
+        )
+    );
+    // The start relaunches it with the policy and the mark is gone.
+    let mut start = launch_payload("tenant-gp");
+    start.on_guest_poweroff = Some(OnGuestPoweroff::Stop);
+    start.require_existing_disks = false;
+    let wire = signed_wire(&sk, "gp-s", OrderKind::Launch, start);
+    assert_eq!(post(addr, "/v1/miner/order/launch", &wire).await.0, 200);
+    assert_eq!(
+        get(addr, path).await,
+        (200, r#"{"running":true}"#.to_string())
+    );
 }

@@ -21,6 +21,12 @@ ASSET="hippius-miner-agent-x86_64-linux-gnu"
 # (YYYY, MM, DD, N); publishing anything else would strand the fleet.
 [[ "$TAG" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]{0,2})?$ ]] \
     || { echo "error: tag '$TAG' is not vYYYY.MM.DD[.N]" >&2; exit 1; }
+# Miners pass over a release dated more than one day after the UTC day it
+# was published: refuse such a tag here rather than publish a release no
+# miner will take.
+tomorrow="$(date -u -d tomorrow +%Y.%m.%d)"
+[[ ! "${TAG:1:10}" > "$tomorrow" ]] \
+    || { echo "error: tag '$TAG' is dated after tomorrow in UTC ($tomorrow); miners would never install it" >&2; exit 1; }
 
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export CARGO_INCREMENTAL=0

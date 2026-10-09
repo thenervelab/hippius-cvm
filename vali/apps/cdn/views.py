@@ -149,7 +149,11 @@ class CdnNodeDnsReleasedView(CdnRootView):
         body = _body(request)
         if body is None:
             return refuse("bad-request", "body must be a JSON object", 400)
-        change_id = body.get("change_id", "")
+        # `null` is "no Route 53 change": the backend sends it for a node
+        # that never had a record (§B.2), like an absent field.
+        change_id = body.get("change_id")
+        if change_id is None:
+            change_id = ""
         insync_raw = body.get("insync_at")
         revision_seen = body.get("revision_seen")
         if not isinstance(change_id, str) or len(change_id) > 256:

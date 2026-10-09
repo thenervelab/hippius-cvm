@@ -41,8 +41,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential perl curl ca-certificates openssl python3 shellcheck
       - name: shellcheck
         run: |
-          shellcheck -S warning packer/cdn-node/openresty/build-openresty.sh \
-            packer/cdn-node/openresty/render.sh packer/cdn-node/openresty/tests/run.sh
+          shellcheck -S warning -x packer/cdn-node/openresty/build-openresty.sh \
+            packer/cdn-node/openresty/render.sh packer/cdn-node/openresty/tests/run.sh \
+            packer/cdn-node/openresty/fetch-geoip.sh
       - name: Build OpenResty (pinned sources)
         run: |
           BUILD_ROOT="/tmp/hippius-openresty-build" \
@@ -53,5 +54,11 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/or"
           tar -xzf "${RUNNER_TEMP}/openresty.tar.gz" -C "${RUNNER_TEMP}/or"
+      # The pinned GeoIP database, as the tenant-baker image fetches it: a
+      # bump with a wrong sha256 fails here, and the reader runs on it.
+      - name: Fetch the pinned GeoIP database
+        run: packer/cdn-node/openresty/fetch-geoip.sh "${RUNNER_TEMP}/geoip"
       - name: Data-plane tests
-        run: OPENRESTY_PREFIX="${RUNNER_TEMP}/or/opt/openresty" packer/cdn-node/openresty/tests/run.sh
+        run: |
+          HIPPIUS_REAL_GEOIP_DB="${RUNNER_TEMP}/geoip/dbip-country-lite.mmdb" \
+            OPENRESTY_PREFIX="${RUNNER_TEMP}/or/opt/openresty" packer/cdn-node/openresty/tests/run.sh

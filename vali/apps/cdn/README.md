@@ -16,6 +16,16 @@ also needs `VALI_CDN_LAUNCH_ROLE`, and running the fleet needs
 | `vali_cdn_region list / create <XX>` | Regions. Set the target with `PATCH /v1/cdn/regions/<XX>`. |
 | `vali_cdn_node list / drain / force-drained` | Nodes. `force-drained` stands in for the backend's dns-released ack. |
 
+## Backend contract notes
+
+- `POST /v1/cdn/nodes/<node_id>/dns-released` (§B.2) takes
+  `{"revision_seen": int|null, "change_id": str|null, "insync_at": ISO 8601|null}`.
+  Every field is optional. `change_id: null` (or absent) means no Route 53
+  change: the backend sends it for a node that never had a record. A
+  non-string, non-null `change_id` is refused with 400. The decommission
+  grace counts from vali's receipt of the ack. The call is accepted for
+  `draining` and `failed` nodes; any other state gets 409 `not-draining`.
+
 ## Custody
 
 - **CA.** The CA is the Vault Transit key `cdn-ca` (ed25519, non-exportable). vali only signs with it and reads its public half.
