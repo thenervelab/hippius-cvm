@@ -1020,6 +1020,7 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     let vsock_task = tokio::spawn(hippius_miner_agent::vsock::run_vsock_listener(
         lifecycle.cid_allocator(),
         Arc::clone(&edge),
+        lifecycle.guest_runs(),
         cancel.clone(),
     ));
 
@@ -1458,6 +1459,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
         require_existing_disks: false,
         guardian_ep: None,
         net: None,
+        on_guest_poweroff: None,
     };
 
     // The lifecycle is async (`tokio::process` drives `virsh`); a

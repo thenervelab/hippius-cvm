@@ -24,7 +24,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from apps.identity import scoping
-from apps.orchestration import webhook
+from apps.orchestration import power_policy, webhook
 from apps.orchestration.effects import EffectError, EffectUnavailable
 from apps.orchestration.models import LaunchJob, LaunchJobState, LaunchPhase
 from apps.orchestration.services import customer_keys, flavors, launch, vault_kv
@@ -127,6 +127,11 @@ _OPTIONAL: dict[str, Any] = {
     # only on a miner the geo-probe has DETECTED there, or the launch
     # fails `no-miner-in-region` — it never falls back to another region.
     "region": "",
+    # Anti-affinity — `[a-z0-9-]{1,64}`, namespaced by the tenant. Empty ⇒
+    # none. Consumed by scheduler gate (k): never two VMs of one group on a
+    # miner; an unsatisfiable launch fails
+    # `placement-anti-affinity-unsatisfiable`.
+    "placement_group": "",
 }
 
 
@@ -214,6 +219,22 @@ def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
             "bad-field",
         )
     spec["region"] = region.upper()
+
+    group = spec["placement_group"]
+    if group and not _IMAGE_NAME_RE.fullmatch(group):
+        raise LaunchIntentError("placement_group must match [a-z0-9-]{1,64}", "bad-field")
+
+    # Guest-poweroff policy — `restart` (default) | `stop`; anything else is
+    # a synchronous 400, never a silent default. Written into `spec_json`
+    # only for `stop`, so every other launch's record is as before (and an
+    # older image rolled back to can still rebuild its relaunch spec).
+    if intent.get("on_guest_poweroff") is not None:
+        try:
+            policy = power_policy.parse_policy(intent["on_guest_poweroff"])
+        except ValueError as exc:
+            raise LaunchIntentError(str(exc), "bad-field") from exc
+        if policy == power_policy.STOP:
+            spec["on_guest_poweroff"] = policy
 
     # Tenant price ceiling — optional positive int (USD/unit ×1e6) or None
     # (no ceiling ⇒ the VM is never migrated on a miner price change).
@@ -819,6 +840,15 @@ def start_launch(
             customer_keys.check_pinned(existing, binding)
         except customer_keys.CustomerKeysError as exc:
             raise LaunchIntentError(str(exc), "conflict") from exc
+        # The placement group is fixed when the row is created: a re-POST
+        # may omit it (the row's stays), never name another.
+        asked = intent.get("placement_group") or ""
+        if asked and asked != existing.placement_group:
+            raise LaunchIntentError(
+                f"vm {existing.vm_id!r} is in placement group "
+                f"{existing.placement_group or None!r}; it cannot change",
+                "conflict",
+            )
     else:
         # Customer-held keys (M1/M2) FIRST launch: the new-launch gates,
         # namely flag on, golden only, and a bake the operator marked

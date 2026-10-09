@@ -6,6 +6,8 @@
 -- document once per version and keeps the decoded table, plus derived
 -- indexes, until the version changes.
 local cjson = require("cjson.safe")
+local limits = require("hippius_cdn.limits")
+local rules = require("hippius_cdn.rules")
 local util = require("hippius_cdn.util")
 
 local M = {}
@@ -158,8 +160,31 @@ function validators.config(d)
     if skipped > 0 and ngx and ngx.log then
         ngx.log(ngx.WARN, "hippius-cdn: ", skipped, " purge keys or block values skipped (not a request path)")
     end
+    -- Cache rules, compiled once per config version. A rule this node
+    -- cannot use is dropped (logged here, once per version and worker),
+    -- never a refused document.
+    local zone_rules, zone_limits = {}, {}
+    for zid, z in pairs(d.zones) do
+        local settings_doc = is_map(z.settings) and z.settings or {}
+        local compiled, dropped, glob_over_cap = rules.compile(settings_doc.rules)
+        zone_rules[zid] = compiled
+        if glob_over_cap and ngx and ngx.log then
+            ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": glob patterns over ", rules.GLOB_CAP,
+                " bytes, its glob rules ignored")
+        end
+        if dropped > 0 and ngx and ngx.log then
+            ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": ", dropped, " cache rules ignored (not usable)")
+        end
+        local lim, usable = limits.of(settings_doc)
+        zone_limits[zid] = lim
+        if not usable and ngx and ngx.log then
+            ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": limits not usable, the defaults apply")
+        end
+    end
     return {
         doc = d,
+        rules = zone_rules,
+        limits = zone_limits,
         skipped = skipped,
         hostnames = hostnames,
         acme = acme,

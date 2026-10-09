@@ -17,6 +17,13 @@ _JOB_KEYS = {
     "job_id",
     "vm_id",
     "kind",
+    "failover_id",
+    "trigger",
+    "outcome",
+    "started_at",
+    "committed_at",
+    "restored_point_at",
+    "dead_miner_evidence",
     "run_id",
     "chain_id",
     "point_taken_at",
@@ -56,10 +63,12 @@ def test_post_opens_a_restore_and_replays_on_the_same_request_id(root_client) ->
     assert again.status_code == 202 and again.json()["job_id"] == body["job_id"]
     assert MigrationJob.objects.count() == 1
 
-    latest = root_client.get(f"/v1/vm/{vm.vm_id}/restore")
-    assert latest.status_code == 200 and latest.json()["job_id"] == body["job_id"]
+    listed = root_client.get(f"/v1/vm/{vm.vm_id}/restore")
+    assert listed.status_code == 200
+    [latest] = listed.json()["jobs"]
+    assert latest["job_id"] == body["job_id"]
     one = root_client.get(f"/v1/vm/{vm.vm_id}/restore/{body['job_id']}")
-    assert one.status_code == 200 and one.json() == latest.json()
+    assert one.status_code == 200 and one.json() == latest
 
 
 def test_the_routes_are_root_only(authed_client) -> None:
@@ -98,7 +107,7 @@ def test_unknown_vm_and_no_restore_are_404(root_client) -> None:
     assert root_client.get("/v1/vm/ghost/restore").json()["error"] == "vm-not-found"
     vm = _golden_vm()
     resp = root_client.get(f"/v1/vm/{vm.vm_id}/restore")
-    assert resp.status_code == 404 and resp.json()["error"] == "no-restore"
+    assert resp.status_code == 200 and resp.json() == {"jobs": []}
     resp = root_client.get(f"/v1/vm/{vm.vm_id}/restore/" + "0" * 32)
     assert resp.status_code == 404 and resp.json()["error"] == "no-restore"
 

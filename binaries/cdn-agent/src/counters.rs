@@ -43,7 +43,7 @@ use crate::error::{CdnError, Result};
 use crate::hooks::RecordSink;
 use crate::persist;
 use crate::shutdown::ShutdownWatch;
-use crate::wire::{CounterSet, UsageReport};
+use crate::wire::{CacheTotals, CounterSet, UsageReport};
 
 /// Counter file format version.
 const COUNTERS_FORMAT: u32 = 1;
@@ -130,6 +130,10 @@ pub struct Counters {
     seq: u64,
     zones: BTreeMap<String, BTreeMap<String, CounterSet>>,
     unattributed: CounterSet,
+    /// Node-wide cache outcomes (`CacheTotals`); absent in files written
+    /// before they existed.
+    #[serde(default)]
+    cache: CacheTotals,
     #[serde(skip)]
     keys: usize,
 }
@@ -156,6 +160,7 @@ impl Counters {
             seq: 0,
             zones: BTreeMap::new(),
             unattributed: CounterSet::default(),
+            cache: CacheTotals::default(),
             keys: 0,
         }
     }
@@ -220,6 +225,20 @@ impl Counters {
             }
         };
         add(slot, rec);
+        // Node-wide, whatever the zone: BYPASS is a miss here (the origin
+        // was fetched), unlike the per-zone counters.
+        match rec.cache {
+            Some(
+                CacheStatus::Hit
+                | CacheStatus::Stale
+                | CacheStatus::Updating
+                | CacheStatus::Revalidated,
+            ) => self.cache.hits = self.cache.hits.saturating_add(1),
+            Some(CacheStatus::Miss | CacheStatus::Expired | CacheStatus::Bypass) => {
+                self.cache.misses = self.cache.misses.saturating_add(1);
+            }
+            None => {}
+        }
     }
 
     /// Persist the current totals (atomic).
@@ -290,6 +309,8 @@ impl Counters {
             geoip_db: geoip_db.to_string(),
             zones: self.zones.clone(),
             unattributed: self.unattributed,
+            disk: None,
+            cache: Some(self.cache),
         }
     }
 }
@@ -448,6 +469,80 @@ mod tests {
         ] {
             assert_eq!(RequestRecord::parse(bad).unwrap_err().class(), want);
         }
+    }
+
+    #[test]
+    fn totals_are_kept_per_zone_and_client_region() {
+        let mut c = Counters::fresh();
+        let mut r = |zone: &str, region: &str, bytes: u64| {
+            let mut x = rec(Some(zone), true, bytes, 200);
+            x.client_region = region.into();
+            c.record(&x, true);
+        };
+        r("z1", "FR", 100);
+        r("z1", "FR", 50);
+        r("z1", "AU", 7);
+        r("z1", "XX", 3);
+        r("z2", "FR", 11);
+        let z1 = &c.zones["z1"];
+        assert_eq!(z1.len(), 3);
+        assert_eq!(
+            (z1["FR"].billable_bytes_out, z1["FR"].billable_requests),
+            (150, 2)
+        );
+        assert_eq!(
+            (z1["AU"].billable_bytes_out, z1["AU"].billable_requests),
+            (7, 1)
+        );
+        assert_eq!(
+            (z1["XX"].billable_bytes_out, z1["XX"].billable_requests),
+            (3, 1)
+        );
+        assert_eq!(c.zones["z2"]["FR"].billable_bytes_out, 11);
+        assert!(!c.zones["z2"].contains_key("AU"));
+        // The report carries the same keys, and the database version.
+        let rep = c.report(
+            "cdn-fr-1",
+            "t".into(),
+            1,
+            "dbip-country-lite-2026-10-dbd70ccf",
+        );
+        assert_eq!(rep.zones["z1"]["AU"].billable_bytes_out, 7);
+        assert_eq!(rep.zones["z2"].len(), 1);
+        assert_eq!(rep.geoip_db, "dbip-country-lite-2026-10-dbd70ccf");
+    }
+
+    #[test]
+    fn node_cache_totals_count_bypass_as_a_miss_and_survive_old_files() {
+        let mut c = Counters::fresh();
+        for (status, n) in [
+            (CacheStatus::Hit, 2),
+            (CacheStatus::Stale, 1),
+            (CacheStatus::Updating, 1),
+            (CacheStatus::Revalidated, 1),
+            (CacheStatus::Miss, 3),
+            (CacheStatus::Expired, 1),
+            (CacheStatus::Bypass, 2),
+        ] {
+            for _ in 0..n {
+                let mut r = rec(Some("z1"), true, 1, 200);
+                r.cache = Some(status);
+                c.record(&r, true);
+            }
+        }
+        let mut no_cache = rec(None, false, 1, 421);
+        no_cache.cache = None;
+        c.record(&no_cache, false);
+        let rep = c.report("n", "t".into(), 1, "db");
+        assert_eq!(rep.cache, Some(CacheTotals { hits: 5, misses: 6 }));
+        // The per-zone counters keep their own rule (BYPASS is neither).
+        assert_eq!(rep.zones["z1"]["FR"].misses, 4);
+        // A counter file written before node totals existed still loads.
+        let mut old: serde_json::Value = serde_json::to_value(&c).unwrap();
+        old.as_object_mut().unwrap().remove("cache");
+        let back = Counters::decode(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(back.cache, CacheTotals::default());
+        assert_eq!(back.zones, c.zones);
     }
 
     #[test]

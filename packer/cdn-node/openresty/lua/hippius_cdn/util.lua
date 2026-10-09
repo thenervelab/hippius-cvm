@@ -122,7 +122,9 @@ end
 -- the generation of every covering directory prefix, the exact-path
 -- generation, and the path. Hostnames of one zone share objects; the
 -- query string never reaches the origin, so it is not part of the key.
-function M.cache_key_material(zone_id, purge, path)
+-- `query` (optional) is the cache rule's query-string part
+-- (rules.query_key): empty for the default, so default keys never change.
+function M.cache_key_material(zone_id, purge, path, query)
     local zgen = 0
     local prefixes, paths = {}, {}
     if purge then
@@ -134,9 +136,13 @@ function M.cache_key_material(zone_id, purge, path)
     for i, p in ipairs(M.purge_prefixes(path)) do
         gens[i] = tostring(tonumber(prefixes[p]) or 0)
     end
-    return table.concat({
+    local parts = {
         "v2", zone_id, tostring(zgen), table.concat(gens, ","), tostring(tonumber(paths[path]) or 0), path,
-    }, "\0")
+    }
+    if query and query ~= "" then
+        parts[#parts + 1] = "q=" .. query
+    end
+    return table.concat(parts, "\0")
 end
 
 -- The wildcard name that covers `host` ("*.b.c" for "a.b.c").

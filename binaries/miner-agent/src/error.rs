@@ -421,4 +421,11 @@ pub enum MinerAgentError {
     ///   under-VM situation, fail-closed.
     #[error("snp-probe/{0}")]
     SnpProbe(&'static str),
+
+    /// The per-VM guest-poweroff policy file
+    /// ([`crate::lifecycle::power_policy`]) could not be read or written.
+    /// Sub-classifiers: `mkdir`, `write`, `sync`, `rename`, `remove`,
+    /// `read`, `parse`, `encode`.
+    #[error("power-policy-store/{0}")]
+    PowerPolicyStore(&'static str),
 }

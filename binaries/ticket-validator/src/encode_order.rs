@@ -129,6 +129,17 @@
 //! The miner-agent checks the values (canonical IPv4, charsets, ranges)
 //! and acks `applied:<revision>:<content sha256>`; `net-policy-digest`
 //! computes that sha from the same JSON.
+//!
+//! ### `power-policy`
+//!
+//! A VM's guest-poweroff policy, both keys required, nothing else:
+//!
+//! ```json
+//! { "vm_id": "tenant-1", "on_guest_poweroff": "restart" | "stop" }
+//! ```
+//!
+//! `launch` takes the same optional `on_guest_poweroff`, emitted only
+//! when present (an agent too old to know it refuses the body at decode).
 
 use ciborium::value::Value;
 use clap::Args;
@@ -222,6 +233,7 @@ fn build(args: &EncodeOrderArgs, payload_json: &[u8]) -> Result<Vec<u8>, &'stati
         "restore" => build_restore(payload_obj)?,
         "migrate-snapshot" => build_migrate_snapshot(payload_obj)?,
         "net-policy" => build_net_policy(payload_obj)?,
+        "power-policy" => build_power_policy(payload_obj)?,
         _ => return Err("bad-kind"),
     };
 
@@ -377,7 +389,52 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
     }
     push_guardian_ep(&mut entries, guardian_ep);
     push_net(&mut entries, net_field(obj)?);
+    // The guest-poweroff policy: emitted only when present, so a launch
+    // without it is byte-identical to before, and a value this bridge does
+    // not know is refused — dropping it would silently turn a `stop` VM
+    // into a `restart` one (the #365 lesson again).
+    if let Some(policy) = on_guest_poweroff_field(obj, false)? {
+        entries.push((
+            Value::Text("on_guest_poweroff".into()),
+            Value::Text(policy.into()),
+        ));
+    }
     Ok(Value::Map(entries))
+}
+
+/// `on_guest_poweroff` — mirrors the miner-agent's `OnGuestPoweroff`
+/// (`restart` | `stop`). Absent / null ⇒ `None`, unless `required`.
+fn on_guest_poweroff_field(
+    obj: &serde_json::Map<String, Json>,
+    required: bool,
+) -> Result<Option<&'static str>, &'static str> {
+    match obj.get("on_guest_poweroff") {
+        None | Some(Json::Null) if required => Err("missing-on-guest-poweroff"),
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some("restart") => Ok(Some("restart")),
+            Some("stop") => Ok(Some("stop")),
+            _ => Err("bad-on-guest-poweroff"),
+        },
+    }
+}
+
+/// Build the `payload` map for `kind=power-policy`. Mirrors
+/// `binaries/miner-agent/src/orders/types.rs::PowerPolicyOrder`; an
+/// unknown key is refused rather than dropped.
+fn build_power_policy(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    if obj.keys().any(|k| k != "vm_id" && k != "on_guest_poweroff") {
+        return Err("power-policy-unknown-field");
+    }
+    let vm_id = string_field(obj, "vm_id")?;
+    let policy = on_guest_poweroff_field(obj, true)?.ok_or("missing-on-guest-poweroff")?;
+    Ok(Value::Map(vec![
+        (
+            Value::Text("on_guest_poweroff".into()),
+            Value::Text(policy.into()),
+        ),
+        (Value::Text("vm_id".into()), Value::Text(vm_id)),
+    ]))
 }
 
 /// Highest cap the miner-agent accepts (`netpolicy::MAX_VM_CAP_MBPS`).
@@ -3533,5 +3590,102 @@ mod tests {
             }),
             "net-policy-bad-uint"
         );
+    }
+
+    fn power_policy_vector() -> Json {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/power_policy_v1.json"
+        );
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn power_policy_bodies_match_the_shared_vector() {
+        let v = power_policy_vector();
+        for case in v["cases"].as_array().unwrap() {
+            let args = EncodeOrderArgs {
+                order_id: v["order_id"].as_str().unwrap().to_string(),
+                kind: case["kind"].as_str().unwrap().to_string(),
+                target_miner_id: v["target_miner_id"].as_str().unwrap().to_string(),
+                issued_at_unix: v["issued_at_unix"].as_u64().unwrap(),
+            };
+            let payload = serde_json::to_vec(&case["payload"]).unwrap();
+            let bytes = build(&args, &payload).unwrap();
+            assert_canonical(&bytes).unwrap();
+            assert_eq!(
+                hex::encode(&bytes),
+                case["body_hex"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_carries_on_guest_poweroff_only_when_set() {
+        let plain = build(&args("g", "launch"), launch_payload()).unwrap();
+        assert!(!launch_payload_has_key(&plain, "on_guest_poweroff"));
+        let null = launch_json_with("console=hvc0", "\"on_guest_poweroff\": null,");
+        assert_eq!(build(&args("g", "launch"), null.as_bytes()).unwrap(), plain);
+        for policy in ["stop", "restart"] {
+            let json = launch_json_with(
+                "console=hvc0",
+                &format!("\"on_guest_poweroff\": \"{policy}\","),
+            );
+            let bytes = build(&args("g", "launch"), json.as_bytes()).unwrap();
+            assert_canonical(&bytes).unwrap();
+            let v: Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            let Value::Map(top) = v else { panic!() };
+            let Some((_, Value::Map(payload))) =
+                top.iter().find(|(k, _)| k.as_text() == Some("payload"))
+            else {
+                panic!("no payload");
+            };
+            let got = payload
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("on_guest_poweroff"))
+                .and_then(|(_, v)| v.as_text());
+            assert_eq!(got, Some(policy));
+        }
+    }
+
+    #[test]
+    fn a_bad_on_guest_poweroff_is_refused_never_dropped() {
+        for extra in [
+            "\"on_guest_poweroff\": \"Stop\",",
+            "\"on_guest_poweroff\": \"halt\",",
+            "\"on_guest_poweroff\": true,",
+        ] {
+            let json = launch_json_with("console=hvc0", extra);
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                "bad-on-guest-poweroff",
+                "{extra}"
+            );
+        }
+        for (payload, want) in [
+            (&br#"{"vm_id":"t"}"#[..], "missing-on-guest-poweroff"),
+            (
+                br#"{"vm_id":"t","on_guest_poweroff":null}"#,
+                "missing-on-guest-poweroff",
+            ),
+            (
+                br#"{"vm_id":"t","on_guest_poweroff":"off"}"#,
+                "bad-on-guest-poweroff",
+            ),
+            (br#"{"on_guest_poweroff":"stop"}"#, "missing-vm-id"),
+            (
+                br#"{"vm_id":"t","on_guest_poweroff":"stop","graceful":true}"#,
+                "power-policy-unknown-field",
+            ),
+        ] {
+            assert_eq!(
+                build(&args("p", "power-policy"), payload).unwrap_err(),
+                want,
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
     }
 }

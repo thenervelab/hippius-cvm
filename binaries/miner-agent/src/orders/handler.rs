@@ -34,7 +34,7 @@ use crate::lifecycle::CvmLifecycle;
 use super::migration::{MigrationStore, SnapshotDownloader, SnapshotUploader};
 use super::types::{
     DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder, MigrateQuiesceOrder,
-    MigrateSnapshotOrder, NetPolicyOrder, StopOrder, TenantPreflightOrder,
+    MigrateSnapshotOrder, NetPolicyOrder, PowerPolicyOrder, StopOrder, TenantPreflightOrder,
 };
 
 /// Default upper bound on tracked `order_id`s. A miner processes a
@@ -210,6 +210,14 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
         MinerAgentError::NetPolicyNotLoaded => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "net-policy-not-loaded")
         }
+        // The VM's guest-poweroff policy could not be persisted: the
+        // launch / policy change is refused rather than run without it.
+        MinerAgentError::PowerPolicyStore(_) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: power-policy-store-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "power-policy-store")
+        }
         // Everything else — a libvirt fault, a poisoned lock, a launch
         // that did not reach running — is an internal failure. The
         // public class stays `dispatch-failed` (no wire-side breaking
@@ -339,6 +347,26 @@ pub async fn handle_stop(
     match lifecycle.stop(&order.vm_id, order.graceful).await {
         Ok(()) => Ok("stopped".to_string()),
         Err(MinerAgentError::VmNotFound) => Ok("not-running".to_string()),
+        Err(err) => Err(reject_dispatch(&err, order.vm_id.as_str())),
+    }
+}
+
+/// Dispatch a `power-policy` order: persist the VM's new guest-poweroff
+/// policy; the next guest poweroff reads it. Answers
+/// `power-policy:<restart|stop>`. A VM this host does not have is a `404
+/// vm-not-found` (vali carries the policy on the VM's next launch).
+pub async fn handle_power_policy(
+    lifecycle: &CvmLifecycle,
+    order: PowerPolicyOrder,
+) -> std::result::Result<String, OrderRejection> {
+    match lifecycle
+        .set_power_policy(&order.vm_id, order.on_guest_poweroff)
+        .await
+    {
+        Ok(()) => Ok(format!("power-policy:{}", order.on_guest_poweroff.as_str())),
+        Err(MinerAgentError::VmNotFound) => {
+            Err(OrderRejection::new(StatusCode::NOT_FOUND, "vm-not-found"))
+        }
         Err(err) => Err(reject_dispatch(&err, order.vm_id.as_str())),
     }
 }
@@ -1216,6 +1244,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         }
     }
 

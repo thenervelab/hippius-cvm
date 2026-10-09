@@ -8,6 +8,8 @@
 local cjson = require("cjson.safe")
 local docs = require("hippius_cdn.docs")
 local mime = require("hippius_cdn.mime")
+local rules = require("hippius_cdn.rules")
+local limits = require("hippius_cdn.limits")
 local settings = require("hippius_cdn.settings")
 local sigv4 = require("hippius_cdn.sigv4")
 local util = require("hippius_cdn.util")
@@ -101,6 +103,23 @@ function M.s3_credentials(zone_secrets)
     return { access_key_id = c.access_key_id, secret_access_key = secret, session_token = token }
 end
 
+-- One line per zone and ceiling a minute (per worker) while a zone is held
+-- at its ceiling.
+local limit_logged = {}
+
+-- Body bytes a request adds up before counting them (see body_filter).
+local ACCOUNT_BATCH = 65536
+
+function M.should_log_limit(zone_id, which, now)
+    local key = zone_id .. "\0" .. which
+    local last = limit_logged[key]
+    if last and now - last < 60 then
+        return false
+    end
+    limit_logged[key] = now
+    return true
+end
+
 -- One CRIT line per zone and reason a minute (per worker): a busy zone
 -- with broken credentials must not flood the journal.
 local CRED_LOG_EVERY = 60
@@ -183,6 +202,25 @@ function M.access()
     if zone.state == "paused" or not zone.serving then
         return refuse(503)
     end
+    -- The zone's ceilings (per node): over one, new requests get 503.
+    local lim = store.limits and store.limits[zone_id]
+    if lim then
+        local ok, which = limits.admit(ngx.shared.hippius_limits, zone_id, lim, ngx.time())
+        if not ok then
+            if M.should_log_limit(zone_id, which, ngx.now()) then
+                -- CRIT: this location logs nothing below (presigned URLs).
+                ngx.log(ngx.CRIT, "hippius-cdn: zone ", zone_id, " over its ", which, " ceiling: 503")
+            end
+            -- When to come back: the request window is one second, the
+            -- bandwidth one looks back two. A ceiling of 0 never clears;
+            -- no Retry-After then.
+            if lim[which] ~= 0 then
+                ngx.ctx.retry_after = which == "rps" and "1" or "2"
+            end
+            return refuse(503)
+        end
+    end
+    var.hippius_zone = zone_id
     local path = var.uri
     if not util.valid_path(path) then
         return refuse(400)
@@ -215,8 +253,89 @@ function M.access()
         return refuse(503)
     end
     var.hippius_origin_uri = origin_uri
-    var.hippius_cache_key = ngx.md5(util.cache_key_material(zone_id, store.purges[zone_id], path))
+    -- The zone's first matching cache rule, on the decoded path (none:
+    -- the defaults).
+    local decision = rules.decide(rules.match(store.rules and store.rules[zone_id], path))
+    if M.client_headers_bypass(zone.origin, var) then
+        decision.bypass, decision.skip_lookup = true, true
+    end
+    ctx.decision = decision
+    var.hippius_edge_ttl = rules.edge_header(decision)
+    if decision.skip_lookup then
+        var.hippius_cache_bypass = "1"
+    end
+    if decision.bypass then
+        var.hippius_no_store = "1"
+    end
+    var.hippius_cache_key = ngx.md5(util.cache_key_material(zone_id, store.purges[zone_id], path,
+        rules.query_key(decision.qs, var.args)))
     ctx.billable = true
+end
+
+-- Requests carrying Authorization or a cookie bypass the cache only for
+-- origins that receive client headers (contract C.4, amended). An S3 origin
+-- never sees one (the node presigns its own request), so its response
+-- cannot depend on one and such requests are cached like any other. The
+-- one place to change when an origin kind that forwards client headers
+-- arrives.
+function M.client_headers_bypass(origin, var)
+    if type(origin) == "table" and origin.type == "s3" then
+        return false
+    end
+    return var.http_authorization ~= nil or var.http_cookie ~= nil
+end
+
+-- The client's Cache-Control for a 2xx/304 under `decision` (nil: no
+-- rule), given the edge TTL the response was stored with (`stored_ttl`,
+-- nil when unknown), as the backend contract states it: the rule's
+-- browser_ttl when it sets a number; else `no-store` when the request
+-- skips the cache (bypass or edge_ttl 0) or the edge TTL in effect is 0
+-- (the origin forbade caching under "origin"); else the edge TTL in effect.
+function M.client_cache_control(decision, stored_ttl)
+    if decision and decision.browser then
+        return "public, max-age=" .. decision.browser
+    end
+    if decision and decision.skip_lookup then
+        return "no-store"
+    end
+    local max_age = stored_ttl or settings.default_ttl
+    if max_age == 0 then
+        return "no-store"
+    end
+    return "public, max-age=" .. max_age
+end
+
+-- Internal origin server (unix socket, behind the cache): the edge TTL
+-- the caching location stores the response for, as X-Accel-Expires, from
+-- the rule's decision sent in X-Hippius-Edge-TTL ("default", "origin" or
+-- seconds). The origin's own X-Accel-* never get here (hidden). Only
+-- 200/206/304: a 404 keeps proxy_cache_valid's minute, errors are never
+-- stored. X-Hippius-TTL repeats the figure for the client's Cache-Control;
+-- it is stored with the response and dropped before the client.
+function M.origin_ttl_header(edge, status, cache_control, expires, now)
+    if status ~= 200 and status ~= 206 and status ~= 304 then
+        return nil
+    end
+    local seconds
+    if edge == "origin" then
+        seconds = rules.origin_ttl(cache_control, expires, now)
+    else
+        seconds = tonumber(edge)
+        if seconds and (seconds < 0 or seconds > rules.MAX_TTL or seconds % 1 ~= 0) then
+            seconds = nil
+        end
+    end
+    return seconds or settings.default_ttl
+end
+
+function M.origin_header_filter()
+    local var = ngx.var
+    local ttl = M.origin_ttl_header(var.http_x_hippius_edge_ttl or "default", ngx.status,
+        var.upstream_http_cache_control, var.upstream_http_expires, ngx.time())
+    if ttl then
+        ngx.header["X-Accel-Expires"] = ttl
+        ngx.header["X-Hippius-TTL"] = ttl
+    end
 end
 
 -- Error bodies: an origin error (S3 XML naming the bucket, the key, the
@@ -268,6 +387,9 @@ function M.header_filter()
         return
     end
     local ctx = ngx.ctx
+    -- The edge TTL the internal origin server set (stored with a cached
+    -- response, so replayed on a HIT), read before the allowlist drops it.
+    local stored_ttl = tonumber(ngx.header["X-Hippius-TTL"])
     for _, name in ipairs(M.headers_to_drop(ngx.resp.get_headers(0, true), ctx.redirect)) do
         ngx.header[name] = nil
     end
@@ -283,7 +405,9 @@ function M.header_filter()
         ngx.header["Content-Range"] = nil
         ngx.header["Content-Length"] = 0
         ngx.header["Content-Type"] = mime.fallback(ngx.var.uri, nil)
-        ngx.header["Cache-Control"] = "public, max-age=" .. settings.default_ttl
+        local d = ctx.decision
+        ngx.header["Cache-Control"] = M.client_cache_control(d,
+            d and type(d.edge) == "number" and d.edge or nil)
         ctx.empty_body = true
         return
     end
@@ -298,6 +422,7 @@ function M.header_filter()
         ngx.header["Content-Encoding"] = nil
         ngx.header["Content-Type"] = "text/plain"
         ngx.header["Cache-Control"] = "no-store"
+        ngx.header["Retry-After"] = ctx.retry_after
         return
     end
     if ctx.redirect then
@@ -310,22 +435,41 @@ function M.header_filter()
     if M.on_fleet_domain(ngx.var.host, docs.get("config")) then
         ngx.header["Content-Security-Policy"] = mime.csp_for(ngx.header["Content-Type"])
     end
-    ngx.header["Cache-Control"] = "public, max-age=" .. settings.default_ttl
+    ngx.header["Cache-Control"] = M.client_cache_control(ctx.decision, stored_ttl)
 end
 
 function M.body_filter()
-    if ngx.ctx.empty_body then
+    local ctx = ngx.ctx
+    if ctx.empty_body then
         ngx.arg[1] = nil
+    elseif ctx.generic_body then
+        if ngx.arg[2] then
+            ngx.arg[1] = tostring(ngx.status) .. "\n"
+        else
+            ngx.arg[1] = nil
+        end
+    end
+    -- Bandwidth ceiling: every body byte sent, the main request's and each
+    -- slice subrequest's (the zone variable is shared with them; each has
+    -- its own ctx). Added up per request and counted every ACCOUNT_BATCH
+    -- bytes, at the second's end and at the last chunk (one shared-dict
+    -- write per batch, not per buffer).
+    local zone_id = ngx.var.hippius_zone
+    if zone_id == nil or zone_id == "" then
         return
     end
-    if not ngx.ctx.generic_body then
-        return
+    local now = ngx.time()
+    local pending = ctx.limit_pending or 0
+    if pending > 0 and ctx.limit_sec ~= now then
+        limits.account(ngx.shared.hippius_limits, zone_id, pending, ctx.limit_sec)
+        pending = 0
     end
-    if ngx.arg[2] then
-        ngx.arg[1] = tostring(ngx.status) .. "\n"
-    else
-        ngx.arg[1] = nil
+    pending = pending + #(ngx.arg[1] or "")
+    if pending >= ACCOUNT_BATCH or (ngx.arg[2] and pending > 0) then
+        limits.account(ngx.shared.hippius_limits, zone_id, pending, now)
+        pending = 0
     end
+    ctx.limit_pending, ctx.limit_sec = pending, now
 end
 
 return M

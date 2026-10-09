@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:3aa58cf98894708af95624f8136ee11c7c70579b1a0e9a63878bcdab6a6e43b3"
+  digest: "sha256:b6c1bbf8a0ad9c42fdde31ffdf4addde92e0304d25aa4ebbe4e2579e8c2adc20"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "21c1d5e5f8d470d570fa7edb51c93697d3e6215d"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37667438751/attempts/1"
+    commitSha: "146fe5040b36044d9e08a6249e468ec3b5f81e38"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37933643963/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -118,6 +118,11 @@ scheduler:
   # wherever a host can hold it. Setting
   # a flavor here withdraws the larger sizes — a commercial decision.
   maxFlavor: ""
+  # The first miner-agent release tag (vYYYY.MM.DD[.N]) that knows the
+  # guest-poweroff policy (`on_guest_poweroff`). Empty = no miner qualifies:
+  # `stop` launches fail `no-miner-supports-power-policy`. Set it once that
+  # release is rolled out AND the v6 heartbeat (agent_version) is on.
+  powerPolicyMinAgentVersion: ""
   # Capacity v2 (`scheduler.capacity_config`). resourceAdmission "true"
   # (enable it after `vali_capacity_report --preflight` passes): v2 is
   # gate (a) — vCPU / RAM + per-VM overhead / VM count per flavor. "false"
@@ -803,7 +808,7 @@ syntheticMonitor:
 # carry a hundred pending security updates), and unattended-upgrades then
 # patches each VM's overlay upper, away from the measured golden.
 #
-# `enabled` — a monthly CronJob re-bakes ubuntu/debian/cs10/fedora from the
+# `enabled` — a monthly CronJob re-bakes ubuntu/debian/cs10/fedora/cdn-node from the
 #   currently blessed bakes' inputs WITH a package refresh (apt
 #   dist-upgrade / dnf upgrade; the stamp misses the stage-1 cache), ONE
 #   BAKE AT A TIME (concurrent bakes race on loop devices), then runs the
@@ -828,9 +833,10 @@ goldenRebake:
   e2e: "true"
   # Must exceed the in-process worst case so the e2e `finally` teardown
   # always runs before SIGKILL: one idle wait (3600) + 4 × (bake wait 3600
-  # + e2e budget 1800 + teardown 720) = 28080 s. A normal run is ~2-3 h
-  # (cold bake ~15 min with the upgrade, e2e ~15-25 min).
-  activeDeadlineSeconds: 28800
+  # + e2e budget 1800 + teardown 720) + the cdn-node bake (3600, no tenant
+  # e2e) = 31680 s. A normal run is ~2-3 h (cold bake ~15 min with the
+  # upgrade, e2e ~15-25 min).
+  activeDeadlineSeconds: 32400
   resources:
     requests:
       cpu: 50m
@@ -1203,7 +1209,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:869a2e6e8a36e19e8184d96167d99872011e0d8a731247859a88d8d219722fd6"
+    digest: "sha256:9b73229b1cfa3b6576d81158f30950e5977a546f0bdbc75418e1e1a53ec2b136"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1218,8 +1224,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "4f74b68186f48d95080b8168b127ed47b5cd0c49"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37766532511/attempts/1"
+      commitSha: "d2a9dc68f9278d3f1659d3351997420148ea7920"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37919812657/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the

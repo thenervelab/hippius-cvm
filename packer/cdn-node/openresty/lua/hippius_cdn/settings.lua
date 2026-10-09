@@ -9,6 +9,8 @@ local M = {
     -- Worker 0 re-checks (and rewrites if needed) the cache canary this
     -- often, in seconds.
     canary_interval = 10,
+    -- The baked GeoIP database (DB-IP Lite Country, MaxMind DB format).
+    geoip_db = "/opt/hippius-cdn/geoip/dbip-country-lite.mmdb",
     -- nginx's mime.types (Content-Type fallback by extension).
     mime_types = "/opt/openresty/nginx/conf/mime.types",
     -- Edge and browser lifetime of a 200/206, in seconds: nginx's

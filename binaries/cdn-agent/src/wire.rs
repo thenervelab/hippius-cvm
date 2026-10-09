@@ -382,6 +382,42 @@ pub struct UsageReport {
     pub geoip_db: String,
     pub zones: BTreeMap<String, BTreeMap<String, CounterSet>>,
     pub unattributed: CounterSet,
+    /// Node health, optional: a value the agent could not read is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheTotals>,
+}
+
+/// The data volume and the cache on it, in bytes. Each field is omitted
+/// when it could not be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_size_bytes: Option<u64>,
+}
+
+impl DiskUsage {
+    pub fn is_empty(&self) -> bool {
+        self.cache_used_bytes.is_none()
+            && self.cache_max_bytes.is_none()
+            && self.volume_used_bytes.is_none()
+            && self.volume_size_bytes.is_none()
+    }
+}
+
+/// Node-wide cache outcomes since the counter epoch began: HIT, STALE,
+/// UPDATING and REVALIDATED are hits; MISS, EXPIRED and BYPASS are misses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTotals {
+    pub hits: u64,
+    pub misses: u64,
 }
 
 // ── I4 (ACME) ────────────────────────────────────────────────────────
@@ -502,9 +538,31 @@ mod tests {
             geoip_db: "dbip-2026-10".into(),
             zones,
             unattributed: CounterSet::default(),
+            disk: None,
+            cache: None,
         };
         let bytes = serde_json::to_vec(&r).unwrap();
         let back: UsageReport = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, r);
+        // Without node stats the body has no `disk` / `cache` key at all (a
+        // report queued by an older agent still parses).
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("\"disk\"") && !text.contains("\"cache\""));
+        // A field that could not be read is omitted, the others are sent.
+        let mut r2 = r.clone();
+        r2.disk = Some(DiskUsage {
+            volume_used_bytes: Some(40),
+            volume_size_bytes: Some(100),
+            ..DiskUsage::default()
+        });
+        r2.cache = Some(CacheTotals { hits: 9, misses: 1 });
+        let v = serde_json::to_value(&r2).unwrap();
+        assert_eq!(
+            v["disk"],
+            serde_json::json!({"volume_used_bytes": 40, "volume_size_bytes": 100})
+        );
+        assert_eq!(v["cache"], serde_json::json!({"hits": 9, "misses": 1}));
+        let back: UsageReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r2);
     }
 }

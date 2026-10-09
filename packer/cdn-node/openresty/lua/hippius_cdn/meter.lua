@@ -5,6 +5,7 @@
 -- the agent's Unix datagram socket. The record format is the agent's
 -- RequestRecord (closed field set). A full queue drops and counts.
 local cjson = require("cjson.safe")
+local geoip = require("hippius_cdn.geoip")
 local settings = require("hippius_cdn.settings")
 local util = require("hippius_cdn.util")
 
@@ -69,7 +70,10 @@ function M.log()
         dropped = dropped + 1
         return
     end
-    local rec = cjson.encode(M.record(ngx.ctx, ngx.var, ngx.status))
+    local ctx = ngx.ctx
+    -- The node has its own public IP: $remote_addr is the client.
+    ctx.client_region = geoip.country(ngx.var.remote_addr)
+    local rec = cjson.encode(M.record(ctx, ngx.var, ngx.status))
     if rec and #rec <= 2048 then
         tail = tail + 1
         queue[tail] = rec

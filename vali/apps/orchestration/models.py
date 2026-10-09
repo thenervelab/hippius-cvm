@@ -468,6 +468,13 @@ class MigrationJob(models.Model):
     kind = models.CharField(
         max_length=16, choices=MigrationKind.choices, default=MigrationKind.MIGRATE
     )
+    #: Who opened a restore / failover: `operator` (the API), or `auto` (the
+    #: automatic failover worker, a later part).
+    trigger = models.CharField(max_length=16, default="operator", db_default="operator")
+    #: When vali saw a restore / failover pass its commit point (the restored
+    #: guest's key release at `new_gen`, `restore.h_verifying`); also set on a
+    #: job that failed after it (`restore._stamp_committed`).
+    committed_at = models.DateTimeField(null=True, blank=True)
     # The backup point restored from. Pins its chain against pruning while
     # the job is not terminal.
     restore_run = models.ForeignKey(

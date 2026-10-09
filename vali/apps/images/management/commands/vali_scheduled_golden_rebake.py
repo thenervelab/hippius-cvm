@@ -4,9 +4,9 @@
     python manage.py vali_scheduled_golden_rebake --report-only
 
 Re-bakes every golden image (`VALI_GOLDEN_REBAKE_IMAGES`, default
-ubuntu/debian/cs10/fedora) from its currently blessed bake's inputs WITH a
+ubuntu/debian/cs10/fedora/cdn-node) from its currently blessed bake's inputs WITH a
 package refresh, strictly one bake in flight at a time, optionally runs
-the synthetic full e2e on each new bake, and pushes the results plus the
+the synthetic full e2e on each new bake (not cdn-node), and pushes the results plus the
 freshness gauges to the Pushgateway. See `apps.images.rebake`.
 
 It NEVER blesses. Blessing stays a human step after the real-boot checks

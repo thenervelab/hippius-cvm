@@ -613,3 +613,44 @@ def test_concurrent_activations_leave_exactly_one_active() -> None:
     states = dict(CdnFleetKey.objects.values_list("version", "state"))
     assert states == {1: "retiring", 2: "active"}
     CdnFleetKey.objects.all().delete()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"change_id": None, "revision_seen": None, "insync_at": None},
+        {"change_id": None},
+        {},
+        {"change_id": ""},
+    ],
+    ids=["all-null", "change-id-null", "absent", "empty"],
+)
+def test_dns_released_without_a_route53_change(
+    root_client: APIClient,
+    fleet_fakes: Fleet,  # noqa: F811
+    body: dict,
+) -> None:
+    """A node that never had a record: the backend acks with `change_id:
+    null` (§B.2). Seen in prod as a 400 that left the node draining."""
+    node = _ready(fleet_fakes)
+    CdnNode.objects.filter(pk=node.pk).update(state=CdnNodeState.DRAINING)
+    resp = root_client.post(f"/v1/cdn/nodes/{node.node_id}/dns-released", body, format="json")
+    assert resp.status_code == 200, resp.content
+    node.refresh_from_db()
+    assert node.dns_released_at is not None and node.dns_release_change_id == ""
+
+
+@pytest.mark.parametrize("change_id", [7, True, ["/change/C1"], {"id": "x"}])
+def test_dns_released_refuses_a_non_string_change_id(
+    root_client: APIClient,
+    fleet_fakes: Fleet,  # noqa: F811
+    change_id: object,
+) -> None:
+    node = _ready(fleet_fakes)
+    CdnNode.objects.filter(pk=node.pk).update(state=CdnNodeState.DRAINING)
+    resp = root_client.post(
+        f"/v1/cdn/nodes/{node.node_id}/dns-released", {"change_id": change_id}, format="json"
+    )
+    assert resp.status_code == 400
+    node.refresh_from_db()
+    assert node.dns_released_at is None

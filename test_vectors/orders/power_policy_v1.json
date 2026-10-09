@@ -1,0 +1,44 @@
+{
+  "_comment": "guest-poweroff policy order vectors: ticket-validator encode-order output (body_hex) for each payload, all under the same order_id/target/issued_at. The miner-agent decodes body_hex into its real types, the edge-gateway signs and forwards it, vali's encoder must reproduce it. Drift = a wire change; do not update silently.",
+  "order_id": "pp-1",
+  "target_miner_id": "cc-test-miner",
+  "issued_at_unix": 1770000000,
+  "cases": [
+    {
+      "name": "power-policy-stop",
+      "kind": "power-policy",
+      "payload": {
+        "vm_id": "tenant-1",
+        "on_guest_poweroff": "stop"
+      },
+      "body_hex": "a6646b696e646c706f7765722d706f6c69637966646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164a265766d5f69646874656e616e742d31716f6e5f67756573745f706f7765726f66666473746f70686f726465725f69646470702d316e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572"
+    },
+    {
+      "name": "power-policy-restart",
+      "kind": "power-policy",
+      "payload": {
+        "vm_id": "tenant-1",
+        "on_guest_poweroff": "restart"
+      },
+      "body_hex": "a6646b696e646c706f7765722d706f6c69637966646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164a265766d5f69646874656e616e742d31716f6e5f67756573745f706f7765726f66666772657374617274686f726465725f69646470702d316e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572"
+    },
+    {
+      "name": "launch-stop",
+      "kind": "launch",
+      "payload": {
+        "vm_id": "tenant-1",
+        "ovmf_path": "/var/lib/hippius-miner/ovmf.fd",
+        "kernel_path": "/var/lib/hippius-miner/vmlinuz",
+        "initrd_path": "/var/lib/hippius-miner/initrd",
+        "cmdline": "console=hvc0",
+        "luks_disk_path": "/var/lib/hippius-miner/d.img",
+        "luks_disk_size_gb": 10,
+        "cpu_count": 2,
+        "memory_mb": 2048,
+        "cose_ticket": "ZmFrZS1jb3NlLXRpY2tldC1ieXRlcw==",
+        "on_guest_poweroff": "stop"
+      },
+      "body_hex": "a6646b696e64666c61756e636866646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164ab65766d5f69646874656e616e742d3167636d646c696e656c636f6e736f6c653d68766330696370755f636f756e7402696d656d6f72795f6d62190800696f766d665f70617468781e2f7661722f6c69622f686970706975732d6d696e65722f6f766d662e66646b636f73655f7469636b65745666616b652d636f73652d7469636b65742d62797465736b696e697472645f70617468781d2f7661722f6c69622f686970706975732d6d696e65722f696e697472646b6b65726e656c5f70617468781e2f7661722f6c69622f686970706975732d6d696e65722f766d6c696e757a6e6c756b735f6469736b5f70617468781c2f7661722f6c69622f686970706975732d6d696e65722f642e696d67716c756b735f6469736b5f73697a655f67620a716f6e5f67756573745f706f7765726f66666473746f70686f726465725f69646470702d316e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572"
+    }
+  ]
+}

@@ -36,6 +36,8 @@
 //! - `POST /v1/miner/order/restore`  — [`RestoreOrder`] (staged restore)
 //! - `POST /v1/miner/order/net-policy` — [`NetPolicyOrder`] (host-wide;
 //!   persisted, not applied yet)
+//! - `POST /v1/miner/order/power-policy` — [`PowerPolicyOrder`] (a VM's
+//!   guest-poweroff policy, applied in place)
 //! - `GET  /v1/miner/restore/{vm_id}/status` — staged-restore status
 //! - `GET  /v1/miner/vm/{vm_id}/domain-state` — read-only tenant-domain
 //!   liveness probe for the reboot-recovery reconcile loop (NOT a
@@ -77,8 +79,9 @@ pub use migration::{
 pub use types::{
     BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
     MigrateQuiesceOrder, MigrateSnapshotOrder, NetEndpoint, NetPolicyLocalAction, NetPolicyMode,
-    NetPolicyOrder, NetProto, NetSpec, Order, OrderBody, OrderKind, OrderSubject,
-    PreflightArtifact, RestoreOrder, SignedOrder, StopOrder, TenantPreflightOrder, ORDER_DOMAIN,
+    NetPolicyOrder, NetProto, NetSpec, OnGuestPoweroff, Order, OrderBody, OrderKind, OrderSubject,
+    PowerPolicyOrder, PreflightArtifact, RestoreOrder, SignedOrder, StopOrder,
+    TenantPreflightOrder, ORDER_DOMAIN,
 };
 
 /// Default TCP port the orders HTTP server binds (on the NetBird
@@ -336,6 +339,7 @@ pub fn build_orders_router(state: OrderState) -> Router {
             post(route_tenant_preflight),
         )
         .route("/v1/miner/order/net-policy", post(route_net_policy))
+        .route("/v1/miner/order/power-policy", post(route_power_policy))
         .route("/healthz", get(route_healthz))
         // Size cap BEFORE any decode — an oversize body never buffers.
         .layer(DefaultBodyLimit::max(MAX_ORDER_BODY))
@@ -530,6 +534,18 @@ async fn route_stop(State(st): State<OrderState>, body: Bytes) -> Response {
         body,
         OrderKind::Stop,
         |lifecycle, order: StopOrder| async move { handler::handle_stop(&lifecycle, order).await },
+    )
+    .await
+}
+
+async fn route_power_policy(State(st): State<OrderState>, body: Bytes) -> Response {
+    process_order(
+        st,
+        body,
+        OrderKind::PowerPolicy,
+        |lifecycle, order: PowerPolicyOrder| async move {
+            handler::handle_power_policy(&lifecycle, order).await
+        },
     )
     .await
 }
@@ -732,7 +748,10 @@ async fn route_migration_status(
 /// the signed-order POST handlers.
 ///
 /// `running: true` / `false` is a DEFINITE libvirt answer (live /
-/// down). A libvirt-unreachable host cannot honestly answer either
+/// down). A down VM the agent left stopped after its guest powered off
+/// (guest-poweroff policy `stop`) also carries `"stop_reason":
+/// "guest-poweroff"`, so vali settles it `stopped` instead of relaunching
+/// it; vali honours that only for a VM whose policy it set to `stop`. A libvirt-unreachable host cannot honestly answer either
 /// way, so it is surfaced as `503` rather than folded into `false` —
 /// an untrusted miner reporting "down" when it merely can't tell would
 /// let it dodge a reboot-recovery relaunch it should actually receive.
@@ -751,7 +770,11 @@ async fn route_domain_state(State(st): State<OrderState>, Path(vm_id): Path<Stri
         crate::lifecycle::DomainLiveness::Down => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            r#"{"running":false}"#,
+            if st.lifecycle.stopped_by_guest(&vm_id) {
+                r#"{"running":false,"stop_reason":"guest-poweroff"}"#
+            } else {
+                r#"{"running":false}"#
+            },
         )
             .into_response(),
         crate::lifecycle::DomainLiveness::Unknown => {

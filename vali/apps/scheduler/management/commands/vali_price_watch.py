@@ -223,6 +223,7 @@ class Command(BaseCommand):
                 family_load_by_node=fam,
                 max_family_per_node=service.cdn_family_cap(family),
                 **service.cdn_edge_arguments(family, intent.vm_id),
+                **service.group_arguments(intent.vm_id),
                 max_epoch_lag=service.max_epoch_lag(),
                 excluded=frozenset({intent.node_id}),
                 # Gate (f) — the suggestion is the ONLY region guard on this

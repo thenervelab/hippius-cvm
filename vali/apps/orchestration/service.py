@@ -481,6 +481,18 @@ def _reject_cdn_colocated_dest(vm: Vm, dest_node_id: str) -> None:
         raise StartError(reason, "cdn-no-local-edge")
 
 
+def _reject_group_colocated_dest(vm: Vm, dest_node_id: str) -> None:
+    """Refuse an EXPLICIT destination that already carries (or is about to
+    carry) another VM of `vm`'s placement group: anti-affinity is a hard
+    rule, and `decide_placement` never sees a destination the API / CLI
+    name."""
+    from apps.scheduler import service as sched
+
+    reason = sched.group_dest_reason(vm.tenant_id, vm.placement_group, vm.vm_id, dest_node_id)
+    if reason is not None:
+        raise StartError(reason, "placement-anti-affinity")
+
+
 def _reject_disk_full_dest(vm: Vm, dest_node_id: str) -> None:
     """Refuse an EXPLICIT §25 destination with no room for the VM's DATA
     disk, under `VALI_SCHEDULER_DISK_GATE=enforce` (record: logged and
@@ -606,6 +618,7 @@ def start_migration(
     _reject_zombie_quarantined_dest(dest_node_id)
     _reject_cordoned_dest(dest_node_id)
     _reject_cdn_colocated_dest(vm, dest_node_id)
+    _reject_group_colocated_dest(vm, dest_node_id)
     _reject_disk_full_dest(vm, dest_node_id)
     # §24/§25 GAP-3 — the EOL nonce is NOT (re-)minted for a migration.
     # For a COLD migration the source guest signs its `stopped{}` ack from
@@ -1335,6 +1348,7 @@ def enroll_departing_miner_migrations() -> int:
                 family_load_by_node=family,
                 max_family_per_node=sched.cdn_family_cap(placement.vm_family),
                 **sched.cdn_edge_arguments(placement.vm_family, vm.vm_id),
+                **sched.group_arguments(vm.vm_id),
                 max_epoch_lag=sched.max_epoch_lag(),
                 # Exclude the departing source AND every cross-generation
                 # candidate (a cross-gen dest fails the KBS release, §25).
@@ -1769,6 +1783,26 @@ def _reboot_recovery_step(vm: Vm, *, now: Any, cutoff: Any) -> bool:
 
     # running is False → the VM is DOWN on an alive miner.
     #
+    # (4a) A guest that powered ITSELF off under the tenant's `stop`
+    # guest-poweroff policy: the miner left it down on purpose. Record it
+    # stopped — never relaunch it. Honoured only for a VM whose tenant
+    # asked for `stop` (`settle_guest_poweroff` checks), so a miner saying
+    # so cannot keep a `restart` VM down.
+    # The reason is read only for such a VM, so every other VM costs no
+    # extra probe.
+    from . import power_policy
+
+    if vm.on_guest_poweroff == power_policy.STOP:
+        still_running, stop_reason = effects.poll_domain_state(vm)
+        if (
+            still_running is False
+            and stop_reason == power_policy.GUEST_POWEROFF
+            and power_policy.settle_guest_poweroff(vm)
+        ):
+            RebootRecovery.objects.filter(pk=rec.pk).update(
+                consecutive_down=0, consecutive_wedged=0
+            )
+            return False
     # (4b) SEEN-RUNNING gate — only recover a VM we have PREVIOUSLY observed
     # running. A VM that has been down for every poll (a stale/zombie
     # `Active` row, or a launch that never came up) is NOT resurrected here
@@ -2970,6 +3004,9 @@ def _reboot_recovery_relaunch(
                     # The ticket binds the host it names. A §25-moved VM's
                     # recorded launch may have pinned its FIRST miner.
                     "platform_id": miner.platform_id,
+                    # The tenant's CURRENT guest-poweroff choice, not the
+                    # one it launched with.
+                    "on_guest_poweroff": vm.on_guest_poweroff,
                     # A resize: the new vCPU/RAM, the SAME data disk.
                     **(
                         {"flavor": flavor, "data_disk_size_gb": launch_record.data_disk_gb(job)}
@@ -3288,6 +3325,15 @@ def tick_once() -> TickReport:
         reboot_recovery_relaunches = reboot_recovery_once()
     except Exception:  # noqa: BLE001 — the recovery scan must not break the tick.
         log.exception("reboot-recovery: unhandled error in scan")
+    # Guest-poweroff policy — re-send it to every running VM whose host has
+    # not acknowledged what the tenant asked for (a failed PATCH dispatch, a
+    # §25 move, an agent back on a version that knows it).
+    try:
+        from apps.orchestration import power_policy
+
+        power_policy.reconcile_once(max_dispatches=5)
+    except Exception:  # noqa: BLE001 — the reconcile must not break the tick.
+        log.exception("power-policy: unhandled error in reconcile")
     relaunch_disks_missing = 0
     try:
         relaunch_disks_missing = sweep_relaunch_disks_missing()

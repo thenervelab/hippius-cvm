@@ -104,6 +104,7 @@ KBS_T4_REASONS: dict[str, str] = {
 M_REPORT_TS = "hippius_guest_report_timestamp_seconds"
 M_KBS_AUDIT_LAG = "hippius_kbs_audit_lag_records"
 M_KBS_AUDIT_CHECKED = "hippius_kbs_audit_checked_timestamp_seconds"
+M_BOOT_INFERRED = "hippius_vm_boot_running_inferred_24h"
 
 #: How far back the T4 detectors look.
 T4_WINDOW_S = 24 * 3600
@@ -460,5 +461,13 @@ def report_metrics() -> metrics.MetricSet:
     _behind(ms)
     _t4(ms, time.time())
     _kbs_audit(ms)
+    ms.gauge(
+        M_BOOT_INFERRED,
+        Vm.objects.filter(boot_phase_inferred_at__gte=now - timedelta(hours=24)).count(),
+        help_text=(
+            "VMs whose boot_phase `running` was inferred from a live attestation in the "
+            "last 24 h: no served receipt set it."
+        ),
+    )
     ms.gauge(M_REPORT_TS, metrics.now(), help_text="Unix ts of the last guest upgrade report.")
     return ms

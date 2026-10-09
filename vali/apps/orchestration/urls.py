@@ -30,6 +30,7 @@ from .views import (
     MigrateCancelView,
     MigrateJobView,
     MigrateStartView,
+    VmPowerPolicyView,
     VmRebootView,
     VmStartView,
     VmStopView,
@@ -110,6 +111,10 @@ urlpatterns = [
     path("vm/<str:vm_id>/stop", VmStopView.as_view(), name="vm_stop"),
     path("vm/<str:vm_id>/start", VmStartView.as_view(), name="vm_start"),
     path("vm/<str:vm_id>/reboot", VmRebootView.as_view(), name="vm_reboot"),
+    # The guest-poweroff policy (`power_policy.py`) — applied in place.
+    path(
+        "vm/<str:vm_id>/power-policy", VmPowerPolicyView.as_view(), name="vm_power_policy"
+    ),
     # Resize (`resize.py`) — root-only. `resize/flavors` is listed before
     # `resize/<job_id>` so it can never be read as a job id.
     path(

@@ -31,6 +31,16 @@
 //! §20-safe; the bytes the miner sees during the initial vsock push
 //! are the same bytes we re-push here.
 //!
+//! ## Guest poweroff
+//!
+//! A VM whose guest-poweroff policy is `stop`
+//! ([`crate::lifecycle::power_policy`]) is NOT restarted when its booted
+//! guest powers itself off: the watcher leaves it stopped and marks it so
+//! the `domain-state` probe tells vali. The cause comes from QEMU's QMP
+//! `SHUTDOWN` event, read on a second stream (`virsh qemu-monitor-event`)
+//! this module also owns; everything else (a crash, a reboot, a panic, a
+//! missing event) is restarted as before.
+//!
 //! ## Lifecycle
 //!
 //! The watcher is spawned at miner-agent startup (`serve --` boot) and
@@ -48,8 +58,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
+use async_trait::async_trait;
+
 use crate::lifecycle::cvm_handle::VmId;
+use crate::lifecycle::power_policy::{self, PoweroffVerdict};
 use crate::lifecycle::{CvmLifecycle, TicketPushState};
+use crate::orders::OnGuestPoweroff;
 use crate::vsock::ticket_push::TicketPusher;
 
 /// Prefix every tenant domain name carries.
@@ -77,6 +91,14 @@ const RESTART_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// the watcher forever.
 const DOMSTATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DOMSTATE_POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a `stop`-policy VM's `Stopped` waits for the run's QMP
+/// `SHUTDOWN` event once the domain is shut off. QEMU emits it before
+/// libvirt kills the process, so it is normally already there; it travels
+/// on another `virsh` stream, though, and this covers the skew. A VM still
+/// without one is restarted (no evidence of a guest poweroff).
+const SHUTDOWN_EVIDENCE_GRACE: Duration = Duration::from_secs(3);
+const SHUTDOWN_EVIDENCE_POLL: Duration = Duration::from_millis(50);
 
 /// #294 — vsock push retry window. The libvirt `Started` event fires
 /// the instant QEMU returns from `qemu_init_main_loop`, well before
@@ -131,13 +153,26 @@ pub async fn run(
 ) {
     eprintln!("hippius-miner-agent: reboot-watcher: up");
     let history: Arc<Mutex<RestartHistory>> = Arc::new(Mutex::new(HashMap::new()));
+    let control: Arc<dyn DomainControl> = Arc::new(VirshControl);
+    let shutdown_events = tokio::spawn(run_shutdown_events(
+        Arc::clone(&lifecycle),
+        "virsh".into(),
+        cancel.clone(),
+    ));
     loop {
         if cancel.is_cancelled() {
             break;
         }
         match spawn_virsh_event() {
             Ok(child) => {
-                run_one(child, &lifecycle, &pusher, &migration, &history, &cancel).await;
+                let ctx = WatchCtx {
+                    lifecycle: &lifecycle,
+                    pusher: &pusher,
+                    migration: &migration,
+                    history: &history,
+                    control: control.as_ref(),
+                };
+                run_one(child, &ctx, &cancel).await;
             }
             Err(class) => {
                 eprintln!("hippius-miner-agent: reboot-watcher: spawn-failed:{class}");
@@ -148,20 +183,136 @@ pub async fn run(
             _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
         }
     }
+    let _ = shutdown_events.await;
     eprintln!("hippius-miner-agent: reboot-watcher: drained");
+}
+
+/// Wall-clock now in Unix µs — the clock QEMU stamps QMP events with.
+fn unix_now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// Everything one lifecycle event is handled with.
+struct WatchCtx<'a> {
+    lifecycle: &'a Arc<CvmLifecycle>,
+    pusher: &'a Arc<dyn TicketPusher>,
+    migration: &'a Arc<crate::orders::MigrationStore>,
+    history: &'a Arc<Mutex<RestartHistory>>,
+    control: &'a dyn DomainControl,
+}
+
+/// The two libvirt calls the `Stopped` path makes — a seam so tests can
+/// drive the real decision without a libvirtd.
+#[async_trait]
+trait DomainControl: Send + Sync {
+    /// `virsh domstate <name>`, trimmed.
+    async fn domstate(&self, name: &str) -> Result<String, &'static str>;
+    /// `virsh start <name>`.
+    async fn start(&self, name: &str) -> Result<(), &'static str>;
+}
+
+/// Production [`DomainControl`]: shells out to `virsh`.
+struct VirshControl;
+
+#[async_trait]
+impl DomainControl for VirshControl {
+    async fn domstate(&self, name: &str) -> Result<String, &'static str> {
+        virsh_domstate(name).await
+    }
+    async fn start(&self, name: &str) -> Result<(), &'static str> {
+        virsh_start(name).await
+    }
+}
+
+/// Feed every tenant domain's QMP `SHUTDOWN` events into the lifecycle's
+/// [`power_policy::GuestRuns`] until `cancel` fires, re-spawning
+/// `virsh qemu-monitor-event` like the lifecycle stream. While this
+/// stream is down a poweroff carries no evidence and is restarted.
+async fn run_shutdown_events(
+    lifecycle: Arc<CvmLifecycle>,
+    virsh: std::path::PathBuf,
+    cancel: CancellationToken,
+) {
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        match spawn_virsh_shutdown_events(&virsh) {
+            Ok(mut child) => match child.stdout.take() {
+                Some(stdout) => {
+                    let mut lines = BufReader::new(stdout).lines();
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                let _ = child.kill().await;
+                                return;
+                            }
+                            line = lines.next_line() => match line {
+                                Ok(Some(text)) => note_shutdown_line(&text, &lifecycle),
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                    }
+                    let _ = child.kill().await;
+                }
+                None => {
+                    eprintln!("hippius-miner-agent: reboot-watcher: qmp-events: no-stdout");
+                    let _ = child.kill().await;
+                }
+            },
+            Err(class) => {
+                eprintln!("hippius-miner-agent: reboot-watcher: qmp-events: spawn-failed:{class}");
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+        }
+    }
+}
+
+/// Record one `virsh qemu-monitor-event` line, if it is a tenant's
+/// `SHUTDOWN`.
+fn note_shutdown_line(line: &str, lifecycle: &CvmLifecycle) {
+    let Some(event) = power_policy::parse_shutdown_event(line) else {
+        return;
+    };
+    let cause = event.cause;
+    let Some(vm_id) = event
+        .domain
+        .strip_prefix(DOMAIN_PREFIX)
+        .and_then(|s| VmId::new(s).ok())
+    else {
+        return;
+    };
+    eprintln!(
+        "hippius-miner-agent: reboot-watcher: vm={} event=SHUTDOWN cause={cause:?}",
+        vm_id.as_str()
+    );
+    lifecycle
+        .guest_runs()
+        .note_shutdown(&vm_id, cause, event.at_us);
+}
+
+/// Subprocess `virsh qemu-monitor-event --event SHUTDOWN --loop`: every
+/// domain's QMP `SHUTDOWN`, payload verbatim. Registering for monitor
+/// events does not taint a domain.
+fn spawn_virsh_shutdown_events(virsh: &std::path::Path) -> Result<Child, &'static str> {
+    Command::new(virsh)
+        .args(["qemu-monitor-event", "--event", "SHUTDOWN", "--loop"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "spawn-virsh")
 }
 
 /// One `virsh event` lifetime — read lines until the child exits OR
 /// the cancel token fires (in which case we kill the child and
 /// return).
-async fn run_one(
-    mut child: Child,
-    lifecycle: &Arc<CvmLifecycle>,
-    pusher: &Arc<dyn TicketPusher>,
-    migration: &Arc<crate::orders::MigrationStore>,
-    history: &Arc<Mutex<RestartHistory>>,
-    cancel: &CancellationToken,
-) {
+async fn run_one(mut child: Child, ctx: &WatchCtx<'_>, cancel: &CancellationToken) {
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
@@ -179,9 +330,7 @@ async fn run_one(
             }
             line = lines.next_line() => {
                 match line {
-                    Ok(Some(text)) => {
-                        handle_event_line(&text, lifecycle, pusher, migration, history).await
-                    }
+                    Ok(Some(text)) => handle_event_line(&text, ctx).await,
                     Ok(None) => return, // child closed stdout
                     Err(_) => return,
                 }
@@ -198,13 +347,7 @@ async fn run_one(
 ///   under the SAME XML — same kernel/initrd/cmdline → same SNP
 ///   launch_digest → KBS releases the same KEK on the new
 ///   attestation. Rate-limited per-vm to absorb a crash-loop.
-async fn handle_event_line(
-    line: &str,
-    lifecycle: &Arc<CvmLifecycle>,
-    pusher: &Arc<dyn TicketPusher>,
-    migration: &Arc<crate::orders::MigrationStore>,
-    history: &Arc<Mutex<RestartHistory>>,
-) {
+async fn handle_event_line(line: &str, ctx: &WatchCtx<'_>) {
     let Some(parsed) = parse_lifecycle_event(line) else {
         return;
     };
@@ -216,8 +359,13 @@ async fn handle_event_line(
         return;
     };
     match parsed.event {
-        "Started" => handle_started(&vm_id, lifecycle, pusher).await,
-        "Stopped" => handle_stopped(&vm_id, parsed.domain, lifecycle, migration, history).await,
+        "Started" => {
+            // A new run: what was observed of the last one no longer
+            // describes this guest.
+            ctx.lifecycle.guest_runs().begin_run(&vm_id, unix_now_us());
+            handle_started(&vm_id, ctx.lifecycle, ctx.pusher).await
+        }
+        "Stopped" => handle_stopped(&vm_id, parsed.domain, ctx).await,
         _ => {}
     }
 }
@@ -399,13 +547,14 @@ async fn repush_ticket(
 /// per-vm rate limit. Bails if the vm_id isn't admitted by the
 /// lifecycle (foreign / already-destroyed domain), or if the rate
 /// limit window is full.
-async fn handle_stopped(
-    vm_id: &VmId,
-    domain_name: &str,
-    lifecycle: &Arc<CvmLifecycle>,
-    migration: &Arc<crate::orders::MigrationStore>,
-    history: &Arc<Mutex<RestartHistory>>,
-) {
+async fn handle_stopped(vm_id: &VmId, domain_name: &str, ctx: &WatchCtx<'_>) {
+    let WatchCtx {
+        lifecycle,
+        migration,
+        history,
+        control,
+        ..
+    } = *ctx;
     // §25 cold migration — a `migrate-quiesce` deliberately STOPS the
     // source domain so its encrypted volume is crash-consistent for the
     // snapshot, and the VM must then stay stopped (it is moving to the
@@ -440,6 +589,23 @@ async fn handle_stopped(
     if !lifecycle.restart_eligible(vm_id) {
         return;
     }
+    // The tenant's guest-poweroff policy. `restart` (or a record the agent
+    // cannot read — logged) takes the historic path below unchanged.
+    let policy = lifecycle.power_policy(vm_id).unwrap_or_else(|err| {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} power-policy unreadable ({err}) \
+             — treated as restart",
+            vm_id.as_str()
+        );
+        OnGuestPoweroff::Restart
+    });
+    if policy == OnGuestPoweroff::Stop {
+        if leave_stopped_after_guest_poweroff(vm_id, domain_name, lifecycle, control).await {
+            return;
+        }
+    } else {
+        lifecycle.guest_runs().take(vm_id);
+    }
     if !claim_restart_slot(vm_id, history) {
         eprintln!(
             "hippius-miner-agent: reboot-watcher: vm={} restart-rate-limited \
@@ -449,7 +615,7 @@ async fn handle_stopped(
         );
         return;
     }
-    if !wait_for_shut_off(domain_name).await {
+    if !wait_for_shut_off(domain_name, control).await {
         eprintln!(
             "hippius-miner-agent: reboot-watcher: vm={} domstate-poll-timeout",
             vm_id.as_str()
@@ -465,7 +631,7 @@ async fn handle_stopped(
         );
         return;
     }
-    match virsh_start(domain_name).await {
+    match control.start(domain_name).await {
         Ok(()) => {
             eprintln!(
                 "hippius-miner-agent: reboot-watcher: vm={} event=Stopped → virsh start ok",
@@ -477,6 +643,65 @@ async fn handle_stopped(
                 "hippius-miner-agent: reboot-watcher: vm={} virsh start failed: {class}",
                 vm_id.as_str()
             );
+        }
+    }
+}
+
+/// The `stop`-policy branch of a `Stopped` event. `true` when the VM is
+/// handled and must NOT be restarted: left stopped after a guest poweroff,
+/// or taken over meanwhile by an agent-initiated stop. `false` sends it
+/// down the restart path — any doubt about the cause is a restart.
+async fn leave_stopped_after_guest_poweroff(
+    vm_id: &VmId,
+    domain_name: &str,
+    lifecycle: &Arc<CvmLifecycle>,
+    control: &dyn DomainControl,
+) -> bool {
+    if !wait_for_shut_off(domain_name, control).await {
+        // The restart path waits again and gives up the same way.
+        return false;
+    }
+    let runs = lifecycle.guest_runs();
+    let deadline = Instant::now() + SHUTDOWN_EVIDENCE_GRACE;
+    while runs.first_shutdown(vm_id).is_none() && Instant::now() < deadline {
+        tokio::time::sleep(SHUTDOWN_EVIDENCE_POLL).await;
+    }
+    let evidence = runs.take(vm_id);
+    match power_policy::decide(OnGuestPoweroff::Stop, evidence) {
+        PoweroffVerdict::Restart(reason) => {
+            eprintln!(
+                "hippius-miner-agent: reboot-watcher: vm={} event=Stopped policy=stop \
+                 not a guest poweroff ({reason}) → restart",
+                vm_id.as_str()
+            );
+            false
+        }
+        PoweroffVerdict::StayStopped => {
+            if !lifecycle.restart_eligible(vm_id) {
+                // A stop / §24 destroy began meanwhile and owns the domain.
+                return true;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            match lifecycle.settle_guest_poweroff(vm_id, now).await {
+                Ok(()) => {
+                    eprintln!(
+                        "hippius-miner-agent: reboot-watcher: vm={} event=Stopped policy=stop \
+                         guest poweroff → left stopped (stop_reason=guest-poweroff)",
+                        vm_id.as_str()
+                    );
+                    true
+                }
+                Err(err) => {
+                    eprintln!(
+                        "hippius-miner-agent: reboot-watcher: vm={} guest poweroff could not \
+                         be settled ({err}) → restart",
+                        vm_id.as_str()
+                    );
+                    false
+                }
+            }
         }
     }
 }
@@ -504,10 +729,10 @@ fn claim_restart_slot(vm_id: &VmId, history: &Arc<Mutex<RestartHistory>>) -> boo
 /// teardown returns `operation invalid`. Polling avoids both a
 /// fixed-sleep race (too short → invalid op; too long → slow user
 /// reboot) and the ad-hoc retry loop alternative.
-async fn wait_for_shut_off(domain_name: &str) -> bool {
+async fn wait_for_shut_off(domain_name: &str, control: &dyn DomainControl) -> bool {
     let deadline = Instant::now() + DOMSTATE_POLL_DEADLINE;
     while Instant::now() < deadline {
-        match virsh_domstate(domain_name).await {
+        match control.domstate(domain_name).await {
             Ok(state) => {
                 let trimmed = state.trim();
                 if trimmed == "shut off" {
@@ -766,6 +991,7 @@ mod tests {
             require_existing_disks: false,
             guardian_ep: None,
             net: None,
+            on_guest_poweroff: None,
         }
     }
 
@@ -1097,5 +1323,398 @@ mod tests {
             "same slot, now pending-create"
         );
         assert_eq!(lc.ticket_push_state(&vm_id, cid, &t), TicketPushState::Wait);
+    }
+
+    // ── Guest poweroff vs crash (guest-poweroff policy) ─────────────────
+    //
+    // These drive the REAL event path — `handle_event_line` on libvirt's
+    // `virsh event` lines and `note_shutdown_line` on `virsh
+    // qemu-monitor-event` lines, verbatim formats — against the real
+    // lifecycle, with only the two `virsh` calls of the `Stopped` path
+    // faked over the mock driver.
+
+    mod guest_poweroff {
+        use super::*;
+        use crate::lifecycle::{DomainId, DomainState, LibvirtDriver};
+        use crate::orders::OnGuestPoweroff;
+
+        /// `domstate` / `start` over the mock driver; records starts.
+        struct FakeVirsh {
+            driver: Arc<MockLibvirtDriver>,
+            starts: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl DomainControl for FakeVirsh {
+            async fn domstate(&self, name: &str) -> std::result::Result<String, &'static str> {
+                let id = DomainId::new(name).map_err(|_| "id")?;
+                match self.driver.query_domain_state(&id).await {
+                    Ok(DomainState::ShutOff) => Ok("shut off".into()),
+                    Ok(DomainState::Running) => Ok("running".into()),
+                    Ok(_) => Ok("other".into()),
+                    Err(_) => Err("non-zero"),
+                }
+            }
+            async fn start(&self, name: &str) -> std::result::Result<(), &'static str> {
+                self.starts.lock().unwrap().push(name.to_string());
+                self.driver
+                    .force_all_to_state(DomainState::Running)
+                    .map_err(|_| "start")
+            }
+        }
+
+        struct Rig {
+            lc: Arc<CvmLifecycle>,
+            driver: Arc<MockLibvirtDriver>,
+            virsh: FakeVirsh,
+            pusher: Arc<dyn TicketPusher>,
+            migration: Arc<crate::orders::MigrationStore>,
+            history: Arc<Mutex<RestartHistory>>,
+            _root: tempfile::TempDir,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+                    cbitpos: 51,
+                    reduced_phys_bits: 1,
+                });
+                let root = tempfile::tempdir().unwrap();
+                let driver = Arc::new(MockLibvirtDriver::new());
+                let lc = Arc::new(
+                    CvmLifecycle::new_with_poll(
+                        driver.clone(),
+                        Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+                        HostResources {
+                            total_cpus: 16,
+                            total_memory_mb: 65536,
+                            total_disk_gb: 0,
+                        },
+                        Duration::from_millis(1),
+                        5,
+                    )
+                    .skip_state_disk_provision_for_tests()
+                    .with_state_disk_root(root.path().to_path_buf()),
+                );
+                Self {
+                    lc,
+                    virsh: FakeVirsh {
+                        driver: driver.clone(),
+                        starts: Mutex::new(Vec::new()),
+                    },
+                    driver,
+                    pusher: Arc::new(ListenerPusher::default()),
+                    migration: Arc::new(crate::orders::MigrationStore::new()),
+                    history: Arc::new(Mutex::new(HashMap::new())),
+                    _root: root,
+                }
+            }
+
+            async fn launch(&self, vm: &str, policy: Option<OnGuestPoweroff>) -> VmId {
+                let mut o = order(vm);
+                o.on_guest_poweroff = policy;
+                let vm_id = self.lc.launch(o).await.unwrap();
+                self.event(&format!(
+                    "event 'lifecycle' for domain 'hippius-tenant-{vm}': Started Booted"
+                ))
+                .await;
+                vm_id
+            }
+
+            async fn event(&self, line: &str) {
+                let ctx = WatchCtx {
+                    lifecycle: &self.lc,
+                    pusher: &self.pusher,
+                    migration: &self.migration,
+                    history: &self.history,
+                    control: &self.virsh,
+                };
+                handle_event_line(line, &ctx).await;
+            }
+
+            /// A QMP `SHUTDOWN` line stamped now, as QEMU stamps it.
+            fn qmp(&self, vm: &str, payload: &str) {
+                self.qmp_at(vm, payload, unix_now_us());
+            }
+
+            fn qmp_at(&self, vm: &str, payload: &str, at_us: u64) {
+                note_shutdown_line(
+                    &format!(
+                        "event SHUTDOWN at {}.{:06} for domain 'hippius-tenant-{vm}': {payload}",
+                        at_us / 1_000_000,
+                        at_us % 1_000_000
+                    ),
+                    &self.lc,
+                );
+            }
+
+            /// The guest's userspace dialled the relay (what the vsock
+            /// listener records for a verified CID).
+            fn guest_up(&self, vm_id: &VmId) {
+                self.lc.guest_runs().note_guest_up(vm_id);
+            }
+
+            /// QEMU went away and libvirt reports it.
+            async fn stopped(&self, vm: &str, detail: &str) {
+                self.driver
+                    .force_all_to_state(DomainState::ShutOff)
+                    .unwrap();
+                self.event(&format!(
+                    "event 'lifecycle' for domain 'hippius-tenant-{vm}': Stopped {detail}"
+                ))
+                .await;
+            }
+
+            fn starts(&self) -> usize {
+                self.virsh.starts.lock().unwrap().len()
+            }
+        }
+
+        const POWEROFF: &str = r#"{"guest":true,"reason":"guest-shutdown"}"#;
+        const REBOOT: &str = r#"{"guest":true,"reason":"guest-reset"}"#;
+        const HOST_SIGNAL: &str = r#"{"guest":false,"reason":"host-signal"}"#;
+
+        #[tokio::test]
+        async fn a_stop_vm_whose_guest_powers_off_stays_stopped_and_says_so() {
+            let rig = Rig::new();
+            let vm = rig.launch("gp-1", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-1", POWEROFF);
+            // libvirt's own SIGTERM, answered by QEMU, comes second.
+            rig.qmp("gp-1", HOST_SIGNAL);
+            rig.stopped("gp-1", "Shutdown").await;
+
+            assert_eq!(
+                rig.starts(),
+                0,
+                "a guest poweroff in stop mode was restarted"
+            );
+            assert!(rig.lc.stopped_by_guest(&vm));
+            assert!(!rig.lc.restart_eligible(&vm), "the handle is released");
+            assert!(rig.lc.ticket_for_vm(&vm).is_none());
+            assert!(rig.lc.cid_allocator().cid_for_vm(&vm).unwrap().is_none());
+            assert_eq!(
+                rig.lc.tenant_domain_liveness(&vm).await,
+                crate::lifecycle::DomainLiveness::Down
+            );
+            // The policy itself survives (a start relaunches with it anyway).
+            assert_eq!(rig.lc.power_policy(&vm).unwrap(), OnGuestPoweroff::Stop);
+
+            // A start (vali relaunch) clears the mark.
+            let mut relaunch = order("gp-1");
+            relaunch.on_guest_poweroff = Some(OnGuestPoweroff::Stop);
+            rig.lc.launch(relaunch).await.unwrap();
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_crash_is_restarted_whatever_the_policy() {
+            // QEMU killed: no SHUTDOWN event at all, libvirt says Failed.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-2", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.stopped("gp-2", "Failed").await;
+            assert_eq!(rig.starts(), 1, "a crash must always be restarted");
+            assert!(!rig.lc.stopped_by_guest(&vm));
+            assert!(rig.lc.restart_eligible(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_host_signal_kill_is_restarted_in_stop_mode() {
+            let rig = Rig::new();
+            let vm = rig.launch("gp-3", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-3", HOST_SIGNAL);
+            rig.stopped("gp-3", "Shutdown").await;
+            assert_eq!(rig.starts(), 1);
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_guest_reboot_is_restarted_in_stop_mode() {
+            // SNP: a reboot terminates QEMU too, but its cause is guest-reset.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-4", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-4", REBOOT);
+            rig.qmp("gp-4", HOST_SIGNAL);
+            rig.stopped("gp-4", "Shutdown").await;
+            assert_eq!(rig.starts(), 1);
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn an_initramfs_fail_closed_poweroff_is_restarted_in_stop_mode() {
+            // The guest never reached userspace: a boot failure, retried.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-5", Some(OnGuestPoweroff::Stop)).await;
+            rig.qmp("gp-5", POWEROFF);
+            rig.stopped("gp-5", "Shutdown").await;
+            assert_eq!(rig.starts(), 1);
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_restart_vm_whose_guest_powers_off_is_restarted() {
+            let rig = Rig::new();
+            let vm = rig.launch("gp-6", None).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-6", POWEROFF);
+            rig.stopped("gp-6", "Shutdown").await;
+            assert_eq!(rig.starts(), 1);
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn the_evidence_of_one_run_does_not_leak_into_the_next() {
+            // Run 1 is a reboot (restarted). Run 2's guest powers off: the
+            // first SHUTDOWN of run 2 must decide, not run 1's guest-reset.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-7", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-7", REBOOT);
+            rig.stopped("gp-7", "Shutdown").await;
+            assert_eq!(rig.starts(), 1);
+            // Run 1's trailing host-signal SHUTDOWN read only now, after
+            // its Stopped was handled.
+            rig.qmp("gp-7", HOST_SIGNAL);
+            // The restart's own Started opens run 2 — userspace not up yet.
+            rig.event("event 'lifecycle' for domain 'hippius-tenant-gp-7': Started Booted")
+                .await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-7", POWEROFF);
+            rig.stopped("gp-7", "Shutdown").await;
+            assert_eq!(rig.starts(), 1, "run 2's poweroff was restarted");
+            assert!(rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_late_qmp_event_inside_the_grace_still_counts() {
+            // The QMP stream is a separate process: its line may land just
+            // after libvirt's Stopped.
+            let rig = Arc::new(Rig::new());
+            let vm = rig.launch("gp-8", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            let late = {
+                let rig = Arc::clone(&rig);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    rig.qmp("gp-8", POWEROFF);
+                })
+            };
+            rig.stopped("gp-8", "Shutdown").await;
+            late.await.unwrap();
+            assert_eq!(rig.starts(), 0);
+            assert!(rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_policy_change_in_place_is_read_by_the_next_poweroff() {
+            let rig = Rig::new();
+            let vm = rig.launch("gp-9", None).await;
+            rig.lc
+                .set_power_policy(&vm, OnGuestPoweroff::Stop)
+                .await
+                .unwrap();
+            rig.guest_up(&vm);
+            rig.qmp("gp-9", POWEROFF);
+            rig.stopped("gp-9", "Shutdown").await;
+            assert_eq!(rig.starts(), 0);
+            assert!(rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn the_policy_survives_an_agent_restart() {
+            // A SIGKILL swap: a new process, same state root, empty memory.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-10", Some(OnGuestPoweroff::Stop)).await;
+            let fresh = CvmLifecycle::new_with_poll(
+                Arc::new(MockLibvirtDriver::new()),
+                Arc::new(MockLaunchDigest::fixed([0u8; 48])),
+                HostResources {
+                    total_cpus: 16,
+                    total_memory_mb: 65536,
+                    total_disk_gb: 0,
+                },
+                Duration::from_millis(1),
+                5,
+            )
+            .with_state_disk_root(rig._root.path().to_path_buf());
+            assert_eq!(fresh.power_policy(&vm).unwrap(), OnGuestPoweroff::Stop);
+        }
+
+        #[tokio::test]
+        async fn an_agent_stop_in_flight_is_never_settled_or_restarted() {
+            // A stop / §24 destroy owns the domain: the watcher stays out.
+            let rig = Rig::new();
+            let vm = rig.launch("gp-11", Some(OnGuestPoweroff::Stop)).await;
+            rig.guest_up(&vm);
+            rig.qmp("gp-11", POWEROFF);
+            rig.lc.force_phase_for_tests(&vm, CvmPhase::Stopping);
+            rig.stopped("gp-11", "Shutdown").await;
+            assert_eq!(rig.starts(), 0);
+            assert!(!rig.lc.stopped_by_guest(&vm));
+        }
+
+        #[tokio::test]
+        async fn a_policy_change_needs_the_vm_on_this_host() {
+            let rig = Rig::new();
+            let ghost = VmId::new("gp-ghost").unwrap();
+            assert!(matches!(
+                rig.lc.set_power_policy(&ghost, OnGuestPoweroff::Stop).await,
+                Err(crate::error::MinerAgentError::VmNotFound)
+            ));
+            assert_eq!(
+                rig.lc.power_policy(&ghost).unwrap(),
+                OnGuestPoweroff::Restart
+            );
+        }
+
+        #[tokio::test]
+        async fn destroy_removes_the_policy() {
+            let rig = Rig::new();
+            let vm = rig.launch("gp-12", Some(OnGuestPoweroff::Stop)).await;
+            rig.lc.destroy(&vm, None).await.unwrap();
+            assert!(power_policy::load(rig._root.path(), &vm).unwrap().is_none());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn the_qmp_stream_reads_a_virsh_qemu_monitor_event_process() {
+            // The real spawn + line loop, against a stand-in `virsh` that
+            // prints what libvirt prints (and checks it was asked for the
+            // SHUTDOWN events of every domain).
+            use std::os::unix::fs::PermissionsExt;
+            let rig = Rig::new();
+            let vm = rig.launch("gp-13", Some(OnGuestPoweroff::Stop)).await;
+            let dir = tempfile::tempdir().unwrap();
+            let virsh = dir.path().join("virsh");
+            std::fs::write(
+                &virsh,
+                r#"#!/bin/sh
+[ "$*" = "qemu-monitor-event --event SHUTDOWN --loop" ] || exit 3
+printf "event SHUTDOWN at %s.000000 for domain 'hippius-tenant-gp-13': {\"guest\":true,\"reason\":\"guest-shutdown\"}\n" "$(( $(date +%s) + 1 ))"
+exec sleep 30
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&virsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(run_shutdown_events(
+                Arc::clone(&rig.lc),
+                virsh,
+                cancel.clone(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while rig.lc.guest_runs().first_shutdown(&vm).is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            cancel.cancel();
+            task.await.unwrap();
+            assert_eq!(
+                rig.lc.guest_runs().first_shutdown(&vm),
+                Some(power_policy::ShutdownCause::GuestPoweroff)
+            );
+        }
     }
 }

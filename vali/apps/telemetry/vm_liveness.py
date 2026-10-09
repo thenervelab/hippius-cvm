@@ -801,7 +801,101 @@ def ingest_live_attestation(*, envelope: bytes) -> tuple[VmLiveAttestation, bool
     from apps.lifecycle import guest_liveness
 
     guest_liveness.record_signal(row.vm_id, guest_liveness.SIGNAL_LIVE_ATTESTATION)
+    try:
+        _infer_running(row, superseded=verdict.verdict == guest_resources.VERDICT_SUPERSEDED)
+    except Exception:  # noqa: BLE001 — display-only, never break ingest.
+        log.warning("boot-phase inference failed for vm=%s", row.vm_id, exc_info=True)
     return row, True
+
+
+def _current_launch_measurement(vm_id: str) -> str:
+    """The measurement of `vm_id`'s current launch: its newest pin the miner
+    accepted, else (a launch not yet stamped) its newest pin."""
+    from apps.orchestration.models import MeasurementLedger
+
+    rows = MeasurementLedger.objects.filter(vm_id=vm_id)
+    row = (
+        rows.filter(launched_at__isnull=False).order_by("-launched_at").first()
+        or rows.order_by("-pinned_at").first()
+    )
+    return row.launch_digest_hex.lower() if row is not None else ""
+
+
+def _chip_is_current_host(vm, chip_id_hex: str) -> bool:
+    """The attested chip is the VM's current host's (`platform_id`; a Turin
+    id is the 8-byte prefix of the zero-padded 64-byte `chip_id`). An
+    absent chip in the body (an older image) does not refuse."""
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.effects import _bound_miner_id
+
+    if not chip_id_hex:
+        return True
+    miner_id = _bound_miner_id(vm)
+    platform = (
+        MinerIdentity.objects.filter(miner_id=miner_id)
+        .values_list("platform_id", flat=True)
+        .first()
+        if miner_id
+        else ""
+    ) or ""
+    platform = platform.lower()
+    return bool(platform) and chip_id_hex.lower().startswith(platform)
+
+
+def _infer_running(row: VmLiveAttestation, *, superseded: bool) -> bool:
+    """Advance the VM's `boot_phase` to `running` from a live attestation.
+
+    `running` otherwise comes only from a served receipt
+    (`service._advance_tenant_vm_boot_progress`): the miner-agent reports
+    `booting` and `kek-released`, never `running`. A guest whose receipts do
+    not land (a receipt refused at ingest, a pusher that never connects)
+    therefore sat at `kek_released` while it attested — ~7 % of launches,
+    destroyed by the backend's boot timeout.
+
+    A live attestation is a KBS-verified SNP report minted from the guest's
+    USERSPACE keepalive: the guest is past its initramfs and running. But
+    only for the guest of the VM's CURRENT launch on its CURRENT host:
+    - the sample is not `superseded` (an earlier launch still attesting),
+      and its measurement is the current launch's;
+    - its chip is the current host's (a §25 source still attesting after
+      the destination took over never speaks for the destination);
+    - the VM is `Active` — never during a §25 move (`Migrating`: the fence
+      reset `boot_phase` for the destination's milestones, see
+      `orchestration.service._fence_vm`) nor during a decommission.
+    Monotonic like `Vm.advance_boot_phase`: only `""` / `booting` /
+    `kek_released` move, in one conditional UPDATE, so a concurrent fence
+    or a later phase is never overwritten. Returns True if it advanced."""
+    from apps.lifecycle.models import Vm, VmBootPhase, VmState
+
+    if superseded:
+        return False
+    vm = Vm.objects.filter(vm_id=row.vm_id).first()
+    if vm is None or vm.state != VmState.ACTIVE or vm.boot_phase == VmBootPhase.RUNNING:
+        return False
+    if row.measurement.lower() != _current_launch_measurement(vm.vm_id):
+        return False
+    if not _chip_is_current_host(vm, row.chip_id):
+        return False
+    now = timezone.now()
+    advanced = Vm.objects.filter(
+        pk=vm.pk,
+        state=VmState.ACTIVE,
+        host=vm.host,
+        boot_phase__in=("", VmBootPhase.BOOTING, VmBootPhase.KEK_RELEASED),
+    ).update(
+        boot_phase=VmBootPhase.RUNNING,
+        boot_phase_at=now,
+        boot_phase_inferred_at=now,
+        updated_at=now,
+    )
+    if advanced:
+        log.info(
+            "boot_phase running inferred from live attestation: vm=%s was=%s seq=%d",
+            vm.vm_id,
+            vm.boot_phase or "-",
+            row.attestation_seq,
+        )
+    return bool(advanced)
 
 
 # ─── the coverage meter ──────────────────────────────────────────────

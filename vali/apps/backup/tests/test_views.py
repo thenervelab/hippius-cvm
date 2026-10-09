@@ -76,7 +76,7 @@ def test_put_creates_then_updates_the_policy(root_client: APIClient) -> None:
     assert resp.status_code == 201, resp.content
     assert resp.json()["interval_s"] == 3600
     assert resp.json()["retention_days"] == 7
-    assert resp.json()["failover_mode"] == "auto"
+    assert resp.json()["failover_mode"] == "manual", "manual unless the customer opts in"
 
     resp = root_client.put(
         _policy_url(),

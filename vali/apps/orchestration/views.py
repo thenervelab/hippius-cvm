@@ -51,6 +51,8 @@ from .schemas import (
     MeasurementAuditSerializer,
     MigrateStartRequestSerializer,
     MigrationJobSerializer,
+    PowerPolicyRequestSerializer,
+    PowerPolicySerializer,
 )
 from .service import StartError
 
@@ -821,3 +823,67 @@ class VmRebootView(_PowerOpView):
     )
     def post(self, request: Request, vm_id: str) -> Response:
         return super().post(request, vm_id)
+
+
+class VmPowerPolicyView(APIView):
+    """`PATCH /v1/vm/<vm_id>/power-policy` — the guest-poweroff policy."""
+
+    object_scope = scoping.OPERATOR_ONLY
+    permission_classes = [IsAuthenticated, IsOrchestrationRoot]
+    http_method_names = ["patch", "options"]
+
+    @extend_schema(
+        summary="Set what happens when the guest powers itself off",
+        description=(
+            "Root-only. `on_guest_poweroff`: `restart` (start the VM again) or "
+            "`stop` (leave it stopped, `stop_reason` `guest-poweroff`). A crash "
+            "is restarted either way. Applied to the running instance through "
+            "its miner — no relaunch; a stopped VM gets it with its next start. "
+            "Until the miner acknowledges, the VM reads "
+            "`on_guest_poweroff_pending: true` (`awaiting-ack`) and the order is "
+            "re-sent.\n\n"
+            "`stop` on a miner whose agent does not support it is refused with "
+            "409 `power-policy-unsupported-on-host`."
+        ),
+        tags=["VM orchestration"],
+        parameters=[_VM_ID_PARAM],
+        request=PowerPolicyRequestSerializer,
+        responses={
+            200: PowerPolicySerializer,
+            400: OpenApiResponse(ErrorSerializer, "Malformed body (`wire`/`bad-field`)."),
+            403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
+            404: OpenApiResponse(ErrorSerializer, "VM not found."),
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "`power-policy-unsupported-on-host`, or the VM is not active.",
+            ),
+        },
+    )
+    def patch(self, request: Request, vm_id: str) -> Response:
+        from apps.orchestration import power_policy
+
+        body = request.data
+        if not isinstance(body, dict):
+            return _error(
+                status.HTTP_400_BAD_REQUEST, "request body must be a JSON object", "wire"
+            )
+        unknown = sorted(set(body) - {"on_guest_poweroff"})
+        if unknown:
+            return _error(
+                status.HTTP_400_BAD_REQUEST, f"unknown field(s): {', '.join(unknown)}", "wire"
+            )
+        try:
+            policy = power_policy.parse_policy(body.get("on_guest_poweroff"))
+        except ValueError as exc:
+            return _error(status.HTTP_400_BAD_REQUEST, str(exc), "bad-field")
+        try:
+            vm = Vm.objects.get(vm_id=vm_id)
+        except Vm.DoesNotExist:
+            return _error(status.HTTP_404_NOT_FOUND, "vm not found", "not-found")
+        try:
+            vm = power_policy.change(vm, policy)
+        except power_policy.PowerPolicyRefused as exc:
+            return _error(status.HTTP_409_CONFLICT, exc.detail, exc.reason)
+        return Response(
+            {"vm_id": vm.vm_id, **power_policy.view(vm)}, status=status.HTTP_200_OK
+        )

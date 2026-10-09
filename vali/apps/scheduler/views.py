@@ -219,6 +219,7 @@ class SchedulerPlaceView(APIView):
                 family_load_by_node=family_load,
                 max_family_per_node=service.cdn_family_cap(vm_family),
                 **service.cdn_edge_arguments(vm_family, vm_id),
+                **service.group_arguments(vm_id),
                 max_epoch_lag=service.max_epoch_lag(),
                 dispatchable=service.dispatchable_node_ids(),
                 # Gate (f) — the region the VM's launch asked for, if any.
@@ -991,6 +992,7 @@ def _replace(
             family_load_by_node=family_load,
             max_family_per_node=service.cdn_family_cap(failed.vm_family),
             **service.cdn_edge_arguments(failed.vm_family, vm.vm_id),
+            **service.group_arguments(vm.vm_id),
             max_epoch_lag=service.max_epoch_lag(),
             excluded=frozenset({failed.miner_node_id}),
             dispatchable=service.dispatchable_node_ids(),

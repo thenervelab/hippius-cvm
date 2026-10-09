@@ -37,6 +37,8 @@ http {
     lua_package_path "@LUA_DIR@/?.lua;@PREFIX@/lualib/?.lua;;";
     lua_package_cpath "@PREFIX@/lualib/?.so;;";
     lua_shared_dict hippius_docs @DOCS_DICT_SIZE@;
+    # Per-zone ceilings (limits.lua): one-second request and byte counters.
+    lua_shared_dict hippius_limits 32m;
     lua_socket_log_errors off;
 
     init_by_lua_block {
@@ -45,8 +47,23 @@ http {
             cache_dir = "@CACHE_DIR@",
             s3_region = "@S3_REGION@",
             mime_types = "@PREFIX@/nginx/conf/mime.types",
+            geoip_db = "@GEOIP_DB@",
         })
         require("hippius_cdn.mime").load(require("hippius_cdn.settings").mime_types)
+        -- Loaded in the master, shared copy-on-write by the workers. Without
+        -- it every client region is XX; requests are never affected.
+        do
+            local loaded, ok, info = pcall(require("hippius_cdn.geoip").load,
+                require("hippius_cdn.settings").geoip_db)
+            if not loaded then
+                ok, info = nil, ok
+            end
+            if ok then
+                ngx.log(ngx.WARN, "hippius-cdn: geoip database loaded: ", info)
+            else
+                ngx.log(ngx.ERR, "hippius-cdn: geoip database unavailable, every client region is XX: ", info)
+            end
+        end
         require("hippius_cdn.router")
         require("hippius_cdn.cert")
         require("hippius_cdn.control")
@@ -98,6 +115,61 @@ http {
     gzip_types text/plain text/css text/xml text/javascript application/javascript
                application/json application/xml application/rss+xml application/atom+xml
                application/wasm image/svg+xml application/manifest+json font/ttf font/otf;
+
+    # ── internal origin server ─────────────────────────────────────────
+    # The caching location's upstream for misses. It fetches the presigned
+    # S3 URL it is given and adds X-Accel-Expires, the edge TTL of the
+    # zone's cache rule (router.origin_header_filter). On a unix socket in
+    # /run/cdn (0750 openresty:hippius-cdn): only OpenResty and the agent
+    # can reach it, never the network.
+    upstream hippius_origin {
+        server unix:@ORIGIN_SOCKET@;
+        keepalive 64;
+    }
+
+    server {
+        # A full backlog on a unix socket fails connect() at once (a 502
+        # without a stale copy): room for bursts of misses.
+        listen unix:@ORIGIN_SOCKET@ backlog=4096;
+        location / {
+            # Upstream errors print the presigned URL: critical only.
+            error_log stderr crit;
+            proxy_method GET;
+            proxy_http_version 1.1;
+            proxy_pass_request_headers off;
+            proxy_pass_request_body off;
+            proxy_set_header Host $hippius_s3_host;
+            proxy_set_header Connection "";
+            proxy_set_header Range $http_range;
+            # Revalidation (proxy_cache_revalidate) of a stale entry.
+            proxy_set_header If-Modified-Since $http_if_modified_since;
+            proxy_set_header If-None-Match $http_if_none_match;
+
+            proxy_ssl_server_name on;
+            proxy_ssl_name $hippius_s3_host;
+            proxy_ssl_verify on;
+            proxy_ssl_verify_depth 4;
+            proxy_ssl_trusted_certificate @CA_BUNDLE@;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 30s;
+            proxy_intercept_errors off;
+            proxy_redirect off;
+            # The origin's own X-Accel-* neither steer this server nor reach
+            # the cache; ours are set in the header filter below.
+            proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate
+                                 X-Accel-Buffering X-Accel-Charset;
+            proxy_hide_header X-Accel-Redirect;
+            proxy_hide_header X-Accel-Expires;
+            proxy_hide_header X-Accel-Limit-Rate;
+            proxy_hide_header X-Accel-Buffering;
+            proxy_hide_header X-Accel-Charset;
+            proxy_hide_header X-Hippius-TTL;
+            header_filter_by_lua_block { require("hippius_cdn.router").origin_header_filter() }
+
+            proxy_pass $hippius_s3_scheme://$hippius_s3_host$request_uri;
+        }
+    }
 
     # ── control socket: the agent only ─────────────────────────────────
     server {
@@ -166,6 +238,16 @@ http {
             set $hippius_cache_key "";
             set $hippius_origin_uri "";
             set $hippius_origin_bytes 0;
+            # The zone's cache rule (router.access): the edge TTL for the
+            # internal origin server; "1" to skip the cache lookup (bypass,
+            # edge_ttl 0); "1" to store nothing (bypass; under edge_ttl 0 a
+            # 200/206 is not stored by its X-Accel-Expires, a 404 still is).
+            # The request's zone, shared with its slice subrequests (their
+            # bytes count against the zone's bandwidth ceiling too).
+            set $hippius_zone "";
+            set $hippius_edge_ttl "default";
+            set $hippius_cache_bypass "";
+            set $hippius_no_store "";
             access_by_lua_block { require("hippius_cdn.router").access() }
             header_filter_by_lua_block { require("hippius_cdn.router").header_filter() }
             body_filter_by_lua_block { require("hippius_cdn.router").body_filter() }
@@ -182,7 +264,8 @@ http {
             # with a generic body).
             proxy_cache_valid 200 206 1h;
             proxy_cache_valid 404 1m;
-            proxy_no_cache $hippius_no_cache;
+            proxy_no_cache $hippius_no_cache $hippius_no_store;
+            proxy_cache_bypass $hippius_cache_bypass;
             proxy_cache_revalidate on;
             proxy_cache_lock on;
             proxy_cache_lock_timeout 10s;
@@ -190,7 +273,10 @@ http {
             proxy_cache_background_update on;
             proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
 
-            # The origin request carries only what is set here.
+            # Misses go to the internal origin server (below), which fetches
+            # from S3 and states the edge TTL in X-Accel-Expires: the zone's
+            # cache rule, which proxy_cache_valid (no variables) cannot carry.
+            # The request carries only what is set here.
             proxy_method GET;
             proxy_http_version 1.1;
             proxy_pass_request_headers off;
@@ -198,29 +284,25 @@ http {
             proxy_set_header Host $hippius_s3_host;
             proxy_set_header Connection "";
             proxy_set_header Range $slice_range;
-
-            proxy_ssl_server_name on;
-            proxy_ssl_name $hippius_s3_host;
-            proxy_ssl_verify on;
-            proxy_ssl_verify_depth 4;
-            proxy_ssl_trusted_certificate @CA_BUNDLE@;
-            proxy_ssl_protocols TLSv1.2 TLSv1.3;
-            proxy_connect_timeout 5s;
-            proxy_read_timeout 30s;
+            proxy_set_header X-Hippius-Edge-TTL $hippius_edge_ttl;
+            proxy_connect_timeout 2s;
+            proxy_read_timeout 35s;
             proxy_intercept_errors off;
             proxy_redirect off;
 
             # Never let the origin steer nginx (internal redirects, rate,
-            # buffering, cache lifetime). The lifetime is the zone's alone:
-            # the S3 gateway marks every private object "private, no-store",
-            # which would turn the CDN into a pass-through. Set-Cookie never
-            # reaches a client (the router's header allowlist), so it does not
-            # make a response uncacheable either. Vary is ignored because the
-            # origin request carries no client header (proxy_pass_request_headers
-            # off): the origin's answer cannot depend on one, and honouring
-            # "Vary: *" or "Vary: Origin" would only stop or split caching.
-            # The client-facing Vary is gzip's own Accept-Encoding.
-            proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate
+            # buffering). The lifetime is the zone's alone: the S3 gateway
+            # marks every private object "private, no-store", which would
+            # turn the CDN into a pass-through; X-Accel-Expires is honoured
+            # because only the internal origin server sets it (it hides the
+            # origin's). Set-Cookie never reaches a client (the router's
+            # header allowlist), so it does not make a response uncacheable
+            # either. Vary is ignored because the origin request carries no
+            # client header (proxy_pass_request_headers off): the origin's
+            # answer cannot depend on one, and honouring "Vary: *" or
+            # "Vary: Origin" would only stop or split caching. The
+            # client-facing Vary is gzip's own Accept-Encoding.
+            proxy_ignore_headers X-Accel-Redirect X-Accel-Limit-Rate
                                  X-Accel-Buffering X-Accel-Charset
                                  Cache-Control Expires Set-Cookie Vary;
             proxy_hide_header X-Accel-Redirect;
@@ -236,7 +318,7 @@ http {
             proxy_hide_header Server;
             add_header X-Cache $upstream_cache_status always;
 
-            proxy_pass $hippius_s3_scheme://$hippius_s3_host$hippius_origin_uri;
+            proxy_pass http://hippius_origin$hippius_origin_uri;
         }
     }
 }

@@ -535,9 +535,15 @@ def build_launch_payload(
     data_disk_size_gb: int = 0,
     require_existing_disks: bool = False,
     net: dict[str, Any] | None = None,
+    on_guest_poweroff: str | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a ``launch`` order — mirrors the
     Rust ``LaunchOrder`` shape.
+
+    ``on_guest_poweroff`` (``"stop"``) asks the miner to leave the VM
+    stopped when its guest powers itself off. Carried only when set, and
+    only for a miner whose agent knows it (`power_policy.launch_field`): an
+    older agent refuses the whole order.
 
     ``require_existing_disks`` marks a RELAUNCH of a VM that already ran on
     this miner (reboot-recovery, power ``start``): the miner then refuses
@@ -594,6 +600,8 @@ def build_launch_payload(
     _add_guardian_ep(payload, cmdline)
     if net is not None:
         payload["net"] = net
+    if on_guest_poweroff is not None:
+        payload["on_guest_poweroff"] = on_guest_poweroff
     return payload
 
 

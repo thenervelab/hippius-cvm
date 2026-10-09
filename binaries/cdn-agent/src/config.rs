@@ -105,6 +105,7 @@ struct RawPaths {
     control_socket_uid: Option<u32>,
     metering_socket: Option<PathBuf>,
     geoip_version_file: Option<PathBuf>,
+    cache_conf: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +282,11 @@ pub struct PathsConfig {
     /// control socket's directory, which OpenResty writes).
     pub metering_socket: PathBuf,
     pub geoip_version_file: Option<PathBuf>,
+    /// OpenResty's generated `proxy_cache_path` include (`render.sh
+    /// cache-auto`): the cache's `max_size` as nginx applies it. Unset: the
+    /// agent computes it the same way from the volume and
+    /// `data_plane.cache_fill_percent`.
+    pub cache_conf: Option<PathBuf>,
 }
 
 /// What the agent tells OpenResty about the data plane.
@@ -520,6 +526,11 @@ fn resolve_paths(raw: &RawPaths) -> Result<PathsConfig> {
             .geoip_version_file
             .clone()
             .map(|p| require_abs(p, "geoip-version-file-relative"))
+            .transpose()?,
+        cache_conf: raw
+            .cache_conf
+            .clone()
+            .map(|p| require_abs(p, "cache-conf-relative"))
             .transpose()?,
     })
 }

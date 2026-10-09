@@ -257,7 +257,8 @@ standard bake is unchanged.
   - `X-Accel-*` headers from the origin are ignored and stripped.
   - A purge bumps a generation, and old objects age out.
   - Different query strings share one object, because the origin never
-    sees the query.
+    sees the query, unless a cache rule puts it in the key (see Cache
+    rules).
   - Hostnames of one zone share objects.
   - The lifetime is the zone's alone: 1 h for 200/206 and 1 min for 404
     (`settings.default_ttl` and `proxy_cache_valid`) until zone rules are
@@ -277,6 +278,95 @@ standard bake is unchanged.
   - An origin redirect (3xx other than 304) is not followed, never cached,
     and gets the same generic body as an error: S3's XML body names the
     bucket and endpoint.
+- **Cache rules.** A zone's `settings.rules`, with the semantics of the
+  backend contract (`cdn-contracts.md` in hippius-backend, C.4 "Rules",
+  final since #439; validated by `cdn/rules.py`).
+  - The first rule whose match matches wins, whole: no other rule applies,
+    and its unset actions take the defaults. Specific rules go first.
+  - The path matched is the decoded, normalised request path (`$uri`), the
+    form purges and the cache key use. Patterns arrive percent-encoded and
+    are decoded once. `path_prefix`: the path starts with it. `glob`: `*`
+    any run of characters within a segment, `?` one character other than
+    `/`, `**` any run across segments; without `/` it matches the last
+    segment (`*.jpg` matches `/a/b/c.jpg`), starting with `/` the whole
+    path (`/img/*.jpg` matches `/img/x.jpg`, not `/img/a/x.jpg`;
+    `/img/**.jpg` both). `extensions`: what follows the last `.` of the last
+    segment, case-insensitively. Globs and prefixes are case-sensitive.
+  - `edge_ttl` (seconds) is how long the edge keeps a 200/206; a 404 is
+    always cached a minute and errors are never stored. `0`: never stored,
+    every request goes to the origin (the cache is not read). `"origin"`
+    takes it from the origin's `Cache-Control` (`s-maxage`, `max-age`;
+    `no-store`, `no-cache` or `private` means not cached) or `Expires`,
+    else the default hour; the S3 gateway's blanket `private, no-store`
+    counts as no header.
+  - `bypass: true`: neither looked up nor stored (`proxy_cache_bypass` +
+    `proxy_no_cache`).
+  - Client `Cache-Control` on a 200/206: `public, max-age=<browser_ttl>`
+    when the rule sets a number; else `no-store` when the request skips the
+    cache (bypass, `edge_ttl: 0`) or the edge TTL in effect is 0; else
+    `public, max-age=<the edge TTL in effect>` (3600 without a rule).
+  - `query_string`: `"ignore"` (default), `"include"` or
+    `{"whitelist": [...]}` changes only the cache key: the raw query split
+    on `&`, each part at its first `=`, kept as sent, sorted by name then
+    value. It never reaches the origin: an S3 object does not depend on it,
+    and a client parameter on a presigned GET could select another version
+    or override response headers.
+  - `ignore_set_cookie` is a no-op: Set-Cookie never reaches a client and
+    never prevents caching.
+  - Requests carrying `Authorization` or a cookie are cached like any
+    other: an S3 origin never receives a client header from the node, so its
+    response cannot depend on one (as the contract states).
+  - A rule the node cannot use is ignored and logged once per config
+    version; the others still apply. Never a 5xx.
+  - Globs are matched bit-parallel (Shift-And with wildcards): one pass over
+    the path, the cost bounded by path length times pattern length whatever
+    either contains, so no glob and path can stall a worker.
+  - A zone's `glob` patterns total at most 2048 bytes (wire form as stored,
+    summed over its rules; the backend validates the same cap). Over it,
+    every glob rule of the zone is ignored (logged once per config version
+    and worker), its prefix and extensions rules still apply. The matching
+    work is per glob more than per byte, so the 50-rule maximum is what
+    bounds it: the worst zone within both (50 globs of 40 bytes, none
+    matching a 4 KiB path) costs about 10 ms a request.
+  - A rule applies to what is fetched after it arrives: an object already
+    cached keeps the edge TTL it was stored with (and its client max-age)
+    until it expires or is purged. `bypass` / `edge_ttl: 0` take effect at
+    once (the cache is not read). Purge the zone to apply a shorter TTL now.
+  - How the edge TTL is applied: `proxy_cache_valid` takes no variable, and
+    nginx reads a response's lifetime from its upstream headers before any
+    Lua phase. So the caching location's upstream is an internal server on
+    a unix socket (`/run/cdn/origin.sock`, reachable only by OpenResty and
+    the agent). It fetches the presigned S3 URL and adds `X-Accel-Expires`
+    (and `X-Hippius-TTL`, dropped before the client), computed from the
+    rule; the origin's own `X-Accel-*` and `X-Hippius-TTL` are hidden there.
+    Only misses take this local hop.
+- **Zone limits.** A zone's `settings.limits` (contract C.4 "Zone
+  settings"): `max_mbps` (bytes out, megabits per second; default 2000) and
+  `max_rps` (requests per second; default 20000), integers, 0 = no allowance
+  at all. Over a ceiling, a new request of the zone gets 503 (not billable);
+  responses already in flight finish.
+  - **Per node.** Each node applies the whole ceiling to the traffic it
+    serves itself, with no coordination: a zone served by N nodes can reach
+    up to N times its ceiling across the fleet.
+  - Counted in one-second windows in a shared dict (`hippius_limits`, all
+    workers): requests admitted, and body bytes as they are sent (main
+    request and slice subrequests alike, so a long download counts while it
+    runs; bytes before gzip). A request is refused when the current or the
+    previous second is over the bandwidth ceiling, or when it would be over
+    the request ceiling of the current second.
+  - The 503 is the generic body (`503`), `Cache-Control: no-store`, never
+    cached (refused before the cache), not billable, with `Retry-After: 1`
+    (requests) or `2` (bandwidth); none for a ceiling of 0.
+  - A new value through the feed applies to the next request: the ceilings
+    are read from the config document, no reload.
+  - Why Lua counters and not `limit_req` / `limit_rate`: `limit_req`'s rate
+    is fixed in nginx.conf (one rate per zone of the directive, so a
+    per-zone value from the feed would need a reload), and `limit_rate` is
+    per connection, never a zone's total. The cost is bounded: one
+    shared-dict read pair and one increment per request, one increment per
+    64 KiB of body.
+  - An unusable `limits` object falls back to the defaults (logged). A zone
+    held at a ceiling logs one CRIT line per ceiling a minute per worker.
 - **Response headers.** An allowlist: from the origin, a client sees only
   `Content-Type`, `Content-Length`, `Content-Range`, `Content-Encoding`,
   `Content-Language`, `Content-Disposition`, `ETag`, `Last-Modified` and
@@ -314,7 +404,7 @@ standard bake is unchanged.
   itself). `bytes_from_origin` (stats only) counts every slice
   fetched for the request (slice subrequests are logged and add theirs to
   the main record; a background cache update is not counted).
-  `client_region` is `XX` until the GeoIP database exists. Records are queued per worker and sent by a
+  `client_region` comes from the baked GeoIP database (see GeoIP below). Records are queued per worker and sent by a
   100 ms timer, because the log phase cannot use sockets.
 - **Health.** `/__hippius/health` returns 200 only when all of these hold:
   - the agent's `ready` is true;
@@ -325,6 +415,53 @@ standard bake is unchanged.
     and so is the recovery. The cached objects live in `<cache_dir>/objects`,
     because nginx's cache loader deletes every file in its tree that is
     not a cache entry, a minute after start.
+- **Cache usage.** The usage reports carry the cache's size
+  (`disk.cache_used_bytes`). nginx creates the cache tree 0700, so the
+  agent cannot measure it: `hippius-cdn-cache-usage.timer` runs `du` of
+  `<cache_dir>/objects` every 10 minutes as the OpenResty user, at idle
+  I/O priority, and writes the byte count to
+  `<cache_dir>/.hippius-cache-usage` (outside the cache tree, so the cache
+  loader leaves it alone). The cache maximum comes from the generated
+  include (`/run/cdn/cache.conf`).
+- **GeoIP.** `client_region` is the client's ISO 3166 alpha-2 country,
+  from `$remote_addr` (the node has its own public IP, so it is the client).
+  - The database is DB-IP Lite Country (MaxMind DB format), pinned by month
+    and sha256 in `geoip.env`. `fetch-geoip.sh` downloads it when the
+    tenant-baker image is built, from our mirror first and DB-IP second,
+    and checks either copy against the one pinned sha256; the installer stages it read-only
+    at `/opt/hippius-cdn/geoip/` with its `NOTICE`, and writes its version
+    (`dbip-country-lite-YYYY-MM-<sha8>`) for the agent's reports. Nothing is
+    downloaded on a node.
+  - `lua/hippius_cdn/geoip.lua` reads it (country only) through the LuaJIT
+    FFI; it is loaded once in `init_by_lua` and shared by the workers. A
+    lookup costs about 2 µs.
+  - Private, loopback, link-local and CGNAT addresses (the overlay
+    included), an address without an entry, a code that is not alpha-2 or is
+    `ZZ`, and any error all give `XX`. A missing or corrupt database logs
+    once at start and gives `XX` everywhere; no request ever fails on it.
+  - Refresh is a re-bake. The monthly bump, in order:
+    1. download `dbip-country-lite-YYYY-MM.mmdb.gz` from DB-IP;
+    2. `sha256sum` it;
+    3. upload it unchanged and public:
+       `aws s3 cp <file> s3://hippius-compute-images/geoip/ --acl public-read`.
+       Without `--acl public-read` the object is private: the mirror answers
+       403 to anonymous requests, and the build silently falls back to DB-IP
+       until DB-IP drops the month;
+    4. `curl` the mirror URL anonymously and check the sha256 again;
+    5. bump `geoip.env` (month, both URLs, sha256), merge, pin the rebuilt
+       tenant-baker image, re-bake cdn-node.
+
+    DB-IP serves only the current and the previous month; the mirror keeps
+    an older pin buildable.
+    `cdn-geoip-freshness.yml` (weekly) warns when the pin is more than a
+    month old or the mirror copy is unreachable.
+  - Memory safety: every read of the file goes through a bounds check, the
+    tree walk is bounded by the address length, data decoding by a depth
+    limit, metadata decoding by a value budget. The unit tests load 400
+    randomly corrupted databases through a verifying byte proxy and require
+    XX or a country for every lookup and zero reads outside the buffer.
+  - Attribution: IP Geolocation by DB-IP (https://db-ip.com), licensed
+    under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
 - **Other endpoints.** `/.well-known/acme-challenge/<token>` serves the
   feed's key authorisation for any host, over HTTP. `/.well-known/hippius-attestation`
   serves the agent's attestation document.
@@ -337,9 +474,6 @@ standard bake is unchanged.
   token to its hostname.
 - **Origin keepalive.** `proxy_pass` uses variables, so there is no
   upstream keepalive pool: each miss opens a new TLS connection to S3.
-- **Zone rules.** Signed URLs, CORS, per-zone headers and cache rules are
-  not enforced yet. The zone's `settings` are passed through but not acted
-  on.
+- **Zone rules.** Signed URLs, CORS and per-zone headers are not enforced
+  yet (cache rules are, see Cache rules above).
 - **Origin shield.** There is no origin shield; every miss goes to the origin.
-- **GeoIP.** There is no GeoIP database yet: `client_region` is always
-  `XX` (decision G.7).

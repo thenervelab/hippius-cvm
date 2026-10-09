@@ -135,6 +135,7 @@ fn order(vm_id: &str) -> LaunchOrder {
         require_existing_disks: false,
         guardian_ep: None,
         net: None,
+        on_guest_poweroff: None,
     }
 }
 

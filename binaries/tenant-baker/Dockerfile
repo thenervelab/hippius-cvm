@@ -208,6 +208,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 COPY packer/cdn-node/openresty/versions.env packer/cdn-node/openresty/build-openresty.sh /openresty/
 RUN BUILD_ROOT=/build /openresty/build-openresty.sh /out/openresty.tar.gz
+# The GeoIP database (DB-IP Lite Country, sha256-pinned in geoip.env). Its
+# own layer: a monthly bump does not rebuild OpenResty.
+COPY packer/cdn-node/openresty/geoip.env packer/cdn-node/openresty/fetch-geoip.sh /openresty/
+RUN /openresty/fetch-geoip.sh /out/geoip
 
 # ───────────────────────────────────────────────────────────────────
 # Stage 2 — runtime: the actual k8s Job image
@@ -402,6 +406,7 @@ RUN chmod 0755 /usr/sbin/hippius-cdn-agent
 COPY --from=openresty-builder /out/openresty.tar.gz /out/openresty.tar.gz.sha256 /usr/local/share/hippius/cdn-node/
 COPY packer/cdn-node/openresty/lua/ /usr/local/share/hippius/cdn-node/openresty-config/lua/
 COPY packer/cdn-node/openresty/nginx.conf.in packer/cdn-node/openresty/origin.conf packer/cdn-node/openresty/render.sh /usr/local/share/hippius/cdn-node/openresty-config/
+COPY --from=openresty-builder /out/geoip/ /usr/local/share/hippius/cdn-node/openresty-config/geoip/
 COPY scripts/cdn-node/ /usr/local/bin/cdn-node/
 
 WORKDIR /work

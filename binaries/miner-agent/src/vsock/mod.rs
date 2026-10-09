@@ -171,6 +171,7 @@ fn log_listener(event: &'static str, class: &'static str) {
 pub async fn run_vsock_listener(
     allocator: Arc<CidAllocator>,
     edge: Arc<EdgeClient>,
+    guest_runs: Arc<crate::lifecycle::power_policy::GuestRuns>,
     cancel: CancellationToken,
 ) {
     use tokio::task::JoinSet;
@@ -209,6 +210,12 @@ pub async fn run_vsock_listener(
                     }
                 };
                 let src_cid = addr.cid();
+                // Only a booted guest dials this port (the telemetry
+                // pusher, the keepalive) — never its initramfs. The
+                // guest-poweroff policy needs exactly that fact.
+                if let Ok(CidOwner::Verified(vm_id)) = allocator.owner_of(src_cid) {
+                    guest_runs.note_guest_up(&vm_id);
+                }
                 // Per-guest share first, so a guest at its cap never
                 // touches the global semaphore its neighbours rely on.
                 let guest_permit = match per_guest.try_acquire(src_cid) {

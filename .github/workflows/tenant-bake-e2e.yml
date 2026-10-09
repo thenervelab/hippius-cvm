@@ -365,6 +365,13 @@ jobs:
             echo "$u.service active"
           done
 
+          # The baked GeoIP database loads (client region for metering).
+          log="$(in_guest /usr/bin/journalctl --no-pager -o cat -u hippius-cdn-openresty.service 2>/dev/null)"
+          grep -q 'hippius-cdn: geoip database loaded: DBIP-Country-Lite' <<<"$log" \
+            || fail "OpenResty did not load the GeoIP database"
+          [ -s "$ROOT/opt/hippius-cdn/geoip/NOTICE" ] || fail "the GeoIP attribution is missing"
+          echo "GeoIP database loaded ($(cat "$ROOT/opt/hippius-cdn/geoip/version"))"
+
           # cdn-agent: credentials loaded, keys derived, state dir and
           # counter epoch set up; it then keeps retrying the (unreachable)
           # backend, so the unit stays active.

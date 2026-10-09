@@ -593,6 +593,47 @@ def test_a_rebake_keeps_the_bake_profile(make_golden_bake) -> None:
     assert rebake._queue(std, "std-rebake-1", "stamp-2").profile == "standard"
 
 
+def test_a_cdn_node_rebake_runs_without_the_tenant_e2e(make_golden_bake, settings) -> None:
+    """The e2e launches a tenant VM; a cdn-node image is not one."""
+    settings.VALI_CDN_BACKEND_URL = "https://api.hippius.com"
+    _bless_all(make_golden_bake)
+    bake = make_golden_bake(
+        bake_id="blessed-cdn-node",
+        vm_id="golden-cdn-node-dp",
+        s3_output_prefix="tenant/golden-cdn-node-dp/",
+        profile="cdn-node",
+        finished_at=timezone.now() - timedelta(days=30),
+    )
+    GoldenImage.objects.create(
+        image_name="cdn-node",
+        distro="debian",
+        bake_id=bake.bake_id,
+        blessed_at=timezone.now() - timedelta(days=29),
+        blessed_by="ops",
+        restricted_tenant="hippius-cdn",
+    )
+    calls: list[str] = []
+    outcome = rebake.run_rebake(
+        images=("ubuntu", "cdn-node"),
+        stamp=STAMP,
+        timing=_timing(FakeWorker()),
+        e2e=lambda image, bake_id: calls.append(image) or True,
+    )
+    assert calls == ["ubuntu"]
+    by_image = {r.image: r for r in outcome.results}
+    assert by_image["cdn-node"].bake_ok
+    assert by_image["cdn-node"].e2e_success is None
+    assert outcome.success
+    row = TenantBake.objects.get(vm_id=f"golden-cdn-node-rebake-{STAMP}")
+    assert row.profile == "cdn-node"
+    assert row.rebake_e2e_passed is None
+
+
+def test_cdn_node_is_rebaked_by_default(settings) -> None:
+    assert "cdn-node" in rebake.DEFAULT_IMAGES
+    assert "cdn-node" in settings.VALI_GOLDEN_REBAKE_IMAGES
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("backend", "queued"),

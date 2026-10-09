@@ -81,6 +81,13 @@ EOF
 
 write_release() { release_json "$@" >"$SB/remote/latest"; }
 
+# The release list (the default endpoint): pick the highest complete one.
+release_list() { printf '[%s]\n' "$(IFS=,; echo "$*")" >"$SB/remote/latest"; }
+incomplete_json() {
+    printf '{"tag_name": "%s", "published_at": "%s", "draft": false, "prerelease": false, "assets": [{"name": "SBOM.cdx.json", "updated_at": "%s", "browser_download_url": "https://github.test/dl/x/SBOM.cdx.json"}]}' "$1" "$2" "$2"
+}
+
+
 write_mocks() {
     # curl: serve $SB/remote/<basename of the URL> to -o.
     cat >"$SB/bin/curl" <<EOF
@@ -103,17 +110,30 @@ case "\$1" in
     echo "systemctl \$*" >>"$SB/forbidden"; exit 97 ;;
   show)
     case "\$3" in
-      MainPID) cat "$SB/sysd/pid" ;;
-      ActiveState) cat "$SB/sysd/state" ;;
+      MainPID)
+        if [ -f "$SB/crash-tag" ] && "$SB/hippius-miner-agent" --version | grep -qF "(\$(cat "$SB/crash-tag"))"; then
+          echo \$(( \$(cat "$SB/sysd/pid") + 1 )) >"$SB/sysd/pid"
+        fi
+        cat "$SB/sysd/pid" ;;
+      ActiveState)
+        if [ -f "$SB/flip-after" ]; then
+          n=\$(( \$(cat "$SB/flip-count" 2>/dev/null || echo 0) + 1 )); echo \$n >"$SB/flip-count"
+          if [ \$n -gt \$(cat "$SB/flip-after") ]; then echo 0 >"$SB/sysd/pid"; echo inactive >"$SB/sysd/state"; fi
+        fi
+        cat "$SB/sysd/state" ;;
       Restart) cat "$SB/sysd/restart" ;;
       ControlGroup) echo /system.slice/hippius-miner-agent.service ;;
+      ExecMainStartTimestamp) [ -f "$SB/sysd/started" ] && echo "@\$(cat "$SB/sysd/started")" ;;
     esac ;;
   kill)
     [ "\$2" = "--signal=SIGKILL" ] || { echo "systemctl \$*" >>"$SB/forbidden"; exit 97; }
     sha256sum "$SB/hippius-miner-agent" | cut -d' ' -f1 >>"$SB/kills"
-    if [ -f "$SB/no-relaunch" ]; then echo 0 >"$SB/sysd/pid"; echo activating >"$SB/sysd/state"; rm -f "$SB/no-relaunch"
+    if [ -f "$SB/clean-exit-tag" ] && "$SB/hippius-miner-agent" --version | grep -qF "(\$(cat "$SB/clean-exit-tag"))"; then echo 0 >"$SB/sysd/pid"; echo inactive >"$SB/sysd/state"
+    elif [ -f "$SB/stop-on-kill" ]; then echo 0 >"$SB/sysd/pid"; echo deactivating >"$SB/sysd/state"
+    elif [ -f "$SB/no-relaunch" ]; then echo 0 >"$SB/sysd/pid"; echo activating >"$SB/sysd/state"; rm -f "$SB/no-relaunch"
     else echo \$(( \$(cat "$SB/sysd/pid") + 1 )) >"$SB/sysd/pid"; echo active >"$SB/sysd/state"; fi ;;
   start)
+    if [ -f "$SB/clean-exit-tag" ] && "$SB/hippius-miner-agent" --version | grep -qF "(\$(cat "$SB/clean-exit-tag"))"; then echo 0 >"$SB/sysd/pid"; echo inactive >"$SB/sysd/state"; exit 0; fi
     echo \$(( \$(cat "$SB/sysd/pid") + 100 )) >"$SB/sysd/pid"; echo active >"$SB/sysd/state" ;;
   reset-failed) ;;
   *) echo "systemctl \$*" >>"$SB/forbidden"; exit 97 ;;
@@ -321,10 +341,45 @@ run_update
 check "interrupted swap: the run after that is clean (marker holds, nothing retried)" \
     bash -c "[ $RC = 0 ] && grep -q 'failed its health check here before' '$SB/journal' && [ \$(wc -l <'$SB/kills') = 1 ]"
 
+setup v2025.01.08 v2025.01.09 48; echo failed >"$SB/sysd/state"; echo 0 >"$SB/sysd/pid"
+fake_agent "$SB/hippius-miner-agent.bak" v2025.01.07; echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
+check "interrupted swap, agent FAILED (systemd gave up): rollback starts it on .bak, no kill" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.07)' && [ ! -e '$SB/kills' ] && grep -q 'systemctl start hippius-miner-agent' '$SB/calls' && [ ! -e '$SB/forbidden' ]"
+
 setup v2025.01.08 v2025.01.09 48; echo inactive >"$SB/sysd/state"; echo 0 >"$SB/sysd/pid"
 fake_agent "$SB/hippius-miner-agent.bak" v2025.01.07; echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
-check "interrupted swap with the agent down: rollback STARTS it (no kill), never stop/restart" \
-    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.07)' && [ ! -e '$SB/kills' ] && grep -q 'systemctl start hippius-miner-agent' '$SB/calls' && [ ! -e '$SB/forbidden' ]"
+check "interrupted swap, agent stopped by an operator: .bak restored, agent NOT started, no marker" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.07)' && [ ! -e '$SB/kills' ] && ! grep -q 'systemctl start' '$SB/calls' && [ ! -e '$SB/state/update-in-progress' ] && [ ! -e '$SB/state/.update-failed-v2025.01.09' ] && grep -q 'left stopped' '$SB/journal'"
+
+setup v2025.01.08 v2025.01.09 48; echo deactivating >"$SB/sysd/state"; echo 4242 >"$SB/sysd/pid"
+fake_agent "$SB/hippius-miner-agent.bak" v2025.01.07; echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
+check "interrupted swap, operator stop in progress (deactivating): agent NOT started, no kill" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.07)' && [ ! -e '$SB/kills' ] && ! grep -q 'systemctl start' '$SB/calls' && grep -q 'left stopped' '$SB/journal'"
+
+# Cut short after the swap worked (between installed-release and the
+# in-progress file, or during the health window): the new binary is on disk
+# AND running (started after it was installed) AND healthy => finish.
+setup v2025.01.09 v2025.01.09 48; fake_agent "$SB/hippius-miner-agent.bak" v2025.01.08
+touch -d '2 hours ago' "$SB/hippius-miner-agent"; date +%s >"$SB/sysd/started"
+echo v2025.01.09 >"$SB/state/update-in-progress"; echo v2025.01.09 >"$SB/state/installed-release"; run_update
+check "interrupted after a working swap: finished, no rollback, no kill, no marker" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)' && [ ! -e '$SB/kills' ] && [ ! -e '$SB/state/update-in-progress' ] && [ ! -e '$SB/state/.update-failed-v2025.01.09' ] && [ \"\$(cat '$SB/state/installed-release')\" = v2025.01.09 ] && grep -q 'update finished' '$SB/journal'"
+
+setup v2025.01.09 v2025.01.09 48; fake_agent "$SB/hippius-miner-agent.bak" v2025.01.08
+echo $(( $(date +%s) - 7200 )) >"$SB/sysd/started"
+echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
+check "interrupted before the kill (agent older than the binary on disk): rolled back" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ -f '$SB/state/.update-failed-v2025.01.09' ]"
+
+setup v2025.01.09 v2025.01.09 48; fake_agent "$SB/hippius-miner-agent.bak" v2025.01.08
+touch -d '2 hours ago' "$SB/hippius-miner-agent"; date +%s >"$SB/sysd/started"; echo v2025.01.09 >"$SB/bad-tag"
+echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
+check "interrupted, new binary running but unhealthy: rolled back" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ -f '$SB/state/.update-failed-v2025.01.09' ]"
+
+setup v2025.01.08 v2025.01.09 48; touch "$SB/stop-on-kill"; run_update
+check "operator stop in progress during the swap (deactivating): .bak restored, left alone, no marker" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && ! grep -q 'systemctl start' '$SB/calls' && [ ! -e '$SB/state/.update-failed-v2025.01.09' ] && [ ! -e '$SB/state/update-in-progress' ] && [ ! -e '$SB/forbidden' ]"
 
 setup v2025.01.08 v2025.01.09 48; printf '#!/bin/sh\nexit 1\n' >"$SB/bin/virsh"; run_update
 check "virsh cannot list domains: refused before the swap" bash -c "[ $RC = 1 ] && grep -q 'cannot list the running domains' '$SB/journal' && [ ! -e '$SB/kills' ]"
@@ -349,14 +404,76 @@ check "draft release ignored" bash -c "[ $RC = 0 ] && [ ! -e '$SB/kills' ]"
 
 setup v2025.01.08 v2025.01.09 48; printf 'aaaa-1\n' >"$SB/domains.after"
 sed -i "s|cat \"$SB/domains\"|if [ -f \"$SB/kills\" ]; then cat \"$SB/domains.after\"; else cat \"$SB/domains\"; fi|" "$SB/bin/virsh"; run_update
-check "a domain lost across the swap: ERROR, rolled back, marker" \
-    bash -c "grep -q 'ERROR: domain(s) running before the swap are no longer running: bbbb-2' '$SB/journal' && [ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ -f '$SB/state/.update-failed-v2025.01.09' ]"
+check "a domain lost across the swap: DOMAIN-LOSS warning only, update kept, one kill, no marker" \
+    bash -c "grep -q 'WARNING: DOMAIN-LOSS: .*no longer running: bbbb-2' '$SB/journal' && [ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)' && [ \$(wc -l <'$SB/kills') = 1 ] && [ ! -e '$SB/state/.update-failed-v2025.01.09' ]"
 
-# The release list (the default endpoint): pick the highest complete one.
-release_list() { printf '[%s]\n' "$(IFS=,; echo "$*")" >"$SB/remote/latest"; }
-incomplete_json() {
-    printf '{"tag_name": "%s", "published_at": "%s", "draft": false, "prerelease": false, "assets": [{"name": "SBOM.cdx.json", "updated_at": "%s", "browser_download_url": "https://github.test/dl/x/SBOM.cdx.json"}]}' "$1" "$2" "$2"
-}
+setup v2025.01.08 v2025.01.09 48
+sed -i "s|cat \"$SB/domains\"|if [ -f \"$SB/kills\" ]; then exit 1; else cat \"$SB/domains\"; fi|" "$SB/bin/virsh"; run_update
+check "virsh fails after the swap: warning only, update kept" \
+    bash -c "[ $RC = 0 ] && grep -q 'DOMAIN-LOSS: cannot list' '$SB/journal' && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)'"
+
+# An operator stops the agent after the preflight, before our kill: the
+# "inactive" it leaves is not ours, so it is never started.
+setup v2025.01.08 v2025.01.09 48; echo 1 >"$SB/flip-after"; run_update
+check "operator stop between preflight and kill: not killed, not started, .bak restored, no marker" \
+    bash -c "[ $RC = 1 ] && [ ! -e '$SB/kills' ] && ! grep -q 'systemctl start' '$SB/calls' && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ ! -e '$SB/state/.update-failed-v2025.01.09' ] && grep -q 'left stopped' '$SB/journal'"
+
+# ...or during the health window, after the agent came back from our kill.
+setup v2025.01.08 v2025.01.09 48; echo 3 >"$SB/flip-after"; run_update
+check "operator stop during the health window: rolled back on disk, NOT started, no marker" \
+    bash -c "[ $RC = 1 ] && [ \$(wc -l <'$SB/kills') = 1 ] && ! grep -q 'systemctl start' '$SB/calls' && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ ! -e '$SB/state/.update-failed-v2025.01.09' ] && grep -q 'left stopped' '$SB/journal'"
+
+setup v2025.01.08 v2025.01.09 48; echo v2025.01.09 >"$SB/bad-tag"; echo v2025.01.08 >"$SB/crash-tag"; run_update
+check "previous binary crash-loops after the rollback: ERROR, marker, in-progress KEPT for the next run" \
+    bash -c "[ $RC = 1 ] && grep -q 'ROLLBACK FAILED: the previous binary is not staying up' '$SB/journal' && [ -f '$SB/state/.update-failed-v2025.01.09' ] && [ -f '$SB/state/update-in-progress' ] && [ ! -e '$SB/forbidden' ]"
+
+setup v2025.01.09 v2025.01.09 48; echo v2025.01.09 >"$SB/state/update-in-progress"; run_update
+check "rollback with no .bak: ERROR and the failed marker" \
+    bash -c "[ $RC = 1 ] && grep -q 'no .*hippius-miner-agent.bak to roll back to' '$SB/journal' && [ -f '$SB/state/.update-failed-v2025.01.09' ]"
+
+# Selection: the newest ELIGIBLE tag, not just the newest.
+setup v2025.01.07 v2025.01.09 48
+release_list "$(release_json v2025.01.10 "$(iso_hours_ago 2)")" "$(release_json v2025.01.09 "$(iso_hours_ago 48)")"
+run_update
+check "selection: a too-young top tag does not hide an older eligible one" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)' && grep -q 'release v2025.01.10 has been complete for 2h' '$SB/journal'"
+
+setup v2025.01.07 v2025.01.09 48; touch "$SB/state/.update-failed-v2025.01.10"
+release_list "$(release_json v2025.01.10 "$(iso_hours_ago 48)")" "$(release_json v2025.01.09 "$(iso_hours_ago 48)")"
+run_update
+check "selection: a failed top tag does not hide an older eligible one" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)' && grep -q 'v2025.01.10 failed its health check here before' '$SB/journal'"
+
+setup v2025.01.09 v2025.01.09 48
+release_list "$(release_json v2025.01.10 "$(iso_hours_ago 2)")" "$(release_json v2025.01.09 "$(iso_hours_ago 48)")"
+run_update
+check "selection: eligible tags never go below the installed one" \
+    bash -c "[ $RC = 0 ] && grep -q 'up to date (v2025.01.09)' '$SB/journal' && [ ! -e '$SB/kills' ]"
+
+setup v2025.01.08 v2025.01.09 48; write_release v2025.01.09 2025-01-07T23:30:00Z
+run_update
+check "selection: a tag dated two days after its publication is passed over" \
+    bash -c "[ $RC = 0 ] && grep -q 'v2025.01.09 is dated after its publication' '$SB/journal' && [ ! -e '$SB/kills' ]"
+
+setup v2025.01.08 v2025.01.09 48; write_release v2025.01.09 2025-01-08T00:05:00Z
+run_update
+check "selection: a tag dated the day after its publication is accepted (+1 UTC day)" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)'"
+
+# The new binary exits 0 after the kill: Restart=on-failure would leave the
+# unit inactive. Within a run that is not an operator stop.
+setup v2025.01.08 v2025.01.09 48; echo v2025.01.09 >"$SB/clean-exit-tag"; run_update
+check "new binary exits 0: started once, still down => rolled back, agent ACTIVE on the previous binary, marker" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ \"\$(cat '$SB/sysd/state')\" = active ] && [ -f '$SB/state/.update-failed-v2025.01.09' ] && [ ! -e '$SB/state/update-in-progress' ] && [ ! -e '$SB/forbidden' ] && grep -q 'rolled back: hippius-miner-agent healthy again' '$SB/journal'"
+
+setup v2025.01.08 v2025.01.09 48; echo v2025.01.08 >"$SB/clean-exit-tag"; echo v2025.01.09 >"$SB/bad-tag"; run_update
+check "new binary unhealthy AND previous binary exits 0: ERROR, marker, in-progress kept for the next run" \
+    bash -c "[ $RC = 1 ] && grep -q 'ROLLBACK FAILED' '$SB/journal' && [ -f '$SB/state/.update-failed-v2025.01.09' ] && [ -f '$SB/state/update-in-progress' ] && [ ! -e '$SB/forbidden' ]"
+
+setup v2025.01.08 v2025.01.09 48; write_release v2025.01.09 2025-01-09T00:10:00Z
+run_update
+check "selection: a tag published on its own day is accepted" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)'"
 
 setup v2025.01.08 v2025.01.09 48
 release_list "$(incomplete_json v2025.01.10 "$(iso_hours_ago 30)")" "$(release_json v2025.01.09 "$(iso_hours_ago 48)")" "$(release_json v2025.01.07 "$(iso_hours_ago 90)")"

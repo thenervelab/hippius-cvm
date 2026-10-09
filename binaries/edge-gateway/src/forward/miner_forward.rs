@@ -205,6 +205,9 @@ pub enum OrderKind {
     /// it under a monotonic revision and answers
     /// `applied:<revision>:<sha256>`.
     NetPolicy,
+    /// A VM's guest-poweroff policy (`restart` | `stop`), applied by the
+    /// miner in place; it answers `power-policy:<policy>`.
+    PowerPolicy,
 }
 
 impl OrderKind {
@@ -226,6 +229,7 @@ impl OrderKind {
             OrderKind::Backup => "backup",
             OrderKind::Restore => "restore",
             OrderKind::NetPolicy => "net-policy",
+            OrderKind::PowerPolicy => "power-policy",
         }
     }
 
@@ -270,6 +274,8 @@ impl OrderKind {
             "migrate-snapshot" => Some(OrderKind::MigrateSnapshot),
             // vali's net-policy reconcile pushes each miner's policy here.
             "net-policy" => Some(OrderKind::NetPolicy),
+            // vali's `PATCH /v1/vm/<id>/power-policy` and its reconcile.
+            "power-policy" => Some(OrderKind::PowerPolicy),
             _ => None,
         }
     }
@@ -981,6 +987,12 @@ mod tests {
         // Must match the miner-agent's `/v1/miner/order/net-policy` route.
         assert_eq!(OrderKind::NetPolicy.route_segment(), "net-policy");
         assert_eq!(OrderKind::NetPolicy.max_order_body(), MAX_MINER_ORDER_BODY);
+        // Must match the miner-agent's `/v1/miner/order/power-policy` route.
+        assert_eq!(OrderKind::PowerPolicy.route_segment(), "power-policy");
+        assert_eq!(
+            OrderKind::PowerPolicy.max_order_body(),
+            MAX_MINER_ORDER_BODY
+        );
     }
 
     #[test]
@@ -997,6 +1009,7 @@ mod tests {
             // §25 snapshot with multipart part URLs.
             ("migrate-snapshot", OrderKind::MigrateSnapshot),
             ("net-policy", OrderKind::NetPolicy),
+            ("power-policy", OrderKind::PowerPolicy),
         ] {
             assert_eq!(OrderKind::from_header(text), Some(expected));
         }

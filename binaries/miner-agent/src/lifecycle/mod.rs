@@ -39,6 +39,7 @@ pub mod guardian;
 pub mod infra;
 pub mod launch_digest;
 pub mod libvirt_driver;
+pub mod power_policy;
 pub mod preflight;
 pub mod qemu_config;
 pub mod reboot_watcher;
@@ -253,6 +254,9 @@ pub struct CvmLifecycle {
     /// The net-policy launch latch ([`crate::netpolicy::apply`]). `None`
     /// ⇒ no gate (tests, and agents without the net-policy route).
     net_policy_gate: Option<Arc<crate::netpolicy::NetPolicyEnforcer>>,
+    /// What this process saw of each VM's current run — the evidence the
+    /// guest-poweroff policy decides on ([`power_policy::GuestRuns`]).
+    guest_runs: Arc<power_policy::GuestRuns>,
 }
 
 /// How long a preflight's ASID reservation holds without a launch.
@@ -362,6 +366,7 @@ impl CvmLifecycle {
             asids: Arc::new(crate::sev_asid::SysfsAsidSource::default()),
             asid_reservations: Mutex::new(HashMap::new()),
             net_policy_gate: None,
+            guest_runs: Arc::new(power_policy::GuestRuns::new()),
         }
     }
 
@@ -532,6 +537,97 @@ impl CvmLifecycle {
         Arc::clone(&self.cids)
     }
 
+    /// The per-run evidence the guest-poweroff policy decides on — fed by
+    /// the reboot-watcher (QMP `SHUTDOWN`, libvirt `Started`) and the
+    /// vsock relay (guest userspace up).
+    pub fn guest_runs(&self) -> Arc<power_policy::GuestRuns> {
+        Arc::clone(&self.guest_runs)
+    }
+
+    /// `vm_id`'s guest-poweroff policy (`restart` when it has none).
+    pub fn power_policy(&self, vm_id: &VmId) -> Result<crate::orders::OnGuestPoweroff> {
+        power_policy::policy(&self.state_disk_root, vm_id)
+    }
+
+    /// Change `vm_id`'s guest-poweroff policy in place (a `power-policy`
+    /// order). Only for a VM this host has: one the agent tracks, or
+    /// whose domain libvirt still defines. `VmNotFound` otherwise — the
+    /// next launch carries the policy anyway.
+    pub async fn set_power_policy(
+        &self,
+        vm_id: &VmId,
+        policy: crate::orders::OnGuestPoweroff,
+    ) -> Result<()> {
+        let tracked = self.lock_handles()?.contains_key(vm_id);
+        if !tracked {
+            match self.tenant_domain_defined(vm_id).await {
+                Some(true) => {}
+                Some(false) => return Err(MinerAgentError::VmNotFound),
+                None => return Err(MinerAgentError::LibvirtDriver("unreachable")),
+            }
+        }
+        power_policy::change(&self.state_disk_root, vm_id, policy)
+    }
+
+    /// Whether `vm_id` was left stopped after its guest powered off.
+    pub fn stopped_by_guest(&self, vm_id: &VmId) -> bool {
+        power_policy::stopped_by_guest(&self.state_disk_root, vm_id)
+    }
+
+    /// Leave `vm_id` stopped after its guest powered itself off (policy
+    /// `stop`, decided by the reboot-watcher): mark it on disk FIRST — the
+    /// mark is what tells vali the VM is stopped and not crashed — then
+    /// release it exactly as a clean [`Self::stop`] does (undefine,
+    /// handle, CID, re-adoption snapshot), so a later start is the same
+    /// relaunch as after an API stop.
+    ///
+    /// Refuses (and changes nothing) unless the VM is `Running` here and
+    /// libvirt reports its domain DOWN. On a failed mark the VM is handed
+    /// back `Running` and the error returned: the caller restarts it,
+    /// since a VM vali cannot see as stopped would be relaunched anyway.
+    pub async fn settle_guest_poweroff(&self, vm_id: &VmId, now_unix: u64) -> Result<()> {
+        let domain_id = {
+            let mut handles = self.lock_handles()?;
+            let handle = handles.get_mut(vm_id).ok_or(MinerAgentError::VmNotFound)?;
+            if handle.phase != CvmPhase::Running {
+                return Err(MinerAgentError::CvmBusy);
+            }
+            handle.phase = CvmPhase::Stopping;
+            handle.domain_id.clone()
+        };
+        let back_to_running = |err: MinerAgentError| {
+            if let Ok(mut handles) = self.lock_handles() {
+                if let Some(handle) = handles.get_mut(vm_id) {
+                    if handle.phase == CvmPhase::Stopping {
+                        handle.phase = CvmPhase::Running;
+                    }
+                }
+            }
+            err
+        };
+        if self.domain_liveness(&domain_id).await != DomainLiveness::Down {
+            return Err(back_to_running(MinerAgentError::CvmBusy));
+        }
+        power_policy::record_guest_poweroff(&self.state_disk_root, vm_id, now_unix)
+            .map_err(back_to_running)?;
+        self.cancel_ticket_push(vm_id);
+        if self.driver.undefine_domain(&domain_id).await.is_err() {
+            eprintln!(
+                "hippius-miner-agent: lifecycle: guest-poweroff: vm {vm_id} domain stayed \
+                 defined — libvirt record may need a manual `virsh undefine`"
+            );
+        }
+        if let Ok(mut handles) = self.lock_handles() {
+            if let Some(handle) = handles.get_mut(vm_id) {
+                handle.phase = CvmPhase::Stopped;
+            }
+            handles.remove(vm_id);
+        }
+        self.release_cid(vm_id);
+        adopt::forget(&self.state_disk_root, vm_id.as_str());
+        Ok(())
+    }
+
     /// Provision and launch a tenant CVM from `order`.
     ///
     /// The pre-flight launch digest is computed before any `virsh`
@@ -568,6 +664,7 @@ impl CvmLifecycle {
         // re-push it on every libvirt domain restart.
         let cose_ticket: Vec<u8> = order.cose_ticket.clone().into_vec();
         let require_existing_disks = order.require_existing_disks;
+        let on_guest_poweroff = order.on_guest_poweroff;
         // #312 — refuse the launch if the L1-minted ticket's `flavor`
         // disagrees with the dispatcher's `cpu_count`. The §22
         // allowlist would catch this at KBS release time anyway (vcpus
@@ -765,6 +862,18 @@ impl CvmLifecycle {
                     guardian: guardian_route,
                 },
             );
+        }
+
+        // The guest-poweroff policy this order carries, persisted before
+        // the domain can start (a guest that powers off at once is read
+        // against it). Refused rather than launched without it: a `stop`
+        // VM must never silently become a `restart` one.
+        if let Err(err) =
+            power_policy::apply_launch(&self.state_disk_root, &vm_id, on_guest_poweroff)
+        {
+            self.unreserve_handle(&vm_id);
+            self.release_cid(&vm_id);
+            return Err(err);
         }
 
         // Pre-flight launch digest — computed BEFORE any virsh call.
@@ -1367,6 +1476,15 @@ impl CvmLifecycle {
             if !f.as_os_str().is_empty() && f.exists() {
                 anything = true;
             }
+        }
+        // The guest-poweroff policy dies with the VM — on every path,
+        // including the nothing-left no-op below. Logged, not returned: a
+        // leftover record names a VM no launch will ever carry again.
+        if power_policy::remove(&self.state_disk_root, vm_id).is_err() {
+            eprintln!(
+                "hippius-miner-agent: destroy: vm {} power-policy record not removed",
+                vm_id.as_str()
+            );
         }
         if handle_disk.is_none()
             && !anything
@@ -2674,6 +2792,8 @@ impl CvmLifecycle {
     /// retry — the new VM is bricked).
     fn release_cid(&self, vm_id: &VmId) {
         self.cancel_ticket_push(vm_id);
+        // The VM's run is over: drop what was observed of it.
+        self.guest_runs.forget(vm_id);
         // Only once the domain is confirmed down: a stop that fails keeps
         // the VM, and with it what is known about its ticket.
         if let Ok(mut map) = self.ticket_delivery.lock() {

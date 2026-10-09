@@ -40,6 +40,15 @@ record also keeps `emit["booted_artifacts"]` — the artefact location the
 CURRENT boot came from — and every reader that must reproduce the current
 boot (the §25 dest staging, the launch-digest recompute) reads it through
 [`booted_artifacts`]. An accepted relaunch records what IT booted there.
+
+A userdata restage ([`repoint_userdata`], the `vali_restage_userdata`
+command) points the record's `userdata_vault_path` / `userdata_vault_version`
+— the cloud-init TEMPLATE a relaunch reads back — at another staged version,
+for the NEXT boot. The running boot is not described by it (its ticket binds
+the canonical copy the launch staged), so nothing else in the record moves.
+Its audit trail is `emit["userdata_restages"]`, not `emit["superseded"]`:
+the initrd swap reads every `superseded` entry that carries `new` as a spec
+change of its own.
 """
 
 from __future__ import annotations
@@ -694,4 +703,87 @@ def swap_initrd(
         result["emit"] = emit
         job.result_json = result
         job.save(update_fields=["spec_json", "result_json"])
+        return True
+
+
+# `emit` key of the userdata-restage audit trail, newest last, bounded like
+# `superseded`.
+USERDATA_RESTAGES_KEY = "userdata_restages"
+
+
+def userdata_restages(job: Any) -> list[dict[str, Any]]:
+    """`job`'s userdata-restage audit trail, oldest first."""
+    emit = (job.result_json or {}).get("emit") or {}
+    return [e for e in (emit.get(USERDATA_RESTAGES_KEY) or []) if isinstance(e, dict)]
+
+
+def repoint_userdata(
+    vm_id: str,
+    *,
+    new_path: str,
+    new_version: int,
+    expected_job_id: str,
+    expected_path: str,
+    expected_version: int,
+    reason: str,
+    operator: str,
+    evidence: dict[str, Any],
+) -> bool:
+    """Point `vm_id`'s launch record at another staged userdata template for
+    its NEXT boot (see the `vali_restage_userdata` command, which decides
+    WHETHER, and stages the bytes).
+
+    Rewrites `userdata_vault_path` + `userdata_vault_version` — what a
+    relaunch (`_reboot_recovery_relaunch`, power start) reads the template
+    back from — under the record's row lock, compare-and-set against the
+    record (`expected_job_id`) and the pointer the caller decided on. The
+    previous and new pointer, the operator, the reason and `evidence` are
+    appended to `emit["userdata_restages"]`. Returns `True`."""
+    if not (new_path and new_version > 0 and operator and reason):
+        raise ValueError(
+            f"vm {vm_id!r}: a restage needs a path, a version, an operator, a reason"
+        )
+    with transaction.atomic():
+        job = _latest_succeeded(vm_id, for_update=True)
+        if job is None:
+            raise LookupError(f"vm {vm_id!r} has no SUCCEEDED launch record")
+        if job.job_id != expected_job_id:
+            raise ValueError(
+                f"vm {vm_id!r}: its current launch record is {job.job_id!r}, not the "
+                f"{expected_job_id!r} that was checked — refusing to overwrite"
+            )
+        current = (str(job.userdata_vault_path), int(job.userdata_vault_version))
+        if current != (expected_path, int(expected_version)):
+            raise ValueError(
+                f"vm {vm_id!r}: its userdata pointer changed since it was read "
+                f"({expected_path}@{expected_version} → {current[0]}@{current[1]}) — "
+                "refusing to overwrite"
+            )
+        if current == (new_path, int(new_version)):
+            raise ValueError(f"vm {vm_id!r}: already points at {new_path}@{new_version}")
+        result = dict(job.result_json or {})
+        emit = dict(result.get("emit") or {})
+        history = userdata_restages(job)
+        history.append(
+            {
+                "at": timezone.now().isoformat(),
+                "reason": reason,
+                "operator": operator,
+                "previous": {
+                    "userdata_vault_path": current[0],
+                    "userdata_vault_version": current[1],
+                },
+                "new": {
+                    "userdata_vault_path": new_path,
+                    "userdata_vault_version": int(new_version),
+                },
+                "evidence": evidence,
+            }
+        )
+        emit[USERDATA_RESTAGES_KEY] = history[-MAX_SUPERSEDED:]
+        result["emit"] = emit
+        job.result_json = result
+        job.userdata_vault_path = new_path
+        job.userdata_vault_version = int(new_version)
+        job.save(update_fields=["userdata_vault_path", "userdata_vault_version", "result_json"])
         return True

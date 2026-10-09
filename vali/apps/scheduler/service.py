@@ -732,6 +732,86 @@ def cdn_colocation_reason(tenant_id: str, vm_id: str, miner_id: str) -> str | No
     return None
 
 
+def group_nodes(tenant_id: str, group: str, *, exclude_vm_id: str = "") -> frozenset[str]:
+    """The lower-case chain node_ids that carry, or are about to carry, a VM
+    of the tenant's `placement_group` (anti-affinity): each live VM's host
+    (`Vm.host`, else its launch's miner), its active placement (a launch in
+    flight is placed before it binds), its `migration_dest`, and the
+    destination of any §25 / restore / failover job still in flight. A host
+    gone dark still counts: the VM may come back there. `exclude_vm_id`
+    leaves one VM out (the one being placed or moved)."""
+    from apps.lifecycle.models import Vm
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.effects import _bound_miner_id
+    from apps.orchestration.models import TERMINAL_MIGRATION_STATES, MigrationJob
+
+    if not group:
+        return frozenset()
+    rows = Vm.objects.filter(tenant_id=tenant_id, placement_group=group).exclude(
+        state=VmState.DESTROYED
+    )
+    if exclude_vm_id:
+        rows = rows.exclude(vm_id=exclude_vm_id)
+    vms = list(rows)
+    if not vms:
+        return frozenset()
+    miners: set[str] = set()
+    for vm in vms:
+        miners |= {_bound_miner_id(vm), vm.migration_dest}
+    miners |= set(
+        MigrationJob.objects.filter(vm__in=vms)
+        .exclude(state__in=TERMINAL_MIGRATION_STATES)
+        .values_list("dest_node_id", flat=True)
+    )
+    nodes = set(
+        Placement.objects.filter(vm__in=vms, status__in=ACTIVE_PLACEMENT_STATES).values_list(
+            "miner_node_id", flat=True
+        )
+    )
+    nodes |= set(
+        MinerIdentity.objects.filter(miner_id__in=miners - {""})
+        .exclude(chain_node_id__isnull=True)
+        .values_list("chain_node_id", flat=True)
+    )
+    return frozenset(str(n).lower() for n in nodes if n)
+
+
+def group_arguments(vm_id: str) -> dict[str, Any]:
+    """Gate (k)'s [`decide_placement`] argument for the VM `vm_id`: the
+    nodes its `placement_group` already holds. `{}` when the VM has no
+    group (or no row yet)."""
+    from apps.lifecycle.models import Vm
+
+    if not vm_id:
+        return {}
+    row = Vm.objects.filter(vm_id=vm_id).values_list("tenant_id", "placement_group").first()
+    if row is None or not row[1]:
+        return {}
+    return {"group_occupied": group_nodes(row[0], row[1], exclude_vm_id=vm_id)}
+
+
+def group_dest_reason(tenant_id: str, group: str, vm_id: str, miner_id: str) -> str | None:
+    """Why `miner_id` must not take the VM `vm_id` of the tenant's
+    `placement_group` — another VM of the group is on it or headed to it —
+    or `None`. For the paths that name a miner instead of asking
+    [`decide_placement`]."""
+    from apps.miners.models import MinerIdentity
+
+    if not group:
+        return None
+    node_id = (
+        MinerIdentity.objects.filter(miner_id=miner_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    if node_id and node_id.lower() in group_nodes(tenant_id, group, exclude_vm_id=vm_id):
+        return (
+            f"miner {miner_id!r} already carries a VM of placement group {group!r} "
+            "(anti-affinity)"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class HostResources:
     """What one host has free NOW, and what it could ever offer.
@@ -836,9 +916,13 @@ def placement_arguments(
     budgets: dict[str, HostBudget] | None = None,
     boot_gate: bool = False,
     vm_id: str = "",
+    power_policy_stop: bool = False,
 ) -> dict[str, Any]:
     """Every [`decide_placement`] argument EXCEPT `snapshot`, assembled
     from settings + the DB exactly as a real launch assembles them.
+
+    `power_policy_stop` adds gate (l): only miners whose agent supports
+    the guest-poweroff policy (an `on_guest_poweroff=stop` launch).
 
     `boot_gate` adds gate (g), concurrent boots per miner — the launch path
     only. It is transient by construction (the launch WAITS for a boot slot
@@ -900,7 +984,19 @@ def placement_arguments(
         **(boot_gate_arguments() if boot_gate else {}),
         # Gate (j) — a CDN node only where its edge is local.
         **cdn_edge_arguments(tenant_id, vm_id),
+        # Gate (k) — never two VMs of one placement group on a host.
+        **group_arguments(vm_id),
+        # Gate (l) — an `on_guest_poweroff=stop` VM only where the agent
+        # knows the policy.
+        **(power_policy_arguments() if power_policy_stop else {}),
     }
+
+
+def power_policy_arguments() -> dict[str, Any]:
+    """Gate (l)'s [`decide_placement`] argument."""
+    from apps.orchestration import power_policy
+
+    return {"power_policy_capable": power_policy.capable_node_ids()}
 
 
 def boot_gate_arguments() -> dict[str, Any]:

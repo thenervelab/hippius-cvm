@@ -284,6 +284,62 @@ async fn a_net_policy_vector_is_signed_and_decodes_on_the_miner() {
     }
 }
 
+/// `power-policy`: vali's encoded bodies from the shared vector are
+/// signed verbatim, forwarded under their kind, and verify and decode on
+/// the miner-agent side.
+#[tokio::test]
+async fn a_power_policy_vector_is_signed_and_decodes_on_the_miner() {
+    use hippius_miner_agent::orders::types::{OrderBody, PowerPolicyOrder, SignedOrder};
+    use hippius_miner_agent::orders::OrderVerifier;
+    use serde_bytes::ByteBuf;
+
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/power_policy_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let signer = test_signer();
+    let verifier =
+        OrderVerifier::from_hex(&hex::encode(signer.verifying_key().to_bytes())).unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        if case["kind"] != "power-policy" {
+            continue;
+        }
+        let name = case["name"].as_str().unwrap();
+        let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(
+            signer.clone(),
+            forward,
+            "100.100.100.100:9700",
+            "power-policy",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}");
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "{name}");
+        assert_eq!(calls[0].kind, OrderKind::PowerPolicy);
+        assert_eq!(calls[0].body, body, "{name}");
+        let signed = SignedOrder {
+            body: ByteBuf::from(calls[0].body.clone()),
+            sig: ByteBuf::from(calls[0].sig.to_vec()),
+        };
+        verifier.verify(&signed).unwrap();
+        let order: OrderBody<PowerPolicyOrder> =
+            ciborium::de::from_reader(body.as_slice()).unwrap();
+        assert_eq!(
+            order.payload.on_guest_poweroff.as_str(),
+            case["payload"]["on_guest_poweroff"].as_str().unwrap(),
+            "{name}"
+        );
+    }
+}
+
 // ─── error paths ────────────────────────────────────────────────────
 
 #[tokio::test]

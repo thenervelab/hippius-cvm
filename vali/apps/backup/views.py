@@ -23,7 +23,6 @@ from apps.lifecycle.models import Vm
 from apps.orchestration.permissions import IsOrchestrationRoot
 
 from . import service
-from .models import FailoverMode
 from .schemas import (
     BackupErrorSerializer,
     BackupPolicyRequestSerializer,
@@ -41,15 +40,18 @@ _ERROR_STATUS = {
     "disk-too-large": status.HTTP_409_CONFLICT,
     "no-launch-record": status.HTTP_409_CONFLICT,
     "vm-not-live": status.HTTP_409_CONFLICT,
+    "failover-auto-unavailable": status.HTTP_409_CONFLICT,
     "backup-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
 
 def _refuse(exc: BackupError) -> Response:
-    return Response(
-        {"error": exc.code, "detail": exc.detail},
-        status=_ERROR_STATUS.get(exc.code, status.HTTP_400_BAD_REQUEST),
-    )
+    body: dict[str, Any] = {"error": exc.code, "detail": exc.detail}
+    if isinstance(exc, service.FailoverAutoUnavailable):
+        # The failover contract's shape (`code`, `blocker`); `error` stays
+        # for the clients that read every backup refusal by it.
+        body.update(code=exc.code, blocker=exc.blocker)
+    return Response(body, status=_ERROR_STATUS.get(exc.code, status.HTTP_400_BAD_REQUEST))
 
 
 def _get_vm(vm_id: str) -> Vm:
@@ -124,7 +126,8 @@ class VmBackupPolicyView(_RootView):
             404: OpenApiResponse(BackupErrorSerializer, "`vm-not-found`."),
             409: OpenApiResponse(
                 BackupErrorSerializer,
-                "`not-golden` / `disk-too-large` / `no-launch-record` / `vm-not-live`.",
+                "`not-golden` / `disk-too-large` / `no-launch-record` / `vm-not-live` / "
+                "`failover-auto-unavailable` (with `code` and `blocker`).",
             ),
             503: OpenApiResponse(BackupErrorSerializer, "`backup-unavailable`."),
             **_COMMON,
@@ -137,7 +140,7 @@ class VmBackupPolicyView(_RootView):
                 _get_vm(vm_id),
                 interval_s=body.get("interval_s"),
                 retention_days=body.get("retention_days", service.DEFAULT_RETENTION_DAYS),
-                failover_mode=body.get("failover_mode", FailoverMode.AUTO.value),
+                failover_mode=body.get("failover_mode"),
             )
         except BackupError as exc:
             return _refuse(exc)

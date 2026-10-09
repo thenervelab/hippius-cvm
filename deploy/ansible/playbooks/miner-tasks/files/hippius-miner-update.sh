@@ -83,6 +83,10 @@ INSTALLED_FILE="${STATE_DIR}/installed-release"
 # confirmed healthy or rolled back. Found at startup = an earlier run was
 # cut short (timeout, power loss): roll back before anything else.
 TXN_FILE="${STATE_DIR}/update-in-progress"
+# Exists once THIS run has SIGKILLed the agent (cleared when the run takes
+# the lock). After our own kill, an "inactive" unit is a binary that exited
+# cleanly; without one, "inactive" is an operator stop.
+KILLED_FLAG="${STATE_DIR}/.update-killed"
 BACKUP_PATH="${BINARY_PATH}.bak"
 LOG_TAG="hippius-miner-update"
 
@@ -173,7 +177,8 @@ sigkill_agent() {
         0) err "not sending SIGKILL: QEMU pid $found, inside $SERVICE_NAME's cgroup"; return 1 ;;
         2) err "not sending SIGKILL: cannot read the cgroup of $SERVICE_NAME"; return 1 ;;
     esac
-    systemctl kill --signal=SIGKILL "$SERVICE_NAME"
+    systemctl kill --signal=SIGKILL "$SERVICE_NAME" || return 1
+    : >"$KILLED_FLAG"
 }
 
 # Waits for systemd to bring the agent back under a PID other than $1.
@@ -262,46 +267,115 @@ install_binary() {
 }
 
 # Brings the agent up on whatever binary is installed: SIGKILL if it is
-# running, `start` if systemd gave up on it (starting a stopped unit tears
-# nothing down). If systemd does not relaunch it after the kill (start
-# limit), starts it once by hand. Prints the new PID.
+# running; `start` if systemd gave up on it after a crash ("failed") or is
+# still between restarts ("activating"). Starting such a unit tears nothing
+# down. Prints the new PID.
+#
+# Returns 3, touching nothing, in any other state: "deactivating" (or
+# "inactive" when resuming) means an operator stopped, or is stopping, the
+# agent on purpose, and a `start` would even replace a pending stop job. It
+# stays stopped.
 relaunch() {
     local old_pid
     old_pid="$(unit_prop MainPID)"
     if [ "$(unit_prop ActiveState)" = active ] && [ -n "$old_pid" ] && [ "$old_pid" != 0 ]; then
         sigkill_agent || return 1
-        wait_relaunch "$old_pid" && return 0
+        # The flag only covers the stretch from our kill until the agent is
+        # back up: after that, a later "inactive" is someone else's stop.
+        wait_relaunch "$old_pid" && { rm -f -- "$KILLED_FLAG"; return 0; }
         [ "$(unit_prop ActiveState)" = active ] && return 1
     fi
+    case "$(unit_prop ActiveState)" in
+        failed | activating) ;;
+        # After this run's own kill (the preflight saw the agent active),
+        # "inactive" is the new or restored binary exiting cleanly, which
+        # Restart=on-failure does not cover: start it once. Only when the
+        # prior state is unknown (resuming a cut-short run) is it taken as
+        # an operator stop.
+        inactive) [ -f "$KILLED_FLAG" ] || return 3 ;;
+        *) return 3 ;;
+    esac
     systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
     systemctl start "$SERVICE_NAME" || return 1
-    wait_relaunch "$old_pid"
+    wait_relaunch "$old_pid" && { rm -f -- "$KILLED_FLAG"; return 0; }
+    return 1
 }
 
 # Puts the previous binary back and relaunches the agent on it, then marks
 # $1 failed so it is not retried. The in-progress file is cleared only once
 # the previous binary runs again: if this dies half way, the next run
-# starts over from here before doing anything else.
+# starts over from here before doing anything else. An agent an operator
+# stopped is left stopped, on the previous binary, and $1 is not marked.
 rollback() {
-    local tag="$1" reason="$2" pid since
-    err "release $tag unhealthy ($reason): rolling back to the previous binary"
-    [ -f "$BACKUP_PATH" ] \
-        || die "ROLLBACK FAILED: no $BACKUP_PATH to roll back to. Manual intervention needed; never stop or restart $SERVICE_NAME while it hosts domains."
-    install_binary "$BACKUP_PATH" \
-        || die "ROLLBACK FAILED: cannot reinstall $BACKUP_PATH over $BINARY_PATH; the next run retries. Never stop or restart $SERVICE_NAME while it hosts domains."
-    since="$(date +%s)"
-    if ! pid="$(relaunch)"; then
-        die "ROLLBACK FAILED: $SERVICE_NAME did not come back on the previous binary (installed from $BACKUP_PATH); the next run retries. Never stop or restart it while it hosts domains."
+    local tag="$1" reason="$2" pid since rc=0
+    mark_failed() {
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >"${STATE_DIR}/.update-failed-${tag}" \
+            || err "cannot write ${STATE_DIR}/.update-failed-${tag}; $tag may be retried"
+    }
+    err "release $tag not kept ($reason): rolling back to the previous binary"
+    if [ ! -f "$BACKUP_PATH" ]; then
+        mark_failed "$reason; no backup to roll back to"
+        die "ROLLBACK FAILED: no $BACKUP_PATH to roll back to; $tag is marked failed. Manual intervention needed; never stop or restart $SERVICE_NAME while it hosts domains."
     fi
-    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >"${STATE_DIR}/.update-failed-${tag}" \
-        || err "cannot write ${STATE_DIR}/.update-failed-${tag}; $tag may be retried"
-    rm -f -- "$TXN_FILE"
+    if ! install_binary "$BACKUP_PATH"; then
+        mark_failed "$reason; cannot reinstall the backup"
+        die "ROLLBACK FAILED: cannot reinstall $BACKUP_PATH over $BINARY_PATH; $tag is marked failed and the next run retries the rollback. Never stop or restart $SERVICE_NAME while it hosts domains."
+    fi
+    since="$(date +%s)"
+    pid="$(relaunch)" || rc=$?
+    if [ "$rc" = 3 ]; then
+        rm -f -- "$TXN_FILE"
+        warn "$SERVICE_NAME was stopped by an operator: previous binary restored, agent left stopped"
+        exit 1
+    fi
+    mark_failed "$reason"
+    if [ "$rc" != 0 ]; then
+        die "ROLLBACK FAILED: $SERVICE_NAME did not come back on the previous binary (installed from $BACKUP_PATH); $tag is marked failed and the next run retries the rollback. Never stop or restart it while it hosts domains."
+    fi
     if wait_healthy "$pid" "$since"; then
+        rm -f -- "$TXN_FILE"
         log "rolled back: $SERVICE_NAME healthy again on the previous binary (pid $pid); $tag will not be retried (remove ${STATE_DIR}/.update-failed-${tag} to retry it)"
+    elif [ "$(unit_prop ActiveState)" = active ] && [ "$(unit_prop MainPID)" = "$pid" ]; then
+        # Up but silent (an Edge or network outage looks the same): done
+        # here, a later rollback would only SIGKILL it again.
+        rm -f -- "$TXN_FILE"
+        err "rolled back: the previous binary runs (pid $pid) but delivered no heartbeat. Check the Edge and the agent log."
     else
-        err "rolled back, but the previous binary is not healthy either (pid $pid). Manual intervention needed."
+        # Down or crash-looping: keep the in-progress file so the next run
+        # retries the rollback.
+        err "ROLLBACK FAILED: the previous binary is not staying up (pid $pid gone); the next run retries the rollback. Manual intervention needed; never stop or restart $SERVICE_NAME while it hosts domains."
     fi
     exit 1
+}
+
+# Marks $1 installed, then drops the in-progress file. A crash between the
+# two is harmless: the next run resumes, finds $1 running and healthy, and
+# finishes here again.
+commit_release() {
+    printf '%s\n' "$1" >"${INSTALLED_FILE}.new"
+    mv -f "${INSTALLED_FILE}.new" "$INSTALLED_FILE"
+    rm -f -- "$TXN_FILE"
+}
+
+# An earlier run was cut short after writing the in-progress file for $1.
+# If $1 is on disk, the running agent was started from it (after the file
+# was installed) and it delivers heartbeats, the swap had in fact worked:
+# finish it. Anything else: roll back.
+resume_interrupted() {
+    local tag="$1" pid started_s mtime_s
+    if valid_tag "$tag" && [ "$(binary_tag "$BINARY_PATH")" = "$tag" ] \
+            && [ "$(unit_prop ActiveState)" = active ]; then
+        pid="$(unit_prop MainPID)"
+        started_s="$(date -d "$(unit_prop ExecMainStartTimestamp)" +%s 2>/dev/null || echo 0)"
+        mtime_s="$(stat -c %Y "$BINARY_PATH")"
+        if [ "$started_s" -ge "$mtime_s" ] && wait_healthy "$pid" "$started_s"; then
+            commit_release "$tag"
+            log "an earlier run was cut short after swapping to $tag; it is running and healthy (pid $pid): update finished"
+            exit 0
+        fi
+    fi
+    err "an earlier run was cut short while swapping to $tag; restoring the previous binary"
+    rollback "$tag" "interrupted mid-swap"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -327,13 +401,13 @@ main() {
     mkdir -p "$STATE_DIR"
     exec 9>"${STATE_DIR}/.update.lock"
     flock -n 9 || { log "another update run holds the lock; exiting"; exit 0; }
+    rm -f -- "$KILLED_FLAG"
 
     if [ -f "$TXN_FILE" ]; then
         local stuck
         stuck="$(head -n1 "$TXN_FILE" | tr -d '[:space:]')"
         valid_tag "$stuck" || stuck=unknown
-        err "an earlier run was cut short while swapping to $stuck; restoring the previous binary first"
-        rollback "$stuck" "interrupted mid-swap"
+        resume_interrupted "$stuck"
     fi
 
     [ -x "$BINARY_PATH" ] || die "installed binary not found at $BINARY_PATH"
@@ -357,27 +431,39 @@ main() {
         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
         || die "cannot fetch $RELEASES_API"
 
-    # The newest release that is complete: a valid tag, not a draft or
-    # prerelease, carrying the binary, SHA256SUMS and the attestation. A
-    # release without them (its workflow failed, or it was published
-    # empty, as v2026.10.08 was) is passed over rather than stalling. A tag dated
-    # more than two days after its publication is ignored: anti-downgrade
-    # would otherwise pin the host to a mistyped far-future tag forever.
-    # "ready" is when the last of the three files landed; the soak counts
-    # from there, not from when the release object was created.
+    local installed
+    installed="$(installed_tag)"
+
+    # The newest ELIGIBLE release: complete (a valid tag, not a draft or
+    # prerelease, carrying the binary, SHA256SUMS and the attestation),
+    # newer than the installed one, past the soak, and not marked failed
+    # here. A top tag that is too young or failed does not hide an older
+    # eligible one. A tag dated more than one day after its UTC publication
+    # day is passed over (one day of slack for UTC+ time zones):
+    # anti-downgrade would otherwise pin the host to a mistyped far-future
+    # tag. The soak counts from when the last of the three files landed,
+    # not from when the release object was created (v2026.10.08 was
+    # published empty before releases had a single creator).
     local fields
     fields="$(python3 -I -c '
-import json, re, sys
+import json, os, re, sys, time
 from datetime import datetime, timezone
 
 def ts(s):
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
 
+def say(level, msg):
+    print(f"{level}: {msg}", file=sys.stderr)
+
 data = json.load(open(sys.argv[1]))
 releases = data if isinstance(data, list) else [data]
-asset, tag_re = sys.argv[2], re.compile(sys.argv[3])
+asset, tag_re, installed, min_age_h, state_dir = sys.argv[2], re.compile(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6]
 need = (asset, "SHA256SUMS", asset + ".sigstore.json")
-best = None
+
+def key(m):
+    return (int(m[1]), int(m[2]), int(m[3]), int(m[5] or 0))
+
+cands = []
 for rel in releases:
     tag = rel.get("tag_name") or ""
     m = tag_re.fullmatch(tag)
@@ -385,66 +471,73 @@ for rel in releases:
         continue
     assets = {a.get("name"): a for a in rel.get("assets", [])}
     if not all(n in assets for n in need):
-        print(f"release {tag} is incomplete (needs " + " + ".join(need) + "); passed over", file=sys.stderr)
+        say("warn", f"release {tag} is incomplete (needs " + " + ".join(need) + "); passed over")
         continue
     try:
         published = ts(rel["published_at"])
         tag_day = int(datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc).timestamp())
         ready = max([published] + [ts(assets[n].get("updated_at") or rel["published_at"]) for n in need])
     except (KeyError, TypeError, ValueError):
-        print(f"release {tag} has an unreadable date; passed over", file=sys.stderr)
+        say("warn", f"release {tag} has an unreadable date; passed over")
         continue
-    if tag_day > published + 2 * 86400:
-        print(f"release {tag} is dated after its publication; passed over", file=sys.stderr)
+    if tag_day > published + 86400:
+        say("warn", f"release {tag} is dated after its publication; passed over")
         continue
-    key = (int(m[1]), int(m[2]), int(m[3]), int(m[5] or 0))
-    if best is None or key > best[0]:
-        best = (key, tag, ready, [assets[n].get("browser_download_url") or "" for n in need])
-if best is None:
-    print("")
+    cands.append((key(m), tag, ready, [assets[n].get("browser_download_url") or "" for n in need]))
+
+cands.sort(reverse=True)
+if not cands:
+    say("info", "no complete release yet; nothing to do")
     sys.exit(0)
-print(best[1]); print(best[2])
-for u in best[3]:
-    print(u)
-' "$tmp/release.json" "$ASSET_NAME" "$TAG_RE" 2>"$tmp/select.log")" \
+im = tag_re.fullmatch(installed)
+inst = key(im) if im else None
+if inst is not None and cands[0][0] < inst:
+    say("warn", f"newest release {cands[0][1]} is OLDER than installed {installed}; downgrade refused")
+    sys.exit(0)
+now = int(time.time())
+for k, tag, ready, urls in cands:
+    if inst is not None and k <= inst:
+        say("info", f"up to date ({installed})")
+        sys.exit(0)
+    marker = os.path.join(state_dir, ".update-failed-" + tag)
+    if os.path.exists(marker):
+        say("info", f"release {tag} failed its health check here before; skipping it (remove {marker} to retry)")
+        continue
+    age = now - ready
+    if age < min_age_h * 3600:
+        say("info", f"release {tag} has been complete for {age // 3600}h (< MIN_RELEASE_AGE_H={min_age_h}h); waiting")
+        continue
+    print(tag)
+    for u in urls:
+        print(u)
+    sys.exit(0)
+say("info", "no eligible release; nothing to do")
+' "$tmp/release.json" "$ASSET_NAME" "$TAG_RE" "$installed" "$MIN_RELEASE_AGE_H" "$STATE_DIR" 2>"$tmp/select.log")" \
         || die "cannot parse the release metadata from $RELEASES_API: $(tail -n 1 "$tmp/select.log")"
-    while read -r line; do [ -n "$line" ] && warn "$line"; done <"$tmp/select.log"
+    local line
+    while read -r line; do
+        case "$line" in
+            warn:*) warn "${line#warn: }" ;;
+            info:*) log "${line#info: }" ;;
+            ?*) err "$line" ;;
+        esac
+    done <"$tmp/select.log"
 
     # mapfile, not a chain of `read`s: a short answer (no release) must not
     # trip errexit on EOF.
-    local f tag ready_s url_bin url_sums url_bundle
+    local f tag url_bin url_sums url_bundle
     mapfile -t f <<<"$fields"
-    tag="${f[0]:-}" ready_s="${f[1]:-}" url_bin="${f[2]:-}" url_sums="${f[3]:-}" url_bundle="${f[4]:-}"
+    tag="${f[0]:-}" url_bin="${f[1]:-}" url_sums="${f[2]:-}" url_bundle="${f[3]:-}"
+    [ -n "$tag" ] || exit 0
 
-    if [ -z "$tag" ]; then
-        log "no complete release at $RELEASES_API yet; nothing to do"
-        exit 0
-    fi
+    # Re-checked here, independently of the selection above.
     valid_tag "$tag" || die "selected release tag '$tag' is not vYYYY.MM.DD[.N]; refusing"
-
-    local installed
-    installed="$(installed_tag)"
+    [ ! -f "${STATE_DIR}/.update-failed-${tag}" ] || die "selected release $tag is marked failed; refusing"
     if [ -n "$installed" ]; then
-        case "$(tag_cmp "$tag" "$installed")" in
-            0) log "up to date ($installed)"; exit 0 ;;
-            -1) warn "newest release $tag is OLDER than installed $installed; downgrade refused"; exit 0 ;;
-        esac
+        [ "$(tag_cmp "$tag" "$installed")" = 1 ] || die "selected release $tag is not newer than installed $installed; refusing"
         log "release $tag is newer than installed $installed"
     else
         log "installed release unknown (source build or a release without an embedded tag); $tag counts as an upgrade"
-    fi
-
-    if [ -f "${STATE_DIR}/.update-failed-${tag}" ]; then
-        log "release $tag failed its health check here before; skipping it (remove ${STATE_DIR}/.update-failed-${tag} to retry)"
-        exit 0
-    fi
-
-    [[ "$ready_s" =~ ^[0-9]+$ ]] || die "release $tag has an unreadable publication time"
-    local age_s
-    age_s=$(( $(date -u +%s) - ready_s ))
-    if [ "$age_s" -lt $(( MIN_RELEASE_AGE_H * 3600 )) ]; then
-        log "release $tag has been complete for $(( age_s / 3600 ))h (< MIN_RELEASE_AGE_H=${MIN_RELEASE_AGE_H}h); waiting"
-        exit 0
     fi
 
     local u
@@ -503,28 +596,31 @@ for u in best[3]:
     log "swapping $SERVICE_NAME to $tag (backup $BACKUP_PATH, $(printf '%s' "$domains_before" | grep -c .) running domain(s))"
     install_binary "$new" || rollback "$tag" "cannot install the new binary"
     since="$(date +%s)"
-    if ! pid="$(relaunch)"; then
-        rollback "$tag" "agent did not relaunch within ${RELAUNCH_TIMEOUT_S}s"
-    fi
+    local rc=0
+    pid="$(relaunch)" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) rollback "$tag" "agent stopped by an operator during the swap" ;;
+        *) rollback "$tag" "agent did not relaunch within ${RELAUNCH_TIMEOUT_S}s" ;;
+    esac
     if ! wait_healthy "$pid" "$since"; then
         rollback "$tag" "health check failed"
     fi
 
-    # Domains outlive the agent. One that stopped across the swap means
-    # something is wrong with this release here: put the previous one back.
+    # Domains outlive the agent, so one that stopped across the swap is
+    # worth a loud line, but not a rollback: tenants stop, orders destroy,
+    # guests crash, and a rollback would only SIGKILL the agent again.
     local after lost
-    after="$(running_domains)" || rollback "$tag" "cannot list the running domains after the swap"
-    lost="$(comm -23 <(printf '%s\n' "$domains_before" | sed '/^$/d') <(printf '%s\n' "$after" | sed '/^$/d'))"
-    if [ -n "$lost" ]; then
-        err "domain(s) running before the swap are no longer running: $(printf '%s' "$lost" | tr '\n' ' ')"
-        rollback "$tag" "running domain(s) disappeared across the swap"
+    if after="$(running_domains)"; then
+        lost="$(comm -23 <(printf '%s\n' "$domains_before" | sed '/^$/d') <(printf '%s\n' "$after" | sed '/^$/d'))"
+        if [ -n "$lost" ]; then
+            warn "DOMAIN-LOSS: domain(s) running before the swap to $tag are no longer running: $(printf '%s' "$lost" | tr '\n' ' ')(check them; the update is kept)"
+        fi
+    else
+        warn "DOMAIN-LOSS: cannot list the running domains after the swap to $tag; check them by hand"
     fi
 
-    # The in-progress file goes first: if power fails right after, the
-    # binary's own compiled-in tag still says what is installed.
-    rm -f -- "$TXN_FILE"
-    printf '%s\n' "$tag" >"${INSTALLED_FILE}.new"
-    mv -f "${INSTALLED_FILE}.new" "$INSTALLED_FILE"
+    commit_release "$tag"
     log "updated to $tag: $SERVICE_NAME pid $pid healthy, heartbeat delivered"
 }
 

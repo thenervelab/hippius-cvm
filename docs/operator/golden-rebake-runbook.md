@@ -19,7 +19,7 @@ The machine does the bake and a first boot test. A human does the bless.
 ## 1. The re-bake (`vali_scheduled_golden_rebake`)
 
 For each image (`VALI_GOLDEN_REBAKE_IMAGES`, default
-`ubuntu,debian,cs10,fedora`) the command:
+`ubuntu,debian,cs10,fedora,cdn-node`) the command:
 
 - clones the **currently blessed** bake's inputs (dated base image URL +
   sha256, size, bucket) into a new golden `TenantBake`:
@@ -221,3 +221,22 @@ blessed images (it reads the catalog), and
 `hippius_golden_rebake_awaiting_bless` drops to 0 within the hour.
 
 Existing VMs keep their bake; a new golden only reaches new launches.
+
+## cdn-node
+
+`cdn-node` is re-baked with the others: the blessed cdn-node bake is cloned
+with `profile=cdn-node` and the current `VALI_CDN_BACKEND_URL` (a bare
+https origin, or the image is not re-baked). This is also how a node gets
+a new GeoIP database: the database is pinned in
+`packer/cdn-node/openresty/geoip.env` and baked from the tenant-baker
+image, so the order is: merge the monthly `geoip.env` bump, pin the rebuilt
+tenant-baker image, then this re-bake picks it up.
+
+- The synthetic e2e is **not** run on a cdn-node bake: it launches the
+  bake as a tenant VM, which a cdn-node image is not.
+- A blessed cdn-node with a missing or invalid `VALI_CDN_BACKEND_URL` is
+  not re-baked, and shows up as `GoldenRebakeFailed` for `cdn-node`.
+- Its real-boot check is the node itself: after `vali_bless_golden_image
+  cdn-node`, vali replaces the CDN nodes; check one new node's
+  `/__hippius/health` (200, `canary: true`), its journal (`geoip database
+  loaded: DBIP-Country-Lite ...`) and a usage sample's `geoip_db`.
