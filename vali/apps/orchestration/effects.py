@@ -1497,8 +1497,13 @@ def dispatch_migrate_activate(
     snapshot_sha256_hex: str = "",
     settle_by_unix: int = 0,
     staged_restore_id: str = "",
+    measurement_hex: str = "",
 ) -> None:
     """§25 M4 — dispatch the ``migrate-activate`` order to the DEST miner.
+
+    ``measurement_hex`` (a cross-generation restore / failover,
+    `apps.orchestration.cross_gen`): the ticket carries the destination
+    generation's digest instead of the record's.
 
     ``staged_restore_id`` (a restore, `apps.orchestration.restore`): the
     destination installs the backup point it already staged under that id
@@ -1562,7 +1567,7 @@ def dispatch_migrate_activate(
     # Fail-closed: no new_gen ticket ⇒ no dispatch ⇒ the dest is never
     # activated with a stale-gen ticket the KBS would deny.
     cose_ticket = migration_ticket.remint_dest_ticket(
-        vm, dest_node_id=dest_node_id, new_gen=new_gen
+        vm, dest_node_id=dest_node_id, new_gen=new_gen, measurement_hex=measurement_hex
     )
 
     # Resolve the measured launch tuple from the launch record. The cmdline

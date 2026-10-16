@@ -97,7 +97,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> _World:
 def _failover_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "VALI_FAILOVER_MANUAL_ENABLED", True)
     # Every other miner is a fine destination unless a test says otherwise.
-    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, source=None: None)
+    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, source=None, **kw: None)
 
 
 def _failover(vm: Vm, **kw: Any) -> MigrationJob:
@@ -299,6 +299,9 @@ def test_a_failover_never_lands_on_a_host_of_the_vms_placement_group(
     Vm.objects.filter(pk=vm.pk).update(tenant_id="t-g", placement_group="db")
     vm.refresh_from_db()
     MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    # The VM was sold in FR, where the destination is.
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "FR"})
     monkeypatch.setattr(sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None))
     monkeypatch.setattr(
         sched,
@@ -323,6 +326,9 @@ def test_a_destination_without_disk_room_is_refused(world: _World, monkeypatch) 
     monkeypatch.setattr(restore, "_validate_other_dest", _REAL_VALIDATE)
     vm = _golden_vm()
     MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    # The VM was sold in FR, where the destination is.
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "FR"})
     monkeypatch.setattr(sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None))
     monkeypatch.setattr(
         sched,

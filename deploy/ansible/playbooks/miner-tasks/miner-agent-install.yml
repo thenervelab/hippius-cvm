@@ -291,16 +291,6 @@
       miner_heartbeat_schema_host_health: the v6 heartbeat is the v5 body
       plus the agent release tag, and the agent refuses the config otherwise.
 
-- name: Render the miner-agent config
-  ansible.builtin.template:
-    # Explicit playbook-relative path — unambiguous regardless of the
-    # template search-path heuristics for an imported task file.
-    src: "{{ playbook_dir }}/miner-tasks/templates/miner-agent-config.toml.j2"
-    dest: "{{ miner_agent.config_path }}"
-    owner: root
-    group: root
-    mode: "0644"
-
 # ── Identity self-gen (first run only) ──────────────────────────────
 - name: Check whether the miner identity already exists
   ansible.builtin.stat:
@@ -325,6 +315,50 @@
       - "--print-pubkey"
   register: miner_identity_init
   changed_when: "'already present' not in miner_identity_init.stderr"
+
+# ── miner_id ────────────────────────────────────────────────────────
+# vali's `miner_id` is a global namespace, so a NEW miner does not pick
+# one: it is `m-` + the first 16 hex chars of its node id (the
+# `node_id_to_miner_id` filter, filter_plugins/miner_id.py), the same
+# value the backend declares to vali. A host already registered under
+# another id pins it with the `miner_id` host var, which always wins —
+# changing a registered miner's id orphans its identity, telemetry and
+# placements. Hence the config is rendered only AFTER init-identity.
+- name: Read the miner identity public key (the node id)
+  ansible.builtin.slurp:
+    src: "{{ miner_agent.state_dir }}/identity.pub"
+  register: miner_identity_pub
+  when: miner_id is not defined
+
+- name: Resolve this miner's vali miner_id
+  ansible.builtin.set_fact:
+    miner_agent_miner_id: >-
+      {{ miner_id if miner_id is defined
+         else (miner_identity_pub.content | b64decode | node_id_to_miner_id) }}
+
+- name: Refuse an empty, oversize or unsafe miner_id
+  # vali's `MinerIdentity.miner_id` and the signed heartbeat body cap
+  # the id at 64 chars; the agent refuses an empty one at start. The
+  # charset keeps the id a plain TOML string in the rendered config.
+  ansible.builtin.assert:
+    that:
+      - miner_agent_miner_id | string | trim | length > 0
+      - miner_agent_miner_id | string | length <= 64
+      - miner_agent_miner_id is match('^[A-Za-z0-9._-]+$')
+    fail_msg: >-
+      miner_id {{ miner_agent_miner_id | to_json }} is not a 1-64 char
+      [A-Za-z0-9._-] id. Fix the `miner_id` host var, or unset it to
+      derive the id from the node id.
+
+- name: Render the miner-agent config
+  ansible.builtin.template:
+    # Explicit playbook-relative path — unambiguous regardless of the
+    # template search-path heuristics for an imported task file.
+    src: "{{ playbook_dir }}/miner-tasks/templates/miner-agent-config.toml.j2"
+    dest: "{{ miner_agent.config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
 
 - name: Read this host's real SEV-SNP CHIP_ID (the launch/attestation platform_id)
   # The `platform_id` vali stores in `MinerIdentity` MUST be the real
@@ -354,7 +388,7 @@
       MINER REGISTRATION — record with vali's admin API
       (POST /v1/admin/miner/register), all fields REAL (no placeholders):
 
-        miner_id:      "{{ inventory_hostname }}"
+        miner_id:      "{{ miner_agent_miner_id }}"
         pubkey:        "{{ miner_identity_init.stdout }}"
         chain_node_id: "{{ miner_identity_init.stdout }}"
         platform_id:   "{{ miner_platform_id.stdout }}"   # real CHIP_ID
@@ -375,7 +409,7 @@
   # (the family/child hex the console showed at preparation). Same values
   # as above; a second rendering so nothing is re-typed by hand.
   ansible.builtin.debug:
-    msg: "{{ {'miner_id': inventory_hostname,
+    msg: "{{ {'miner_id': miner_agent_miner_id,
               'node_id': miner_identity_init.stdout,
               'platform_id': miner_platform_id.stdout,
               'netbird_ip': miner_netbird_ip | default('')} | to_json }}"

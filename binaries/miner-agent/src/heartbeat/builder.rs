@@ -145,6 +145,42 @@ pub struct HeartbeatBuilder {
     /// well-formed, [`build`](Self::build) emits the `v6` heartbeat
     /// carrying it (`[heartbeat] schema_agent_version = true`).
     agent_version: Option<String>,
+    /// When set (on top of a well-formed `agent_version`),
+    /// [`build`](Self::build) emits the `v7` heartbeat carrying the
+    /// storage report (`[heartbeat] emit_pools = true`).
+    storage: Option<Arc<dyn StorageSource>>,
+    /// How long [`build`](Self::build) waits for the storage report.
+    storage_timeout: std::time::Duration,
+    /// Set while a storage read runs. A read past the timeout keeps its
+    /// blocking thread; the next builds skip the report until it returns,
+    /// so a host read stuck for good holds one thread, not one per beat.
+    storage_inflight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Clears the in-flight flag when the storage read ends (or panics).
+struct InflightGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The longest the builder waits for the storage report before it emits
+/// the heartbeat without it.
+const STORAGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a `v7` heartbeat reports about storage: the pools and dedicated
+/// disks ([`crate::storage::StorageReporter`]). Reads the host, so the
+/// builder calls it off the async worker.
+pub trait StorageSource: Send + Sync {
+    fn read(&self) -> hippius_types::storage_report::StorageReport;
+}
+
+impl StorageSource for crate::storage::StorageReporter {
+    fn read(&self) -> hippius_types::storage_report::StorageReport {
+        self.report()
+    }
 }
 
 /// What a `v3` heartbeat declares: the operator's `[host]` budgets (the
@@ -173,7 +209,10 @@ impl CapacityDeclarer {
 
 /// What a `v4` heartbeat declares about disk: the operator's `[host]
 /// cvm_disk_gb_budget` and a live `statvfs` of the data + staging
-/// filesystems.
+/// filesystems. With storage pools these stay the `default` pool's
+/// figures (it is `data_disk_root` with the host budget, by config and
+/// `storage-config` validation), never sums over pools: the other pools
+/// are the `v7` report's.
 pub struct DiskDeclarer {
     /// `[host] cvm_disk_gb_budget`, saturated into `u32` GiB.
     pub cvm_disk_gb_budget: u32,
@@ -275,6 +314,9 @@ impl HeartbeatBuilder {
             disk: None,
             host_health: None,
             agent_version: None,
+            storage: None,
+            storage_timeout: STORAGE_READ_TIMEOUT,
+            storage_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -319,6 +361,19 @@ impl HeartbeatBuilder {
         self
     }
 
+    /// Opt into the `v7` heartbeat (`[heartbeat] emit_pools = true`),
+    /// carrying the storage report. `v7` is a superset of `v6`, so this
+    /// takes effect only with a well-formed agent version (the config
+    /// refuses `emit_pools` without `schema_agent_version`).
+    ///
+    /// A report the schema would refuse degrades the heartbeat to `v6`
+    /// (logged) rather than failing the build: liveness must never depend
+    /// on the storage report.
+    pub fn with_storage_report(mut self, source: Arc<dyn StorageSource>) -> Self {
+        self.storage = Some(source);
+        self
+    }
+
     /// Sample, stamp, draw `sequence`, encode, and sign — yielding a
     /// signed heartbeat ready for the queue.
     ///
@@ -339,18 +394,69 @@ impl HeartbeatBuilder {
             (Some(capacity), Some(disk), Some(host_health)) => {
                 let (capacity, disk, host_health) =
                     (capacity.declare(), disk.declare(), host_health.read().await);
-                heartbeat = match self
-                    .agent_version
-                    .as_deref()
-                    .filter(|v| is_valid_agent_version(v))
-                {
-                    Some(version) => heartbeat.with_agent_version(
+                let storage = match (&self.storage, &self.agent_version) {
+                    (Some(_), Some(_))
+                        if self
+                            .storage_inflight
+                            .swap(true, std::sync::atomic::Ordering::AcqRel) =>
+                    {
+                        eprintln!(
+                            "hippius-miner-agent: heartbeat: previous storage report still \
+                             running, emitting v6"
+                        );
+                        None
+                    }
+                    (Some(source), Some(_)) => {
+                        let source = Arc::clone(source);
+                        let guard = InflightGuard(Arc::clone(&self.storage_inflight));
+                        let read = tokio::task::spawn_blocking(move || {
+                            let _guard = guard;
+                            source.read()
+                        });
+                        // A host read stuck on a dying disk must not hold
+                        // the heartbeat: past the bound this one is `v6`
+                        // (the read finishes, or not, on its own thread).
+                        match tokio::time::timeout(self.storage_timeout, read).await {
+                            Ok(Ok(report)) if report.validate().is_ok() => Some(report),
+                            Ok(Ok(_)) => {
+                                eprintln!(
+                                    "hippius-miner-agent: heartbeat: storage report refused by \
+                                     the schema, emitting v6"
+                                );
+                                None
+                            }
+                            Ok(Err(_)) => None,
+                            Err(_) => {
+                                eprintln!(
+                                    "hippius-miner-agent: heartbeat: storage report timed out, \
+                                     emitting v6"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                heartbeat = match (
+                    self.agent_version
+                        .as_deref()
+                        .filter(|v| is_valid_agent_version(v)),
+                    storage,
+                ) {
+                    (Some(version), Some(storage)) => heartbeat.with_storage(
+                        capacity,
+                        disk,
+                        host_health,
+                        version.to_string(),
+                        storage,
+                    ),
+                    (Some(version), None) => heartbeat.with_agent_version(
                         capacity,
                         disk,
                         host_health,
                         version.to_string(),
                     ),
-                    None => heartbeat.with_host_health(capacity, disk, host_health),
+                    (None, _) => heartbeat.with_host_health(capacity, disk, host_health),
                 };
             }
             (Some(capacity), Some(disk), None) => {
@@ -444,6 +550,7 @@ impl HeartbeatBuilder {
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: Default::default(),
         })
     }
 
@@ -890,6 +997,196 @@ mod tests {
         }
     }
 
+    struct FixedStorage(hippius_types::storage_report::StorageReport);
+    impl StorageSource for FixedStorage {
+        fn read(&self) -> hippius_types::storage_report::StorageReport {
+            self.0.clone()
+        }
+    }
+
+    fn one_pool_report() -> hippius_types::storage_report::StorageReport {
+        use hippius_types::storage_report::{DiskPoolReport, PoolClass, PoolState, StorageReport};
+        StorageReport {
+            disk_pools: vec![DiskPoolReport {
+                id: "default".into(),
+                class: PoolClass::Undeclared,
+                total_gb: 3_500,
+                available_gb: 2_900,
+                budget_gb: 3_000,
+                committed_gb: 80,
+                os_disks: true,
+                state: PoolState::Active,
+                error: String::new(),
+            }],
+            dedicated_disks: Vec::new(),
+            storage_config_revision: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn with_the_storage_report_the_periodic_heartbeat_is_v7() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let b = v5_builder()
+            .with_agent_version("v1.2.3".into())
+            .with_storage_report(Arc::new(FixedStorage(one_pool_report())));
+        let signed = b.build(&mut seq).await.unwrap();
+        let map = body_map(&signed.body);
+        assert_eq!(int(&map, "schema_version"), Some(7));
+        assert_eq!(map.len(), 27);
+        assert_eq!(int(&map, "storage_config_revision"), Some(0));
+        // The v4 scalars still ride along, unchanged.
+        assert_eq!(int(&map, "data_disk_total_gb"), Some(3_500));
+        // The report decodes back exactly.
+        let v: ciborium::value::Value = ciborium::de::from_reader(signed.body.as_slice()).unwrap();
+        let ciborium::value::Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        assert_eq!(
+            hippius_types::storage_report::StorageReport::from_entries(&entries).unwrap(),
+            one_pool_report()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_storage_report_the_schema_refuses_degrades_to_v6() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let mut bad = one_pool_report();
+        bad.disk_pools.clear();
+        let b = v5_builder()
+            .with_agent_version("v1.2.3".into())
+            .with_storage_report(Arc::new(FixedStorage(bad)));
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(6));
+    }
+
+    /// A storage read that blocks until the test releases it.
+    struct StuckStorage(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl StorageSource for StuckStorage {
+        fn read(&self) -> hippius_types::storage_report::StorageReport {
+            let _ = self.0.lock().unwrap().recv();
+            one_pool_report()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stuck_storage_read_degrades_to_v6_instead_of_holding_the_heartbeat() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let (release, stuck) = std::sync::mpsc::channel();
+        let b = v5_builder()
+            .with_agent_version("v1.2.3".into())
+            .with_storage_report(Arc::new(StuckStorage(std::sync::Mutex::new(stuck))));
+        let b = HeartbeatBuilder {
+            storage_timeout: std::time::Duration::from_millis(50),
+            ..b
+        };
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(6));
+        // While the stuck read runs, the next build starts no second one.
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(6));
+        release.send(()).unwrap();
+        // Once it returns, the report is read again.
+        for _ in 0..200 {
+            if !b
+                .storage_inflight
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!b
+            .storage_inflight
+            .load(std::sync::atomic::Ordering::Acquire));
+        release.send(()).unwrap();
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_storage_report_without_an_agent_version_stays_v5() {
+        let dir = tempdir().unwrap();
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let b = v5_builder().with_storage_report(Arc::new(FixedStorage(one_pool_report())));
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(5));
+    }
+
+    #[test]
+    fn the_v4_disk_figures_are_the_default_pools_alone() {
+        use crate::config::{
+            PoolClassConfig, StorageDesiredStateConfig, StoragePoolConfig, StorageSection,
+        };
+        let dir = tempdir().unwrap();
+        let hdd = tempdir().unwrap();
+        let pool = |id: &str, path: &std::path::Path, budget_gb: u64| StoragePoolConfig {
+            id: id.into(),
+            path: path.to_path_buf(),
+            class: PoolClassConfig::Hdd,
+            budget_gb,
+            os_disks: true,
+            state: StorageDesiredStateConfig::Active,
+        };
+        let pools = crate::storage::StoragePools::from_config(
+            &StorageSection {
+                data_disk_root: dir.path().to_path_buf(),
+                state_disk_root: dir.path().to_path_buf(),
+                pools: vec![
+                    pool("default", dir.path(), 3000),
+                    pool("hdd0", hdd.path(), 9000),
+                ],
+                dedicated_disks: Vec::new(),
+            },
+            3000,
+        );
+        let reporter = crate::storage::StorageReporter::new(
+            Arc::new(crate::storage::state::StorageState::with_pools(pools)),
+            dir.path().to_path_buf(),
+        );
+        let reading = StatvfsDiskSource {
+            data_root: dir.path().to_path_buf(),
+            staging_root: dir.path().to_path_buf(),
+        }
+        .read();
+        let reports = reporter.pool_reports();
+        let default = reports.iter().find(|p| p.id == "default").unwrap();
+        assert!(reading.data_total_gb > 0);
+        assert_eq!(reading.data_total_gb, default.total_gb);
+    }
+
+    #[tokio::test]
+    async fn the_real_reporter_on_an_implicit_pool_builds_a_valid_v7() {
+        // The production reporter over a temp data root with no
+        // `[[storage.pools]]` and no dedicated disks.
+        let dir = tempdir().unwrap();
+        let pools = Arc::new(crate::storage::StoragePools::implicit(
+            dir.path().to_path_buf(),
+            0,
+        ));
+        let reporter = crate::storage::StorageReporter::new(
+            Arc::new(crate::storage::state::StorageState::with_pools(
+                (*pools).clone(),
+            )),
+            dir.path().to_path_buf(),
+        );
+        let report = reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        assert_eq!(report.disk_pools.len(), 1);
+        let pool = &report.disk_pools[0];
+        assert_eq!(pool.id, "default");
+        assert_eq!(pool.state, hippius_types::storage_report::PoolState::Active);
+        assert!(pool.total_gb > 0 || pool.available_gb == 0);
+        let mut seq = SequenceStore::open(&dir.path().join("hb.seq")).unwrap();
+        let b = v5_builder()
+            .with_agent_version("v1.2.3".into())
+            .with_storage_report(Arc::new(reporter));
+        let map = body_map(&b.build(&mut seq).await.unwrap().body);
+        assert_eq!(int(&map, "schema_version"), Some(7));
+    }
+
     #[tokio::test]
     async fn the_agent_version_without_the_host_health_source_stays_v4() {
         // v6 is a superset of v5: no version jump (the config refuses this).
@@ -1047,6 +1344,7 @@ mod tests {
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: Default::default(),
         }
     }
 }

@@ -316,6 +316,15 @@ pub struct HeartbeatSection {
     /// FIRST.
     #[serde(default)]
     pub schema_agent_version: bool,
+    /// Emit the `v7` heartbeat instead: the `v6` body plus the storage
+    /// report — every storage pool (`[[storage.pools]]`, or the implicit
+    /// `default` one) and every declared dedicated disk
+    /// (`[[storage.dedicated_disks]]`), with their state and refusal code
+    /// ([`crate::storage`]). Requires `schema_agent_version` (`v7` is a
+    /// superset of `v6`). Default `false`: vali's verifier must accept `v7`
+    /// FIRST.
+    #[serde(default)]
+    pub emit_pools: bool,
 }
 
 impl Default for HeartbeatSection {
@@ -328,6 +337,7 @@ impl Default for HeartbeatSection {
             schema_disk: false,
             schema_host_health: false,
             schema_agent_version: false,
+            emit_pools: false,
         }
     }
 }
@@ -419,6 +429,20 @@ pub struct StorageSection {
     /// worth moving. Default `/var/lib/hippius-miner`.
     #[serde(default = "default_storage_root")]
     pub state_disk_root: PathBuf,
+    /// `[[storage.pools]]` — the storage pools OS disks may live on
+    /// (docs/design/disk-tier-verification.md §4.1). Optional: absent, the
+    /// agent has ONE implicit pool `default` at `data_disk_root` with the
+    /// `[host] cvm_disk_gb_budget` budget, which is exactly the historical
+    /// single-root behaviour. When present it must include a pool
+    /// `id = "default"` at `data_disk_root`: every OS disk still lands
+    /// there until vali can place on the others.
+    #[serde(default)]
+    pub pools: Vec<StoragePoolConfig>,
+    /// `[[storage.dedicated_disks]]` — whole physical disks offered for
+    /// passthrough, by `/dev/disk/by-id/` name (design §4.2). Optional.
+    /// The agent only inspects and reports them; it never formats or wipes.
+    #[serde(default)]
+    pub dedicated_disks: Vec<DedicatedDiskConfig>,
 }
 
 impl Default for StorageSection {
@@ -426,8 +450,62 @@ impl Default for StorageSection {
         Self {
             data_disk_root: default_storage_root(),
             state_disk_root: default_storage_root(),
+            pools: Vec::new(),
+            dedicated_disks: Vec::new(),
         }
     }
+}
+
+/// A storage pool's declared class — a hint, never a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PoolClassConfig {
+    Nvme,
+    Ssd,
+    Hdd,
+}
+
+/// The desired state of a pool or dedicated disk: `draining` takes no new
+/// disks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageDesiredStateConfig {
+    #[default]
+    Active,
+    Draining,
+}
+
+/// One `[[storage.pools]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePoolConfig {
+    /// `[a-z0-9-]{1,32}`.
+    pub id: String,
+    /// An already-mounted filesystem (absolute). The agent never mounts.
+    pub path: PathBuf,
+    pub class: PoolClassConfig,
+    /// GiB the operator offers on this pool. For `default` it must equal
+    /// `[host] cvm_disk_gb_budget`, the budget the launch gate reserves.
+    pub budget_gb: u64,
+    /// Whether OS disks may be placed here. Default `true`.
+    #[serde(default = "default_true")]
+    pub os_disks: bool,
+    #[serde(default)]
+    pub state: StorageDesiredStateConfig,
+}
+
+/// One `[[storage.dedicated_disks]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedDiskConfig {
+    /// A `/dev/disk/by-id/` basename (`wwn-…`, `ata-…`, `scsi-…`, `nvme-…`).
+    pub id: String,
+    #[serde(default)]
+    pub state: StorageDesiredStateConfig,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_storage_root() -> PathBuf {
@@ -534,6 +612,13 @@ impl Config {
                 "heartbeat.schema_agent_version-requires-schema_host_health",
             ));
         }
+        // …and `v7` extends `v6`.
+        if self.heartbeat.emit_pools && !self.heartbeat.schema_agent_version {
+            return Err(MinerAgentError::ConfigInvalid(
+                "heartbeat.emit_pools-requires-schema_agent_version",
+            ));
+        }
+        self.validate_storage()?;
 
         // `[kbs]` / `[lifecycle]` are optional. When present, the vsock
         // proxy forwards over the host's network to these HTTPS bases —
@@ -575,6 +660,81 @@ impl Config {
                 96,
                 "host_attestor.measurement_sha256",
             )?;
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    /// The static rules of `[[storage.pools]]` / `[[storage.dedicated_disks]]`.
+    /// What can only be checked on the host (mounts, filesystem types,
+    /// `O_DIRECT`, the disks themselves) is checked at run time by
+    /// [`crate::storage`] and reported per pool / disk, never a load error.
+    fn validate_storage(&self) -> Result<()> {
+        use hippius_types::storage_report::{
+            is_valid_dedicated_disk_id, is_valid_pool_id, MAX_DEDICATED_DISKS, MAX_DISK_POOLS,
+        };
+        let pools = &self.storage.pools;
+        if pools.len() > MAX_DISK_POOLS {
+            return Err(MinerAgentError::ConfigInvalid("storage.pools-too-many"));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        for pool in pools {
+            if !is_valid_pool_id(&pool.id) {
+                return Err(MinerAgentError::ConfigInvalid("storage.pools.id"));
+            }
+            require_absolute(&pool.path, "storage.pools.path")?;
+            if !ids.insert(pool.id.as_str()) {
+                return Err(MinerAgentError::ConfigInvalid("storage.pools.id-duplicate"));
+            }
+            if !paths.insert(pool.path.as_path()) {
+                return Err(MinerAgentError::ConfigInvalid(
+                    "storage.pools.path-duplicate",
+                ));
+            }
+        }
+        if !pools.is_empty() {
+            // Every OS disk still lands on `default` (vali cannot place on
+            // another pool yet), and backups, restores and migrations work
+            // on `data_disk_root`: the default pool must be that root,
+            // budgeted as the launch gate reserves.
+            let default = pools
+                .iter()
+                .find(|p| p.id == crate::storage::DEFAULT_POOL_ID)
+                .ok_or(MinerAgentError::ConfigInvalid("storage.pools-no-default"))?;
+            if default.path != self.storage.data_disk_root {
+                return Err(MinerAgentError::ConfigInvalid(
+                    "storage.pools.default-path-not-data_disk_root",
+                ));
+            }
+            if default.budget_gb != self.host.cvm_disk_gb_budget {
+                return Err(MinerAgentError::ConfigInvalid(
+                    "storage.pools.default-budget-not-host-budget",
+                ));
+            }
+            if !default.os_disks || default.state != StorageDesiredStateConfig::Active {
+                return Err(MinerAgentError::ConfigInvalid(
+                    "storage.pools.default-must-take-os-disks",
+                ));
+            }
+        }
+        let disks = &self.storage.dedicated_disks;
+        if disks.len() > MAX_DEDICATED_DISKS {
+            return Err(MinerAgentError::ConfigInvalid(
+                "storage.dedicated_disks-too-many",
+            ));
+        }
+        let mut disk_ids = std::collections::BTreeSet::new();
+        for disk in disks {
+            if !is_valid_dedicated_disk_id(&disk.id) {
+                return Err(MinerAgentError::ConfigInvalid("storage.dedicated_disks.id"));
+            }
+            if !disk_ids.insert(disk.id.as_str()) {
+                return Err(MinerAgentError::ConfigInvalid(
+                    "storage.dedicated_disks.id-duplicate",
+                ));
+            }
         }
         Ok(())
     }
@@ -1221,5 +1381,187 @@ cvm_memory_mb_budget = 16384
                 "host_attestor.measurement_sha256"
             ))
         ));
+    }
+
+    // ── [[storage.pools]] / [[storage.dedicated_disks]] ──────────────
+
+    fn with_storage(extra: &str) -> String {
+        format!("{VALID}\n[storage]\ndata_disk_root = \"/var/lib/hippius-miner\"\n{extra}")
+    }
+
+    const DEFAULT_POOL: &str = r#"
+[[storage.pools]]
+id = "default"
+path = "/var/lib/hippius-miner"
+class = "nvme"
+budget_gb = 0
+"#;
+
+    fn refused(cfg: &str, class: &str) {
+        match parse(cfg) {
+            Err(MinerAgentError::ConfigInvalid(got)) => assert_eq!(got, class),
+            other => panic!("expected {class}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_config_without_pools_has_no_pools() {
+        let c = parse(VALID).unwrap();
+        assert!(c.storage.pools.is_empty());
+        assert!(c.storage.dedicated_disks.is_empty());
+        assert!(!c.heartbeat.emit_pools);
+    }
+
+    #[test]
+    fn pools_and_dedicated_disks_parse() {
+        let c = parse(&with_storage(&format!(
+            "{DEFAULT_POOL}
+[[storage.pools]]
+id = \"hdd0\"
+path = \"/srv/hdd0/hippius\"
+class = \"hdd\"
+budget_gb = 16000
+os_disks = false
+state = \"draining\"
+
+[[storage.dedicated_disks]]
+id = \"wwn-0x5000c500a1b2c3d4\"
+
+[[storage.dedicated_disks]]
+id = \"ata-ST18000NM000J_ZR5ABCDE\"
+state = \"draining\"
+"
+        )))
+        .unwrap();
+        assert_eq!(c.storage.pools.len(), 2);
+        let hdd = &c.storage.pools[1];
+        assert_eq!(hdd.class, PoolClassConfig::Hdd);
+        assert_eq!(hdd.budget_gb, 16000);
+        assert!(!hdd.os_disks);
+        assert_eq!(hdd.state, StorageDesiredStateConfig::Draining);
+        // Defaults: os_disks true, state active.
+        assert!(c.storage.pools[0].os_disks);
+        assert_eq!(c.storage.pools[0].state, StorageDesiredStateConfig::Active);
+        assert_eq!(c.storage.dedicated_disks.len(), 2);
+        assert_eq!(
+            c.storage.dedicated_disks[1].state,
+            StorageDesiredStateConfig::Draining
+        );
+    }
+
+    #[test]
+    fn an_unknown_pool_key_or_class_is_a_parse_error() {
+        assert!(parse(&with_storage(
+            &DEFAULT_POOL.replace("budget_gb = 0", "budget_gb = 0\nsize = 1")
+        ))
+        .is_err());
+        assert!(parse(&with_storage(&DEFAULT_POOL.replace("nvme", "tape"))).is_err());
+    }
+
+    #[test]
+    fn pools_need_a_default_at_the_data_root_with_the_host_budget() {
+        refused(
+            &with_storage(&DEFAULT_POOL.replace("id = \"default\"", "id = \"nvme0\"")),
+            "storage.pools-no-default",
+        );
+        refused(
+            &with_storage(
+                &DEFAULT_POOL.replace("path = \"/var/lib/hippius-miner\"", "path = \"/srv/nvme0\""),
+            ),
+            "storage.pools.default-path-not-data_disk_root",
+        );
+        refused(
+            &with_storage(&DEFAULT_POOL.replace("budget_gb = 0", "budget_gb = 10")),
+            "storage.pools.default-budget-not-host-budget",
+        );
+        refused(
+            &with_storage(
+                &DEFAULT_POOL.replace("budget_gb = 0", "budget_gb = 0\nos_disks = false"),
+            ),
+            "storage.pools.default-must-take-os-disks",
+        );
+        refused(
+            &with_storage(
+                &DEFAULT_POOL.replace("budget_gb = 0", "budget_gb = 0\nstate = \"draining\""),
+            ),
+            "storage.pools.default-must-take-os-disks",
+        );
+    }
+
+    fn extra_pool(id: &str, path: &str) -> String {
+        format!(
+            "\n[[storage.pools]]\nid = \"{id}\"\npath = \"{path}\"\nclass = \"hdd\"\nbudget_gb = 1\n"
+        )
+    }
+
+    #[test]
+    fn pool_ids_paths_and_counts_are_checked() {
+        refused(
+            &with_storage(&format!("{DEFAULT_POOL}{}", extra_pool("Bad_Id", "/srv/a"))),
+            "storage.pools.id",
+        );
+        refused(
+            &with_storage(&format!("{DEFAULT_POOL}{}", extra_pool("a", "relative"))),
+            "storage.pools.path",
+        );
+        refused(
+            &with_storage(&format!(
+                "{DEFAULT_POOL}{}",
+                extra_pool("default", "/srv/a")
+            )),
+            "storage.pools.id-duplicate",
+        );
+        refused(
+            &with_storage(&format!(
+                "{DEFAULT_POOL}{}",
+                extra_pool("a", "/var/lib/hippius-miner")
+            )),
+            "storage.pools.path-duplicate",
+        );
+        let five: String = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| extra_pool(id, &format!("/srv/{id}")))
+            .collect();
+        refused(
+            &with_storage(&format!("{DEFAULT_POOL}{five}")),
+            "storage.pools-too-many",
+        );
+        let four: String = ["a", "b", "c"]
+            .iter()
+            .map(|id| extra_pool(id, &format!("/srv/{id}")))
+            .collect();
+        assert!(parse(&with_storage(&format!("{DEFAULT_POOL}{four}"))).is_ok());
+    }
+
+    fn disk(id: &str) -> String {
+        format!("\n[[storage.dedicated_disks]]\nid = \"{id}\"\n")
+    }
+
+    #[test]
+    fn dedicated_disk_ids_and_counts_are_checked() {
+        refused(&with_storage(&disk("sda")), "storage.dedicated_disks.id");
+        refused(
+            &with_storage(&disk("wwn-0x1-part1")),
+            "storage.dedicated_disks.id",
+        );
+        refused(
+            &with_storage(&format!("{}{}", disk("wwn-0x1"), disk("wwn-0x1"))),
+            "storage.dedicated_disks.id-duplicate",
+        );
+        let many: String = (0..25).map(|i| disk(&format!("wwn-0x{i:02}"))).collect();
+        refused(&with_storage(&many), "storage.dedicated_disks-too-many");
+        // Dedicated disks need no pool declaration.
+        assert!(parse(&with_storage(&disk("nvme-eui.0025388b91c0a1b2"))).is_ok());
+    }
+
+    #[test]
+    fn emit_pools_requires_the_agent_version_heartbeat() {
+        let base = format!("{VALID}\n[heartbeat]\nemit_pools = true\n");
+        refused(&base, "heartbeat.emit_pools-requires-schema_agent_version");
+        let full = format!(
+            "{VALID}\n[heartbeat]\nschema_capacity = true\nschema_disk = true\n\
+             schema_host_health = true\nschema_agent_version = true\nemit_pools = true\n"
+        );
+        assert!(parse(&full).unwrap().heartbeat.emit_pools);
     }
 }

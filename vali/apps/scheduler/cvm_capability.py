@@ -258,6 +258,7 @@ gate removed.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -330,16 +331,35 @@ CLASSES_NOT_START_CAPABILITY = frozenset(
 #: build names it (`data-disk/insufficient-space`, `…/insufficient-space`).
 DISK_REFUSAL_MARKER = "insufficient-space"
 
+#: The 507 classes a storage pool other than `default` answers, followed by
+#: the pool id (`[a-z0-9-]{1,32}`): full (`insufficient-disk:<pool>`), or
+#: unable to take a disk now — draining, unmounted, another filesystem
+#: (`pool-unavailable:<pool>`). Disk-tier design §4.1 / §9.
+_POOL_REFUSAL = re.compile(r"(insufficient-disk|pool-unavailable):[a-z0-9-]{1,32}")
+
 
 def is_disk_refusal(classifier: str) -> bool:
-    """Is a miner rejection class a DATA-disk capacity refusal — the 507
-    `insufficient-disk`, or any class containing `insufficient-space`?
+    """Is a miner rejection class a DATA-disk capacity refusal of the host
+    — the 507 `insufficient-disk`, or any class containing
+    `insufficient-space`? It cuts the host's earned disk ceiling.
+
+    A storage pool's own refusal is NOT one ([`is_pool_refusal`]): one
+    pool full or unmounted says nothing about the host's capacity.
 
     Miner-controlled, like every class: it can only move a failure from
     the host's SEV record to its (earned) disk ceiling — a cut to its OWN
     capacity — never mark a rival."""
     c = (classifier or "").strip().lower()[:_MAX_REASON]
     return c == "insufficient-disk" or DISK_REFUSAL_MARKER in c
+
+
+def is_pool_refusal(classifier: str) -> bool:
+    """Is a miner rejection class a storage pool's refusal —
+    `insufficient-disk:<pool>` or `pool-unavailable:<pool>`? Re-placed
+    like any refusal, never a SEV start failure, and it cuts no capacity
+    (per-pool capacity is the scheduler's own, later)."""
+    c = (classifier or "").strip().lower()[:_MAX_REASON]
+    return _POOL_REFUSAL.fullmatch(c) is not None
 
 
 def is_start_capability_failure(classifier: str) -> bool:
@@ -363,7 +383,7 @@ def is_start_capability_failure(classifier: str) -> bool:
     it. It can never mark a rival, and it can never buy `PROVEN`
     (`record_start_ok` is written from a 2xx, not from a string).
     """
-    if is_disk_refusal(classifier):
+    if is_disk_refusal(classifier) or is_pool_refusal(classifier):
         return False
     return (classifier or "").strip().lower()[:_MAX_REASON] not in (
         CLASSES_NOT_START_CAPABILITY
@@ -395,6 +415,11 @@ DEST_ACTIVATION_CLASSES_NOT_START_CAPABILITY = frozenset(
         "migration/staged-restore-conflict",
         "migration/restore-size-mismatch",
         "migration/restore-swap-conflict",
+        # The dest's launch was refused for disk — the host's or a storage
+        # pool's — or because its pool cannot take a disk now (draining,
+        # unmounted): `orders/migration.rs::dest_launch_failure`. No boot.
+        "migration/dest-insufficient-disk",
+        "migration/dest-pool-unavailable",
     }
 )
 DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY = (

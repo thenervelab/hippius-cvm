@@ -26,7 +26,7 @@ from .factories import (
     make_vm,
 )
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture(autouse=True)

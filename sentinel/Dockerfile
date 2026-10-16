@@ -3,7 +3,7 @@
 #
 # Built for linux/amd64 to match the RKE2 cluster (`docker buildx
 # build --platform linux/amd64 -t <YOUR_REGISTRY>/hippius-sentinel ...`).
-FROM python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b AS base
+FROM mirror.gcr.io/library/python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

@@ -60,3 +60,6 @@ sev = { version = "7.1", default-features = false, features = ["snp"] }
 # transitively — that footprint is unchanged here and out of scope.)
 [target.'cfg(target_os = "linux")'.dependencies]
 vsock = "0.5"
+
+[dev-dependencies]
+tempfile = "3"

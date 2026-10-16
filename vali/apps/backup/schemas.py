@@ -56,14 +56,35 @@ class BackupPolicySerializer(serializers.Serializer):
         help_text="Automatic failover would act for this VM now."
     )
     failover_auto_blocker = serializers.ChoiceField(
-        choices=["no-point", "region-backups-not-local", "disabled"],
+        choices=["no-point", "region-backups-not-local", "no-failover-peer", "disabled"],
         allow_null=True,
         help_text=(
             "Why it would not: `disabled` (the policy is off), "
             "`region-backups-not-local` (the VM's region keeps its backups in another "
-            "region; `auto` is refused there), `no-point` (no restorable backup of the "
+            "region; `auto` is refused there), `no-failover-peer` (no other miner in its "
+            "region could ever take it), `no-point` (no restorable backup of the "
             "current boot yet). Null when eligible."
         ),
+    )
+    failover_cross_generation = serializers.BooleanField(
+        help_text="A failover may restore the VM on another CPU generation of its region."
+    )
+    deferred_reason = serializers.ChoiceField(
+        choices=["vm-stopped", "first-full-deferred", "boot-in-progress"],
+        allow_null=True,
+        help_text=(
+            "Why no backup starts now although one is due: `vm-stopped` (nothing new to "
+            "copy while it is stopped; not a failure), `first-full-deferred` (the first "
+            "full waits for the guest to finish booting, at most 15 min), "
+            "`boot-in-progress` (after a start, resize or reboot, the next backup waits "
+            "the same way). Null when nothing is held back."
+        ),
+    )
+    deferred_since = serializers.DateTimeField(allow_null=True)
+    failover_cross_generation_warning = serializers.CharField(
+        allow_null=True,
+        help_text="Shown to the customer when that generation is older than the VM's: "
+        "software built for the newer CPU may crash there. Null otherwise.",
     )
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
@@ -112,6 +133,15 @@ class BackupRunSerializer(serializers.Serializer):
             "The run carries the KBS's signed checkpoint of its boot counter — what a "
             "rollback restore to it needs."
         )
+    )
+    boot_settled = serializers.BooleanField(
+        allow_null=True,
+        help_text=(
+            "True: the run was taken after the VM's boot had settled (the guest still "
+            "signalling VALI_BACKUP_BOOT_SETTLE_S after it began). Null: cannot be told — "
+            "a run from before this was recorded, or one taken when the wait's cap ran out "
+            "with no in-guest signal. Never false."
+        ),
     )
     created_at = serializers.DateTimeField()
     finished_at = serializers.DateTimeField(allow_null=True)

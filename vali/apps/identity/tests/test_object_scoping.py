@@ -73,7 +73,7 @@ from apps.orchestration.models import (
     MigrationState,
 )
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 ROOT_PRINCIPAL = "orchestration-root"
 

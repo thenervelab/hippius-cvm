@@ -6,17 +6,27 @@
 -- upstream. The origin host is the measured OpenResty config's, never
 -- the feed's; the feed only names the bucket and prefix.
 local cjson = require("cjson.safe")
+local cors = require("hippius_cdn.cors")
 local docs = require("hippius_cdn.docs")
 local mime = require("hippius_cdn.mime")
 local rules = require("hippius_cdn.rules")
 local limits = require("hippius_cdn.limits")
 local settings = require("hippius_cdn.settings")
+local site = require("hippius_cdn.site")
 local sigv4 = require("hippius_cdn.sigv4")
 local util = require("hippius_cdn.util")
 
 local M = {}
 
 local null = cjson.null
+
+-- The status the internal origin server gives an origin 404 that may fall
+-- back to the zone's index document (SPA): only the caching location's
+-- `error_page` for it sends the request to the fallback location, so a 404
+-- of any other request is passed on exactly as before. It is cached like a
+-- 404 (a minute) as an nginx error entry, which replays the error_page on a
+-- hit. Never sent to a client.
+M.SPA_MISSING = 469
 
 -- Answer without touching the cache or the origin: never billable.
 local function refuse(status)
@@ -165,14 +175,24 @@ local function signed_uri(var, zone_secrets, origin, uri)
     })
 end
 
-function M.access()
+-- `fallback`: the request is the SPA fallback of an origin 404 (the
+-- caching location's error_page sent it to its fallback location, with a
+-- fresh ngx.ctx): every check runs again on the current config, the zone's
+-- ceilings are not counted a second time, and the object is the zone's
+-- index document.
+local function prepare(fallback)
     local ctx, var = ngx.ctx, ngx.var
     local store = docs.get("config")
     if not store then
         return refuse(503)
     end
     local method = ngx.req.get_method()
-    if method ~= "GET" and method ~= "HEAD" then
+    -- A CORS preflight (OPTIONS with Origin and Access-Control-Request-
+    -- Method) is answered by the node for a zone with a policy: its 405
+    -- waits until the zone is known. Any other method is refused here.
+    local preflight = method == "OPTIONS" and var.http_origin ~= nil
+        and var.http_access_control_request_method ~= nil
+    if method ~= "GET" and method ~= "HEAD" and not preflight then
         return refuse(405)
     end
     local host = var.host
@@ -193,6 +213,12 @@ function M.access()
     end
     ctx.zone = zone_id
     local zone = store.doc.zones[zone_id]
+    local policy = store.cors and store.cors[zone_id]
+    if preflight and not policy then
+        -- As any other refused method: unattributed, as before CORS.
+        ctx.zone = nil
+        return refuse(405)
+    end
     if store.blocks.hosts[host] then
         return refuse(451)
     end
@@ -204,7 +230,7 @@ function M.access()
     end
     -- The zone's ceilings (per node): over one, new requests get 503.
     local lim = store.limits and store.limits[zone_id]
-    if lim then
+    if lim and not fallback then
         local ok, which = limits.admit(ngx.shared.hippius_limits, zone_id, lim, ngx.time())
         if not ok then
             if M.should_log_limit(zone_id, which, ngx.now()) then
@@ -228,13 +254,37 @@ function M.access()
     if path_blocked(store.blocks, zone_id, path) then
         return refuse(451)
     end
+    if preflight then
+        -- Answered here, never sent to the origin: a request for the
+        -- zone (it counted against its ceiling), with no billable bytes.
+        ctx.billable = true
+        ctx.preflight = cors.preflight_headers(policy, var.http_origin,
+            var.http_access_control_request_method, var.http_access_control_request_headers)
+        return ngx.exit(204)
+    end
     local settings_doc = type(zone.settings) == "table" and zone.settings or {}
     if var.scheme == "http" and settings_doc.redirect_https ~= false then
         ctx.billable = true
         ctx.redirect = true
         return ngx.redirect("https://" .. host .. var.request_uri, 301)
     end
-    local uri = M.origin_uri(zone.origin, path)
+    -- Static site / SPA: a directory path fetches the zone's index
+    -- document; a fallback fetches the index document at the root.
+    local site_doc = store.sites and store.sites[zone_id] or site.OFF
+    local object_path = site.object_path(site_doc, path)
+    if fallback then
+        if not site.falls_back(site_doc, path, object_path) then
+            -- The zone stopped falling back since this 404 was cached: it
+            -- is the 404 it was (billable, as the origin's 404 is).
+            ctx.billable = true
+            return ngx.exit(404)
+        end
+        object_path = site.fallback_path(site_doc)
+    end
+    if object_path ~= path and path_blocked(store.blocks, zone_id, object_path) then
+        return refuse(451)
+    end
+    local uri = M.origin_uri(zone.origin, object_path)
     if not uri then
         return refuse(404)
     end
@@ -253,9 +303,11 @@ function M.access()
         return refuse(503)
     end
     var.hippius_origin_uri = origin_uri
-    -- The zone's first matching cache rule, on the decoded path (none:
-    -- the defaults).
-    local decision = rules.decide(rules.match(store.rules and store.rules[zone_id], path))
+    ctx.object_path = object_path
+    -- The zone's first matching cache rule, on the decoded path of the
+    -- object fetched (none: the defaults). "/" and "/index.html" are one
+    -- object: one rule, one cache entry.
+    local decision = rules.decide(rules.match(store.rules and store.rules[zone_id], object_path))
     if M.client_headers_bypass(zone.origin, var) then
         decision.bypass, decision.skip_lookup = true, true
     end
@@ -267,9 +319,45 @@ function M.access()
     if decision.bypass then
         var.hippius_no_store = "1"
     end
-    var.hippius_cache_key = ngx.md5(util.cache_key_material(zone_id, store.purges[zone_id], path,
-        rules.query_key(decision.qs, var.args)))
+    -- The object's own key: a directory path and its index document, and
+    -- every SPA fallback, share the index document's entry (one copy,
+    -- purged with it). A request that may fall back is keyed apart (see
+    -- util.cache_key_material); the index document itself never is.
+    local spa = not fallback and site.falls_back(site_doc, path, object_path)
+    if spa then
+        var.hippius_spa = "1"
+    end
+    var.hippius_cache_key = ngx.md5(util.cache_key_material(zone_id, store.purges[zone_id], object_path,
+        rules.query_key(decision.qs, var.args), spa))
     ctx.billable = true
+end
+
+function M.access()
+    return prepare(false)
+end
+
+-- Rewrite phase of the fallback location. Only the main request belongs
+-- there: a subrequest shares the main request's variables, and the access
+-- phase (fallback_access) never runs for one, so it would fetch with
+-- whatever they hold. None should arrive (origin_status); one that did gets
+-- the 404 it was. For the main request, the per-request variables start
+-- over, as the customer location's `set` lines do.
+function M.fallback_rewrite()
+    if ngx.is_subrequest then
+        return ngx.exit(404)
+    end
+    local var = ngx.var
+    var.hippius_cache_key = ""
+    var.hippius_origin_uri = ""
+    var.hippius_origin_bytes = 0
+    var.hippius_zone = ""
+    var.hippius_edge_ttl = "default"
+    var.hippius_cache_bypass = ""
+    var.hippius_no_store = ""
+end
+
+function M.fallback_access()
+    return prepare(true)
 end
 
 -- Requests carrying Authorization or a cookie bypass the cache only for
@@ -328,8 +416,28 @@ function M.origin_ttl_header(edge, status, cache_control, expires, now)
     return seconds or settings.default_ttl
 end
 
+-- The internal origin server's status for an origin answer: an origin 404
+-- of a request that may fall back (`spa` is its X-Hippius-SPA, "1") becomes
+-- SPA_MISSING. Only on the main request's first slice, which always asks
+-- for a range from 0: every subrequest shares the main request's variables
+-- ($hippius_spa included), and none may be replaced by another object. A
+-- later slice asks for a later range; a background cache update asks for
+-- none ($slice_range is empty there). Never a 403 (a private bucket's
+-- AccessDenied) or a 5xx: those pass through.
+function M.origin_status(status, spa, range)
+    if status == 404 and spa == "1" and range ~= nil and range:find("^bytes=0%-") ~= nil then
+        return M.SPA_MISSING
+    end
+    return status
+end
+
 function M.origin_header_filter()
     local var = ngx.var
+    local status = M.origin_status(ngx.status, var.http_x_hippius_spa, var.http_range)
+    if status ~= ngx.status then
+        ngx.status = status
+        return
+    end
     local ttl = M.origin_ttl_header(var.http_x_hippius_edge_ttl or "default", ngx.status,
         var.upstream_http_cache_control, var.upstream_http_expires, ngx.time())
     if ttl then
@@ -380,6 +488,22 @@ function M.on_fleet_domain(host, store)
         and util.wildcard_of(host) == wildcard
 end
 
+local filter_headers
+
+-- The zone's CORS headers for this response (none without a policy).
+-- Computed per response, after the origin's headers were dropped: never
+-- stored in the cache.
+local function add_cors(ctx)
+    local store = ctx.zone and docs.get("config")
+    local policy = store and store.cors and store.cors[ctx.zone]
+    if not policy then
+        return
+    end
+    for name, value in pairs(cors.response_headers(policy, ngx.var.http_origin)) do
+        ngx.header[name] = value
+    end
+end
+
 function M.header_filter()
     -- Slice subrequests never reach the client: the main request is
     -- filtered once.
@@ -387,6 +511,24 @@ function M.header_filter()
         return
     end
     local ctx = ngx.ctx
+    if ctx.preflight then
+        ngx.header["X-Content-Type-Options"] = "nosniff"
+        ngx.header["Content-Type"] = nil
+        for name, value in pairs(ctx.preflight) do
+            ngx.header[name] = value
+        end
+        return
+    end
+    filter_headers(ctx)
+    add_cors(ctx)
+end
+
+-- The response headers but CORS (see header_filter).
+filter_headers = function(ctx)
+    -- Never seen by a client (the error_page catches it); a 404 if it were.
+    if ngx.status == M.SPA_MISSING then
+        ngx.status = 404
+    end
     -- The edge TTL the internal origin server set (stored with a cached
     -- response, so replayed on a HIT), read before the allowlist drops it.
     local stored_ttl = tonumber(ngx.header["X-Hippius-TTL"])
@@ -404,7 +546,7 @@ function M.header_filter()
         ngx.status = 200
         ngx.header["Content-Range"] = nil
         ngx.header["Content-Length"] = 0
-        ngx.header["Content-Type"] = mime.fallback(ngx.var.uri, nil)
+        ngx.header["Content-Type"] = mime.fallback(ctx.object_path or ngx.var.uri, nil)
         local d = ctx.decision
         ngx.header["Cache-Control"] = M.client_cache_control(d,
             d and type(d.edge) == "number" and d.edge or nil)
@@ -428,7 +570,7 @@ function M.header_filter()
     if ctx.redirect then
         return
     end
-    local t = mime.fallback(ngx.var.uri, ngx.header["Content-Type"])
+    local t = mime.fallback(ctx.object_path or ngx.var.uri, ngx.header["Content-Type"])
     if t then
         ngx.header["Content-Type"] = t
     end

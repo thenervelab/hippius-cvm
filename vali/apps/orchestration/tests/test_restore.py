@@ -6,7 +6,7 @@ module docstring there for the phases."""
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -385,6 +385,9 @@ def test_another_destination_needs_room_for_the_flavor(monkeypatch) -> None:
     vm = _golden_vm()
     run = _chain(vm)[-1]
     MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    # The VM was sold in FR, where the destination is.
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "FR"})
     monkeypatch.setattr(
         sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None)
     )
@@ -584,7 +587,7 @@ def test_a_grant_at_another_generation_is_not_the_commit(fx: FakeEffects, pwr: _
 def test_a_restore_onto_another_miner_moves_the_vm(
     fx: FakeEffects, pwr: _Power, monkeypatch
 ) -> None:
-    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest: None)
+    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, **kw: None)
     vm = _golden_vm()
     job = _start(vm, _chain(vm)[-1], dest_node_id="node-dst")
     job = _to_verifying(fx, pwr, job)
@@ -933,7 +936,7 @@ def test_a_restore_onto_another_miner_also_reclaims_the_source(
     fx: FakeEffects, pwr: _Power, monkeypatch
 ) -> None:
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest: None)
+    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, **kw: None)
     monkeypatch.setattr(
         effects,
         "dispatch_source_reclaim",
@@ -1221,6 +1224,10 @@ def test_the_backup_tick_starts_no_run_while_a_restore_is_in_flight(
     )
     monkeypatch.setattr(backup_service, "_probe_if_due", lambda policy, now: False)
     vm = _golden_vm()
+    # Booted long ago, its guest alive (the backup boot gate is not the point).
+    Vm.objects.filter(pk=vm.pk).update(
+        boot_started_at=timezone.now() - timedelta(days=1), guest_signal_at=timezone.now()
+    )
     BackupPolicy.objects.filter(vm=vm).update(full_required=True)
     job = _start(vm, _chain(vm)[-1])
     report = backup_service.BackupTickReport()
@@ -1568,3 +1575,229 @@ def test_a_stopping_tick_that_lost_to_a_cancel_stops_nothing(
     restore.cancel_restore(job=job, decided_by=make_service_client())
     assert restore.h_stopping(stale) is None
     assert pwr.stopped == []
+
+
+def test_an_operator_restore_onto_another_region_needs_the_override(monkeypatch) -> None:
+    from apps.orchestration.service import CrossRegion
+    from apps.scheduler import service as sched
+
+    vm = _golden_vm()
+    run = _chain(vm)[-1]
+    MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "DE"})
+    monkeypatch.setattr(sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None))
+    monkeypatch.setattr(
+        sched,
+        "host_resources_by_node",
+        lambda: {"d" * 64: sched.HostResources(64 * 1024, 8, 10**6, 64)},
+    )
+    over = CrossRegion("DE", "FR full for a week", "julien")
+    with pytest.raises(restore.RestoreError) as exc:
+        _start(vm, run, dest_node_id="node-dst")
+    assert exc.value.code == "no-eligible-miner", "in-region only without it"
+    with pytest.raises(restore.RestoreError) as exc:
+        _start(vm, run, cross_region=over)
+    assert exc.value.code == "bad-request", "an in-place restore never crosses"
+    job = _start(vm, run, dest_node_id="node-dst", cross_region=over)
+    assert (job.region, job.cross_region_override, job.cross_region_from) == ("DE", True, "FR")
+    assert job.cross_region_by == "julien"
+    assert job.authorization.evidence["cross_region"]["reason"] == "FR full for a week"
+
+
+def test_a_restored_vm_that_speaks_reads_settling_until_the_grace(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    """VM-08: committed at 10:34:13, `verifying` until 10:44:13 although the
+    VM was up. Now `settling` (usable) as soon as the restored guest speaks;
+    the original is still kept until the grace, and `done` comes after."""
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    assert job.state == MigrationState.DONE.value
+    assert restore.serialize(job)["phase"] == "verifying", "no signal since the commit"
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=job.finished_at + timedelta(seconds=5))
+    job.refresh_from_db()
+    view = restore.serialize(job)
+    assert view["phase"] == "settling"
+    assert view["outcome"] is None and view["finished_at"] is None, "not final yet"
+    assert view["committed_at"] is not None
+    assert job.source_reclaim_state == SourceReclaimState.PENDING.value, "the original is kept"
+    service.reclaim_migrated_sources()
+    job.refresh_from_db()
+    assert job.source_reclaim_state == SourceReclaimState.PENDING.value, "not before the grace"
+    Vm.objects.filter(pk=vm.pk).update(
+        guest_signal_at=job.finished_at + service._reclaim_liveness_grace() + timedelta(seconds=1)
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["phase"] == "done"
+
+
+def test_a_signal_from_before_the_commit_is_not_the_restored_guest(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=job.finished_at - timedelta(seconds=30))
+    job.refresh_from_db()
+    assert restore.serialize(job)["phase"] == "verifying"
+
+
+def test_a_restored_guest_that_spoke_once_and_hung_falls_back_to_verifying(
+    fx: FakeEffects, pwr: _Power, settings
+) -> None:
+    """One receipt, then silence: not `settling` once that signal is stale."""
+    settings.VALI_GUEST_LIVENESS_STALE_S = 60
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=timezone.now())
+    job.refresh_from_db()
+    assert restore.serialize(job)["phase"] == "settling"
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=timezone.now() - timedelta(seconds=120))
+    MigrationJob.objects.filter(pk=job.pk).update(
+        finished_at=timezone.now() - timedelta(seconds=180)
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["phase"] == "verifying"
+
+
+def test_a_cold_restore_reads_settling_once_its_guest_speaks(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    vm = _golden_vm()
+    Vm.objects.filter(pk=vm.pk).update(power_state=VmPowerState.STOPPED)
+    vm.refresh_from_db()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    assert job.cold
+    _grant(fx, job)
+    job = _advance(job)
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=timezone.now())
+    job.refresh_from_db()
+    view = restore.serialize(job)
+    assert (view["phase"], view["prior_power_state"]) == ("settling", "stopped")
+
+
+# ── VM-11: finished_at is the final phase, eta_s is recomputed ───────
+
+
+def test_finished_at_is_when_the_phase_became_final_not_the_commit(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    assert restore.serialize(job)["finished_at"] is None
+    # Committed an hour ago; the guest proved it runs past the grace: `done`,
+    # dated at that earliest instant — not the commit, and not the reclaim
+    # (which may run days later).
+    committed = timezone.now() - timedelta(hours=1)
+    MigrationJob.objects.filter(pk=job.pk).update(finished_at=committed)
+    final = committed + service._reclaim_liveness_grace()
+    Vm.objects.filter(pk=vm.pk).update(guest_signal_at=final + timedelta(seconds=5))
+    job.refresh_from_db()
+    view = restore.serialize(job)
+    assert view["phase"] == "done"
+    assert view["finished_at"] == final.isoformat(), "the final phase, not the commit"
+    assert view["committed_at"] is not None
+    MigrationJob.objects.filter(pk=job.pk).update(
+        source_reclaim_state=SourceReclaimState.RECLAIMED.value,
+        source_reclaim_at=committed + timedelta(days=5),
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["finished_at"] == final.isoformat(), "stable once shown"
+
+
+def test_a_restore_that_never_proves_it_runs_finished_when_vali_gave_up(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    gave_up = job.finished_at + timedelta(hours=6)
+    MigrationJob.objects.filter(pk=job.pk).update(
+        source_reclaim_state=SourceReclaimState.SKIPPED.value,
+        source_reclaim_reason="dest-unproven:dest-guest-not-alive-past-grace",
+        source_reclaim_at=gave_up,
+    )
+    job.refresh_from_db()
+    view = restore.serialize(job)
+    assert (view["phase"], view["finished_at"]) == ("failed", gave_up.isoformat())
+
+
+def test_a_reverted_restore_finishes_when_it_failed(fx: FakeEffects, pwr: _Power) -> None:
+    vm = _golden_vm()
+    job = _start(vm, _chain(vm)[-1])
+    ended = timezone.now()
+    MigrationJob.objects.filter(pk=job.pk).update(
+        state=MigrationState.FAILED.value, reverted=True, finished_at=ended
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["finished_at"] == ended.isoformat()
+
+
+def test_eta_s_is_recomputed_from_the_bytes_left_while_staging(
+    fx: FakeEffects, pwr: _Power
+) -> None:
+    vm = _golden_vm()
+    job = _start(vm, _chain(vm)[-1])
+    assert job.state == MigrationState.RESTORE_STAGING.value
+    total = 10 * 10**9
+    MigrationJob.objects.filter(pk=job.pk).update(
+        restore_eta_s=1000,
+        restore_bytes_total=total,
+        restore_bytes_done=0,
+        phase_started_at=timezone.now(),
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["eta_s"] == 1000, "no progress yet: the estimate"
+    # Half done in 100 s: 5 GB left at 50 MB/s, about 100 s — not the 1000 s
+    # estimated at creation.
+    MigrationJob.objects.filter(pk=job.pk).update(
+        restore_bytes_done=total // 2, phase_started_at=timezone.now() - timedelta(seconds=100)
+    )
+    job.refresh_from_db()
+    assert 95 <= restore.serialize(job)["eta_s"] <= 105
+    MigrationJob.objects.filter(pk=job.pk).update(restore_bytes_done=total)
+    job.refresh_from_db()
+    assert restore.serialize(job)["eta_s"] is None, "nothing left to download"
+    MigrationJob.objects.filter(pk=job.pk).update(
+        state=MigrationState.FAILED.value, finished_at=timezone.now()
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["eta_s"] is None, "final: nothing left"
+
+
+def test_a_done_job_is_never_dated_in_the_future(fx: FakeEffects, pwr: _Power) -> None:
+    """A VM destroyed inside the grace: final at its reclaim, not at a grace
+    that has not run out."""
+    vm = _golden_vm()
+    job = _to_verifying(fx, pwr, _start(vm, _chain(vm)[-1]))
+    _grant(fx, job)
+    job = _advance(job)
+    committed = timezone.now() - timedelta(seconds=60)
+    reclaimed = committed + timedelta(seconds=30)
+    MigrationJob.objects.filter(pk=job.pk).update(
+        finished_at=committed,
+        source_reclaim_state=SourceReclaimState.RECLAIMED.value,
+        source_reclaim_reason="vm-destroyed",
+        source_reclaim_at=reclaimed,
+    )
+    Vm.objects.filter(pk=vm.pk).update(state=VmState.DESTROYED)
+    job.refresh_from_db()
+    view = restore.serialize(job)
+    assert view["phase"] == "done"
+    assert view["finished_at"] == reclaimed.isoformat()
+    assert datetime.fromisoformat(view["finished_at"]) <= timezone.now()
+    # Before the reclaim tick stamps it: null, never a moving "now".
+    MigrationJob.objects.filter(pk=job.pk).update(
+        source_reclaim_state=SourceReclaimState.PENDING.value, source_reclaim_at=None
+    )
+    job.refresh_from_db()
+    assert restore.serialize(job)["finished_at"] is None

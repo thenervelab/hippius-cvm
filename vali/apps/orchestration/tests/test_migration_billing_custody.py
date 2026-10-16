@@ -28,7 +28,7 @@ from apps.scheduler.models import VmBillingAssignment, VmBillingBinding
 from .conftest import FakeEffects
 from .factories import make_service_client, make_vm
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 SRC_NODE = "aa" * 32
 DST_NODE = "bb" * 32

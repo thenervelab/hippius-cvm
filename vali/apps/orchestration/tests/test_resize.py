@@ -56,6 +56,7 @@ from .factories import make_service_client, make_vm
 
 pytestmark = [
     pytest.mark.django_db,
+    pytest.mark.usefixtures("located_fr"),
 ]
 
 HOST = "miner-a"

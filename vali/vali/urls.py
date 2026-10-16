@@ -11,6 +11,10 @@ PR-vali-miner-register: `/v1/admin/miner/...` (miner-fleet registry).
 
 from __future__ import annotations
 
+import functools
+import logging
+
+from django.conf import settings
 from django.contrib import admin
 from django.http import HttpRequest, JsonResponse
 from django.urls import include, path
@@ -28,10 +32,43 @@ def healthz(_request: HttpRequest) -> JsonResponse:
     """Cheap liveness probe.
 
     Intentionally NOT authenticated — the load balancer needs to reach
-    it. Returns only a static literal; no DB, no validator, nothing
-    that could surface secrets through a 500.
+    it. No DB, no validator, nothing that could surface secrets through a
+    500: the image's commit (`VALI_GIT_SHA`, baked at build time) and the
+    newest migration each vali app ships, read once from the code on disk
+    (`_shipped_migrations`) — what a pin compares against, never the
+    applied state (that would put the database in the liveness path).
     """
-    return JsonResponse({"status": "ok"})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "version": settings.VALI_GIT_SHA,
+            "migrations": _shipped_migrations(),
+        }
+    )
+
+
+@functools.cache
+def _shipped_migrations() -> dict[str, str]:
+    """`{app_label: newest migration name}` of the vali apps (`apps.*`), from
+    the migration files in the image — no database. Cached for the process
+    (the code does not change under it)."""
+    from django.apps import apps as django_apps
+    from django.db.migrations.loader import MigrationLoader
+
+    ours = {
+        cfg.label for cfg in django_apps.get_app_configs() if cfg.name.startswith("apps.")
+    }
+    try:
+        leaves = MigrationLoader(None, ignore_no_migrations=True).graph.leaf_nodes()
+    except Exception:  # noqa: BLE001 — a cosmetic field never fails the probe
+        logging.getLogger(__name__).exception("healthz: cannot read the migration graph")
+        return {}
+    out: dict[str, str] = {}
+    for app, name in sorted(leaves):
+        if app in ours:
+            # Two leaves (an unmerged pair) read as both, never one silently.
+            out[app] = f"{out[app]}+{name}" if app in out else name
+    return out
 
 
 urlpatterns = [
@@ -55,6 +92,7 @@ urlpatterns = [
     path("v1/", include("apps.network.urls")),
     path("v1/", include("apps.backup.urls")),
     path("v1/", include("apps.cdn.urls")),
+    path("v1/", include("apps.disktier.urls")),
     # OpenAPI 3 API documentation (drf-spectacular). The schema + docs are
     # unauthenticated *documentation* (they describe the API shape; the
     # endpoints themselves stay auth-gated).

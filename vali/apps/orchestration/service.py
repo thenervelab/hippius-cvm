@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -174,6 +175,10 @@ def _activate_settle_by_unix(job: MigrationJob) -> int:
 
 
 _warned_activate_timeout: float | None = None
+#: `{vm_id: reason}` of the departing miners' VMs the drain could not move
+#: on its last pass (`region-unknown`, or no destination in their region):
+#: logged at ERROR when the reason first appears or changes.
+_drain_stuck: dict[str, str] = {}
 
 
 def _warn_if_activate_timeout_too_small() -> None:
@@ -304,9 +309,9 @@ def _has_active_job(
     vm: Vm, *, ignore_resize: bool = False, ignore_guest_upgrade: bool = False
 ) -> bool:
     """True iff the VM already has an in-flight migration, decommission,
-    resize, or a guest upgrade that holds it (past `pending`; a pending
-    upgrade waits for its window and re-checks everything when it leaves
-    it — `apps.orchestration.guest_upgrade`).
+    resize, userdata restage, or a guest upgrade that holds it (past
+    `pending`; a pending upgrade waits for its window and re-checks
+    everything when it leaves it — `apps.orchestration.guest_upgrade`).
 
     Same-kind double-starts are closed at the database by each
     model's partial unique index. A cross-kind race (a migration and
@@ -334,6 +339,16 @@ def _has_active_job(
     if (
         not ignore_resize
         and ResizeJob.objects.filter(vm=vm).exclude(state__in=TERMINAL_RESIZE_STATES).exists()
+    ):
+        return True
+    # A userdata restage owns the VM's power state and launch record from
+    # its admission until its relaunch settles (`userdata_restage`).
+    from .models import TERMINAL_USERDATA_RESTAGE_PHASES, UserdataRestageJob
+
+    if (
+        UserdataRestageJob.objects.filter(vm=vm)
+        .exclude(phase__in=TERMINAL_USERDATA_RESTAGE_PHASES)
+        .exists()
     ):
         return True
     # A guest upgrade owns the VM's power state and launch record from the
@@ -451,6 +466,128 @@ def _reject_zombie_quarantined_dest(dest_node_id: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class CrossRegion:
+    """An operator's explicit cross-region move: the region it moves the VM
+    TO, and why. Only the operator paths take one (POST migrate / restore /
+    failover, the operator drain); every automatic path stays in-region."""
+
+    region: str
+    reason: str
+    #: The person who decided it: the API credential is a shared service
+    #: principal, so `decided_by` alone does not name anyone.
+    operator: str = ""
+
+
+_FREE_TEXT_RE = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
+
+
+def parse_cross_region(
+    allow: Any, region: Any, reason: Any, operator: Any = None
+) -> CrossRegion | None:
+    """`allow_cross_region` + `region` + `reason` + `operator` from an
+    operator body: `None` when the override is not asked; raises
+    `ValueError` (a 400) on a malformed one. With it, `region` NAMES the
+    destination region, and a free-text `reason` and the deciding
+    `operator` are required (no control characters: they reach the logs)."""
+    if allow is None or allow is False:
+        if reason not in (None, "") or operator not in (None, ""):
+            raise ValueError("reason and operator apply to allow_cross_region only")
+        return None
+    if allow is not True:
+        raise ValueError("allow_cross_region must be a boolean")
+    if not isinstance(region, str) or not re.fullmatch(r"[A-Za-z]{2}", region.strip()):
+        raise ValueError(
+            "allow_cross_region needs region: the destination region, an ISO 3166-1 "
+            "alpha-2 country code"
+        )
+    if not isinstance(reason, str) or not _FREE_TEXT_RE.fullmatch(reason.strip() or "\x00"):
+        raise ValueError("allow_cross_region needs a reason (1..256 printable characters)")
+    if not isinstance(operator, str) or not _FREE_TEXT_RE.fullmatch(operator.strip() or "\x00"):
+        raise ValueError(
+            "allow_cross_region needs operator: who decided it (1..256 printable characters)"
+        )
+    return CrossRegion(
+        region=region.strip().upper(), reason=reason.strip(), operator=operator.strip()
+    )
+
+
+class NotDeparting(Exception):
+    """The operator drain was asked for a miner that is not leaving."""
+
+
+def move_region(vm: Vm, stated: str = "") -> tuple[str, bool]:
+    """The region a §25 move keeps the VM in: vali's
+    (`sched.move_region_for_vm`), or — only when vali cannot tell — the one
+    the operator states. A stated region that differs from the known one is
+    refused: never a way to move a VM to another country. Returns `(region,
+    stated_by_operator)`; `""` when neither is known."""
+    from apps.scheduler import service as sched
+
+    known = sched.move_region_for_vm(vm)
+    stated = (stated or "").strip().upper()
+    if not stated:
+        return known, False
+    if known and stated != known:
+        raise StartError(
+            f"the vm is in region {known}; a migration keeps it there", "region-conflict"
+        )
+    return stated, not known
+
+
+def _reject_cross_region_dest(dest_node_id: str, region: str) -> None:
+    """Refuse a §25 destination outside the VM's region — or anywhere, when
+    the region cannot be told (`region-unknown`; an operator may state it).
+    The destination's region is its current placeable location
+    (`sched.region_by_node`): a miner not located now is in no region."""
+    from apps.miners.models import MinerIdentity
+    from apps.scheduler import service as sched
+
+    if not region:
+        raise StartError(
+            "the vm's region cannot be told (no launch region, and its host was never "
+            "located): refusing a destination that could be in another region — state "
+            "`region` to move it",
+            "region-unknown",
+        )
+    chain_node_id = (
+        MinerIdentity.objects.filter(miner_id=dest_node_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    dest_region = sched.region_by_node().get((chain_node_id or "").lower(), "")
+    if dest_region != region:
+        raise StartError(
+            f"destination {dest_node_id!r} is in region {dest_region or 'unknown'}, "
+            f"the vm's is {region}",
+            "cross-region",
+        )
+
+
+def _reject_failover_incapable_dest(vm: Vm, dest_node_id: str) -> None:
+    """A VM launched `require_failover_peer` moves only to a host with a
+    failover peer (gate (m)): `no-failover-capable-host` otherwise."""
+    from apps.miners.models import MinerIdentity
+    from apps.scheduler import service as sched
+
+    if not sched.launch_requires_failover_peer(vm.vm_id):
+        return
+    chain_node_id = (
+        MinerIdentity.objects.filter(miner_id=dest_node_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    pinned = bool(sched._launch_spec(vm.vm_id).get("measurement_hex"))
+    if (chain_node_id or "").lower() not in sched.failover_capable_node_ids(
+        same_generation=pinned
+    ):
+        raise StartError(
+            f"destination {dest_node_id!r} has no failover peer and the vm was launched "
+            "require_failover_peer",
+            "no-failover-capable-host",
+        )
+
+
 def _reject_cordoned_dest(dest_node_id: str) -> None:
     """Refuse an EXPLICIT §25 destination the operator has cordoned
     (`MinerCapacity.cordoned_at`): a cordoned miner takes no new work, and
@@ -536,8 +673,17 @@ def start_migration(
     decided_by: Any,
     cold: bool = False,
     resize_to_flavor: str = "",
+    region: str = "",
+    cross_region: CrossRegion | None = None,
+    failover_peer_exempt: bool = False,
 ) -> MigrationJob:
     """Create a §25 `MigrationJob` in `Draining`. Raises `StartError`.
+
+    The destination is in the VM's region, always (`move_region`): `region`
+    is the one an operator states for a VM whose region vali cannot tell,
+    recorded on the job; a different known region is `region-conflict`.
+    `cross_region` (an operator's override, never an automatic path) moves
+    it to the region it names instead, recorded with its reason.
 
     `cold=True` migrates a tenant-STOPPED VM: the job starts in
     `SourceStarting` (the VM is started on its source until its guest proves
@@ -597,6 +743,26 @@ def start_migration(
             "boots a different SNP measurement and the KBS would refuse the KEK",
             "cross-gen",
         )
+    # Never another region — nor anywhere when the VM's cannot be told: a
+    # destination not located now is in no region (unlike gate (e) below,
+    # absence of evidence refuses here).
+    if cross_region is None:
+        region, region_stated = move_region(vm, region)
+        cross_from = ""
+    else:
+        from apps.scheduler import service as sched
+
+        region, region_stated = cross_region.region, True
+        cross_from = sched.move_region_for_vm(vm)
+        if cross_from == region:
+            raise StartError(
+                f"the vm is already in region {region}: no cross-region override needed",
+                "not-cross-region",
+            )
+    _reject_cross_region_dest(dest_node_id, region)
+    if not failover_peer_exempt:
+        # Only the graceful-exit drain is exempt: in-region, peer or not.
+        _reject_failover_incapable_dest(vm, dest_node_id)
     # §23 gate (e) at §25 INTAKE — refuse a destination vali has OBSERVED
     # fail to start a confidential guest.
     #
@@ -695,6 +861,12 @@ def start_migration(
             Vm.objects.select_for_update().filter(pk=vm.pk).first()
             if _has_active_job(vm, ignore_resize=bool(resize_to_flavor)):
                 raise StartError("vm already has an in-flight orchestration job", "job-in-flight")
+            # Its own stop/start bypass the power API's launch check
+            # (`by_migration`): a launch in flight now would race them.
+            from .services import power as _power
+
+            if _power.launch_in_flight(vm):
+                raise StartError("vm has a launch job in flight", "job-in-flight")
             job = MigrationJob.objects.create(
                 job_id=secrets.token_hex(16),
                 vm=vm,
@@ -710,6 +882,12 @@ def start_migration(
                 decided_by=decided_by,
                 cold=cold,
                 resize_to_flavor=resize_to_flavor,
+                region=region,
+                region_stated_by_operator=region_stated,
+                cross_region_override=cross_region is not None,
+                cross_region_from=cross_from,
+                cross_region_reason=cross_region.reason if cross_region else "",
+                cross_region_by=cross_region.operator if cross_region else "",
             )
             # The EOL nonce is PRESERVED (see the precondition above): the
             # launch-baked `Vm.eol_nonce` is exactly what the source guest
@@ -726,6 +904,18 @@ def start_migration(
         job.source_gen,
         job.new_gen,
     )
+    if cross_region is not None:
+        log.warning(
+            "CROSS-REGION migration by operator: job=%s vm=%s %s→%s (%s) by %s via %s — %s",
+            job.job_id,
+            vm.vm_id,
+            cross_from or "unknown",
+            region,
+            dest_node_id,
+            cross_region.operator,
+            getattr(decided_by, "name", decided_by),
+            cross_region.reason,
+        )
     return job
 
 
@@ -1214,7 +1404,13 @@ def sweep_stale_pending_placements() -> tuple[int, int]:
 _GRACEFUL_DEPARTURE_STATUSES = ("quarantined", "decommissioned")
 
 
-def enroll_departing_miner_migrations() -> int:
+def enroll_departing_miner_migrations(
+    *,
+    only_node: str = "",
+    cross_region: CrossRegion | None = None,
+    decided_by: Any = None,
+    report: dict[str, str] | None = None,
+) -> int:
     """Auto-create a warm §25 `MigrationJob` for every Active VM still
     bound to a miner that has gone Quarantined/Decommissioned on-chain.
 
@@ -1236,8 +1432,15 @@ def enroll_departing_miner_migrations() -> int:
     Returns the number of migrations enrolled this call.
 
     Enrols nothing while `VALI_MIGRATION_AUTO_ENROL_ENABLED` is off.
+
+    The operator drain (`POST /v1/admin/miner/<id>/drain`) runs one pass for
+    one departing miner (`only_node`, its chain node id), switch or not, as
+    `decided_by`; with an operator's `cross_region` its VMs go to the region
+    it names. `report` collects `{vm_id: reason}` of the VMs it could not
+    move. The automatic tick passes none of these: it never leaves a VM's
+    region.
     """
-    if not getattr(settings, "VALI_MIGRATION_AUTO_ENROL_ENABLED", True):
+    if not only_node and not getattr(settings, "VALI_MIGRATION_AUTO_ENROL_ENABLED", True):
         return 0
     # Local imports: the scheduler app + identity model are only needed
     # here; a module-level import would couple orchestration to scheduler
@@ -1255,6 +1458,8 @@ def enroll_departing_miner_migrations() -> int:
     try:
         snapshot = chain.read_miner_status()
     except chain.ChainReadUnavailable:
+        if only_node:
+            raise  # the operator is told (503), never "nothing to do"
         return 0
 
     from apps.miners.models import MinerIdentity, MinerStatus
@@ -1276,7 +1481,13 @@ def enroll_departing_miner_migrations() -> int:
         .values_list("chain_node_id", flat=True)
         if nid
     }
+    if only_node:
+        if only_node not in departing:
+            raise NotDeparting(only_node)
+        departing &= {only_node}
     if not departing:
+        if not only_node:
+            _drain_stuck.clear()
         return 0
 
     sched.refresh_miner_capacity(snapshot)
@@ -1294,6 +1505,10 @@ def enroll_departing_miner_migrations() -> int:
     )
 
     enrolled = 0
+    stuck: dict[str, str] = {}
+    # Why the others were left this pass — only reported to an operator's
+    # drain (an in-flight job is normal, not an ERROR).
+    skipped: dict[str, str] = {}
     # Gate (f) input, built ONCE per tick and only if some departing VM
     # was launched with a region: most ticks enrol nothing region-bound,
     # and the map is one query per VM otherwise.
@@ -1306,10 +1521,13 @@ def enroll_departing_miner_migrations() -> int:
     for placement in bound:
         vm = placement.vm
         if vm.state != VmState.ACTIVE:
+            skipped[vm.vm_id] = f"vm-{vm.state}"
             continue
         if vm.power_state not in (VmPowerState.RUNNING, VmPowerState.STOPPED):
+            skipped[vm.vm_id] = f"power-{vm.power_state}"
             continue  # a power op in flight — next tick
         if is_cdn_vm(vm.vm_id):
+            skipped[vm.vm_id] = "cdn-node"
             continue  # replaced by the CDN reconciler, never migrated
         # A STOPPED VM migrates COLD: started on its source for the warm
         # §25, stopped again at the destination (#1150) — but not again right
@@ -1324,14 +1542,32 @@ def enroll_departing_miner_migrations() -> int:
                 finished_at__gte=timezone.now() - _cold_retry_backoff(),
             ).exists()
         ):
+            skipped[vm.vm_id] = "cold-retry-backoff"
             continue
         if _has_active_job(vm):
+            skipped[vm.vm_id] = "job-in-flight"
             continue
         # The region the VM was sold in. An auto-migration is the one path
         # where nobody is watching the destination get chosen, so it is
         # exactly where a "FR" VM would otherwise quietly end up in "DE".
-        region = sched.launch_region_for_vm(vm.vm_id)
-        if region and region_map is None:
+        # Unknown means nowhere: the VM waits for its host's location (or an
+        # operator's migration naming its region), never lands elsewhere.
+        # Only an operator's drain carries a `cross_region`.
+        region = (
+            cross_region.region
+            if cross_region is not None
+            else sched.move_region_for_vm(vm, from_node=placement.miner_node_id)
+        )
+        if not region:
+            stuck[vm.vm_id] = "region-unknown"
+            _drain_report_stuck(
+                vm.vm_id,
+                placement.miner_node_id,
+                "region-unknown",
+                "its region cannot be told (no launch region, host never located)",
+            )
+            continue
+        if region_map is None:
             region_map = sched.region_by_node()
         # (Golden VMs are auto-migrated too now — the golden intake guard was
         # lifted once the golden guest ack was proven to deliver; §25 quiesce +
@@ -1349,6 +1585,10 @@ def enroll_departing_miner_migrations() -> int:
                 max_family_per_node=sched.cdn_family_cap(placement.vm_family),
                 **sched.cdn_edge_arguments(placement.vm_family, vm.vm_id),
                 **sched.group_arguments(vm.vm_id),
+                # No gate (m): a `require_failover_peer` VM leaving a
+                # departing miner moves in-region even without a peer, rather
+                # than staying stranded (logged below; its policy then reads
+                # `no-failover-peer`).
                 max_epoch_lag=sched.max_epoch_lag(),
                 # Exclude the departing source AND every cross-generation
                 # candidate (a cross-gen dest fails the KBS release, §25).
@@ -1356,7 +1596,7 @@ def enroll_departing_miner_migrations() -> int:
                 | _cross_gen_chain_ids(placement.miner_node_id, dispatchable),
                 dispatchable=dispatchable,
                 region=region,
-                region_by_node=region_map if region else None,
+                region_by_node=region_map,
                 weights=SelectionWeights.from_settings(),
                 max_host_share=sched.max_host_share(),
                 price_by_node=sched.price_by_node(snapshot),
@@ -1390,7 +1630,10 @@ def enroll_departing_miner_migrations() -> int:
                     ),
                 ),
             )
-        except PlacementError:
+        except PlacementError as exc:
+            reason = exc.category or "no-destination"
+            stuck[vm.vm_id] = reason
+            _drain_report_stuck(vm.vm_id, placement.miner_node_id, reason, exc.message)
             continue
         # `decide_placement` returns a chain `node_id`, but `start_migration`
         # + the downstream dispatch/KBS release all key on the human
@@ -1402,12 +1645,33 @@ def enroll_departing_miner_migrations() -> int:
         try:
             dest_miner_id = MinerIdentity.objects.get(chain_node_id=dest).miner_id
         except MinerIdentity.DoesNotExist:
+            skipped[vm.vm_id] = "destination-unresolvable"
             continue
         try:
-            job = start_migration(vm=vm, dest_node_id=dest_miner_id, decided_by=system, cold=cold)
-        except StartError:
+            requires_peer = sched.launch_requires_failover_peer(vm.vm_id)
+            job = start_migration(
+                vm=vm,
+                dest_node_id=dest_miner_id,
+                decided_by=decided_by or system,
+                cold=cold,
+                # Only an operator's drain carries one.
+                **({"cross_region": cross_region} if cross_region is not None else {}),
+                **({"failover_peer_exempt": True} if requires_peer else {}),
+            )
+        except StartError as exc:
+            reason = f"refused:{exc.category}"
+            stuck[vm.vm_id] = reason
+            _drain_report_stuck(vm.vm_id, placement.miner_node_id, reason, exc.message)
             continue
         enrolled += 1
+        if requires_peer and dest.lower() not in sched.failover_capable_node_ids():
+            log.warning(
+                "§25 graceful-exit: vm %s moved without failover peer: %s has none in its "
+                "region (it was launched require_failover_peer; its policy now reads "
+                "no-failover-peer)",
+                vm.vm_id,
+                dest,
+            )
         log.warning(
             "§25 graceful-exit migration enrolled: vm=%s %s→%s job=%s",
             vm.vm_id,
@@ -1415,7 +1679,28 @@ def enroll_departing_miner_migrations() -> int:
             dest,
             job.job_id,
         )
+    if report is not None:
+        report.update(skipped)
+        report.update(stuck)
+    if only_node:
+        return enrolled
+    # Only what this pass saw: a VM moved, gone or unstuck is forgotten.
+    _drain_stuck.clear()
+    _drain_stuck.update(stuck)
     return enrolled
+
+
+def _drain_report_stuck(vm_id: str, node_id: str, reason: str, detail: str) -> None:
+    """A departing miner's VM the drain cannot move: ERROR when the reason
+    first appears or changes, not every tick."""
+    if _drain_stuck.get(vm_id) != reason:
+        log.error(
+            "§25 graceful-exit: vm %s on departing %s NOT migrated (%s) — %s",
+            vm_id,
+            node_id,
+            reason,
+            detail,
+        )
 
 
 # ─── reboot-recovery — relaunch a down VM on its still-alive miner ────
@@ -2997,6 +3282,12 @@ def _reboot_recovery_relaunch(
         except EffectError as exc:
             log.warning("reboot-recovery: vm=%s userdata fetch failed: %s", vm.vm_id, exc)
             return False
+        # A restaged userdata (`userdata_restage`, M0 only) is delivered as
+        # staged. An M1/M2 VM is never restaged: its bytes are left as they
+        # are, so nothing skips its NetBird hardening.
+        verbatim = False
+        if getattr(vm, "key_mode", "hippius") == "hippius":
+            userdata, verbatim = launch.split_verbatim_userdata(userdata)
         try:
             spec = launch.LaunchSpec(
                 **{
@@ -3016,6 +3307,7 @@ def _reboot_recovery_relaunch(
                 },
                 kek_bytes=None,
                 userdata=userdata,
+                userdata_verbatim=verbatim,
             )
         except TypeError as exc:
             log.warning(
@@ -3236,6 +3528,13 @@ def tick_once() -> TickReport:
     except Exception:  # noqa: BLE001 — the resizes must not break the tick.
         log.exception("resize: unhandled error in tick")
 
+    # Userdata restages admitted by the API (`userdata_restage`): relaunch.
+    try:
+        from .userdata_restage import tick_userdata_restages
+
+        tick_userdata_restages()
+    except Exception:  # noqa: BLE001 — the restages must not break the tick.
+        log.exception("userdata restage: unhandled error in tick")
     # Guest upgrades (`guest_upgrade`, off unless VALI_GUEST_UPGRADE_ENABLED).
     try:
         from .guest_upgrade import tick_guest_upgrades
@@ -3428,6 +3727,16 @@ def tick_once() -> TickReport:
         _restore().reconcile_failover_quarantines()
     except Exception:  # noqa: BLE001 — the sweep must not break the tick.
         log.exception("failover: unhandled error in reappearance reconciliation")
+    try:
+        idempotency.purge_expired_throttled()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("idempotency: unhandled error in the expired-entry purge")
+    try:
+        from . import failover_auto
+
+        failover_auto.tick()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("failover-auto: unhandled error")
 
     # Public IPs: follow each attached VM's NetBird address, release the
     # addresses of VMs that are gone, and keep the edges' exit routing
@@ -3449,6 +3758,16 @@ def tick_once() -> TickReport:
         reconcile_net_policies()
     except Exception:  # noqa: BLE001 — the sweep must not break the tick.
         log.exception("net-policy: unhandled error in reconcile")
+
+    # Storage pools + dedicated disks: push each selected node its desired
+    # `storage-config` document and record the verdict. Inert unless
+    # VALI_STORAGE_CONFIG_PUSH.
+    try:
+        from apps.disktier.storage_config import reconcile as reconcile_storage_configs
+
+        reconcile_storage_configs()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("storage-config: unhandled error in reconcile")
 
     # The CDN fleet: launch, ready, drain and replace nodes per region.
     # Inert unless VALI_CDN_ENABLED and VALI_CDN_RECONCILE_ENABLED.
@@ -3549,6 +3868,26 @@ def _guarded(key: str, effect: Callable[[], None]) -> None:
             key,
             exc,
         )
+
+
+def _kbs_activate_stamped(job: MigrationJob, get_url: str) -> None:
+    """`effects.kbs_activate_dest`, with its attempt and its acknowledgement
+    stamped on the job itself: the failover
+    fence re-check decides "the KBS has moved" from these."""
+    now = timezone.now()
+    MigrationJob.objects.filter(id=job.id, kbs_activate_first_attempt_at__isnull=True).update(
+        kbs_activate_first_attempt_at=now
+    )
+    MigrationJob.objects.filter(id=job.id).update(kbs_activate_last_attempt_at=now)
+    effects.kbs_activate_dest(
+        job.vm,
+        dest_node_id=job.dest_node_id,
+        new_gen=job.new_gen,
+        get_url=get_url,
+    )
+    MigrationJob.objects.filter(id=job.id, kbs_activated_at__isnull=True).update(
+        kbs_activated_at=timezone.now(), kbs_activated_gen=job.new_gen
+    )
 
 
 def _mig_key(job: MigrationJob, step: str) -> str:
@@ -5702,15 +6041,14 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
                 key=job.snapshot_state_key,
                 ttl_seconds=_presign_ttl(),
             ).url
-    _guarded(
-        _mig_key(job, "dest-activating"),
-        lambda: effects.kbs_activate_dest(
-            job.vm,
-            dest_node_id=job.dest_node_id,
-            new_gen=job.new_gen,
-            get_url=get_url,
-        ),
-    )
+    if restoring or failing_over:
+        # Another SNP generation: its own digest, pinned before the KBS moves
+        # (`cross_gen`; a no-op for the same generation, and a failure here
+        # fails the job before anything moved).
+        from . import cross_gen
+
+        cross_gen.prepare_dest_measurement(job)
+    _guarded(_mig_key(job, "dest-activating"), lambda: _kbs_activate_stamped(job, get_url))
     if restoring and _restore().is_rollback(job):
         # A2 — arm the KBS for ONE release of the restored (earlier-boot)
         # disk, now that it holds `Migrating{new_gen, dest}` and BEFORE the
@@ -5801,6 +6139,11 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
                 settle_by_unix=_activate_settle_by_unix(job),
                 **({"staged_restore_id": job.restore_id} if restoring else {}),
                 **({"backup_chain": backup_chain} if failing_over else {}),
+                **(
+                    {"measurement_hex": job.dest_measurement_hex}
+                    if job.dest_measurement_hex
+                    else {}
+                ),
             ),
         )
     # Poll the dest's async restore. `running` ⇒ WAIT (timeout → fail closed,

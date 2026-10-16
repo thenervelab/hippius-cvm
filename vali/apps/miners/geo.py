@@ -791,24 +791,32 @@ def placeable_locations(*, now: datetime | None = None, verified_only: bool | No
 
 
 def last_known_countries(miner_ids: Any) -> dict[str, str]:
-    """`{miner_id: country_code}` from each miner's newest location verdict,
-    however OLD it is (`verified`, plus `unverified` unless
-    `VALI_GEO_REQUIRE_VERIFIED`). For naming where a VM was — a dead
-    miner's row goes stale by definition — never for placing anything:
-    placement reads `placeable_locations`."""
+    """`{miner_id: country_code}`: where each miner last was, however OLD
+    — the country of its newest `verified` verdict, which a downgrade never
+    clears (a miner that dies stops answering the probe and drops to
+    `unverified`; its region must not vanish with it). A current verdict that
+    counts as a region (`verified`, or `unverified` with
+    `VALI_GEO_REQUIRE_VERIFIED` off) wins, as it does for placement. For
+    naming where a VM is and fencing its failover to that region — never for
+    placing anything: placement reads `placeable_locations`."""
     from .models import MinerLocation
 
-    verdicts = [LocationVerdict.VERIFIED]
-    if not geo_require_verified():
-        verdicts.append(LocationVerdict.UNVERIFIED)
     ids = [m for m in miner_ids if m]
     if not ids:
         return {}
-    return {
-        str(miner_id): str(cc).upper()
-        for miner_id, cc in MinerLocation.objects.filter(
-            miner__miner_id__in=ids, verdict__in=verdicts
-        )
-        .exclude(country_code="")
-        .values_list("miner__miner_id", "country_code")
-    }
+    allow_unverified = not geo_require_verified()
+    out: dict[str, str] = {}
+    for miner_id, last_verified, cc, verdict in MinerLocation.objects.filter(
+        miner__miner_id__in=ids
+    ).values_list("miner__miner_id", "last_verified_country_code", "country_code", "verdict"):
+        if cc and (
+            verdict == LocationVerdict.VERIFIED
+            or (allow_unverified and verdict == LocationVerdict.UNVERIFIED)
+        ):
+            # The current verdict, when it counts as a region at all: the
+            # same answer placement gives (a miner that moved and is now
+            # unverified elsewhere, with verified not required, is THERE).
+            out[str(miner_id)] = str(cc).upper()
+        elif last_verified:
+            out[str(miner_id)] = str(last_verified).upper()
+    return out

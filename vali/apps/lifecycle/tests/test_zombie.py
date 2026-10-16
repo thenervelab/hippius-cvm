@@ -22,7 +22,7 @@ from apps.lifecycle.models import Vm, VmState, ZombieObservation
 from apps.miners.models import MinerIdentity, MinerStatus
 from apps.orchestration.models import DecommissionJob, DecommissionState
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture(autouse=True)

@@ -284,6 +284,94 @@ async fn a_net_policy_vector_is_signed_and_decodes_on_the_miner() {
     }
 }
 
+/// `storage-config`: the ticket-validator's encoded bodies from the shared
+/// vector are signed verbatim, forwarded under their kind, and verify and
+/// decode on the miner-agent side into its `StorageConfigOrder`.
+#[tokio::test]
+async fn a_storage_config_vector_is_signed_and_decodes_on_the_miner() {
+    use hippius_miner_agent::orders::types::{OrderBody, SignedOrder, StorageConfigOrder};
+    use hippius_miner_agent::orders::OrderVerifier;
+    use serde_bytes::ByteBuf;
+
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/storage_config_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let signer = test_signer();
+    let verifier =
+        OrderVerifier::from_hex(&hex::encode(signer.verifying_key().to_bytes())).unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(
+            signer.clone(),
+            forward,
+            "100.100.100.100:9700",
+            "storage-config",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}");
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1, "{name}");
+        assert_eq!(calls[0].kind, OrderKind::StorageConfig);
+        assert_eq!(calls[0].body, body, "{name}");
+        let signed = SignedOrder {
+            body: ByteBuf::from(calls[0].body.clone()),
+            sig: ByteBuf::from(calls[0].sig.to_vec()),
+        };
+        verifier.verify(&signed).unwrap();
+        let order: OrderBody<StorageConfigOrder> =
+            ciborium::de::from_reader(body.as_slice()).unwrap();
+        assert_eq!(order.order_id, vector["order_id"].as_str().unwrap());
+        assert_eq!(
+            order.payload.revision,
+            case["payload"]["revision"].as_u64().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            order.payload.pools.len(),
+            case["payload"]["pools"].as_array().unwrap().len(),
+            "{name}"
+        );
+    }
+}
+
+/// A `storage-config` refusal is a 422 with a short machine body naming
+/// the code and the pool (`{"code","pool"}`); the dashboard shows it, so
+/// the Edge must relay it unchanged.
+#[tokio::test]
+async fn a_storage_config_refusal_body_is_relayed_unchanged() {
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/storage_config_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let body = hex::decode(vector["cases"][0]["body_hex"].as_str().unwrap()).unwrap();
+    let refusal = br#"{"code":"pool-has-disks","pool":"hdd0"}"#.to_vec();
+    let mock = Arc::new(MockMinerForward::with_response(422, refusal.clone()));
+    let forward: Arc<dyn MinerForward> = mock.clone();
+    let (status, relayed) = post(
+        test_signer(),
+        forward,
+        "100.100.100.100:9700",
+        "storage-config",
+        body,
+    )
+    .await;
+    assert_eq!(status, 422);
+    assert_eq!(relayed, refusal);
+}
+
 /// `power-policy`: vali's encoded bodies from the shared vector are
 /// signed verbatim, forwarded under their kind, and verify and decode on
 /// the miner-agent side.

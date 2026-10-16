@@ -95,9 +95,10 @@ http {
     keepalive_requests 1000;
 
     # Only these origin statuses are cached, whatever Cache-Control says:
-    # an origin error or redirect never becomes a cached HIT.
+    # an origin error or redirect never becomes a cached HIT. After an SPA
+    # fallback, $upstream_status lists the first answer too ("469 : 200").
     map $upstream_status $hippius_no_cache {
-        ~^(200|206|404)$ 0;
+        "~^(469 : )?(200|206|404)$" 0;
         default 1;
     }
 
@@ -165,6 +166,9 @@ http {
             proxy_hide_header X-Accel-Buffering;
             proxy_hide_header X-Accel-Charset;
             proxy_hide_header X-Hippius-TTL;
+            # Also turns the origin 404 of a request that may fall back to
+            # the zone's index document (X-Hippius-SPA: 1) into 469, the
+            # status the caching location's error_page catches.
             header_filter_by_lua_block { require("hippius_cdn.router").origin_header_filter() }
 
             proxy_pass $hippius_s3_scheme://$hippius_s3_host$request_uri;
@@ -248,6 +252,9 @@ http {
             set $hippius_edge_ttl "default";
             set $hippius_cache_bypass "";
             set $hippius_no_store "";
+            # "1" when an origin 404 may be answered with the zone's index
+            # document (SPA fallback, router.access).
+            set $hippius_spa "";
             access_by_lua_block { require("hippius_cdn.router").access() }
             header_filter_by_lua_block { require("hippius_cdn.router").header_filter() }
             body_filter_by_lua_block { require("hippius_cdn.router").body_filter() }
@@ -264,13 +271,34 @@ http {
             # with a generic body).
             proxy_cache_valid 200 206 1h;
             proxy_cache_valid 404 1m;
+            # SPA fallback. The internal origin server answers 469 for the
+            # origin 404 of a request that may fall back ($hippius_spa), and
+            # only 469 has an error_page here: every other status, 403 and
+            # 5xx included, passes through untouched. nginx keeps an
+            # intercepted error as a cache entry (no body) for its
+            # proxy_cache_valid, and a hit replays the error_page, so the
+            # missing path is not asked again for a minute either way. That
+            # entry is stored even under bypass / edge_ttl 0: nginx stores an
+            # intercepted error before proxy_no_cache is ever read. Harmless:
+            # such a request skips the lookup, so nothing reads the entry, and
+            # the fallback's own response follows the index document's rule.
+            proxy_cache_valid 469 1m;
+            proxy_intercept_errors on;
+            error_page 469 = @hippius_spa_fallback;
             proxy_no_cache $hippius_no_cache $hippius_no_store;
             proxy_cache_bypass $hippius_cache_bypass;
             proxy_cache_revalidate on;
             proxy_cache_lock on;
             proxy_cache_lock_timeout 10s;
             proxy_cache_lock_age 30s;
-            proxy_cache_background_update on;
+            # No background update: nginx runs it as a subrequest, where
+            # $slice_range is empty, so it fetched the whole object without a
+            # Range and stored it under a key no lookup uses (#1581): the
+            # stale slices were never refreshed. Instead, the first request
+            # after expiry refreshes each slice it reads in the foreground, a
+            # conditional GET (proxy_cache_revalidate: a 304 when unchanged),
+            # and the requests meanwhile get the stale copy (updating).
+            proxy_cache_background_update off;
             proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
 
             # Misses go to the internal origin server (below), which fetches
@@ -285,9 +313,9 @@ http {
             proxy_set_header Connection "";
             proxy_set_header Range $slice_range;
             proxy_set_header X-Hippius-Edge-TTL $hippius_edge_ttl;
+            proxy_set_header X-Hippius-SPA $hippius_spa;
             proxy_connect_timeout 2s;
             proxy_read_timeout 35s;
-            proxy_intercept_errors off;
             proxy_redirect off;
 
             # Never let the origin steer nginx (internal redirects, rate,
@@ -318,6 +346,71 @@ http {
             proxy_hide_header Server;
             add_header X-Cache $upstream_cache_status always;
 
+            proxy_pass http://hippius_origin$hippius_origin_uri;
+        }
+
+        # The SPA fallback: an origin 404 the customer location's error_page
+        # sent here (same URI, same method, a fresh ngx.ctx). router
+        # .fallback_access checks the request again and fetches the zone's
+        # index document under its own cache key: the very entry a GET of
+        # /<index_document> uses, so a purge of it reaches every fallback,
+        # and the response, its Cache-Control included, is the index
+        # document's, with status 200. Everything from `slice` down is the
+        # customer location's (tests/run.sh checks they stay identical),
+        # without the error_page: a missing index document is a 404.
+        location @hippius_spa_fallback {
+            # Presigned URLs: critical only, as above.
+            error_log stderr crit;
+            # Not `set`: its rewrite runs for subrequests too, and would
+            # clear the variables they share with the main request.
+            rewrite_by_lua_block { require("hippius_cdn.router").fallback_rewrite() }
+            access_by_lua_block { require("hippius_cdn.router").fallback_access() }
+            header_filter_by_lua_block { require("hippius_cdn.router").header_filter() }
+            body_filter_by_lua_block { require("hippius_cdn.router").body_filter() }
+
+            slice 1m;
+            proxy_cache hippius_cache;
+            proxy_cache_key $hippius_cache_key$slice_range;
+            proxy_cache_methods GET HEAD;
+            proxy_cache_valid 200 206 1h;
+            proxy_cache_valid 404 1m;
+            proxy_no_cache $hippius_no_cache $hippius_no_store;
+            proxy_cache_bypass $hippius_cache_bypass;
+            proxy_cache_revalidate on;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 10s;
+            proxy_cache_lock_age 30s;
+            proxy_cache_background_update off;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+
+            proxy_method GET;
+            proxy_http_version 1.1;
+            proxy_pass_request_headers off;
+            proxy_pass_request_body off;
+            proxy_set_header Host $hippius_s3_host;
+            proxy_set_header Connection "";
+            proxy_set_header Range $slice_range;
+            proxy_set_header X-Hippius-Edge-TTL $hippius_edge_ttl;
+            proxy_connect_timeout 2s;
+            proxy_read_timeout 35s;
+            proxy_intercept_errors off;
+            proxy_redirect off;
+
+            proxy_ignore_headers X-Accel-Redirect X-Accel-Limit-Rate
+                                 X-Accel-Buffering X-Accel-Charset
+                                 Cache-Control Expires Set-Cookie Vary;
+            proxy_hide_header X-Accel-Redirect;
+            proxy_hide_header X-Accel-Expires;
+            proxy_hide_header X-Accel-Limit-Rate;
+            proxy_hide_header X-Accel-Buffering;
+            proxy_hide_header X-Accel-Charset;
+            proxy_hide_header Set-Cookie;
+            proxy_hide_header x-amz-request-id;
+            proxy_hide_header x-amz-id-2;
+            proxy_hide_header x-amz-version-id;
+            proxy_hide_header x-amz-server-side-encryption;
+            proxy_hide_header Server;
+            add_header X-Cache $upstream_cache_status always;
             proxy_pass http://hippius_origin$hippius_origin_uri;
         }
     }

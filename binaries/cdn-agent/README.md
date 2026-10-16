@@ -58,7 +58,18 @@ OpenResty only what it serves.
 - **Unseals** certificate keys and zone secrets in RAM and pushes them
   to OpenResty over the control socket. Nothing cleartext touches disk.
 - **Meters** every request into epoch-scoped counters and queues a
-  signed usage report every 60 s.
+  signed usage report every 60 s, and one more as soon as a new feed
+  revision is applied (pushed to OpenResty, not just received), so the
+  backend's purge status (`applied_revision`, which only moves forward)
+  follows within seconds instead of up to a minute. The feed revision is
+  fleet-wide, so this is bounded: at most one such report per 10 s (the
+  first after a quiet spell goes at once), and only into an empty queue
+  (a backlog means the backend is not taking reports; the next interval
+  report carries the revision).
+  It is an ordinary report (the next `seq`, the epoch's totals) on the
+  same `POST /api/cdn/node/usage/`: no other endpoint. The counters file
+  and the queue have one writer (`agent::Checkpointer`), so a periodic
+  persist never lands over a newer checkpoint.
 - Publishes the **readiness bits** behind `/__hippius/health` and the
   TLS-bound **SNP report** behind `/.well-known/hippius-attestation`.
 
@@ -205,6 +216,15 @@ Answer `2xx` when stored, and `409` when shared memory is empty (after
 an OpenResty restart): the agent then re-pushes everything. Push order
 is secrets, certs, config. `/__hippius/health` returns 200 only when
 `ready` is true **and** the canary object is served.
+
+A zone's `settings` reach OpenResty as the backend sent them, except the
+static-site keys (`index_document`, `spa_fallback`, `spa_fallback_exclude`,
+`src/site.rs`): a value that fails its check is turned off (an unusable
+index turns off both, an unusable exclude list turns off the fallback) and
+logged (`zone setting turned off: <zone>=<class>`); the zone serves.
+Its CORS policy (`cors`, `src/cors.rs`) likewise: an unusable policy is
+removed whole and logged, and the zone serves without CORS.
+A feed without them passes unchanged.
 
 Secret values are the unsealed plaintext, unchanged. `s3_credentials` is
 the backend's JSON `{"access_key_id", "secret"}` (plus `secret_access_key`,

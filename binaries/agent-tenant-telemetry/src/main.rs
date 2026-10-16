@@ -23,7 +23,9 @@ use hippius_agent_tenant_telemetry::config::Config;
 use hippius_agent_tenant_telemetry::error::Result;
 use hippius_agent_tenant_telemetry::establish::{establish, Established};
 use hippius_agent_tenant_telemetry::receipt_builder::ReceiptBuilder;
-use hippius_agent_tenant_telemetry::receipt_loop::{run_receipt_loop, unix_now, ReceiptLoopConfig};
+use hippius_agent_tenant_telemetry::receipt_loop::{
+    run_receipt_loop, unix_now, ReceiptLoopConfig, FIRST_RECEIPT_AFTER,
+};
 use hippius_agent_tenant_telemetry::receipt_queue::ReceiptQueue;
 use hippius_agent_tenant_telemetry::served_work::StaticServedWorkSource;
 use hippius_agent_tenant_telemetry::shutdown::{self, Shutdown};
@@ -95,14 +97,23 @@ fn run_receipts(cfg: &Config, established: &Established, shutdown: &Shutdown) ->
         cfg.node_id.clone(),
         cfg.resource_class.clone(),
         genesis,
-    );
+    )
+    // Disk evidence (`disk_io` counters, a probe VM's `disk_probe`):
+    // optional receipt keys, vali only records them.
+    .with_disk_evidence(Box::new(
+        hippius_agent_tenant_telemetry::disk_stats::SysDiskEvidence::new(cfg.vm_id.clone()),
+    ));
 
     // PR-E2.3 — the receipt queue is shared: this thread's receipt
     // loop fills it; the vsock pusher (its own thread) drains it to
     // the host miner-agent. Spawn the pusher BEFORE the loop so a
     // receipt is never built with nowhere to drain.
     let queue = Arc::new(Mutex::new(ReceiptQueue::new()));
-    let pusher = spawn_vsock_pusher(cfg, Arc::clone(&queue), shutdown.clone())?;
+    // The pusher stops on its OWN latch, not the signal: triggered once
+    // the loop has buffered its final receipt, so the last drain carries
+    // it (on the signal latch the pusher could drain before it).
+    let pusher_stop = Shutdown::manual();
+    let pusher = spawn_vsock_pusher(cfg, Arc::clone(&queue), pusher_stop.clone())?;
 
     // No challenge provisioned ⇒ the loop runs idle (a later refinement
     // wires the live Edge-pulled challenge source).
@@ -114,6 +125,7 @@ fn run_receipts(cfg: &Config, established: &Established, shutdown: &Shutdown) ->
 
     let loop_config = ReceiptLoopConfig {
         interval: Duration::from_secs(cfg.interval_secs),
+        first_interval: FIRST_RECEIPT_AFTER,
         ttl_secs: cfg.receipt_ttl_secs,
     };
 
@@ -127,12 +139,13 @@ fn run_receipts(cfg: &Config, established: &Established, shutdown: &Shutdown) ->
         &loop_config,
     );
 
-    // The receipt loop has ended — on a shutdown signal, or (defence
-    // in depth) an error. Latch shutdown unconditionally so the pusher
-    // thread observes it; its final drain then flushes the buffered
-    // receipts. The join is time-bounded so a wedged blocking vsock
-    // dial cannot stall the process (and its key-zeroizing exit).
+    // The receipt loop has ended — on a shutdown signal (after its final
+    // receipt), or (defence in depth) an error. Stop the pusher now: its
+    // final drain then flushes every buffered receipt, the last included.
+    // The join is time-bounded so a wedged blocking vsock dial cannot
+    // stall the process (and its key-zeroizing exit).
     shutdown.trigger();
+    pusher_stop.trigger();
     if let Some(handle) = pusher {
         join_pusher_bounded(handle);
     }

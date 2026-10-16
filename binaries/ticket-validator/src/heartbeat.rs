@@ -27,7 +27,8 @@
 //!     asid_capacity,asid_used[,cvm_disk_gb_budget,data_disk_total_gb,
 //!     data_disk_available_gb,staging_disk_available_gb[,snp_enabled,
 //!     cpus_offline,snp_launches_since_boot,df_flush_failures
-//!     [,agent_version]]]]}}` —
+//!     [,agent_version[,disk_pools,dedicated_disks,
+//!     storage_config_revision]]]]]}}` —
 //!     `graceful_exit_requested` is the `v2`..`v6` flag (always
 //!     emitted; `false` for a `v1` body, which never carries the key).
 //!     The four capacity keys are emitted ONLY for a `v3`+ body (raw
@@ -35,9 +36,11 @@
 //!     never carries them, so the consumer can tell "no declaration" from
 //!     "declared unknown". The four disk keys (GiB) are emitted ONLY for a
 //!     `v4`+ body, with the same `0` = unknown convention, the four
-//!     host-health keys ONLY for a `v5`/`v6` body (raw signed values), and
-//!     `agent_version` ONLY for a `v6` body (a checked
-//!     `[0-9A-Za-z._-]{1,32}` string).
+//!     host-health keys ONLY for a `v5`+ body (raw signed values),
+//!     `agent_version` ONLY for a `v6`+ body (a checked
+//!     `[0-9A-Za-z._-]{1,32}` string), and the three storage keys ONLY for
+//!     a `v7` body (the `hippius_types::storage_report::StorageReport`,
+//!     validated: pools 1..=4, dedicated disks 0..=24, both sorted by id).
 //!   - reject → `{"ok":false,"error_class":"<class>"}`
 //! - On a reject the body fields are **never** echoed — even a body
 //!   that decoded cleanly but failed a later gate yields only the
@@ -72,8 +75,10 @@ use hippius_types::cbor::assert_canonical;
 use hippius_types::heartbeat::{
     is_valid_agent_version, SignedMinerHeartbeat, DOMAIN, MAX_MINER_ID_LEN, SCHEMA_VERSION,
     SCHEMA_VERSION_AGENT_VERSION, SCHEMA_VERSION_CAPACITY, SCHEMA_VERSION_DISK,
-    SCHEMA_VERSION_GRACEFUL_EXIT, SCHEMA_VERSION_HOST_HEALTH, SIGNATURE_LEN,
+    SCHEMA_VERSION_GRACEFUL_EXIT, SCHEMA_VERSION_HOST_HEALTH, SCHEMA_VERSION_STORAGE,
+    SIGNATURE_LEN,
 };
+use hippius_types::storage_report::StorageReport;
 use serde::Serialize;
 
 /// Exit code on a validation outcome — accept OR reject. The JSON
@@ -85,10 +90,13 @@ const EXIT_INTERNAL: u8 = 1;
 /// line is emitted; NO JSON — the Django consumer parses stdout only.
 const EXIT_USAGE: u8 = 2;
 
-/// Hard cap on the `SignedMinerHeartbeat` envelope read from stdin. A
-/// heartbeat is tiny (ten small fields + a 64-byte signature); a
+/// Hard cap on the `SignedMinerHeartbeat` envelope read from stdin; a
 /// larger blob is rejected BEFORE any CBOR decode (parser hardening).
-const MAX_HEARTBEAT_BYTES: u64 = 4096;
+/// A `v1`..`v6` heartbeat is well under 1 KiB; a worst-case `v7` (4 pools
+/// and 24 dedicated disks, every string at its maximum) is about 9 KiB
+/// (`worst_case_v7_fits_the_cap`). vali's heartbeat view carries the same
+/// cap.
+const MAX_HEARTBEAT_BYTES: u64 = 16 * 1024;
 
 /// A canonical `v1` `MinerHeartbeat` body is exactly this many CBOR-map
 /// fields. A `v1` body with any extra or missing key is malformed.
@@ -117,12 +125,18 @@ const HEARTBEAT_FIELD_COUNT_V5: usize = HEARTBEAT_FIELD_COUNT_V4 + 4;
 /// A canonical `v6` body is the `v5` body plus `agent_version`.
 const HEARTBEAT_FIELD_COUNT_V6: usize = HEARTBEAT_FIELD_COUNT_V5 + 1;
 
+/// A canonical `v7` body is the `v6` body plus the storage report
+/// (`disk_pools`, `dedicated_disks`, `storage_config_revision`).
+const HEARTBEAT_FIELD_COUNT_V7: usize = HEARTBEAT_FIELD_COUNT_V6 + 3;
+
 /// The exact CBOR-map field count a body of `schema_version` must carry
-/// — 24 for `v6`, 23 for `v5`, 19 for `v4`, 15 for `v3`, 11 for `v2`, 10
-/// for every other (incl. `v1`). An unknown version gets the `v1` count
-/// here and fails closed at the schema gate after decode.
+/// — 27 for `v7`, 24 for `v6`, 23 for `v5`, 19 for `v4`, 15 for `v3`, 11
+/// for `v2`, 10 for every other (incl. `v1`). An unknown version gets the
+/// `v1` count here and fails closed at the schema gate after decode.
 fn expected_field_count(schema_version: i128) -> usize {
-    if schema_version == i128::from(SCHEMA_VERSION_AGENT_VERSION) {
+    if schema_version == i128::from(SCHEMA_VERSION_STORAGE) {
+        HEARTBEAT_FIELD_COUNT_V7
+    } else if schema_version == i128::from(SCHEMA_VERSION_AGENT_VERSION) {
         HEARTBEAT_FIELD_COUNT_V6
     } else if schema_version == i128::from(SCHEMA_VERSION_HOST_HEALTH) {
         HEARTBEAT_FIELD_COUNT_V5
@@ -166,6 +180,10 @@ mod error_class {
     /// A `v6` body's `agent_version` was empty, longer than 32 bytes, or
     /// outside `[0-9A-Za-z._-]`.
     pub const AGENT_VERSION_INVALID: &str = "agent_version_invalid";
+    /// A `v7` body's storage report was malformed: a pool or dedicated
+    /// disk with a bad id, state, size or code, a count out of range, an
+    /// unsorted list, or a key missing or extra inside an entry.
+    pub const STORAGE_INVALID: &str = "storage_invalid";
 }
 
 #[derive(clap::Args)]
@@ -238,6 +256,11 @@ struct HeartbeatBody {
     /// only after [`is_valid_agent_version`] accepts it.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_version: Option<String>,
+    /// `v7`-only storage report, flattened into the three keys
+    /// `disk_pools`, `dedicated_disks`, `storage_config_revision`. `None`
+    /// (ABSENT from the JSON) for every earlier version.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    storage: Option<StorageReport>,
 }
 
 /// `verify-heartbeat` entry point.
@@ -354,8 +377,8 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
     //    graceful-exit flag). `decode_body` has already enforced the
     //    version-correct field count, so a `v2`-versioned body with the
     //    `v1` field count (or vice-versa) was rejected `body_decode_failed`
-    //    before this point. `v3` (15 fields), `v4` (19), `v5` (23) and
-    //    `v6` (24) likewise. Any version outside {1, 2, 3, 4, 5, 6} fails
+    //    before this point. `v3` (15 fields), `v4` (19), `v5` (23),
+    //    `v6` (24) and `v7` (27) likewise. Any version outside {1..=7} fails
     //    closed here.
     if body.schema_version != SCHEMA_VERSION
         && body.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
@@ -363,6 +386,7 @@ fn verify(buf: &[u8], vk: &VerifyingKey) -> Result<HeartbeatBody, &'static str> 
         && body.schema_version != SCHEMA_VERSION_DISK
         && body.schema_version != SCHEMA_VERSION_HOST_HEALTH
         && body.schema_version != SCHEMA_VERSION_AGENT_VERSION
+        && body.schema_version != SCHEMA_VERSION_STORAGE
     {
         return Err(error_class::WRONG_SCHEMA_VERSION);
     }
@@ -439,7 +463,8 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
         u8::try_from(schema_version_raw).map_err(|_| error_class::BODY_DECODE_FAILED)?;
     // The flag is a `v2`+ field. For `v1` it is absent ⇒ `false`; for the
     // others it MUST be present and a CBOR bool.
-    let is_v6 = schema_version == SCHEMA_VERSION_AGENT_VERSION;
+    let is_v7 = schema_version == SCHEMA_VERSION_STORAGE;
+    let is_v6 = schema_version == SCHEMA_VERSION_AGENT_VERSION || is_v7;
     let is_v5 = schema_version == SCHEMA_VERSION_HOST_HEALTH || is_v6;
     let is_v4 = schema_version == SCHEMA_VERSION_DISK || is_v5;
     let is_v3 = schema_version == SCHEMA_VERSION_CAPACITY || is_v4;
@@ -486,6 +511,13 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
     } else {
         None
     };
+    // The storage report is `v7`-only. Its decoder is the one in
+    // `hippius-types`: exact key sets, ranges, charsets, order and counts.
+    let storage = if is_v7 {
+        Some(StorageReport::from_entries(&entries).map_err(|_| error_class::STORAGE_INVALID)?)
+    } else {
+        None
+    };
     Ok(HeartbeatBody {
         schema_version,
         domain: text_field(&entries, "domain")?,
@@ -513,6 +545,7 @@ fn decode_body(body: &[u8]) -> Result<HeartbeatBody, &'static str> {
         snp_launches_since_boot: host_health("snp_launches_since_boot")?,
         df_flush_failures: host_health("df_flush_failures")?,
         agent_version,
+        storage,
     })
 }
 
@@ -585,6 +618,7 @@ mod tests {
             disk: hippius_types::heartbeat::DiskDeclaration::default(),
             host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: Default::default(),
         }
     }
 
@@ -1106,6 +1140,246 @@ mod tests {
     /// The canonical `v3` body of [`kat_v3`] as raw map entries, with
     /// one key replaced/overridden — for forging bodies
     /// `MinerHeartbeat::canonical()` refuses to produce.
+    fn kat_storage() -> StorageReport {
+        use hippius_types::storage_report::{
+            DedicatedDiskReport, DedicatedDiskState, DiskPoolReport, PoolClass, PoolState,
+        };
+        StorageReport {
+            disk_pools: vec![DiskPoolReport {
+                id: "default".into(),
+                class: PoolClass::Nvme,
+                total_gb: 3_500,
+                available_gb: 2_900,
+                budget_gb: 3_000,
+                committed_gb: 400,
+                os_disks: true,
+                state: PoolState::Active,
+                error: String::new(),
+            }],
+            dedicated_disks: vec![DedicatedDiskReport {
+                id: "wwn-0x5000c500a1b2c3d4".into(),
+                size_mb: 17_166_336,
+                state: DedicatedDiskState::Assigned,
+                vm: "vm-1".into(),
+                error: String::new(),
+            }],
+            storage_config_revision: 3,
+        }
+    }
+
+    fn kat_v7() -> MinerHeartbeat {
+        let v6 = kat_v6();
+        kat_heartbeat().with_storage(
+            hippius_types::heartbeat::CapacityDeclaration {
+                cvm_cpu_budget: v6.cvm_cpu_budget,
+                cvm_memory_mb_budget: v6.cvm_memory_mb_budget,
+                asid_capacity: v6.asid_capacity,
+                asid_used: v6.asid_used,
+            },
+            v6.disk,
+            v6.host_health,
+            v6.agent_version,
+            kat_storage(),
+        )
+    }
+
+    fn v7_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
+        let v: Value = ciborium::de::from_reader(kat_v7().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        entries
+            .into_iter()
+            .filter_map(|(k, v)| match &k {
+                Value::Text(t) if t == key => value.clone().map(|nv| (k, nv)),
+                _ => Some((k, v)),
+            })
+            .collect()
+    }
+
+    const STORAGE_KEYS: [&str; 3] = ["disk_pools", "dedicated_disks", "storage_config_revision"];
+
+    #[test]
+    fn v7_heartbeat_verifies_and_carries_the_storage_report() {
+        let sk = SigningKey::from_bytes(&[0x71u8; 32]);
+        let envelope = signed_envelope(kat_v7().canonical().unwrap(), &sk);
+        let body = verify(&envelope, &sk.verifying_key()).unwrap();
+        assert_eq!(body.schema_version, 7);
+        assert_eq!(body.storage.as_ref(), Some(&kat_storage()));
+        let json = serde_json::to_value(&body).unwrap();
+        // Everything v6 carries is still there…
+        assert_eq!(json["agent_version"], "v1.2.3");
+        assert_eq!(json["data_disk_total_gb"], 3_500);
+        assert_eq!(json["df_flush_failures"], 3);
+        // …plus the storage report, flattened.
+        assert_eq!(json["storage_config_revision"], 3);
+        let pool = &json["disk_pools"][0];
+        assert_eq!(pool["id"], "default");
+        assert_eq!(pool["class"], "nvme");
+        assert_eq!(pool["state"], "active");
+        assert_eq!(pool["os_disks"], true);
+        assert_eq!(pool["committed_gb"], 400);
+        let disk = &json["dedicated_disks"][0];
+        assert_eq!(disk["id"], "wwn-0x5000c500a1b2c3d4");
+        assert_eq!(disk["state"], "assigned");
+        assert_eq!(disk["vm"], "vm-1");
+        assert_eq!(disk["size_mb"], 17_166_336);
+    }
+
+    #[test]
+    fn pre_v7_json_never_carries_the_storage_keys() {
+        let sk = SigningKey::from_bytes(&[0x72u8; 32]);
+        for hb in [
+            kat_heartbeat(),
+            kat_graceful_exit(),
+            kat_v3(),
+            kat_v4(),
+            kat_v5(),
+            kat_v6(),
+        ] {
+            let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+            let json =
+                serde_json::to_value(verify(&envelope, &sk.verifying_key()).unwrap()).unwrap();
+            let obj = json.as_object().unwrap();
+            for key in STORAGE_KEYS {
+                assert!(!obj.contains_key(key), "{key} leaked into a pre-v7 output");
+            }
+        }
+    }
+
+    #[test]
+    fn v7_body_missing_or_renaming_a_storage_key_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        for key in STORAGE_KEYS {
+            // Missing: the count gate.
+            let envelope = signed_envelope(forged_body(v7_entries_with(key, None)), &sk);
+            assert_eq!(
+                verify(&envelope, &sk.verifying_key()).unwrap_err(),
+                error_class::BODY_DECODE_FAILED,
+                "{key} missing",
+            );
+            // Renamed: same count, so the storage decoder catches it.
+            let mut entries = v7_entries_with(key, None);
+            entries.push((Value::Text(format!("{key}_x")), Value::Integer(0.into())));
+            let envelope = signed_envelope(forged_body(entries), &sk);
+            assert_eq!(
+                verify(&envelope, &sk.verifying_key()).unwrap_err(),
+                error_class::STORAGE_INVALID,
+                "{key} renamed",
+            );
+        }
+    }
+
+    #[test]
+    fn v7_malformed_storage_report_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x74u8; 32]);
+        for (key, bad) in [
+            ("disk_pools", Value::Array(Vec::new())),
+            ("disk_pools", Value::Integer(1.into())),
+            ("dedicated_disks", Value::Text("x".into())),
+            ("storage_config_revision", Value::Integer((-1).into())),
+            (
+                "disk_pools",
+                Value::Array(vec![Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text("default".into()),
+                )])]),
+            ),
+        ] {
+            let envelope = signed_envelope(forged_body(v7_entries_with(key, Some(bad))), &sk);
+            assert_eq!(
+                verify(&envelope, &sk.verifying_key()).unwrap_err(),
+                error_class::STORAGE_INVALID,
+                "{key}",
+            );
+        }
+    }
+
+    #[test]
+    fn v6_body_carrying_storage_keys_is_rejected() {
+        let sk = SigningKey::from_bytes(&[0x75u8; 32]);
+        let v: Value = ciborium::de::from_reader(kat_v7().canonical().unwrap().as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("not a map")
+        };
+        let entries: Vec<_> = entries
+            .into_iter()
+            .map(|(k, v)| match &k {
+                Value::Text(t) if t == "schema_version" => (k, Value::Integer(6.into())),
+                _ => (k, v),
+            })
+            .collect();
+        let envelope = signed_envelope(forged_body(entries), &sk);
+        assert_eq!(
+            verify(&envelope, &sk.verifying_key()).unwrap_err(),
+            error_class::BODY_DECODE_FAILED,
+        );
+    }
+
+    #[test]
+    fn v7_keeps_the_agent_version_gate() {
+        let sk = SigningKey::from_bytes(&[0x76u8; 32]);
+        let envelope = signed_envelope(
+            forged_body(v7_entries_with(
+                "agent_version",
+                Some(Value::Text("a b".into())),
+            )),
+            &sk,
+        );
+        assert_eq!(
+            verify(&envelope, &sk.verifying_key()).unwrap_err(),
+            error_class::AGENT_VERSION_INVALID,
+        );
+    }
+
+    /// Every count and every string of a `v7` heartbeat at its maximum.
+    #[test]
+    fn worst_case_v7_fits_the_cap() {
+        use hippius_types::storage_report::{
+            DedicatedDiskReport, DedicatedDiskState, DiskPoolReport, PoolClass, PoolState,
+            MAX_ASSIGNED_VM_ID_LEN, MAX_DEDICATED_DISKS, MAX_DEDICATED_DISK_ID_LEN, MAX_DISK_POOLS,
+            MAX_POOL_ID_LEN,
+        };
+        let err = "e".repeat(48);
+        let storage = StorageReport {
+            disk_pools: (0..MAX_DISK_POOLS)
+                .map(|i| DiskPoolReport {
+                    id: format!("{i}{}", "p".repeat(MAX_POOL_ID_LEN - 1)),
+                    class: PoolClass::Nvme,
+                    total_gb: u32::MAX,
+                    available_gb: u32::MAX,
+                    budget_gb: u32::MAX,
+                    committed_gb: u32::MAX,
+                    os_disks: true,
+                    state: PoolState::Unavailable,
+                    error: err.clone(),
+                })
+                .collect(),
+            dedicated_disks: (0..MAX_DEDICATED_DISKS)
+                .map(|i| DedicatedDiskReport {
+                    id: format!("wwn-{i:02}{}", "d".repeat(MAX_DEDICATED_DISK_ID_LEN - 6)),
+                    size_mb: u64::MAX,
+                    state: DedicatedDiskState::Assigned,
+                    vm: "v".repeat(MAX_ASSIGNED_VM_ID_LEN),
+                    error: err.clone(),
+                })
+                .collect(),
+            storage_config_revision: u64::MAX,
+        };
+        let mut hb = kat_v7();
+        hb.miner_id = "m".repeat(64);
+        hb.agent_version = "a".repeat(32);
+        hb.storage = storage;
+        let sk = SigningKey::from_bytes(&[0x77u8; 32]);
+        let envelope = signed_envelope(hb.canonical().unwrap(), &sk);
+        assert!(
+            (envelope.len() as u64) < MAX_HEARTBEAT_BYTES,
+            "worst-case v7 envelope is {} bytes",
+            envelope.len()
+        );
+        assert!(verify(&envelope, &sk.verifying_key()).is_ok());
+    }
+
     fn v3_entries_with(key: &str, value: Option<Value>) -> Vec<(Value, Value)> {
         let v: Value = ciborium::de::from_reader(kat_v3().canonical().unwrap().as_slice()).unwrap();
         let Value::Map(entries) = v else {
@@ -1488,8 +1762,8 @@ mod tests {
 
     #[test]
     fn wrong_schema_version_is_rejected() {
-        // A validly-signed 10-field body whose `schema_version` is 7 —
-        // an UNKNOWN version (not v1 through v6). 10 fields matches the
+        // A validly-signed 10-field body whose `schema_version` is 8 —
+        // an UNKNOWN version (not v1 through v7). 10 fields matches the
         // v1-count branch, so the body decodes cleanly and the failure
         // lands on the schema-version gate (not the count gate).
         let sk = SigningKey::from_bytes(&[6u8; 32]);
@@ -1510,7 +1784,7 @@ mod tests {
             (Value::Text("miner_id".into()), Value::Text("m".into())),
             (
                 Value::Text("schema_version".into()),
-                Value::Integer(7.into()),
+                Value::Integer(8.into()),
             ),
             (Value::Text("sequence".into()), Value::Integer(1.into())),
             (
@@ -1670,9 +1944,9 @@ mod tests {
     #[test]
     fn over_cap_envelope_is_body_too_large() {
         let sk = SigningKey::from_bytes(&[10u8; 32]);
-        // A 5000-byte `body` → an envelope past the 4096-byte cap.
+        // A 17000-byte `body` → an envelope past the 16 KiB cap.
         let envelope = SignedMinerHeartbeat {
-            body: vec![0u8; 5000],
+            body: vec![0u8; 17_000],
             sig: vec![0u8; SIGNATURE_LEN],
         }
         .canonical()

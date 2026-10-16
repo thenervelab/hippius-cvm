@@ -1,0 +1,88 @@
+{
+  "_comment": "storage-config order vectors: ticket-validator encode-order output (body_hex) and storage-config-digest (content_sha256) per payload, all under the same order_id/target/issued_at. The edge-gateway and miner-agent tests sign and decode body_hex. Drift = a wire change; do not update silently.",
+  "order_id": "sc-3",
+  "target_miner_id": "cc-test-miner",
+  "issued_at_unix": 1770000000,
+  "cases": [
+    {
+      "name": "full",
+      "payload": {
+        "revision": 3,
+        "not_after_unix": 1770086400,
+        "dry_run": false,
+        "pools": [
+          {
+            "id": "default",
+            "path": "/var/lib/hippius-miner",
+            "class": "nvme",
+            "budget_gb": 3000,
+            "os_disks": true,
+            "state": "active"
+          },
+          {
+            "id": "hdd0",
+            "path": "/srv/hdd0/hippius",
+            "class": "hdd",
+            "budget_gb": 16000,
+            "os_disks": false,
+            "state": "draining"
+          }
+        ],
+        "dedicated_disks": [
+          {
+            "id": "ata-ST18000NM000J_ZR5ABCDE",
+            "state": "draining"
+          },
+          {
+            "id": "wwn-0x5000c500a1b2c3d4",
+            "state": "active"
+          }
+        ]
+      },
+      "body_hex": "a6646b696e646e73746f726167652d636f6e66696766646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164a565706f6f6c7382a66269646764656661756c746470617468762f7661722f6c69622f686970706975732d6d696e657265636c617373646e766d6565737461746566616374697665686f735f6469736b73f5696275646765745f6762190bb8a662696464686464306470617468712f7372762f686464302f6869707069757365636c6173736368646465737461746568647261696e696e67686f735f6469736b73f4696275646765745f6762193e80676472795f72756ef4687265766973696f6e036e6e6f745f61667465725f756e69781a698160006f6465646963617465645f6469736b7382a2626964781a6174612d535431383030304e4d3030304a5f5a5235414243444565737461746568647261696e696e67a26269647677776e2d30783530303063353030613162326333643465737461746566616374697665686f726465725f69646473632d336e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572",
+      "content_sha256": "23bb7dea710bc79e7782e92cd65b158a6113e8f46d58bb631303840cf22302b0"
+    },
+    {
+      "name": "dry-run",
+      "payload": {
+        "revision": 4,
+        "not_after_unix": 1770086400,
+        "dry_run": true,
+        "pools": [
+          {
+            "id": "default",
+            "path": "/var/lib/hippius-miner",
+            "class": "ssd",
+            "budget_gb": 800,
+            "os_disks": true,
+            "state": "active"
+          }
+        ],
+        "dedicated_disks": []
+      },
+      "body_hex": "a6646b696e646e73746f726167652d636f6e66696766646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164a565706f6f6c7381a66269646764656661756c746470617468762f7661722f6c69622f686970706975732d6d696e657265636c6173736373736465737461746566616374697665686f735f6469736b73f5696275646765745f6762190320676472795f72756ef5687265766973696f6e046e6e6f745f61667465725f756e69781a698160006f6465646963617465645f6469736b7380686f726465725f69646473632d336e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572",
+      "content_sha256": "61035e99704c037c3cb2d4221caa4b3d9217a62e881f75ab5a87859ceb9cd7e8"
+    },
+    {
+      "name": "minimal",
+      "payload": {
+        "revision": 1,
+        "not_after_unix": 1770086400,
+        "dry_run": false,
+        "pools": [
+          {
+            "id": "default",
+            "path": "/var/lib/hippius-miner",
+            "class": "nvme",
+            "budget_gb": 3000,
+            "os_disks": true,
+            "state": "active"
+          }
+        ],
+        "dedicated_disks": []
+      },
+      "body_hex": "a6646b696e646e73746f726167652d636f6e66696766646f6d61696e76484950504955535f4d494e45525f4f524445525f5631677061796c6f6164a565706f6f6c7381a66269646764656661756c746470617468762f7661722f6c69622f686970706975732d6d696e657265636c617373646e766d6565737461746566616374697665686f735f6469736b73f5696275646765745f6762190bb8676472795f72756ef4687265766973696f6e016e6e6f745f61667465725f756e69781a698160006f6465646963617465645f6469736b7380686f726465725f69646473632d336e6973737565645f61745f756e69781a69800e806f7461726765745f6d696e65725f69646d63632d746573742d6d696e6572",
+      "content_sha256": "be9c2b96eddd56f6850d60d92eb055d40f33a12d88e3e4882a44d7f5bd291dd4"
+    }
+  ]
+}

@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod components;
+pub mod daemon;
 pub mod relay;
 pub mod resources;
 pub mod tick;

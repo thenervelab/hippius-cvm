@@ -208,6 +208,10 @@ pub enum OrderKind {
     /// A VM's guest-poweroff policy (`restart` | `stop`), applied by the
     /// miner in place; it answers `power-policy:<policy>`.
     PowerPolicy,
+    /// Host-wide desired storage document (pools, dedicated disks). Names
+    /// no VM; the miner answers `applied:<revision>:<sha256>` (or
+    /// `dry-run-ok:…`), or 422 with a closed refusal code.
+    StorageConfig,
 }
 
 impl OrderKind {
@@ -230,6 +234,7 @@ impl OrderKind {
             OrderKind::Restore => "restore",
             OrderKind::NetPolicy => "net-policy",
             OrderKind::PowerPolicy => "power-policy",
+            OrderKind::StorageConfig => "storage-config",
         }
     }
 
@@ -276,6 +281,8 @@ impl OrderKind {
             "net-policy" => Some(OrderKind::NetPolicy),
             // vali's `PATCH /v1/vm/<id>/power-policy` and its reconcile.
             "power-policy" => Some(OrderKind::PowerPolicy),
+            // vali's storage-config reconcile (dashboard-managed pools).
+            "storage-config" => Some(OrderKind::StorageConfig),
             _ => None,
         }
     }
@@ -993,6 +1000,13 @@ mod tests {
             OrderKind::PowerPolicy.max_order_body(),
             MAX_MINER_ORDER_BODY
         );
+        // Must match the miner-agent's `/v1/miner/order/storage-config`
+        // route (served from A1b on).
+        assert_eq!(OrderKind::StorageConfig.route_segment(), "storage-config");
+        assert_eq!(
+            OrderKind::StorageConfig.max_order_body(),
+            MAX_MINER_ORDER_BODY
+        );
     }
 
     #[test]
@@ -1010,6 +1024,7 @@ mod tests {
             ("migrate-snapshot", OrderKind::MigrateSnapshot),
             ("net-policy", OrderKind::NetPolicy),
             ("power-policy", OrderKind::PowerPolicy),
+            ("storage-config", OrderKind::StorageConfig),
         ] {
             assert_eq!(OrderKind::from_header(text), Some(expected));
         }

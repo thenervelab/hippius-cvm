@@ -76,6 +76,8 @@ fn expected(seq: u64) -> ServedDeliveryReceipt<'static> {
         period_start,
         period_end,
         expiry: period_end + TTL,
+        disk_io: None,
+        disk_probe: None,
     }
 }
 
@@ -204,6 +206,7 @@ fn run_receipt_loop_returns_at_once_when_already_shut_down() {
     let shutdown = DeadlineShutdown::already();
     let config = ReceiptLoopConfig {
         interval: Duration::from_secs(INTERVAL),
+        first_interval: Duration::from_secs(INTERVAL),
         ttl_secs: TTL,
     };
 
@@ -211,9 +214,12 @@ fn run_receipt_loop_returns_at_once_when_already_shut_down() {
     run_receipt_loop(&mut b, &q, &cs, &ws, &signer, &shutdown, &config)
         .expect("the loop returns Ok on shutdown");
     // A pre-latched shutdown is honored before the first tick — it must
-    // not have slept out an interval.
+    // not have slept out an interval — and still leaves the one final
+    // receipt for the window since genesis.
     assert!(started.elapsed() < Duration::from_secs(INTERVAL));
-    assert!(q.lock().unwrap().is_empty());
+    let buffered = q.lock().unwrap().drain(99);
+    assert_eq!(buffered.len(), 1);
+    assert_is_receipt_signed(&signer, &buffered[0]);
 }
 
 #[test]
@@ -229,6 +235,7 @@ fn run_receipt_loop_buffers_real_receipts_then_stops_on_shutdown() {
     // seconds (receipts are second-granular); shut down after ~2.6 s.
     let config = ReceiptLoopConfig {
         interval: Duration::from_millis(1_100),
+        first_interval: Duration::from_millis(1_100),
         ttl_secs: TTL,
     };
     let shutdown = DeadlineShutdown::after(Duration::from_millis(2_600));
@@ -289,6 +296,7 @@ fn run_receipt_loop_rejects_a_sub_second_interval() {
         let q = Mutex::new(ReceiptQueue::new());
         let config = ReceiptLoopConfig {
             interval,
+            first_interval: interval,
             ttl_secs: TTL,
         };
         let started = Instant::now();
@@ -298,4 +306,93 @@ fn run_receipt_loop_rejects_a_sub_second_interval() {
         assert!(q.lock().unwrap().is_empty());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
+}
+
+fn assert_is_receipt_signed(signer: &Ed25519TelemetrySigner, signed: &SignedServedDeliveryReceipt) {
+    let sig = Signature::from_slice(&signed.sig).expect("64-byte signature");
+    signer
+        .verifying_key()
+        .verify_strict(&signed.body, &sig)
+        .expect("a buffered receipt must carry the signer's signature");
+}
+
+#[test]
+fn the_first_receipt_comes_after_first_interval_not_a_full_interval() {
+    let signer = Ed25519TelemetrySigner::generate().unwrap();
+    let mut b = builder(unix_now().unwrap().saturating_sub(2));
+    let q = Mutex::new(ReceiptQueue::new());
+    let cs = StaticChallengeSource::new(challenge());
+    let ws = StaticServedWorkSource::new(DEGRADATION).unwrap();
+    // A one-hour interval: only `first_interval` can produce a receipt
+    // before the shutdown (plus the final one).
+    let config = ReceiptLoopConfig {
+        interval: Duration::from_secs(3_600),
+        first_interval: Duration::from_millis(1_100),
+        ttl_secs: TTL,
+    };
+    // Shut down at 3.5 s: the early receipt at 1.1 s, then the final one
+    // over the >= 2 s since. Without the early tick only the final one
+    // would exist.
+    let shutdown = DeadlineShutdown::after(Duration::from_millis(3_500));
+    run_receipt_loop(&mut b, &q, &cs, &ws, &signer, &shutdown, &config).unwrap();
+    let buffered = q.lock().unwrap().drain(99);
+    assert_eq!(
+        buffered.len(),
+        2,
+        "the early first receipt, then the final one"
+    );
+    for signed in &buffered {
+        assert_is_receipt_signed(&signer, signed);
+    }
+}
+
+#[test]
+fn shutdown_mid_interval_buffers_the_partial_window() {
+    let signer = Ed25519TelemetrySigner::generate().unwrap();
+    // Running for 30 s already, the next receipt an hour away.
+    let mut b = builder(unix_now().unwrap().saturating_sub(30));
+    let q = Mutex::new(ReceiptQueue::new());
+    let cs = StaticChallengeSource::new(challenge());
+    let ws = StaticServedWorkSource::new(DEGRADATION).unwrap();
+    let config = ReceiptLoopConfig {
+        interval: Duration::from_secs(3_600),
+        first_interval: Duration::from_secs(3_600),
+        ttl_secs: TTL,
+    };
+    let shutdown = DeadlineShutdown::after(Duration::from_millis(600));
+    let started = Instant::now();
+    run_receipt_loop(&mut b, &q, &cs, &ws, &signer, &shutdown, &config).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "stopped promptly"
+    );
+    let buffered = q.lock().unwrap().drain(99);
+    assert_eq!(buffered.len(), 1, "the final partial-window receipt");
+    assert_is_receipt_signed(&signer, &buffered[0]);
+    assert_eq!(b.next_seq(), 2);
+}
+
+#[test]
+fn an_idle_source_buffers_no_final_receipt() {
+    let signer = Ed25519TelemetrySigner::generate().unwrap();
+    let mut b = builder(GENESIS);
+    let q = Mutex::new(ReceiptQueue::new());
+    let cs = StaticChallengeSource::idle();
+    let ws = StaticServedWorkSource::new(DEGRADATION).unwrap();
+    let config = ReceiptLoopConfig {
+        interval: Duration::from_secs(INTERVAL),
+        first_interval: Duration::from_secs(INTERVAL),
+        ttl_secs: TTL,
+    };
+    run_receipt_loop(
+        &mut b,
+        &q,
+        &cs,
+        &ws,
+        &signer,
+        &DeadlineShutdown::already(),
+        &config,
+    )
+    .unwrap();
+    assert!(q.lock().unwrap().is_empty());
 }

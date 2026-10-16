@@ -40,6 +40,11 @@ import dj_database_url
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+# The commit the image was built from (`/healthz`), baked by the image build
+# (`--build-arg VALI_GIT_SHA`); "unknown" off a build that set none.
+VALI_GIT_SHA = os.environ.get("VALI_GIT_SHA", "") or "unknown"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -59,6 +64,15 @@ def _env_int(name: str, default: int) -> int:
     if v is None:
         return default
     return int(v)
+
+
+def _env_nonneg_int(name: str, default: int) -> int:
+    """`_env_int`, refusing to start on a negative value (a typo there would
+    silently turn a wait into none)."""
+    value = _env_int(name, default)
+    if value < 0:
+        raise RuntimeError(f"{name} must be an integer >= 0, got {value}")
+    return value
 
 
 def _env_float(name: str, default: float) -> float:
@@ -115,6 +129,7 @@ INSTALLED_APPS = [
     "drf_spectacular",
     "apps.identity",
     "apps.cdn",
+    "apps.disktier",
     "apps.images",
     "apps.lifecycle",
     "apps.miners",
@@ -383,6 +398,8 @@ SPECTACULAR_SETTINGS = {
             "destroyed",
         ],
         "BuildFinalizeToStateEnum": ["running", "succeeded", "failed"],
+        # A pool's / dedicated disk's desired state (`apps.disktier`).
+        "StorageDesiredStateEnum": ["active", "draining"],
     },
 }
 
@@ -1263,11 +1280,8 @@ VALI_ORCHESTRATION_SNAPSHOT_PART_BYTES = _env_int(
 # Per-HTTP-call timeout for the `effects` peer calls.
 VALI_ORCHESTRATION_EFFECT_TIMEOUT_S = _env_float("VALI_ORCHESTRATION_EFFECT_TIMEOUT_S", 15.0)
 
-# §14 idempotency store — a directory shared with the
-# `idempotency-record` / `idempotency-recall` subcommands of the
-# validator binary. Empty default fails loud: the orchestrator
-# cannot safely run a side-effecting step without retry-dedup.
-VALI_IDEMPOTENCY_DIR = os.environ.get("VALI_IDEMPOTENCY_DIR", "")
+# §14 idempotency store — the `IdempotencyRecord` table
+# (`apps.orchestration.idempotency`); an entry is recallable this long.
 VALI_IDEMPOTENCY_TTL_SECS = _env_int("VALI_IDEMPOTENCY_TTL_SECS", 86400)
 
 # Peer endpoints the orchestrator's effects reach. An unset endpoint
@@ -1381,6 +1395,19 @@ VALI_ORDER_TICKET_MINT_BIN = os.environ.get(
 # held to the mode pinned on its `Vm` row, so turning this off never
 # strands a running customer-keys VM.
 VALI_CUSTOMER_KEYS_ENABLED = _env_bool("VALI_CUSTOMER_KEYS_ENABLED", False)
+# Userdata restage API (`POST /v1/vm/<id>/userdata/restage`,
+# `apps.orchestration.userdata_restage`): replace an M0 VM's cloud-init
+# userdata for its next boot, and relaunch it. OFF by default (403
+# `userdata-restage-disabled`), and even when on only the vm_ids listed in
+# the allow-list may be restaged (403 `userdata-restage-not-allowed`;
+# empty = none). The operator CLI `vali_restage_userdata` is held to both
+# as well.
+VALI_USERDATA_RESTAGE_ENABLED = _env_bool("VALI_USERDATA_RESTAGE_ENABLED", False)
+VALI_USERDATA_RESTAGE_VM_ALLOWLIST = os.environ.get("VALI_USERDATA_RESTAGE_VM_ALLOWLIST", "")
+# Versions the Vault KV mount keeps per path (its `max_versions`; Vault's
+# default is 10). A restage refuses to write the version that would prune
+# the one the VM's launch record still points at.
+VALI_VAULT_KV_MAX_VERSIONS = _env_int("VALI_VAULT_KV_MAX_VERSIONS", default=10)
 # The NetBird group every miner's peer is in (a name or an id): the SOURCE
 # of each tenant's `miners -> key guardian` policy
 # (`services.guardian_netbird`). Empty = the guardian endpoints refuse
@@ -1824,6 +1851,16 @@ VALI_BACKUP_PROBE_INTERVAL_S = _env_int("VALI_BACKUP_PROBE_INTERVAL_S", 300)
 # Wait after a failed run before the next attempt (the next interval wins if
 # it is sooner).
 VALI_BACKUP_RETRY_AFTER_S = _env_int("VALI_BACKUP_RETRY_AFTER_S", 900)
+# A run waits for the VM's current boot to finish: the guest must still be
+# signalling this long after the boot began (past the first-boot cloud-init
+# window), at most VALI_BACKUP_BOOT_WAIT_MAX_S (a guest with no in-guest agent
+# never signals). `apps.backup.service._boot_gate`.
+VALI_BACKUP_BOOT_SETTLE_S = _env_nonneg_int("VALI_BACKUP_BOOT_SETTLE_S", 180)
+VALI_BACKUP_BOOT_WAIT_MAX_S = _env_nonneg_int("VALI_BACKUP_BOOT_WAIT_MAX_S", 900)
+# A run whose domain vanished with no sign yet of why (a guest poweroff or
+# reboot reaches vali late) is held open this long before it counts as
+# failed. `apps.backup.service._domain_gone`.
+VALI_BACKUP_DOMAIN_GONE_GRACE_S = _env_nonneg_int("VALI_BACKUP_DOMAIN_GONE_GRACE_S", 900)
 # The backup janitor — what bucket lifecycle rules would do, done by vali
 # because Hippius S3 acknowledges PutBucketLifecycle without enforcing it.
 # Multipart uploads under `backups/` older than this that no active run
@@ -1880,6 +1917,39 @@ VALI_FAILOVER_DEAD_AFTER_S = _env_float("VALI_FAILOVER_DEAD_AFTER_S", 600.0)
 # whose backups are stored locally. `failover_mode=auto` is refused for a VM
 # of any other region (AU at launch: its backups live in the EU bucket).
 VALI_FAILOVER_AUTO_REGIONS = _env_list("VALI_FAILOVER_AUTO_REGIONS", ["FR", "NL"])
+# The automatic failover worker (`apps.orchestration.failover_auto`, run by
+# the orchestration tick): fails `failover_mode=auto` VMs over off a miner
+# the three-way proof has held dead for `VALI_FAILOVER_AUTO_AFTER_S`. Off,
+# the policy reads `failover_auto_blocker: disabled`.
+VALI_FAILOVER_AUTO_ENABLED = _env_bool("VALI_FAILOVER_AUTO_ENABLED", False)
+# Restore / failover onto another SNP generation (Genoa / Turin / Milan): the
+# destination's ticket carries the digest recomputed for its generation
+# (`apps.orchestration.cross_gen`). Off until the lab proof
+# (docs/operator/cross-gen-failover-lab.md); needs vali's own digest
+# recompute (`VALI_LAUNCH_DIGEST_BIN` + the OVMF pin).
+VALI_FAILOVER_CROSS_GEN_ENABLED = _env_bool("VALI_FAILOVER_CROSS_GEN_ENABLED", False)
+# The vCPU models a cross-generation move may join; Milan once proven on
+# hardware (there is no Milan pair in any region today).
+VALI_FAILOVER_CROSS_GEN_GENERATIONS = _env_list(
+    "VALI_FAILOVER_CROSS_GEN_GENERATIONS", ["EpycGenoa", "EpycTurin"]
+)
+# A typo (`genoa`) would silently disable crossing: refuse to start instead.
+# Must match `apps.orchestration.cross_gen.GENERATION_ORDER`.
+_UNKNOWN_GENERATIONS = sorted(
+    set(VALI_FAILOVER_CROSS_GEN_GENERATIONS) - {"EpycMilan", "EpycGenoa", "EpycTurin"}
+)
+if _UNKNOWN_GENERATIONS:
+    raise RuntimeError(
+        "VALI_FAILOVER_CROSS_GEN_GENERATIONS names no vCPU model: "
+        f"{', '.join(_UNKNOWN_GENERATIONS)} (expected EpycMilan, EpycGenoa, EpycTurin)"
+    )
+# The lab window: when set, only these VMs may cross (empty = every VM).
+VALI_FAILOVER_CROSS_GEN_VM_IDS = _env_list("VALI_FAILOVER_CROSS_GEN_VM_IDS", [])
+VALI_FAILOVER_AUTO_AFTER_S = _env_float("VALI_FAILOVER_AUTO_AFTER_S", 900.0)
+# More miners dead at once than this looks like vali's own view failing,
+# not the fleet: the worker starts nothing and alerts (an operator can
+# still fail over by hand).
+VALI_FAILOVER_AUTO_MAX_DEAD_MINERS = _env_int("VALI_FAILOVER_AUTO_MAX_DEAD_MINERS", 2)
 
 # §25 SOURCE-side reclaim (P9/#15). A migration is a COPY: the source host
 # keeps the tenant's LUKS overlay, the boot-counter state disk and the
@@ -2328,3 +2398,76 @@ VALI_PUBLIC_API_PATHS = os.environ.get("VALI_PUBLIC_API_PATHS", "")
 #
 # The CDN fleet's one-node-per-host rule does not read it (CDN plan N2).
 VALI_MAX_FAMILY_PER_NODE = os.environ.get("VALI_MAX_FAMILY_PER_NODE", "")
+
+# ── Verified disk tiers (`apps.disktier`, docs/design/disk-tier-verification.md).
+#
+# Every switch is OFF and nothing reads them yet: the tables and the
+# classifier ship first, the probe, the passive ingest, the scheduler gate
+# and the consequences each arrive behind their own flag.
+#
+# The active probe: a vali-owned attested VM benchmarks a miner's pools and
+# dedicated disks and reports in its signed receipt.
+VALI_DISK_PROBE_ENABLED = _env_bool("VALI_DISK_PROBE_ENABLED", False)
+# The probe VM's flavor. The v1 thresholds are calibrated for `medium`
+# (2 vCPU): at 1 vCPU the disk crypto, not the disk, is the bottleneck.
+VALI_DISK_PROBE_FLAVOR = os.environ.get("VALI_DISK_PROBE_FLAVOR", "medium")
+# At most this many probe VMs at once, fleet-wide (and never two on a node).
+VALI_DISK_PROBE_MAX_CONCURRENT = _env_int("VALI_DISK_PROBE_MAX_CONCURRENT", 1)
+# A probe with no verified result after this long is a timeout: a failed
+# probe for health, never a downgrade on its own.
+VALI_DISK_PROBE_TIMEOUT_S = _env_int("VALI_DISK_PROBE_TIMEOUT_S", 3600)
+# Fold the `/sys/block` deltas of tenant receipts into hourly rows. Off:
+# the fields are parsed and dropped.
+VALI_DISK_IO_INGEST = _env_bool("VALI_DISK_IO_INGEST", False)
+# What a probe verdict may change: `off` nothing, `record` events + audit
+# only, `enforce` tiers, health, cordons.
+VALI_DISK_TIER_CONSEQUENCES = os.environ.get("VALI_DISK_TIER_CONSEQUENCES", "off")
+if VALI_DISK_TIER_CONSEQUENCES not in {"off", "record", "enforce"}:
+    raise RuntimeError(
+        "VALI_DISK_TIER_CONSEQUENCES must be off, record or enforce, "
+        f"got {VALI_DISK_TIER_CONSEQUENCES!r}"
+    )
+
+# ── Storage-config push (`apps.disktier.storage_config`, disk-tier design §9).
+#
+# The desired storage document (pools + dedicated disks) an operator sets
+# through `/v1/operator/miners/{node_id}/storage` is pushed to the miner as
+# a signed `storage-config` order. ALL DARK by default: off, no miner
+# selected, and no agent version good enough.
+VALI_STORAGE_CONFIG_PUSH = _env_bool("VALI_STORAGE_CONFIG_PUSH", False)
+# miner_ids or chain node_ids; `*` = every miner. Empty = none.
+VALI_STORAGE_CONFIG_MINERS = _env_list("VALI_STORAGE_CONFIG_MINERS")
+# The oldest agent release (`vYYYY.MM.DD[.N]`, from the v6 heartbeat) that
+# has the `storage-config` route. Empty = push to nobody; `*` = any agent
+# (dev builds included — test hosts only).
+VALI_STORAGE_CONFIG_MIN_AGENT_VERSION = os.environ.get(
+    "VALI_STORAGE_CONFIG_MIN_AGENT_VERSION", ""
+).strip()
+# Re-send an acked document this often (expiry renewal, drift repair).
+VALI_STORAGE_CONFIG_SYNC_S = _env_nonneg_int("VALI_STORAGE_CONFIG_SYNC_S", 600)
+# Re-send an unacked (or drifted) document this often...
+VALI_STORAGE_CONFIG_RETRY_S = _env_nonneg_int("VALI_STORAGE_CONFIG_RETRY_S", 60)
+# ...doubled per 422 refusal / 500 store failure, up to this.
+VALI_STORAGE_CONFIG_APPLY_BACKOFF_MAX_S = _env_nonneg_int(
+    "VALI_STORAGE_CONFIG_APPLY_BACKOFF_MAX_S", 1800
+)
+# An agent without the route (404) or with it off (503) is left alone this long.
+VALI_STORAGE_CONFIG_UNSUPPORTED_RETRY_S = _env_nonneg_int(
+    "VALI_STORAGE_CONFIG_UNSUPPORTED_RETRY_S", 21600
+)
+# Validity of one order (`not_after_unix`); the agent refuses more than 7 d.
+VALI_STORAGE_CONFIG_TTL_S = _env_nonneg_int("VALI_STORAGE_CONFIG_TTL_S", 86400)
+if not 0 < VALI_STORAGE_CONFIG_TTL_S <= 7 * 24 * 3600:
+    raise RuntimeError("VALI_STORAGE_CONFIG_TTL_S must be 1..604800")
+# Wall-clock budget of one push pass in the orchestration tick.
+VALI_STORAGE_CONFIG_TICK_BUDGET_S = _env_float("VALI_STORAGE_CONFIG_TICK_BUDGET_S", 60.0)
+
+# Service principals (`ServiceClient.name`) allowed to WRITE a miner's
+# configuration under `/v1/operator/*` (`IsOperatorConfigWriter`). The
+# backend calls with its own token for these (`VALI_OPERATOR_CONFIG_TOKEN`
+# there). Empty = no write is allowed.
+VALI_OPERATOR_CONFIG_PRINCIPALS = _env_list("VALI_OPERATOR_CONFIG_PRINCIPALS")
+# How long one on-chain node → family read is trusted (the
+# `X-Hippius-Acting-Family` check), and its RPC timeout.
+VALI_OPERATOR_FAMILY_CACHE_S = _env_nonneg_int("VALI_OPERATOR_FAMILY_CACHE_S", 30)
+VALI_OPERATOR_FAMILY_RPC_TIMEOUT_S = _env_float("VALI_OPERATOR_FAMILY_RPC_TIMEOUT_S", 15.0)

@@ -50,6 +50,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Pull Docker Hub images through mirror.gcr.io
+        # A dockerd registry mirror: `FROM <img>@sha256:…` resolves the SAME
+        # digest through it, so the build — and the measurement — cannot
+        # change; dockerd falls back to Docker Hub for anything the mirror
+        # lacks. Docker Hub's anonymous pull limit 429s shared runners.
+        run: |
+          sudo mkdir -p /etc/docker
+          cfg=/etc/docker/daemon.json
+          [ -s "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
+          jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' "$cfg" | sudo tee "$cfg.new" >/dev/null
+          sudo mv "$cfg.new" "$cfg"
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}' | grep -q mirror.gcr.io
+
       - name: Build the AmdSevX64 OVMF (reproducibility-checked)
         # Runs `make ovmf` twice into ISOLATED output / work dirs and
         # refuses to exit 0 unless the two `OVMF.fd` blobs are

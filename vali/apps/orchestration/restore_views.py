@@ -30,6 +30,7 @@ from . import restore
 from .models import MigrationJob
 from .permissions import IsOrchestrationRoot
 from .restore import RestoreError
+from .schemas import CrossRegionSerializer
 
 _TAGS = ["Backups"]
 
@@ -49,6 +50,9 @@ _ERROR_STATUS = {
     "job-in-flight": status.HTTP_409_CONFLICT,
     "vm-not-restorable": status.HTTP_409_CONFLICT,
     "no-eligible-miner": status.HTTP_409_CONFLICT,
+    "region-unknown": status.HTTP_409_CONFLICT,
+    "region-conflict": status.HTTP_409_CONFLICT,
+    "not-cross-region": status.HTTP_409_CONFLICT,
     "request-id-conflict": status.HTTP_409_CONFLICT,
     "not-cancellable": status.HTTP_409_CONFLICT,
     "revert-superuser-only": status.HTTP_403_FORBIDDEN,
@@ -70,12 +74,42 @@ _BODY_FIELDS = frozenset(
         "accept_rollback",
         "on_behalf_of",
         "customer_authorized",
+        "region",
+        "allow_cross_region",
+        "reason",
+        "operator",
     }
 )
 #: An undo names only who asked (a superuser).
 _REVERT_FIELDS = frozenset({"on_behalf_of"})
 #: A failover never rolls back: it takes neither rollback field.
-_FAILOVER_FIELDS = frozenset({"run_id", "request_id", "dest_node_id"})
+_FAILOVER_FIELDS = frozenset(
+    {
+        "run_id",
+        "request_id",
+        "dest_node_id",
+        "region",
+        "allow_cross_region",
+        "reason",
+        "operator",
+    }
+)
+
+
+def _cross_region(body: dict[str, Any]) -> Any:
+    """The operator's cross-region override in a restore / failover body
+    (`service.parse_cross_region`), or None."""
+    from . import service
+
+    try:
+        return service.parse_cross_region(
+            body.get("allow_cross_region"),
+            body.get("region"),
+            body.get("reason"),
+            body.get("operator"),
+        )
+    except ValueError as exc:
+        raise RestoreError("bad-request", str(exc)) from exc
 
 
 class RestoreErrorSerializer(serializers.Serializer):
@@ -128,6 +162,34 @@ class RestoreRequestSerializer(serializers.Serializer):
         required=False,
         help_text="Restore onto this miner instead of the VM's current host.",
     )
+    region = serializers.CharField(
+        required=False,
+        help_text=(
+            "Only when vali cannot tell the VM's region (no launch region, its "
+            "host never verified): the region the operator states for it, ISO "
+            "3166-1 alpha-2. The destination must be verified there. Refused "
+            "`region-conflict` when it differs from a region vali knows. With "
+            "`allow_cross_region: true` it NAMES the destination region instead."
+        ),
+    )
+    allow_cross_region = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Operator override: restore the VM in ANOTHER region, the one `region` "
+            "names. Needs `reason`; recorded on the job. Never taken by any "
+            "automatic path."
+        ),
+    )
+    reason = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Why the VM leaves its region (required with `allow_cross_region`).",
+    )
+    operator = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Who decided the cross-region move (required with `allow_cross_region`).",
+    )
     accept_rollback = serializers.BooleanField(
         required=False,
         help_text=(
@@ -160,6 +222,34 @@ class FailoverRequestSerializer(serializers.Serializer):
     dest_node_id = serializers.CharField(
         required=False, help_text="The miner to fail over to; chosen by vali if absent."
     )
+    region = serializers.CharField(
+        required=False,
+        help_text=(
+            "Only when vali cannot tell the VM's region (no launch region, its "
+            "host never verified): the region the operator states for it, ISO "
+            "3166-1 alpha-2. The destination must be verified there. Refused "
+            "`region-conflict` when it differs from a region vali knows. With "
+            "`allow_cross_region: true` it NAMES the destination region instead."
+        ),
+    )
+    allow_cross_region = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Operator override: restore the VM in ANOTHER region, the one `region` "
+            "names. Needs `reason`; recorded on the job. Never taken by any "
+            "automatic path."
+        ),
+    )
+    reason = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Why the VM leaves its region (required with `allow_cross_region`).",
+    )
+    operator = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Who decided the cross-region move (required with `allow_cross_region`).",
+    )
 
 
 class MinerNotDeadSerializer(serializers.Serializer):
@@ -178,6 +268,10 @@ class DeadMinerEvidenceSerializer(serializers.Serializer):
 
 class RestoreJobSerializer(serializers.Serializer):
     job_id = serializers.CharField()
+    cross_region = CrossRegionSerializer(
+        allow_null=True,
+        help_text="The operator's cross-region override this job carried, else null.",
+    )
     vm_id = serializers.CharField()
     kind = serializers.ChoiceField(choices=["restore", "failover"])
     failover_id = serializers.CharField(
@@ -223,7 +317,14 @@ class RestoreJobSerializer(serializers.Serializer):
             "`pending_capacity`: an automatic failover waiting for a destination "
             "with room (retried every tick). "
             "`verifying`: the restored disk booted, waiting for its key release "
-            "to be proven. `settling`: returning to a stopped prior power state. "
+            "to be proven, then for the restored guest's first signal. "
+            "`settling`: committed and the restored guest speaks, while vali keeps "
+            "the original until `VALI_MIGRATION_RECLAIM_LIVENESS_GRACE_S` has "
+            "passed. Usable when `prior_power_state` is `running`; when it is "
+            "`stopped`, the VM is about to be stopped again. Not final: a guest "
+            "that stops proving it runs reads `verifying` again, and one that "
+            "never proves it past the grace reads `failed` (`finished_at` stays "
+            "null, `committed_at` is set). "
             "`reverted`: failed before the point of no return, the original is "
             "back as it was. `failed`: a staging failure (the original was never "
             "touched, the reason starts with `stage-`) or a failure after the "
@@ -236,7 +337,14 @@ class RestoreJobSerializer(serializers.Serializer):
     prior_power_state = serializers.ChoiceField(choices=["running", "stopped"])
     source_node_id = serializers.CharField()
     dest_node_id = serializers.CharField()
-    eta_s = serializers.IntegerField(allow_null=True)
+    eta_s = serializers.IntegerField(
+        allow_null=True,
+        help_text=(
+            "Seconds of download left, recomputed at every read: while a restore stages "
+            "(the bytes left at the measured throughput) or a failover's destination "
+            "downloads. Null once nothing is left to download, and on a final phase."
+        ),
+    )
     rollback = RollbackViewSerializer(
         allow_null=True, help_text="Set for a restore to a point of an earlier boot."
     )
@@ -245,7 +353,15 @@ class RestoreJobSerializer(serializers.Serializer):
         help_text="Set once an operator asked to put the original back (`.../revert`).",
     )
     created_at = serializers.DateTimeField()
-    finished_at = serializers.DateTimeField(allow_null=True)
+    finished_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text=(
+            "When the phase became final (`done`: the commit plus the liveness grace, "
+            "or the re-stop of a VM that was stopped before; `failed` / `reverted`: when "
+            "it failed); null before, stable once set. `committed_at` is the commit — "
+            "done for the tenant."
+        ),
+    )
 
 
 class RestoreJobListSerializer(serializers.Serializer):
@@ -348,7 +464,8 @@ class VmRestoreView(_RootView):
                 "`customer-rollback-authorization-required` (an M2 VM: the customer "
                 "authorizes the rollback on their guardian) / `job-in-flight` / "
                 "`vm-not-restorable` / "
-                "`no-eligible-miner` / `request-id-conflict`.",
+                "`no-eligible-miner` / `region-unknown` / `region-conflict` / "
+                "`request-id-conflict`.",
             ),
             429: OpenApiResponse(
                 RestoreErrorSerializer, "`rollback-rate-limited` (with `retry_after_s`)."
@@ -362,11 +479,14 @@ class VmRestoreView(_RootView):
     def post(self, request: Request, vm_id: str) -> Response:
         try:
             body = _body(request)
+            cross = _cross_region(body)
             job, _created = restore.start_restore(
                 vm=_get_vm(vm_id),
                 run_id=body.get("run_id"),
                 request_id=body.get("request_id"),
                 dest_node_id=body.get("dest_node_id"),
+                region=None if cross else body.get("region"),
+                cross_region=cross,
                 accept_rollback=body.get("accept_rollback"),
                 on_behalf_of=body.get("on_behalf_of"),
                 customer_authorized=body.get("customer_authorized"),
@@ -394,10 +514,10 @@ class VmRestoreView(_RootView):
     def get(self, request: Request, vm_id: str) -> Response:
         try:
             limit = _limit(request.query_params.get("limit"))
-            jobs = restore.list_jobs(_get_vm(vm_id), limit=limit)
+            entries = restore.list_entries(_get_vm(vm_id), limit=limit)
         except RestoreError as exc:
             return _refuse(exc)
-        return Response({"jobs": [restore.serialize(job) for job in jobs]})
+        return Response({"jobs": entries})
 
 
 class VmRestoreJobView(_RootView):
@@ -417,7 +537,13 @@ class VmRestoreJobView(_RootView):
     )
     def get(self, request: Request, vm_id: str, job_id: str) -> Response:
         try:
-            job = _job(_get_vm(vm_id), job_id)
+            vm = _get_vm(vm_id)
+            # An automatic failover waiting for room has no job yet; its id
+            # is the one the job will carry.
+            wait = restore.wait_entry(vm, job_id)
+            if wait is not None:
+                return Response(wait)
+            job = _job(vm, job_id)
         except RestoreError as exc:
             return _refuse(exc)
         return Response(restore.serialize(job))
@@ -546,7 +672,8 @@ class VmFailoverView(_RootView):
                 "`miner-not-dead` (with the evidence) / `no-backup-point` / "
                 "`point-not-restorable` / `rollback-unsupported` / `job-in-flight` / "
                 "`vm-not-restorable` / "
-                "`no-eligible-miner` / `request-id-conflict`.",
+                "`no-eligible-miner` / `region-unknown` / `region-conflict` / "
+                "`request-id-conflict`.",
             ),
             503: OpenApiResponse(RestoreErrorSerializer, "`failover-disabled`."),
             **_COMMON,
@@ -562,11 +689,14 @@ class VmFailoverView(_RootView):
                 raise RestoreError(
                     "bad-request", f"unknown field(s): {', '.join(sorted(unknown))}"
                 )
+            cross = _cross_region(data)
             job, _created = restore.start_failover(
                 vm=_get_vm(vm_id),
                 request_id=data.get("request_id"),
                 run_id=data.get("run_id"),
                 dest_node_id=data.get("dest_node_id"),
+                region=None if cross else data.get("region"),
+                cross_region=cross,
                 decided_by=request.user,
             )
         except RestoreError as exc:

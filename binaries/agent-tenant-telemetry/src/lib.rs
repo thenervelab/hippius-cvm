@@ -34,6 +34,7 @@
 
 pub mod challenge;
 pub mod config;
+pub mod disk_stats;
 pub mod error;
 pub mod establish;
 pub mod kbs_client;

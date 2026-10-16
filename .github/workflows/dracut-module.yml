@@ -36,7 +36,7 @@ jobs:
       matrix:
         image:
           - quay.io/centos/centos:stream10
-          - fedora:latest
+          - mirror.gcr.io/library/fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
       - name: dracut build + lsinitrd asserts — legacy 90hippius-luks (${{ matrix.image }})

@@ -1,0 +1,33 @@
+[package]
+name = "hippius-agent-disk-probe"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Disk-tier probe (docs/design/disk-tier-verification.md §3.2, §3.3): in a vali probe VM, benchmarks the OS disk (profile v1) and dedicated disks (profile d1) one at a time with O_DIRECT I/O at offsets drawn from a keyed SHA-256 stream seeded by vali's nonce, and leaves a DiskProbeResult the telemetry agent signs into its receipts. Dormant in every tenant VM: it runs only when vali's probe userdata wrote its request file."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hippius-agent-disk-probe"
+path = "src/main.rs"
+
+[lib]
+name = "hippius_agent_disk_probe"
+path = "src/lib.rs"
+
+[dependencies]
+hippius-types = { path = "../../hippius-types" }
+ciborium = "0.2"
+hex = "0.4"
+libc = "0.2"
+# fallocate(2) without `unsafe` (the workspace forbids it).
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -38,6 +38,9 @@
 //!   persisted, not applied yet)
 //! - `POST /v1/miner/order/power-policy` — [`PowerPolicyOrder`] (a VM's
 //!   guest-poweroff policy, applied in place)
+//! - `POST /v1/miner/order/storage-config` — [`StorageConfigOrder`]
+//!   (host-wide; the desired storage document, validated, persisted and
+//!   put in force, see [`crate::storage::remote`])
 //! - `GET  /v1/miner/restore/{vm_id}/status` — staged-restore status
 //! - `GET  /v1/miner/vm/{vm_id}/domain-state` — read-only tenant-domain
 //!   liveness probe for the reboot-recovery reconcile loop (NOT a
@@ -80,7 +83,7 @@ pub use types::{
     BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
     MigrateQuiesceOrder, MigrateSnapshotOrder, NetEndpoint, NetPolicyLocalAction, NetPolicyMode,
     NetPolicyOrder, NetProto, NetSpec, OnGuestPoweroff, Order, OrderBody, OrderKind, OrderSubject,
-    PowerPolicyOrder, PreflightArtifact, RestoreOrder, SignedOrder, StopOrder,
+    PowerPolicyOrder, PreflightArtifact, RestoreOrder, SignedOrder, StopOrder, StorageConfigOrder,
     TenantPreflightOrder, ORDER_DOMAIN,
 };
 
@@ -180,6 +183,9 @@ pub struct OrderState {
     /// The host net policy (persisted and loaded). `None` ⇒ the
     /// `net-policy` route answers `503 net-policy-disabled`.
     pub net_policy: Option<Arc<crate::netpolicy::NetPolicyEnforcer>>,
+    /// The desired storage document. `None` ⇒ the `storage-config` route
+    /// answers `503 storage-config-disabled`.
+    pub storage_config: Option<Arc<crate::storage::remote::StorageConfigService>>,
 }
 
 impl OrderState {
@@ -214,6 +220,7 @@ impl OrderState {
             chain_restorer: None,
             restore: None,
             net_policy: None,
+            storage_config: None,
         }
     }
 
@@ -231,6 +238,15 @@ impl OrderState {
     /// Accept `net-policy` orders through `enforcer`.
     pub fn with_net_policy(mut self, enforcer: Arc<crate::netpolicy::NetPolicyEnforcer>) -> Self {
         self.net_policy = Some(enforcer);
+        self
+    }
+
+    /// Accept `storage-config` orders through `service`.
+    pub fn with_storage_config(
+        mut self,
+        service: Arc<crate::storage::remote::StorageConfigService>,
+    ) -> Self {
+        self.storage_config = Some(service);
         self
     }
 
@@ -340,6 +356,7 @@ pub fn build_orders_router(state: OrderState) -> Router {
         )
         .route("/v1/miner/order/net-policy", post(route_net_policy))
         .route("/v1/miner/order/power-policy", post(route_power_policy))
+        .route("/v1/miner/order/storage-config", post(route_storage_config))
         .route("/healthz", get(route_healthz))
         // Size cap BEFORE any decode — an oversize body never buffers.
         .layer(DefaultBodyLimit::max(MAX_ORDER_BODY))
@@ -883,6 +900,28 @@ async fn route_net_policy(State(st): State<OrderState>, body: Bytes) -> Response
         OrderKind::NetPolicy,
         move |_lifecycle, order: NetPolicyOrder| async move {
             handler::handle_net_policy(&enforcer, clock.now_unix(), order).await
+        },
+    )
+    .await
+}
+
+/// Host-wide desired storage document — a signed order naming no VM,
+/// verified and replay-checked by [`process_order`] like every kind.
+async fn route_storage_config(State(st): State<OrderState>, body: Bytes) -> Response {
+    let Some(service) = st.storage_config.clone() else {
+        return reject(
+            OrderKind::StorageConfig,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage-config-disabled",
+        );
+    };
+    let clock = Arc::clone(&st.clock);
+    process_order(
+        st,
+        body,
+        OrderKind::StorageConfig,
+        move |_lifecycle, order: StorageConfigOrder| async move {
+            handler::handle_storage_config(service, clock.now_unix(), order).await
         },
     )
     .await

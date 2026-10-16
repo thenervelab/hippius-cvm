@@ -1469,8 +1469,12 @@ def test_customer_keys_need_a_64_hex_chain_node_id(harness, node_id) -> None:
     """The node id is measured and the pre-pin check stands in for it with
     64 hex, so an M1/M2 launch refuses any other shape before the pin."""
     miner = _miner()
-    MinerIdentity.objects.filter(pk=miner.pk).update(chain_node_id=node_id)
-    miner.refresh_from_db()
+    if node_id is not None and len(node_id) > 64:
+        # Longer than the column: only an in-memory identity can carry it.
+        miner.chain_node_id = node_id
+    else:
+        MinerIdentity.objects.filter(pk=miner.pk).update(chain_node_id=node_id)
+        miner.refresh_from_db()
     with pytest.raises(launch.LaunchConfigError, match="64-hex chain_node_id"):
         launch.launch_on_miner(_spec(vm_id="vm-nid"), miner)
     assert not Vm.objects.filter(vm_id="vm-nid").exists()

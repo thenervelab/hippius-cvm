@@ -43,7 +43,7 @@ cp "${HOOK}" "${T}/hook"
 # A /24 docker is unlikely to have in use; dnsmasq leases from .100-.200.
 SUBNET_PREFIX="172.31.$(( ($$ % 200) + 20 ))"
 docker network create --subnet "${SUBNET_PREFIX}.0/24" "${NET}" >/dev/null
-docker run -d --name "${SRV}" --network "${NET}" --ip "${SUBNET_PREFIX}.2" --cap-add NET_ADMIN debian:13 \
+docker run -d --name "${SRV}" --network "${NET}" --ip "${SUBNET_PREFIX}.2" --cap-add NET_ADMIN mirror.gcr.io/library/debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 \
     bash -c "apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsmasq-base >/dev/null 2>&1 && touch /tmp/ready && exec dnsmasq -d --port=0 --log-dhcp --dhcp-authoritative --dhcp-range=${SUBNET_PREFIX}.100,${SUBNET_PREFIX}.200,1h --dhcp-leasefile=/tmp/leases" >/dev/null
 for _ in $(seq 1 120); do docker exec "${SRV}" test -e /tmp/ready 2>/dev/null && break; sleep 1; done
 sleep 2
@@ -118,9 +118,9 @@ run_case() {
     fi
 }
 
-run_case stock  ubuntu:24.04 2   # control: duid ll ≠ 01:<MAC> → a second lease
-run_case hooked ubuntu:24.04 1
-run_case klibc  debian:13    1
+run_case stock  mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 2   # control: duid ll ≠ 01:<MAC> → a second lease
+run_case hooked mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 1
+run_case klibc  mirror.gcr.io/library/debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5    1
 
 if [[ ${fail} -eq 0 ]]; then
     echo "${NAME}: ALL OK"

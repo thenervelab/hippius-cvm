@@ -321,6 +321,13 @@ class MinerLocation(models.Model):
     geo_refreshed_at = models.DateTimeField(null=True, blank=True)
     observed_at = models.DateTimeField()
     evidence_json = models.JSONField(default=dict, blank=True)
+    # The country of the newest `verified` verdict, and when — written by
+    # every verified verdict, NEVER cleared by a downgrade (a miner that
+    # stops answering drops to `unverified`): where a dead miner was, for
+    # naming a VM's region and fencing its failover to it
+    # (`geo.last_known_countries`). Never used to place anything.
+    last_verified_country_code = models.CharField(max_length=2, blank=True, default="")
+    last_verified_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["miner_id"]

@@ -123,6 +123,10 @@ jobs:
       # published empty by a second creator racing on the same tag.
       - name: Only the release workflow writes releases
         run: bash scripts/dev/release-creator-test.sh --self-test
+      # A new miner's vali miner_id is derived from its node id by this
+      # Ansible filter; stdlib-only, no Ansible install.
+      - name: ansible miner_id filter
+        run: python3 deploy/ansible/tests/test_miner_id_filter.py
       # Miner-agent auto-update: the updater against a mocked GitHub API,
       # cosign, systemd and journald. Its systemctl mock fails any
       # stop/restart (a graceful stop destroys every domain on a miner).
@@ -221,7 +225,7 @@ jobs:
           shellcheck -S error scripts/dev/golden-userdata-test.sh
           bash scripts/dev/golden-userdata-test.sh
           shellcheck -S error scripts/dev/cloud-init-first-boot-only-check.sh scripts/dev/cloud-init-first-boot-only-guest.sh
-          bash scripts/dev/cloud-init-first-boot-only-check.sh ubuntu:24.04
+          bash scripts/dev/cloud-init-first-boot-only-check.sh mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
           # golden-bake PR4: the SHARED base per-instance scrub (no ssh
           # host keys / machine-id / cloud state / logs; swap fails closed).
           shellcheck -S error scripts/dev/golden-sanitize-test.sh
@@ -603,7 +607,9 @@ jobs:
     # The lock tests re-run against this service (`settings_test_pg`).
     services:
       postgres:
-        image: postgres:16
+        # Not Docker Hub: its anonymous pull limit 429s shared runners.
+        # mirror.gcr.io serves the same image (same digest), unlimited.
+        image: mirror.gcr.io/library/postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -659,7 +665,7 @@ jobs:
         # `-rs` lists every skip, so a binary that stops being found shows
         # up in the log instead of silently shrinking the run.
         run: pytest -q -rs
-      - name: Pytest (pin lock on Postgres)
+      - name: Pytest (locks + races on Postgres)
         working-directory: vali
         env:
           VALI_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/vali
@@ -668,8 +674,10 @@ jobs:
           apps/orchestration/tests/test_allowlist_pin_concurrency.py
           apps/orchestration/tests/test_allowlist_pin_busy.py
           apps/orchestration/tests/test_allowlist_pin.py
+          apps/telemetry/tests/test_autoprovision_collision.py
           apps/telemetry/tests/test_host_attestor_release.py
           apps/images/tests/test_rebake_queue_lock.py
+          apps/orchestration/tests/test_idempotency.py
 
   audit:
     # RA-M-NEW-1 — dependency-vulnerability gate. `cargo audit` fails the
@@ -694,3 +702,7 @@ jobs:
       - name: cargo audit (RustSec advisory gate)
         # Reads .cargo/audit.toml for the documented `ignore` allow-list.
         run: cargo audit
+      - name: No QUIC stack compiled in (attack-surface gate)
+        # quinn sits in Cargo.lock through a weak reqwest feature without
+        # being built; this reads the resolved build graph (#1592).
+        run: scripts/ci/check-no-quic-stack.sh

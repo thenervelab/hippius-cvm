@@ -20,7 +20,7 @@
 
 # ── stage 1: Rust validator binary ──────────────────────────────────
 # Rust 1.93.0 — matches rust-toolchain.toml. Digest-pinned (§F).
-FROM rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS rust-build
+FROM mirror.gcr.io/library/rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS rust-build
 WORKDIR /src
 COPY . .
 # `--locked` builds strictly from the committed Cargo.lock.
@@ -63,7 +63,7 @@ RUN cargo build --locked --release --features snp \
         -p hippius-launch-digest
 
 # ── stage 2: Python package + deps ──────────────────────────────────
-FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS python-build
+FROM mirror.gcr.io/library/python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS python-build
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
@@ -80,7 +80,7 @@ COPY vali/ ./vali/
 RUN pip install --prefix=/install ./vali "gunicorn>=23,<24"
 
 # ── stage 3: runtime ────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d
+FROM mirror.gcr.io/library/python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DJANGO_SETTINGS_MODULE=vali.settings
@@ -156,6 +156,13 @@ RUN DJANGO_DEBUG=1 \
     python manage.py collectstatic --no-input --clear \
     && find /app/staticfiles -exec touch -h -d "@${SOURCE_DATE_EPOCH:-0}" {} + \
     && chown -R 65532:65532 /app/staticfiles
+
+# The commit the image is built from, for `/healthz` (`version`). Set by the
+# image workflow (`--build-arg VALI_GIT_SHA=<sha>`); "unknown" otherwise. The
+# same commit always bakes the same value, so a rebuild keeps its digest.
+# Last, so a new commit invalidates no earlier layer.
+ARG VALI_GIT_SHA=unknown
+ENV VALI_GIT_SHA=${VALI_GIT_SHA}
 
 USER 65532:65532
 

@@ -12,7 +12,7 @@
 //! - [`wire`], [`backend`], [`reqsign`]: the §C backend contract, its client
 //!   and the per-request node signatures;
 //! - [`feed`]: snapshot/delta application, purge generations, LKG;
-//! - [`render`], [`certstore`], [`control`]: what OpenResty receives;
+//! - [`render`], [`site`], [`cors`], [`certstore`], [`control`]: what OpenResty receives;
 //! - [`counters`], [`usage`]: metering and signed usage reports;
 //! - [`health`], [`attestation`]: readiness bits, TLS-bound SNP report;
 //! - [`issuer`], [`acme`], [`csr`]: certificate issuance (I4);
@@ -27,6 +27,7 @@ pub mod certstore;
 pub mod clock;
 pub mod config;
 pub mod control;
+pub mod cors;
 pub mod counters;
 pub mod csr;
 pub mod disk;
@@ -41,6 +42,7 @@ pub mod persist;
 pub mod render;
 pub mod reqsign;
 pub mod shutdown;
+pub mod site;
 pub mod unseal;
 pub mod usage;
 pub mod wire;

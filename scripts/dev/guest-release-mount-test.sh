@@ -43,7 +43,7 @@ mount --make-rprivate "${T}"
 
 # A release whose agents are shell scripts printing their own name.
 mkdir -p "${T}/bins"
-for b in hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs \
+for b in hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs hippius-agent-disk-probe \
          hippius-guest-release hippius-vsock-ticket; do
     printf '#!/bin/sh\necho %s --attest-components\n' "${b}" > "${T}/bins/${b}"
     chmod 0755 "${T}/bins/${b}"

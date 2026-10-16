@@ -89,7 +89,7 @@ SHIM="${SCRIPT_DIR}/hippius-keepalive-start"
 for tool in mksquashfs rdsquashfs cpio sha256sum python3; do
     command -v "${tool}" >/dev/null 2>&1 || die "missing host tool: ${tool}"
 done
-AGENTS=(hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs)
+AGENTS=(hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs hippius-agent-disk-probe)
 INITRD_BINS=(hippius-guest-release hippius-vsock-ticket)
 for b in "${AGENTS[@]}" "${INITRD_BINS[@]}"; do
     [[ -f "${bin_dir}/${b}" && -x "${bin_dir}/${b}" ]] || die "--bin-dir: missing executable ${b}"

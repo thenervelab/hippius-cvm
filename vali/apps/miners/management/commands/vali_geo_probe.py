@@ -252,6 +252,10 @@ def _probe_miner(
             "rtt_samples": c.samples,
         },
     }
+    if verdict.verdict == LocationVerdict.VERIFIED and country:
+        # Durable: a later downgrade leaves these as they are.
+        fields["last_verified_country_code"] = country
+        fields["last_verified_at"] = c.now
     MinerLocation.objects.update_or_create(miner=miner, defaults=fields)
     if previous != verdict.verdict:
         report.changed.append((miner.miner_id, previous or "-", verdict.verdict))

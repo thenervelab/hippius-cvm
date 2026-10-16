@@ -201,9 +201,14 @@ standard bake is unchanged.
   - A hostname block, or a path or prefix block, gets 451; a suspended
     zone gets 403 (spec §12.2).
   - A paused zone, or one with `serving: false`, gets 503.
-  - Methods other than GET or HEAD get 405.
+  - Methods other than GET or HEAD get 405, except a CORS preflight to a
+    zone with a CORS policy (see CORS). A preflight-shaped OPTIONS (with
+    `Origin` and `Access-Control-Request-Method`) gets its 405 once the
+    zone is known, so an invalid or unknown host answers 400 or 421 first
+    (a zone without a policy still meters its 405 unattributed).
   - A path with a `.` or `..` segment, a control byte or a backslash gets 400.
-  - The bucket root gets 404.
+  - The bucket root gets 404 (a zone with an `index_document` serves it
+    instead, see Static site / SPA).
   - Plain HTTP gets a 301 to HTTPS, unless the zone sets
     `settings.redirect_https = false`.
   - None of these contacts the origin, and none is billable.
@@ -256,6 +261,36 @@ standard bake is unchanged.
     XML (bucket, key, access key id) never reaches a client.
   - `X-Accel-*` headers from the origin are ignored and stripped.
   - A purge bumps a generation, and old objects age out.
+  - **Expiry, per slice.** An entry past its edge TTL is refreshed by the
+    first request that reads it, in the foreground: a conditional GET of
+    that slice (`If-None-Match` / `If-Modified-Since`, so a 304 when the
+    object did not change, no body refetched). Requests arriving meanwhile
+    get the stale copy (`proxy_cache_use_stale updating`). There is no
+    background update: nginx runs it as a subrequest, where `$slice_range`
+    is empty, so it fetched the whole object without a Range and stored it
+    under a key no lookup uses, and stale entries were never refreshed
+    (#1581).
+  - Its cost, once per edge TTL: one conditional GET per slice read, in
+    turn as the download reaches each slice. Measured in the test harness
+    (local plaintext mock origin): a 3-slice object refreshed in about
+    60 ms (3 conditional GETs, all 304) against about 23 ms for a hit.
+    Against S3 each one is a new TCP and TLS connection plus the request
+    (no origin keepalive, see Not yet), about 3 round trips: from a node
+    far from S3 (280 ms) about 0.8 s more per MiB on that first read.
+  - An origin that hangs costs the request that refreshes a slice a full
+    timeout (connect 5 s, read 30 s at the internal origin server) before
+    it gets the stale copy; requests arriving meanwhile get the stale copy
+    at once, and the next one after it refreshes again. A 5xx or a refused
+    connection is answered stale at once.
+  - Validity is kept in whole seconds: an entry is stale once the second
+    its TTL ends in is past, so a TTL lasts up to a second longer.
+  - Slices of one object filled at different times (range requests) can
+    hold two versions after a change: a download that crosses them is cut
+    (nginx's slice module refuses an ETag mismatch). That lasts until the
+    older slice expires, at most its edge TTL; then every download is the
+    new object, whole. A purge ends it at once. Until then each cut
+    download fetched its newer slice from the origin again (it is never
+    stored), so the origin bytes of that window are wasted.
   - Different query strings share one object, because the origin never
     sees the query, unless a cache rule puts it in the key (see Cache
     rules).
@@ -340,6 +375,103 @@ standard bake is unchanged.
     (and `X-Hippius-TTL`, dropped before the client), computed from the
     rule; the origin's own `X-Accel-*` and `X-Hippius-TTL` are hidden there.
     Only misses take this local hop.
+- **Static site / SPA.** A zone's `settings.index_document`,
+  `spa_fallback` and `spa_fallback_exclude` (contract C.4 "Zone settings",
+  feed schema 3; `lua/hippius_cdn/site.lua`). Without them (an older
+  backend) nothing changes.
+  - `index_document` (one file name, `[A-Za-z0-9._-]`, never `.` or `..`):
+    `/` and every path ending in `/` fetch `<prefix><path><index_document>`.
+    The bucket is never listed. Blocks, cache rules, the cache key and the
+    content type are those of that object: `/` and `/index.html` are one
+    cache entry, matched by one rule, purged together. So on a zone with an
+    index document, rules and exact purges match the object path, not the
+    request path: a rule or an exact purge for `/` (or `/docs/`) no longer
+    matches it; write it for `/index.html` (`/docs/index.html`), or use a
+    prefix.
+  - `spa_fallback` (needs an index): when the origin answers **404** (S3
+    `NoSuchKey`, which the gateway always sends as 404 with its XML body;
+    the status alone decides, the body is never read) to a GET/HEAD whose
+    decoded path is under none of `spa_fallback_exclude` (default
+    `["/assets/"]`, at most 16 directory prefixes), the client gets the
+    zone's `/<index_document>` with 200. Never on a 403 (a private bucket's
+    AccessDenied stays a 403), a 5xx (passed through), a 3xx, any other
+    status, or another method (405 before anything). The index document
+    itself missing is a 404 (no loop).
+  - The fallback is the index document's own cache entry (the key of a GET
+    of `/<index_document>`): one copy for every route, its `Cache-Control`
+    and headers, and a purge of `/index.html` reaches every fallback at
+    once. A blocked index document gives 451 there too.
+  - How: the internal origin server turns the origin's 404 of a request
+    that may fall back (`X-Hippius-SPA: 1`, first slice only) into 469, the
+    one status the customer location has an `error_page` for
+    (`proxy_intercept_errors on` touches nothing else). nginx keeps an
+    intercepted error as a body-less cache entry for its
+    `proxy_cache_valid` (a minute, like a 404) and replays the
+    `error_page` on a hit, so a route is asked of the origin once a minute
+    at most. `@hippius_spa_fallback` runs every check again on the current
+    config (the zone's request ceiling is not counted twice) and fetches
+    the index document; its directives are the customer location's
+    (`tests/run.sh` checks they stay identical).
+  - Only the main request falls back. Every subrequest shares the main
+    request's variables, `$hippius_spa` included, and none runs the access
+    phase: a slice subrequest asks for a later range and a background cache
+    update for none, so only a first-slice range from 0 can become 469; and
+    the fallback location answers a subrequest that got there anyway with
+    404 (`router.fallback_rewrite`, a Lua rewrite rather than `set`, which
+    would clear the shared variables). A stale object deleted at the origin
+    is a 404 once it expired, and falls back.
+  - The 469 entry is stored even under `bypass` / `edge_ttl: 0`: nginx stores
+    an intercepted error before `proxy_no_cache` is read. Nothing reads it
+    (such a request skips the lookup).
+  - A request that may fall back has its own cache key (a `spa` part), so
+    a plain 404 cached before the fallback was turned on, or before a
+    path left an exclude, never shadows it, and a 469 entry never answers a
+    request that keeps its 404. Turning the fallback on or off refetches
+    the zone's objects once.
+  - A client `Range` that starts past the first 1 MiB slice on a missing
+    path keeps its 404: only the first slice may be replaced (later slices
+    are subrequests that share the main request's variables).
+  - Billing is unchanged: one request, its bytes, one record (status 200).
+    `bytes_from_origin` (stats only) counts the first leg's 404 body on a
+    miss, not on a hit of the 469 entry.
+  - An unusable value turns its feature off (logged once per config
+    version and worker), never a refused document: an unusable index turns
+    off both, an unusable exclude list turns off the fallback.
+- **CORS.** A zone's `settings.cors` (contract C.4 "Zone settings";
+  `lua/hippius_cdn/cors.lua`, checked again by the agent's `src/cors.rs`).
+  Without it nothing changes: no CORS header, no `Vary: Origin`, OPTIONS
+  is a 405.
+  - The policy: `allow_origins` (1 to 32: `["*"]`, origins
+    `scheme://host[:port]` as browsers send them, lower case, no path, no
+    default port, or `scheme://*.suffix[:port]` for exactly one label),
+    `allow_methods` (GET and/or HEAD, default both), `allow_headers` and
+    `expose_headers` (up to 32 names, or `["*"]`), `max_age` (0 to 86400
+    s; absent: no `Access-Control-Max-Age`), `allow_credentials` (never
+    with a `*`). An unusable policy is ignored whole (logged once per
+    config version and worker); unknown keys are ignored.
+  - Every response of the zone, errors included (so a page can read a
+    404): with `["*"]`, `Access-Control-Allow-Origin: *` whatever the
+    request; with a list, `Vary: Origin`, and for an allowed `Origin` that
+    origin echoed, `Access-Control-Allow-Credentials: true` when set, and
+    `Access-Control-Expose-Headers` when set. A browser or downstream cache
+    must never hand a response made for one origin to another: hence
+    `Vary: Origin` on every response of a list zone, matched or not.
+  - These headers are computed for each response from the zone's policy
+    and the request's `Origin`, after the origin's headers were dropped:
+    the cache never stores them and its key never depends on `Origin`, so
+    one cached copy serves every origin, each with its own header.
+  - Preflight (OPTIONS with `Origin` and `Access-Control-Request-Method`):
+    answered by the node with 204, never sent to the origin. The allow
+    headers (`-Origin`, `-Methods`, `-Headers`, `-Max-Age`,
+    `-Credentials`) come only when the origin, the method and every
+    requested header are allowed; otherwise a bare 204 (the browser then
+    refuses the request). With `allow_headers: ["*"]` the requested headers
+    are echoed when they are a plain list of names. Blocks, the zone's
+    state and its ceilings apply first. Metering: a billable request with
+    no billable bytes.
+  - nginx writes gzip's `Vary: Accept-Encoding` as its own line, so a
+    gzipped response of a list zone has two `Vary` lines (valid: a list
+    header is combined by the recipient).
 - **Zone limits.** A zone's `settings.limits` (contract C.4 "Zone
   settings"): `max_mbps` (bytes out, megabits per second; default 2000) and
   `max_rps` (requests per second; default 20000), integers, 0 = no allowance
@@ -374,7 +506,9 @@ standard bake is unchanged.
   every `x-amz-*`, `Set-Cookie`, `Expires`, `Vary`, `Location`, `Age`:
   nginx would replay the origin's value unchanged). The node adds `Cache-Control`, `X-Cache`,
   `X-Content-Type-Options`, `Content-Security-Policy` (script-capable
-  types only) and gzip's `Vary`. There is no `Server` header.
+  types only), gzip's `Vary`, and the zone's CORS headers (see CORS); the
+  origin's own `Access-Control-*` are dropped like the rest. There is no
+  `Server` header.
 - **Content-Type.**
   - `X-Content-Type-Options: nosniff` is on every response, nginx's own
     error pages and the node's endpoints included (`more_set_headers` at
@@ -474,6 +608,6 @@ standard bake is unchanged.
   token to its hostname.
 - **Origin keepalive.** `proxy_pass` uses variables, so there is no
   upstream keepalive pool: each miss opens a new TLS connection to S3.
-- **Zone rules.** Signed URLs, CORS and per-zone headers are not enforced
-  yet (cache rules are, see Cache rules above).
+- **Zone rules.** Signed URLs and per-zone headers are not enforced yet
+  (cache rules and CORS are, see above).
 - **Origin shield.** There is no origin shield; every miss goes to the origin.

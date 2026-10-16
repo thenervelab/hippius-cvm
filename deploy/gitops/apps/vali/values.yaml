@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:b6c1bbf8a0ad9c42fdde31ffdf4addde92e0304d25aa4ebbe4e2579e8c2adc20"
+  digest: "sha256:1e95babd5aab80cd42ac08f350a7fce9e2059488d2d5dd5f84f0569e3ef87de5"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "146fe5040b36044d9e08a6249e468ec3b5f81e38"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37933643963/attempts/1"
+    commitSha: "df21723827bef9bf7d3a7b6e51b923b83b3030bb"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38867012767/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -122,7 +122,9 @@ scheduler:
   # guest-poweroff policy (`on_guest_poweroff`). Empty = no miner qualifies:
   # `stop` launches fail `no-miner-supports-power-policy`. Set it once that
   # release is rolled out AND the v6 heartbeat (agent_version) is on.
-  powerPolicyMinAgentVersion: ""
+  # v2026.10.09 is the first hippius-cvm release carrying the agent's
+  # power-policy order.
+  powerPolicyMinAgentVersion: "v2026.10.09"
   # Capacity v2 (`scheduler.capacity_config`). resourceAdmission "true"
   # (enable it after `vali_capacity_report --preflight` passes): v2 is
   # gate (a) — vCPU / RAM + per-VM overhead / VM count per flavor. "false"
@@ -143,6 +145,25 @@ scheduler:
 # are all live. An image predating H6a ignores the variable.
 customerKeys:
   enabled: "false"
+
+# Operator storage-config API (`/v1/operator/miners/{node_id}/...`, #1609).
+# Reads take any operator-scoped principal; a WRITE needs a ServiceClient
+# named here (comma-separated; empty = every write refused, fail-closed).
+# `backend-operator-config` is the backend's dedicated write token
+# (VALI_OPERATOR_CONFIG_TOKEN on its side), not its read token.
+operatorConfig:
+  principals: "backend-operator-config"
+
+# Userdata restage — API (POST /v1/vm/<id>/userdata/restage, root-only) and
+# CLI (docs/operator/userdata-restage-runbook.md). OFF by default; even when on,
+# only the comma-separated vm_ids in `vmAllowlist` may be restaged (empty =
+# none). Turn it back off and empty the list once a repair is done.
+userdataRestage:
+  enabled: "false"
+  vmAllowlist: ""
+  # The Vault KV mount's `max_versions` (Vault's default 10): a restage
+  # refuses the write that would prune the version a VM still points at.
+  kvMaxVersions: "10"
 
 # §23 uptime billing — how `compute_epoch_weights` ranks miners:
 #   "snapshot" — the on-chain score snapshot (legacy).
@@ -470,6 +491,27 @@ vmBackup:
   # only a VM whose guest attested stamp protocol v2, so a VM on an older
   # guest stays same-boot-restore only.
   restoreRollbackEnabled: true
+  # Automatic failover off a dead miner (VALI_FAILOVER_AUTO_ENABLED, the
+  # orchestration tick): only VMs whose policy says failover_mode=auto, in
+  # VALI_FAILOVER_AUTO_REGIONS, after the three-way dead proof held
+  # VALI_FAILOVER_AUTO_AFTER_S (900 s). Off until the user turns it on;
+  # alerts: prometheusrule-failover-auto.yaml. A boolean: the templates test
+  # it with `if`, so the string "false" would turn it ON.
+  # ON 2026-10-10 (user go), step 1 = observation: no backup policy is in
+  # failover_mode=auto yet, so the worker watches and decides nothing.
+  failoverAutoEnabled: true
+  # Cross-generation restore / failover (#1577, apps.orchestration.cross_gen):
+  # the destination's ticket carries the digest recomputed for its SNP
+  # generation. OFF until the lab proof (docs/operator/cross-gen-failover-lab.md).
+  # A boolean (the template uses ternary).
+  failoverCrossGenEnabled: false
+  # The vCPU models a cross-generation move may join. ⚠️ Case-sensitive, only
+  # EpycMilan / EpycGenoa / EpycTurin: any other entry makes vali REFUSE TO
+  # START (settings.py raises at import).
+  failoverCrossGenGenerations: "EpycGenoa,EpycTurin"
+  # Optional lab list: comma-separated vm_ids allowed to cross generations.
+  # "" = NO list, i.e. once enabled every VM may cross (cross_gen.allowed).
+  failoverCrossGenVmIds: ""
   credentials:
     # Secret vali/vali-backup-s3 (object-scoped key, bucket hippius-vm-backup).
     enabled: true
@@ -1209,7 +1251,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:9b73229b1cfa3b6576d81158f30950e5977a546f0bdbc75418e1e1a53ec2b136"
+    digest: "sha256:e29b271c67e014d8359c2ab8b8892013c67370deb11b33304fabce2b51a17eb1"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1224,8 +1266,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "d2a9dc68f9278d3f1659d3351997420148ea7920"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/37919812657/attempts/1"
+      commitSha: "a9695e633f4a3cfb44921d1d99de37a5b6c445fa"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38426512573/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the

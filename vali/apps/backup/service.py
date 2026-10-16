@@ -240,6 +240,27 @@ def _retry_after() -> timedelta:
     return timedelta(seconds=int(getattr(settings, "VALI_BACKUP_RETRY_AFTER_S", 900)))
 
 
+def _domain_gone_grace() -> timedelta:
+    """How long a run whose domain is gone, with no sign yet of why, is held
+    open: a guest poweroff reaches vali through reboot recovery (a debounce,
+    then a settle or a relaunch), a guest reboot through the boot counter
+    the new boot writes after its key release."""
+    return timedelta(seconds=int(getattr(settings, "VALI_BACKUP_DOMAIN_GONE_GRACE_S", 900)))
+
+
+def _boot_settle() -> timedelta:
+    """How long after a boot started the guest must still be signalling
+    before a run may copy its disk: past the first-boot cloud-init window
+    (`_boot_gate`)."""
+    return timedelta(seconds=int(getattr(settings, "VALI_BACKUP_BOOT_SETTLE_S", 180)))
+
+
+def _boot_wait_max() -> timedelta:
+    """The longest a run waits for the boot to finish before it is taken
+    anyway (a guest with no in-guest agent never signals)."""
+    return timedelta(seconds=int(getattr(settings, "VALI_BACKUP_BOOT_WAIT_MAX_S", 900)))
+
+
 def _min_part_bytes() -> int:
     raw = int(getattr(settings, "VALI_BACKUP_MIN_PART_BYTES", MAX_S3_PART_BYTES))
     return min(max(raw, MIN_S3_PART_BYTES), MAX_S3_PART_BYTES)
@@ -479,6 +500,13 @@ def _poll(vm_id: str, miner_id: str) -> MinerBackupStatus | None:
 #: point is gone (`bitmap-missing`) or the guest booted mid-run
 #: (`state-changed`).
 _FULL_REQUIRED_ERRORS = frozenset({"bitmap-missing", "state-changed"})
+#: The miner's "the domain was not there, or restarted": the run's VM was
+#: down, or went down or rebooted under it (`_went_down` decides whether
+#: that was legitimate). `job-vanished`: QEMU came back before the next job
+#: poll; `state-changed`: the guest booted mid-run.
+_DOMAIN_GONE_ERRORS = frozenset(
+    {"qmp-no-domain", "vm-not-running", "job-vanished", "state-changed"}
+)
 
 
 def _reason(raw: str, fallback: str) -> str:
@@ -1103,21 +1131,95 @@ def _maybe_start(policy: BackupPolicy, now: datetime, report: BackupTickReport) 
         policy.disabled_at = now
         policy.save(update_fields=["enabled", "disabled_at", "updated_at"])
         return
+    if vm.state == VmState.ACTIVE and vm.power_state in (
+        VmPowerState.STOPPED,
+        VmPowerState.OFF,
+        VmPowerState.STOPPING,
+    ):
+        # Stopped: its disk holds nothing new. Not a failure, not overdue.
+        _defer(policy, "vm-stopped", now)
+        return
     if vm.state != VmState.ACTIVE or vm.power_state != VmPowerState.RUNNING or not vm.host:
+        _defer(policy, "", now)
         return
     if BackupRun.objects.filter(vm=vm, status__in=ACTIVE_RUN_STATUSES).exists():
+        _defer(policy, "", now)
         return
     if _orchestration_job_in_flight(vm):
         # A restore stages from, then replaces, this disk; a migration moves
         # it. Backups resume once the job is over.
+        _defer(policy, "", now)
         return
     if _probe_if_due(policy, now):
         report.probed += 1
     kind = _next_kind(policy)
     if not _is_due(policy, now):
+        _defer(policy, "", now)
         return
+    held = _boot_gate(policy, now)
+    if held:
+        _defer(policy, held, now)
+        return
+    _defer(policy, "", now)
     if _start_run(policy, kind, now):
         report.started += 1
+
+
+def _boot_gate(policy: BackupPolicy, now: datetime) -> str:
+    """Why a due run must wait for the VM's current boot to finish, or "".
+
+    A disk copied in the first seconds of a boot holds a half-run
+    cloud-init: restored, it does not come up (VM-09). The current boot
+    began at the latest of: the VM's launch or last relaunch
+    (`Vm.boot_started_at`; a power start, a resize, a reboot recovery, a
+    §25 activation) and a guest reboot the boot counter showed
+    (`BackupPolicy.boot_seen_at`). It counts as finished once the guest
+    still signals from inside (`Vm.guest_signal_at`: a served receipt or a
+    live attestation) `VALI_BACKUP_BOOT_SETTLE_S` after it began. After
+    `VALI_BACKUP_BOOT_WAIT_MAX_S` the run is taken anyway: a guest with no
+    in-guest agent never signals. `first-full-deferred` while the VM has
+    no backup at all yet, `boot-in-progress` otherwise."""
+    vm = policy.vm
+    if _boot_settled(policy, now) or now - _boot_began(policy) >= _boot_wait_max():
+        return ""
+    if BackupRun.objects.filter(vm=vm, status=RunStatus.DONE).exists():
+        return "boot-in-progress"
+    return "first-full-deferred"
+
+
+def _boot_began(policy: BackupPolicy) -> datetime:
+    """When the VM's current boot began (`_boot_gate`)."""
+    vm = policy.vm
+    clocks = [c for c in (vm.boot_started_at, policy.boot_seen_at) if c is not None]
+    return max(clocks) if clocks else vm.created_at
+
+
+def _boot_settled(policy: BackupPolicy, now: datetime) -> bool:
+    """The current boot has settled: the guest still signalled from inside
+    `VALI_BACKUP_BOOT_SETTLE_S` after it began (`_boot_gate`)."""
+    signal = policy.vm.guest_signal_at
+    return signal is not None and signal >= _boot_began(policy) + _boot_settle()
+
+
+def _run_boot_settled(policy: BackupPolicy, now: datetime) -> bool | None:
+    """What a run starting now records as `boot_settled`: True once the boot
+    settled, else None — the gate (`_boot_gate`) starts no run inside a
+    young boot, so a run without the proof is one taken at the wait's cap:
+    a guest with no in-guest signal, whose boot vali cannot date."""
+    return True if _boot_settled(policy, now) else None
+
+
+def _defer(policy: BackupPolicy, reason: str, now: datetime) -> None:
+    """Record why no run starts now (`deferred_reason`, blank: nothing held
+    back), and since when. Written only when it changes."""
+    if policy.deferred_reason == reason:
+        return
+    if reason:
+        log.info("backup: vm=%s deferred: %s", policy.vm.vm_id, reason)
+    BackupPolicy.objects.filter(pk=policy.pk).update(
+        deferred_reason=reason, deferred_since=now if reason else None
+    )
+    policy.deferred_reason, policy.deferred_since = reason, (now if reason else None)
 
 
 def _orchestration_job_in_flight(vm: Vm) -> bool:
@@ -1172,6 +1274,11 @@ def _note_boot_counter(policy: BackupPolicy, boot_counter: int, now: datetime) -
             )
         policy.observed_boot_counter = boot_counter
         policy.observed_at = now
+        if observed is not None or boot_counter > 1:
+            # A boot vali did not order (or, first seen past the first boot,
+            # one it cannot date — cloud-init may have just rebooted it): the
+            # next run waits for it to finish.
+            policy.boot_seen_at = now
         policy.full_required = True
     return False
 
@@ -1219,6 +1326,10 @@ def _is_due(policy: BackupPolicy, now: datetime) -> bool:
     if last.status == RunStatus.FAILED:
         wait = min(_retry_after(), timedelta(seconds=policy.interval_s))
         return now >= (last.finished_at or last.created_at) + wait
+    if last.status == RunStatus.SKIPPED:
+        # The VM went down under it: nothing to wait out but the boot
+        # (`_boot_gate`).
+        return True
     # The last run is DONE. A required full (a new boot, a lost bitmap, a
     # re-enabled policy) is taken now; anything else waits for the interval.
     if policy.full_required:
@@ -1295,6 +1406,7 @@ def _start_run(policy: BackupPolicy, kind: str, now: datetime) -> bool:
                 parent_run_id=parent.run_id if parent is not None else "",
                 part_size=part_size,
                 part_count=part_count,
+                boot_settled=_run_boot_settled(policy, now),
             )
     except IntegrityError:
         # Another run of this VM got there first.
@@ -1451,8 +1563,7 @@ def _advance_run(run: BackupRun, now: datetime, report: BackupTickReport) -> Non
         # that host). The parent point is untouched either way; if it is
         # gone, the next incremental is refused `bitmap-missing`.
         if now - dispatched > _lost_grace():
-            _fail(run, "lost", now, full_required=False)
-            report.failed += 1
+            _domain_gone(run, "lost", now, report)
         return
     if got.status == "running":
         if timed_out:
@@ -1461,6 +1572,9 @@ def _advance_run(run: BackupRun, now: datetime, report: BackupTickReport) -> Non
         return
     if got.status == "failed":
         reason = _reason(got.error, "miner-failed")
+        if reason in _DOMAIN_GONE_ERRORS:
+            _domain_gone(run, reason, now, report)
+            return
         _fail(run, reason, now, full_required=reason in _FULL_REQUIRED_ERRORS)
         report.failed += 1
         return
@@ -1842,6 +1956,71 @@ def _mark_chain_failed(chain: BackupChain, now: datetime) -> None:
     )
 
 
+def _domain_gone(run: BackupRun, reason: str, now: datetime, report: BackupTickReport) -> bool:
+    """The run's domain was gone (`reason`): skipped when the VM legitimately
+    went down (`_went_down`), held open while no sign of why has reached
+    vali yet, failed `reason` once `_domain_gone_grace` has passed with
+    none. Returns whether the run ended."""
+    gone = _went_down(run)
+    if gone:
+        _skip(run, gone, now)
+        return True
+    if run.domain_gone_at is None:
+        run.domain_gone_at = now
+        run.save(update_fields=["domain_gone_at"])
+        return False
+    if now - run.domain_gone_at < _domain_gone_grace():
+        return False
+    _fail(run, reason, now, full_required=reason in _FULL_REQUIRED_ERRORS)
+    report.failed += 1
+    return True
+
+
+def _went_down(run: BackupRun) -> str:
+    """Why `run`'s VM legitimately had no domain, or "": it is not running
+    now (`vm-stopped`), or it stopped, restarted or rebooted since the run
+    was dispatched (`vm-restarted`: a power op, a relaunch, a guest
+    poweroff, a boot counter that moved). A domain missing with none of
+    these is a real failure."""
+    vm = Vm.objects.get(pk=run.vm_id)
+    if vm.power_state != VmPowerState.RUNNING:
+        return "vm-stopped"
+    dispatched = run.dispatched_at or run.created_at
+    policy = BackupPolicy.objects.filter(vm=vm).first()
+    for at in (
+        vm.power_state_at,
+        vm.boot_started_at,
+        vm.power_stopped_by_guest_at,
+        policy.boot_seen_at if policy is not None else None,
+    ):
+        if at is not None and at > dispatched:
+            return "vm-restarted"
+    return ""
+
+
+def _skip(run: BackupRun, reason: str, now: datetime) -> None:
+    """End a run whose VM went down under it (`_went_down`): no failure is
+    counted or alerted. Its upload is aborted like a failed one's, and the
+    next run is a full (whatever QEMU held for the chain went with it)."""
+    _abort_upload(run)
+    with transaction.atomic():
+        run.status = RunStatus.SKIPPED
+        run.reason = reason[:64]
+        run.finished_at = now
+        run.save(update_fields=["status", "reason", "finished_at"])
+        if run.kind == BackupKind.FULL:
+            _mark_chain_failed(run.chain, now)
+        BackupPolicy.objects.filter(vm=run.vm).update(full_required=True)
+    log.info(
+        "backup: vm=%s run=%s %s #%d skipped: %s",
+        run.vm.vm_id,
+        run.run_id,
+        run.kind,
+        run.seq,
+        reason,
+    )
+
+
 def _fail(run: BackupRun, reason: str, now: datetime, *, full_required: bool) -> None:
     """Fail a run: abort its upload and, when the dirty bitmap may now miss
     writes, require a full next."""
@@ -1902,7 +2081,9 @@ def prune(*, now: datetime | None = None) -> int:
     full is useless. Also retries the abort of any failed run whose upload
     is still open. Returns the number of chains pruned."""
     now = now or timezone.now()
-    for run in BackupRun.objects.filter(status=RunStatus.FAILED, upload_open=True):
+    for run in BackupRun.objects.filter(
+        status__in=[RunStatus.FAILED, RunStatus.SKIPPED], upload_open=True
+    ):
         _abort_upload(run)
     pruned = 0
     chains = (
@@ -1968,12 +2149,24 @@ def failover_auto_regions() -> frozenset[str]:
 
 
 def vm_region(vm: Vm) -> str:
-    """The region the VM belongs to: the one its launch asked for, else its
-    host's last known location (however old: the host may be the dead miner
-    a failover leaves). `""` when neither is known."""
+    """The region the VM belongs to: the one an operator's cross-region move
+    that took last moved it to (`MigrationJob.cross_region_override`), else
+    the one its launch asked for, else its host's last known location
+    (however old: the host may be the dead miner a failover leaves). `""`
+    when none is known."""
     from apps.miners import geo
+    from apps.orchestration.models import MigrationJob, MigrationState
     from apps.scheduler import service as sched
 
+    moved = (
+        MigrationJob.objects.filter(vm=vm, cross_region_override=True, reverted=False)
+        .filter(Q(state=MigrationState.DONE.value) | Q(committed_at__isnull=False))
+        .order_by("-started_at")
+        .values_list("region", flat=True)
+        .first()
+    )
+    if moved:
+        return moved.upper()
     region = sched.launch_region_for_vm(vm.vm_id)
     if region:
         return region.upper()
@@ -2002,15 +2195,76 @@ def failover_region_blocker(vm: Vm) -> str | None:
     return None if region and region in failover_auto_regions() else "region-backups-not-local"
 
 
+def failover_peer_blocker(vm: Vm) -> str | None:
+    """`no-failover-peer` when no other miner could ever take the VM's
+    failover: none is active (not quarantined, not leaving; on chain too, a
+    positive `active` mirror row — `sched.active_mirror_node_ids`), not cordoned,
+    of its host's SNP generation, and last known in its region. Room is not
+    asked — none right now is `pending_capacity` at failover time; this is
+    the VM that would wait forever while reading as protected. A peer's
+    region is its durable last known one (a missed probe does not flip the
+    blocker), where the failover pick needs it located and dispatchable
+    then: eligible here can still wait at failover time, never the reverse.
+    Of any generation where a cross-generation restore is allowed
+    (`failover_peer_generations`)."""
+    from apps.orchestration import service as orch
+
+    region = vm_region(vm)
+    if not region:
+        return "no-failover-peer"
+    try:
+        generation = orch._snp_generation(vm.host)
+    except orch.StartError:
+        return "no-failover-peer"
+    return None if failover_peer_generations(vm, region, generation) else "no-failover-peer"
+
+
+def failover_peer_generations(vm: Vm, region: str, generation: str) -> set[str]:
+    """The SNP generations of the miners that could take `vm`'s failover in
+    `region`: active, not cordoned, last located there, of `generation` —
+    or of any, where a cross-generation restore is allowed for the VM
+    (`cross_gen.allowed`)."""
+    from apps.miners import geo
+    from apps.miners.models import MinerIdentity, MinerStatus
+    from apps.orchestration import cross_gen
+    from apps.orchestration.effects import EffectError
+    from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
+    from apps.scheduler import service as sched
+
+    cordoned = sched.cordoned_node_ids()
+    on_chain = sched.active_mirror_node_ids()
+    peers = [
+        m
+        for m in MinerIdentity.objects.filter(status=MinerStatus.ACTIVE).exclude(miner_id=vm.host)
+        if (m.chain_node_id or "").lower() not in cordoned
+        and (m.chain_node_id or "").lower() in on_chain
+    ]
+    countries = geo.last_known_countries([m.miner_id for m in peers])
+    out: set[str] = set()
+    for miner in peers:
+        if countries.get(miner.miner_id) != region:
+            continue
+        try:
+            theirs = _vcpu_type_for_platform(miner.platform_id, miner.snp_generation)
+        except EffectError:
+            continue
+        if theirs == generation or cross_gen.allowed(vm, generation, theirs):
+            out.add(theirs)
+    return out
+
+
 def failover_auto_status(policy: BackupPolicy) -> tuple[bool, str | None]:
     """`(eligible, blocker)` for automatic failover of the policy's VM:
-    `disabled` (the policy is off), `region-backups-not-local`, `no-point`
-    (no restorable current-boot point), or eligible. The checks are those
-    the automatic worker makes; whether `failover_mode` is `auto` is not one
-    of them (a `manual` VM can be eligible)."""
-    if not policy.enabled:
+    `disabled` (the policy is off, or automatic failover is off on this
+    deployment, `VALI_FAILOVER_AUTO_ENABLED`), `region-backups-not-local`,
+    `no-failover-peer` (no other miner of its SNP generation in its region,
+    `failover_peer_blocker`), `no-point` (no restorable current-boot point),
+    or eligible. The checks are those the automatic worker makes; whether
+    `failover_mode` is `auto` is not one of them (a `manual` VM can be
+    eligible)."""
+    if not policy.enabled or not settings.VALI_FAILOVER_AUTO_ENABLED:
         return False, "disabled"
-    blocker = failover_region_blocker(policy.vm)
+    blocker = failover_region_blocker(policy.vm) or failover_peer_blocker(policy.vm)
     if blocker is not None:
         return False, blocker
     if not has_current_boot_point(policy):
@@ -2020,6 +2274,32 @@ def failover_auto_status(policy: BackupPolicy) -> tuple[bool, str | None]:
 
 def has_current_boot_point(policy: BackupPolicy) -> bool:
     return restore_point(policy.vm, policy) is not None
+
+
+def failover_generation_view(vm: Vm) -> dict[str, Any]:
+    """`failover_cross_generation`: a failover of the VM may land on another
+    SNP generation (allowed for it, and such a peer is in its region);
+    `failover_cross_generation_warning`: the text the customer is shown when
+    that generation is OLDER than its host's (`cross_gen.warning`), else
+    null. No detection of what the guest runs: a warning, nothing else."""
+    from apps.orchestration import cross_gen
+    from apps.orchestration import service as orch
+
+    off = {"failover_cross_generation": False, "failover_cross_generation_warning": None}
+    region = vm_region(vm)
+    if not region or not vm.host or not cross_gen.enabled():
+        return off
+    try:
+        own = orch._snp_generation(vm.host)
+    except orch.StartError:
+        return off
+    others = failover_peer_generations(vm, region, own) - {own}
+    if not others:
+        return off
+    return {
+        "failover_cross_generation": True,
+        "failover_cross_generation_warning": cross_gen.warning(vm, others),
+    }
 
 
 def policy_view(policy: BackupPolicy) -> dict[str, Any]:
@@ -2032,6 +2312,14 @@ def policy_view(policy: BackupPolicy) -> dict[str, Any]:
         "failover_mode": policy.failover_mode,
         "failover_auto_eligible": eligible,
         "failover_auto_blocker": blocker,
+        **failover_generation_view(policy.vm),
+        # Why no run starts now although one is due (VM-07, VM-09).
+        "deferred_reason": (policy.deferred_reason or None) if policy.enabled else None,
+        "deferred_since": (
+            policy.deferred_since.isoformat()
+            if policy.enabled and policy.deferred_since
+            else None
+        ),
         "created_at": policy.created_at.isoformat(),
         "updated_at": policy.updated_at.isoformat(),
     }
@@ -2077,6 +2365,7 @@ def _run_view(
         "boot_counter": run.boot_counter,
         "manifest_sha256": run.manifest_sha256 or None,
         "has_checkpoint": checkpoint_of(run) is not None,
+        "boot_settled": run.boot_settled,
         "created_at": run.created_at.isoformat(),
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
     }

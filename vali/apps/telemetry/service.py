@@ -237,6 +237,70 @@ def _node_id_is_onchain_active(node_id_hex: str) -> bool:
     )
 
 
+def _autoprovision_binding_is_free(
+    miner_id: str, node_id: bytes, node_hex: str
+) -> bool:
+    """`True` iff node `node_hex` may (re-)claim `miner_id` — call inside
+    a transaction; the rows read are locked `FOR UPDATE`.
+
+    `miner_id` is operator-chosen in the signed body, i.e. a global
+    namespace any on-chain-Active node can name. It is claimable only
+    when it is free, or already bound to THIS node (the idempotent heal):
+
+    - a `MinerIdentity` under `miner_id` bound to another node
+      (neither `chain_node_id` nor `pubkey_hex` is `node_hex`) ⇒ refuse;
+    - a miner `TelemetrySource` under `miner_id` with another key and no
+      `MinerIdentity` behind it ⇒ refuse (never re-key an orphan source);
+    - `node_hex` already bound to ANOTHER `miner_id` ⇒ refuse: one node,
+      one miner. Refused rather than redirected to the existing row —
+      that row may carry a distinct operator-registered telemetry key
+      (`pubkey_hex` ≠ `chain_node_id`) that a re-key would clobber, and
+      the body's `miner_id` would fail the ingest's peer-vs-body gate
+      (5) anyway.
+    """
+    from apps.miners.models import MinerIdentity
+
+    ident = MinerIdentity.objects.select_for_update().filter(miner_id=miner_id).first()
+    if ident is not None and node_hex not in (ident.chain_node_id, ident.pubkey_hex):
+        log.warning(
+            "autoprovision refused: miner_id=%s is bound to another node "
+            "(claimed node_id=%s…)",
+            miner_id,
+            node_hex[:16],
+        )
+        return False
+    if ident is None:
+        src = (
+            TelemetrySource.objects.select_for_update()
+            .filter(source=SourceType.MINER.value, source_id=miner_id)
+            .first()
+        )
+        if src is not None and bytes(src.verifying_key) != node_id:
+            log.warning(
+                "autoprovision refused: miner_id=%s has a source keyed to "
+                "another node (claimed node_id=%s…)",
+                miner_id,
+                node_hex[:16],
+            )
+            return False
+    other = (
+        MinerIdentity.objects.select_for_update()
+        .filter(Q(chain_node_id=node_hex) | Q(pubkey_hex=node_hex))
+        .exclude(miner_id=miner_id)
+        .first()
+    )
+    if other is not None:
+        log.warning(
+            "autoprovision refused: node_id=%s… is already bound to "
+            "miner_id=%s, not claimed miner_id=%s",
+            node_hex[:16],
+            other.miner_id,
+            miner_id,
+        )
+        return False
+    return True
+
+
 def autoprovision_node_heartbeat_source(
     node_id_hex: str, envelope: bytes
 ) -> str | None:
@@ -256,7 +320,10 @@ def autoprovision_node_heartbeat_source(
 
     Returns the provisioned `miner_id` (== the signed body's `miner_id`,
     so the peer-vs-body gate passes on the subsequent ingest), or `None`
-    to fail-closed. Idempotent — a re-provision heals an existing row.
+    to fail-closed. Idempotent — a re-provision heals an existing row,
+    but only one already bound to THIS node: the body's `miner_id` is
+    operator-chosen, so a node naming another miner's id is refused
+    (`_autoprovision_binding_is_free`), never handed its source.
     """
     try:
         node_id = bytes.fromhex(node_id_hex)
@@ -278,17 +345,40 @@ def autoprovision_node_heartbeat_source(
     from apps.miners.models import MinerIdentity, autoprovision_platform_id
 
     miner_id = hb.miner_id
+    node_hex = node_id.hex()
     with transaction.atomic():
-        MinerIdentity.objects.get_or_create(
-            miner_id=miner_id,
-            defaults={
-                "pubkey_hex": node_id_hex,
-                # Per node — `platform_id` is unique, so a shared literal
-                # would let only one unregistered miner exist at a time.
-                "platform_id": autoprovision_platform_id(node_id_hex),
-                "chain_node_id": node_id_hex,
-            },
-        )
+        if not _autoprovision_binding_is_free(miner_id, node_id, node_hex):
+            return None
+        try:
+            # Locked `get_or_create`: a concurrent first heartbeat that
+            # won the INSERT race is returned here (not created) and
+            # re-checked below; a unique-key clash on `pubkey_hex` /
+            # `chain_node_id` (same node, another miner_id) raises.
+            ident, created = MinerIdentity.objects.select_for_update().get_or_create(
+                miner_id=miner_id,
+                defaults={
+                    "pubkey_hex": node_hex,
+                    # Per node — `platform_id` is unique, so a shared literal
+                    # would let only one unregistered miner exist at a time.
+                    "platform_id": autoprovision_platform_id(node_hex),
+                    "chain_node_id": node_hex,
+                },
+            )
+        except IntegrityError:
+            log.warning(
+                "autoprovision refused: concurrent claim on miner_id=%s or node_id=%s…",
+                miner_id,
+                node_hex[:16],
+            )
+            return None
+        if not created and node_hex not in (ident.chain_node_id, ident.pubkey_hex):
+            log.warning(
+                "autoprovision refused: miner_id=%s is bound to another node "
+                "(claimed node_id=%s…)",
+                miner_id,
+                node_hex[:16],
+            )
+            return None
         TelemetrySource.objects.update_or_create(
             source=SourceType.MINER.value,
             source_id=miner_id,
@@ -836,6 +926,21 @@ def ingest_heartbeat(
                     agent_version=hb.agent_version,
                     agent_version_reported_at=now,
                 )
+            # The `v7` storage report — pools and dedicated disks. UNTRUSTED,
+            # RECORD ONLY (`apps.disktier.ingest`): it fills the
+            # miner-reported columns and decides nothing. The v4 scalar
+            # disk columns above are still filled from the same body. A
+            # failure here is logged and confined to its own savepoint: it
+            # must never cost the miner its liveness.
+            if hb.declared_storage is not None and miner.chain_node_id:
+                from apps.disktier.ingest import record_storage_report
+
+                try:
+                    record_storage_report(miner.chain_node_id, hb.declared_storage, now)
+                except Exception:
+                    log.exception(
+                        "heartbeat storage report not recorded: miner_id=%s", miner_id
+                    )
     except IngestError:
         raise
     except IntegrityError:

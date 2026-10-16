@@ -81,6 +81,10 @@ pub enum OrderKind {
     /// Set what the agent does when the guest powers itself off
     /// ([`PowerPolicyOrder`]). Persisted per VM; no relaunch.
     PowerPolicy,
+    /// The desired storage document ([`StorageConfigOrder`]). Host-wide;
+    /// validated, persisted under a revision floor and put in force
+    /// ([`crate::storage::remote`]).
+    StorageConfig,
 }
 
 impl OrderKind {
@@ -99,6 +103,7 @@ impl OrderKind {
             OrderKind::TenantPreflight => "tenant-preflight",
             OrderKind::NetPolicy => "net-policy",
             OrderKind::PowerPolicy => "power-policy",
+            OrderKind::StorageConfig => "storage-config",
         }
     }
 }
@@ -920,6 +925,12 @@ impl OrderSubject for NetPolicyOrder {
     }
 }
 
+impl OrderSubject for StorageConfigOrder {
+    fn log_subject(&self) -> &str {
+        "host"
+    }
+}
+
 /// `local`: guests leave through the miner's own NAT. `edge`: through
 /// the region's edge, the miner allowing only the listed endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -989,6 +1000,68 @@ pub struct NetPolicyOrder {
     pub smtp_allowed_vms: Vec<VmId>,
     /// Per-VM cap in Mbit/s, keyed by VM id.
     pub vm_caps: std::collections::BTreeMap<String, u32>,
+}
+
+/// A storage pool's declared class — a hint for vali's probe and the
+/// operator, never a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoragePoolClass {
+    Nvme,
+    Ssd,
+    Hdd,
+}
+
+/// The desired state of a pool or a dedicated disk: `draining` takes no
+/// new disks and is removed once empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageDesiredState {
+    Active,
+    Draining,
+}
+
+/// One storage pool of a [`StorageConfigOrder`]: an already-mounted
+/// filesystem the agent may put OS disks on. The agent never formats,
+/// mounts or moves anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePoolSpec {
+    /// `[a-z0-9-]{1,32}`.
+    pub id: String,
+    /// Absolute, canonical mount point.
+    pub path: String,
+    pub class: StoragePoolClass,
+    pub budget_gb: u32,
+    pub os_disks: bool,
+    pub state: StorageDesiredState,
+}
+
+/// One dedicated physical disk of a [`StorageConfigOrder`], declared by
+/// its `/dev/disk/by-id/` basename.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedDiskSpec {
+    pub id: String,
+    pub state: StorageDesiredState,
+}
+
+/// The miner's full desired storage document (`storage-config`), see
+/// `docs/design/disk-tier-verification.md` §9. Never a patch: the agent
+/// validates the whole document and applies all of it or nothing.
+///
+/// Like [`NetPolicyOrder`], `revision` is per miner and monotonic and
+/// `not_after_unix` is left out of the content hash. `dry_run` runs every
+/// check and persists nothing. Served by `/v1/miner/order/storage-config`
+/// ([`crate::storage::remote`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfigOrder {
+    pub revision: u64,
+    pub not_after_unix: u64,
+    pub dry_run: bool,
+    pub pools: Vec<StoragePoolSpec>,
+    pub dedicated_disks: Vec<DedicatedDiskSpec>,
 }
 
 impl Order for LaunchOrder {

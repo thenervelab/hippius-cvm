@@ -253,6 +253,11 @@ class OperatorRegionSerializer(serializers.Serializer):
         allow_null=True,
         help_text="Summed admission capacity of the counted miners; null when none reports one.",
     )
+    failover_capable = serializers.BooleanField(
+        help_text="The region holds at least one pair of dispatchable, active, uncordoned "
+        "miners of the same SNP generation: a VM placed here with "
+        "`require_failover_peer` can be failed over within the region."
+    )
     node_ids = serializers.ListField(
         child=serializers.CharField(), help_text="On-chain node_ids of the counted miners."
     )

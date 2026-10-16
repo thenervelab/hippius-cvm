@@ -102,6 +102,7 @@ fn kat_heartbeat() -> MinerHeartbeat {
         disk: hippius_types::heartbeat::DiskDeclaration::default(),
         host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
         agent_version: String::new(),
+        storage: Default::default(),
     }
 }
 
@@ -304,6 +305,49 @@ fn v6_kat_emits_the_agent_version() {
 }
 
 #[test]
+fn v7_kat_emits_the_storage_report() {
+    // The committed frozen v7 envelope, through the real binary — the
+    // JSON keys the vali consumer reads.
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v7.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v7.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    assert_eq!(run.exit, 0, "stderr: {}", run.stderr);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    let body = &json["body"];
+    assert_eq!(body["schema_version"], 7);
+    assert_eq!(body["agent_version"], "v1.2.3");
+    assert_eq!(body["data_disk_total_gb"], 3_500);
+    assert_eq!(body["storage_config_revision"], 3);
+    let pools = body["disk_pools"].as_array().expect("disk_pools");
+    assert_eq!(pools.len(), 2);
+    assert_eq!(pools[0]["id"], "default");
+    assert_eq!(pools[0]["class"], "");
+    assert_eq!(pools[1]["state"], "draining");
+    assert_eq!(pools[1]["error"], "pool-not-a-mount");
+    let disks = body["dedicated_disks"].as_array().expect("dedicated_disks");
+    assert_eq!(disks.len(), 2);
+    assert_eq!(disks[1]["state"], "assigned");
+    assert_eq!(disks[1]["vm"], "vm-kat-1");
+}
+
+#[test]
+fn v6_kat_carries_no_storage_report() {
+    let envelope =
+        std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v6.cbor"))
+            .expect("read test_vectors/heartbeat/signed_heartbeat_v6.cbor");
+    let sk = SigningKey::from_bytes(&KAT_SEED);
+    let run = run_verify_heartbeat(&vk_hex(&sk), &envelope);
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).expect("stdout is not JSON");
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    for key in ["disk_pools", "dedicated_disks", "storage_config_revision"] {
+        assert!(json["body"].get(key).is_none(), "{key}");
+    }
+}
+
+#[test]
 fn v5_kat_carries_no_agent_version() {
     let envelope =
         std::fs::read(repo_root().join("test_vectors/heartbeat/signed_heartbeat_v5.cbor"))
@@ -500,10 +544,10 @@ fn array_encoded_body_field_is_rejected() {
 
 #[test]
 fn over_cap_envelope_is_body_too_large() {
-    // A 5000-byte body → an envelope past the 4096-byte cap.
+    // A 17000-byte body → an envelope past the 16 KiB cap.
     let sk = SigningKey::from_bytes(&[0x66u8; 32]);
     let envelope = SignedMinerHeartbeat {
-        body: vec![0u8; 5000],
+        body: vec![0u8; 17_000],
         sig: vec![0u8; SIGNATURE_LEN],
     }
     .canonical()
@@ -514,11 +558,11 @@ fn over_cap_envelope_is_body_too_large() {
 
 #[test]
 fn wrong_schema_version_is_rejected() {
-    // Version 7 is unknown (not v1 through v6). A 10-field body matches
+    // Version 8 is unknown (not v1 through v7). A 10-field body matches
     // the v1-count branch, so it decodes cleanly and the failure lands
     // on the schema-version gate.
     let sk = SigningKey::from_bytes(&[0x77u8; 32]);
-    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(7.into()))]));
+    let body = forged_body(body_pairs(&[("schema_version", Value::Integer(8.into()))]));
     let run = run_verify_heartbeat(&vk_hex(&sk), &signed_envelope(body, &sk));
     assert_reject(&run, "wrong_schema_version");
 }

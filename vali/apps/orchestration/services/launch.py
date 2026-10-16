@@ -712,6 +712,16 @@ class LaunchSpec:
     # rides the launch order; intake writes the key into `spec_json` only
     # for `stop`. A relaunch passes the VM's CURRENT choice instead.
     on_guest_poweroff: str = "restart"
+    # Gate (m): only a host with a failover peer. Defaulted (and written
+    # into `spec_json` only when true) for the same reason as `region`.
+    require_failover_peer: bool = False
+    # The userdata is a RESTAGED one (`apps.orchestration.userdata_restage`):
+    # delivered byte for byte. No NetBird key is minted for it and no
+    # `{{…}}` token in it is substituted or required — the caller staged
+    # the complete userdata of a guest that is already enrolled. Set by a
+    # relaunch from the stamp the restage writes inside the wrapped
+    # template ([`split_verbatim_userdata`]); never by a launch.
+    userdata_verbatim: bool = False
 
 
 @dataclass
@@ -1419,7 +1429,9 @@ def launch_on_miner(
     kek_bytes = spec.kek_bytes
 
     # ── 1. Optional NetBird enrolment (#306, #309) ──────────────────
-    if spec.enable_netbird:
+    # A restaged userdata is delivered as staged: nothing minted, nothing
+    # substituted (`LaunchSpec.userdata_verbatim`).
+    if spec.enable_netbird and not spec.userdata_verbatim:
         nb_err = check_netbird_userdata(
             userdata,
             enable=True,
@@ -2650,6 +2662,7 @@ def _place_and_launch(
                         getattr(spec, "on_guest_poweroff", power_policy.RESTART)
                         == power_policy.STOP
                     ),
+                    require_failover_peer=getattr(spec, "require_failover_peer", False),
                 ),
             )
         except PlacementError as exc:
@@ -3199,6 +3212,40 @@ def _persist_billing_binding(
 _WORKING_STAMP = b"hippius-userdata-for-canonical-v"
 
 
+# A RESTAGED template's header (`stage_userdata_restage_copy`), inside the
+# Transit-wrapped blob like the working copy's stamp: only a holder of
+# `transit/encrypt/ud-<vm_id>` can write one. A cloud-config never starts
+# with it, and launch intake refuses a userdata that does.
+VERBATIM_STAMP = b"hippius-userdata-verbatim-v1\n"
+
+
+def stage_userdata_restage_copy(
+    mount: str, path: str, vm_id: str, userdata: bytes, *, cas: int
+):
+    """Stage a RESTAGED userdata at the intake path, wrapped under
+    `ud-<vm_id>` like the intake template, and stamped VERBATIM: the
+    relaunch that reads it back delivers it byte for byte, with no NetBird
+    key minted or substituted ([`split_verbatim_userdata`]).
+
+    `cas` is the path's current version (0: none yet), as KV v2
+    check-and-set: a write that landed since the caller read it raises
+    `VaultCasConflict` instead of writing past it."""
+    transit_key = vault_kv.userdata_transit_key_name(vm_id)
+    vault_kv.ensure_transit_key(transit_key)
+    return vault_kv.put_kv(
+        mount, path, vault_kv.transit_encrypt(transit_key, VERBATIM_STAMP + userdata), cas=cas
+    )
+
+
+def split_verbatim_userdata(opened: bytes) -> tuple[bytes, bool]:
+    """`(userdata, verbatim)` of a template read back with
+    [`open_userdata_intake_copy`]: a restaged one loses its stamp and is
+    delivered as is; anything else is a launch template, unchanged."""
+    if bytes(opened[: len(VERBATIM_STAMP)]) == VERBATIM_STAMP:
+        return opened[len(VERBATIM_STAMP) :], True
+    return opened, False
+
+
 class UserdataPairingError(EffectError):
     """The working copy does not demonstrably correspond to the canonical
     version being bound — see [`open_userdata_working_copy`]."""
@@ -3506,7 +3553,7 @@ def _ensure_vm_row(spec: LaunchSpec) -> Any:
             binding, cmdline=spec.cmdline, vm_id=spec.vm_id, lease_id=spec.lease_id
         )
         customer_keys.check_lease_id(binding, spec.lease_id)
-        if spec.enable_netbird:
+        if spec.enable_netbird and not spec.userdata_verbatim:
             customer_keys.harden_netbird_up(binding, spec.userdata)
     except customer_keys.CustomerKeysError as exc:
         raise LaunchConfigError(str(exc)) from exc

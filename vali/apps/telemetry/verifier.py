@@ -142,11 +142,107 @@ def verify_envelope(
 
 
 @dataclass(frozen=True)
+class DiskIoDelta:
+    """One device's `/sys/block` deltas over a receipt window (the optional
+    receipt key `disk_io`, docs/design/disk-tier-verification.md §3.5).
+    Passive evidence: in-VM root controls it, so it may only ever schedule
+    a probe. `state` is `ok`, or `mismatch` / `missing` for a dedicated
+    slot the guest refused or could not find."""
+
+    dev: str
+    serial: str
+    state: str
+    r_ios: int
+    r_sectors: int
+    r_ticks_ms: int
+    w_ios: int
+    w_sectors: int
+    w_ticks_ms: int
+    io_ticks_ms: int
+    tiq_ms: int
+    inflight: int
+
+
+_DISK_IO_COUNTERS: tuple[str, ...] = (
+    "r_ios",
+    "r_sectors",
+    "r_ticks_ms",
+    "w_ios",
+    "w_sectors",
+    "w_ticks_ms",
+    "io_ticks_ms",
+    "tiq_ms",
+    "inflight",
+)
+_DISK_IO_STATES = frozenset({"ok", "mismatch", "missing"})
+# Mirrors of the `hippius_types::disk_stats` rules the binary enforced,
+# re-checked as defence in depth (the values land in the DB later).
+_SLOT_RE = re.compile(r"os|x(?:[0-9]|1[0-9]|2[0-3])")
+_SLOT_SERIAL_RE = re.compile(r"hippius-(?:os|x(?:[0-9]|1[0-9]|2[0-3]))")
+_DEV_RE = re.compile(r"[a-z0-9]{1,16}")
+_PROFILE_RE = re.compile(r"[a-z0-9]{1,8}")
+_METRIC_RE = re.compile(r"[a-z0-9_]{1,32}")
+_DISK_CODE_RE = re.compile(r"[a-z0-9-]{0,48}")
+_DISK_IO_KEYS = frozenset({"dev", "serial", "state", *_DISK_IO_COUNTERS})
+_PROBE_KEYS = frozenset(
+    {
+        "run_id_hex",
+        "nonce_hex",
+        "vm_id",
+        "vcpus",
+        "kernel",
+        "release_version",
+        "started_at",
+        "finished_at",
+        "targets",
+    }
+)
+_TARGET_KEYS = frozenset({"slot", "profile", "metrics", "hist_qd1", "error"})
+_DEDICATED_SERIAL_RE = re.compile(r"hippius-x(?:[0-9]|1[0-9]|2[0-3])")
+_HIST_BUCKETS = 32
+
+
+@dataclass(frozen=True)
+class DiskProbeTarget:
+    """One disk a probe measured: its slot (`os` / `x<N>`), the profile it
+    ran, its integer metrics, the QD1 latency histogram and an error code
+    (`""` when it finished)."""
+
+    slot: str
+    profile: str
+    metrics: dict[str, int]
+    hist_qd1: tuple[int, ...]
+    error: str
+
+
+@dataclass(frozen=True)
+class DiskProbeResult:
+    """A probe VM's benchmark result (the optional receipt key
+    `disk_probe`). Worth nothing on its own: vali accepts it only from a VM
+    it launched as a probe, matched on `run_id_hex` + `nonce_hex` +
+    `vm_id`."""
+
+    run_id_hex: str
+    nonce_hex: str
+    vm_id: str
+    vcpus: int
+    kernel: str
+    release_version: int
+    started_at: int
+    finished_at: int
+    targets: tuple[DiskProbeTarget, ...]
+
+
+@dataclass(frozen=True)
 class ServedReceiptFields:
     """The attested billing fields of a verified served-delivery receipt
     (the data-bearing `verify-served-receipt` output). Every field is
     covered by the guest's Ed25519 signature — the miner that relayed the
-    receipt cannot forge them."""
+    receipt cannot forge them.
+
+    `disk_io` / `disk_probe` are the optional disk evidence; a receipt
+    without it (every guest today) yields `()` / `None`. The usage meter
+    never reads them."""
 
     vm_id: str
     lease_id: str
@@ -157,6 +253,8 @@ class ServedReceiptFields:
     period_end: int
     monotonic_seq: int
     observed_degradation_bps: int
+    disk_io: tuple[DiskIoDelta, ...] = ()
+    disk_probe: DiskProbeResult | None = None
 
 
 def verify_served_receipt(
@@ -223,10 +321,152 @@ def verify_served_receipt(
     return _served_receipt_fields(payload)
 
 
+_U64_MAX = 2**64 - 1
+_U32_MAX = 2**32 - 1
+
+
+def _uint(value: object, what: str, maximum: int = _U64_MAX) -> int:
+    """A non-negative, non-bool JSON integer within the wire type's range,
+    else contract drift."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        raise ValueError(f"{what} is not an integer in range")
+    return value
+
+
+def _exact_keys(obj: dict, keys: frozenset[str], what: str) -> None:
+    if set(obj) != keys:
+        raise ValueError(f"{what} keys are not the wire keys")
+
+
+def _text(value: object, what: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{what} is not a string")
+    return value
+
+
+def _disk_io(raw: object) -> tuple[DiskIoDelta, ...]:
+    if not isinstance(raw, list) or not raw or len(raw) > 16:
+        raise ValueError("disk_io is not a list of 1..=16 entries")
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("disk_io entry is not an object")
+        _exact_keys(item, _DISK_IO_KEYS, "disk_io entry")
+        state = _text(item.get("state"), "disk_io.state")
+        if state not in _DISK_IO_STATES:
+            raise ValueError("disk_io.state is unknown")
+        out.append(
+            DiskIoDelta(
+                dev=_text(item.get("dev"), "disk_io.dev"),
+                serial=_text(item.get("serial"), "disk_io.serial"),
+                state=state,
+                **{k: _uint(item.get(k), f"disk_io.{k}") for k in _DISK_IO_COUNTERS},
+            )
+        )
+    for d in out:
+        if d.serial and not _SLOT_SERIAL_RE.fullmatch(d.serial):
+            raise ValueError("disk_io.serial names no slot")
+        if d.state != "ok" and not _DEDICATED_SERIAL_RE.fullmatch(d.serial):
+            raise ValueError("disk_io slot verdict without a dedicated slot serial")
+        if (d.state == "missing") != (d.dev == ""):
+            raise ValueError("disk_io.dev is empty exactly for a missing slot")
+        if d.dev and not _DEV_RE.fullmatch(d.dev):
+            raise ValueError("disk_io.dev malformed")
+        if d.state == "missing" and any(getattr(d, k) for k in _DISK_IO_COUNTERS):
+            raise ValueError("disk_io missing slot with counters")
+    if [(d.dev, d.serial) for d in out] != sorted({(d.dev, d.serial) for d in out}):
+        raise ValueError("disk_io not strictly sorted by (dev, serial)")
+    serials = [d.serial for d in out if d.serial]
+    devs = [d.dev for d in out if d.dev]
+    if len(set(serials)) != len(serials) or len(set(devs)) != len(devs):
+        raise ValueError("disk_io names a device or slot twice")
+    return tuple(out)
+
+
+def _disk_probe(raw: object, receipt_vm_id: str) -> DiskProbeResult:
+    if not isinstance(raw, dict):
+        raise ValueError("disk_probe is not an object")
+    _exact_keys(raw, _PROBE_KEYS, "disk_probe")
+    targets_raw = raw.get("targets")
+    if not isinstance(targets_raw, list) or not targets_raw or len(targets_raw) > 9:
+        raise ValueError("disk_probe.targets is not a list of 1..=9 entries")
+    targets = []
+    for t in targets_raw:
+        if not isinstance(t, dict):
+            raise ValueError("disk_probe target is not an object")
+        _exact_keys(t, _TARGET_KEYS, "disk_probe target")
+        metrics = t.get("metrics")
+        hist = t.get("hist_qd1")
+        if not isinstance(metrics, dict) or not isinstance(hist, list):
+            raise ValueError("disk_probe target metrics / hist_qd1 malformed")
+        if len(hist) != _HIST_BUCKETS or len(metrics) > 16:
+            raise ValueError("disk_probe target hist_qd1 / metrics out of bounds")
+        if not isinstance(t.get("slot"), str) or not _SLOT_RE.fullmatch(t["slot"]):
+            raise ValueError("disk_probe.slot is not a slot")
+        if not isinstance(t.get("profile"), str) or not _PROFILE_RE.fullmatch(t["profile"]):
+            raise ValueError("disk_probe.profile malformed")
+        if not isinstance(t.get("error"), str) or not _DISK_CODE_RE.fullmatch(t["error"]):
+            raise ValueError("disk_probe.error malformed")
+        if not all(isinstance(k, str) and _METRIC_RE.fullmatch(k) for k in metrics):
+            raise ValueError("disk_probe metric name malformed")
+        targets.append(
+            DiskProbeTarget(
+                slot=_text(t.get("slot"), "disk_probe.slot"),
+                profile=_text(t.get("profile"), "disk_probe.profile"),
+                metrics={
+                    _text(k, "disk_probe metric name"): _uint(v, f"disk_probe metric {k}")
+                    for k, v in metrics.items()
+                },
+                hist_qd1=tuple(_uint(b, "disk_probe.hist_qd1", _U32_MAX) for b in hist),
+                error=_text(t.get("error"), "disk_probe.error"),
+            )
+        )
+    if [t.slot for t in targets] != sorted({t.slot for t in targets}):
+        raise ValueError("disk_probe targets are not strictly sorted by slot")
+    probe = DiskProbeResult(
+        run_id_hex=_text(raw.get("run_id_hex"), "disk_probe.run_id_hex"),
+        nonce_hex=_text(raw.get("nonce_hex"), "disk_probe.nonce_hex"),
+        vm_id=_text(raw.get("vm_id"), "disk_probe.vm_id"),
+        vcpus=_uint(raw.get("vcpus"), "disk_probe.vcpus", _U32_MAX),
+        kernel=_text(raw.get("kernel"), "disk_probe.kernel"),
+        release_version=_uint(
+            raw.get("release_version"), "disk_probe.release_version", _U32_MAX
+        ),
+        started_at=_uint(raw.get("started_at"), "disk_probe.started_at"),
+        finished_at=_uint(raw.get("finished_at"), "disk_probe.finished_at"),
+        targets=tuple(targets),
+    )
+    if not 1 <= len(probe.vm_id) <= 128 or not re.fullmatch(r"[!-~]+", probe.vm_id):
+        raise ValueError("disk_probe.vm_id malformed")
+    if not re.fullmatch(r"[ -~]{0,64}", probe.kernel):
+        raise ValueError("disk_probe.kernel malformed")
+    if not re.fullmatch(r"[0-9a-f]{32}", probe.run_id_hex) or not re.fullmatch(
+        r"[0-9a-f]{64}", probe.nonce_hex
+    ):
+        raise ValueError("disk_probe run_id / nonce are not hex of the right length")
+    if probe.finished_at < probe.started_at:
+        raise ValueError("disk_probe finished before it started")
+    if probe.vm_id != receipt_vm_id:
+        raise ValueError("disk_probe vm_id is not the receipt's")
+    return probe
+
+
 def _served_receipt_fields(payload: dict) -> ServedReceiptFields:
     """Coerce the data-bearing `verify-served-receipt` ok payload into a
-    typed `ServedReceiptFields` (fail-closed on a shape drift)."""
+    typed `ServedReceiptFields` (fail-closed on a shape drift). The
+    optional disk evidence is absent from every receipt today and
+    defaults to `()` / `None`; when present it is parsed and type-checked
+    here, then dropped by every consumer until the disk-tier ingest
+    (`VALI_DISK_IO_INGEST`) lands."""
     try:
+        # The binary omits a key it has nothing for; a present `null` is
+        # contract drift, not "absent".
+        disk_io = _disk_io(payload["disk_io"]) if "disk_io" in payload else ()
+        disk_probe = (
+            _disk_probe(payload["disk_probe"], str(payload["vm_id"]))
+            if "disk_probe" in payload
+            else None
+        )
         return ServedReceiptFields(
             vm_id=str(payload["vm_id"]),
             lease_id=str(payload["lease_id"]),
@@ -237,6 +477,8 @@ def _served_receipt_fields(payload: dict) -> ServedReceiptFields:
             period_end=int(payload["period_end"]),
             monotonic_seq=int(payload["monotonic_seq"]),
             observed_degradation_bps=int(payload["observed_degradation_bps"]),
+            disk_io=disk_io,
+            disk_probe=disk_probe,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise VerifierUnavailable(
@@ -276,6 +518,8 @@ HEARTBEAT_ERROR_CLASSES: frozenset[str] = frozenset(
         "capacity_invalid",
         # `v6` only: `agent_version` outside `[0-9A-Za-z._-]{1,32}`.
         "agent_version_invalid",
+        # `v7` only: a malformed storage report.
+        "storage_invalid",
     }
 )
 
@@ -374,6 +618,172 @@ class DeclaredCapacity:
 
 
 @dataclass(frozen=True)
+class DeclaredPool:
+    """One storage pool from a `v7` heartbeat — UNTRUSTED. `declared_class`
+    is a hint (`""` = undeclared), never a tier; sizes in GiB, `total_gb ==
+    0` = unknown."""
+
+    pool_id: str
+    declared_class: str
+    total_gb: int
+    available_gb: int
+    budget_gb: int
+    committed_gb: int
+    os_disks: bool
+    state: str
+    error: str
+
+
+@dataclass(frozen=True)
+class DeclaredDedicatedDisk:
+    """One dedicated disk from a `v7` heartbeat — UNTRUSTED. `vm` is the
+    VM the agent believes holds it (`""` unless `assigned`); vali is
+    authoritative for assignment."""
+
+    disk_id: str
+    size_mb: int
+    state: str
+    vm: str
+    error: str
+
+
+@dataclass(frozen=True)
+class DeclaredStorage:
+    """A `v7` heartbeat's storage report."""
+
+    pools: tuple[DeclaredPool, ...]
+    dedicated_disks: tuple[DeclaredDedicatedDisk, ...]
+    storage_config_revision: int
+
+
+_POOL_CLASSES = frozenset({"", "nvme", "ssd", "hdd"})
+_POOL_STATES = frozenset({"active", "draining", "unavailable"})
+_DEDICATED_STATES = frozenset(
+    {"free", "assigned", "failed", "draining", "replaced", "unavailable"}
+)
+# `hippius_types::heartbeat::SCHEMA_VERSION_STORAGE`.
+_SCHEMA_VERSION_STORAGE = 7
+_POOL_KEYS = frozenset(
+    {
+        "id",
+        "class",
+        "total_gb",
+        "available_gb",
+        "budget_gb",
+        "committed_gb",
+        "os_disks",
+        "state",
+        "error",
+    }
+)
+_DEDICATED_KEYS = frozenset({"id", "size_mb", "state", "vm", "error"})
+HEARTBEAT_STORAGE_KEYS: tuple[str, ...] = (
+    "disk_pools",
+    "dedicated_disks",
+    "storage_config_revision",
+)
+
+
+def _declared_storage_from(body: dict[str, object]) -> DeclaredStorage | None:
+    """The `v7` storage report, or `None` when the body has none. The Rust
+    binary validated it; a partial or mistyped report here is contract
+    drift (`ValueError`)."""
+    present = [key for key in HEARTBEAT_STORAGE_KEYS if key in body]
+    if not present:
+        return None
+    if len(present) != len(HEARTBEAT_STORAGE_KEYS):
+        raise ValueError("partial storage report")
+    pools_raw = body["disk_pools"]
+    disks_raw = body["dedicated_disks"]
+    if not isinstance(pools_raw, list) or not pools_raw or not isinstance(disks_raw, list):
+        raise ValueError("storage report lists malformed")
+    pools = []
+    for p in pools_raw:
+        if not isinstance(p, dict) or not isinstance(p.get("os_disks"), bool):
+            raise ValueError("pool entry malformed")
+        _exact_keys(p, _POOL_KEYS, "pool")
+        declared_class = _text(p.get("class"), "pool.class")
+        state = _text(p.get("state"), "pool.state")
+        if declared_class not in _POOL_CLASSES or state not in _POOL_STATES:
+            raise ValueError("pool class / state unknown")
+        pools.append(
+            DeclaredPool(
+                pool_id=_text(p.get("id"), "pool.id"),
+                declared_class=declared_class,
+                total_gb=_uint(p.get("total_gb"), "pool.total_gb", _U32_MAX),
+                available_gb=_uint(p.get("available_gb"), "pool.available_gb", _U32_MAX),
+                budget_gb=_uint(p.get("budget_gb"), "pool.budget_gb", _U32_MAX),
+                committed_gb=_uint(p.get("committed_gb"), "pool.committed_gb", _U32_MAX),
+                os_disks=p["os_disks"],
+                state=state,
+                error=_text(p.get("error"), "pool.error"),
+            )
+        )
+    disks = []
+    for d in disks_raw:
+        if not isinstance(d, dict):
+            raise ValueError("dedicated disk entry malformed")
+        _exact_keys(d, _DEDICATED_KEYS, "dedicated disk")
+        state = _text(d.get("state"), "dedicated.state")
+        if state not in _DEDICATED_STATES:
+            raise ValueError("dedicated disk state unknown")
+        disks.append(
+            DeclaredDedicatedDisk(
+                disk_id=_text(d.get("id"), "dedicated.id"),
+                size_mb=_uint(d.get("size_mb"), "dedicated.size_mb"),
+                state=state,
+                vm=_text(d.get("vm"), "dedicated.vm"),
+                error=_text(d.get("error"), "dedicated.error"),
+            )
+        )
+    _check_storage_invariants(pools, disks)
+    return DeclaredStorage(
+        pools=tuple(pools),
+        dedicated_disks=tuple(disks),
+        storage_config_revision=_uint(
+            body["storage_config_revision"], "storage_config_revision"
+        ),
+    )
+
+
+_POOL_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
+_ERROR_CODE_RE = re.compile(r"[a-z0-9-]{0,48}")
+_DEDICATED_ID_RE = re.compile(r"(?:wwn|ata|scsi|nvme)-[A-Za-z0-9._:-]+")
+_VM_ID_RE = re.compile(r"[A-Za-z0-9._-]{0,128}")
+
+
+def _check_storage_invariants(
+    pools: list[DeclaredPool], disks: list[DeclaredDedicatedDisk]
+) -> None:
+    """The `hippius_types::storage_report` rules the binary enforced,
+    re-checked as defence in depth before anything lands in the DB."""
+    if not 1 <= len(pools) <= 4 or len(disks) > 24:
+        raise ValueError("storage report counts out of range")
+    pool_ids = [p.pool_id for p in pools]
+    if pool_ids != sorted(set(pool_ids)):
+        raise ValueError("pools are not strictly sorted by id")
+    for p in pools:
+        if not _POOL_ID_RE.fullmatch(p.pool_id) or not _ERROR_CODE_RE.fullmatch(p.error):
+            raise ValueError("pool id / error code malformed")
+        if p.total_gb and p.available_gb > p.total_gb:
+            raise ValueError("pool available above total")
+    disk_ids = [d.disk_id for d in disks]
+    if disk_ids != sorted(set(disk_ids)):
+        raise ValueError("dedicated disks are not strictly sorted by id")
+    for d in disks:
+        if (
+            len(d.disk_id) > 96
+            or not _DEDICATED_ID_RE.fullmatch(d.disk_id)
+            or re.search(r"-part[0-9]+$", d.disk_id)
+        ):
+            raise ValueError("dedicated disk id malformed")
+        if not _ERROR_CODE_RE.fullmatch(d.error) or not _VM_ID_RE.fullmatch(d.vm):
+            raise ValueError("dedicated disk vm / error code malformed")
+        if (d.state == "assigned") != bool(d.vm):
+            raise ValueError("dedicated disk vm is set exactly when assigned")
+
+
+@dataclass(frozen=True)
 class HeartbeatBody:
     """The decoded heartbeat fields the §K ingest gate acts on.
 
@@ -411,6 +821,9 @@ class HeartbeatBody:
     # The `v6` miner-agent release tag. UNTRUSTED, observability only.
     # `None` before `v6`, same discipline.
     agent_version: str | None = None
+    # The `v7` storage report (pools, dedicated disks, applied storage-
+    # config revision). UNTRUSTED, recorded only. `None` before `v7`.
+    declared_storage: DeclaredStorage | None = None
 
 
 def verify_heartbeat(*, envelope: bytes, verifying_key: bytes) -> HeartbeatBody:
@@ -1131,7 +1544,33 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
             )
         return value
 
+    def _declared_storage(agent_version: str | None) -> DeclaredStorage | None:
+        # `v7` only — present exactly for a `v7` body — and `v7` is a
+        # superset of `v6`: the report without an `agent_version`, a
+        # malformed one, or one on (or missing from) the wrong version is
+        # contract drift.
+        try:
+            storage = _declared_storage_from(body)
+        except ValueError as exc:
+            raise VerifierUnavailable(f"verifier body storage report: {exc}") from exc
+        if storage is not None and agent_version is None:
+            raise VerifierUnavailable(
+                "verifier body carried a storage report without agent_version"
+            )
+        if (storage is not None) != (body.get("schema_version") == _SCHEMA_VERSION_STORAGE):
+            raise VerifierUnavailable("verifier body storage report does not match its version")
+        # `v7` is a superset of `v3`..`v6`: it carries every earlier
+        # declaration too, so the scalar columns stay fresh.
+        if storage is not None and (declared_capacity is None or declared_disk is None):
+            raise VerifierUnavailable(
+                "verifier body carried a storage report without the v3/v4 declarations"
+            )
+        return storage
+
     host_health = _declared_host_health()
+    agent_version = _agent_version(host_health)
+    declared_capacity = _declared_capacity()
+    declared_disk = _declared_disk()
     return HeartbeatBody(
         schema_version=_int("schema_version"),
         domain=_str("domain"),
@@ -1140,10 +1579,11 @@ def _heartbeat_body(body: dict[str, object]) -> HeartbeatBody:
         sequence=_int("sequence"),
         memory_available_mib=_opt_uint("memory_available_mib"),
         graceful_exit_requested=_bool_default_false("graceful_exit_requested"),
-        declared_capacity=_declared_capacity(),
-        declared_disk=_declared_disk(),
+        declared_capacity=declared_capacity,
+        declared_disk=declared_disk,
         declared_host_health=host_health,
-        agent_version=_agent_version(host_health),
+        agent_version=agent_version,
+        declared_storage=_declared_storage(agent_version),
     )
 
 

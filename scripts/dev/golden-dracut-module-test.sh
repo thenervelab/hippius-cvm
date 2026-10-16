@@ -21,7 +21,7 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "${HERE}/../.." && pwd)"
 DOCKER="${DOCKER:-docker}"
-IMAGES=(${DRACUT_TEST_IMAGES:-quay.io/centos/centos:stream10 fedora:latest})
+IMAGES=(${DRACUT_TEST_IMAGES:-quay.io/centos/centos:stream10 mirror.gcr.io/library/fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80})
 
 run_one() {
     local image="$1"

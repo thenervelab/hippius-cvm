@@ -29,6 +29,7 @@ import uuid
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.lifecycle.models import Vm, VmPowerState, VmState
@@ -79,7 +80,13 @@ def _require_active(vm: Vm) -> None:
         )
 
 
-def stop_vm(vm: Vm, *, by_migration: bool = False, by_guest_upgrade: str = "") -> Vm:
+def stop_vm(
+    vm: Vm,
+    *,
+    by_migration: bool = False,
+    by_guest_upgrade: str = "",
+    by_userdata_restage: str = "",
+) -> Vm:
     """Graceful ACPI stop. The VM keeps its reservation.
 
     Reuses the SAME signed `stop` order §24 issues to collect the guest's
@@ -96,7 +103,11 @@ def stop_vm(vm: Vm, *, by_migration: bool = False, by_guest_upgrade: str = "") -
     from apps.orchestration import effects
 
     vm = _claim(
-        vm, VmPowerState.STOPPING, by_migration=by_migration, by_guest_upgrade=by_guest_upgrade
+        vm,
+        VmPowerState.STOPPING,
+        by_migration=by_migration,
+        by_guest_upgrade=by_guest_upgrade,
+        by_userdata_restage=by_userdata_restage,
     )
     try:
         # A fresh order_id per stop: stop → start → stop within one
@@ -127,7 +138,9 @@ def stop_vm(vm: Vm, *, by_migration: bool = False, by_guest_upgrade: str = "") -
 STALE_POWER_MARKER = timedelta(minutes=10)
 
 
-def _require_no_migration(vm: Vm, *, by_guest_upgrade: str = "") -> None:
+def _require_no_migration(
+    vm: Vm, *, by_guest_upgrade: str = "", by_userdata_restage: str = ""
+) -> None:
     """A §25 job owns the VM's power state from its start until it ends:
     before the fence the VM is still `Active`, so `_require_active` alone
     would let a click stop the guest the job is about to quiesce (no
@@ -175,6 +188,60 @@ def _require_no_migration(vm: Vm, *, by_guest_upgrade: str = "") -> None:
             "guest-upgrade-not-holding",
             f"guest upgrade {by_guest_upgrade!r} does not hold vm {vm.vm_id!r}",
         )
+    # A userdata restage relaunches the VM itself, the same way: only its
+    # own stop/start pass (`by_userdata_restage` = its job_id).
+    from apps.orchestration.models import TERMINAL_USERDATA_RESTAGE_PHASES, UserdataRestageJob
+
+    restage = (
+        UserdataRestageJob.objects.filter(vm=vm)
+        .exclude(phase__in=TERMINAL_USERDATA_RESTAGE_PHASES)
+        .values_list("job_id", flat=True)
+        .first()
+    )
+    if restage is not None and restage != by_userdata_restage:
+        raise PowerOpRefused(
+            "userdata-restage-in-flight",
+            f"vm {vm.vm_id!r} is being relaunched onto a restaged userdata — power "
+            "operations resume once the restage ends",
+        )
+    if by_userdata_restage and restage != by_userdata_restage:
+        raise PowerOpRefused(
+            "userdata-restage-not-holding",
+            f"userdata restage {by_userdata_restage!r} does not hold vm {vm.vm_id!r}",
+        )
+
+
+def launch_in_flight(vm: Vm) -> bool:
+    """A launch job for `vm`'s vm_id is queued, or running and not yet past
+    the orphan bound (`launch_jobs.launch_job_orphan_after_s`). An orphan the
+    janitor cannot settle stays `running` forever, and must not hold the
+    VM's power — or its §25/restore — hostage with it."""
+    from apps.orchestration.launch_jobs import launch_job_orphan_after_s
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+
+    cutoff = timezone.now() - timedelta(seconds=launch_job_orphan_after_s())
+    return (
+        LaunchJob.objects.filter(vm_id=vm.vm_id)
+        .filter(
+            Q(state=LaunchJobState.QUEUED.value)
+            | Q(state=LaunchJobState.RUNNING.value, phase_started_at__gte=cutoff)
+        )
+        .exists()
+    )
+
+
+def _require_no_launch_job(vm: Vm) -> None:
+    """A launch job in flight for the vm_id becomes its launch record when
+    it succeeds: a stop/start now would race it (stop the domain it boots,
+    or relaunch from the record it is replacing). Launch intake refuses a
+    live power marker the same way, under the same Vm row lock
+    (`launch_jobs._refuse_held`)."""
+    if launch_in_flight(vm):
+        raise PowerOpRefused(
+            "launch-in-flight",
+            f"vm {vm.vm_id!r} has a launch job in flight — power operations resume "
+            "once it ends",
+        )
 
 
 def _recovery_relaunch_in_flight(vm: Vm) -> bool:
@@ -212,7 +279,12 @@ def _live_marker(vm: Vm, marker: str) -> bool:
 
 @transaction.atomic
 def _claim(
-    vm: Vm, in_flight: str, *, by_migration: bool = False, by_guest_upgrade: str = ""
+    vm: Vm,
+    in_flight: str,
+    *,
+    by_migration: bool = False,
+    by_guest_upgrade: str = "",
+    by_userdata_restage: str = "",
 ) -> Vm:
     """Re-read under a row lock, check the guards, and commit the in-flight
     marker — a SHORT transaction that ends before anything is dispatched.
@@ -223,7 +295,13 @@ def _claim(
     vm = Vm.objects.select_for_update().get(pk=vm.pk)
     _require_active(vm)
     if not by_migration:
-        _require_no_migration(vm, by_guest_upgrade=by_guest_upgrade)
+        # A job driving its own stop/start (`by_migration`: §25, restore,
+        # resize) refused an in-flight launch at its admission, and holds the
+        # VM against intake since.
+        _require_no_launch_job(vm)
+        _require_no_migration(
+            vm, by_guest_upgrade=by_guest_upgrade, by_userdata_restage=by_userdata_restage
+        )
     if in_flight == VmPowerState.STOPPING and _recovery_relaunch_in_flight(vm):
         # Holding the Vm row lock the relaunch claim also takes: while
         # reboot-recovery is dispatching a relaunch, a stop would find no
@@ -305,6 +383,7 @@ def start_vm(
     supersede: bool = False,
     launch_ref: str = "",
     claimed: bool = False,
+    by_userdata_restage: str = "",
 ) -> Vm:
     """Relaunch a stopped VM on its OWN miner, reusing its overlay + KEK.
 
@@ -349,6 +428,7 @@ def start_vm(
             VmPowerState.STARTING,
             by_migration=by_migration,
             by_guest_upgrade=by_guest_upgrade,
+            by_userdata_restage=by_userdata_restage,
         )
     try:
         if launch_ref:

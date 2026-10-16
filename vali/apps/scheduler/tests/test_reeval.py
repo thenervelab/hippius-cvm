@@ -299,5 +299,5 @@ def test_every_cycle_runs_the_disk_survey_even_when_the_chain_is_down(
 
     monkeypatch.setattr(chain, "read_miner_status", _down)
     call_command("vali_scheduler_reeval", "--once")
-    # One disk push, one host-health push.
-    assert len(_no_metrics_push) == 2
+    # One disk push, one host-health push, one storage-config push.
+    assert len(_no_metrics_push) == 3

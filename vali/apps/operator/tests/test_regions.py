@@ -7,7 +7,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.miners.models import LocationVerdict, MinerLocation
+from apps.miners.models import LocationVerdict, MinerIdentity, MinerLocation
 from apps.scheduler.models import MinerCapacity, PlacementStatus
 from apps.scheduler.tests.factories import (
     make_dispatchable_identity,
@@ -33,6 +33,7 @@ ROW_KEYS = {
     "miners_dispatchable",
     "hosted_vm_count",
     "capacity",
+    "failover_capable",
     "node_ids",
 }
 BODY_KEYS = {"regions", "unlocated_miners", "require_verified", "vantage", "generated_at"}
@@ -110,6 +111,7 @@ def test_shape_of_a_region_row(operator_client: APIClient) -> None:
         "miners_dispatchable": 1,
         "hosted_vm_count": 2,
         "capacity": row["capacity"],
+        "failover_capable": False,
         "node_ids": [node_id(1)],
     }
     assert _legacy(row["capacity"]) == {"total_units": 6, "committed_units": 2, "free_units": 4}
@@ -237,3 +239,63 @@ def test_query_count_does_not_grow_with_miner_count(operator_client: APIClient) 
     with CaptureQueriesContext(connection) as many:
         assert operator_client.get(URL).status_code == 200
     assert len(many) == len(few)
+
+
+def _chip(seed: int, generation: str) -> None:
+    """Give miner `seed` a CHIP_ID of `generation`'s length (8-byte Turin,
+    64-byte Genoa)."""
+    n = {"turin": 8, "genoa": 64}[generation]
+    MinerIdentity.objects.filter(chain_node_id=node_id(seed)).update(platform_id=f"{seed:02x}" * n)
+    # Active on chain: a failover peer needs a positive mirror row.
+    MinerCapacity.objects.get_or_create(
+        miner_node_id=node_id(seed),
+        defaults={
+            "status": "active",
+            "capacity_slots": 6,
+            "observed_epoch": 10,
+            "data_epoch": 10,
+            "refreshed_at": timezone.now(),
+        },
+    )
+
+
+def _failover_capable(client: APIClient) -> dict[str, bool]:
+    return {r["region"]: r["failover_capable"] for r in client.get(URL).json()["regions"]}
+
+
+def test_a_region_with_a_same_generation_pair_is_failover_capable(
+    operator_client: APIClient,
+) -> None:
+    for seed, country, gen in (
+        (1, "FR", "turin"),
+        (2, "FR", "turin"),
+        (3, "FR", "genoa"),
+        (4, "AU", "genoa"),
+        (5, "NL", "genoa"),
+        (6, "NL", "turin"),
+    ):
+        _located(seed, country)
+        _chip(seed, gen)
+    assert _failover_capable(operator_client) == {"AU": False, "FR": True, "NL": False}
+
+
+def test_a_cordoned_or_quarantined_peer_breaks_the_pair(operator_client: APIClient) -> None:
+    for seed in (1, 2):
+        _located(seed, "FR")
+        _chip(seed, "turin")
+    assert _failover_capable(operator_client) == {"FR": True}
+    MinerCapacity.objects.update_or_create(
+        miner_node_id=node_id(2),
+        defaults={
+            "status": "active",
+            "capacity_slots": 6,
+            "observed_epoch": 10,
+            "data_epoch": 10,
+            "refreshed_at": timezone.now(),
+            "cordoned_at": timezone.now(),
+        },
+    )
+    assert _failover_capable(operator_client) == {"FR": False}
+    MinerCapacity.objects.filter(miner_node_id=node_id(2)).update(cordoned_at=None)
+    MinerIdentity.objects.filter(chain_node_id=node_id(2)).update(status="quarantined")
+    assert _failover_capable(operator_client) == {"FR": False}

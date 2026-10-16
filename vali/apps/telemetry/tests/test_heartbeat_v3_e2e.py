@@ -101,3 +101,25 @@ def test_real_v6_vector_carries_the_agent_version() -> None:
 
 def test_real_v5_vector_carries_no_agent_version() -> None:
     assert _verify("signed_heartbeat_v5.cbor").agent_version is None
+
+
+def test_real_v7_vector_carries_the_storage_report() -> None:
+    hb = _verify("signed_heartbeat_v7.cbor")
+    assert hb.schema_version == 7
+    assert hb.agent_version == "v1.2.3"
+    assert hb.declared_disk is not None  # the v4 scalars still arrive
+    storage = hb.declared_storage
+    assert storage is not None
+    assert storage.storage_config_revision == 3
+    assert [p.pool_id for p in storage.pools] == ["default", "hdd0"]
+    assert storage.pools[1].state == "draining"
+    assert storage.pools[1].error == "pool-not-a-mount"
+    assert [d.disk_id for d in storage.dedicated_disks] == [
+        "ata-ST18000NM000J_ZR5ABCDE",
+        "wwn-0x5000c500a1b2c3d4",
+    ]
+    assert storage.dedicated_disks[1].vm == "vm-kat-1"
+
+
+def test_real_v6_vector_carries_no_storage_report() -> None:
+    assert _verify("signed_heartbeat_v6.cbor").declared_storage is None

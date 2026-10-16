@@ -314,8 +314,52 @@ Each orchestration tick, when `VALI_BACKUP_ENABLED`:
    - On `failed`, a timeout (`VALI_BACKUP_RUN_TIMEOUT_S`, which is also the
      presign TTL), or a run the miner forgot (`VALI_BACKUP_LOST_GRACE_S`),
      abort the upload.
+   - A run whose VM went down under it ends **`skipped`**, not `failed`. Such
+     a run failed `qmp-no-domain` / `vm-not-running` / `job-vanished` /
+     `state-changed`, or was forgotten, because the VM:
+     - is not running now (`vm-stopped`), or
+     - stopped, restarted or rebooted since the dispatch (`vm-restarted`:
+       a power op, a relaunch, a guest poweroff, or a boot counter that
+       moved).
+
+     A skip is counted nowhere: no backoff, no `last_failure`, no fleet
+     alert. The next run is a full, once the VM is back and booted.
+
+     With no such sign yet, the run is held open for
+     `VALI_BACKUP_DOMAIN_GONE_GRACE_S` (900 s). A guest poweroff or a guest
+     reboot reaches vali late: through reboot recovery, or through the boot
+     counter the new boot writes after its key release. A missing domain
+     with still no sign after that is a failure. While held, the run still
+     reads `running`: its upload stays open, and a guest upgrade waits
+     (`backup-in-flight`).
 2. **Start due runs.** One run per VM at a time, enforced by a database
    constraint. Only for VMs that are `active`, powered on and placed.
+   - **A stopped VM owes no backup.** Its policy reads `deferred_reason:
+     vm-stopped`; this is not a failure, and the VM is not overdue.
+   - **A run waits for the VM's current boot to finish**, because a disk
+     copied mid cloud-init does not come up when restored.
+     - The boot began at the latest of the VM's launch or last relaunch
+       (`Vm.boot_started_at`) and a guest reboot the boot counter showed
+       (`BackupPolicy.boot_seen_at`). A counter first seen past 1 also
+       counts as a reboot, since that boot cannot be dated (cloud-init may
+       just have rebooted the guest).
+     - It is finished once the guest still signals from inside
+       (`Vm.guest_signal_at`: a served receipt or a live attestation)
+       `VALI_BACKUP_BOOT_SETTLE_S` (180 s) after the boot began.
+     - It is taken anyway after `VALI_BACKUP_BOOT_WAIT_MAX_S` (900 s): a
+       guest with no in-guest agent never signals.
+     - Meanwhile the policy reads `deferred_reason: first-full-deferred`
+       (no backup yet) or `boot-in-progress`, with `deferred_since`.
+
+     This is not proof that cloud-init finished: no guest signal says so
+     today.
+   - **Each run records `boot_settled`:**
+     - true when it was taken after the boot settled (the signal above);
+     - null when that cannot be told: a run from before this was recorded,
+       or one taken when the wait's cap ran out with no in-guest signal.
+
+     It is never false, because the wait starts no run inside a young boot.
+     It is shown on each run in `GET .../backups`.
    - **Full** when any of these holds:
      - the policy is new or re-enabled;
      - a new boot was seen;
@@ -328,7 +372,7 @@ Each orchestration tick, when `VALI_BACKUP_ENABLED`:
    - A required full (new boot, lost bitmap) starts **now**. Anything else
      waits for the interval.
    - A failure waits `VALI_BACKUP_RETRY_AFTER_S`, or the interval if that is
-     shorter.
+     shorter. A skip does not wait.
    - A lost run, a timeout or an order whose answer never came back is
      retried from the same parent: it could not consume that point.
    - A refused report or refused stored objects forces a full: the miner is
@@ -463,7 +507,7 @@ proved it runs, unless the tenant changed its power state in between.
 
 | Method · path | |
 |---|---|
-| `POST /v1/vm/<id>/restore` | `{run_id, request_id, dest_node_id?, accept_rollback?, on_behalf_of?}` → `202` job. Idempotent on `request_id`. Refusals: `bad-request`, `on-behalf-of-required` (400); `point-not-restorable`, `rollback-unsupported`, `rollback-not-accepted`, `rollback-no-checkpoint`, `rollback-not-capable`, `job-in-flight`, `vm-not-restorable`, `no-eligible-miner`, `request-id-conflict` (409); `rollback-rate-limited` (429, with `retry_after_s`); `restore-disabled`, `restore-unavailable` (503). |
+| `POST /v1/vm/<id>/restore` | `{run_id, request_id, dest_node_id?, region?, accept_rollback?, on_behalf_of?}` → `202` job. Idempotent on `request_id`. Refusals: `bad-request`, `on-behalf-of-required` (400); `point-not-restorable`, `rollback-unsupported`, `rollback-not-accepted`, `rollback-no-checkpoint`, `rollback-not-capable`, `job-in-flight`, `vm-not-restorable`, `no-eligible-miner`, `region-unknown`, `region-conflict`, `request-id-conflict` (409); `rollback-rate-limited` (429, with `retry_after_s`); `restore-disabled`, `restore-unavailable` (503). |
 | `GET /v1/vm/<id>/restore?limit=` | `{"jobs": [...]}`, restores and failovers, newest first. `limit` defaults to 20, at most 100, else `400 bad-request`. Empty list when there is none. |
 | `GET /v1/vm/<id>/restore/<job_id>` | One job. |
 | `POST /v1/vm/<id>/restore/<job_id>/cancel` | Only in `staging` / `stopping`, else `409 not-cancellable`. |
@@ -487,9 +531,43 @@ commit (an undo in progress reads `activating`, outcome null).
 for a failover it reads `{heartbeat_silent_s, netbird_silent_s,
 edge_unreachable}`, from the re-check before the fence when there was one,
 else from the intake.
-`verifying` lasts until the restored guest has both released its key (the
-job activates the VM there) and proved it runs (the reclaim gate); one
-that never proves it reads `failed`, its original kept. `finished_at` is
+`verifying` lasts until the restored guest has released its key (the job
+activates the VM there) and then sent an in-guest signal
+(`Vm.guest_signal_at`) since the commit. While that signal is fresh
+(`VALI_GUEST_LIVENESS_STALE_S`), the job reads `settling`:
+- **`committed_at` is set.** The VM is usable when `prior_power_state` is
+  `running`.
+- **vali still keeps the original** until the liveness proof past
+  `VALI_MIGRATION_RECLAIM_LIVENESS_GRACE_S` (the reclaim gate).
+- **A VM that was stopped before** is about to be stopped again.
+
+`settling` is not final:
+- a guest that falls silent reads `verifying` again;
+- one that never proves it runs past the grace reads `failed`, its original
+  kept.
+
+`finished_at` is null until the phase is final. Then it gives the moment
+it became final, and it is stable once shown:
+- a `done` job: the commit plus the liveness grace, the earliest instant
+  its guest could prove it runs. It is never in the future and never
+  moves: a VM destroyed inside the grace is dated at its reclaim, and reads
+  null until the reclaim tick stamps it. For a VM that was stopped
+  before, it is when the VM was stopped again. Never a later reclaim, which
+  may run days after, since a failover's source must come back first.
+- a job that failed after its commit: when vali gave up on it.
+- any other failure: when it failed.
+
+`committed_at` is the commit.
+
+`eta_s` is the download left, recomputed at every read:
+- while a restore stages, the bytes left at the throughput measured in
+  that phase;
+- for a failover in `dest_activating`, the estimate made at creation less
+  the time spent there.
+
+It is null once nothing is left to download.
+
+`outcome` stays null until the phase is final. `finished_at` is
 null until the phase is final. `rollback` is null except for a rollback
 restore: `{from_boot_counter, to_boot_counter, point_taken_at,
 requested_by: {kind, id}, committed_at}`. Each run in `GET .../backups`
@@ -690,7 +768,12 @@ the destination downloading the chain as it activates.
   old instance never gets a key again), and the old miner is
   **failover-quarantined**: not dispatchable (no placement, no restore or
   migration onto it) until an operator clears it
-  (`manage.py vali_failover_quarantine --clear <miner>`).
+  (`manage.py vali_failover_quarantine --clear <miner>`). While it is open,
+  the miner is also no failover peer, so its region's `failover_capable`
+  can read false and `require_failover_peer` launches there fail.
+  `hippius_failover_quarantine_open{miner}` gives the seconds it has been
+  open, and `HippiusFailoverQuarantineOpen` fires a warning after 2 h. Both
+  exist only while the automatic worker is on (its report carries them).
 - The commit point, the revert (without a relaunch on the dead miner: the
   VM is back `Active` there, and reboot-recovery relaunches it if the
   miner returns) and the post-commit retention are those of §8.3.
@@ -704,11 +787,17 @@ the destination downloading the chain as it activates.
   rebooted less than one probe interval before its miner died has already
   moved the KBS counter past it: the restored guest is refused before the
   commit point, and the job does not commit.
-- `POST /v1/vm/<id>/failover {run_id?, request_id, dest_node_id?}` → `202`
+- `POST /v1/vm/<id>/failover {run_id?, request_id, dest_node_id?, region?}` → `202`
   job (`kind: failover`), polled like a restore. Without `dest_node_id`,
   vali picks a dispatchable miner of the same SNP generation, in the VM's
   launch region, with room for it. Behind `VALI_FAILOVER_MANUAL_ENABLED`
   (off). Without a current-boot point: `409 no-backup-point`.
+- A restore or failover to another miner keeps the VM in its region: the
+  destination must be verified there (`no-eligible-miner` otherwise), and
+  a VM whose region vali cannot tell gets no destination at all
+  (`409 region-unknown`). The operator may then state it (`region`, ISO
+  3166-1 alpha-2; recorded on the job's authorization); a stated region
+  that differs from one vali knows is `409 region-conflict`.
 
 ### 9.1 Failover mode
 
@@ -721,10 +810,69 @@ it is `manual`. The policy reads:
 - `failover_auto_blocker`: null when eligible, else, checked in this order,
   `disabled` (the policy is off), `region-backups-not-local` (the VM's region
   is not in `VALI_FAILOVER_AUTO_REGIONS`: its backups are not stored close
-  enough for a restore elsewhere, e.g. AU), `no-point` (no complete
+  enough for a restore elsewhere, e.g. AU), `no-failover-peer` (no other
+  miner of the host's SNP generation in the VM's region: none of them is
+  active, uncordoned and last located there, so the failover could never
+  find a destination; room is not asked, since having none right now is
+  `pending_capacity` at failover time), `no-point` (no complete
   current-boot point yet).
 
-The VM's region is its launch region, else its host's region. `PUT
+**Cross-generation restore and failover.** This is behind
+`VALI_FAILOVER_CROSS_GEN_ENABLED`, default off until the lab proof
+(`docs/operator/cross-gen-failover-lab.md`); see `orchestration/cross_gen.py`.
+
+A restore boots the guest afresh. Only the vCPU signature in the VMSA
+differs between SNP generations: the disk keys are KBS KEKs, and the KBS
+binds a ticket to the exact chip. So a destination of another generation
+works if its ticket carries the digest of ITS generation:
+
+- Before the KBS activate, vali recomputes that digest from the recorded
+  boot. It pins the digest under the class of the VM's current pin and
+  keeps it on the job (`dest_measurement_hex`).
+- The destination's ticket is a fresh mint carrying it.
+- At the commit, it becomes the VM's recorded measurement.
+- The source's digest (`source_measurement_hex`) stays pinned until the
+  source is reclaimed, or until the VM's next launch on the destination
+  (`cross_gen.held_source_digests`).
+- A job that fails past its commit records the destination's digest too.
+
+Which generations may cross is `VALI_FAILOVER_CROSS_GEN_GENERATIONS`
+(Genoa, Turin; Milan once proven on hardware). `VALI_FAILOVER_CROSS_GEN_VM_IDS`
+limits it to the lab VMs during the proof.
+
+When this is on:
+- the failover pick prefers the source's generation, then a newer one,
+  then the nearest older one in the region;
+- `no-failover-peer` and `failover_capable` count any generation.
+
+A VM with an operator-pinned measurement never crosses. §25 migration and
+resize stay same-generation.
+
+The policy shows `failover_cross_generation`, plus
+`failover_cross_generation_warning` when a peer is OLDER than the VM's
+host: software built for the newer CPU may hit SIGILL. Nothing detects
+what the guest runs.
+
+A launch can ask to be placed where a failover is possible at all:
+`require_failover_peer: true` (optional; written into `spec_json` only when
+true). Scheduler gate (m) then places it only on a host that has a failover
+peer: another dispatchable, active, uncordoned miner of its SNP generation,
+located in its region now. When no host qualifies, the launch is refused
+with `no-failover-capable-host`.
+
+Every later placement keeps the constraint: a resize, the drain, `/place`,
+`/fail`, a price-watch suggestion, and any §25 destination. With a single
+pair, losing either miner (cordon, quarantine, graceful exit) leaves the
+other with no peer, so a VM that requires a peer cannot move off a
+departing miner. The drain logs this at ERROR. The regions where such a
+launch can land are `failover_capable` in `GET /v1/operator/regions`.
+
+The VM's region is its launch region, else its host's last VERIFIED
+country (`MinerLocation.last_verified_country_code`, written by every
+verified verdict and never cleared by a downgrade: a miner that dies stops
+answering the geo-probe and drops to `unverified`, and its VMs must keep
+their region). An `unverified` verdict never yields a region while
+`VALI_GEO_REQUIRE_VERIFIED` is on. `PUT
 failover_mode=auto` on a VM whose region is not eligible is refused with
 `409 failover-auto-unavailable` `{code, detail, blocker}`; a missing point
 is not a refusal (the blocker clears with the next backup).
@@ -763,20 +911,117 @@ is not a refusal (the blocker clears with the next backup).
   (`no-eligible-miner`), never a violation; the automatic worker waits in
   `pending_capacity` instead (§9.4).
 
-### 9.4 Automatic failover (contract; a later PR)
+### 9.4 Automatic failover
 
-- Behind `VALI_FAILOVER_AUTO_ENABLED` (off).
-- A miner is dead when the three-way proof of §9 holds for at least
-  `VALI_FAILOVER_AUTO_AFTER_S`; it is re-checked right before the fence.
-- It applies to VMs with `failover_mode=auto`, a complete current-boot point
-  and an eligible region; a VM not opted in is never touched. One automatic
-  failover job (`trigger: auto`) at a time per dead miner.
-- The destination is in the same region and SNP generation, respects
-  anti-affinity, and its capacity is reserved before the fence. With no
-  room the job waits in `pending_capacity`, retried every tick. A miner
-  back before the fence cancels the job (`outcome: cancelled`).
-- Quarantine, reappearance and reclaim are those of the manual path. Every
-  automatic failover leaves an audit trail.
+Behind `VALI_FAILOVER_AUTO_ENABLED` (off), run by the orchestration tick
+(`apps.orchestration.failover_auto`). While it is off every policy reads
+`failover_auto_blocker: disabled`, and nothing the worker watched survives.
+
+- **Which VMs.** `failover_mode=auto`, an enabled policy, an eligible region
+  and a complete current-boot point (`failover_auto_eligible`), `Active` on
+  the dead miner, not starting, with no job or launch in flight. A VM that
+  did not opt in is never looked at; the opt-in is re-read under the
+  policy's row lock as the job opens, so an opt-out racing the worker wins.
+- **Dead.** The three-way proof of §9, with the heartbeat and the NetBird
+  peer silent for `VALI_FAILOVER_AUTO_AFTER_S`, and the proof unbroken at
+  every check for that long (probed once a minute). One live signal — a
+  fresh heartbeat, a connected peer, NetBird unreadable, an Edge that
+  reaches the miner or cannot tell, the fence re-check below — starts the
+  count again; so does a gap of three minutes in the checks (a proof nobody
+  watched is not one). The proof is taken afresh right before a job opens,
+  never read from the last probe. A miner still heart-beating is never
+  probed.
+- **Held.** More miners dead at once than `VALI_FAILOVER_AUTO_MAX_DEAD_MINERS`
+  — watched by the worker, or registered `active`, heartbeat-silent for
+  `VALI_FAILOVER_AUTO_AFTER_S` and either hosting an `Active` VM or heard
+  from in the last 24 h (vali's own heartbeat intake failing looks like
+  this; an abandoned registration does not) — holds the worker: nothing starts, and the fence re-check
+  cancels an open job (`HippiusAutoFailoverHeld`). A manual failover still
+  works.
+- **One at a time per dead miner.** While an automatic failover job off a
+  miner is open, no other starts off it; the VMs that waited longest go
+  first. After one ends `failed` / `reverted` the VM waits an hour, and
+  after three it waits for an operator, who resets it with
+  `manage.py vali_failover_auto reset --vm-id <vm> --operator <name>`.
+- **Destination.** Same region (the VM's launch region, else its host's
+  last verified one — with neither, `region-unknown`: no destination at
+  all, never one in another country; this holds for every restore and
+  failover to another miner, manual included), same SNP generation, not a host of its placement group,
+  with room. The job's destination is counted against that host's capacity
+  (v1 slots, v2 vCPU / RAM / VM count, and disk) from the moment the job
+  opens until the VM's placement moves there. With no room the VM waits in
+  `pending_capacity` (`AutoFailover`), retried every tick; the id it waits
+  under becomes the job's `job_id`. `GET .../restore` and `last_failover`
+  show the wait.
+- **The job** is the manual one with `trigger: auto` and the longer proof
+  as its evidence. The fence re-check (manual failovers too) runs until the
+  KBS has moved, decided from durable state only (`restore.kbs_moved`): the
+  job's own stamps (`kbs_activate_*_attempt_at`, `kbs_activated_at` /
+  `kbs_activated_gen`, written around the KBS activate; jobs older than
+  them were backfilled), else the chain-verified KBS admin audit log of the
+  KBS's current epoch as vali ingests it (an `activate` answered 200 for
+  the VM since the first attempt = moved). Only positive proof says
+  "moved"; "not moved" means no activate was ever asked — the audit log's
+  silence proves nothing (the KBS applies before it appends). Never the
+  §14 idempotency store alone, an emptyDir a pod replacement wipes.
+  - Not fenced yet: any verdict but `dead` cancels (`outcome: cancelled`),
+    as does an automatic job whose worker is held, off, or whose VM is no
+    longer opted in (re-read under the policy row lock, held through the
+    fence).
+  - Fenced, the KBS moved: no re-check; the failover finishes (the old
+    instance never gets a key again).
+  - Fenced, the KBS never asked, a positive sign of life: cancelled, the
+    VM back on its source.
+  - Fenced, undecided (an activate errored and the audit log does not show
+    it landed), the source answering: the job waits, retried every
+    tick — never a revert onto a miner that may be dead, never an activate
+    elsewhere — and `HippiusFailoverFenceUndecided` fires after ten
+    minutes. An unreadable signal is simply asked again.
+  `cancelled` is only ever reported while the KBS never moved. Then the
+  quarantine, the reappearance and the reclaim of §9. A miner back while
+  VMs wait cancels the waits (`phase: failed`, `outcome: cancelled`).
+- **Audit.** Every decision is an `AutoFailover` row (evidence, attempts,
+  reason) linked to its job, whose `DestAuthorization` holds the proof;
+  `decided_by` is the `failover-auto` principal. A crash between the job
+  opening and its row is repaired on the next pass.
+- **Alerts** (gauges pushed by the tick at most once a minute while the
+  worker is on; a report older than five minutes is ignored):
+  `HippiusAutoFailoverStarted` (an open automatic job),
+  `HippiusAutoFailoverFailed` (one ended `failed` / `reverted` in the last
+  24 h), `HippiusAutoFailoverNoCapacity` (a VM waiting more than five
+  minutes), `HippiusAutoFailoverHeld`, `HippiusAutoFailoverCancelled` (a
+  miner back at the fence, or held, or turned off),
+  `HippiusFailoverFenceUndecided`, `HippiusAutoFailoverBlocked` (a miner
+  dead for the auto window with auto VMs and no job open nor waiting; not
+  while held, which `HippiusAutoFailoverHeld` already says). An auto VM on
+  a dead miner the worker passes over is never silent: one ERROR line per
+  (vm, reason) and `hippius_failover_auto_skipped{vm, miner, reason}` —
+  `not-eligible:<blocker>`, `power-<state>`, `job-in-flight`,
+  `launch-in-flight`, `backoff-retry`, `backoff-exhausted`,
+  `refused:<code>` — as of the worker's last look at that VM. Blocked
+  needs a dead verdict the worker held for the auto window: a miner whose
+  probe errors, or whose checks keep restarting (passes further apart
+  than the gap tolerance), never gets one, and shows only in
+  `hippius_failover_auto_dead_miners` and the tick's own errors.
+- **What it cannot rule out.** The proof is three missing signals. A miner
+  cut off from vali, NetBird and the Edge at once, yet still running, is
+  indistinguishable from a dead one: its guest keeps the key it already
+  holds while the restored copy starts. The KBS fence stops every future
+  release to it, nothing more. The same residual covers a source that
+  answers again AFTER the KBS moved: the failover finishes by design (the
+  old instance never gets a key again), but a guest still running there
+  keeps the key already in its memory until it stops. What closes it is
+  the custody lease (off today): a guest
+  that cannot renew its lease wipes its key.
+- **Known behaviour: a revert onto a dead source.** A failover whose
+  destination fails before the commit point (the KBS moved, the restored
+  guest never released) reverts: the KBS goes back to the source and the VM
+  reads `Active` there, on a miner that may still be dead. Nothing is lost —
+  the destination never committed, so the source disk is the latest truth —
+  and reboot-recovery relaunches the VM if the miner returns, while an
+  automatic failover retries another destination after its backoff. This
+  differs from the fence, which never turns back to a source because the
+  KBS cannot be read.
 
 ## 10. Configuration
 
@@ -808,8 +1053,9 @@ is not a refusal (the blocker clears with the next backup).
 | `VALI_FAILOVER_MANUAL_ENABLED` | `false` | Opens `POST /v1/vm/<id>/failover`. |
 | `VALI_FAILOVER_DEAD_AFTER_S` | 600 s | How long the heartbeat and the NetBird peer must both be silent. |
 | `VALI_FAILOVER_AUTO_REGIONS` | `FR,NL` | Regions whose VMs may be set to `failover_mode=auto` (§9.1). |
-| `VALI_FAILOVER_AUTO_ENABLED` | `false` | The automatic failover worker (§9.4; a later PR). |
-| `VALI_FAILOVER_AUTO_AFTER_S` | 900 s | How long the dead-miner proof must hold before an automatic failover (§9.4; a later PR). |
+| `VALI_FAILOVER_AUTO_ENABLED` | `false` | The automatic failover worker (§9.4). |
+| `VALI_FAILOVER_AUTO_AFTER_S` | 900 s | How long the dead-miner proof must hold before an automatic failover (§9.4). |
+| `VALI_FAILOVER_AUTO_MAX_DEAD_MINERS` | 2 | More miners dead at once holds the worker (§9.4). |
 
 ## 11. Limits
 

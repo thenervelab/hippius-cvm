@@ -5,9 +5,11 @@
 //! deterministic given `now_unix` — the basis for the loop's tests.
 //!
 //! [`run_receipt_loop`] is the driver: it calls `tick` once per
-//! `interval`, sleeping between ticks in short polls so a `SIGTERM`
-//! latched in the [`ShutdownWatch`] ends the loop within
-//! [`POLL_CHUNK`]. It is synchronous — `std::thread::sleep`, no tokio —
+//! `interval` (the first after `first_interval`, a few seconds, so a
+//! guest that lives less than a full interval still proves it ran),
+//! sleeping between ticks in short polls so a `SIGTERM` latched in the
+//! [`ShutdownWatch`] ends the loop within [`POLL_CHUNK`] — after one
+//! final tick covering the partial window since the last receipt. It is synchronous — `std::thread::sleep`, no tokio —
 //! matching the rest of the §E agent track.
 
 use std::sync::Mutex;
@@ -72,10 +74,18 @@ pub fn tick(
     })
 }
 
+/// How soon after start the first receipt is built: a guest stopped or
+/// rebooted within its first interval would otherwise never prove it ran.
+/// The meter bills a receipt's window pro rata (`period_end -
+/// period_start`), so a short window costs nothing extra.
+pub const FIRST_RECEIPT_AFTER: Duration = Duration::from_secs(5);
+
 /// Tuning for [`run_receipt_loop`].
 pub struct ReceiptLoopConfig {
     /// Wall time between ticks.
     pub interval: Duration,
+    /// Wall time before the FIRST tick (capped at `interval`).
+    pub first_interval: Duration,
     /// `expiry = period_end + ttl_secs` for each receipt.
     pub ttl_secs: u64,
 }
@@ -83,8 +93,12 @@ pub struct ReceiptLoopConfig {
 /// Run the receipt loop until a shutdown signal is latched.
 ///
 /// Each `interval`: build + sign + buffer one receipt (see [`tick`]).
-/// The interval is waited out *before* every tick, so each receipt
-/// covers a full `interval`-long window. A tick error is logged by
+/// The interval is waited out *before* every tick — the first one only
+/// `first_interval` — so each receipt covers the window since the last.
+/// Once shutdown latches, one final tick covers the partial window since
+/// the last receipt (skipped when not a whole second has passed), so the
+/// seconds a guest served before a stop or a reboot are not lost; the
+/// caller then lets the pusher drain it. A tick error is logged by
 /// static class and the interval skipped — one bad interval never ends
 /// the loop. The loop returns `Ok(())` once `shutdown` reports pending;
 /// `main` then drops the established signer, zeroizing the key.
@@ -122,15 +136,31 @@ pub fn run_receipt_loop(
     // Whether the last tick was idle — so "no challenge" is logged once
     // on entry into idle, not every interval.
     let mut logged_idle = false;
+    let mut wait = config.first_interval.min(config.interval);
     loop {
         if shutdown.is_pending() {
-            return Ok(());
+            return final_tick(
+                builder,
+                queue,
+                challenge_source,
+                work_source,
+                signer,
+                config,
+            );
         }
-        // Wait out the interval BEFORE the tick, so the first receipt —
-        // like every later one — covers a full `interval`-long window.
-        if sleep_until_due_or_shutdown(config.interval, shutdown) {
-            return Ok(());
+        // Wait BEFORE the tick: the first receipt after `first_interval`,
+        // every later one a full `interval` after the last.
+        if sleep_until_due_or_shutdown(wait, shutdown) {
+            return final_tick(
+                builder,
+                queue,
+                challenge_source,
+                work_source,
+                signer,
+                config,
+            );
         }
+        wait = config.interval;
         let now = match unix_now() {
             Ok(n) => n,
             Err(e) => {
@@ -191,6 +221,45 @@ pub fn run_receipt_loop(
             }
         }
     }
+}
+
+/// The receipt for the partial window since the last one, on shutdown.
+/// Best effort: an idle source, a window that has not advanced a whole
+/// second, or a clock error buffers nothing — the loop ends `Ok` anyway,
+/// unless the queue is poisoned.
+fn final_tick(
+    builder: &mut ReceiptBuilder,
+    queue: &Mutex<ReceiptQueue>,
+    challenge_source: &dyn ChallengeSource,
+    work_source: &dyn ServedWorkSource,
+    signer: &dyn TelemetrySigner,
+    config: &ReceiptLoopConfig,
+) -> Result<()> {
+    let Ok(now) = unix_now() else {
+        return Ok(());
+    };
+    let mut q = queue
+        .lock()
+        .map_err(|_| TelemetryError::Receipt("queue-poisoned"))?;
+    match tick(
+        builder,
+        &mut q,
+        challenge_source,
+        work_source,
+        signer,
+        now,
+        config.ttl_secs,
+    ) {
+        Ok(TickOutcome::Idle) => {}
+        Ok(_) => eprintln!("hippius-agent-tenant-telemetry: final receipt buffered"),
+        // `interval-not-advanced` (stopped within the same second as the
+        // last receipt) is the expected miss; any other is logged.
+        Err(e) => eprintln!(
+            "hippius-agent-tenant-telemetry: final receipt skipped: {}",
+            e.class()
+        ),
+    }
+    Ok(())
 }
 
 /// Read the current Unix time in whole seconds. `main` uses it for the
@@ -275,6 +344,8 @@ mod tests {
             period_start: 100,
             period_end: 160,
             expiry: 160 + 3_600,
+            disk_io: None,
+            disk_probe: None,
         };
         let buffered = q.drain(1);
         verify_served_receipt(&signer.verifying_key(), &buffered[0], &expected).unwrap();

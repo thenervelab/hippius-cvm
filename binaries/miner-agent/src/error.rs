@@ -119,6 +119,18 @@ pub enum MinerAgentError {
     #[error("cvm-insufficient-disk")]
     InsufficientDisk,
 
+    /// [`Self::InsufficientDisk`] on a storage pool other than `default`.
+    /// Carries the pool's 507 class, `insufficient-disk:<pool>`, so vali
+    /// can cut that pool's capacity rather than the node's.
+    #[error("cvm-{0}")]
+    InsufficientPoolDisk(&'static str),
+
+    /// The launch's storage pool cannot take a disk now: `draining`, not
+    /// for OS disks, or failing its host checks (unmounted, another
+    /// filesystem). Carries `pool-unavailable:<pool>`: vali re-places.
+    #[error("cvm-{0}")]
+    PoolUnavailable(&'static str),
+
     /// A `LaunchOrder` / `QemuConfig` field is unusable. The
     /// sub-classifier names which check failed — a compile-time
     /// constant, never an echoed path or run-time value.
@@ -313,6 +325,9 @@ pub enum MinerAgentError {
     ///   no parent directory (a producer bug).
     /// - `dest-launch-failed`: the libvirt domain recreate on the dest
     ///   (the launch path) failed after a successful snapshot download.
+    /// - `dest-insufficient-disk` / `dest-pool-unavailable`: that launch
+    ///   was refused for disk (the host's or a pool's) or because its pool
+    ///   cannot take a disk now — not a start failure.
     #[error("migration/{0}")]
     Migration(&'static str),
 

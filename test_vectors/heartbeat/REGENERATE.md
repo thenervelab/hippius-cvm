@@ -26,6 +26,8 @@ so a fixed key + fixed body yields a byte-exact signed envelope.
 | `signed_heartbeat_v5.cbor` | **Frozen output** — the signed `v5` envelope, same test key. |
 | `heartbeat_body_v6.cbor` | **Frozen output** — the `v6` (agent-version) body: the `v5` tuple + `kat_heartbeat_v6()`'s `agent_version`. |
 | `signed_heartbeat_v6.cbor` | **Frozen output** — the signed `v6` envelope, same test key. |
+| `heartbeat_body_v7.cbor` | **Frozen output** — the `v7` (storage-report) body: the `v6` tuple + `kat_heartbeat_v7()`'s pools, dedicated disks and storage-config revision. |
+| `signed_heartbeat_v7.cbor` | **Frozen output** — the signed `v7` envelope, same test key. |
 
 ## Pinned input tuple
 
@@ -85,4 +87,11 @@ The `v6` pair likewise:
 ```bash
 cargo test -p hippius-types --test heartbeat_kat \
     regenerate_v6_vectors -- --ignored --exact
+```
+
+The `v7` pair likewise:
+
+```bash
+cargo test -p hippius-types --test heartbeat_kat \
+    regenerate_v7_vectors -- --ignored --exact
 ```

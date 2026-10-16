@@ -327,3 +327,33 @@ fn a_later_receipt_is_pushed_on_a_fresh_connection() {
         .expect("pusher thread joins")
         .expect("pusher returns Ok on shutdown");
 }
+
+#[test]
+fn the_final_drain_retries_a_failed_dial() {
+    // Stopped with receipts still queued (the receipt loop's final one):
+    // the first final dial fails, the next succeeds and carries them.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let queue = queue_with(&[4, 5]);
+    let shutdown = TestShutdown::new();
+    shutdown.trigger();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&dials);
+    let connect = move || {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(TelemetryError::Vsock("test-connect"));
+        }
+        TcpStream::connect(addr).map_err(|_| TelemetryError::Vsock("test-connect"))
+    };
+    let pusher = VsockPusher::new(2, 5000, Arc::clone(&queue), shutdown);
+    let pusher_thread = thread::spawn(move || pusher.run_with(connect));
+
+    let mut peer = accept_within_5s(&listener);
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let received: Vec<SignedServedDeliveryReceipt> =
+        (0..2).map(|_| read_frame(&mut peer)).collect();
+    assert_eq!(received, vec![receipt(4), receipt(5)]);
+    pusher_thread.join().unwrap().unwrap();
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert!(queue.lock().unwrap().is_empty());
+}

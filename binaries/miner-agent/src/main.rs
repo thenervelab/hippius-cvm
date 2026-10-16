@@ -794,6 +794,47 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             Arc::new(hippius_miner_agent::netpolicy::VirshTuner::default()),
         )),
     ));
+    // The storage set in force: an applied `storage-config` document,
+    // else `[[storage.pools]]` / `[[storage.dedicated_disks]]`, else the
+    // implicit `default` at `data_disk_root` (the historical single root).
+    // A pool dropped while VM disks sit on it refuses the start, before
+    // any VM is re-adopted or any order accepted.
+    let local_storage = hippius_miner_agent::storage::remote::LocalStorage::from_config(&config);
+    let (storage_pools, dedicated_disks, storage_revision) =
+        hippius_miner_agent::storage::remote::boot_set(&local_storage);
+    let storage_pools = Arc::new(storage_pools);
+    let pool_bindings = hippius_miner_agent::storage::registry::enforce(
+        &config.storage.state_disk_root,
+        &storage_pools,
+    )?;
+    if storage_pools.is_configured() {
+        for (id, check) in hippius_miner_agent::storage::pools::check_pools(
+            &storage_pools,
+            &hippius_miner_agent::storage::pools::SystemPoolFs::default(),
+            &pool_bindings.errors_now(
+                &storage_pools,
+                &hippius_miner_agent::storage::registry::FsIdentitySource::default(),
+            ),
+        ) {
+            eprintln!(
+                "hippius-miner-agent: storage: pool {id} {} {}",
+                check.state.as_str(),
+                check.error
+            );
+        }
+    }
+    // The dedicated-disk identities, one copy for the route and the
+    // heartbeat inventory.
+    let disk_identities =
+        Arc::new(hippius_miner_agent::storage::dedicated::IdentityStore::default());
+    let storage_state = Arc::new(hippius_miner_agent::storage::state::StorageState::new(
+        hippius_miner_agent::storage::state::EffectiveStorage {
+            pools: storage_pools,
+            dedicated: dedicated_disks,
+            revision: storage_revision,
+            bindings: pool_bindings,
+        },
+    ));
     let lifecycle = Arc::new(
         CvmLifecycle::new(
             driver,
@@ -808,6 +849,7 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             config.storage.data_disk_root.clone(),
             config.storage.state_disk_root.clone(),
         )
+        .with_storage_state(Arc::clone(&storage_state))
         .with_progress_sink(progress.clone())
         .with_net_policy_gate(Arc::clone(&net_policy)),
     );
@@ -921,7 +963,18 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     .with_restore(restore)
     // `net-policy` orders are persisted (replay-safe across restarts),
     // loaded, and acked once loaded.
-    .with_net_policy(Arc::clone(&net_policy));
+    .with_net_policy(Arc::clone(&net_policy))
+    // `storage-config` orders: validated in full, persisted under a
+    // revision floor, then the set in force. vali sends none until its
+    // push loop is enabled for this miner.
+    .with_storage_config(Arc::new(
+        hippius_miner_agent::storage::remote::StorageConfigService::new(
+            local_storage,
+            Arc::clone(&storage_state),
+            hippius_miner_agent::storage::remote::Host::system(),
+            Arc::clone(&disk_identities),
+        ),
+    ));
 
     // Bind the orders HTTP server. `Config::validate` already proved
     // `bind_addr` is a NetBird-mesh address; a bind failure here is a
@@ -998,6 +1051,17 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             );
         }
         heartbeat_builder = heartbeat_builder.with_agent_version(tag.to_string());
+    }
+    // `v7` storage heartbeat — opt-in, and only on top of `v6`. Miner →
+    // vali data again: the vali that accepts `v7` must be live first.
+    if config.heartbeat.emit_pools {
+        heartbeat_builder = heartbeat_builder.with_storage_report(Arc::new(
+            hippius_miner_agent::storage::StorageReporter::new(
+                Arc::clone(&storage_state),
+                config.storage.state_disk_root.clone(),
+            )
+            .with_identities(Arc::clone(&disk_identities)),
+        ));
     }
     let heartbeat_builder = Arc::new(heartbeat_builder);
     let heartbeat_client: Arc<dyn HeartbeatClient> =
@@ -1151,6 +1215,12 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // touches the lifecycle's own bookkeeping.
     // Keeps the net policy's rules loaded (drift, uplink and tap changes).
     let _net_policy_task = tokio::spawn(Arc::clone(&net_policy).run(cancel.clone()));
+    // Unlinks the disks destroys could not reach on a pool that was off
+    // its filesystem, once it is back (nothing to do without pools).
+    let _pool_reclaim_task = tokio::spawn(hippius_miner_agent::storage::reclaim::run(
+        Arc::clone(&lifecycle),
+        cancel.clone(),
+    ));
     let _cid_verify_task = tokio::spawn(hippius_miner_agent::lifecycle::cid_verify::run(
         Arc::clone(&lifecycle),
         cancel.clone(),

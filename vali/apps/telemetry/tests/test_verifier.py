@@ -1309,3 +1309,387 @@ def test_live_attestation_components_drift_is_vali_side(
 ) -> None:
     with pytest.raises(verifier.VerifierUnavailable):
         _live(monkeypatch, _live_body(**body))
+
+
+# ─── heartbeat v7: the storage report ────────────────────────────────
+
+_V7_POOL = {
+    "id": "default",
+    "class": "",
+    "total_gb": 3500,
+    "available_gb": 2900,
+    "budget_gb": 3000,
+    "committed_gb": 400,
+    "os_disks": True,
+    "state": "active",
+    "error": "",
+}
+_V7_DISK = {
+    "id": "wwn-0x5000c500a1b2c3d4",
+    "size_mb": 17_166_336,
+    "state": "assigned",
+    "vm": "vm-1",
+    "error": "",
+}
+
+
+def _v7_body(**overrides: object) -> dict[str, object]:
+    return {
+        **_v6_body(),
+        "schema_version": 7,
+        "disk_pools": [_V7_POOL],
+        "dedicated_disks": [_V7_DISK],
+        "storage_config_revision": 3,
+        **overrides,
+    }
+
+
+def test_heartbeat_v7_body_parses_the_storage_report(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v7_body())
+    hb = verifier.verify_heartbeat(**_hb_kwargs())
+    assert hb.schema_version == 7
+    # Everything v6 carries still parses.
+    assert hb.agent_version == "v2026.10.08"
+    assert hb.declared_disk is not None
+    storage = hb.declared_storage
+    assert storage is not None
+    assert storage.storage_config_revision == 3
+    assert storage.pools == (
+        verifier.DeclaredPool(
+            pool_id="default",
+            declared_class="",
+            total_gb=3500,
+            available_gb=2900,
+            budget_gb=3000,
+            committed_gb=400,
+            os_disks=True,
+            state="active",
+            error="",
+        ),
+    )
+    assert storage.dedicated_disks == (
+        verifier.DeclaredDedicatedDisk(
+            disk_id="wwn-0x5000c500a1b2c3d4",
+            size_mb=17_166_336,
+            state="assigned",
+            vm="vm-1",
+            error="",
+        ),
+    )
+
+
+def test_heartbeat_pre_v7_body_has_no_storage_report(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v6_body())
+    assert verifier.verify_heartbeat(**_hb_kwargs()).declared_storage is None
+
+
+@pytest.mark.parametrize("missing", ["disk_pools", "dedicated_disks", "storage_config_revision"])
+def test_heartbeat_partial_storage_report_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, missing: str
+) -> None:
+    body = _v7_body()
+    del body[missing]
+    _stub_heartbeat_body(monkeypatch, body)
+    with pytest.raises(verifier.VerifierUnavailable, match="partial storage"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_pools": []},
+        {"disk_pools": "x"},
+        {"disk_pools": [{**_V7_POOL, "state": "gone"}]},
+        {"disk_pools": [{**_V7_POOL, "class": "tape"}]},
+        {"disk_pools": [{**_V7_POOL, "os_disks": 1}]},
+        {"disk_pools": [{**_V7_POOL, "total_gb": -1}]},
+        {"dedicated_disks": [{**_V7_DISK, "state": "lost"}]},
+        {"dedicated_disks": [{**_V7_DISK, "size_mb": True}]},
+        {"storage_config_revision": "3"},
+    ],
+)
+def test_heartbeat_malformed_storage_report_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, overrides: dict[str, object]
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v7_body(**overrides))
+    with pytest.raises(verifier.VerifierUnavailable, match="storage report"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_heartbeat_storage_report_without_agent_version_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    body = _v7_body()
+    del body["agent_version"]
+    _stub_heartbeat_body(monkeypatch, body)
+    with pytest.raises(verifier.VerifierUnavailable, match="without agent_version"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_heartbeat_storage_invalid_is_a_known_reject(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: _stub_completed(
+            json.dumps({"ok": False, "error_class": "storage_invalid"}).encode(), 0
+        ),
+    )
+    with pytest.raises(verifier.VerifierFailed) as exc:
+        verifier.verify_heartbeat(**_hb_kwargs())
+    assert exc.value.category == "storage_invalid"
+
+
+# ─── served receipts: the optional disk evidence ─────────────────────
+
+_RECEIPT_OK = {
+    "tag": "ok",
+    "vm_id": "vm-abc",
+    "lease_id": "lease-9",
+    "node_id_hex": "ab" * 32,
+    "epoch": 42,
+    "resource_class": "small",
+    "period_start": 1000,
+    "period_end": 1060,
+    "monotonic_seq": 5,
+    "observed_degradation_bps": 0,
+}
+_DISK_IO = {
+    "dev": "vda",
+    "serial": "hippius-x0",
+    "state": "ok",
+    "r_ios": 10,
+    "r_sectors": 80,
+    "r_ticks_ms": 3,
+    "w_ios": 4,
+    "w_sectors": 32,
+    "w_ticks_ms": 7,
+    "io_ticks_ms": 9,
+    "tiq_ms": 11,
+    "inflight": 1,
+}
+_DISK_PROBE = {
+    "run_id_hex": "55" * 16,
+    "nonce_hex": "66" * 32,
+    "vm_id": "vm-abc",
+    "vcpus": 2,
+    "kernel": "6.8.0",
+    "release_version": 5,
+    "started_at": 1010,
+    "finished_at": 1290,
+    "targets": [
+        {
+            "slot": "os",
+            "profile": "v1",
+            "metrics": {"qd1_p50_us": 92, "seq_read_mbps": 2100},
+            "hist_qd1": [1] * 32,
+            "error": "",
+        }
+    ],
+}
+
+
+def test_a_receipt_without_disk_evidence_parses_exactly_as_before() -> None:
+    fields = verifier._served_receipt_fields(dict(_RECEIPT_OK))
+    assert fields.disk_io == ()
+    assert fields.disk_probe is None
+    assert fields == verifier.ServedReceiptFields(
+        vm_id="vm-abc",
+        lease_id="lease-9",
+        node_id_hex="ab" * 32,
+        epoch=42,
+        resource_class="small",
+        period_start=1000,
+        period_end=1060,
+        monotonic_seq=5,
+        observed_degradation_bps=0,
+    )
+
+
+def test_a_receipt_with_disk_evidence_parses_it() -> None:
+    fields = verifier._served_receipt_fields(
+        {**_RECEIPT_OK, "disk_io": [_DISK_IO], "disk_probe": _DISK_PROBE}
+    )
+    (dev,) = fields.disk_io
+    assert dev.dev == "vda" and dev.serial == "hippius-x0" and dev.state == "ok"
+    assert dev.tiq_ms == 11
+    probe = fields.disk_probe
+    assert probe is not None
+    assert probe.run_id_hex == "55" * 16
+    (target,) = probe.targets
+    assert target.slot == "os"
+    assert target.metrics == {"qd1_p50_us": 92, "seq_read_mbps": 2100}
+    assert len(target.hist_qd1) == 32
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_io": []},
+        {"disk_io": [{**_DISK_IO, "state": "weird"}]},
+        {"disk_io": [{**_DISK_IO, "r_ios": -1}]},
+        {"disk_io": [{**_DISK_IO, "dev": 3}]},
+        {"disk_probe": {**_DISK_PROBE, "targets": []}},
+        {"disk_probe": {**_DISK_PROBE, "vcpus": True}},
+        {"disk_probe": "x"},
+    ],
+)
+def test_malformed_disk_evidence_is_contract_drift(overrides: dict[str, object]) -> None:
+    with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
+        verifier._served_receipt_fields({**_RECEIPT_OK, **overrides})
+
+
+def test_a_v7_body_without_its_storage_report_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    body = _v7_body()
+    for key in ("disk_pools", "dedicated_disks", "storage_config_revision"):
+        del body[key]
+    _stub_heartbeat_body(monkeypatch, body)
+    with pytest.raises(verifier.VerifierUnavailable, match="does not match its version"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_a_pre_v7_body_with_a_storage_report_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v7_body(schema_version=6))
+    with pytest.raises(verifier.VerifierUnavailable, match="does not match its version"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_pools": [{**_V7_POOL, "id": "b"}, {**_V7_POOL, "id": "a"}]},
+        {"disk_pools": [_V7_POOL, _V7_POOL]},
+        {"disk_pools": [{**_V7_POOL, "id": f"p{i}"} for i in range(5)]},
+        {"disk_pools": [{**_V7_POOL, "id": "Bad_Id"}]},
+        {"disk_pools": [{**_V7_POOL, "available_gb": 3501}]},
+        {"disk_pools": [{**_V7_POOL, "error": "Not A Code"}]},
+        {"dedicated_disks": [{**_V7_DISK, "vm": ""}]},
+        {"dedicated_disks": [{**_V7_DISK, "state": "free"}]},
+        {"dedicated_disks": [{**_V7_DISK, "id": "sda"}]},
+        {"dedicated_disks": [{**_V7_DISK, "id": "wwn-0x1-part1"}]},
+        {"dedicated_disks": [{**_V7_DISK, "id": "wwn-0x2"}, {**_V7_DISK, "id": "wwn-0x1"}]},
+    ],
+)
+def test_a_storage_report_breaking_a_wire_invariant_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, overrides: dict[str, object]
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v7_body(**overrides))
+    with pytest.raises(verifier.VerifierUnavailable, match="storage report"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_an_unknown_pool_total_leaves_available_unconstrained(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    _stub_heartbeat_body(
+        monkeypatch, _v7_body(disk_pools=[{**_V7_POOL, "total_gb": 0, "available_gb": 9}])
+    )
+    assert verifier.verify_heartbeat(**_hb_kwargs()).declared_storage is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_io": None},
+        {"disk_probe": None},
+        {"disk_io": [{**_DISK_IO, "serial": "not-a-slot"}]},
+        {"disk_io": [{**_DISK_IO, "state": "missing"}]},
+        {"disk_io": [_DISK_IO, {**_DISK_IO, "dev": "vdb"}]},
+        {"disk_io": [{**_DISK_IO, "state": "mismatch", "serial": "hippius-os"}]},
+        {"disk_probe": {**_DISK_PROBE, "vm_id": "vm-other"}},
+        {"disk_probe": {**_DISK_PROBE, "finished_at": 1}},
+        {"disk_probe": {**_DISK_PROBE, "run_id_hex": "55"}},
+        {"disk_probe": {**_DISK_PROBE, "targets": [{**_DISK_PROBE["targets"][0], "slot": "x24"}]}},
+        {
+            "disk_probe": {
+                **_DISK_PROBE,
+                "targets": [{**_DISK_PROBE["targets"][0], "hist_qd1": [0] * 31}],
+            }
+        },
+    ],
+)
+def test_disk_evidence_breaking_a_wire_invariant_is_contract_drift(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
+        verifier._served_receipt_fields({**_RECEIPT_OK, **overrides})
+
+
+_TARGET0 = _DISK_PROBE["targets"][0]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_io": [{**_DISK_IO, "dev": "VDA"}]},
+        {"disk_io": [{**_DISK_IO, "extra": 1}]},
+        {"disk_io": [{**_DISK_IO, "r_ios": 2**64}]},
+        {"disk_io": [{**_DISK_IO, "dev": "vdb"}, {**_DISK_IO, "serial": "", "dev": "vda"}]},
+        {
+            "disk_io": [
+                {**_DISK_IO, "dev": "", "serial": "hippius-x1", "state": "missing", "r_ios": 1}
+            ]
+        },
+        {"disk_probe": {**_DISK_PROBE, "extra": 1}},
+        {"disk_probe": {**_DISK_PROBE, "vcpus": 2**32}},
+        {"disk_probe": {**_DISK_PROBE, "targets": [{**_TARGET0, "profile": "V1"}]}},
+        {"disk_probe": {**_DISK_PROBE, "targets": [{**_TARGET0, "error": "Bad"}]}},
+        {
+            "disk_probe": {
+                **_DISK_PROBE,
+                "targets": [{**_DISK_PROBE["targets"][0], "metrics": {"Bad-Name": 1}}],
+            }
+        },
+    ],
+)
+def test_more_disk_evidence_wire_rules_are_rechecked(overrides: dict[str, object]) -> None:
+    with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
+        verifier._served_receipt_fields({**_RECEIPT_OK, **overrides})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_pools": [{**_V7_POOL, "extra": 1}]},
+        {"disk_pools": [{**_V7_POOL, "total_gb": 2**32}]},
+        {"dedicated_disks": [{**_V7_DISK, "extra": 1}]},
+    ],
+)
+def test_more_storage_report_wire_rules_are_rechecked(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, overrides: dict[str, object]
+) -> None:
+    _stub_heartbeat_body(monkeypatch, _v7_body(**overrides))
+    with pytest.raises(verifier.VerifierUnavailable, match="storage report"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+def test_a_v7_body_without_the_earlier_declarations_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    body = _v7_body()
+    for key in _V4_DISK:
+        del body[key]
+    _stub_heartbeat_body(monkeypatch, body)
+    with pytest.raises(verifier.VerifierUnavailable, match="v3/v4 declarations"):
+        verifier.verify_heartbeat(**_hb_kwargs())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disk_probe": {**_DISK_PROBE, "kernel": "k" * 65}},
+        {"disk_probe": {**_DISK_PROBE, "kernel": "6.8\n"}},
+    ],
+)
+def test_probe_kernel_rules_are_rechecked(overrides: dict[str, object]) -> None:
+    with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
+        verifier._served_receipt_fields({**_RECEIPT_OK, **overrides})

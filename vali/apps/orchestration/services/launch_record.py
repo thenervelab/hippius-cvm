@@ -373,6 +373,21 @@ def record_relaunch(
         return booted_changed or superseded or flavor_changed
 
 
+def record_cross_generation(vm_id: str, measurement_hex: str, *, reason: str) -> bool:
+    """A cross-generation restore / failover committed
+    (`apps.orchestration.cross_gen`): the same boot — same cmdline,
+    artefacts and booted size — now measured on another SNP generation.
+    Only the measurement changes, and it is the VM's current launch; every
+    other marker (a stopped VM's booted flavor, a pending initrd swap) stays
+    as it was. Returns `True` iff something changed."""
+    with transaction.atomic():
+        job = _latest_succeeded(vm_id, for_update=True)
+        if job is None:
+            raise LookupError(f"vm {vm_id!r} has no SUCCEEDED launch record")
+        _stamp_current_launch(vm_id, measurement_hex)
+        return _supersede(job, {"measurement_hex": measurement_hex}, reason=reason, extra={})
+
+
 def dispatched_boot_candidate(
     boot: dict[str, Any], *, booted: tuple[str, str] | None, flavor: str | None
 ) -> dict[str, Any]:

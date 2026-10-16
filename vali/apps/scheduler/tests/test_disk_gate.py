@@ -379,7 +379,8 @@ def test_record_admits_unknown_even_under_deny(caplog: pytest.LogCaptureFixture)
 
 def test_a_lying_huge_declared_budget_cannot_buy_a_placement() -> None:
     _mirror(1)
-    _disk(1, declared=4_000_000_000, total=SMALL + 100 + 5)  # fs holds one small
+    # Huge, and still within the column (a PositiveIntegerField).
+    _disk(1, declared=2_000_000_000, total=SMALL + 100 + 5)  # fs holds one small
     with ENFORCE:
         with pytest.raises(PlacementError):
             _decide("large", 1)

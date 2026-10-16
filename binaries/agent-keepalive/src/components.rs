@@ -38,8 +38,8 @@ use hippius_types::live_attestation::{components_health, GuestComponents};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The telemetry agent's unit.
@@ -132,6 +132,10 @@ pub struct ComponentsTracker {
     probe: ComponentsProbe,
     instance: u32,
     unhealthy_ticks: AtomicU32,
+    /// The last reading, and whether the tracker is frozen on it (the
+    /// guest is stopping, see [`ComponentsTracker::freeze`]).
+    last: Mutex<Option<GuestComponents>>,
+    frozen: AtomicBool,
 }
 
 impl ComponentsTracker {
@@ -140,6 +144,8 @@ impl ComponentsTracker {
             probe,
             instance,
             unhealthy_ticks: AtomicU32::new(0),
+            last: Mutex::new(None),
+            frozen: AtomicBool::new(false),
         }
     }
 
@@ -150,9 +156,27 @@ impl ComponentsTracker {
         Self::new(probe, random_instance())
     }
 
-    /// Run the checks once and count a failing tick. Never fails.
+    /// Stop probing: the guest is shutting down, so the units the checks
+    /// look at are stopping too, which says nothing about the release.
+    /// From now on [`tick`](Self::tick) returns the last reading taken
+    /// before the stop, and nothing more is counted.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::SeqCst);
+    }
+
+    /// Run the checks once and count a failing tick. Never fails. Once
+    /// frozen, the last reading before the stop (one probe, uncounted,
+    /// if there was none).
     pub fn tick(&self) -> GuestComponents {
+        if self.frozen.load(Ordering::SeqCst) {
+            return self.frozen_reading();
+        }
         let mut c = self.probe.read();
+        if self.frozen.load(Ordering::SeqCst) {
+            // Frozen while probing: this reading may have seen the stop —
+            // discarded, never stored.
+            return self.frozen_reading();
+        }
         let unhealthy = if c.health & components_health::ALL == components_health::ALL {
             self.unhealthy_ticks.load(Ordering::SeqCst)
         } else {
@@ -166,11 +190,25 @@ impl ComponentsTracker {
         };
         c.instance = self.instance;
         c.unhealthy_ticks = unhealthy;
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
         c
     }
 }
 
 impl ComponentsTracker {
+    /// The reading a frozen tracker answers: the last one taken before the
+    /// stop. With none (no check ever completed — then no final keepalive
+    /// runs either, `daemon`), one probe, neither stored nor counted.
+    fn frozen_reading(&self) -> GuestComponents {
+        if let Some(c) = *self.last.lock().unwrap_or_else(|e| e.into_inner()) {
+            return c;
+        }
+        let mut c = self.probe.read();
+        c.instance = self.instance;
+        c.unhealthy_ticks = self.unhealthy_ticks();
+        c
+    }
+
     /// Run the checks every `every` on a thread of their own, for the
     /// life of the process — the count must not depend on the keepalive
     /// loop, whose KBS round trips the host can stall.
@@ -330,6 +368,52 @@ mod tests {
             self.write("guest/bin/hippius-agent-keepalive", "", 0o755);
             self.write("guest/bin/hippius-agent-initramfs", "", 0o755);
         }
+    }
+
+    #[test]
+    fn a_frozen_tracker_keeps_its_last_pre_stop_reading_and_counts_nothing() {
+        // The guest is stopping: telemetry and eol-sign go inactive alongside
+        // the keepalive. Without the freeze the final tick would attest them
+        // missing (and count an unhealthy tick); frozen, it repeats the last
+        // reading taken before the stop.
+        let f = Fixture::new();
+        f.healthy();
+        let stopping = f.path("stopping");
+        let probe = f.probe(f.systemctl(
+            &[TELEMETRY_UNIT, EOL_SIGN_UNIT],
+            &format!(
+                "[ -e {} ] && {{ echo inactive; exit 0; }}",
+                stopping.display()
+            ),
+        ));
+        let tracker = ComponentsTracker::new(probe, 7);
+        let before = tracker.tick();
+        assert_eq!(before.health, components_health::ALL);
+        fs::write(&stopping, "").unwrap();
+        tracker.freeze();
+        let after = tracker.tick();
+        assert_eq!(after, before);
+        assert_eq!(tracker.unhealthy_ticks(), 0);
+    }
+
+    #[test]
+    fn an_unfrozen_tracker_sees_the_units_stop() {
+        let f = Fixture::new();
+        f.healthy();
+        let stopping = f.path("stopping");
+        let probe = f.probe(f.systemctl(
+            &[TELEMETRY_UNIT, EOL_SIGN_UNIT],
+            &format!(
+                "[ -e {} ] && {{ echo inactive; exit 0; }}",
+                stopping.display()
+            ),
+        ));
+        let tracker = ComponentsTracker::new(probe, 7);
+        tracker.tick();
+        fs::write(&stopping, "").unwrap();
+        let c = tracker.tick();
+        assert_ne!(c.health, components_health::ALL);
+        assert_eq!(c.unhealthy_ticks, 1);
     }
 
     #[test]

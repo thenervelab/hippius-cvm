@@ -85,9 +85,14 @@ def test_eligibility_on_both_views(
     has_point: bool,
     enabled: bool,
     blocker: str | None,
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    settings.VALI_FAILOVER_AUTO_ENABLED = True
     vm = make_vm(region=region)
     BackupPolicy.objects.create(vm=vm, interval_s=3600, enabled=enabled)
+    # Whether a peer exists has its own tests (`test_no_failover_peer_*`).
+    monkeypatch.setattr(service, "failover_peer_blocker", lambda vm: None)
     point["point"] = has_point
     policy = service.policy_view(BackupPolicy.objects.get())
     assert policy["failover_auto_eligible"] is (blocker is None)
@@ -137,3 +142,17 @@ def test_the_migration_moves_every_policy_to_manual() -> None:
     module.every_policy_manual(django_apps, None)
     assert set(BackupPolicy.objects.values_list("failover_mode", flat=True)) == {"manual"}
     assert BackupPolicy._meta.get_field("failover_mode").default == FailoverMode.MANUAL
+
+
+def test_eligibility_reads_disabled_while_the_worker_is_off(
+    point: dict[str, object], settings
+) -> None:
+    settings.VALI_FAILOVER_AUTO_ENABLED = False
+    vm = make_vm(region="FR")
+    BackupPolicy.objects.create(vm=vm, interval_s=3600)
+    point["point"] = True
+    policy = service.policy_view(BackupPolicy.objects.get())
+    assert (policy["failover_auto_eligible"], policy["failover_auto_blocker"]) == (
+        False,
+        "disabled",
+    )

@@ -1996,7 +1996,24 @@ async fn launch_dest(
     // The launch path's rejection is already a static-class HTTP mapping;
     // surface a migration-flavoured outcome so vali's audit log
     // distinguishes a dest-activation launch failure.
-    Err(MinerAgentError::Migration("dest-launch-failed"))
+    Err(dest_launch_failure(rejected.class))
+}
+
+/// The dest-activation failure for a launch rejected with `class`. A disk
+/// refusal keeps its meaning, so vali does not charge the dest a SEV start
+/// failure for it: `migration/dest-insufficient-disk` (the host's disk or
+/// a pool's, `insufficient-disk[:<pool>]`), `migration/dest-pool-unavailable`
+/// (`pool-unavailable:<pool>`); anything else `migration/dest-launch-failed`.
+pub fn dest_launch_failure(class: &str) -> MinerAgentError {
+    if class == crate::storage::pools::INSUFFICIENT_DISK_CLASS
+        || class.starts_with("insufficient-disk:")
+    {
+        MinerAgentError::Migration("dest-insufficient-disk")
+    } else if class.starts_with("pool-unavailable:") {
+        MinerAgentError::Migration("dest-pool-unavailable")
+    } else {
+        MinerAgentError::Migration("dest-launch-failed")
+    }
 }
 
 /// [`activate_dest_with_chain`] without a chain restorer — the §25
@@ -2182,6 +2199,40 @@ pub async fn snapshot(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// The exact classes vali's dest-activation excuse list names
+    /// (`vali/apps/scheduler/cvm_capability.py`), from the agent errors a
+    /// launch refusal carries through `reject_dispatch`.
+    #[test]
+    fn a_dest_launch_disk_refusal_keeps_its_class() {
+        use crate::orders::handler::reject_dispatch;
+        let cases = [
+            (
+                MinerAgentError::InsufficientDisk,
+                "migration/dest-insufficient-disk",
+            ),
+            (
+                MinerAgentError::InsufficientPoolDisk("insufficient-disk:hdd0"),
+                "migration/dest-insufficient-disk",
+            ),
+            (
+                MinerAgentError::PoolUnavailable("pool-unavailable:hdd0"),
+                "migration/dest-pool-unavailable",
+            ),
+            (
+                MinerAgentError::InsufficientResources,
+                "migration/dest-launch-failed",
+            ),
+            (
+                MinerAgentError::Destroy("domain-still-up"),
+                "migration/dest-launch-failed",
+            ),
+        ];
+        for (err, want) in cases {
+            let class = reject_dispatch(&err, "tenant-1").class;
+            assert_eq!(dest_launch_failure(class).to_string(), want, "{class}");
+        }
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

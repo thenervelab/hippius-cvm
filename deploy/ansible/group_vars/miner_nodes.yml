@@ -172,6 +172,13 @@ miner_agent:
   state_dir: "/var/lib/hippius-miner"
   systemd_unit_name: "hippius-miner-agent"
 
+# vali `miner_id` — NOT set here. Unset, a miner's id is derived from its
+# node id: `m-` + the first 16 lowercase hex chars of identity.pub
+# (filter_plugins/miner_id.py), the value the backend declares to vali.
+# `miner_id` in host_vars overrides it, ONLY to pin a miner already
+# registered under another id (changing that id orphans the miner).
+# miner_id: "<registered id>"
+
 # ── miner-agent auto-update (GitHub Releases) ──────────────────────
 # A systemd timer runs /usr/local/bin/hippius-miner-update, which installs
 # the latest hippius-miner-agent release of `miner_auto_update_release_repo`
@@ -338,7 +345,7 @@ miner_heartbeat_schema_disk: true
 # `--version` is the never-bumped 0.0.1), so a re-render alone would
 # leave the old binary to fail at its next restart. Set it true in
 # host_vars for a host once its agent is upgraded, then here once all are.
-miner_heartbeat_schema_host_health: false
+miner_heartbeat_schema_host_health: true   # on 2026-10-09: the fleet runs v2026.10.08.1, which knows the key
 
 # Agent release tag — v6 heartbeat (v5 + agent_version, the release tag
 # the miner-agent binary was built from, `dev` for a source build). vali
@@ -349,7 +356,7 @@ miner_heartbeat_schema_host_health: false
 # the host's heartbeats would stop landing and it would be quarantined),
 # and only for a host whose agent knows the key (an older agent refuses it,
 # `deny_unknown_fields`). Same host_vars-first rollout as v5.
-miner_heartbeat_schema_agent_version: false
+miner_heartbeat_schema_agent_version: true   # on 2026-10-09: vali accepts v6 (pin #1521); power-policy gating reads it
 
 # ── Edge auth model ─────────────────────────────────────────────────
 # `onchain` (default) — PERMISSIONLESS: the agent self-signs its Edge
@@ -380,7 +387,7 @@ miner_edge_auth: "onchain"
 #
 # §17.7 cert binding (the SAN URI):
 #   `client.crt` MUST carry exactly one URI SAN of the form
-#       URI:hippius-miner:<inventory_hostname>
+#       URI:hippius-miner:<miner_id>
 #   so the Edge gateway's mTLS acceptor pins this miner's identity. A
 #   cert without that SAN — or with a SAN naming a different host —
 #   will silently fail every handshake at the Edge; the

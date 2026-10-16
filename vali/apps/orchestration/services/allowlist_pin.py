@@ -651,7 +651,12 @@ def _query_carry_forward_classes() -> dict[str, str]:
         (cdn if cls == ALLOWLIST_CLASS_CDN_NODE else tenant).add(measurement)
 
     if live_vm_ids:
+        from apps.orchestration import cross_gen
+
         current = _current_launch_pins(ledger_model, live_vm_ids)
+        # A cross-generation move keeps its source's digest until the source
+        # is reclaimed (`cross_gen.held_source_digests`).
+        held = cross_gen.held_source_digests(current)
         rows = ledger_model.objects.filter(vm_id__in=live_vm_ids).values_list(
             "vm_id", "launch_digest_hex", "pinned_at"
         )
@@ -659,7 +664,9 @@ def _query_carry_forward_classes() -> dict[str, str]:
             measurement = _normalise_measurement(digest)
             if measurement is None:
                 continue
-            if _superseded(current.get(vm_id), measurement, pinned_at):
+            if (vm_id, measurement) not in held and _superseded(
+                current.get(vm_id), measurement, pinned_at
+            ):
                 continue
             _carry(vm_id, measurement)
 
@@ -674,6 +681,7 @@ def _query_carry_forward_classes() -> dict[str, str]:
             (vm_id, measurement)
             for vm_id, digest, pinned_at in rows
             if (measurement := _normalise_measurement(digest)) is not None
+            and (vm_id, measurement) not in held
             and _superseded(current.get(vm_id), measurement, pinned_at)
         }
         seen_vm_ids: set[str] = set()
@@ -835,13 +843,20 @@ def pending_superseded_pins() -> list[Any]:
     }
     if not live_vm_ids:
         return []
+    from apps.orchestration import cross_gen
+
     current = _current_launch_pins(ledger_model, live_vm_ids)
+    held = cross_gen.held_source_digests(current)
     pending = []
     for row in ledger_model.objects.filter(
         vm_id__in=set(current), evicted_at__isnull=True
     ).order_by("pinned_at"):
         measurement = _normalise_measurement(row.launch_digest_hex)
-        if measurement is not None and _superseded(current[row.vm_id], measurement, row.pinned_at):
+        if (
+            measurement is not None
+            and (row.vm_id, measurement) not in held
+            and _superseded(current[row.vm_id], measurement, row.pinned_at)
+        ):
             pending.append(row)
     return pending
 

@@ -140,6 +140,27 @@
 //!
 //! `launch` takes the same optional `on_guest_poweroff`, emitted only
 //! when present (an agent too old to know it refuses the body at decode).
+//!
+//! ### `storage-config`
+//!
+//! Host-wide, no `vm_id`: the miner's full desired storage document
+//! (docs/design/disk-tier-verification.md §9), never a patch. Every key is
+//! required; an unknown key at any level is refused
+//! (`storage-config-unknown-field`):
+//!
+//! ```json
+//! {
+//!   "revision": 3, "not_after_unix": 1770086400, "dry_run": false,
+//!   "pools": [{"id": "nvme0", "path": "/srv/nvme0/hippius", "class": "nvme",
+//!              "budget_gb": 3000, "os_disks": true, "state": "active"}],
+//!   "dedicated_disks": [{"id": "wwn-0x5000c500a1b2c3d4", "state": "active"}]
+//! }
+//! ```
+//!
+//! Types and enum values are checked here; the miner-agent checks the
+//! values (paths, mounts, charsets, counts, live-disk safety) and acks
+//! `applied:<revision>:<sha256>` or `dry-run-ok:<revision>:<sha256>`;
+//! `storage-config-digest` computes that sha from the same JSON.
 
 use ciborium::value::Value;
 use clap::Args;
@@ -234,6 +255,7 @@ fn build(args: &EncodeOrderArgs, payload_json: &[u8]) -> Result<Vec<u8>, &'stati
         "migrate-snapshot" => build_migrate_snapshot(payload_obj)?,
         "net-policy" => build_net_policy(payload_obj)?,
         "power-policy" => build_power_policy(payload_obj)?,
+        "storage-config" => build_storage_config(payload_obj)?,
         _ => return Err("bad-kind"),
     };
 
@@ -1418,6 +1440,166 @@ pub fn run_net_policy_digest() -> ExitCode {
         }
         Err(class) => {
             eprintln!("hippius-ticket-validator: net-policy-digest: {class}");
+            ExitCode::from(SCHEMA_FAIL)
+        }
+    }
+}
+
+/// Keys of a `storage-config` payload. Mirrors
+/// `binaries/miner-agent/src/orders/types.rs::StorageConfigOrder`.
+const STORAGE_CONFIG_KEYS: [&str; 5] = [
+    "dedicated_disks",
+    "dry_run",
+    "not_after_unix",
+    "pools",
+    "revision",
+];
+/// Keys of one pool. Mirrors `StoragePoolSpec`.
+const STORAGE_POOL_KEYS: [&str; 6] = ["budget_gb", "class", "id", "os_disks", "path", "state"];
+/// Keys of one dedicated disk. Mirrors `DedicatedDiskSpec`.
+const STORAGE_DISK_KEYS: [&str; 2] = ["id", "state"];
+
+/// Build the `payload` map for `kind=storage-config`. Types and enum
+/// values are checked here; the values themselves on the miner.
+fn build_storage_config(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    if obj.len() != STORAGE_CONFIG_KEYS.len()
+        || obj
+            .keys()
+            .any(|k| !STORAGE_CONFIG_KEYS.contains(&k.as_str()))
+    {
+        return Err("storage-config-unknown-field");
+    }
+    let uint = |o: &serde_json::Map<String, Json>, name: &'static str| {
+        o.get(name)
+            .and_then(Json::as_u64)
+            .ok_or("storage-config-bad-uint")
+    };
+    let text = |o: &serde_json::Map<String, Json>, name: &'static str| {
+        o.get(name)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .ok_or("storage-config-bad-string")
+    };
+    let flag = |o: &serde_json::Map<String, Json>, name: &'static str| {
+        o.get(name)
+            .and_then(Json::as_bool)
+            .ok_or("storage-config-bad-bool")
+    };
+    let one_of = |o: &serde_json::Map<String, Json>, name: &'static str, allowed: &[&str]| {
+        text(o, name).and_then(|v| {
+            if allowed.contains(&v.as_str()) {
+                Ok(v)
+            } else {
+                Err("storage-config-bad-enum")
+            }
+        })
+    };
+    let list = |name: &'static str| {
+        obj.get(name)
+            .and_then(Json::as_array)
+            .ok_or("storage-config-bad-list")
+    };
+    let entry = |item: &Json, keys: &[&str]| {
+        let o = item.as_object().ok_or("storage-config-bad-entry")?;
+        if o.len() != keys.len() || o.keys().any(|k| !keys.contains(&k.as_str())) {
+            return Err("storage-config-unknown-field");
+        }
+        Ok(o.clone())
+    };
+
+    let mut pools = Vec::new();
+    for item in list("pools")? {
+        let p = entry(item, &STORAGE_POOL_KEYS)?;
+        let budget_gb =
+            u32::try_from(uint(&p, "budget_gb")?).map_err(|_| "storage-config-bad-uint")?;
+        pools.push(Value::Map(vec![
+            (
+                Value::Text("budget_gb".into()),
+                Value::Integer(budget_gb.into()),
+            ),
+            (
+                Value::Text("class".into()),
+                Value::Text(one_of(&p, "class", &["nvme", "ssd", "hdd"])?),
+            ),
+            (Value::Text("id".into()), Value::Text(text(&p, "id")?)),
+            (
+                Value::Text("os_disks".into()),
+                Value::Bool(flag(&p, "os_disks")?),
+            ),
+            (Value::Text("path".into()), Value::Text(text(&p, "path")?)),
+            (
+                Value::Text("state".into()),
+                Value::Text(one_of(&p, "state", &["active", "draining"])?),
+            ),
+        ]));
+    }
+    let mut disks = Vec::new();
+    for item in list("dedicated_disks")? {
+        let d = entry(item, &STORAGE_DISK_KEYS)?;
+        disks.push(Value::Map(vec![
+            (Value::Text("id".into()), Value::Text(text(&d, "id")?)),
+            (
+                Value::Text("state".into()),
+                Value::Text(one_of(&d, "state", &["active", "draining"])?),
+            ),
+        ]));
+    }
+    Ok(Value::Map(vec![
+        (Value::Text("dedicated_disks".into()), Value::Array(disks)),
+        (
+            Value::Text("dry_run".into()),
+            Value::Bool(flag(obj, "dry_run")?),
+        ),
+        (
+            Value::Text("not_after_unix".into()),
+            Value::Integer(uint(obj, "not_after_unix")?.into()),
+        ),
+        (Value::Text("pools".into()), Value::Array(pools)),
+        (
+            Value::Text("revision".into()),
+            Value::Integer(uint(obj, "revision")?.into()),
+        ),
+    ]))
+}
+
+/// The `storage-config` content hash a miner acks: SHA-256 of the
+/// canonical payload map without `not_after_unix` (the document's own
+/// expiry, renewed on every re-push), lower-case hex.
+pub fn storage_config_digest(payload_json: &[u8]) -> Result<String, &'static str> {
+    use sha2::{Digest, Sha256};
+    let payload: Json = serde_json::from_slice(payload_json).map_err(|_| "payload-json-parse")?;
+    let obj = payload.as_object().ok_or("payload-not-object")?;
+    let Value::Map(entries) = build_storage_config(obj)? else {
+        return Err("canonical-encode");
+    };
+    let content = Value::Map(
+        entries
+            .into_iter()
+            .filter(|(k, _)| k.as_text() != Some("not_after_unix"))
+            .collect(),
+    );
+    let bytes = to_canonical_vec(&content).map_err(|_| "canonical-encode")?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// `storage-config-digest` subcommand: JSON payload on stdin, the content
+/// hash hex on stdout. Same exit codes as `encode-order`.
+pub fn run_storage_config_digest() -> ExitCode {
+    let mut payload_bytes = Vec::new();
+    if let Err(e) = io::stdin().read_to_end(&mut payload_bytes) {
+        eprintln!("hippius-ticket-validator: stdin read failed: {e}");
+        return ExitCode::from(INTERNAL_FAIL);
+    }
+    match storage_config_digest(&payload_bytes) {
+        Ok(hex) => {
+            if let Err(e) = writeln!(io::stdout().lock(), "{hex}") {
+                eprintln!("hippius-ticket-validator: stdout write failed: {e}");
+                return ExitCode::from(INTERNAL_FAIL);
+            }
+            ExitCode::from(0)
+        }
+        Err(class) => {
+            eprintln!("hippius-ticket-validator: storage-config-digest: {class}");
             ExitCode::from(SCHEMA_FAIL)
         }
     }
@@ -3589,6 +3771,167 @@ mod tests {
                 p.insert("dns_limit_pps".into(), Json::from(u64::from(u32::MAX) + 1));
             }),
             "net-policy-bad-uint"
+        );
+    }
+
+    fn storage_config_vector() -> Json {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/storage_config_v1.json"
+        );
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn storage_config_args(v: &Json) -> EncodeOrderArgs {
+        EncodeOrderArgs {
+            order_id: v["order_id"].as_str().unwrap().to_string(),
+            kind: "storage-config".to_string(),
+            target_miner_id: v["target_miner_id"].as_str().unwrap().to_string(),
+            issued_at_unix: v["issued_at_unix"].as_u64().unwrap(),
+        }
+    }
+
+    fn storage_config_payload(mutate: impl FnOnce(&mut serde_json::Map<String, Json>)) -> Vec<u8> {
+        let mut payload = storage_config_vector()["cases"][0]["payload"]
+            .as_object()
+            .unwrap()
+            .clone();
+        mutate(&mut payload);
+        serde_json::to_vec(&payload).unwrap()
+    }
+
+    /// The shared vectors the edge-gateway and miner-agent tests consume:
+    /// a change here is a wire change on all three.
+    #[test]
+    fn storage_config_matches_the_shared_vectors() {
+        let v = storage_config_vector();
+        for case in v["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let payload = serde_json::to_vec(&case["payload"]).unwrap();
+            let body = build(&storage_config_args(&v), &payload).unwrap();
+            assert_canonical(&body).unwrap();
+            assert_eq!(
+                hex::encode(&body),
+                case["body_hex"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                storage_config_digest(&payload).unwrap(),
+                case["content_sha256"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_config_digest_ignores_only_the_expiry() {
+        let base = storage_config_digest(&storage_config_payload(|_| {})).unwrap();
+        let renewed = storage_config_payload(|p| {
+            p.insert("not_after_unix".into(), Json::from(1_770_100_000u64));
+        });
+        assert_eq!(storage_config_digest(&renewed).unwrap(), base);
+        for mutate in [
+            &(|p: &mut serde_json::Map<String, Json>| {
+                p.insert("dry_run".into(), Json::Bool(true));
+            }) as &dyn Fn(&mut serde_json::Map<String, Json>),
+            &|p| {
+                p.insert("revision".into(), Json::from(4u64));
+            },
+            &|p| {
+                p["pools"][0]["budget_gb"] = Json::from(2999u64);
+            },
+            &|p| {
+                p["dedicated_disks"][0]["state"] = Json::from("active");
+            },
+        ] {
+            let other = storage_config_payload(mutate);
+            assert_ne!(storage_config_digest(&other).unwrap(), base);
+        }
+    }
+
+    #[test]
+    fn storage_config_refuses_rather_than_drops() {
+        let v = storage_config_vector();
+        let refused = |mutate: &dyn Fn(&mut serde_json::Map<String, Json>)| {
+            build(&storage_config_args(&v), &storage_config_payload(mutate)).unwrap_err()
+        };
+        assert_eq!(
+            refused(&|p| {
+                p.insert("vm_id".into(), Json::from("tenant-1"));
+            }),
+            "storage-config-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.remove("dry_run");
+            }),
+            "storage-config-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["pools"][0]["extra"] = Json::from(1u64);
+            }),
+            "storage-config-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["pools"][0].as_object_mut().unwrap().remove("path");
+            }),
+            "storage-config-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["dedicated_disks"][0]["size"] = Json::from(1u64);
+            }),
+            "storage-config-unknown-field"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["pools"][0]["class"] = Json::from("tape");
+            }),
+            "storage-config-bad-enum"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["pools"][0]["state"] = Json::from("unavailable");
+            }),
+            "storage-config-bad-enum"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["dedicated_disks"][0]["state"] = Json::from("free");
+            }),
+            "storage-config-bad-enum"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p["pools"][0]["budget_gb"] = Json::from(u64::from(u32::MAX) + 1);
+            }),
+            "storage-config-bad-uint"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("revision".into(), Json::from(-1i64));
+            }),
+            "storage-config-bad-uint"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("dry_run".into(), Json::from("no"));
+            }),
+            "storage-config-bad-bool"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("pools".into(), Json::from("nvme0"));
+            }),
+            "storage-config-bad-list"
+        );
+        assert_eq!(
+            refused(&|p| {
+                p.insert("dedicated_disks".into(), serde_json::json!(["wwn-0x1"]));
+            }),
+            "storage-config-bad-entry"
         );
     }
 

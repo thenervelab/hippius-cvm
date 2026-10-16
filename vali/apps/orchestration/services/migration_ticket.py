@@ -71,6 +71,7 @@ triple (non-secret) reach the log.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass
@@ -157,7 +158,9 @@ def _zeroize(buf: bytes) -> None:
         pass
 
 
-def remint_dest_ticket(vm: object, *, dest_node_id: str, new_gen: int) -> bytes:
+def remint_dest_ticket(
+    vm: object, *, dest_node_id: str, new_gen: int, measurement_hex: str = ""
+) -> bytes:
     """§25 — re-mint the DESTINATION OrderTicket at `new_gen` for `vm` and
     return its byte-exact COSE_Sign1 blob.
 
@@ -177,7 +180,20 @@ def remint_dest_ticket(vm: object, *, dest_node_id: str, new_gen: int) -> bytes:
     Thin wrapper over [`remint_ticket`] pinned to the §25 defaults (reuse an
     existing same-gen intake, `tk-mig` ticket namespace) — the §25 call site
     is behaviourally unchanged by the generalisation.
+
+    `measurement_hex` (a cross-generation restore / failover,
+    `apps.orchestration.cross_gen`): the digest the destination's generation
+    measures, instead of the record's. Always a fresh mint — a stored ticket
+    at `new_gen` may carry the source's digest.
     """
+    if measurement_hex:
+        return remint_ticket(
+            vm,
+            node_id=dest_node_id,
+            generation=new_gen,
+            reuse_existing=False,
+            measurement_hex=measurement_hex,
+        )
     return remint_ticket(vm, node_id=dest_node_id, generation=new_gen)
 
 
@@ -188,6 +204,7 @@ def remint_ticket(
     generation: int,
     reuse_existing: bool = True,
     ticket_id_prefix: str = TICKET_PREFIX_MIGRATION,
+    measurement_hex: str = "",
 ) -> bytes:
     """Mint a fresh OrderTicket for `vm` bound to `(node_id, generation)`,
     persist it as an `OrderTicketIntake`, and return its COSE_Sign1 blob.
@@ -270,6 +287,8 @@ def remint_ticket(
             )
 
     inputs = resolve_ticket_inputs(vm, node_id=node_id, generation=generation)
+    if measurement_hex:
+        inputs = dataclasses.replace(inputs, measurement_hex=measurement_hex.lower())
     return _mint_from(inputs, ticket_id_prefix=ticket_id_prefix)
 
 

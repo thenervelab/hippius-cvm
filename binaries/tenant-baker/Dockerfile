@@ -185,6 +185,11 @@ RUN cargo build --release \
 # bytes of the three tenant agents are untouched.
 RUN cargo build --release -p hippius-cdn-agent
 
+# The disk-tier probe (`hippius-agent-disk-probe`), shipped in the guest
+# components release only (dormant unless vali's probe userdata asks).
+# Its own package-scoped invocation, like the cdn-node agent above.
+RUN cargo build --release -p hippius-agent-disk-probe
+
 # ───────────────────────────────────────────────────────────────────
 # Stage 1c — openresty-builder: the cdn-node data plane (CDN plan I2)
 #
@@ -399,6 +404,11 @@ RUN chmod 0755 /usr/sbin/hippius-agent-keepalive
 # cdn-node` only (with the OpenResty tree copied below).
 COPY --from=eol-builder /src/target/release/hippius-cdn-agent /usr/sbin/hippius-cdn-agent
 RUN chmod 0755 /usr/sbin/hippius-cdn-agent
+
+# The disk-tier probe: `build-guest-release.sh` takes it from /usr/sbin
+# into the components image (never installed into a rootfs).
+COPY --from=eol-builder /src/target/release/hippius-agent-disk-probe /usr/sbin/hippius-agent-disk-probe
+RUN chmod 0755 /usr/sbin/hippius-agent-disk-probe
 
 # CDN I2 — the cdn-node data plane: the OpenResty tree (with its
 # .sha256) and the Lua + nginx config the cdn-node bake profile (I3)

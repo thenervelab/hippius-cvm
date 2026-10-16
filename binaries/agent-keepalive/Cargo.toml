@@ -30,6 +30,9 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 ciborium = "0.2"
 thiserror = "2"
+# Turn SIGTERM into a latch so the daemon runs its final keepalive before
+# it exits (`daemon`), the same crate the tenant telemetry agent uses.
+signal-hook = "0.3"
 # Same `rustls-tls` + `http2` posture as the other guest binaries —
 # blocking client, kept dep-light. The KBS endpoint is HTTP/1.1 +
 # HTTP/2; `rustls` floor at TLS 1.3.

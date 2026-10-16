@@ -698,3 +698,31 @@ def test_remint_refuses_a_plaintext_value_at_the_working_path(
     with pytest.raises(EffectError, match="no usable working copy"):
         migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
     assert "args" not in _vault_and_mint
+
+
+def test_a_cross_generation_dest_ticket_carries_its_own_digest(
+    monkeypatch: pytest.MonkeyPatch, _vault_and_mint: dict[str, Any]
+) -> None:
+    """Cross-generation restore / failover: the destination's digest, and a
+    fresh mint — never a stored new_gen ticket carrying the source's."""
+    from apps.miners.models import MinerIdentity
+
+    vm = make_vm(generation=5, host="node-src")
+    _launch_record(vm, measurement_hex="cd" * 48)
+    MinerIdentity.objects.create(miner_id="node-dst", pubkey_hex="bb" * 32, platform_id="22" * 8)
+    monkeypatch.setattr(migration_ticket, "persist_intake", lambda blob, **kw: None)
+    reused: list[bool] = []
+    real = migration_ticket.remint_ticket
+
+    def spy(*a: Any, **kw: Any) -> bytes:
+        reused.append(kw.get("reuse_existing", True))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(migration_ticket, "remint_ticket", spy)
+    migration_ticket.remint_dest_ticket(
+        vm, dest_node_id="node-dst", new_gen=6, measurement_hex="EF" * 48
+    )
+    assert _vault_and_mint["args"].allowed_measurement_hex == "ef" * 48
+    assert reused == [False]
+    migration_ticket.remint_dest_ticket(vm, dest_node_id="node-dst", new_gen=6)
+    assert _vault_and_mint["args"].allowed_measurement_hex == "cd" * 48, "the same generation"

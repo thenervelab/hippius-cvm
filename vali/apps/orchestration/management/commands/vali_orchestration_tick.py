@@ -10,11 +10,13 @@ crypto-erase, …).
 Deploy as a **single** instance. A crashed-then-restarted tick is
 safe: every job transition is an optimistic CAS on
 `(id, version, state)`, so it cannot double-advance, and the §14
-idempotency store + idempotent peer effects (§24) absorb a re-run of
-the in-flight step. Two concurrently-racing tick processes are not a
-supported topology — the CAS still prevents a double-advance, but
-side-effect dedup then degrades to "peer idempotency only" (same
-posture as `vali_scheduler_reeval`).
+idempotency store (a Postgres table, so it survives the restart) +
+idempotent peer effects (§24) absorb a re-run of the in-flight step.
+Two concurrently-racing tick processes are still not a supported
+topology: the CAS prevents a double-advance and the shared store dedups
+a recorded step, but a step two ticks start at once before either
+records it runs twice (peer idempotency then holds; same posture as
+`vali_scheduler_reeval`).
 
 `--once` runs a single cycle and exits — for a cron-driven
 deployment and for tests.

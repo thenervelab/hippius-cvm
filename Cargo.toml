@@ -7,6 +7,7 @@ members = [
     "kbs-transport",
     "hippius-guest",
     "pallets/compute-scoring",
+    "binaries/agent-disk-probe",
     "binaries/agent-host-attestor",
     "binaries/agent-initramfs",
     "binaries/agent-keepalive",

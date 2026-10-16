@@ -109,6 +109,54 @@ GATEWAY_HEADERS = [
     ("x-hippius-body-blake3-chunk", "b3c"), ("x-amz-meta-original-name", "cdn-test.html"),
     ("Age", "5000"),
 ]
+# A static site / SPA (zones zspa, zidx, znone, zspp): bucket media, prefix
+# spa/. A missing key under it gets the S3 gateway's own answer, 404
+# NoSuchKey with its XML body; under spa/plain/ an empty 404; spa/deny/ is
+# AccessDenied (403) and spa/boom/ a 503.
+SPA_INDEX = b"<!doctype html><title>spa</title><div id=root></div>"
+OBJECTS["/media/spa/index.html"] = (SPA_INDEX, "text/html")
+OBJECTS["/media/spa/sub/index.html"] = (b"<p>sub index</p>", "text/html")
+OBJECTS["/media/spa/assets/app.js"] = (b"console.log(1);", "text/javascript")
+OBJECTS["/media/spa/real.txt"] = (b"a real object", "text/plain")
+SPA_SITE = {"index_document": "index.html", "spa_fallback": True}
+# A private SPA bucket (zone zsps, presigned): an object over one slice whose
+# edge TTL is a second, and the index document.
+STALE_BIG = bytes(range(256)) * (5 * 4096 + 3)
+OBJECTS["/private/spa/stale/big.bin"] = (STALE_BIG, "application/octet-stream")
+OBJECTS["/private/spa/index.html"] = (SPA_INDEX, "text/html")
+# Zone zst (private, presigned, edge TTL of a second): objects changed or
+# deleted at the origin after they were cached. ST_BIG is over 3 slices.
+ST_BIG = bytes(range(256)) * (13 * 1024 + 9)
+ST_SMALL = b"small object v1"
+ST_KEEP = bytes(range(251)) * 9000
+EXPIRE = 2.2
+# Origin paths the mock answers with a 503 (an origin outage).
+FAILING = set()
+# Zone zri: an index document at the bucket root (no prefix), where a key is
+# the request path itself.
+ROOT_INDEX = b"<p>root index</p>"
+# CORS (zones zc, zca, zcs on bucket media, prefix cors/). The origin sends
+# its own CORS headers on these objects: only the zone's policy may decide.
+CORS_TEXT = ("cors object " * 64).encode()
+OBJECTS["/media/cors/a.txt"] = (CORS_TEXT, "text/plain")
+OBJECTS["/media/cors/index.html"] = (b"<p>cors index</p>", "text/html")
+CORS_POLICY = {"allow_origins": ["https://app.example", "https://*.tenant.example"],
+               "allow_headers": ["X-Custom", "Content-Type"], "expose_headers": ["ETag"],
+               "max_age": 600, "allow_credentials": True}
+BACKEND_CORS = {"allow_origins": ["https://app.example", "https://*.tenant.example"],
+                "allow_methods": ["GET", "HEAD"], "allow_headers": [], "expose_headers": [],
+                "max_age": 600, "allow_credentials": False}
+ORIGIN_CORS_HEADERS = [("Access-Control-Allow-Origin", "https://evil.example"),
+                       ("Access-Control-Allow-Credentials", "true"),
+                       ("Access-Control-Expose-Headers", "x-amz-meta-secret")]
+OBJECTS["/media/index.html"] = (ROOT_INDEX, "text/html")
+# hippius-s3 lists a public bucket to anyone: GET /<bucket> (its router's
+# get_bucket, also reached from /<bucket>/), and any listing query. The mock
+# answers those with a ListBucketResult, so a test sees one if it ever leaks.
+LIST_QUERIES = ("list-type", "prefix", "delimiter", "uploads", "versions", "acl", "marker",
+                "continuation-token", "max-keys", "encoding-type", "location")
+LISTING = (b"<?xml version='1.0' encoding='UTF-8'?>\n<ListBucketResult><Name>media</Name>"
+           b"<Contents><Key>secret/x</Key></Contents></ListBucketResult>")
 MOVED_PATH = "/media/site/gw/moved.txt"
 # What a client may see on a 200 (lower case).
 CLIENT_HEADERS = {"content-type", "content-length", "content-range", "content-encoding",
@@ -117,6 +165,17 @@ CLIENT_HEADERS = {"content-type", "content-length", "content-range", "content-en
                   "content-security-policy",
                   "date", "connection", "vary"}
 ERROR_PATH = "/media/site/err.txt"
+
+
+def combined_headers(r):
+    """Response headers by lower-case name, repeated lines joined with ", "
+    the way a recipient combines a list header (RFC 9110 5.3): nginx writes
+    gzip's `Vary: Accept-Encoding` as its own line."""
+    out = {}
+    for k, v in r.getheaders():
+        k = k.lower()
+        out[k] = f"{out[k]}, {v}" if k in out else v
+    return out
 
 
 def free_port():
@@ -211,12 +270,56 @@ class Origin(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         obj = OBJECTS.get(path)
+        names = {k for k, _ in urllib.parse.parse_qsl(query, keep_blank_values=True)}
+        if path.count("/") == 1 or (path.count("/") == 2 and path.endswith("/")) \
+                or names & set(LIST_QUERIES):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(LISTING)))
+            self.end_headers()
+            self.wfile.write(LISTING)
+            return
+        if path.startswith("/media/spa/deny/") or path.startswith("/media/spa/boom/"):
+            deny = "/deny/" in path
+            body = (b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>" if deny
+                    else b"<Error><Code>SlowDown</Code></Error>")
+            self.send_response(403 if deny else 503)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if obj is None and path.startswith("/media/spa/") and not path.startswith("/media/spa/plain/"):
+            # hippius-s3 (get_object_endpoint.py): s3_error_response("NoSuchKey", ..., 404).
+            body = (b"<?xml version='1.0' encoding='UTF-8'?>\n<Error><Code>NoSuchKey</Code>"
+                    b"<Message>The specified key does not exist</Message><Key>x</Key>"
+                    b"<RequestId>r</RequestId></Error>")
+            self.send_response(404)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if obj is None:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path in FAILING:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body, ctype = obj
+        # Zone zst's objects answer conditional GETs like S3: an ETag of the
+        # whole object, 304 when If-None-Match matches it.
+        etag = '"' + hashlib.md5(body).hexdigest() + '"' if path.startswith("/private/st/") else None
+        if etag and self.headers.get("If-None-Match") == etag:
+            entry["not_modified"] = True
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
         rng = self.headers.get("Range")
         if rng and not body:
             # S3: a ranged GET on an empty object is 416.
@@ -238,12 +341,17 @@ class Origin(BaseHTTPRequestHandler):
         if ctype is not None:
             self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if etag:
+            self.send_header("ETag", etag)
         if "/gw/" in path:
             for k, v in GATEWAY_HEADERS:
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith("/media/cors/"):
+            for k, v in ORIGIN_CORS_HEADERS:
+                self.send_header(k, v)
         if path.endswith("/accel.txt"):
             self.send_header("X-Accel-Redirect", "/.well-known/hippius-attestation")
         if path.endswith("/accel-expires.txt"):
@@ -427,6 +535,51 @@ class DataPlane(unittest.TestCase):
                 "zr": {"state": "active", "serving": True, "refusal": None,
                        "origin": {"type": "s3", "bucket": "media"}, "shield_region": None,
                        "settings": {}, "secrets": []},
+                # Static site / SPA: index + fallback; index only; neither
+                # (the feed of an older backend); a private bucket (no
+                # credentials: every object is AccessDenied).
+                "zspa": {"state": "active", "serving": True, "refusal": None,
+                         "origin": {"type": "s3", "bucket": "media", "prefix": "spa/"}, "shield_region": None,
+                         "settings": dict(SPA_SITE), "secrets": []},
+                "zidx": {"state": "active", "serving": True, "refusal": None,
+                         "origin": {"type": "s3", "bucket": "media", "prefix": "spa/"}, "shield_region": None,
+                         "settings": {"index_document": "index.html"}, "secrets": []},
+                "znone": {"state": "active", "serving": True, "refusal": None,
+                          "origin": {"type": "s3", "bucket": "media", "prefix": "spa/"}, "shield_region": None,
+                          "settings": {"rules": []}, "secrets": []},
+                "zc": {"state": "active", "serving": True, "refusal": None,
+                       "origin": {"type": "s3", "bucket": "media", "prefix": "cors/"}, "shield_region": None,
+                       "settings": {"cors": CORS_POLICY}, "secrets": []},
+                "zca": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "media", "prefix": "cors/"}, "shield_region": None,
+                        "settings": {"cors": {"allow_origins": ["*"], "allow_headers": ["*"]}},
+                        "secrets": []},
+                # The backend's feed shape, as sent (every key, max_age set).
+                "zcf": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "media", "prefix": "cors/"}, "shield_region": None,
+                        "settings": {"cors": BACKEND_CORS}, "secrets": []},
+                "zcn": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "media", "prefix": "cors/"}, "shield_region": None,
+                        "settings": {}, "secrets": []},
+                "zcs": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "media", "prefix": "cors/"}, "shield_region": None,
+                        "settings": dict(SPA_SITE, cors={"allow_origins": ["https://app.example"]}),
+                        "secrets": []},
+                "zri": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "media", "prefix": ""}, "shield_region": None,
+                        "settings": dict(SPA_SITE), "secrets": []},
+                "zst": {"state": "active", "serving": True, "refusal": None,
+                        "origin": {"type": "s3", "bucket": "private", "prefix": "st/"}, "shield_region": None,
+                        "settings": {"rules": [{"match": {"path_prefix": "/"}, "actions": {"edge_ttl": 1}}]},
+                        "secrets": ["s3_credentials"]},
+                "zsps": {"state": "active", "serving": True, "refusal": None,
+                         "origin": {"type": "s3", "bucket": "private", "prefix": "spa/"}, "shield_region": None,
+                         "settings": dict(SPA_SITE, rules=[{"match": {"path_prefix": "/stale/"},
+                                                            "actions": {"edge_ttl": 1}}]),
+                         "secrets": ["s3_credentials"]},
+                "zspp": {"state": "active", "serving": True, "refusal": None,
+                         "origin": {"type": "s3", "bucket": "private", "prefix": "spa/"}, "shield_region": None,
+                         "settings": dict(SPA_SITE), "secrets": []},
             },
             "hostnames": {
                 "img.example.com": "z1", "z1.cdn.hippius.com": "z1", "dl.example.com": "zp",
@@ -435,6 +588,13 @@ class DataPlane(unittest.TestCase):
                 "priv.cdn.hippius.com": "zq",
                 "lim.cdn.hippius.com": "zl", "bw.cdn.hippius.com": "zb", "zero.cdn.hippius.com": "z0",
                 "slices.cdn.hippius.com": "zs",
+                "spa.cdn.hippius.com": "zspa", "idx.cdn.hippius.com": "zidx",
+                "none.cdn.hippius.com": "znone", "spp.cdn.hippius.com": "zspp",
+                "sps.cdn.hippius.com": "zsps", "ri.cdn.hippius.com": "zri",
+                "cors.cdn.hippius.com": "zc", "corsany.cdn.hippius.com": "zca",
+                "corsspa.cdn.hippius.com": "zcs", "corsnone.cdn.hippius.com": "zcn",
+                "corsfeed.cdn.hippius.com": "zcf",
+                "st.cdn.hippius.com": "zst",
             },
             "purges": {"z1": {"zone_generation": 1, "prefixes": {}}},
             "blocks": [{"kind": "path", "value": "/bad.bin", "zone_id": "z1"},
@@ -446,8 +606,8 @@ class DataPlane(unittest.TestCase):
         return c
 
     def push_all(self, health_ready=True, **over):
-        self.assertEqual(self.put("secrets", {"zones": {"zp": {"s3_credentials": json.dumps(
-            {"access_key_id": ACCESS, "secret_access_key": SIGNING_MATERIAL})}}}), 204)
+        creds = {"s3_credentials": json.dumps({"access_key_id": ACCESS, "secret_access_key": SIGNING_MATERIAL})}
+        self.assertEqual(self.put("secrets", {"zones": {"zp": creds, "zsps": creds, "zst": creds}}), 204)
         self.assertEqual(self.put("certs", {"default": "*.cdn.hippius.com", "certs": {
             "*.cdn.hippius.com": {"chain_pem": self.wild_chain, "key_pem": self.wild_key, "not_after": 0},
             "img.example.com": {"chain_pem": self.img_chain, "key_pem": self.img_key, "not_after": 0},
@@ -484,20 +644,22 @@ class DataPlane(unittest.TestCase):
         hdrs = {"Host": host or sni, "Connection": "close"}
         hdrs.update(headers or {})
         req = f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdrs.items()) + "\r\n"
-        s.sendall(req.encode())
-        r = http.client.HTTPResponse(s)
-        r.begin()
-        body = r.read()
-        s.close()
-        return r.status, {k.lower(): v for k, v in r.getheaders()}, body
+        try:
+            s.sendall(req.encode())
+            r = http.client.HTTPResponse(s, method=method)
+            r.begin()
+            body = r.read()
+        finally:
+            s.close()
+        return r.status, combined_headers(r), body
 
-    def http(self, host, path, method="GET"):
+    def http(self, host, path, method="GET", headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=5)
-        conn.request(method, path, headers={"Host": host})
+        conn.request(method, path, headers={"Host": host, **(headers or {})})
         r = conn.getresponse()
         body = r.read()
         conn.close()
-        return r.status, {k.lower(): v for k, v in r.getheaders()}, body
+        return r.status, combined_headers(r), body
 
     def origin_hits(self, path):
         return [e for e in Origin.log if e["path"] == path]
@@ -964,6 +1126,595 @@ class DataPlane(unittest.TestCase):
         self.assertEqual(self.https("dl.example.com", "/doc.txt")[0], 503)
         self.assertEqual(len(Origin.log), before)
         self.push_all()
+
+    # ── static site / SPA (index_document, spa_fallback) ──
+
+    def spa(self, path, host="spa.cdn.hippius.com", **kw):
+        return self.https(host, path, **kw)
+
+    def test_fi_spa_index_document(self):
+        before = len(self.origin_hits("/media/spa/index.html"))
+        st, h, body = self.spa("/")
+        self.assertEqual((st, body, h.get("x-cache")), (200, SPA_INDEX, "MISS"))
+        self.assertEqual(h.get("content-type"), "text/html")
+        self.assertEqual(h.get("cache-control"), "public, max-age=3600")
+        # Fleet name: the sandbox CSP stays on an HTML index.
+        self.assertEqual(h.get("content-security-policy"), "sandbox allow-scripts")
+        # "/" and "/index.html" are one object: one entry, one origin fetch.
+        st, h, body = self.spa("/index.html")
+        self.assertEqual((st, body, h.get("x-cache")), (200, SPA_INDEX, "HIT"))
+        self.assertEqual(len(self.origin_hits("/media/spa/index.html")), before + 1)
+        st, _, body = self.spa("/sub/")
+        self.assertEqual((st, body), (200, b"<p>sub index</p>"))
+        self.assertEqual(self.spa("/sub/index.html")[1].get("x-cache"), "HIT")
+        # Never a listing: the bucket is never asked for a directory.
+        for e in Origin.log:
+            self.assertFalse(e["path"].endswith("/") or "list-type" in e["query"], e)
+        # Index without the fallback: a directory serves, a miss stays a 404.
+        self.assertEqual(self.spa("/", host="idx.cdn.hippius.com")[:3:2], (200, SPA_INDEX))
+        st, h, body = self.spa("/missing/page", host="idx.cdn.hippius.com")
+        self.assertEqual((st, body), (404, b"404\n"))
+        self.assertNotIn(b"NoSuchKey", body)
+
+    def test_fi_spa_without_the_fields_is_todays_behaviour(self):
+        before = len(Origin.log)
+        # A directory is the key itself as before ("spa/", "spa/sub/": a
+        # GetObject, never a list), a 404 with the generic body.
+        for path in ("/", "/sub/"):
+            st, h, body = self.spa(path, host="none.cdn.hippius.com")
+            self.assertEqual((st, body), (404, b"404\n"), path)
+        self.assertEqual([(e["path"], e["query"]) for e in Origin.log[before:]],
+                         [("/media/spa/", ""), ("/media/spa/sub/", "")])
+        # At the bucket root, "/" never reaches the origin.
+        self.assertEqual(self.https("root.cdn.hippius.com", "/")[0], 404)
+        self.assertEqual(len(Origin.log), before + 2)
+        st, h, body = self.spa("/profile/1", host="none.cdn.hippius.com")
+        self.assertEqual((st, body, h.get("cache-control")), (404, b"404\n", "no-store"))
+        # Cached as a 404 is today (X-Cache HIT on the second ask).
+        self.assertEqual(self.spa("/profile/1", host="none.cdn.hippius.com")[1].get("x-cache"), "HIT")
+
+    def test_fj_spa_fallback_on_404_and_nosuchkey(self):
+        self.spa("/")  # the index document cached
+        for path in ("/profile/42", "/plain/route", "/deep/a/b/c?tab=2"):
+            key = "/media/spa" + path.split("?")[0]
+            st, h, body = self.spa(path)
+            self.assertEqual((st, body), (200, SPA_INDEX), path)
+            self.assertEqual(h.get("content-type"), "text/html", path)
+            # The index document's response: its Cache-Control, its entry.
+            self.assertEqual(h.get("cache-control"), "public, max-age=3600", path)
+            self.assertEqual(h.get("x-cache"), "HIT", path)
+            self.assertEqual(h.get("content-security-policy"), "sandbox allow-scripts", path)
+            self.assertNotIn(b"NoSuchKey", body)
+            self.assertEqual(len(self.origin_hits(key)), 1, path)
+            # Asked again: the missing path is cached a minute too (an nginx
+            # error entry replaying the fallback), not fetched again.
+            st, _, body = self.spa(path)
+            self.assertEqual((st, body), (200, SPA_INDEX), path)
+            self.assertEqual(len(self.origin_hits(key)), 1, path)
+        # A real object under a fallback zone is served as itself.
+        self.assertEqual(self.spa("/real.txt")[:3:2], (200, b"a real object"))
+        # HEAD: the index document's headers, no body.
+        st, h, body = self.spa("/profile/head", method="HEAD")
+        self.assertEqual((st, body), (200, b""))
+        self.assertEqual(h.get("content-length"), str(len(SPA_INDEX)))
+        self.assertEqual(h.get("content-type"), "text/html")
+
+    def test_fj_spa_no_fallback_on_403_5xx_post_or_excluded(self):
+        st, h, body = self.spa("/assets/missing.js")
+        self.assertEqual((st, body), (404, b"404\n"), "excluded prefix keeps its 404")
+        self.assertEqual(self.spa("/assets/app.js")[:3:2], (200, b"console.log(1);"))
+        st, h, body = self.spa("/deny/secret")
+        self.assertEqual((st, body), (403, b"403\n"), "AccessDenied is never masked")
+        st, h, body = self.spa("/boom/x")
+        self.assertEqual((st, body), (503, b"503\n"), "a 5xx passes through")
+        self.assertEqual(self.spa("/profile/42", method="POST")[0], 405)
+        # A private bucket answers 403 to everything, "/" included: never 200.
+        for path in ("/", "/profile/42"):
+            st, _, body = self.spa(path, host="spp.cdn.hippius.com")
+            self.assertEqual((st, body), (403, b"403\n"), path)
+        # A range from a later slice of a missing path keeps its 404: only
+        # the first slice may be replaced (later slices are subrequests).
+        st, _, body = self.spa("/profile/range", headers={"Range": "bytes=1048576-1048600"})
+        self.assertEqual((st, body), (404, b"404\n"))
+        # A blocked index document is never served, directly or as a fallback.
+        cfg = self.config()
+        cfg["blocks"] = cfg["blocks"] + [{"kind": "path", "value": "/index.html", "zone_id": "zspa"}]
+        self.assertEqual(self.put("config", cfg), 204)
+        try:
+            for path in ("/", "/index.html", "/profile/42", "/profile/blocked"):
+                self.assertEqual(self.spa(path)[0], 451, path)
+        finally:
+            self.push_all()
+        # The index document itself missing: a 404, no loop.
+        cfg = self.config()
+        cfg["zones"]["zspa"]["settings"] = {"index_document": "nope.html", "spa_fallback": True}
+        self.assertEqual(self.put("config", cfg), 204)
+        try:
+            self.assertEqual(self.spa("/route-x")[:3:2], (404, b"404\n"))
+            self.assertEqual(self.spa("/")[:3:2], (404, b"404\n"))
+            self.assertEqual(len(self.origin_hits("/media/spa/nope.html")), 1,
+                             "asked once, then its cached 404")
+        finally:
+            self.push_all()
+
+    def test_fk_spa_cached_404_never_shadows_a_change(self):
+        # Without the fallback, /later/x is a cached 404 ...
+        cfg = self.config()
+        cfg["zones"]["zspa"]["settings"] = {"index_document": "index.html"}
+        self.assertEqual(self.put("config", cfg), 204)
+        self.assertEqual(self.spa("/later/x")[0], 404)
+        self.assertEqual(self.spa("/later/x")[1].get("x-cache"), "HIT")
+        # ... and the fallback answers at once when it is turned on.
+        self.push_all()
+        self.assertEqual(self.spa("/later/x")[:3:2], (200, SPA_INDEX))
+        # A path newly excluded is a 404 at once, though its fallback is cached.
+        self.assertEqual(self.spa("/later/x")[:3:2], (200, SPA_INDEX))
+        cfg = self.config()
+        cfg["zones"]["zspa"]["settings"] = dict(SPA_SITE, spa_fallback_exclude=["/assets/", "/later/"])
+        self.assertEqual(self.put("config", cfg), 204)
+        self.assertEqual(self.spa("/later/x")[:3:2], (404, b"404\n"))
+        self.push_all()
+
+    def test_fl_spa_purging_the_index_purges_every_fallback(self):
+        self.assertEqual(self.spa("/route-p")[:3:2], (200, SPA_INDEX))
+        self.assertEqual(self.spa("/route-p")[1].get("x-cache"), "HIT")
+        new = b"<!doctype html><title>spa v2</title>"
+        OBJECTS["/media/spa/index.html"] = (new, "text/html")
+        try:
+            # Still the cached copy until the purge.
+            self.assertEqual(self.spa("/route-p")[2], SPA_INDEX)
+            self.push_all(purges={"z1": {"zone_generation": 1, "prefixes": {}},
+                                  "zspa": {"zone_generation": 0, "paths": {"/index.html": 1}}})
+            fetched = len(self.origin_hits("/media/spa/index.html"))
+            for path in ("/route-p", "/", "/index.html", "/other-route"):
+                self.assertEqual(self.spa(path)[:3:2], (200, new), path)
+            self.assertEqual(len(self.origin_hits("/media/spa/index.html")), fetched + 1,
+                             "one entry: fetched once for every path")
+        finally:
+            OBJECTS["/media/spa/index.html"] = (SPA_INDEX, "text/html")
+            self.push_all(purges={"z1": {"zone_generation": 1, "prefixes": {}},
+                                  "zspa": {"zone_generation": 1}})
+
+    # ── stale objects: refreshed per slice (#1581) ──
+    # zst's edge TTL is 1 s; nginx keeps validity in whole seconds and an
+    # entry is stale once that second is past, so it can live almost 2 s.
+
+    def st(self, path, **kw):
+        t = time.monotonic()
+        st, h, body = self.https("st.cdn.hippius.com", path, **kw)
+        return st, h, body, time.monotonic() - t
+
+    def st_sent(self, n0):
+        sent = [e for e in Origin.log[n0:] if e["path"].startswith("/private/st/")]
+        stray = [(e["path"], e.get("sig")) for e in Origin.log[n0:]
+                 if not e["path"].startswith("/private/st/") or e.get("sig")]
+        self.assertEqual(stray, [], "an origin request went out unsigned or off the zone's prefix")
+        return sent
+
+    def test_fp_stale_slices_are_refreshed(self):
+        key = "/private/st/big.bin"
+        OBJECTS[key] = (ST_BIG, "application/octet-stream")
+        try:
+            n0 = len(Origin.log)
+            st, _, body, _ = self.st("/big.bin")
+            self.assertEqual((st, body == ST_BIG), (200, True))
+            # Changed at the origin, a different length too: after the edge
+            # TTL, the first request gets the new object, every slice of it.
+            v2 = bytes(reversed(ST_BIG)) + b"tail"
+            OBJECTS[key] = (v2, "application/octet-stream")
+            st, _, body, _ = self.st("/big.bin")
+            self.assertEqual((st, body == ST_BIG), (200, True), "fresh: the cached copy")
+            time.sleep(EXPIRE)
+            st, h, body, _ = self.st("/big.bin")
+            self.assertEqual((st, len(body), body == v2), (200, len(v2), True))
+            st, h, body, _ = self.st("/big.bin")
+            self.assertEqual((st, body == v2, h.get("x-cache")), (200, True, "HIT"))
+            # A range in a later slice, after expiry: that slice is refreshed too.
+            OBJECTS[key] = (ST_BIG, "application/octet-stream")
+            time.sleep(EXPIRE)
+            st, _, body, _ = self.st("/big.bin", headers={"Range": "bytes=2097152-2097251"})
+            self.assertEqual((st, body), (206, ST_BIG[2097152:2097252]))
+            sent = self.st_sent(n0)
+            # Every refresh is a ranged slice request, never the whole object.
+            self.assertTrue(all((e["headers"].get("range") or "").startswith("bytes=") for e in sent),
+                            [(e["path"], e["headers"].get("range")) for e in sent])
+        finally:
+            OBJECTS.pop(key, None)
+
+    def test_fp_stale_unchanged_object_is_revalidated(self):
+        key = "/private/st/keep.bin"
+        OBJECTS[key] = (ST_KEEP, "application/octet-stream")
+        try:
+            self.assertEqual(self.st("/keep.bin")[2], ST_KEEP)
+            hit = min(self.st("/keep.bin")[3] for _ in range(5))
+            n0 = len(Origin.log)
+            time.sleep(EXPIRE)
+            st, h, body, first = self.st("/keep.bin")
+            self.assertEqual((st, body == ST_KEEP), (200, True))
+            sent = self.st_sent(n0)
+            slices = -(-len(ST_KEEP) // (1 << 20))
+            # One conditional GET per slice, each a 304: no body refetched.
+            self.assertEqual(len(sent), slices, sent)
+            self.assertTrue(all(e.get("not_modified") for e in sent), sent)
+            self.assertEqual(h.get("x-cache"), "REVALIDATED")
+            # Revalidated is fresh again for an edge TTL: hits, no origin request.
+            n1 = len(Origin.log)
+            st, h, body, _ = self.st("/keep.bin")
+            self.assertEqual((st, body == ST_KEEP, h.get("x-cache")), (200, True, "HIT"))
+            self.assertEqual(self.st_sent(n1), [])
+            # ... and for the rule's TTL only (the 304's X-Accel-Expires), not
+            # proxy_cache_valid's hour: it is revalidated again after that.
+            time.sleep(EXPIRE)
+            n2 = len(Origin.log)
+            self.assertEqual(self.st("/keep.bin")[1].get("x-cache"), "REVALIDATED")
+            self.assertEqual(len(self.st_sent(n2)), slices)
+            print(f"\n     refresh after expiry: {first * 1000:.1f} ms for {slices} slices "
+                  f"({len(sent)} conditional GETs, all 304), a hit {hit * 1000:.1f} ms", flush=True)
+        finally:
+            OBJECTS.pop(key, None)
+
+    def test_fp_stale_deleted_object_is_a_404(self):
+        key = "/private/st/gone.bin"
+        OBJECTS[key] = (ST_BIG, "application/octet-stream")
+        try:
+            n0 = len(Origin.log)
+            self.assertEqual(self.st("/gone.bin")[2], ST_BIG)
+            del OBJECTS[key]
+            time.sleep(EXPIRE)
+            # Read whole (no truncated read raised), a 404 at once and after.
+            for _ in range(2):
+                st, _, body, _ = self.st("/gone.bin")
+                self.assertEqual((st, body), (404, b"404\n"))
+            self.st_sent(n0)
+        finally:
+            OBJECTS.pop(key, None)
+
+    def test_fp_stale_slices_of_mixed_age_converge(self):
+        # Slices of one object filled at different times (range requests),
+        # then the object changes. A download that
+        # finds a refreshed slice and one still fresh from the old version is
+        # cut (nginx's slice module refuses the ETag mismatch); that lasts
+        # until the older slice expires, at most its edge TTL, and from then
+        # on every download is the new object, whole. (Before #1581's fix the
+        # stale slices were never refreshed: cut every time.)
+        key = "/private/st/mix.bin"
+        OBJECTS[key] = (ST_BIG, "application/octet-stream")
+        v2 = bytes(reversed(ST_BIG))
+        try:
+            n0 = len(Origin.log)
+            # Slice 0 is filled first; within its TTL (at least a second) the
+            # object changes and a full GET reads slice 0 from the cache (v1)
+            # and slice 1 from the origin (v2): cut.
+            self.st("/mix.bin", headers={"Range": "bytes=0-10"})
+            time.sleep(0.3)
+            self.st("/mix.bin", headers={"Range": "bytes=2097152-2097160"})
+            OBJECTS[key] = (v2, "application/octet-stream")
+            with self.assertRaises(http.client.IncompleteRead):
+                self.st("/mix.bin")
+            deadline = time.monotonic() + 2 * EXPIRE
+            whole = 0
+            while time.monotonic() < deadline and whole < 2:
+                try:
+                    st, _, body, _ = self.st("/mix.bin")
+                    whole = whole + 1 if (st, body) == (200, v2) else 0
+                except http.client.IncompleteRead:
+                    whole = 0
+                time.sleep(0.3)
+            self.assertEqual(whole, 2, "the new object, whole, within two edge TTLs")
+            self.st_sent(n0)
+        finally:
+            OBJECTS.pop(key, None)
+
+    def test_fp_stale_origin_outage_serves_stale(self):
+        # The refresh is in the foreground now: an origin 5xx then still
+        # serves the stale copy, whole (proxy_cache_use_stale http_503).
+        key = "/private/st/outage.bin"
+        OBJECTS[key] = (ST_BIG, "application/octet-stream")
+        try:
+            n0 = len(Origin.log)
+            self.assertEqual(self.st("/outage.bin")[2], ST_BIG)
+            FAILING.add(key)
+            time.sleep(EXPIRE)
+            for _ in range(2):
+                st, h, body, _ = self.st("/outage.bin")
+                self.assertEqual((st, body == ST_BIG, h.get("x-cache")), (200, True, "STALE"))
+            FAILING.discard(key)
+            st, h, body, _ = self.st("/outage.bin")
+            self.assertEqual((st, body == ST_BIG), (200, True))
+            self.assertIn(h.get("x-cache"), ("EXPIRED", "REVALIDATED", "MISS"))
+            self.st_sent(n0)
+        finally:
+            FAILING.discard(key)
+            OBJECTS.pop(key, None)
+
+    def test_fp_stale_small_object(self):
+        key = "/private/st/small.txt"
+        OBJECTS[key] = (ST_SMALL, "text/plain")
+        try:
+            n0 = len(Origin.log)
+            self.assertEqual(self.st("/small.txt")[:3:2], (200, ST_SMALL))
+            self.assertEqual(self.st("/small.txt")[1].get("x-cache"), "HIT")
+            OBJECTS[key] = (b"small object v2, longer", "text/plain")
+            self.assertEqual(self.st("/small.txt")[2], ST_SMALL, "fresh: the cached copy")
+            time.sleep(EXPIRE)
+            self.assertEqual(self.st("/small.txt")[:3:2], (200, b"small object v2, longer"))
+            self.assertEqual(self.st("/small.txt")[1].get("x-cache"), "HIT")
+            sent = self.st_sent(n0)
+            self.assertEqual(len(sent), 2, sent)
+        finally:
+            OBJECTS.pop(key, None)
+
+    def test_fn_spa_stale_object_deleted_at_the_origin(self):
+        # A stale object over one slice, deleted at the origin. No subrequest
+        # may take the fallback path (they share the main request's
+        # variables): every download stays whole, every origin request stays
+        # signed and under the zone's prefix, and once the object expired
+        # the main request's 404 falls back to the index document.
+        path, key = "/stale/big.bin", "/private/spa/stale/big.bin"
+        n0 = len(Origin.log)
+        st, _, body = self.spa(path, host="sps.cdn.hippius.com")
+        self.assertEqual((st, len(body)), (200, len(STALE_BIG)))
+        del OBJECTS[key]
+        try:
+            # After its edge TTL (1 s, kept in whole seconds), the deleted
+            # object is a 404 at the origin and the path falls back.
+            time.sleep(2.2)
+            seen = []
+            for _ in range(4):
+                st, _, body = self.spa(path, host="sps.cdn.hippius.com")
+                seen.append((st, "index" if body == SPA_INDEX else len(body)))
+                time.sleep(0.3)
+            self.assertEqual(seen, [(200, "index")] * 4)
+            time.sleep(0.5)  # let background updates finish
+            stray = [(e["path"], e.get("sig")) for e in Origin.log[n0:]
+                     if not e["path"].startswith("/private/spa/") or e.get("sig")]
+            self.assertEqual(stray, [], "an origin request went out unsigned or off the zone's prefix")
+            # The zone still serves its other paths from the right entries.
+            self.assertEqual(self.spa("/", host="sps.cdn.hippius.com")[:3:2], (200, SPA_INDEX))
+        finally:
+            OBJECTS[key] = (STALE_BIG, "application/octet-stream")
+
+    def test_fo_spa_never_lists_the_bucket(self):
+        # hippius-s3 lists a public bucket to anyone (?list-type=2 is 200 even
+        # under a GetObject-only policy): the node is the only guard. With or
+        # without an index document, at a prefix or at the bucket root, no
+        # listing query reaches the origin and no answer is a listing.
+        queries = ["?list-type=2", "?list-type=2&prefix=", "?delimiter=/", "?uploads", "?versions",
+                   "?acl", "?location", "?prefix=secret/&max-keys=1000"]
+        index = {"spa.cdn.hippius.com": SPA_INDEX, "idx.cdn.hippius.com": SPA_INDEX,
+                 "ri.cdn.hippius.com": ROOT_INDEX}
+        n0 = len(Origin.log)
+        for host, want in index.items():
+            for q in queries:
+                for path in ("/", "/sub/"):
+                    st, _, body = self.spa(path + q, host=host)
+                    self.assertNotIn(b"ListBucketResult", body, host + path + q)
+                    if path == "/":
+                        self.assertEqual((st, body), (200, want), host + path + q)
+            # A fallback on a listing query: the index document, never a list.
+            if host != "idx.cdn.hippius.com":
+                for q in queries:
+                    st, _, body = self.spa("/missing" + q, host=host)
+                    self.assertEqual((st, body), (200, want), host + "/missing" + q)
+        # No index document: the root stays a 404 (today's behaviour).
+        for host in ("none.cdn.hippius.com", "root.cdn.hippius.com"):
+            for q in queries:
+                st, _, body = self.spa("/" + q, host=host)
+                self.assertEqual((st, body), (404, b"404\n"), host + q)
+        sent = Origin.log[n0:]
+        self.assertTrue(sent)
+        for e in sent:
+            self.assertEqual(e["query"], "", f"a query reached the origin: {e['path']}?{e['query']}")
+            # Never a bucket root ("/media", "/media/"), the listing route.
+            self.assertGreater(e["path"].count("/"), 2 if e["path"].endswith("/") else 1, e["path"])
+        # An index fetch is always <prefix><path><index_document>; the only
+        # directory key is the no-index zone's "spa/" (as today: a GetObject
+        # of that key, never the bucket).
+        allowed = {"/media/spa/index.html", "/media/spa/sub/index.html", "/media/index.html",
+                   "/media/sub/index.html", "/media/spa/missing", "/media/missing", "/media/spa/"}
+        self.assertLessEqual({e["path"] for e in sent}, allowed)
+
+    # ── CORS per zone ──
+
+    def cors(self, path, origin=None, host="cors.cdn.hippius.com", **kw):
+        headers = dict(kw.pop("headers", {}))
+        if origin:
+            headers["Origin"] = origin
+        return self.https(host, path, headers=headers, **kw)
+
+    def acao(self, h):
+        return {k: v for k, v in h.items() if k.startswith("access-control-")}
+
+    def test_fr_cors_preflight_is_answered_by_the_node(self):
+        n0, r0 = len(Origin.log), len(self.records)
+        st, h, body = self.cors("/a.txt", "https://app.example", method="OPTIONS", headers={
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-custom, content-type"})
+        self.assertEqual((st, body), (204, b""))
+        self.assertEqual(self.acao(h), {
+            "access-control-allow-origin": "https://app.example",
+            "access-control-allow-methods": "GET, HEAD",
+            "access-control-allow-headers": "x-custom, content-type",
+            "access-control-max-age": "600",
+            "access-control-allow-credentials": "true"})
+        self.assertEqual(h.get("vary"), "Origin")
+        self.assertNotIn("content-type", h)
+        # Refused parts: still a 204, no CORS header (the browser blocks).
+        for origin, method, req_headers in (("https://evil.example", "GET", None),
+                                            ("https://app.example", "GET", "x-other"),
+                                            ("https://app.example", "DELETE", None)):
+            headers = {"Access-Control-Request-Method": method}
+            if req_headers:
+                headers["Access-Control-Request-Headers"] = req_headers
+            st, h, _ = self.cors("/a.txt", origin, method="OPTIONS", headers=headers)
+            self.assertEqual((st, self.acao(h), h.get("vary")), (204, {}, "Origin"), (origin, method))
+        # "*": echoed requested headers.
+        st, h, _ = self.cors("/a.txt", "https://x.example", host="corsany.cdn.hippius.com",
+                             method="OPTIONS", headers={"Access-Control-Request-Method": "HEAD",
+                                                        "Access-Control-Request-Headers": "x-a"})
+        self.assertEqual((st, h.get("access-control-allow-origin"), h.get("access-control-allow-headers")),
+                         (204, "*", "x-a"))
+        self.assertEqual(len(Origin.log), n0, "a preflight never reaches the origin")
+        # Metering: a billable request, no billable bytes.
+        deadline = time.time() + 2
+        while time.time() < deadline and not [r for r in self.records[r0:] if r["status"] == 204]:
+            time.sleep(0.05)
+        pre = [r for r in self.records[r0:] if r["status"] == 204 and r["zone"] == "zc"]
+        self.assertTrue(pre)
+        self.assertTrue(all(r["billable"] and r["bytes_out"] == 0 for r in pre), pre)
+
+    def test_fr_cors_options_without_a_policy_or_a_preflight_is_405(self):
+        r0 = len(self.records)
+        for host, headers in (("img.example.com", {"Access-Control-Request-Method": "GET"}),
+                              ("cors.cdn.hippius.com", {})):
+            st, h, _ = self.cors("/a/b.txt", "https://app.example", host=host, method="OPTIONS",
+                                 headers=headers)
+            self.assertEqual(st, 405, host)
+            self.assertEqual(self.acao(h), {}, host)
+        # Metered as before CORS: unattributed, not billable.
+        deadline = time.time() + 2
+        while time.time() < deadline and len([r for r in self.records[r0:] if r["status"] == 405]) < 2:
+            time.sleep(0.05)
+        refused = [r for r in self.records[r0:] if r["status"] == 405]
+        self.assertEqual(len(refused), 2)
+        self.assertTrue(all(r.get("zone") is None and not r["billable"] for r in refused), refused)
+
+    def test_fr_cors_preflight_over_http_blocks_and_redirects(self):
+        pre = {"Origin": "https://app.example", "Access-Control-Request-Method": "GET"}
+        # Over plain HTTP the preflight is answered (a browser fails a
+        # redirected preflight); the GET is redirected, with its headers.
+        st, h, _ = self.http("cors.cdn.hippius.com", "/a.txt", method="OPTIONS", headers=pre)
+        self.assertEqual((st, h.get("access-control-allow-origin")), (204, "https://app.example"))
+        st, h, _ = self.http("cors.cdn.hippius.com", "/a.txt", headers={"Origin": "https://app.example"})
+        self.assertEqual((st, h.get("location"), h.get("access-control-allow-origin")),
+                         (301, "https://cors.cdn.hippius.com/a.txt", "https://app.example"))
+        # Blocks apply before the preflight.
+        st, h, _ = self.cors("/forbidden/x", "https://app.example", method="OPTIONS",
+                             headers={"Access-Control-Request-Method": "GET"})
+        self.assertEqual(st, 451)
+
+    def test_fs_cors_on_responses_good_bad_and_shared_cache(self):
+        n0 = len(self.origin_hits("/media/cors/a.txt"))
+        st, h, body = self.cors("/a.txt", "https://app.example")
+        self.assertEqual((st, body, h.get("x-cache")), (200, CORS_TEXT, "MISS"))
+        self.assertEqual(self.acao(h), {
+            "access-control-allow-origin": "https://app.example",
+            "access-control-allow-credentials": "true",
+            "access-control-expose-headers": "etag"})
+        # One entry for every origin: the next origin gets its own header from
+        # the cached copy, never the previous one's, nor the origin's.
+        for origin, want in (("https://x.tenant.example", "https://x.tenant.example"),
+                             ("https://evil.example", None), ("https://a.b.tenant.example", None),
+                             (None, None), ("https://app.example", "https://app.example")):
+            st, h, body = self.cors("/a.txt", origin)
+            self.assertEqual((st, body, h.get("x-cache")), (200, CORS_TEXT, "HIT"), origin)
+            self.assertEqual(h.get("access-control-allow-origin"), want, origin)
+            self.assertNotIn("x-amz-meta-secret", h.get("access-control-expose-headers", ""))
+            if want is None:
+                self.assertEqual(self.acao(h), {}, origin)
+            self.assertIn("Origin", h.get("vary", ""), origin)
+        self.assertEqual(len(self.origin_hits("/media/cors/a.txt")), n0 + 1)
+        # gzip keeps its own Vary next to Origin.
+        st, h, body = self.cors("/a.txt", "https://app.example", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual((st, h.get("content-encoding")), (200, "gzip"))
+        self.assertEqual(gzip.decompress(body), CORS_TEXT)
+        varies = {v.strip() for v in h.get("vary", "").split(",")}
+        self.assertTrue({"Origin", "Accept-Encoding"} <= varies, h.get("vary"))
+        # An error carries them too, so the page can read its status.
+        st, h, body = self.cors("/missing.txt", "https://app.example")
+        self.assertEqual((st, body, h.get("access-control-allow-origin")), (404, b"404\n",
+                                                                           "https://app.example"))
+        # HEAD.
+        st, h, body = self.cors("/a.txt", "https://app.example", method="HEAD")
+        self.assertEqual((st, body, h.get("access-control-allow-origin")), (200, b"", "https://app.example"))
+
+    def test_fs_cors_backend_feed_shape(self):
+        host = "corsfeed.cdn.hippius.com"
+        st, h, body = self.cors("/a.txt", "https://x.tenant.example", host=host)
+        self.assertEqual((st, body), (200, CORS_TEXT))
+        self.assertEqual(self.acao(h), {"access-control-allow-origin": "https://x.tenant.example"})
+        self.assertIn("Origin", h.get("vary", ""))
+        st, h, _ = self.cors("/a.txt", "https://evil.example", host=host)
+        self.assertEqual((st, self.acao(h)), (200, {}))
+        st, h, _ = self.cors("/a.txt", "https://app.example", host=host, method="OPTIONS",
+                             headers={"Access-Control-Request-Method": "GET"})
+        self.assertEqual((st, self.acao(h)), (204, {
+            "access-control-allow-origin": "https://app.example",
+            "access-control-allow-methods": "GET, HEAD",
+            "access-control-max-age": "600"}))
+        # No allowed request header: one requested refuses the preflight.
+        st, h, _ = self.cors("/a.txt", "https://app.example", host=host, method="OPTIONS",
+                             headers={"Access-Control-Request-Method": "GET",
+                                      "Access-Control-Request-Headers": "x-custom"})
+        self.assertEqual((st, self.acao(h)), (204, {}))
+
+    def test_fs_cors_any_origin(self):
+        for origin in ("https://whatever.example", None):
+            st, h, body = self.cors("/a.txt", origin, host="corsany.cdn.hippius.com")
+            self.assertEqual((st, body), (200, CORS_TEXT))
+            self.assertEqual(self.acao(h), {"access-control-allow-origin": "*"}, origin)
+            self.assertNotIn("Origin", h.get("vary", ""))
+
+    def test_fs_cors_with_the_spa_fallback(self):
+        st, h, body = self.cors("/deep/route", "https://app.example", host="corsspa.cdn.hippius.com")
+        self.assertEqual((st, body), (200, b"<p>cors index</p>"))
+        self.assertEqual(h.get("access-control-allow-origin"), "https://app.example")
+        self.assertIn("Origin", h.get("vary", ""))
+        st, h, _ = self.cors("/deep/route", "https://evil.example", host="corsspa.cdn.hippius.com")
+        self.assertEqual((st, self.acao(h)), (200, {}))
+
+    def test_fs_cors_none_without_a_policy(self):
+        # A zone without `cors`: no CORS header, no Vary: Origin, whatever
+        # the request (and the origin's own are dropped, as before).
+        for path in ("/a/b.txt", "/missing-cors.txt"):
+            st, h, _ = self.cors(path, "https://app.example", host="img.example.com")
+            self.assertEqual(self.acao(h), {}, path)
+            self.assertNotIn("Origin", h.get("vary", ""), path)
+        # The same objects, whose origin sends its own CORS headers.
+        st, h, body = self.cors("/a.txt", "https://evil.example", host="corsnone.cdn.hippius.com")
+        self.assertEqual((st, body, self.acao(h)), (200, CORS_TEXT, {}))
+        self.assertNotIn("Origin", h.get("vary", ""))
+
+    def test_fs_cors_unusable_policy_is_ignored(self):
+        cfg = self.config()
+        cfg["zones"]["zc"]["settings"] = {"cors": {"allow_origins": ["*"], "allow_credentials": True}}
+        self.assertEqual(self.put("config", cfg), 204)
+        try:
+            st, h, body = self.cors("/a.txt", "https://app.example")
+            self.assertEqual((st, body, self.acao(h)), (200, CORS_TEXT, {}))
+            st, _, _ = self.cors("/a.txt", "https://app.example", method="OPTIONS",
+                                 headers={"Access-Control-Request-Method": "GET"})
+            self.assertEqual(st, 405)
+        finally:
+            self.push_all()
+
+    def test_fm_spa_fallback_is_one_billable_request(self):
+        self.spa("/")
+        time.sleep(0.5)
+        n0 = len(self.records)
+        st, _, body = self.spa("/meter/route")
+        self.assertEqual((st, body), (200, SPA_INDEX))
+        deadline = time.time() + 2
+        while len(self.records) == n0 and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        new = [r for r in self.records[n0:] if r.get("zone") == "zspa"]
+        self.assertEqual(len(new), 1, self.records[n0:])
+        r = new[0]
+        self.assertEqual((r["status"], r["billable"], r["cache"]), (200, True, "hit"))
+        self.assertGreater(r["bytes_out"], len(SPA_INDEX))
+        # The zone's request ceiling counts it once.
+        cfg = self.config()
+        cfg["zones"]["zspa"]["settings"] = dict(SPA_SITE, limits={"max_mbps": 2000, "max_rps": 2})
+        self.assertEqual(self.put("config", cfg), 204)
+        try:
+            # Two fallbacks in one fresh second fit a ceiling of two.
+            time.sleep(1 - time.time() % 1 + 0.02)
+            got = [self.spa(f"/rps/{i}")[0] for i in range(2)]
+            self.assertEqual(got, [200, 200])
+            self.assertEqual(self.spa("/rps/3")[0], 503)
+        finally:
+            self.push_all()
 
     def test_g_http_redirects_and_acme(self):
         st, h, _ = self.http("img.example.com", "/a/b.txt?q=1")

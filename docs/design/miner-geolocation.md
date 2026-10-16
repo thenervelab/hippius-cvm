@@ -136,12 +136,65 @@ Pushgateway — no other vali workload gains those.
 - `GET /v1/operator/regions[?verified_only=]` — `{regions: [{region,
   country_code, miners_total, miners_verified, miners_dispatchable,
   hosted_vm_count, capacity {total_units, committed_units, free_units} | null,
-  node_ids}], unlocated_miners, require_verified, vantage, generated_at}`.
+  failover_capable, node_ids}], unlocated_miners, require_verified, vantage,
+  generated_at}`. `failover_capable` is true when the region holds at least
+  one pair of dispatchable, active, uncordoned miners of the same SNP
+  generation that are located now (`sched.failover_capable_node_ids`). That
+  is where a `require_failover_peer` launch can land.
   `OPERATOR_ONLY`, published on `api.hippius.network` (exact path).
 - `POST /v1/vm/launch` — optional `region` (ISO alpha-2, case-insensitive).
   Hard constraint: no verified miner there ⇒ 409 `no-miner-in-region`,
-  never a silent fallback. Re-placement and graceful-exit migration honour
-  the VM's original region.
+  never a silent fallback.
+- **Every move of an existing VM stays in its region, fail closed.** This
+  covers §25 `start_migration` (the operator API, a price-recommendation
+  approve, the graceful-exit drain, a resize that has to move), `/place`
+  and `/fail` re-placement, and price-watch suggestions.
+  - The region is the launch's, else the host's last known country
+    (`sched.move_region_for_vm`, durable across the host's death).
+  - The destination must be located in that region now
+    (`region_by_node`).
+  - A region that cannot be told moves the VM nowhere:
+    - `POST /v1/vm/<id>/migrate` returns 409 `region-unknown`, unless the
+      operator states `region`. The stated region is recorded on the job
+      (`region`, `region_stated_by_operator`). A stated region that differs
+      from a known one is 409 `region-conflict`, and a destination
+      elsewhere is 409 `cross-region`.
+    - The drain logs at ERROR once and leaves the VM where it is.
+    - A resize fails with `region-unknown`.
+    - `/place` and `/fail` answer `region-unknown`. This applies only to a
+      VM that has run somewhere: a first placement with no region asked
+      stays unconstrained.
+    - The price watch suggests nothing.
+- **Operator cross-region override (never automatic).** The operator
+  paths take `allow_cross_region: true` + `region` + `reason` + `operator`
+  (who decided it; the API credential is a shared service principal). On these
+  paths `region` NAMES the destination region, and the destination must be
+  located there now. The paths are:
+  - `POST /v1/vm/<id>/migrate`;
+  - `POST /v1/vm/<id>/restore` (onto another miner);
+  - `POST /v1/vm/<id>/failover`;
+  - `POST /v1/admin/miner/<id>/drain`. This is one pass of the drain for a
+    quarantined miner, now, as the operator. Without the override it is the
+    automatic drain. It answers `{enrolled, not_moved: {vm: why}}`. While
+    the miner is not leaving (locally or on chain) it is a 409
+    `miner-not-departing`, and on a chain-read failure a 503
+    `chain-unavailable`.
+
+  An override into the VM's own region is refused with `not-cross-region`.
+
+  The job records it (`cross_region_override`, `region` = to,
+  `cross_region_from`, `cross_region_reason`, `cross_region_by`; the
+  credential is `decided_by` and the time is `started_at`). It is shown as
+  `cross_region {from, to, reason, operator}` on the job views, and a failover or restore also records it in
+  its authorization evidence. Once the move took (`done`, or committed), the
+  VM's region is the new one (`backup.service.vm_region`), so every
+  automatic path keeps it there. These paths never take the override: the
+  failover worker (`trigger=auto` refuses one), the drain tick, `/fail`, the
+  price watch and resize.
+
+  ⚠️ Rolling vali back to an image before this one, once an override has
+  taken, is not region-safe. The old `vm_region` ignores the override and
+  would move such a VM back to its launch region automatically.
 - `GET /v1/scheduler/feasibility?region=` — the fit half restricted to the
   region; `never/no-miner-in-region` when no miner is detected there at all,
   `not-now/region-unverified` when miners exist but none is verified,

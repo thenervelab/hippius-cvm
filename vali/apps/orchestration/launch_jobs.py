@@ -236,6 +236,16 @@ def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
         if policy == power_policy.STOP:
             spec["on_guest_poweroff"] = policy
 
+    # Failover-capable placement — optional bool. Written into `spec_json`
+    # only when true (like `on_guest_poweroff`), so every other launch's
+    # record is as before and an older image can still rebuild its spec;
+    # read back by every later placement (`launch_requires_failover_peer`).
+    rfp = intent.get("require_failover_peer")
+    if rfp is not None and not isinstance(rfp, bool):
+        raise LaunchIntentError("require_failover_peer must be a boolean", "bad-field")
+    if rfp:
+        spec["require_failover_peer"] = True
+
     # Tenant price ceiling — optional positive int (USD/unit ×1e6) or None
     # (no ceiling ⇒ the VM is never migrated on a miner price change).
     # Handled outside `_OPTIONAL` because its default is None (the type-
@@ -718,6 +728,24 @@ def _refuse_held(locked: Any) -> None:
 
     if _has_active_job(locked):
         raise LaunchIntentError(f"vm {locked.vm_id!r} is held by another operation", "conflict")
+    # A power stop/start in flight is about to boot (or has just stopped)
+    # the domain this launch would replace the record of. The power claim
+    # refuses an in-flight launch job the same way, under the same lock.
+    from apps.lifecycle.models import VmPowerState
+
+    from .services import power
+
+    for marker in (VmPowerState.STOPPING, VmPowerState.STARTING):
+        if power._live_marker(locked, marker):
+            raise LaunchIntentError(
+                f"vm {locked.vm_id!r} has a power {marker} in flight", "conflict"
+            )
+    # Reboot-recovery marks its relaunch under this lock but leaves
+    # `power_state` running while it dispatches.
+    if power._recovery_relaunch_in_flight(locked):
+        raise LaunchIntentError(
+            f"vm {locked.vm_id!r} is being relaunched by reboot-recovery", "conflict"
+        )
 
 
 def start_launch(
@@ -754,6 +782,12 @@ def start_launch(
             "userdata must be cloud-init plaintext (a `vault:`-prefixed "
             "value is reserved for Transit ciphertext)",
             "bad-field",
+        )
+    # The restage stamp marks a template its relaunches deliver verbatim
+    # (`launch.split_verbatim_userdata`); a launch must not carry it.
+    if userdata.startswith(launch.VERBATIM_STAMP):
+        raise LaunchIntentError(
+            "userdata must not start with the reserved restage stamp", "bad-field"
         )
     # P2 — BIND the object's owner to the credential before anything else.
     # `tenant_id` arrives in the request body, so authorization built on it

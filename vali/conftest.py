@@ -146,3 +146,47 @@ def _no_live_network(request: pytest.FixtureRequest) -> Iterator[None]:
             f"{len(attempts)} live network attempt(s):\n  " + "\n  ".join(attempts[:5]),
             pytrace=False,
         )
+
+
+class _AllIn(dict):  # type: ignore[type-arg]
+    """A region map in which every node is in one region."""
+
+    def __init__(self, region: str) -> None:
+        super().__init__()
+        self.region = region
+
+    def get(self, key: object, default: object = None) -> str:  # type: ignore[override]
+        return self.region
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __contains__(self, key: object) -> bool:
+        return True
+
+
+@pytest.fixture
+def located_fr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test world where every VM's region is FR and every miner is
+    located there: the move paths' fail-closed region gate
+    (`sched.move_region_for_vm`, `sched.region_by_node`) passes, for tests
+    of everything else a move does. The gate has its own tests."""
+    from apps.scheduler import service as sched
+
+    _real_regions.setdefault("region_by_node", sched.region_by_node)
+    _real_regions.setdefault("move_region_for_vm", sched.move_region_for_vm)
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: _AllIn("FR"))
+    monkeypatch.setattr(sched, "move_region_for_vm", lambda vm, from_node="": "FR")
+
+
+_real_regions: dict[str, Any] = {}
+
+
+@pytest.fixture
+def real_regions(located_fr: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo `located_fr` for one test of a module that uses it: the real
+    region maps, for the tests of the region gate itself."""
+    from apps.scheduler import service as sched
+
+    for name, real in _real_regions.items():
+        monkeypatch.setattr(sched, name, real)

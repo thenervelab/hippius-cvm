@@ -21,6 +21,7 @@ from .restore_views import (
     VmRestoreRevertView,
     VmRestoreView,
 )
+from .userdata_restage_views import VmUserdataRestageJobView, VmUserdataRestageView
 from .views import (
     DecommissionJobView,
     DecommissionStartView,
@@ -30,6 +31,7 @@ from .views import (
     MigrateCancelView,
     MigrateJobView,
     MigrateStartView,
+    MinerDrainView,
     VmPowerPolicyView,
     VmRebootView,
     VmStartView,
@@ -70,6 +72,11 @@ urlpatterns = [
         "vm/<str:vm_id>/migrate",
         MigrateStartView.as_view(),
         name="vm_migrate",
+    ),
+    path(
+        "admin/miner/<str:miner_id>/drain",
+        MinerDrainView.as_view(),
+        name="miner_drain",
     ),
     path(
         "vm/<str:vm_id>/migrate/<str:job_id>",
@@ -123,6 +130,17 @@ urlpatterns = [
         name="vm_resize_flavors",
     ),
     path("vm/<str:vm_id>/resize", VmResizeView.as_view(), name="vm_resize"),
+    # Userdata restage (`userdata_restage.py`) — root-only, flag + allow-list.
+    path(
+        "vm/<str:vm_id>/userdata/restage",
+        VmUserdataRestageView.as_view(),
+        name="vm_userdata_restage",
+    ),
+    path(
+        "vm/<str:vm_id>/userdata/restage/<str:job_id>",
+        VmUserdataRestageJobView.as_view(),
+        name="vm_userdata_restage_job",
+    ),
     path(
         "vm/<str:vm_id>/resize/<str:job_id>",
         VmResizeJobView.as_view(),
