@@ -11,6 +11,34 @@
 #
 # This task file does NOT touch Vault and does NOT install k3s.
 
+# The agent's on-disk layout is fixed at /var/lib/hippius-miner: storage
+# pools other than `default` must sit at /var/lib/hippius-miner/pools/<id>
+# (the agent's POOLS_ROOT), and only the state dir is in the unit's
+# ReadWritePaths. A moved or symlinked state dir would refuse every pool.
+- name: Assert the miner-agent state dir is the agent's fixed layout
+  ansible.builtin.assert:
+    that:
+      - miner_agent.state_dir == "/var/lib/hippius-miner"
+    fail_msg: >-
+      miner_agent.state_dir must be /var/lib/hippius-miner (the agent's
+      storage pools root is /var/lib/hippius-miner/pools); to put it on
+      another disk, mount or bind-mount that disk at /var/lib/hippius-miner.
+
+- name: Read the miner-agent state dir
+  ansible.builtin.stat:
+    path: "{{ miner_agent.state_dir }}"
+    follow: false
+  register: miner_agent_state_dir_stat
+
+- name: Assert the miner-agent state dir is not a symlink
+  ansible.builtin.assert:
+    that:
+      - not (miner_agent_state_dir_stat.stat.islnk | default(false))
+    fail_msg: >-
+      {{ miner_agent.state_dir }} is a symlink: every storage pool under it
+      would fail the agent's canonical-path check. Bind-mount the target at
+      {{ miner_agent.state_dir }} instead.
+
 - name: Ensure the miner-agent state directory exists
   ansible.builtin.file:
     path: "{{ miner_agent.state_dir }}"
@@ -482,7 +510,12 @@
 
       # Hardening — a root service kept on a tight leash. The agent
       # reaches libvirt over its UNIX socket and Hippius S3 over the
-      # network; it needs no raw devices and no kernel tunables.
+      # network; it needs no raw devices and no kernel tunables (the
+      # dedicated-disk inventory reads the facts the
+      # hippius-miner-storage-collect oneshot writes). Storage pools other
+      # than `default` live at /var/lib/hippius-miner/pools/<id>
+      # (mounted or bind-mounted there), inside the state dir below, so a
+      # pool declared from the dashboard needs no unit change.
       ProtectSystem=strict
       ProtectHome=true
       ReadWritePaths={{ [miner_agent.state_dir, miner_data_disk_root, miner_state_disk_root] | unique(case_sensitive=True) | join(' ') }}
@@ -494,6 +527,61 @@
 
       [Install]
       WantedBy=multi-user.target
+
+- name: Install the storage collector (dedicated-disk facts) service
+  # A oneshot of the same binary, OUTSIDE the agent's PrivateDevices
+  # sandbox: it reads /sys/block, /dev/disk/by-id and `blkid -p`
+  # (read-only on every disk) and writes the facts the agent reads. No
+  # network. The agent also starts it before judging declared disks.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hippius-miner-storage-collect.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hippius miner storage collector (dedicated-disk facts)
+
+      [Service]
+      Type=oneshot
+      ExecStart={{ miner_agent.install_path }} storage-collect --out /run/hippius-miner/disk-facts.json
+      User=root
+      Group=root
+      RuntimeDirectory=hippius-miner
+      RuntimeDirectoryPreserve=yes
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      PrivateNetwork=true
+      NoNewPrivileges=true
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+      TimeoutStartSec=300
+
+- name: Install the storage collector timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hippius-miner-storage-collect.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Refresh the miner's dedicated-disk facts
+
+      [Timer]
+      OnBootSec=30s
+      OnUnitActiveSec=5min
+      AccuracySec=30s
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable and start the storage collector timer
+  ansible.builtin.systemd:
+    name: hippius-miner-storage-collect.timer
+    enabled: true
+    state: started
+    daemon_reload: true
 
 - name: Enable the miner-agent unit — but DO NOT start it
   # Intentionally no `state:` — the operator starts the service

@@ -17,6 +17,8 @@ from rest_framework.test import APIClient
 
 from apps.identity.models import PrincipalScope, ServiceClient, ServiceToken, TokenLifetime
 
+from .probe_helpers import probe_on  # noqa: F401 — the disk-probe fixture
+
 
 def _bearer_client(name: str, scope: str, tenant_id: str = "") -> APIClient:
     client = ServiceClient.objects.create(scope=scope, name=name, tenant_id=tenant_id)

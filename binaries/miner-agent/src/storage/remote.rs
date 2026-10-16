@@ -54,7 +54,7 @@ use crate::config::{
 };
 use crate::orders::types::{StorageConfigOrder, StorageDesiredState, StoragePoolClass};
 
-use super::dedicated::{self, SignatureProbe, SysPaths};
+use super::dedicated::{self, FactsSource};
 use super::pools::{self, PoolFs};
 use super::registry::{self, FsIdentitySource};
 use super::state::{EffectiveStorage, StorageState};
@@ -152,6 +152,9 @@ pub struct LocalStorage {
     pub host_budget_gb: u64,
     pub pools: Vec<StoragePoolConfig>,
     pub dedicated: Vec<DedicatedDiskConfig>,
+    /// Where pools other than `default` must be
+    /// ([`super::pools::POOLS_ROOT`]); `None` = not enforced (tests).
+    pub pools_root: Option<PathBuf>,
 }
 
 impl LocalStorage {
@@ -162,6 +165,7 @@ impl LocalStorage {
             host_budget_gb: config.host.cvm_disk_gb_budget,
             pools: config.storage.pools.clone(),
             dedicated: config.storage.dedicated_disks.clone(),
+            pools_root: Some(PathBuf::from(super::pools::POOLS_ROOT)),
         }
     }
 
@@ -182,7 +186,8 @@ impl LocalStorage {
     pub fn local_set(&self) -> (StoragePools, Vec<DedicatedDiskConfig>) {
         let section = self.section(self.pools.clone(), self.dedicated.clone());
         (
-            StoragePools::from_config(&section, self.host_budget_gb),
+            StoragePools::from_config(&section, self.host_budget_gb)
+                .with_pools_root(self.pools_root.clone()),
             self.dedicated.clone(),
         )
     }
@@ -195,7 +200,8 @@ impl LocalStorage {
         let dedicated = dedicated_of(doc);
         let section = self.section(pools_of(doc), dedicated.clone());
         (
-            StoragePools::from_config(&section, self.host_budget_gb),
+            StoragePools::from_config(&section, self.host_budget_gb)
+                .with_pools_root(self.pools_root.clone()),
             dedicated,
         )
     }
@@ -432,8 +438,8 @@ pub fn boot_set(local: &LocalStorage) -> (StoragePools, Vec<DedicatedDiskConfig>
 pub struct Host {
     pub pool_fs: Box<dyn PoolFs + Send + Sync>,
     pub fs_identity: FsIdentitySource,
-    pub sys: SysPaths,
-    pub probe: Box<dyn SignatureProbe>,
+    /// The dedicated-disk facts (the collector's report).
+    pub facts: Box<dyn FactsSource>,
 }
 
 impl Host {
@@ -441,8 +447,7 @@ impl Host {
         Self {
             pool_fs: Box::new(pools::SystemPoolFs::default()),
             fs_identity: FsIdentitySource::default(),
-            sys: SysPaths::default(),
-            probe: Box::new(dedicated::BlkidProbe),
+            facts: Box::new(dedicated::FileFacts::default()),
         }
     }
 }
@@ -505,7 +510,13 @@ impl StorageConfigService {
             .dedicated_disks
             .iter()
             .any(|d| d.state == StorageDesiredState::Active);
+        // Fresh disk facts before a decision on declared disks: the
+        // collector runs now, outside the identity lock (which the
+        // heartbeat shares). Not for a re-push of the document in force.
         if order.dry_run {
+            if has_disks {
+                self.host.facts.refresh();
+            }
             // A dry run judges the document, not its place in the
             // revision sequence, and touches nothing.
             let candidate = self.validate_pools(&order)?;
@@ -534,6 +545,9 @@ impl StorageConfigService {
                     return Ok(stored.ack());
                 }
             }
+        }
+        if has_disks {
+            self.host.facts.refresh();
         }
         let candidate = self.validate_pools(&order)?;
         // The identity lock only for a document that binds disks: a hung
@@ -608,17 +622,27 @@ impl StorageConfigService {
     fn finish_bindings(&self, order: &StorageConfigOrder, has_disks: bool) -> Outcome<()> {
         let current = self.state.current();
         // The newly accepted disks' identities, if their save failed.
-        if has_disks {
-            let mut ids = self.identities.lock();
-            let loaded =
-                ids.get_or_insert_with(|| dedicated::IdentityMap::load(&self.local.state_root));
-            let unbound = loaded.as_ref().is_some_and(|map| {
+        let unbound = |ids: &Option<dedicated::IdentityMap>| {
+            ids.as_ref().is_some_and(|map| {
                 order.dedicated_disks.iter().any(|d| {
                     d.state == StorageDesiredState::Active && !map.disks.contains_key(&d.id)
                 })
-            });
-            if !unbound {
-                // Every active disk is bound: no host read on a re-push.
+            })
+        };
+        let refresh = has_disks && {
+            let mut ids = self.identities.lock();
+            let loaded =
+                ids.get_or_insert_with(|| dedicated::IdentityMap::load(&self.local.state_root));
+            unbound(loaded)
+        };
+        // Every active disk bound: no host read on a re-push.
+        if refresh {
+            self.host.facts.refresh();
+            let mut ids = self.identities.lock();
+            let loaded =
+                ids.get_or_insert_with(|| dedicated::IdentityMap::load(&self.local.state_root));
+            if !unbound(loaded) {
+                // Bound meanwhile by the heartbeat.
             } else if let Ok(Some(bound)) =
                 // Deliberately best-effort: the document is in force, so a
                 // disk that now fails the inventory is not a refusal here
@@ -716,10 +740,10 @@ impl StorageConfigService {
             return Err(disk("disk-identity-store-unreadable", &first.id));
         };
         let mut identities = before.clone();
+        let facts = self.host.facts.facts();
         let reports = dedicated::inventory(
             &active,
-            &self.host.sys,
-            self.host.probe.as_ref(),
+            facts.as_ref().map_err(|e| *e),
             &super::system_devs(&self.local.state_root, candidate),
             &mut identities,
         );
@@ -750,7 +774,10 @@ fn registry_error(err: crate::error::MinerAgentError) -> StorageConfigError {
 /// The inventory's error as a `'static` refusal code (the closed set it
 /// emits; anything else is `disk-unavailable`).
 fn dedicated_code(error: &str) -> &'static str {
-    const CODES: [&str; 15] = [
+    const CODES: [&str; 18] = [
+        "disk-facts-missing",
+        "disk-facts-unreadable",
+        "disk-facts-stale",
         "disk-not-found",
         "disk-not-whole-device",
         "disk-offline",
@@ -824,7 +851,7 @@ mod tests {
     }
 
     struct Clean;
-    impl SignatureProbe for Clean {
+    impl dedicated::SignatureProbe for Clean {
         fn has_signature(&self, _device: &Path) -> Result<bool, dedicated::ProbeFailed> {
             Ok(false)
         }
@@ -868,6 +895,7 @@ mod tests {
                 host_budget_gb: 3000,
                 pools,
                 dedicated: Vec::new(),
+                pools_root: None,
             }
         }
 
@@ -877,9 +905,19 @@ mod tests {
                 pool_fs: Box::new(fs),
                 fs_identity: FsIdentitySource {
                     mountinfo: h.join("mountinfo"),
+                    udev_data: h.join("udev"),
+                    sys_class_block: h.join("class-block"),
                     by_uuid: h.join("by-uuid"),
                 },
-                sys: SysPaths {
+                facts: Box::new(self.live_facts()),
+            }
+        }
+
+        /// The fixture host's disks, read directly (the collector's view).
+        fn live_facts(&self) -> dedicated::LiveFacts {
+            let h = self.host_dir.path();
+            dedicated::LiveFacts {
+                paths: dedicated::SysPaths {
                     by_id: h.join("by-id"),
                     sys_block: h.join("sys"),
                     mountinfo: h.join("mountinfo"),
@@ -1491,7 +1529,6 @@ mod tests {
         let m = Miner::new();
         add_disk(&m);
         let host = m.host(Fs::default());
-        let sys = host.sys.clone();
         let identities: Arc<dedicated::IdentityStore> = Arc::default();
         // A locally declared disk, so the reporter reads the map at once.
         let mut local = m.local(Vec::new());
@@ -1515,8 +1552,7 @@ mod tests {
             Arc::clone(&state),
             m.root.path().to_path_buf(),
             Box::new(Fs::default()),
-            sys,
-            Box::new(Clean),
+            Box::new(m.live_facts()),
         )
         .with_identities(Arc::clone(&identities));
         // The reporter has loaded the (empty) map before the apply.

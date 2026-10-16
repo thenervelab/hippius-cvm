@@ -91,7 +91,18 @@ pub struct StoragePools {
     pools: Vec<Pool>,
     /// Whether `[[storage.pools]]` was declared at all.
     configured: bool,
+    /// Where every pool other than `default` must be mounted (or
+    /// bind-mounted): `<pools_root>/<id>`, inside the agent unit's
+    /// writable paths. `None` = not enforced (tests). A `draining` pool is
+    /// exempt: it is being emptied wherever it is, and must keep reporting
+    /// `draining` (it still holds disks) rather than `unavailable`.
+    pools_root: Option<PathBuf>,
 }
+
+/// The production [`StoragePools::with_pools_root`]: already writable in
+/// the agent's sandbox (`ProtectSystem=strict`, the agent's own root in
+/// `ReadWritePaths=`), so a pool declared remotely needs no unit change.
+pub const POOLS_ROOT: &str = "/var/lib/hippius-miner/pools";
 
 /// `<prefix>:<id>` with a `'static` lifetime (a 507 class is a
 /// `&'static str` across the order path). Interned: each class is leaked
@@ -125,6 +136,7 @@ impl StoragePools {
                 draining: false,
             }],
             configured: false,
+            pools_root: None,
         }
     }
 
@@ -155,6 +167,7 @@ impl StoragePools {
         Self {
             pools,
             configured: true,
+            pools_root: None,
         }
     }
 
@@ -185,6 +198,38 @@ impl StoragePools {
         }
         self.pools.sort_by(|a, b| a.id.cmp(&b.id));
         self
+    }
+
+    /// This set plus `extra` pools `(id, path)`, `draining`, with no
+    /// declared class or budget and closed to OS disks: pools the agent
+    /// keeps only because they may still hold VM disks.
+    pub fn with_draining_paths(mut self, extra: &[(String, PathBuf)]) -> Self {
+        for (id, path) in extra {
+            if self.pools.iter().any(|p| &p.id == id || &p.path == path) {
+                continue;
+            }
+            self.pools.push(Pool {
+                id: id.clone(),
+                path: path.clone(),
+                class: PoolClass::Undeclared,
+                budget_gb: 0,
+                os_disks: false,
+                draining: true,
+            });
+            self.configured = true;
+        }
+        self.pools.sort_by(|a, b| a.id.cmp(&b.id));
+        self
+    }
+
+    /// Require every pool other than `default` at `<root>/<id>`.
+    pub fn with_pools_root(mut self, root: Option<PathBuf>) -> Self {
+        self.pools_root = root;
+        self
+    }
+
+    pub fn pools_root(&self) -> Option<&Path> {
+        self.pools_root.as_deref()
     }
 
     pub fn is_configured(&self) -> bool {
@@ -264,8 +309,29 @@ pub trait PoolFs {
     fn mount_of(&self, path: &Path) -> Option<(PathBuf, String)>;
     /// Whether an aligned `O_DIRECT` write + fsync works in `path`.
     fn odirect_ok(&self, path: &Path) -> bool;
+    /// [`Self::odirect_ok`], telling a path the agent may not write
+    /// (outside its unit's `ReadWritePaths=`) from a filesystem without
+    /// `O_DIRECT`.
+    fn odirect(&self, path: &Path) -> Odirect {
+        if self.odirect_ok(path) {
+            Odirect::Ok
+        } else {
+            Odirect::Unsupported
+        }
+    }
     /// `statvfs` size of the filesystem holding `path`, bytes.
     fn total_bytes(&self, path: &Path) -> Option<u64>;
+}
+
+/// The `O_DIRECT` write test's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Odirect {
+    Ok,
+    /// The agent may not write there: read-only to it (its unit's
+    /// `ProtectSystem=strict` without the path in `ReadWritePaths=`), or
+    /// permission denied.
+    ReadOnly,
+    Unsupported,
 }
 
 /// Check every pool against the host (design §9's agent-side rules). Run
@@ -292,7 +358,13 @@ pub fn check_pools(
     for pool in ordered {
         let error = match binding_errors.get(&pool.id) {
             Some(error) if !pool.is_default() => error,
-            _ => check_one(pool, fs, root_dev, pools.is_configured()),
+            _ => check_one(
+                pool,
+                fs,
+                root_dev,
+                pools.is_configured(),
+                pools.pools_root(),
+            ),
         };
         if error.is_empty() {
             if let Some(dev) = fs.stat(&pool.path).map(|s| s.dev) {
@@ -327,7 +399,14 @@ fn check_one(
     fs: &dyn PoolFs,
     root_dev: Option<u64>,
     configured: bool,
+    pools_root: Option<&Path>,
 ) -> &'static str {
+    if !pool.is_default()
+        && !pool.draining
+        && pools_root.is_some_and(|root| pool.path != root.join(&pool.id))
+    {
+        return "pool-outside-pools-root";
+    }
     let Some(stat) = fs.stat(&pool.path) else {
         return "pool-path-missing";
     };
@@ -361,8 +440,10 @@ fn check_one(
     if !POOL_FSTYPES.contains(&fstype.as_str()) {
         return "pool-fstype-unsupported";
     }
-    if !fs.odirect_ok(&pool.path) {
-        return "pool-odirect-unsupported";
+    match fs.odirect(&pool.path) {
+        Odirect::Ok => {}
+        Odirect::ReadOnly => return "pool-path-read-only",
+        Odirect::Unsupported => return "pool-odirect-unsupported",
     }
     let Some(total) = fs.total_bytes(&pool.path) else {
         return "pool-path-missing";
@@ -409,25 +490,38 @@ pub fn parse_mountinfo(text: &str) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-/// `(mount point, root, mount source)` of every line of a mountinfo
-/// file, in file order (a later line is a mount on top of an earlier
+/// Every line of a mountinfo file, in file order (a later line is a mount on top of an earlier
 /// one). `root` is the directory of the filesystem mounted there (`/`, or
 /// a bind mount's / subvolume's own path).
-pub fn parse_mountinfo_sources(text: &str) -> Vec<(PathBuf, String, String)> {
+pub fn parse_mountinfo_sources(text: &str) -> Vec<MountEntry> {
     text.lines()
         .filter_map(|line| {
             let (left, right) = line.split_once(" - ")?;
             let mut fields = left.split(' ');
-            let root = fields.nth(3)?;
+            let dev = fields.nth(2)?;
+            let root = fields.next()?;
             let mount_point = fields.next()?;
             let source = right.split(' ').nth(1)?;
-            Some((
-                PathBuf::from(unescape_octal(mount_point)),
-                unescape_octal(root),
-                unescape_octal(source),
-            ))
+            Some(MountEntry {
+                mount_point: PathBuf::from(unescape_octal(mount_point)),
+                dev: dev.to_string(),
+                root: unescape_octal(root),
+                source: unescape_octal(source),
+            })
         })
         .collect()
+}
+
+/// One mountinfo line, the fields the filesystem binding reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub mount_point: PathBuf,
+    /// `major:minor` of the mounted filesystem.
+    pub dev: String,
+    /// The directory of the filesystem mounted there.
+    pub root: String,
+    /// The mount source (`/dev/md127`, …).
+    pub source: String,
 }
 
 fn unescape_octal(raw: &str) -> String {
@@ -481,9 +575,26 @@ impl PoolFs for SystemPoolFs {
         odirect_probe(path).is_ok()
     }
 
+    fn odirect(&self, path: &Path) -> Odirect {
+        match odirect_probe(path) {
+            Ok(()) => Odirect::Ok,
+            Err(e) if is_read_only(&e) => Odirect::ReadOnly,
+            Err(_) => Odirect::Unsupported,
+        }
+    }
+
     fn total_bytes(&self, path: &Path) -> Option<u64> {
         crate::lifecycle::disk_space::fs_bytes(path).map(|(total, _)| total)
     }
+}
+
+/// EROFS (a read-only mount, or `ProtectSystem=strict` outside
+/// `ReadWritePaths=`), EACCES, EPERM.
+fn is_read_only(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(nix::libc::EROFS) | Some(nix::libc::EACCES) | Some(nix::libc::EPERM)
+    )
 }
 
 /// Create, write 4 KiB with `O_DIRECT`, fsync and unlink a probe file in
@@ -679,6 +790,7 @@ mod tests {
         canon: HashMap<PathBuf, PathBuf>,
         mounts: HashMap<PathBuf, (PathBuf, String)>,
         no_odirect: Vec<PathBuf>,
+        read_only: Vec<PathBuf>,
         totals: HashMap<PathBuf, u64>,
     }
 
@@ -714,6 +826,15 @@ mod tests {
         }
         fn odirect_ok(&self, path: &Path) -> bool {
             !self.no_odirect.iter().any(|p| p == path)
+        }
+        fn odirect(&self, path: &Path) -> Odirect {
+            if self.read_only.iter().any(|p| p == path) {
+                Odirect::ReadOnly
+            } else if self.odirect_ok(path) {
+                Odirect::Ok
+            } else {
+                Odirect::Unsupported
+            }
         }
         fn total_bytes(&self, path: &Path) -> Option<u64> {
             self.totals.get(path).copied()
@@ -819,6 +940,11 @@ mod tests {
         let mut fs = host();
         fs.no_odirect.push(p.clone());
         assert_eq!(error_of(&fs, "hdd0"), "pool-odirect-unsupported");
+
+        // Outside the agent unit's `ReadWritePaths=` (ProtectSystem=strict).
+        let mut fs = host();
+        fs.read_only.push(p.clone());
+        assert_eq!(error_of(&fs, "hdd0"), "pool-path-read-only");
 
         let mut fs = host();
         // 100 GiB budget on a 110 GiB filesystem leaves less than 20 GiB.
@@ -941,6 +1067,54 @@ mod tests {
         assert_eq!(checks["hdd0"].error, "pool-fs-changed");
         // `default` is exempt, as it always was.
         assert_eq!(checks["default"].error, "");
+    }
+
+    #[test]
+    fn the_real_write_test_tells_a_read_only_path() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root ignores the mode bits; this check is for the unprivileged
+        // test run (the agent itself meets EROFS from its sandbox).
+        if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let verdict = SystemPoolFs::default().odirect(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(verdict, Odirect::ReadOnly);
+    }
+
+    #[test]
+    fn a_pool_must_sit_at_the_pools_root_under_its_id() {
+        let at = |root: &str| {
+            check_pools(
+                &two_pools().with_pools_root(Some(PathBuf::from(root))),
+                &host(),
+                &Default::default(),
+            )["hdd0"]
+                .error
+        };
+        assert_eq!(at("/srv"), "");
+        assert_eq!(
+            at("/var/lib/hippius-miner/pools"),
+            "pool-outside-pools-root"
+        );
+        // `default` is never concerned.
+        let checks = check_pools(
+            &two_pools().with_pools_root(Some(PathBuf::from("/nowhere"))),
+            &host(),
+            &Default::default(),
+        );
+        assert_eq!(checks["default"].error, "");
+        // A pool being emptied keeps saying so wherever it is.
+        let mut draining = two_pools().with_pools_root(Some(PathBuf::from("/nowhere")));
+        draining
+            .pools
+            .iter_mut()
+            .for_each(|p| p.draining = !p.is_default());
+        let checks = check_pools(&draining, &host(), &Default::default());
+        assert_eq!(checks["hdd0"].error, "");
+        assert_eq!(checks["hdd0"].state, PoolState::Draining);
     }
 
     #[test]

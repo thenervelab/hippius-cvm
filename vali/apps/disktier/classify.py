@@ -118,12 +118,12 @@ PROFILE_D1 = Profile(
         Threshold("seq_read_outer_mbps", True, nvme=None, ssd=None, hdd=120),
         Threshold("rr_iops", True, nvme=None, ssd=None, hdd=200),
         Threshold("qd1_p99_us", False, nvme=None, ssd=None, hdd=60_000),
-        Threshold("sustained_rw_iops", True, nvme=None, ssd=None, hdd=100),
+        Threshold("rw_sustained_iops", True, nvme=None, ssd=None, hdd=100),
     ),
     sanity_metrics=("qd1_p50_us",),
     error_metric="surface_errors",
     # The middle zone of the sequential read and the bounded-window write.
-    reported_metrics=("seq_read_middle_mbps", "seq_write_mbps"),
+    reported_metrics=("seq_read_mid_mbps", "seq_write_mbps"),
 )
 
 PROFILES: dict[str, Profile] = {p.name: p for p in (PROFILE_V1, PROFILE_D1)}

@@ -1,0 +1,98 @@
+{{- if and (eq (toString .Values.disktierProbe.enabled) "true") (eq (toString .Values.disktierProbe.alerts.enabled) "true") }}
+---
+# Disk-tier probe alerts (apps.disktier.probe, phase R1/R2). RECORD ONLY:
+# they report what the probe measured and what C1 WOULD conclude; nothing
+# here (or in vali) cordons, downgrades or penalises a miner yet.
+#
+# CANNOT FIRE WHILE THE PROBE IS OFF. Every rule is `and on()` the guard
+# below: a push younger than one hour with `hippius_disk_probe_enabled == 1`.
+# `vali_disk_probe` pushes only while VALI_DISK_PROBE_ENABLED is true, and
+# its CronJob is suspended, so today no series exists at all; after the
+# probe is turned off again, the last push ages out of the guard within an
+# hour (a gauge frozen in the Pushgateway cannot keep an alert alive).
+#
+# Same routing as hippius-synthetic-monitor: a `severity` label, no custom
+# receiver ⇒ the Alertmanager default route. `warning` only during the
+# record-only calibration (R2): nothing acts on these verdicts yet.
+{{- $guard := "and on() (hippius_disk_probe_enabled == 1) and on() (time() - hippius_disk_probe_push_timestamp_seconds < 3600)" }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-disktier-probe
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-disktier-probe
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-disktier-probe
+      interval: 5m
+      rules:
+        - alert: DiskProbeFailing
+          # Failed or timed-out probe runs in a row since the node's last
+          # verified one. A timeout counts: a miner cannot dodge by failing
+          # launches (design §5.1).
+          expr: (hippius_disk_probe_node_consecutive_failures >= {{ .Values.disktierProbe.alerts.failingRuns }}) {{ $guard }}
+          for: 30m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "disk probe failing on node {{`{{ $labels.node }}`}}"
+            description: |
+              The last {{`{{ $value }}`}} disk-tier probe runs on node
+              {{`{{ $labels.node }}`}} failed or timed out. Record only: no
+              tier or cordon changes. Check `DiskProbeRun.failure_reason`
+              in the vali admin (launch-failed / probe-timeout /
+              io-error / precondition-incomplete / suspect-cache).
+        - alert: DiskProbeSuspectCache
+          # QD1 4 KiB read p50 < 25 µs through virtio + SNP + disk crypto:
+          # the numbers came from host RAM or page cache (design §2).
+          expr: (hippius_disk_probe_node_suspect_cache == 1) {{ $guard }}
+          for: 5m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "disk probe suspect-cache on node {{`{{ $labels.node }}`}}"
+            description: |
+              The newest disk-tier probe on node {{`{{ $labels.node }}`}}
+              reported a QD1 read latency only host RAM can serve
+              (cache=writeback, tmpfs or a RAM-backed image). The probe is
+              FAILED (no tier). Record only; investigate the host.
+        - alert: DiskProbeStale
+          # Keyed on the verified probe's TIMESTAMP, not an age gauge: a
+          # timestamp keeps ageing when the orchestrator stops pushing it.
+          expr: (time() - hippius_disk_probe_node_last_verified_timestamp_seconds > {{ mul .Values.disktierProbe.alerts.staleDays 86400 }}) {{ $guard }}
+          for: 1h
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "no verified disk probe of node {{`{{ $labels.node }}`}} in {{ .Values.disktierProbe.alerts.staleDays }} days"
+            description: |
+              Node {{`{{ $labels.node }}`}} has not had a verified disk-tier
+              probe for more than {{ .Values.disktierProbe.alerts.staleDays }} days
+              (healthy: 7 d ± 2 d, plus a start delay of up to 2 d; a node
+              never verified counts from when the probe started watching it).
+              Check the probe's skip reasons
+              (`hippius_disk_probe_skipped`): capacity, boot cap, busy,
+              concurrency, gated.
+        - alert: MinerDiskSevere
+          # What C1 WOULD grade severe (design §5.1): an unfit OS-pool
+          # verdict, suspect-cache, or two timeouts in a row.
+          expr: (hippius_disk_probe_node_would_be_severe == 1) {{ $guard }}
+          for: 15m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "node {{`{{ $labels.node }}`}} would be disk-severe (record only)"
+            description: |
+              Under VALI_DISK_TIER_CONSEQUENCES=enforce (C1) node
+              {{`{{ $labels.node }}`}} would be auto-cordoned: its newest
+              probe classified the OS pool unfit, was suspect-cache, or the
+              last two runs timed out. Nothing is cordoned in R1.
+{{- end }}

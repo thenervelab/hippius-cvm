@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import dj_database_url
@@ -961,6 +962,12 @@ VALI_UPTIME_LIVENESS_SKEW_S = _env_int("VALI_UPTIME_LIVENESS_SKEW_S", 300)
 # is still fully credited, so alerting there would page for a fleet that
 # is being paid correctly.
 VALI_UPTIME_LIVENESS_STALL_S = _env_int("VALI_UPTIME_LIVENESS_STALL_S", 1800)
+
+# How long a VM vali records as running may go without any in-guest signal
+# (of its current boot) before `apps.synthetic.checks.check_no_silent_vms`
+# fails. Default 6 h: far above every boot deadline and keepalive cadence,
+# so it names VMs that are gone, not slow.
+VALI_SILENT_VM_ALERT_S = _env_int("VALI_SILENT_VM_ALERT_S", 21600)
 
 # How old a VM's newest live attestation may be for
 # `GET /v1/vm/<id>/attestation` to report it `attested-live` (the guest is
@@ -2413,12 +2420,131 @@ VALI_DISK_PROBE_ENABLED = _env_bool("VALI_DISK_PROBE_ENABLED", False)
 VALI_DISK_PROBE_FLAVOR = os.environ.get("VALI_DISK_PROBE_FLAVOR", "medium")
 # At most this many probe VMs at once, fleet-wide (and never two on a node).
 VALI_DISK_PROBE_MAX_CONCURRENT = _env_int("VALI_DISK_PROBE_MAX_CONCURRENT", 1)
-# A probe with no verified result after this long is a timeout: a failed
-# probe for health, never a downgrade on its own.
+# A probe with no verified result this long after its start delay ran out
+# (launch + `start_delay_s` + this) is a timeout: a failed probe for health,
+# never a downgrade on its own. Covers the boot, the first-boot integrity
+# wipe, the ~5 min v1 run and the receipt lag.
 VALI_DISK_PROBE_TIMEOUT_S = _env_int("VALI_DISK_PROBE_TIMEOUT_S", 3600)
+# The probe orchestrator (`apps.disktier.probe`, `vali_disk_probe`, R1) —
+# RECORD ONLY: it launches probe VMs and stores what each measured and the
+# tier it WOULD be; it never changes a tier, a health, a cordon, placement
+# or rewards (that is C1).
+#
+# The probe identities: `user_id:tenant_id` pairs of operator-created,
+# backend-shaped accounts (numeric user id, SS58 tenant). A run takes one
+# at random and a vm id `hipc-<user_id>-<8 hex>`, like a tenant's. Empty:
+# nothing is launched. Every user id here is excluded from rewards and
+# billing (`scoring._excluded_owners`) and refused at the HTTP launch
+# intake (`disk-probe-id-reserved`).
+VALI_DISK_PROBE_OWNERS = _env_list("VALI_DISK_PROBE_OWNERS")
+for _probe_owner in VALI_DISK_PROBE_OWNERS:
+    # Refuse to start on a typo: a malformed entry would otherwise drop an
+    # id out of the reward exclusion (`apps.disktier.probe_owners`).
+    if not re.fullmatch(r"[0-9]{1,20}:[1-9A-HJ-NP-Za-km-z]{32,64}", _probe_owner):
+        raise RuntimeError(
+            f"VALI_DISK_PROBE_OWNERS entry {_probe_owner!r} is not `<numeric user id>:<SS58>`"
+        )
+# The probe identity is visible to the miner (the vm id carries the user
+# id, like a tenant's), and a miner reads a probe's result in the plaintext
+# receipts after the fact: use MANY owners and rotate them, or a miner
+# learns to recognise probes at launch (design §2; sealing is v2).
+#
+# The blessed golden image the probe boots, and the guest components
+# release it must carry at least (the first one that ships the disk probe,
+# G2). 0 = unset: nothing is launched (an image without the probe would
+# time every node out).
+VALI_DISK_PROBE_IMAGE = os.environ.get("VALI_DISK_PROBE_IMAGE", "ubuntu")
+VALI_DISK_PROBE_MIN_GUEST_RELEASE = _env_int("VALI_DISK_PROBE_MIN_GUEST_RELEASE", 0)
+# The measured cmdline: the backend's tenant cmdline, so a probe's launch
+# reads like a tenant's.
+VALI_DISK_PROBE_CMDLINE = os.environ.get("VALI_DISK_PROBE_CMDLINE", "console=ttyS0 root=/dev/vda")
+# NetBird on, like a tenant.
+VALI_DISK_PROBE_NETBIRD = _env_bool("VALI_DISK_PROBE_NETBIRD", True)
+# The probe waits a random delay in [MIN, MAX] after boot before any I/O,
+# so the miner cannot pair a launch with a probe (design §2). The guest
+# honours at most 72 h.
+VALI_DISK_PROBE_START_DELAY_MIN_S = _env_int("VALI_DISK_PROBE_START_DELAY_MIN_S", 6 * 3600)
+VALI_DISK_PROBE_START_DELAY_MAX_S = _env_int("VALI_DISK_PROBE_START_DELAY_MAX_S", 48 * 3600)
+# After its result the VM lives a random [MIN, MAX] more (lifetime jitter),
+# then is torn down (§24).
+VALI_DISK_PROBE_LINGER_MIN_S = _env_int("VALI_DISK_PROBE_LINGER_MIN_S", 600)
+VALI_DISK_PROBE_LINGER_MAX_S = _env_int("VALI_DISK_PROBE_LINGER_MAX_S", 3600)
+# A pool with a verified probe is due again after PERIOD ± JITTER (the
+# jitter is per run, fixed by its run id); after a run without a verdict
+# the pool waits RETRY before the next attempt.
+VALI_DISK_PROBE_PERIOD_S = _env_int("VALI_DISK_PROBE_PERIOD_S", 7 * 86400)
+VALI_DISK_PROBE_PERIOD_JITTER_S = _env_int("VALI_DISK_PROBE_PERIOD_JITTER_S", 2 * 86400)
+VALI_DISK_PROBE_RETRY_S = _env_int("VALI_DISK_PROBE_RETRY_S", 86400)
+# Never probe a host with fewer free admission slots than this for the
+# probe flavor (the probe takes one; the rest is the tenants' headroom).
+VALI_DISK_PROBE_MIN_FREE_SLOTS = _env_int("VALI_DISK_PROBE_MIN_FREE_SLOTS", 2)
+# An operator-requested probe: at most one per node per this long.
+VALI_DISK_PROBE_MANUAL_INTERVAL_S = _env_int("VALI_DISK_PROBE_MANUAL_INTERVAL_S", 7 * 86400)
+# A probe launch that has not succeeded after this long (the launch-job
+# queue, the boot cap, the miner preflight) times out (`launch-timeout`); a
+# launch refused for an internal reason (Vault) is retried, same run and vm
+# id, within the same window. Once it succeeded, the run's deadline is
+# that moment + `start_delay_s` + VALI_DISK_PROBE_TIMEOUT_S.
+VALI_DISK_PROBE_LAUNCH_TIMEOUT_S = _env_int("VALI_DISK_PROBE_LAUNCH_TIMEOUT_S", 7200)
+# An operator-requested run still queued after this long is dropped.
+VALI_DISK_PROBE_QUEUE_TTL_S = _env_int("VALI_DISK_PROBE_QUEUE_TTL_S", 7 * 86400)
+# At most this many forced (fallback) teardowns per tick: each can wait
+# ~1-2 min, and the tick must finish inside its CronJob deadline.
+VALI_DISK_PROBE_MAX_FALLBACKS_PER_TICK = _env_int("VALI_DISK_PROBE_MAX_FALLBACKS_PER_TICK", 3)
+# A §24 the probe started that has not destroyed the VM after this long
+# falls back to the forced teardown (`orchestration.teardown`).
+VALI_DISK_PROBE_TEARDOWN_TIMEOUT_S = _env_int("VALI_DISK_PROBE_TEARDOWN_TIMEOUT_S", 1800)
+VALI_DISK_PROBE_PUSH_JOB = os.environ.get("VALI_DISK_PROBE_PUSH_JOB", "disk-probe")
+if not (
+    0
+    <= VALI_DISK_PROBE_START_DELAY_MIN_S
+    <= VALI_DISK_PROBE_START_DELAY_MAX_S
+    <= 72 * 3600
+):
+    raise RuntimeError(
+        "VALI_DISK_PROBE_START_DELAY_MIN_S <= VALI_DISK_PROBE_START_DELAY_MAX_S <= 259200 "
+        "(the guest's cap) is required"
+    )
+if not 0 <= VALI_DISK_PROBE_LINGER_MIN_S <= VALI_DISK_PROBE_LINGER_MAX_S:
+    raise RuntimeError("VALI_DISK_PROBE_LINGER_MIN_S <= VALI_DISK_PROBE_LINGER_MAX_S is required")
 # Fold the `/sys/block` deltas of tenant receipts into hourly rows. Off:
 # the fields are parsed and dropped.
 VALI_DISK_IO_INGEST = _env_bool("VALI_DISK_IO_INGEST", False)
+# The passive ingest (P1) folds a receipt's disk evidence only when its
+# window is plausible: no longer than this (the guest sends 60 s windows),
+# ended no more than MAX_AGE ago (billing's own lag bound; the evaluator
+# re-grades VALI_DISK_EVALUATE_HOURS = 2 hours, so a late receipt still
+# lands in a graded hour) and no more than MAX_SKEW in the future.
+VALI_DISK_IO_MAX_WINDOW_S = _env_int("VALI_DISK_IO_MAX_WINDOW_S", 300)
+VALI_DISK_IO_MAX_AGE_S = _env_int("VALI_DISK_IO_MAX_AGE_S", 3600)
+VALI_DISK_IO_MAX_SKEW_S = _env_int("VALI_DISK_IO_MAX_SKEW_S", 600)
+# The passive evaluator (P2, `vali_disktier_evaluate`) — RECORD ONLY: it
+# writes `MinerDiskHealthHourly` rows, `DiskPassiveEvent` rows and metrics,
+# and never changes a tier, a health, a cordon, placement or rewards.
+#
+# A VM device's hour is a sample only with at least this many reads in
+# QD >= 4 small-I/O windows (fewer is noise, not a latency).
+VALI_DISK_PASSIVE_MIN_QD4_READS = _env_int("VALI_DISK_PASSIVE_MIN_QD4_READS", 100)
+# An owner is suspect on a pool once its median read await exceeded the
+# tier threshold this many consecutive hours (design §3.5: >= 2 h).
+VALI_DISK_PASSIVE_SUSTAIN_HOURS = _env_int("VALI_DISK_PASSIVE_SUSTAIN_HOURS", 2)
+# Trusted witnesses (`Placement.owner` values: our own internal VMs, the
+# synthetic monitor, probes): one of them suspect is enough, uncapped.
+VALI_DISK_PASSIVE_INTERNAL_OWNERS = _env_list("VALI_DISK_PASSIVE_INTERNAL_OWNERS")
+# The single-griefer cap: a suspicion raised by ONE non-internal owner
+# counts on at most this many miners per cooldown window.
+VALI_DISK_PASSIVE_LONE_OWNER_MAX_MINERS = _env_int("VALI_DISK_PASSIVE_LONE_OWNER_MAX_MINERS", 1)
+# At most one "would schedule a re-probe" event per miner per this long.
+VALI_DISK_PASSIVE_REPROBE_COOLDOWN_S = _env_int("VALI_DISK_PASSIVE_REPROBE_COOLDOWN_S", 86400)
+# Each run re-grades the last N closed hours (late receipts land).
+VALI_DISK_EVALUATE_HOURS = _env_int("VALI_DISK_EVALUATE_HOURS", 2)
+VALI_DISK_EVALUATE_PUSH_JOB = os.environ.get("VALI_DISK_EVALUATE_PUSH_JOB", "disk-tier")
+# `vali_disktier_gc`: retention of the passive rows and the rollups (design
+# §4.3), the batch size of each DELETE and the most batches per run.
+VALI_DISK_IO_RETENTION_DAYS = _env_int("VALI_DISK_IO_RETENTION_DAYS", 30)
+VALI_DISK_HEALTH_RETENTION_DAYS = _env_int("VALI_DISK_HEALTH_RETENTION_DAYS", 180)
+VALI_DISK_GC_BATCH = _env_int("VALI_DISK_GC_BATCH", 5000)
+VALI_DISK_GC_MAX_BATCHES = _env_int("VALI_DISK_GC_MAX_BATCHES", 200)
 # What a probe verdict may change: `off` nothing, `record` events + audit
 # only, `enforce` tiers, health, cordons.
 VALI_DISK_TIER_CONSEQUENCES = os.environ.get("VALI_DISK_TIER_CONSEQUENCES", "off")

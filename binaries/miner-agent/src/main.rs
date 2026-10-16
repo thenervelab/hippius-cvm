@@ -222,6 +222,32 @@ enum Command {
         #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
         config: PathBuf,
     },
+    /// Read the host's disks for the dedicated-disk inventory and write the
+    /// facts the agent reads (`/run/hippius-miner/disk-facts.json`). Run
+    /// by the `hippius-miner-storage-collect` oneshot, OUTSIDE the agent's
+    /// sandbox (which shows no block device), read-only on every disk.
+    StorageCollect {
+        /// Where to write the facts.
+        #[arg(long, default_value = hippius_miner_agent::storage::dedicated::DISK_FACTS_PATH)]
+        out: PathBuf,
+    },
+    /// Print, as JSON, what the agent would make of the storage
+    /// declaration in `--config` on this host: pools, filesystem
+    /// bindings, dedicated disks. Read-only (the `O_DIRECT` write test
+    /// creates and removes one probe file per pool). Run it under the
+    /// agent unit's own sandbox to see what the agent sees.
+    StorageCheck {
+        /// Operator config file.
+        #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
+        config: PathBuf,
+        /// Read the disks directly instead of the collector's facts
+        /// (needs the devices the agent's sandbox hides).
+        #[arg(long)]
+        collect: bool,
+        /// The collector's facts file.
+        #[arg(long, default_value = hippius_miner_agent::storage::dedicated::DISK_FACTS_PATH)]
+        facts: PathBuf,
+    },
     /// Long-running daemon (MA-4 + MA-5 + MA-6). Loads + validates the
     /// config and identity, then hosts the AF_VSOCK guest relay, the
     /// signed-order HTTP server and the §K signed-heartbeat subsystem
@@ -354,6 +380,12 @@ fn run() -> Result<()> {
         ),
         Command::GracefulExitHeartbeat { config } => cmd_graceful_exit_heartbeat(&config),
         Command::Serve { config } => cmd_serve(&config),
+        Command::StorageCollect { out } => cmd_storage_collect(&out),
+        Command::StorageCheck {
+            config,
+            collect,
+            facts,
+        } => cmd_storage_check(&config, collect, &facts),
     }
 }
 
@@ -503,6 +535,52 @@ fn cmd_request_graceful_exit(
 /// Fail-closed: a non-2xx Edge response or any transport error is an
 /// error exit, so an operator scripting a drain learns the signal did
 /// NOT land (and can fall back to `request-graceful-exit`).
+fn cmd_storage_collect(out: &Path) -> Result<()> {
+    use hippius_miner_agent::storage::dedicated;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let facts = dedicated::collect(&dedicated::SysPaths::default(), &dedicated::BlkidProbe, now);
+    facts.save(out).map_err(|_| {
+        hippius_miner_agent::MinerAgentError::ConfigInvalid("disk-facts-unwritable")
+    })?;
+    eprintln!(
+        "hippius-miner-agent: storage-collect: {} disk(s) written to {}",
+        facts.disks.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn cmd_storage_check(config_path: &Path, collect: bool, facts_path: &Path) -> Result<()> {
+    use hippius_miner_agent::storage::{check, dedicated, pools, registry};
+    let config = Config::read(config_path)?;
+    let facts: Box<dyn dedicated::FactsSource> = if collect {
+        Box::new(dedicated::LiveFacts {
+            paths: dedicated::SysPaths::default(),
+            probe: Box::new(dedicated::BlkidProbe),
+        })
+    } else {
+        Box::new(dedicated::FileFacts {
+            path: facts_path.to_path_buf(),
+            unit: None,
+            ..dedicated::FileFacts::default()
+        })
+    };
+    let report = check::run(
+        &config,
+        std::path::Path::new(hippius_miner_agent::storage::pools::POOLS_ROOT),
+        &pools::SystemPoolFs::default(),
+        &registry::FsIdentitySource::default(),
+        facts.as_ref(),
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
+    );
+    Ok(())
+}
+
 fn cmd_graceful_exit_heartbeat(config_path: &Path) -> Result<()> {
     use std::sync::Arc;
 
@@ -802,11 +880,13 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     let local_storage = hippius_miner_agent::storage::remote::LocalStorage::from_config(&config);
     let (storage_pools, dedicated_disks, storage_revision) =
         hippius_miner_agent::storage::remote::boot_set(&local_storage);
-    let storage_pools = Arc::new(storage_pools);
-    let pool_bindings = hippius_miner_agent::storage::registry::enforce(
+    // Never fatal: a pool that may still hold disks is kept, draining.
+    let (storage_pools, pool_bindings) = hippius_miner_agent::storage::registry::boot_enforce(
         &config.storage.state_disk_root,
-        &storage_pools,
-    )?;
+        storage_pools,
+        &hippius_miner_agent::storage::registry::FsIdentitySource::default(),
+    );
+    let storage_pools = Arc::new(storage_pools);
     if storage_pools.is_configured() {
         for (id, check) in hippius_miner_agent::storage::pools::check_pools(
             &storage_pools,

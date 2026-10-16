@@ -22,11 +22,14 @@ Built from the SAME predicates the scheduler uses, never re-derived:
                       operator sees what arming it WOULD do)
 - zombie quarantine   `lifecycle.zombie.fresh_observations`
 - reward weight       `scheduler.scoring.compute_epoch_weights`
+- passive disk health `disktier.MinerDiskHealthHourly` — the latest graded
+                      hour per pool / dedicated disk (record only: no
+                      VM ids, no owners, aggregates alone)
 
 Cost: one query per table (identities + locations, mirror, hosted VMs,
 their placements + the live ones, attestors, attestor releases, usage, backups,
 backup policies,
-public IPs, zombie rows) and at most ONE chain read — never per miner.
+public IPs, zombie rows, disk-health rollups + events) and at most ONE chain read — never per miner.
 The chain read is best-effort: when it fails the row keeps the DB mirror
 of the on-chain status and `chain.available` says so; prices need the
 chain and are `null` then.
@@ -573,6 +576,78 @@ def _zombies_by_node(now: datetime) -> dict[str, dict[str, Any]]:
     return out
 
 
+#: How far back the fleet looks for a graded disk-health hour.
+DISK_HEALTH_WINDOW = timedelta(hours=48)
+
+
+def _disk_health_by_node(now: datetime) -> dict[str, dict[str, Any]]:
+    """Per node, the latest graded hour of each pool and dedicated disk
+    (`apps.disktier.evaluate`, record only) in the last 48 h, and the last
+    "would re-probe" event of the last 24 h. Aggregates only: never a VM
+    id or an owner."""
+    from apps.disktier.models import (
+        DiskPassiveEvent,
+        DiskPassiveEventKind,
+        MinerDiskHealthHourly,
+    )
+
+    seen: set[tuple[str, str, str]] = set()
+    out: dict[str, dict[str, Any]] = {}
+    rows = MinerDiskHealthHourly.objects.filter(hour__gte=now - DISK_HEALTH_WINDOW).order_by(
+        "-hour", "miner_node_id", "pool_id", "disk_id"
+    )
+    for row in rows:
+        key = (row.miner_node_id.lower(), row.pool_id, row.disk_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = out.setdefault(
+            key[0],
+            {
+                "latest_hour": None,
+                "worst_verdict": None,
+                "pools": [],
+                "dedicated_disks": [],
+                "last_would_reprobe_at": None,
+            },
+        )
+        item: dict[str, Any] = {
+            "hour": _iso(row.hour),
+            "tier": row.tier or None,
+            "verdict": row.verdict or None,
+            "owners": row.owners,
+            "vms": row.vms,
+            "suspect_owners": row.suspect_owners,
+            "median_owner_await_us": row.median_owner_await_us,
+            "p90_owner_await_us": row.p90_owner_await_us,
+        }
+        if row.pool_id:
+            entry["pools"].append({"pool_id": row.pool_id, **item})
+        else:
+            entry["dedicated_disks"].append({"disk_id": row.disk_id, **item})
+        hour = _iso(row.hour)
+        if entry["latest_hour"] is None or (hour and hour > entry["latest_hour"]):
+            entry["latest_hour"] = hour
+        rank = {None: 0, "ok": 1, "suspect": 2}
+        if rank.get(row.verdict or None, 0) > rank.get(entry["worst_verdict"], 0):
+            entry["worst_verdict"] = row.verdict
+    events = (
+        DiskPassiveEvent.objects.filter(
+            kind=DiskPassiveEventKind.WOULD_REPROBE, created_at__gte=now - timedelta(hours=24)
+        )
+        .values("miner_node_id")
+        .annotate(at=Max("created_at"))
+    )
+    for ev in events:
+        nid = ev["miner_node_id"].lower()
+        if nid in out:
+            out[nid]["last_would_reprobe_at"] = _iso(ev["at"])
+    for entry in out.values():
+        entry["pools"].sort(key=lambda p: p["pool_id"])
+        entry["dedicated_disks"].sort(key=lambda d: d["disk_id"])
+    return out
+
+
 def _alerts(row: dict[str, Any], *, now: datetime) -> list[str]:
     """Closed vocabulary of conditions an operator should look at."""
     alerts: list[str] = []
@@ -673,6 +748,7 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
     backup_attention = _backup_attention(now)
     zombies = _zombies_by_node(now)
     shortfalls = guest_resources.flagged(now)
+    disk_health = _disk_health_by_node(now)
     public_ips = dict(
         PublicIP.objects.filter(state=PublicIpState.ATTACHED.value, vm__isnull=False).values_list(
             "vm__vm_id", "address"
@@ -720,6 +796,7 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
                     backup_attention,
                 ),
                 zombie=zombies.get(nid),
+                disk_health=disk_health.get(nid),
                 public_ips=public_ips,
                 shortfalls=shortfalls,
                 liveness_s=liveness_s,
@@ -829,6 +906,7 @@ def _row(
     now: datetime,
     view: scheduler_service.CapacityView | None = None,
     budget: HostBudget | None = None,
+    disk_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_seen = miner.last_seen_at if miner is not None else None
     location: MinerLocation | None = _location_of(miner) if miner is not None else None
@@ -1042,6 +1120,8 @@ def _row(
             "epoch_owed_usd_micros": int(owed) if owed is not None else None,
         },
         "backups": backups,
+        # Passive disk health (record only), null without a graded hour.
+        "disk_health": disk_health,
     }
 
 

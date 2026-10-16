@@ -1,0 +1,79 @@
+"""`vali_disk_probe` — one tick of the disk-tier probe orchestrator
+(`apps.disktier.probe`, design §4.4, phase R1). RECORD ONLY. Run by the
+`disktier-probe` CronJob (suspended until the probe is turned on).
+
+    manage.py vali_disk_probe [--no-push]
+    manage.py vali_disk_probe --request <node_id>   # queue an operator probe
+
+While `VALI_DISK_PROBE_ENABLED` is off the tick launches nothing and
+pushes nothing; a run left in flight by turning it off is still torn
+down.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+
+from apps.disktier import probe
+from apps.synthetic import metrics
+
+_NODE_ID_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class Command(BaseCommand):
+    help = "One disk-tier probe orchestrator tick (record only), then push its gauges."
+
+    def add_arguments(self, parser: Any) -> None:
+        parser.add_argument("--no-push", action="store_true", help="Print the metrics instead.")
+        parser.add_argument(
+            "--request",
+            metavar="NODE_ID",
+            default=None,
+            help="Queue an operator-requested probe of the node's OS pool (1 per 7 days).",
+        )
+
+    def handle(self, *args: Any, **opts: Any) -> None:
+        if opts["request"] is not None:
+            self._request(opts["request"])
+            return
+        report = probe.tick()
+        self.stdout.write(
+            f"disk probe: enabled={report.enabled} due={report.due} launched={report.launched} "
+            f"refused={report.refused} transitions={dict(report.transitions)} "
+            f"torn_down={report.torn_down} forced={report.forced} skipped={dict(report.skipped)}"
+        )
+        if not report.enabled:
+            # Nothing pushed: the alert rules key on a fresh push with
+            # `hippius_disk_probe_enabled == 1`, so they stay silent.
+            return
+        ms = probe.report_metrics(report)
+        if opts["no_push"]:
+            self.stdout.write(ms.render())
+            return
+        pushed = metrics.push(
+            ms,
+            gateway_url=settings.VALI_SYNTHETIC_PUSHGATEWAY_URL,
+            job=settings.VALI_DISK_PROBE_PUSH_JOB,
+            grouping_key={"report": "disk-probe"},
+            replace=True,
+            timeout_s=float(settings.VALI_SYNTHETIC_HTTP_TIMEOUT_S),
+        )
+        if not pushed:
+            raise CommandError("disk probe: the Pushgateway refused or did not answer")
+
+    def _request(self, node_id: str) -> None:
+        if not settings.VALI_DISK_PROBE_ENABLED:
+            raise CommandError("VALI_DISK_PROBE_ENABLED is off: no probe is queued")
+        nid = node_id.strip().lower()
+        if not _NODE_ID_RE.fullmatch(nid):
+            raise CommandError(f"{node_id!r} is not a 64-hex node id")
+        try:
+            run = probe.request_manual(nid)
+        except (ValueError, RuntimeError) as exc:
+            raise CommandError(str(exc)) from exc
+        # The run id only: the vm id and owner are the probe's identity.
+        self.stdout.write(f"disk probe: queued run {run.run_id} for node {nid[:12]}")

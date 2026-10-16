@@ -241,8 +241,9 @@ class ServedReceiptFields:
     receipt cannot forge them.
 
     `disk_io` / `disk_probe` are the optional disk evidence; a receipt
-    without it (every guest today) yields `()` / `None`. The usage meter
-    never reads them."""
+    without it yields `()` / `None`. Billing never reads them: the usage
+    meter only hands them to the passive disk ingest
+    (`apps.disktier.ingest`, behind `VALI_DISK_IO_INGEST`)."""
 
     vm_id: str
     lease_id: str
@@ -454,10 +455,9 @@ def _disk_probe(raw: object, receipt_vm_id: str) -> DiskProbeResult:
 def _served_receipt_fields(payload: dict) -> ServedReceiptFields:
     """Coerce the data-bearing `verify-served-receipt` ok payload into a
     typed `ServedReceiptFields` (fail-closed on a shape drift). The
-    optional disk evidence is absent from every receipt today and
-    defaults to `()` / `None`; when present it is parsed and type-checked
-    here, then dropped by every consumer until the disk-tier ingest
-    (`VALI_DISK_IO_INGEST`) lands."""
+    optional disk evidence defaults to `()` / `None` when absent; when
+    present it is parsed and type-checked here, and only the disk-tier
+    ingest reads it (`VALI_DISK_IO_INGEST`, off by default)."""
     try:
         # The binary omits a key it has nothing for; a present `null` is
         # contract drift, not "absent".

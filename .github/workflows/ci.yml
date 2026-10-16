@@ -575,6 +575,37 @@ jobs:
             ' sh "$f"
           done
 
+  # The agent's storage checks under the agent unit's REAL sandbox
+  # (PrivateDevices, ProtectSystem=strict, … via systemd-run): the unit
+  # tests run without it, which is how a sandbox-only breakage (no
+  # /dev/disk, read-only paths) once shipped unseen.
+  agent-storage-sandbox:
+    runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: Install system deps (Rust build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
+      - name: Install Rust toolchain (rust-toolchain.toml-pinned)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "ci-agent-sandbox"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the agent
+        run: cargo build -p hippius-miner-agent --bin hippius-miner-agent
+      - name: Storage checks under the agent's sandbox
+        env:
+          AGENT_SANDBOX_TEST_REQUIRED: "1"
+        run: |
+          if command -v shellcheck >/dev/null; then
+            shellcheck -S warning scripts/dev/agent-storage-sandbox-test.sh
+          else
+            echo "shellcheck not on this runner: lint skipped"
+          fi
+          bash scripts/dev/agent-storage-sandbox-test.sh target/debug/hippius-miner-agent
+
   sentinel:
     runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}
     steps:
@@ -678,6 +709,12 @@ jobs:
           apps/telemetry/tests/test_host_attestor_release.py
           apps/images/tests/test_rebake_queue_lock.py
           apps/orchestration/tests/test_idempotency.py
+          apps/orchestration/tests/test_decommission_before_launch.py
+          apps/disktier/tests/test_passive_ingest.py
+          apps/disktier/tests/test_passive_evaluate.py
+          apps/scheduler/tests/test_usage_disk_hook.py
+          apps/disktier/tests/test_probe.py
+          apps/disktier/tests/test_probe_results.py
 
   audit:
     # RA-M-NEW-1 — dependency-vulnerability gate. `cargo audit` fails the

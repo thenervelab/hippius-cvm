@@ -1139,3 +1139,68 @@ def test_a_host_without_disk_data_is_unknown_not_alarmed(operator_client: APICli
     assert (disk["gate_mode"], disk["gate_state"], disk["known"]) == ("record", "off", False)
     assert (disk["effective_gb"], disk["free_gb"], disk["over_claim"]) == (None, None, False)
     assert "disk-over-claim" not in row["alerts"]
+
+
+# ─── passive disk health (record only) ───────────────────────────────
+
+
+def test_disk_health_is_null_without_a_graded_hour(operator_client: APIClient) -> None:
+    make_dispatchable_identity(1)
+    _mirror(1)
+    assert _row(_fleet(operator_client), 1)["disk_health"] is None
+
+
+def test_disk_health_shows_the_latest_hour_per_target_without_tenants(
+    operator_client: APIClient,
+) -> None:
+    from apps.disktier.models import DiskPassiveEvent, MinerDiskHealthHourly
+
+    make_dispatchable_identity(1)
+    _mirror(1)
+    hour = timezone.now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    common = {"miner_node_id": node_id(1), "owners": 2, "vms": 3}
+    MinerDiskHealthHourly.objects.create(
+        pool_id="default", hour=hour - timedelta(hours=1), verdict="ok", tier="nvme", **common
+    )
+    MinerDiskHealthHourly.objects.create(
+        pool_id="default",
+        hour=hour,
+        verdict="suspect",
+        tier="nvme",
+        suspect_owners=2,
+        median_owner_await_us=9000,
+        p90_owner_await_us=12000,
+        **common,
+    )
+    MinerDiskHealthHourly.objects.create(disk_id="wwn-0x1", hour=hour, **common)
+    # Older than the window: not shown.
+    MinerDiskHealthHourly.objects.create(
+        pool_id="old", hour=hour - timedelta(days=3), verdict="suspect", **common
+    )
+    DiskPassiveEvent.objects.create(
+        miner_node_id=node_id(1),
+        pool_id="default",
+        hour=hour,
+        kind="would-reprobe",
+        trigger_owner="user-secret",
+        created_at=timezone.now(),
+    )
+    dh = _row(_fleet(operator_client), 1)["disk_health"]
+    assert dh["worst_verdict"] == "suspect"
+    assert dh["last_would_reprobe_at"] is not None
+    (p,) = dh["pools"]
+    assert (p["pool_id"], p["verdict"], p["tier"], p["suspect_owners"]) == (
+        "default",
+        "suspect",
+        "nvme",
+        2,
+    )
+    assert (p["median_owner_await_us"], p["p90_owner_await_us"], p["owners"], p["vms"]) == (
+        9000,
+        12000,
+        2,
+        3,
+    )
+    (d,) = dh["dedicated_disks"]
+    assert (d["disk_id"], d["verdict"], d["tier"]) == ("wwn-0x1", None, None)
+    assert "user-secret" not in str(dh)

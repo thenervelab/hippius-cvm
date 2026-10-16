@@ -54,6 +54,7 @@ fn local(root: &Path) -> LocalStorage {
         host_budget_gb: BUDGET_GB,
         pools: Vec::new(),
         dedicated: Vec::new(),
+        pools_root: None,
     }
 }
 

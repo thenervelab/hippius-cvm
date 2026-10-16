@@ -376,15 +376,32 @@ class DecommissionStartView(APIView):
         responses={
             202: DecommissionJobSerializer,
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
-            404: OpenApiResponse(ErrorSerializer, "VM not found."),
-            409: OpenApiResponse(ErrorSerializer, "VM-state conflict / job in flight."),
+            404: OpenApiResponse(
+                ErrorSerializer,
+                "VM not found — and no launch will create it (a queued launch "
+                "for it is cancelled).",
+            ),
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "VM-state conflict / job in flight (including its launch: retry).",
+            ),
         },
     )
     def post(self, request: Request, vm_id: str) -> Response:
-        try:
+        vm = Vm.objects.filter(vm_id=vm_id).first()
+        if vm is None:
+            # Not created YET is not gone: a queued launch would create it
+            # after this answer. `404` is only returned once no launch can.
+            fence = launch_jobs.fence_launch_for_decommission(vm_id)
+            if fence == launch_jobs.FENCE_RUNNING:
+                return _error(
+                    status.HTTP_409_CONFLICT,
+                    "vm is being launched; the launch was told not to create it — retry",
+                    "job-in-flight",
+                )
+            if fence != launch_jobs.FENCE_VM_EXISTS:
+                return _error(status.HTTP_404_NOT_FOUND, "vm not found", "not-found")
             vm = Vm.objects.get(vm_id=vm_id)
-        except Vm.DoesNotExist:
-            return _error(status.HTTP_404_NOT_FOUND, "vm not found", "not-found")
 
         try:
             job = service.start_decommission(vm=vm, decided_by=request.user)
@@ -476,7 +493,8 @@ class LaunchStartView(APIView):
             400: OpenApiResponse(
                 ErrorSerializer,
                 "Malformed body / bad field (`wire`/`bad-field`), or a flavor above "
-                "the largest offered size (`flavor-not-offered`).",
+                "the largest offered size (`flavor-not-offered`), or a vm id / owner "
+                "reserved for the disk-tier probe (`disk-probe-id-reserved`).",
             ),
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
             409: OpenApiResponse(ErrorSerializer, "In-flight launch already exists for this VM."),

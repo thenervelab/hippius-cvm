@@ -1,0 +1,123 @@
+{{- if eq (toString .Values.disktierProbe.enabled) "true" }}
+---
+# Disk-tier probe orchestrator (`vali_disk_probe`, apps.disktier.probe,
+# docs/design/disk-tier-verification.md §4.4, phase R1). RECORD ONLY: launches
+# vali-owned probe VMs in-process (pinned to a miner, a probe owner, the
+# medium flavor), matches their signed results, stores what each pool WOULD
+# be graded, and tears every probe VM down (§24, then the shared no-leak
+# fallback). Never changes a tier, a cordon, placement or rewards.
+#
+# SUSPENDED, and VALI_DISK_PROBE_ENABLED keeps its code default (off, no
+# chart key): turning it on is R2's ops step. Same posture as the full
+# synthetic monitor (Vault for the launch staging + the forced teardown, the
+# KBS admin identity for the fallback), minus its root token: the probe
+# launches in-process, never over HTTP.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: disktier-probe
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: disktier-probe
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.disktierProbe.schedule | quote }}
+  # Suspended until the probe is turned on (`suspend` in values; R2).
+  suspend: {{ .Values.disktierProbe.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.disktierProbe.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: disktier-probe
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: disktier-probe
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_disk_probe"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+                # Vault: the in-process launch provisions the probe VM's
+                # golden overlay KEK and stages its user-data (Transit), and
+                # the no-leak fallback teardown crypto-erases.
+                {{- include "vali.vaultStaticTokenEnv" . | nindent 16 }}
+                {{- include "vali.vaultAuthEnv" . | nindent 16 }}
+                - name: VALI_VAULT_ADDR
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-vault
+                      key: address
+                {{- if .Values.netbird.enabled }}
+                # NetBird: the forced fallback teardown revokes the probe
+                # VM's (persistent) peer, as the §24 job would.
+                - name: VALI_NETBIRD_API_BASE
+                  value: {{ .Values.netbird.apiBase | quote }}
+                - name: VALI_NETBIRD_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-netbird-token
+                      key: VALI_NETBIRD_API_TOKEN
+                {{- end }}
+              resources:
+                {{- .Values.disktierProbe.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                {{- include "vali.vaultTokenVolumeMount" . | nindent 16 }}
+                {{- include "vali.kbsAdminTlsVolumeMount" . | nindent 16 }}
+                - name: tmp
+                  mountPath: /tmp
+                - name: vault-ca
+                  mountPath: /etc/hippius/vault-ca
+                  readOnly: true
+          volumes:
+            {{- include "vali.vaultTokenVolume" . | nindent 12 }}
+            {{- include "vali.kbsAdminTlsVolume" . | nindent 12 }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+            - name: vault-ca
+              configMap:
+                name: vault-ca
+{{- end }}

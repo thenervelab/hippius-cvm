@@ -12,8 +12,12 @@
   tenant receipts.
 - `MinerDiskHealthHourly` — the evaluator's hourly per-pool (or per-disk)
   rollup of that passive signal.
+- `DiskIoReceipt` / `DiskIngestCounter` / `DiskPassiveEvent` — the passive
+  ingest's replay dedupe and counters, and the evaluator's record-only
+  events.
 
-Nothing reads these tables yet. Host-reported sizes are untrusted and only
+Placement reads none of these tables yet: the passive ingest and the
+evaluator only record (design §10, P1/P2). Host-reported sizes are untrusted and only
 ever clamp down; a tier comes from a probe (or an audited operator
 override, `vali_set_pool_tier`), never from what the host says.
 """
@@ -311,10 +315,35 @@ class DiskProbeRun(models.Model):
     result_at = models.DateTimeField(null=True, blank=True)
     torn_down_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # ── the orchestrator's bookkeeping (R1, `apps.disktier.probe`) ──
+    #: The pool the run's OS disk sits on (the `os` target's pool).
+    os_pool_id = models.CharField(max_length=POOL_ID_MAX_LEN, blank=True, default="", db_default="")
+    #: The first launch attempt (the internal-failure retry window's start).
+    first_attempt_at = models.DateTimeField(null=True, blank=True)
+    #: The `LaunchJob` that launches the probe VM.
+    launch_job_id = models.CharField(max_length=64, blank=True, default="", db_default="")
+    #: The request's `start_delay_s` (the guest waits this long before any I/O).
+    start_delay_s = models.PositiveIntegerField(null=True, blank=True)
+    #: No verdict by then ⇒ `timeout`.
+    deadline_at = models.DateTimeField(null=True, blank=True)
+    #: When the run reached its verdict (`verified` / `failed` / `timeout`).
+    finished_at = models.DateTimeField(null=True, blank=True)
+    #: The VM is torn down from then on (the lifetime jitter after a result).
+    teardown_after = models.DateTimeField(null=True, blank=True)
+    #: When the orchestrator started the VM's §24, and how the teardown ended.
+    teardown_started_at = models.DateTimeField(null=True, blank=True)
+    teardown_detail = models.CharField(max_length=256, blank=True, default="", db_default="")
+    #: SHA-256 of the guest-signed receipt the accepted result came in.
+    result_digest = models.CharField(max_length=64, blank=True, default="", db_default="")
+    #: The result's run facts: `vcpus`, `kernel`, `started_at`, `finished_at`.
+    result_meta = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["-scheduled_at"]
-        indexes = [models.Index(fields=["miner_node_id", "scheduled_at"])]
+        indexes = [
+            models.Index(fields=["miner_node_id", "scheduled_at"]),
+            models.Index(fields=["state"]),
+        ]
 
     def __str__(self) -> str:
         return f"DiskProbeRun {self.run_id} {self.miner_node_id[:12]} {self.state}"
@@ -399,6 +428,11 @@ class VmDiskIoHourly(models.Model):
     #: only ones whose latency says something about the disk.
     qd4_small_ios = models.PositiveBigIntegerField(default=0)
     qd4_small_ticks_ms = models.PositiveBigIntegerField(default=0)
+    #: The READ share of those windows: the evaluator's signal is the read
+    #: await of QD >= 4 small-I/O windows (design §3.5), which the r+w
+    #: bucket above cannot give back.
+    qd4_small_r_ios = models.PositiveBigIntegerField(default=0, db_default=0)
+    qd4_small_r_ticks_ms = models.PositiveBigIntegerField(default=0, db_default=0)
 
     class Meta:
         constraints = [
@@ -406,7 +440,11 @@ class VmDiskIoHourly(models.Model):
                 fields=["vm_id", "device", "hour"], name="disktier_vmio_unique_per_hour"
             ),
         ]
-        indexes = [models.Index(fields=["miner_node_id", "hour"])]
+        indexes = [
+            models.Index(fields=["miner_node_id", "hour"]),
+            # The evaluator reads one hour fleet-wide; the GC reaps by age.
+            models.Index(fields=["hour"]),
+        ]
 
     def __str__(self) -> str:
         return f"VmDiskIoHourly {self.vm_id} {self.device} {self.hour:%Y-%m-%dT%H}"
@@ -428,6 +466,10 @@ class MinerDiskHealthHourly(models.Model):
     p90_owner_await_us = models.PositiveIntegerField(null=True, blank=True)
     suspect_owners = models.PositiveIntegerField(default=0)
     verdict = models.CharField(max_length=10, choices=DiskHealth.choices, blank=True, default="")
+    #: The tier the hour was graded against (the pool's effective tier,
+    #: else its declared class; a dedicated disk's verified tier). Blank =
+    #: not graded (no tier to grade against): `verdict` is blank too.
+    tier = models.CharField(max_length=8, blank=True, default="", db_default="")
 
     class Meta:
         constraints = [
@@ -441,10 +483,83 @@ class MinerDiskHealthHourly(models.Model):
                 name="disktier_health_one_target",
             ),
         ]
+        indexes = [models.Index(fields=["hour"])]
 
     def __str__(self) -> str:
         target = self.pool_id or self.disk_id
         return f"MinerDiskHealthHourly {self.miner_node_id[:12]}/{target} {self.hour:%Y-%m-%dT%H}"
+
+
+class DiskIoReceipt(models.Model):
+    """One served receipt whose disk evidence the passive ingest folded in
+    (design §3.5): the replay dedupe. Keyed on the SHA-256 of the
+    guest-signed receipt body, so it holds whatever the billing watermark
+    decides, and a receipt the usage meter re-queues is never counted
+    twice. Reaped by `vali_disktier_gc` once older than any receipt the
+    ingest still accepts."""
+
+    id = models.BigAutoField(primary_key=True)
+    receipt_digest = models.CharField(max_length=64, unique=True)
+    vm_id = models.CharField(max_length=128)
+    ingested_at = models.DateTimeField()
+
+    class Meta:
+        indexes = [models.Index(fields=["ingested_at"])]
+
+    def __str__(self) -> str:
+        return f"DiskIoReceipt {self.receipt_digest[:12]} {self.vm_id}"
+
+
+class DiskIngestCounter(models.Model):
+    """Cumulative counters of the passive ingest (`ingested_rows`,
+    `dedupe_hits`, `errors`, ...). The usage meter folds its per-cycle
+    tallies in; the evaluator pushes them to the Pushgateway."""
+
+    name = models.CharField(max_length=48, primary_key=True)
+    value = models.PositiveBigIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"DiskIngestCounter {self.name}={self.value}"
+
+
+class DiskPassiveEventKind(models.TextChoices):
+    #: The passive signal says a re-probe is due. RECORD ONLY: nothing is
+    #: scheduled (the probe orchestrator is phase R1).
+    WOULD_REPROBE = "would-reprobe", "would-reprobe"
+    #: A lone non-internal owner's suspicion was dropped by the
+    #: single-griefer cap.
+    GRIEFER_CAPPED = "griefer-capped", "griefer-capped"
+
+
+class DiskPassiveEvent(models.Model):
+    """What the passive evaluator concluded about one pool or dedicated
+    disk of a miner. Append-only; never served to a miner operator (a
+    miner warned of a re-probe could un-throttle for it).
+
+    `trigger_owner` is set only when a single non-internal owner raised
+    the suspicion: the single-griefer cap counts those per owner."""
+
+    id = models.BigAutoField(primary_key=True)
+    miner_node_id = models.CharField(max_length=64)
+    pool_id = models.CharField(max_length=POOL_ID_MAX_LEN, blank=True, default="")
+    disk_id = models.CharField(max_length=DISK_ID_MAX_LEN, blank=True, default="")
+    hour = models.DateTimeField()
+    kind = models.CharField(max_length=16, choices=DiskPassiveEventKind.choices)
+    trigger_owner = models.CharField(max_length=128, blank=True, default="")
+    detail = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["miner_node_id", "kind", "created_at"]),
+            models.Index(fields=["trigger_owner", "kind", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        target = self.pool_id or self.disk_id
+        return f"DiskPassiveEvent {self.miner_node_id[:12]}/{target} {self.kind}"
 
 
 class MinerStorageConfig(models.Model):

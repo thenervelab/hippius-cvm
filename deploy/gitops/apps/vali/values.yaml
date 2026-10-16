@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:1e95babd5aab80cd42ac08f350a7fce9e2059488d2d5dd5f84f0569e3ef87de5"
+  digest: "sha256:6b8f661eacaf725017794a18115b26bfcdc2262f915e19b392124bbc563dd364"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "df21723827bef9bf7d3a7b6e51b923b83b3030bb"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38867012767/attempts/1"
+    commitSha: "e84995f296b2150f363efc6195635f98b0ab3ddf"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38893374706/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -926,6 +926,76 @@ guestReport:
       cpu: 250m
       memory: 256Mi
 
+# Passive disk tiers (docs/design/disk-tier-verification.md §3.5, P1/P2):
+# the hourly evaluator (record only) and the retention sweep. Both stay
+# SUSPENDED until VALI_DISK_IO_INGEST is turned on (no chart key: code
+# default false) and the pinned image carries the two commands.
+disktierEvaluate:
+  enabled: "true"
+  suspend: true
+  schedule: "17 * * * *"
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+disktierGc:
+  enabled: "true"
+  suspend: true
+  schedule: "41 4 * * *"
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+# The disk-tier probe orchestrator (docs/design/disk-tier-verification.md
+# §4.4, R1; `vali_disk_probe`): RECORD ONLY. SUSPENDED, and
+# VALI_DISK_PROBE_ENABLED keeps its code default (off, no chart key), so the
+# command launches nothing and pushes nothing even if run. Enabling (R2):
+# set the probe owners, VALI_DISK_PROBE_MIN_GUEST_RELEASE and the flag, then
+# `suspend: false`. Disabling: turn the flag off but keep the CronJob
+# running until `hippius_disk_probe_inflight` is 0 — the tick still tears
+# down the probe VMs in flight; a suspended CronJob strands them.
+# activeDeadlineSeconds: a tick is short (launch intake, reads); the no-leak
+# fallback teardown can wait ~1-2 min per stuck VM (at most
+# VALI_DISK_PROBE_MAX_FALLBACKS_PER_TICK of them) before forcing.
+#
+# Throughput: a probe holds its fleet slot (VALI_DISK_PROBE_MAX_CONCURRENT,
+# default 1) for its whole start delay — ~28 h on average (6-48 h delay +
+# boot, run, linger, teardown) — so ONE slot probes ~6 pools a week, and
+# the 7-day period needs ~0.86 a week per pool. Set the cap to at least
+# ceil(pools / 6) (3 for the calibration week's 15 runs), or the queue
+# grows (`hippius_disk_probe_skipped{reason="concurrency"}`) and healthy
+# nodes go DiskProbeStale.
+disktierProbe:
+  enabled: "true"
+  suspend: true
+  schedule: "7,22,37,52 * * * *"
+  activeDeadlineSeconds: 840
+  resources:
+    requests:
+      cpu: 25m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+  # The alert rules render, but every expression also requires a FRESH push
+  # (< 1 h) with `hippius_disk_probe_enabled == 1`: the command pushes only
+  # while the flag is on, so with the probe off no series exists and nothing
+  # can fire. `false` drops the PrometheusRule entirely.
+  alerts:
+    enabled: "true"
+    # DiskProbeStale: no verified probe of a node for this many days. Must
+    # exceed the longest healthy gap: period 7 d + jitter 2 d + start delay
+    # 2 d + boot, run and linger (~11 d), or it fires on healthy nodes.
+    staleDays: 12
+    # DiskProbeFailing: this many failed / timed-out runs in a row.
+    failingRuns: 2
+
 postgres:
   # Postgres 16 — pinned by digest.
   image: "postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229"
@@ -1499,6 +1569,23 @@ publicApiIngress:
     # proxies it behind its superuser-only `fleet.read` capability. EXACT
     # path, same rule as `/v1/operator/nodes` above.
     - /v1/operator/fleet
+    # Disk profiles (`apps.disktier`, #1603): storage pools, dedicated disks
+    # and their verified tiers per node. `OPERATOR_ONLY`, read-only.
+    # Published because the operator dashboard of the layer above shows
+    # each node's disk tiers. EXACT path, same rule as `/v1/operator/nodes`.
+    - /v1/operator/disk-profiles
+    # A miner's storage configuration (`apps.disktier`, #1609):
+    # `/v1/operator/miners/{node_id}/{storage, storage/pools[/{id}],
+    # storage/validate, storage/adopt, storage/history, disk-tiers,
+    # dedicated-disks, dedicated-disks/{id}/drain}`. Published because the
+    # operator dashboard edits its own nodes' pools there. A PREFIX, the
+    # one exception to the exact-path rule above: every route under it is
+    # `OPERATOR_ONLY`, reads need an operator principal, WRITES need
+    # `IsOperatorConfigWriter` (the principals in `operatorConfig.principals`), and
+    # each call re-checks on chain that the acting family runs the node.
+    # `apps/disktier/tests/test_public_prefix.py` fails if a route is
+    # added under the prefix (another app's included) or drops a gate.
+    - /v1/operator/miners
     # Public IPs and ingress edges (`apps.network`): `/v1/network/edges*`
     # and `/v1/network/availability`. Published because the layer above
     # sells public IPs and serves each ingress edge its desired state —

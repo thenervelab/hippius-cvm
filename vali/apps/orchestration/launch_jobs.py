@@ -26,7 +26,12 @@ from django.utils import timezone
 from apps.identity import scoping
 from apps.orchestration import power_policy, webhook
 from apps.orchestration.effects import EffectError, EffectUnavailable
-from apps.orchestration.models import LaunchJob, LaunchJobState, LaunchPhase
+from apps.orchestration.models import (
+    TERMINAL_LAUNCH_STATES,
+    LaunchJob,
+    LaunchJobState,
+    LaunchPhase,
+)
 from apps.orchestration.services import customer_keys, flavors, launch, vault_kv
 from apps.scheduler.placement import REGION_RE
 
@@ -542,6 +547,39 @@ def _check_cdn_role(intent: dict[str, Any], *, cdn_node: bool) -> None:
         )
 
 
+def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> None:
+    """The disk-tier probe identity at intake (`apps.disktier.probe`),
+    before anything is staged. A probe VM's vm id and the probe owners
+    (`VALI_DISK_PROBE_OWNERS`, user or tenant id) are launched only by the
+    probe orchestrator, in-process, which says so (`disk_probe=True`);
+    never through the HTTP API, whoever calls it (`disk-probe-id-reserved`,
+    400). Symmetric: the orchestrator's launch must name one of its own
+    runs AND a probe owner, so a bug there cannot launch a probe VM under
+    a real tenant's identity."""
+    from apps.disktier.models import DiskProbeRun
+    from apps.disktier.probe_owners import probe_tenant_ids, probe_user_ids
+
+    vm_id = str(intent.get("vm_id") or "")
+    user_id = str(intent.get("user_id") or "")
+    tenant_id = str(intent.get("tenant_id") or "")
+    is_run = bool(vm_id) and DiskProbeRun.objects.filter(vm_id=vm_id).exists()
+    probe_user = user_id in probe_user_ids()
+    probe_tenant = tenant_id in probe_tenant_ids()
+    if not disk_probe:
+        if is_run or probe_user or probe_tenant:
+            raise LaunchIntentError(
+                "this vm id or owner is reserved for vali's disk-tier probe; "
+                "only the probe orchestrator launches it",
+                "disk-probe-id-reserved",
+            )
+        return
+    if not (is_run and probe_user and probe_tenant):
+        raise LaunchIntentError(
+            f"a disk-probe launch must name its own run ({vm_id!r}) and a probe owner",
+            "disk-probe-id-reserved",
+        )
+
+
 def _resolve_bake(intent: dict[str, Any]) -> None:
     """Fill the launch-spec artifact fields from a Succeeded `TenantBake`
     named by `intent['bake_id']`. A no-op when `bake_id` is absent.
@@ -749,7 +787,12 @@ def _refuse_held(locked: Any) -> None:
 
 
 def start_launch(
-    *, intent: dict[str, Any], userdata: bytes, decided_by: Any, cdn_node: bool = False
+    *,
+    intent: dict[str, Any],
+    userdata: bytes,
+    decided_by: Any,
+    cdn_node: bool = False,
+    disk_probe: bool = False,
 ) -> LaunchJob:
     """Validate the intent, stage `userdata` to Vault, and enqueue a
     `LaunchJob`. The KEK is NOT staged here — `intent['kek_vault_path']`
@@ -757,7 +800,8 @@ def start_launch(
 
     `cdn_node` is the CDN fleet reconciler's, in-process only: it launches
     the CDN node the intent's `vm_id` names (`_check_cdn_role`). No HTTP
-    caller can set it.
+    caller can set it. `disk_probe` is the disk-tier probe orchestrator's,
+    the same way (`_check_disk_probe_role`).
 
     Raises [`LaunchIntentError`] on a bad body / an in-flight launch for
     the same VM / a Vault failure.
@@ -805,6 +849,9 @@ def start_launch(
         )
     except ValueError as exc:
         raise LaunchIntentError(str(exc), "bad-field") from exc
+    # The disk-probe identity, before any lookup or Vault write: a tenant
+    # launch naming a probe's vm id or owner stages nothing.
+    _check_disk_probe_role(intent, disk_probe=disk_probe)
     # #587 Phase 1C — bake→launch chaining: if the intent names a
     # `bake_id`, fill the artifact fields a Succeeded TenantBake already
     # determined (the qcow2/kernel/initrd SHAs + the LUKS-header MAC + the
@@ -826,6 +873,16 @@ def start_launch(
         .values_list("state", flat=True)
         .first()
     )
+    if LaunchJob.objects.filter(
+        vm_id=intent.get("vm_id") or "", cancel_requested_at__isnull=False
+    ).exists():
+        # Decommissioned before its first launch created the row
+        # (`fence_launch_for_decommission`): the caller was told it is gone.
+        raise LaunchIntentError(
+            f"vm {intent.get('vm_id')!r} was decommissioned before it was launched — "
+            "launch under a fresh vm_id",
+            "conflict",
+        )
     if spent:
         raise LaunchIntentError(
             f"vm {intent.get('vm_id')!r} is {spent} — a decommissioned vm_id "
@@ -1038,6 +1095,89 @@ def start_launch(
     return job
 
 
+# ── §24 before the Vm row exists ─────────────────────────────────────
+
+#: `LaunchJob.reason` (and result outcome) of a launch a §24 cancelled.
+CANCELLED_BY_DECOMMISSION = "cancelled-by-decommission"
+
+#: [`fence_launch_for_decommission`] verdicts.
+FENCE_NO_LAUNCH = "no-launch"
+FENCE_CANCELLED = "cancelled"
+FENCE_RUNNING = "running"
+FENCE_VM_EXISTS = "vm-exists"
+
+
+def fence_launch_for_decommission(vm_id: str) -> str:
+    """A §24 for a vm_id that has no `Vm` row: fence its in-flight launch.
+
+    The launch is async and the worker creates the row only once it claims
+    the job, which may be minutes after the POST (one launch at a time).
+    A §24 answered "not found" meanwhile is read by its caller as "gone",
+    and the worker then launched a VM its owner had already deleted
+    (2026-10-08: eight days running, owned by nobody).
+
+    Under the row locks of every in-flight launch job for `vm_id` (the
+    lock `launch._ensure_vm_row` takes before it creates the row):
+
+    - the row exists after all ⇒ `FENCE_VM_EXISTS`; the caller runs §24;
+    - no in-flight launch ⇒ `FENCE_NO_LAUNCH`, nothing ever runs;
+    - a queued job is failed `cancelled-by-decommission` ⇒
+      `FENCE_CANCELLED`: no worker can claim it any more;
+    - a running job is marked `cancel_requested_at` ⇒ `FENCE_RUNNING`:
+      the worker refuses to create the row, but it may still be on its way
+      there, so the caller is told to ask again rather than told "gone".
+    """
+    from apps.lifecycle.models import Vm
+
+    now = timezone.now()
+    cancelled: list[LaunchJob] = []
+    running = False
+    with transaction.atomic():
+        jobs = list(
+            LaunchJob.objects.select_for_update()
+            .filter(vm_id=vm_id)
+            .exclude(state__in=TERMINAL_LAUNCH_STATES)
+        )
+        if Vm.objects.filter(vm_id=vm_id).exists():
+            return FENCE_VM_EXISTS
+        for job in jobs:
+            if job.state == LaunchJobState.QUEUED.value:
+                LaunchJob.objects.filter(
+                    id=job.id, version=job.version, state=LaunchJobState.QUEUED.value
+                ).update(
+                    state=LaunchJobState.FAILED.value,
+                    version=job.version + 1,
+                    finished_at=now,
+                    cancel_requested_at=now,
+                    reason=CANCELLED_BY_DECOMMISSION,
+                    result_json={"ok": False, "outcome": CANCELLED_BY_DECOMMISSION},
+                    phase=LaunchPhase.FAILED.value,
+                )
+                cancelled.append(job)
+            else:
+                running = True
+                if job.cancel_requested_at is None:
+                    LaunchJob.objects.filter(id=job.id).update(cancel_requested_at=now)
+    for job in cancelled:
+        log.warning(
+            "launch job %s: vm %s decommissioned before the launch ran — cancelled",
+            job.job_id,
+            vm_id,
+        )
+        try:
+            webhook.enqueue_launch_terminal(LaunchJob.objects.get(id=job.id))
+        except Exception as exc:  # noqa: BLE001 — webhook is non-load-bearing
+            log.warning("webhook enqueue skipped job=%s: %s", job.job_id, exc)
+    if running:
+        log.warning(
+            "vm %s: decommission requested while its launch runs, before the vm "
+            "row exists — the launch will not create it",
+            vm_id,
+        )
+        return FENCE_RUNNING
+    return FENCE_CANCELLED if cancelled else FENCE_NO_LAUNCH
+
+
 # ── worker ───────────────────────────────────────────────────────────
 
 
@@ -1137,6 +1277,16 @@ def run_job(job: LaunchJob) -> None:
                 on_phase=_phase_callback(job),
                 queued_for_s=(timezone.now() - job.started_at).total_seconds(),
             )
+        except launch.LaunchCancelled as exc:
+            log.warning("launch job %s: %s", job.job_id, exc)
+            _finish(
+                job,
+                LaunchJobState.FAILED,
+                reason=CANCELLED_BY_DECOMMISSION,
+                result={"ok": False, "outcome": CANCELLED_BY_DECOMMISSION},
+                phase=LaunchPhase.FAILED,
+            )
+            return
         except Exception as exc:
             # `launch_vm` can RAISE (e.g. `OrderDispatchUnavailable` when a
             # miner / the Edge is unreachable) rather than return a failed

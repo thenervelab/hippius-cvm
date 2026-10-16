@@ -302,6 +302,8 @@ KBS_ADMIN_WORKLOADS = (
     "Deployment/vali-orchestration-tick",
     "CronJob/synthetic-monitor-light",
     "CronJob/synthetic-monitor-full",
+    # The disk-tier probe's no-leak fallback teardown (the synthetic one).
+    "CronJob/disktier-probe",
 )
 
 _MTLS_ON = (
@@ -544,7 +546,9 @@ def test_public_ingress_publishes_the_cdn_prefix() -> None:
 def test_public_ingress_publishes_the_operator_paths_exactly() -> None:
     """The backend's support views reach vali through the public hostname,
     so each operator read is published — one EXACT path at a time, never
-    the `/v1/operator` prefix (it would publish every future route there)."""
+    the `/v1/operator` prefix (it would publish every future route there).
+    The one prefix, `/v1/operator/miners`, is pinned route by route in
+    `apps/disktier/tests/test_public_prefix.py`."""
     paths = {
         p.get("path")
         for doc in _docs()
@@ -553,7 +557,16 @@ def test_public_ingress_publishes_the_operator_paths_exactly() -> None:
         for p in rule["http"]["paths"]
     }
     operator = sorted(p for p in paths if p.rstrip("/").startswith("/v1/operator"))
-    assert operator == ["/v1/operator/fleet", "/v1/operator/nodes", "/v1/operator/regions"]
+    assert operator == [
+        "/v1/operator/disk-profiles",
+        "/v1/operator/fleet",
+        "/v1/operator/miners",
+        "/v1/operator/nodes",
+        "/v1/operator/regions",
+    ]
+    # No broader operator prefix: `/v1/operator` (or `/v1/operator/`) would
+    # publish everything under it.
+    assert not any(p.rstrip("/") == "/v1/operator" for p in paths)
     public = _configmap_data(_docs()).get("VALI_PUBLIC_API_PATHS", "").split(",")
     assert "/v1/operator/fleet" in public
 
@@ -890,3 +903,80 @@ def test_the_cdn_switches_default_off() -> None:
     off = _configmap_data(_docs(*(arg for s in sets for arg in ("--set", s))))
     for key in _CDN_SWITCHES:
         assert off[key] == "false", key
+
+
+@_needs_helm
+def test_the_disktier_cronjobs_ship_suspended_with_the_vali_identity() -> None:
+    """P1/P2: the passive evaluator and the GC render, SUSPENDED (Argo
+    deploys a chart merge at once, with whatever image is pinned), on the
+    vali pod identity the Postgres policy admits, and add no ConfigMap key
+    (`VALI_DISK_IO_INGEST` keeps its code default, off)."""
+    docs = _docs()
+    jobs = {
+        d["metadata"]["name"]: d
+        for d in docs
+        if d.get("kind") == "CronJob" and d["metadata"]["name"].startswith("disktier-")
+    }
+    assert set(jobs) == {"disktier-evaluate", "disktier-gc", "disktier-probe"}
+    commands = {
+        "disktier-evaluate": "vali_disktier_evaluate",
+        "disktier-gc": "vali_disktier_gc",
+        "disktier-probe": "vali_disk_probe",
+    }
+    for name, job in jobs.items():
+        assert job["spec"]["suspend"] is True, name
+        template = job["spec"]["jobTemplate"]["spec"]["template"]
+        assert template["metadata"]["labels"]["app.kubernetes.io/name"] == "vali", name
+        (container,) = template["spec"]["containers"]
+        assert container["command"] == ["python", "manage.py", commands[name]]
+    assert not [k for k in _configmap_data(docs) if k.startswith("VALI_DISK")]
+
+
+@_needs_helm
+def test_the_disk_probe_alerts_cannot_fire_while_the_probe_is_off() -> None:
+    """R1/R2: the probe's alert rules render, but every one is guarded on
+    a FRESH push with `hippius_disk_probe_enabled == 1` (the command pushes
+    nothing while VALI_DISK_PROBE_ENABLED is off, and its CronJob ships
+    suspended). `alerts.enabled=false` drops the rule object."""
+    docs = _docs()
+    (rule,) = [
+        d
+        for d in docs
+        if d.get("kind") == "PrometheusRule"
+        and d["metadata"]["name"] == "hippius-disktier-probe"
+    ]
+    alerts = {r["alert"]: r["expr"] for g in rule["spec"]["groups"] for r in g["rules"]}
+    assert set(alerts) == {
+        "DiskProbeFailing",
+        "DiskProbeSuspectCache",
+        "DiskProbeStale",
+        "MinerDiskSevere",
+    }
+    for name, expr in alerts.items():
+        assert "and on() (hippius_disk_probe_enabled == 1)" in expr, name
+        assert "time() - hippius_disk_probe_push_timestamp_seconds < 3600" in expr, name
+    (probe,) = [
+        d for d in docs if d.get("kind") == "CronJob" and d["metadata"]["name"] == "disktier-probe"
+    ]
+    assert probe["spec"]["suspend"] is True
+    off = _docs("--set", "disktierProbe.alerts.enabled=false")
+    assert not [d for d in off if d["metadata"].get("name") == "hippius-disktier-probe"]
+
+
+def test_the_stale_threshold_clears_the_longest_healthy_gap() -> None:
+    """A healthy node's next verified probe can land period + jitter +
+    start delay + timeout + linger after its last one; `DiskProbeStale`
+    must not fire inside that window."""
+    from django.conf import settings
+
+    values = yaml.safe_load(VALUES.read_text())
+    stale_s = values["disktierProbe"]["alerts"]["staleDays"] * 86400
+    gap = (
+        settings.VALI_DISK_PROBE_PERIOD_S
+        + settings.VALI_DISK_PROBE_PERIOD_JITTER_S
+        + settings.VALI_DISK_PROBE_START_DELAY_MAX_S
+        + settings.VALI_DISK_PROBE_LAUNCH_TIMEOUT_S
+        + settings.VALI_DISK_PROBE_TIMEOUT_S
+        + settings.VALI_DISK_PROBE_LINGER_MAX_S
+    )
+    assert stale_s > gap

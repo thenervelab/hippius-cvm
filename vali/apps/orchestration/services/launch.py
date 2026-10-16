@@ -769,6 +769,12 @@ class LaunchConfigError(Exception):
     """
 
 
+class LaunchCancelled(LaunchConfigError):
+    """A §24 asked for this vm_id while its launch job had not created the
+    `Vm` row yet (`launch_jobs.fence_launch_for_decommission`). The row is
+    never created: the caller was told the VM does not exist."""
+
+
 def _fresh_id(prefix: str, vm_id: str) -> str:
     return f"{prefix}-{vm_id}-{uuid.uuid4().hex[:8]}"
 
@@ -3564,6 +3570,7 @@ def _ensure_vm_row(spec: LaunchSpec) -> Any:
     # The row and its birth floor commit together: a retry (or a concurrent
     # launch) never sees a new VM without the floor of the release it boots.
     with transaction.atomic():
+        _refuse_cancelled_launch(spec.vm_id)
         vm, _created = Vm.objects.get_or_create(
             vm_id=spec.vm_id,
             defaults={
@@ -3631,6 +3638,37 @@ def _ensure_vm_row(spec: LaunchSpec) -> Any:
             "Launch under a fresh vm_id."
         )
     return vm
+
+
+def _refuse_cancelled_launch(vm_id: str) -> None:
+    """Inside `_ensure_vm_row`'s transaction: lock this vm_id's in-flight
+    launch jobs and refuse if a §24 cancelled one.
+
+    The decommission API takes the SAME row locks before it decides that
+    the VM does not exist (`launch_jobs.fence_launch_for_decommission`),
+    so exactly one of the two wins: either the row is created first and
+    the §24 sees it, or the cancel lands first and the row is never
+    created. On 2026-10-08 the §24 of a queued launch answered "not found",
+    the caller filed the VM as gone, and the worker launched it minutes
+    later: a VM nobody owned, running for eight days.
+
+    A vm_id is cancelled for good, like a destroyed one: a later launch
+    job for it (a caller retrying its lost launch POST) is refused too.
+    """
+    from apps.orchestration.models import TERMINAL_LAUNCH_STATES, LaunchJob
+
+    # Lock first, read after: the read must see a cancel committed while
+    # this waited for the lock.
+    list(
+        LaunchJob.objects.select_for_update()
+        .filter(vm_id=vm_id)
+        .exclude(state__in=TERMINAL_LAUNCH_STATES)
+    )
+    if LaunchJob.objects.filter(vm_id=vm_id, cancel_requested_at__isnull=False).exists():
+        raise LaunchCancelled(
+            f"vm {vm_id!r}: a decommission was requested before the launch "
+            "created the vm — not launched"
+        )
 
 
 def _assert_per_vm_base(vm_id: str, data_path: str, hash_path: str) -> None:
