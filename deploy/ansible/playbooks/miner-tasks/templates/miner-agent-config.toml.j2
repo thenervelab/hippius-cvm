@@ -60,8 +60,8 @@ s3_bucket = "{{ image.s3_bucket }}"
 # interface ONLY — the miner-agent rejects any bind_addr outside the
 # NetBird CGNAT range (100.64.0.0/10). `miner_netbird_ip` is the
 # miner's own NetBird address, auto-discovered at mesh join by
-# `netbird-agent.yml` (falls back to the `orders_bind_ip` placeholder
-# only if discovery failed); the port is `orders.port` from group_vars.
+# `netbird-agent.yml` (the host_vars `orders_bind_ip` is used only when
+# play 04 is not part of the run); the port is `orders.port` from group_vars.
 bind_addr = "{{ miner_netbird_ip | default(orders_bind_ip) }}:{{ orders.port }}"
 
 {# CVM budget, derived from facts (group_vars `host_cvm`); the
@@ -72,6 +72,7 @@ bind_addr = "{{ miner_netbird_ip | default(orders_bind_ip) }}:{{ orders.port }}"
 {% set _cvm_mem = (ansible_memtotal_mb | int) - (host_cvm.reserve_memory_mb | int) %}
 {% set _cvm_disk = (miner_data_fs_gb | int) - (host_cvm.reserve_disk_gb | int) %}
 {% set _ov = host_cvm_overrides | default({}) %}
+{% set _disk_budget = [_cvm_disk, _ov.disk_gb_budget_max | default(_cvm_disk) | int] | min %}
 [host]
 # CPU / RAM the host allots to tenant CVMs — a deliberate RESERVATION
 # (headroom is kept for the host OS + miner-agent), not the full
@@ -86,7 +87,7 @@ cvm_memory_mb_budget = {{ [_cvm_mem, _ov.memory_mb_budget_max | default(_cvm_mem
 # use it to LOWER its own disk ledger. Independently, the agent always
 # refuses a disk the filesystem cannot physically hold.
 # Derived: {{ miner_data_fs_mount }} is {{ miner_data_fs_gb }} GiB − {{ host_cvm.reserve_disk_gb }} (group_vars `host_cvm`).
-cvm_disk_gb_budget = {{ [_cvm_disk, _ov.disk_gb_budget_max | default(_cvm_disk) | int] | min }}
+cvm_disk_gb_budget = {{ _disk_budget }}
 # Leave the tenant CVMs RUNNING when the agent stops: a `systemctl
 # restart`/upgrade is then transparent to tenants and the new process
 # re-adopts them at startup. Without it a graceful stop force-stops
@@ -117,6 +118,13 @@ schema_host_health = true
 # schema_host_health, and a vali that accepts v6. Rendered only when
 # enabled — an agent older than the key refuses it.
 schema_agent_version = true
+{% endif %}
+{% if miner_heartbeat_emit_pools | default(false) | bool %}
+# Storage pools: emit the v7 heartbeat (v6 + each pool's state, its
+# dedicated disks and the storage config revision). Needs
+# schema_agent_version, and a vali that accepts v7. Rendered only when
+# enabled — an agent older than the key refuses it.
+emit_pools = true
 {% endif %}
 
 {% if miner_kbs_endpoint is defined %}
@@ -186,6 +194,45 @@ data_disk_root = "{{ miner_data_disk_root }}"
 # the file whose LOSS permanently bricks a VM (no counter ⇒ the KBS
 # refuses the KEK), so put it somewhere durable rather than somewhere fast.
 state_disk_root = "{{ miner_state_disk_root }}"
+{% set _pools = miner_storage_pools | default([]) %}
+{% if _pools | length > 0 %}
+
+# Storage pools (`miner_storage_pools`). `default` is `data_disk_root`
+# above, budgeted exactly as `[host] cvm_disk_gb_budget` (the agent
+# refuses anything else). Every other pool is mounted or bind-mounted at
+# {{ miner_agent.state_dir }}/pools/<id> by this play: the agent's sandbox
+# can write there and nowhere else. Rendered only when pools are declared —
+# an agent older than the section refuses it.
+[[storage.pools]]
+id = "default"
+path = "{{ miner_data_disk_root }}"
+class = "{{ miner_storage_default_class | default('nvme') }}"
+budget_gb = {{ _disk_budget }}
+{% for pool in _pools %}
+
+[[storage.pools]]
+id = "{{ pool.id }}"
+path = "{{ miner_agent.state_dir }}/pools/{{ pool.id }}"
+class = "{{ pool.class }}"
+budget_gb = {{ pool.budget_gb | int }}
+{% if not (pool.os_disks | default(true) | bool) %}
+os_disks = false
+{% endif %}
+{% if pool.state | default('active') == 'draining' %}
+state = "draining"
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for disk in miner_storage_dedicated_disks | default([]) %}
+
+# A whole disk offered for passthrough (`miner_storage_dedicated_disks`),
+# by its /dev/disk/by-id/ name. The agent only inspects and reports it.
+[[storage.dedicated_disks]]
+id = "{{ disk.id }}"
+{% if disk.state | default('active') == 'draining' %}
+state = "draining"
+{% endif %}
+{% endfor %}
 
 # [backup]
 # HOST budget for the QEMU copies of live backups, bytes/s (0 = uncapped).

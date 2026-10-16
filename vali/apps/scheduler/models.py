@@ -414,6 +414,14 @@ class MinerCapacity(models.Model):
     max_booting = models.PositiveIntegerField(null=True, blank=True, default=None)
     cordoned_at = models.DateTimeField(null=True, blank=True, default=None)
     cordon_reason = models.CharField(max_length=256, blank=True, default="", db_default="")
+    # ── external-miner approval (`apps.scheduler.approval`). `approved_at`
+    # NULL = pending approval: while `VALI_MINER_APPROVAL_REQUIRED` is on the
+    # miner is held out of new placements through the cordon gate. Set by the
+    # approve step (operator) or, while the switch is off, on first sight;
+    # every row older than the switch was grandfathered (migration 0021).
+    # `approved_by` is the audit actor that approved it.
+    approved_at = models.DateTimeField(null=True, blank=True, default=None)
+    approved_by = models.CharField(max_length=128, blank=True, default="", db_default="")
     observed_epoch = models.BigIntegerField()
     data_epoch = models.BigIntegerField()
     refreshed_at = models.DateTimeField()

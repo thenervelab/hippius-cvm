@@ -896,6 +896,7 @@ fn order(vm: &str, ep: Option<&str>) -> LaunchOrder {
         guardian_ep: ep.map(String::from),
         net: None,
         on_guest_poweroff: None,
+        os_pool: None,
     }
 }
 

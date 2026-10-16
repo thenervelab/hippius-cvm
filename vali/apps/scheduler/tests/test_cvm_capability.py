@@ -581,6 +581,9 @@ def test_these_rejections_count_against_the_host(classifier) -> None:
         "order-stale",
         "order-wrong-miner",
         "net-policy-not-loaded",
+        # The VM's pool record (A4): missing for a VM that ran, or not
+        # readable/writable — refused before any domain start.
+        "vm-pool-record",
     ],
 )
 def test_these_rejections_say_nothing_about_the_host(classifier) -> None:

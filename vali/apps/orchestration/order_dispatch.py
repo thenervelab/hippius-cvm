@@ -550,6 +550,7 @@ def build_launch_payload(
     require_existing_disks: bool = False,
     net: dict[str, Any] | None = None,
     on_guest_poweroff: str | None = None,
+    os_pool: str | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a ``launch`` order — mirrors the
     Rust ``LaunchOrder`` shape.
@@ -616,6 +617,10 @@ def build_launch_payload(
         payload["net"] = net
     if on_guest_poweroff is not None:
         payload["on_guest_poweroff"] = on_guest_poweroff
+    # A4b: the pool a first launch puts the disk on (`apps.disktier.routing`),
+    # only for an agent that takes the key; absent ⇒ `default`.
+    if os_pool:
+        payload["os_pool"] = os_pool
     return payload
 
 
@@ -681,6 +686,7 @@ def build_migrate_activate_payload(
     settle_by_unix: int = 0,
     staged_restore_id: str = "",
     net: dict[str, Any] | None = None,
+    os_pool: str | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a §25 M4 ``migrate-activate`` order —
     mirrors the Rust ``MigrateActivateOrder`` shape.
@@ -766,4 +772,8 @@ def build_migrate_activate_payload(
     # destination. Omitted when unset (agents deploy first).
     if net is not None:
         payload["net"] = net
+    # A4b: the pool the arriving VM's disks are written to when the dest
+    # holds no record of it (`apps.disktier.routing`); absent ⇒ `default`.
+    if os_pool:
+        payload["os_pool"] = os_pool
     return payload

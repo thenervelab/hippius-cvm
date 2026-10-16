@@ -886,6 +886,19 @@ def test_dispatch_migrate_activate_passes_settle_by_to_the_payload(
         settle_by_unix=1_790_000_000,
     )
     assert built[0]["settle_by_unix"] == 1_790_000_000
+    # A4b: the dest's pool reaches the body (`effects._arrival_os_pool`).
+    assert built[0]["os_pool"] is None
+    monkeypatch.setattr(effects, "_arrival_os_pool", lambda miner_id, cmdline: "nvme0")
+    fx.real["dispatch_migrate_activate"](
+        vm,
+        dest_node_id="node-dst",
+        new_gen=job.new_gen,
+        get_url="https://s3/x",
+        boot_artifacts=None,
+        job_id=job.job_id,
+        attempt=1,
+    )
+    assert built[1]["os_pool"] == "nvme0"
 
 
 # ─── the failure the recovery is FOR, end to end ─────────────────────

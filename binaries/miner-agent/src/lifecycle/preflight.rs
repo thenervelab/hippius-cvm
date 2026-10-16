@@ -240,6 +240,8 @@ async fn run_inner(order: TenantPreflightOrder, policy: StagePolicy) -> Result<P
         rootfs_hash,
         cmdline,
         cpu_count,
+        // The pool is the disk gates' concern (`handle_tenant_preflight`).
+        os_pool: _,
     } = order;
 
     if !ovmf_path.is_file() {

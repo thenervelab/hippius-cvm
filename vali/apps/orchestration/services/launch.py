@@ -47,6 +47,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from apps.cdn import identity as cdn_identity
+from apps.disktier import routing as disk_routing
 from apps.miners.models import MinerIdentity
 from apps.network import net_policy
 from apps.orchestration import effects, kbs_admin, order_dispatch, power_policy
@@ -760,6 +761,14 @@ class LaunchOutcome:
     # register and the dispatch too — those used to say `False`, which
     # claimed the KBS had not been touched when it had.
     registered: bool = False
+    # A4b: the pool this launch put the OS disk on (`apps.disktier.routing`),
+    # `None` = `default` — only for a launch the miner STARTED (not an
+    # `already-launched`, whose disk is an earlier attempt's). Recorded on
+    # the placement once it binds.
+    os_pool: str | None = None
+    # The pool this attempt's order named, whatever came of it: a same-miner
+    # retry names the same one (never a second choice under one VM).
+    chosen_os_pool: str | None = None
 
 
 class LaunchConfigError(Exception):
@@ -974,6 +983,41 @@ def _record_netbird_key(
         persistent=persistent,
         expires_at=timezone.now() + timedelta(seconds=ttl_s),
     )
+
+
+#: `launch_on_miner(os_pool=…)` not given: choose one.
+_CHOOSE_OS_POOL = object()
+
+
+def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
+    """`apps.disktier.routing.choose_os_pool` for this launch; any failure
+    is `default` (logged), never a failed launch."""
+    try:
+        return disk_routing.choose_os_pool(miner.chain_node_id or "", _os_disk_need_gb(spec))
+    except Exception:
+        log.exception("launch: vm_id=%s os pool choice failed — using default", spec.vm_id)
+        return None
+
+
+def _retry_os_pool(out: LaunchOutcome) -> str | None:
+    """The pool a same-miner dispatch retry names: the first attempt's,
+    unless the miner refused that pool (`insufficient-disk:<pool>` /
+    `pool-unavailable:<pool>`, before it recorded anything) — then
+    `default`."""
+    from apps.scheduler import cvm_capability
+
+    classifier = str((out.emit or {}).get("classifier") or "")
+    if cvm_capability.is_pool_refusal(classifier):
+        return None
+    return out.chosen_os_pool
+
+
+def _os_disk_need_gb(spec: LaunchSpec) -> int:
+    """What the OS disk takes on its pool: the data disk plus the rootfs,
+    as the placement commits it."""
+    from apps.orchestration.services.flavors import ROOTFS_DISK_GB
+
+    return data_disk_gb(spec) + ROOTFS_DISK_GB
 
 
 def data_disk_gb(spec: LaunchSpec) -> int:
@@ -1249,6 +1293,7 @@ def launch_on_miner(
     require_existing_disks: bool = False,
     supersede: bool = False,
     launch_ref: str = "",
+    os_pool: str | None | object = _CHOOSE_OS_POOL,
 ) -> LaunchOutcome:
     """Run the full launch choreography for ONE miner. Never raises for a
     step failure — returns a typed [`LaunchOutcome`]; raises
@@ -1308,6 +1353,17 @@ def launch_on_miner(
         )
     except power_policy.PowerPolicyRefused as exc:
         return _terminal(exc.reason, exc.detail, EXIT_CONFIG_ERROR)
+    # A4b: a FIRST golden launch goes to the node's best pool other than
+    # `default` when its agent takes `os_pool`; a relaunch never names one
+    # (the miner keeps the pool its record names), nor does a legacy launch
+    # (the agent keeps those on `default`). The preflight checks the same
+    # pool the launch then uses.
+    # A same-miner retry passes the pool its first attempt named
+    # (`os_pool`), so one VM never gets two choices.
+    if require_existing_disks or spec.disk_mode != _DISK_MODE_GOLDEN_VERITY:
+        os_pool = None
+    elif os_pool is _CHOOSE_OS_POOL:
+        os_pool = _choose_os_pool(miner, spec)
     # The CDN role (`apps.cdn.identity`): a CDN node's launch carries the
     # role in its ticket, cmdline and pin class. Refused before any row,
     # secret or pin exists when it must not run, or would boot anything but
@@ -1696,6 +1752,7 @@ def launch_on_miner(
             cmdline=augmented_cmdline,
             cpu_count=flavor.cpu_count,
             artifacts=_preflight_artifacts,
+            os_pool=os_pool,
         )
     except (EffectUnavailable, EffectError) as exc:
         # A preflight rejection means THIS miner could not stage/verify
@@ -2093,6 +2150,7 @@ def launch_on_miner(
             miner_id=miner.miner_id, vm_id=spec.vm_id, flavor=spec.flavor
         ),
         on_guest_poweroff=poweroff_field,
+        os_pool=os_pool,
     )
     import json as _json
 
@@ -2336,6 +2394,8 @@ def launch_on_miner(
         cose_ticket=cose_ticket if result.ok else None,
         ticket_id=ticket_id if result.ok else None,
         registered=True,
+        os_pool=os_pool if result.ok and result.classifier != _ALREADY_LAUNCHED else None,
+        chosen_os_pool=os_pool,
     )
 
 
@@ -2776,7 +2836,7 @@ def _place_and_launch(
             )
             time.sleep(dispatch_retry_backoff_s())
             dispatched.extend(_candidate_of(spec, out))
-            out = launch_on_miner(spec, miner)
+            out = launch_on_miner(spec, miner, os_pool=_retry_os_pool(out))
         if answered_already_launched(out):
             _await_the_attested_boot(
                 spec.vm_id, out, [*_earlier_dispatched_boots(spec.vm_id), *dispatched]
@@ -4017,6 +4077,35 @@ def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
             "transition) — launch dispatched, placement left as-is",
             placement.id,
         )
+        return
+    if out.os_pool:
+        try:
+            _record_os_pool(placement, out.os_pool)
+        except Exception:
+            # The launch succeeded: a missing row only costs the per-pool
+            # attribution of its disk stats (`default` is assumed).
+            log.exception(
+                "launch bind: placement=%s os pool %s not recorded", placement.id, out.os_pool
+            )
+
+
+def _record_os_pool(placement: Any, pool_id: str) -> None:
+    """A4b: the placement's OS disk is on `pool_id` (a placement without
+    a row is on `default`). Sized as the placement commits it; the tier is
+    the one every OS disk is sold at today (no tier choice yet)."""
+    from apps.disktier.models import OS_SLOT, DiskKind, DiskTier, PlacementDisk
+    from apps.scheduler.service import placement_disk_gb
+
+    PlacementDisk.objects.get_or_create(
+        placement_id=placement.id,
+        slot=OS_SLOT,
+        defaults={
+            "kind": DiskKind.POOL,
+            "pool_id": pool_id,
+            "size_gb": placement_disk_gb(placement.resource_class, placement.data_disk_gb),
+            "required_tier": DiskTier.NVME,
+        },
+    )
 
 
 def _fail_placement(placement: Any, *, reason: str) -> None:

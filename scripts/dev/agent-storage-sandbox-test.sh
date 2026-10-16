@@ -18,6 +18,12 @@ if ! command -v systemd-run >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
     exit 0
 fi
 
+# It writes (and removes) files at the agent's real paths: never on a miner.
+if [[ -e /etc/hippius-miner/config.toml || -e /var/lib/hippius-miner/identity.key ]]; then
+    echo "agent-storage-sandbox-test: REFUSED — this host runs a miner agent" >&2
+    exit 1
+fi
+
 AGENT=/usr/local/bin/hippius-miner-agent-sbxtest
 WORK=/var/lib/hippius-miner-sbxtest   # not /tmp, /root: private / hidden in the sandbox
 POOL=/var/lib/hippius-miner/pools/nvme0
@@ -27,7 +33,9 @@ ok() { echo "ok   $*"; }
 
 cleanup() {
     sudo umount "${POOL}" 2>/dev/null || true
-    sudo rm -f "${WORK}/pool.img" "${WORK}/config.toml" "${WORK}/facts.json" "${AGENT}"
+    sudo rm -f "${WORK}/pool.img" "${WORK}/config.toml" "${WORK}/facts.json" "${AGENT}" \
+        /etc/hippius-miner/candidate.toml /root/sbxtest-candidate.toml /run/hippius-miner/disk-facts.json
+    sudo rmdir /etc/hippius-miner /run/hippius-miner 2>/dev/null || true
     sudo rmdir "${WORK}/hdd0" "${WORK}" "${POOL}" 2>/dev/null || true
     sudo rmdir /var/lib/hippius-miner/pools /var/lib/hippius-miner 2>/dev/null || true
 }
@@ -152,6 +160,28 @@ then
     ok "outside ReadWritePaths: pool-path-read-only"
 else
     err "nvme0 not reported read-only: ${out}"
+fi
+
+# The operator doc's own commands (onboarding-a-miner.md): the candidate in
+# /etc/hippius-miner, the facts at the default /run/hippius-miner path. And
+# the trap the doc warns about: a config under /root reads as missing.
+sudo mkdir -p /etc/hippius-miner /run/hippius-miner
+sudo cp "${WORK}/config.toml" /etc/hippius-miner/candidate.toml
+sudo cp "${WORK}/config.toml" /root/sbxtest-candidate.toml
+sudo "${AGENT}" storage-collect --out /run/hippius-miner/disk-facts.json
+if out="$(sudo systemd-run --quiet --wait --pipe --collect "${props[@]}" \
+    -p ReadWritePaths=/var/lib/hippius-miner \
+    "${AGENT}" storage-check --config /etc/hippius-miner/candidate.toml)" \
+    && python3 -c 'import json,sys; r=json.loads(sys.argv[1]); sys.exit(r["storage_error"] is not None or r["disk_facts_error"] is not None)' "${out}"; then
+    ok "the doc's storage-check command works as written"
+else
+    err "the doc's storage-check command failed: ${out:-}"
+fi
+if sudo systemd-run --quiet --wait --pipe --collect "${props[@]}" \
+    "${AGENT}" storage-check --config /root/sbxtest-candidate.toml >/dev/null 2>&1; then
+    err "a config under /root was readable in the sandbox (the doc says it is not)"
+else
+    ok "a config under /root is hidden by the sandbox"
 fi
 
 # The sandbox is real: no /dev/disk, no block device.

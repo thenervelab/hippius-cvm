@@ -122,26 +122,55 @@ pub fn bitmap_name(run_id: &str) -> String {
 pub struct SpaceLedger {
     /// `Some`: this ledger's own counter. `None`: the host counter.
     own: Option<Mutex<u64>>,
-    /// Whose per-VM disks' tails come off the free space (`None`: none).
-    miner_root: Option<PathBuf>,
+    /// The pool roots whose per-VM disks' tails come off the free space
+    /// (`None`: none): those on the written directory's filesystem.
+    roots: Option<DiskRoots>,
+}
+
+/// The pool roots of a host (`default` and every other pool a VM's disks
+/// may be on), read at each reservation: pools change at run time.
+#[derive(Clone)]
+pub struct DiskRoots(std::sync::Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>);
+
+impl DiskRoots {
+    pub fn new(roots: impl Fn() -> Vec<PathBuf> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(roots))
+    }
+
+    /// The roots now.
+    pub fn list(&self) -> Vec<PathBuf> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for DiskRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.list()).finish()
+    }
 }
 
 impl Default for SpaceLedger {
     fn default() -> Self {
         Self {
             own: Some(Mutex::new(0)),
-            miner_root: None,
+            roots: None,
         }
     }
 }
 
 impl SpaceLedger {
     /// The host ledger over the per-VM disks under `miner_root`
-    /// (`[storage] data_disk_root`).
+    /// (`[storage] data_disk_root`) only.
     pub fn host(miner_root: impl Into<PathBuf>) -> Self {
+        let root: PathBuf = miner_root.into();
+        Self::host_pools(DiskRoots::new(move || vec![root.clone()]))
+    }
+
+    /// The host ledger over the per-VM disks of every pool in `roots`.
+    pub fn host_pools(roots: DiskRoots) -> Self {
         Self {
             own: None,
-            miner_root: Some(miner_root.into()),
+            roots: Some(roots),
         }
     }
 
@@ -156,9 +185,13 @@ impl SpaceLedger {
 
     /// Bytes still free on `dir`'s filesystem with `reserved` held.
     fn unreserved(&self, dir: &Path, reserved: u64) -> Result<u64> {
-        match &self.miner_root {
-            Some(root) => crate::lifecycle::disk_space::headroom_bytes(reserved, root, dir)
-                .map_err(MinerAgentError::Backup),
+        match &self.roots {
+            // The tails of the disks on `dir`'s filesystem, whichever
+            // pool root they are under.
+            Some(roots) => {
+                crate::lifecycle::disk_space::headroom_bytes_over(reserved, &roots.list(), dir)
+                    .map_err(MinerAgentError::Backup)
+            }
             None => Ok(free_bytes(dir)?.saturating_sub(reserved)),
         }
     }
@@ -1761,6 +1794,32 @@ mod tests {
         assert!(SpaceLedger::default()
             .reserve(tmp.path(), 1 << 30, 0)
             .is_ok());
+    }
+
+    /// A4b: a write into a VM's pool competes with the disks of THAT
+    /// pool — the host ledger counts every pool root, not only `default`.
+    #[test]
+    fn the_host_ledger_counts_the_disks_of_every_pool() {
+        let _tight = crate::lifecycle::disk_space::tight_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (default_root, pool_root) = (tmp.path().join("default"), tmp.path().join("nvme0"));
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::create_dir_all(&pool_root).unwrap();
+        promise_all_but(&pool_root, 512 << 20);
+        let backup = pool_root.join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        // Over `default` alone the pool's promised space looks free.
+        assert!(SpaceLedger::host(&default_root)
+            .reserve(&backup, 1 << 30, 0)
+            .is_ok());
+        let roots = (default_root.clone(), pool_root.clone());
+        let ledger = SpaceLedger::host_pools(DiskRoots::new(move || {
+            vec![roots.0.clone(), roots.1.clone()]
+        }));
+        assert!(matches!(
+            ledger.reserve(&backup, 1 << 30, 0).unwrap_err(),
+            MinerAgentError::Backup("insufficient-space")
+        ));
     }
 
     #[test]

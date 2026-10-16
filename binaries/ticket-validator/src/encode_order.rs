@@ -421,6 +421,7 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
             Value::Text(policy.into()),
         ));
     }
+    push_os_pool(&mut entries, obj)?;
     Ok(Value::Map(entries))
 }
 
@@ -545,6 +546,29 @@ fn guardian_ep_field(
         (Some(_), None) => Err("guardian-ep-missing"),
         (Some(b), Some(ep)) if b.endpoint == ep => Ok(Some(ep.to_wire())),
         (Some(_), Some(_)) => Err("guardian-ep-mismatch"),
+    }
+}
+
+/// `os_pool` (A4b) — the storage pool a first launch / an arrival puts
+/// the VM's disk on: a pool id (`[a-z0-9-]{1,32}`), mirroring the
+/// miner-agent's `LaunchOrder::os_pool`. Absent / null ⇒ not emitted, so
+/// an order without it is byte-identical to before.
+fn push_os_pool(
+    entries: &mut Vec<(Value, Value)>,
+    obj: &serde_json::Map<String, Json>,
+) -> Result<(), &'static str> {
+    match obj.get("os_pool") {
+        None | Some(Json::Null) => Ok(()),
+        Some(Json::String(id))
+            if (1..=32).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+        {
+            entries.push((Value::Text("os_pool".into()), Value::Text(id.clone())));
+            Ok(())
+        }
+        Some(_) => Err("bad-os-pool"),
     }
 }
 
@@ -758,6 +782,7 @@ fn build_migrate_activate(obj: &serde_json::Map<String, Json>) -> Result<Value, 
     }
     push_guardian_ep(&mut entries, guardian_ep);
     push_net(&mut entries, net_field(obj)?);
+    push_os_pool(&mut entries, obj)?;
     // Staged restore — emitted only when set, so every other activation
     // stays byte-identical and an older agent is never sent the key.
     if let Some(rid) = staged_restore_id {
@@ -1648,6 +1673,9 @@ fn build_tenant_preflight(obj: &serde_json::Map<String, Json>) -> Result<Value, 
         (Value::Text("luks_disk".into()), luks_disk),
         (Value::Text("ovmf_path".into()), Value::Text(ovmf_path)),
     ];
+    // A4b: the pool the launch will use, so the miner's disk gates check
+    // it. Emitted only when set.
+    push_os_pool(&mut entries, obj)?;
     // golden-bake PR4: `rootfs_hash` (the golden dm-verity hash tree) is
     // OPTIONAL — emitted only when the caller supplies it (a GOLDEN-mode
     // launch). Absent on the LEGACY path, so the legacy preflight CBOR is
@@ -3990,6 +4018,73 @@ mod tests {
                 .find(|(k, _)| k.as_text() == Some("on_guest_poweroff"))
                 .and_then(|(_, v)| v.as_text());
             assert_eq!(got, Some(policy));
+        }
+    }
+
+    fn payload_text(bytes: &[u8], key: &str) -> Option<String> {
+        let v: Value = ciborium::de::from_reader(bytes).unwrap();
+        let Value::Map(top) = v else { panic!() };
+        let Some((_, Value::Map(payload))) =
+            top.iter().find(|(k, _)| k.as_text() == Some("payload"))
+        else {
+            panic!("no payload");
+        };
+        payload
+            .iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .and_then(|(_, v)| v.as_text())
+            .map(str::to_string)
+    }
+
+    /// A4b: `os_pool` on a launch, a §25 activation and a tenant preflight
+    /// — emitted only when set (absent / null is byte-identical), a pool
+    /// id only, never dropped when malformed.
+    #[test]
+    fn os_pool_is_carried_only_when_set_and_refused_when_malformed() {
+        let plain = build(&args("g", "launch"), launch_payload()).unwrap();
+        assert_eq!(payload_text(&plain, "os_pool"), None);
+        let null = launch_json_with("console=hvc0", "\"os_pool\": null,");
+        assert_eq!(build(&args("g", "launch"), null.as_bytes()).unwrap(), plain);
+        let json = launch_json_with("console=hvc0", "\"os_pool\": \"nvme0\",");
+        let bytes = build(&args("g", "launch"), json.as_bytes()).unwrap();
+        assert_canonical(&bytes).unwrap();
+        assert_eq!(payload_text(&bytes, "os_pool").as_deref(), Some("nvme0"));
+        for bad in [
+            "\"NVMe0\"",
+            "\"\"",
+            "\"../x\"",
+            "7",
+            &format!("\"{}\"", "a".repeat(33)),
+        ] {
+            let json = launch_json_with("console=hvc0", &format!("\"os_pool\": {bad},"));
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                "bad-os-pool",
+                "{bad}"
+            );
+        }
+
+        for kind in ["migrate-activate", "tenant-preflight"] {
+            let mut payload: Json = match kind {
+                "migrate-activate" => serde_json::from_slice(migrate_activate_payload()).unwrap(),
+                _ => serde_json::from_str(&golden_preflight_json(true)).unwrap(),
+            };
+            let plain = build(&args("g", kind), &serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(payload_text(&plain, "os_pool"), None, "{kind}");
+            payload["os_pool"] = "nvme0".into();
+            let bytes = build(&args("g", kind), &serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_canonical(&bytes).unwrap();
+            assert_eq!(
+                payload_text(&bytes, "os_pool").as_deref(),
+                Some("nvme0"),
+                "{kind}"
+            );
+            payload["os_pool"] = "Bad".into();
+            assert_eq!(
+                build(&args("g", kind), &serde_json::to_vec(&payload).unwrap()).unwrap_err(),
+                "bad-os-pool",
+                "{kind}"
+            );
         }
     }
 

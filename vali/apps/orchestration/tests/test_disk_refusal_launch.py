@@ -96,6 +96,13 @@ def test_a_pool_refusal_is_neither_a_capacity_cut_nor_a_start_failure(classifier
         ("migration/dest-insufficient-disk", False),
         ("migration/dest-pool-unavailable", False),
         ("migration/dest-launch-failed", True),
+        # A launch refused on the VM's pool record (`dest_launch_failure`,
+        # pinned there by `a_dest_launch_disk_refusal_keeps_its_class`).
+        ("migration/dest-vm-pool-record", False),
+        # The arriving VM's pool record could not be written or read
+        # (A4, `CvmLifecycle::place_arriving`): before any download or boot.
+        ("vm-pool-record-unwritable", False),
+        ("vm-pool-record-unreadable", False),
     ],
 )
 def test_a_dest_activation_disk_or_pool_refusal_is_not_a_start_failure(

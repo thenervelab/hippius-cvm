@@ -1568,8 +1568,21 @@ pub async fn activate_dest_with_chain(
     //     `ensure_overlay_disk` find it already present and PRESERVE it
     //     (never reformat) → the guest unlocks the migrated data. Still
     //     ciphertext end-to-end (the miner never holds the key).
+    //
+    //     The overlay goes to the VM's pool: its record when it has one (a
+    //     migrate-back, an in-place restore), else the launch pool —
+    //     recorded `ran` BEFORE anything is written (legacy too: its boot
+    //     disk is the order's, its state disk is restored), so the launch
+    //     below and every later relaunch find these disks and never
+    //     create blank ones.
+    let arriving_root = lifecycle.place_arriving(
+        &vm_id,
+        order.os_pool.as_deref(),
+        crate::orders::handler::parse_disk_gb_token(&order.cmdline),
+        !is_golden,
+    )?;
     let disk_path = if is_golden {
-        lifecycle.golden_overlay_path(&vm_id)
+        crate::lifecycle::golden::overlay_disk_path(&arriving_root, &vm_id)
     } else {
         order.luks_disk_path.clone()
     };
@@ -1692,7 +1705,7 @@ pub async fn activate_dest_with_chain(
                 restorer
                     .restore(
                         chain,
-                        &lifecycle.backup_dir(&vm_id).join("chain-restore"),
+                        &lifecycle.backup_dir(&vm_id)?.join("chain-restore"),
                         &disk_path,
                         &lifecycle.state_disk_path(&vm_id),
                         expected,
@@ -1837,7 +1850,7 @@ async fn activate_staged(
     } else {
         let gb = crate::orders::handler::parse_disk_gb_token(&order.cmdline);
         let expected = (gb > 0).then(|| u64::from(gb) * (1u64 << 30));
-        let paths = staged::RestorePaths::for_vm(lifecycle, &vm_id, &rid);
+        let paths = staged::RestorePaths::for_vm(lifecycle, &vm_id, &rid)?;
         // Re-proven under the restore lock, right before the first rename.
         let domain_down = async {
             let tracked = lifecycle
@@ -2011,6 +2024,10 @@ pub fn dest_launch_failure(class: &str) -> MinerAgentError {
         MinerAgentError::Migration("dest-insufficient-disk")
     } else if class.starts_with("pool-unavailable:") {
         MinerAgentError::Migration("dest-pool-unavailable")
+    } else if class == "vm-pool-record" {
+        // The VM's pool record could not be read or written: refused
+        // before any domain start, not a statement about SEV.
+        MinerAgentError::Migration("dest-vm-pool-record")
     } else {
         MinerAgentError::Migration("dest-launch-failed")
     }
@@ -2218,6 +2235,14 @@ mod tests {
             (
                 MinerAgentError::PoolUnavailable("pool-unavailable:hdd0"),
                 "migration/dest-pool-unavailable",
+            ),
+            (
+                MinerAgentError::VmPoolRecord("unwritable"),
+                "migration/dest-vm-pool-record",
+            ),
+            (
+                MinerAgentError::VmPoolRecord("unreadable"),
+                "migration/dest-vm-pool-record",
             ),
             (
                 MinerAgentError::InsufficientResources,
@@ -2653,7 +2678,9 @@ mod tests {
         }
     }
 
-    fn test_lifecycle() -> CvmLifecycle {
+    /// Not rooted: only [`test_lifecycle_rooted`] may hand it out — a test
+    /// must never read or write the real `/var/lib/hippius-miner`.
+    fn unrooted_lifecycle() -> CvmLifecycle {
         CvmLifecycle::new(
             Arc::new(MockLibvirtDriver::new()),
             Arc::new(MockLaunchDigest::fixed([0u8; 48])),
@@ -2671,7 +2698,7 @@ mod tests {
     /// resolves inside a tempdir instead of the real
     /// `/var/lib/hippius-miner`.
     fn test_lifecycle_rooted(root: &std::path::Path) -> CvmLifecycle {
-        test_lifecycle().with_state_disk_root(root.to_path_buf())
+        unrooted_lifecycle().with_state_disk_root(root.to_path_buf())
     }
 
     /// Build a `migrate-activate` order whose boot artifacts point at
@@ -2714,6 +2741,7 @@ mod tests {
             guardian_ep: None,
             settle_by_unix: 0,
             net: None,
+            os_pool: None,
         }
     }
 
@@ -2753,7 +2781,7 @@ mod tests {
         sha: String,
     ) -> (Result<String>, usize, bool) {
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
         order.snapshot_size = size;
@@ -2811,7 +2839,7 @@ mod tests {
         // verifies it, fetches the VOLUME again, and leaves the state disk
         // that attempt restored alone (the guest may have advanced it).
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
         order.state_get_url = "https://s3.example/state?sig=y".to_string();
@@ -2909,7 +2937,7 @@ mod tests {
         // Through `activate_dest`: the host ledger (tails of this host's
         // disks + every in-flight reservation) gates the download.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
         // A live VM's sparse disk on this host is promised all but 512 MiB
@@ -2982,7 +3010,7 @@ mod tests {
         // staging). A missing one fails closed BEFORE the multi-GB
         // download — and the downloader is never even called.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let order = activate_order(dir.path(), "tenant-x", /*make_artifacts=*/ false);
@@ -3007,7 +3035,7 @@ mod tests {
         // attempted AFTER the download landed (the security-relevant
         // ordering: ciphertext on disk before any boot).
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let order = activate_order(dir.path(), "tenant-x", true);
@@ -3088,7 +3116,7 @@ mod tests {
         // vali has already given up on this attempt: nothing is fetched,
         // nothing is booted at `new_gen`.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-late", true);
@@ -3131,7 +3159,7 @@ mod tests {
         // a 3 s download is cut off at the clamped deadline instead of
         // running on the 2400 s per-attempt budget.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = DelayedDownloader {
             inner: MockDownloader::ok(),
             volume: std::time::Duration::from_secs(3),
@@ -3158,16 +3186,18 @@ mod tests {
         // when it finishes past it, the launch is refused rather than
         // started with too little time to settle before vali gives up.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = DelayedDownloader {
             inner: MockDownloader::ok(),
             volume: std::time::Duration::ZERO,
-            state: std::time::Duration::from_secs(2),
+            state: std::time::Duration::from_secs(4),
         };
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-window", true);
         order.state_get_url = "https://s3.example/state?sig=y".to_string();
-        order.settle_by_unix = unix_now() + DEST_LAUNCH_MARGIN.as_secs() + 1;
+        // 2 s of restore window: room for the (fsynced) record and volume on
+        // a slow runner; the 4 s state download still ends past it.
+        order.settle_by_unix = unix_now() + DEST_LAUNCH_MARGIN.as_secs() + 2;
 
         let err = activate_dest(&lifecycle, &downloader, &pusher, order)
             .await
@@ -3190,7 +3220,7 @@ mod tests {
         // source's `stored = N` for the SAME vm_id — refused before any
         // Vault read, and the migrated guest never unlocks.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
@@ -3230,7 +3260,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
         order.state_get_url = "https://s3.example/state?sig=y".to_string();
@@ -3254,7 +3284,7 @@ mod tests {
         // activate — falling back to the pre-fix blank counter — rather
         // than fail closed on an absent URL.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let order = activate_order(dir.path(), "tenant-x", true);
@@ -3275,7 +3305,7 @@ mod tests {
         // without also making a migrate-back reuse stale artifacts (see
         // `dest_activate_replaces_artifacts_left_by_an_earlier_residency`).
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
@@ -3393,7 +3423,7 @@ mod tests {
     /// overlay is the 1 GiB the cmdline names (sparse).
     async fn staged_vm(lifecycle: &CvmLifecycle) -> crate::backup::staged::RestorePaths {
         let vm = vid("golden-bk");
-        let p = crate::backup::staged::RestorePaths::for_vm(lifecycle, &vm, RID);
+        let p = crate::backup::staged::RestorePaths::for_vm(lifecycle, &vm, RID).unwrap();
         std::fs::create_dir_all(p.live_overlay.parent().unwrap()).unwrap();
         std::fs::create_dir_all(p.live_state.parent().unwrap()).unwrap();
         std::fs::write(&p.live_overlay, b"original").unwrap();
@@ -3554,14 +3584,14 @@ mod tests {
             calls[0].0,
             "chain:job-1:https://s3.example/backups/vm/c1/1.inc.qcow2"
         );
-        assert_eq!(calls[0].1, lifecycle.golden_overlay_path(&vm));
+        assert_eq!(calls[0].1, lifecycle.golden_overlay_path(&vm).unwrap());
         assert_eq!(calls[0].2, lifecycle.state_disk_path(&vm));
         assert_eq!(
             calls[0].3,
             Some(32 << 30),
             "sized from the measured disk_gb"
         );
-        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm));
+        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm).unwrap());
         assert_eq!(
             std::fs::read_to_string(marker).unwrap(),
             "chain:job-1:https://s3.example/backups/vm/c1/1.inc.qcow2"
@@ -3649,10 +3679,11 @@ mod tests {
                 guardian_ep: None,
                 net: None,
                 on_guest_poweroff: None,
+                os_pool: None,
             })
             .await
             .expect("launch should succeed");
-        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm));
+        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vm).unwrap());
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "chain:job-1:https://s3.example/earlier").unwrap();
 
@@ -3699,7 +3730,8 @@ mod tests {
         .with_state_disk_root(dir.path().to_path_buf());
         let order = golden_chain_order(dir.path(), "job-1");
         let identity = order.backup_chain.as_ref().unwrap().identity();
-        let marker = restore_marker_path(&lifecycle.golden_overlay_path(&vid("golden-bk")));
+        let marker =
+            restore_marker_path(&lifecycle.golden_overlay_path(&vid("golden-bk")).unwrap());
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, &identity).unwrap();
         let downloader = MockDownloader::ok();
@@ -3770,7 +3802,7 @@ mod tests {
         // So the migrated ciphertext MUST land THERE — else launch's
         // `ensure_overlay_disk` would create a BLANK overlay (data loss).
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "golden-mig", true);
@@ -3778,7 +3810,7 @@ mod tests {
         order.cmdline = "ro dm-verity.root=abc123 hippius.vm_generation=6".to_string();
         std::fs::write(&order.rootfs_data_path, b"rootfs").unwrap();
         std::fs::write(&order.rootfs_hash_path, b"verity").unwrap();
-        let expected = lifecycle.golden_overlay_path(&vid("golden-mig"));
+        let expected = lifecycle.golden_overlay_path(&vid("golden-mig")).unwrap();
 
         let _ = activate_dest(&lifecycle, &downloader, &pusher, order).await;
 
@@ -3799,13 +3831,90 @@ mod tests {
         );
     }
 
+    /// A4: the overlay goes to the VM's recorded pool (a migrate-back to
+    /// a host where it lived on `nvme0`), and with no record the arrival
+    /// is recorded on the launch pool BEFORE the download, `ran`: the
+    /// launch then requires these disks and never blank-creates them.
+    #[tokio::test]
+    async fn dest_activate_golden_writes_to_the_vms_pool_and_records_the_arrival() {
+        use crate::lifecycle::vm_pool;
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(dir.path());
+        // Done once on this host: a missing record is no longer "default".
+        vm_pool::backfill(dir.path(), dir.path(), &[]).unwrap();
+        let golden = |name: &str| {
+            let mut order = activate_order(dir.path(), name, true);
+            order.cmdline = "ro dm-verity.root=abc123 hippius.vm_generation=6".to_string();
+            std::fs::write(&order.rootfs_data_path, b"rootfs").unwrap();
+            std::fs::write(&order.rootfs_hash_path, b"verity").unwrap();
+            order
+        };
+        let nvme0 = dir.path().join("pools").join("nvme0");
+        vm_pool::write(
+            dir.path(),
+            &vid("back-home"),
+            &vm_pool::VmPoolRecord {
+                pool_id: "nvme0".into(),
+                root: nvme0.clone(),
+                ran: true,
+            },
+        )
+        .unwrap();
+        let pusher = MockTicketPusher::new();
+
+        let downloader = MockDownloader::ok();
+        let _ = activate_dest(&lifecycle, &downloader, &pusher, golden("back-home")).await;
+        assert_eq!(
+            downloader.calls()[0].1,
+            crate::lifecycle::golden::overlay_disk_path(&nvme0, &vid("back-home"))
+        );
+
+        // The download fails: the record found afterwards was written
+        // before it.
+        let downloader = MockDownloader {
+            calls: Mutex::new(Vec::new()),
+            fail: true,
+        };
+        assert!(
+            activate_dest(&lifecycle, &downloader, &pusher, golden("newcomer"))
+                .await
+                .is_err()
+        );
+        let rec = vm_pool::read(dir.path(), &vid("newcomer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (rec.pool_id.as_str(), rec.root.as_path(), rec.ran),
+            ("default", dir.path(), true)
+        );
+        assert_eq!(
+            downloader.calls()[0].1,
+            crate::lifecycle::golden::overlay_disk_path(dir.path(), &vid("newcomer"))
+        );
+
+        // A LEGACY arrival is recorded too: its launch would otherwise
+        // find a restore marker and no record, and be refused.
+        let downloader = MockDownloader {
+            calls: Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let legacy = activate_order(dir.path(), "legacy-in", true);
+        assert!(activate_dest(&lifecycle, &downloader, &pusher, legacy)
+            .await
+            .is_err());
+        let rec = vm_pool::read(dir.path(), &vid("legacy-in"))
+            .unwrap()
+            .unwrap();
+        assert!(rec.ran);
+    }
+
     #[tokio::test]
     async fn dest_activate_golden_fails_closed_without_the_dm_verity_base() {
         // GOLDEN needs the shared read-only dm-verity base (rootfs.img/
         // rootfs.verity) present — golden `launch` never self-fetches it.
         // A missing base fails closed BEFORE the multi-GB download.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "golden-mig", true); // ovmf/kernel/initrd present
@@ -3831,7 +3940,7 @@ mod tests {
         // (the marker names this job's snapshot object) ⇒ the download is
         // NOT repeated, so a tick re-drive never clobbers a volume.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let order = activate_order(dir.path(), "tenant-x", true);
@@ -3865,7 +3974,7 @@ mod tests {
             reduced_phys_bits: 1,
         });
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let vm = vid("tenant-x");
@@ -3889,6 +3998,7 @@ mod tests {
                 guardian_ep: None,
                 net: None,
                 on_guest_poweroff: None,
+                os_pool: None,
             })
             .await
             .expect("launch should succeed");
@@ -3916,7 +4026,7 @@ mod tests {
         // artifacts. Keying on the snapshot object (unique per job_id)
         // re-restores, which is what a retry must do.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
@@ -4065,7 +4175,7 @@ mod tests {
         // KBS. The marker records a DIFFERENT generation, so both must be
         // re-pulled.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle().with_state_disk_root(dir.path().to_path_buf());
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", true);
@@ -4106,7 +4216,7 @@ mod tests {
             Some(""),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let lifecycle = test_lifecycle();
+            let lifecycle = test_lifecycle_rooted(dir.path());
             let downloader = MockDownloader::ok();
             let pusher = MockTicketPusher::new();
             let order = activate_order(dir.path(), "tenant-x", true);
@@ -4146,7 +4256,8 @@ mod tests {
             cbitpos: 51,
             reduced_phys_bits: 1,
         });
-        let lifecycle = test_lifecycle();
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(root.path());
         let store = MigrationStore::new();
         let vm = vid("tenant-nd");
         // A MINER_ROOT-shaped luks path passes `validate_luks_path`
@@ -4171,6 +4282,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         };
         lifecycle
             .launch(order)
@@ -4231,6 +4343,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         }
     }
 
@@ -4238,7 +4351,8 @@ mod tests {
     async fn a_dest_whose_ticket_never_arrives_is_stopped_and_retried_fresh() {
         // Answered `already-launched` on the next attempt, it would be a
         // success — and vali would activate a guest that never unlocked.
-        let lifecycle = test_lifecycle();
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(root.path());
         let vm = vid("tenant-np");
         let err = launch_dest(
             &lifecycle,
@@ -4271,7 +4385,8 @@ mod tests {
     async fn a_slow_dest_boot_the_re_push_reaches_is_a_launch() {
         // The launch's own push gave up; the reboot-watcher's re-push is
         // still trying and delivers. That is a booted guest, never a kill.
-        let lifecycle = Arc::new(test_lifecycle());
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = Arc::new(test_lifecycle_rooted(root.path()));
         let vm = vid("tenant-slow");
         let repush = lifecycle.begin_ticket_push(&vm);
         let (lc, v) = (lifecycle.clone(), vm.clone());
@@ -4295,7 +4410,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_re_push_that_gives_up_ends_in_a_stop() {
-        let lifecycle = Arc::new(test_lifecycle());
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = Arc::new(test_lifecycle_rooted(root.path()));
         let vm = vid("tenant-gone");
         let repush = lifecycle.begin_ticket_push(&vm);
         tokio::spawn(async move {
@@ -4324,7 +4440,8 @@ mod tests {
             cbitpos: 51,
             reduced_phys_bits: 1,
         });
-        let lifecycle = test_lifecycle();
+        let root = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle_rooted(root.path());
         let vm = vid("tenant-up");
         let order = |cpu_count: u8| LaunchOrder {
             vm_id: vm.clone(),
@@ -4344,6 +4461,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         };
         lifecycle
             .launch(order(2))
@@ -4397,7 +4515,7 @@ mod tests {
     #[tokio::test]
     async fn dest_activate_propagates_a_download_failure_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader {
             calls: Mutex::new(Vec::new()),
             fail: true,
@@ -4472,8 +4590,9 @@ mod tests {
     /// stop branch without a real lifecycle handle — pre-seed it the way
     /// a real quiesce would, then drive the producer against a stopped VM
     /// (`VmNotFound` ⇒ Ok).
-    fn empty_lifecycle() -> CvmLifecycle {
-        test_lifecycle()
+    fn empty_lifecycle() -> (CvmLifecycle, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        (test_lifecycle_rooted(root.path()), root)
     }
 
     #[tokio::test]
@@ -4481,7 +4600,7 @@ mod tests {
         // The PRODUCER: with vali's nonce + source_gen, the quiesce drives
         // the signer FIRST (while the guest is up), surfaces the opaque
         // ack into the source-ack store for vali's poll, THEN stops.
-        let lifecycle = empty_lifecycle();
+        let (lifecycle, _root) = empty_lifecycle();
         let store = MigrationStore::new();
         let vm = vid("tenant-x");
         let canned = vec![0xab, 0xcd, 0xef];
@@ -4510,7 +4629,7 @@ mod tests {
         // None, times out, quarantines the source, never activates the
         // dest. The quiesce itself still SUCCEEDS (the guest is stopped so
         // the snapshot is crash-consistent) — it just surfaces no ack.
-        let lifecycle = empty_lifecycle();
+        let (lifecycle, _root) = empty_lifecycle();
         let store = MigrationStore::new();
         let vm = vid("tenant-x");
         let signer = MockAckSigner::producing(None);
@@ -4532,7 +4651,7 @@ mod tests {
     async fn quiesce_is_fail_closed_when_the_signer_errors() {
         // A signer transport error is also fail-closed: no ack surfaced,
         // the quiesce still completes (guest stopped), vali times out.
-        let lifecycle = empty_lifecycle();
+        let (lifecycle, _root) = empty_lifecycle();
         let store = MigrationStore::new();
         let vm = vid("tenant-x");
         let signer = MockAckSigner::erroring();
@@ -4548,7 +4667,7 @@ mod tests {
     async fn quiesce_rejects_an_empty_ack_fail_closed() {
         // A signer that returns Some(empty) is treated as no ack — an
         // empty SignedStoppedAck can never verify, so we never surface it.
-        let lifecycle = empty_lifecycle();
+        let (lifecycle, _root) = empty_lifecycle();
         let store = MigrationStore::new();
         let vm = vid("tenant-x");
         let signer = MockAckSigner::producing(Some(Vec::new()));
@@ -5090,7 +5209,7 @@ mod tests {
         // A tampered staged artifact aborts the activation at the sha
         // verify — the dest never even downloads the snapshot.
         let dir = tempfile::tempdir().unwrap();
-        let lifecycle = test_lifecycle();
+        let lifecycle = test_lifecycle_rooted(dir.path());
         let downloader = MockDownloader::ok();
         let pusher = MockTicketPusher::new();
         let mut order = activate_order(dir.path(), "tenant-x", false);

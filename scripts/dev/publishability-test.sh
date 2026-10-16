@@ -214,6 +214,28 @@ for rule in "${RULES[@]}"; do
     fi
 done
 
+# Internal-only paths. A pattern scan cannot tell an internal runbook from
+# a public one: an approval procedure discloses no address, it discloses
+# how we operate. So those files live under prefixes listed in
+# .publish-exclude, and the published tree must track none of them.
+EXCLUDE_LIST="${ROOT}/.publish-exclude"
+if [[ ! -r "${EXCLUDE_LIST}" ]]; then
+    echo "publishability: ${EXCLUDE_LIST} is missing — internal paths cannot be checked"
+    FAILED=1
+else
+    mapfile -t EXCLUDED < <(grep -vE '^[[:space:]]*(#|$)' "${EXCLUDE_LIST}")
+    for prefix in "${EXCLUDED[@]}"; do
+        mapfile -t internal < <(cd "${ROOT}" && git ls-files -- "${prefix}")
+        if (( ${#internal[@]} > 0 )); then
+            echo "  LEAK  internal-path ${prefix}: ${#internal[@]} file(s) — git rm them on this branch"
+            printf '          %s\n' "${internal[@]}" | head -12
+            FAILED=1
+        else
+            echo "  clean internal-path ${prefix}"
+        fi
+    done
+fi
+
 if (( ALLOWED_TOTAL > MAX_ALLOWED )); then
     echo "publishability: ${ALLOWED_TOTAL} allow-markers (max ${MAX_ALLOWED}) — the exception is being used as a bypass"
     FAILED=1

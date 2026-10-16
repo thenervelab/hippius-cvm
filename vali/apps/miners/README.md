@@ -15,6 +15,7 @@ lists what is currently registered.
 | ---------------------------------------------- | ------------------- | ------------------------------------------ |
 | `POST /v1/admin/miner/register`                | miner-admin token   | same `(miner_id, pubkey_hex, platform_id)` ⇒ `200`; upgrades an auto-provisioned `"onchain:<node_id>"` placeholder ⇒ `200`; mismatch ⇒ `409` |
 | `POST /v1/admin/miner/<miner_id>/quarantine`   | miner-admin token   | already quarantined ⇒ `200`                |
+| `GET`, `POST /v1/admin/miner/<miner_id>/approval` | miner-admin token   | approve a pending miner + anchor it (`apps.scheduler.approval`); already approved ⇒ `409` |
 | `GET  /v1/admin/miner/list`                    | any service token   | offset-paginated by `miner_id`             |
 
 `POST` endpoints are gated by `apps.miners.permissions.IsMinerAdmin`,

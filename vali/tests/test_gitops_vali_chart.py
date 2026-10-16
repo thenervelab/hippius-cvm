@@ -748,6 +748,21 @@ def test_operator_config_writers_are_one_shared_value() -> None:
 
 
 @_needs_helm
+def test_storage_config_push_is_one_shared_value_and_renders_only_when_set() -> None:
+    """The push loop (orchestration tick) and the operator API (web pods)
+    read the same three keys from the shared ConfigMap. Unset, none renders
+    and settings.py keeps the loop off for every miner."""
+    data = _configmap_data(_docs())
+    assert data["VALI_STORAGE_CONFIG_PUSH"] == "true"
+    assert data["VALI_STORAGE_CONFIG_MINERS"] == "*"
+    assert data["VALI_STORAGE_CONFIG_MIN_AGENT_VERSION"] == "v2026.10.16"
+    for label, env in _env_by_workload(_docs()).items():
+        assert not any(k.startswith("VALI_STORAGE_CONFIG_") for k in env), label
+    off = _configmap_data(_docs("--set", "storageConfig=null"))
+    assert not any(k.startswith("VALI_STORAGE_CONFIG_") for k in off)
+
+
+@_needs_helm
 def test_net_policy_push_off_renders_no_miner_list() -> None:
     tick = _env_by_workload(_docs("--set", "orchestrationTick.netPolicy.push=false"))[
         "Deployment/vali-orchestration-tick"
@@ -980,3 +995,109 @@ def test_the_stale_threshold_clears_the_longest_healthy_gap() -> None:
         + settings.VALI_DISK_PROBE_LINGER_MAX_S
     )
     assert stale_s > gap
+
+
+# ── §23 price keeper ─────────────────────────────────────────────────
+
+
+_PRICE_KEEPER_ARMED = (
+    "--set",
+    "priceKeeper.suspend=false",
+    "--set",
+    "priceKeeper.image.digest=sha256:" + "0" * 64,
+    "--set",
+    "priceKeeper.forbiddenAccounts={0x" + "11" * 32 + "}",
+)
+
+
+def _price_keeper_docs(*extra: str) -> list[dict]:
+    return [
+        d
+        for d in _docs("--set", "priceKeeper.enabled=true", *extra)
+        if "price-keeper" in (d.get("metadata") or {}).get("name", "")
+    ]
+
+
+@_needs_helm
+def test_the_price_keeper_is_off_by_default() -> None:
+    names = [(d.get("metadata") or {}).get("name", "") for d in _docs()]
+    assert not [n for n in names if "price-keeper" in n]
+
+
+@_needs_helm
+def test_an_enabled_price_keeper_is_suspended_and_signs_with_its_own_key() -> None:
+    docs = _price_keeper_docs()
+    kinds = {d["kind"]: d for d in docs}
+    assert set(kinds) == {"CronJob", "ExternalSecret", "PrometheusRule"}
+
+    cron = kinds["CronJob"]
+    assert cron["spec"]["suspend"] is True
+    (_, pod), = _pod_specs([cron])
+    (container,) = pod["containers"]
+    assert container["command"] == ["node", "apply-prices.mjs"]
+    assert "@sha256:" in container["image"]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["PRICE_KEEPER_KEY_FILE"] == "/etc/price-keeper/mnemonic"
+    assert "EPOCH_CLOSE_KEY_FILE" not in env
+    (volume,) = pod["volumes"]
+    values = yaml.safe_load(VALUES.read_text())
+    assert volume["secret"]["secretName"] == "price-keeper-key"
+    assert volume["secret"]["secretName"] != values["epochClose"]["keySecretName"]
+
+    secret = kinds["ExternalSecret"]
+    assert secret["spec"]["target"]["name"] == "price-keeper-key"
+    assert secret["spec"]["data"][0]["remoteRef"]["property"] == "mnemonic"
+
+    alerts = {
+        r["alert"] for g in kinds["PrometheusRule"]["spec"]["groups"] for r in g["rules"]
+    }
+    # Suspended: the run-staleness alerts would fire on a job that is
+    # not meant to run, so only the state alerts render.
+    assert alerts == {"PriceKeeperBalanceLow", "PriceKeeperFailing", "PriceKeeperBacklog"}
+    armed = _price_keeper_docs(*_PRICE_KEEPER_ARMED)
+    (rule,) = [d for d in armed if d["kind"] == "PrometheusRule"]
+    armed_alerts = {r["alert"] for g in rule["spec"]["groups"] for r in g["rules"]}
+    assert {"PriceKeeperStale", "PriceKeeperNeverReported"} <= armed_alerts
+
+
+@_needs_helm
+def test_the_price_keeper_refuses_the_epoch_close_key() -> None:
+    values = yaml.safe_load(VALUES.read_text())
+    proc = _render(
+        "--set",
+        "priceKeeper.enabled=true",
+        "--set",
+        f"priceKeeper.keySecretName={values['epochClose']['keySecretName']}",
+    )
+    assert proc.returncode != 0
+    assert "must not be the epoch-close key" in proc.stderr
+
+
+@_needs_helm
+def test_an_unsuspended_price_keeper_needs_its_own_pin_and_a_forbidden_list() -> None:
+    """The epochClose pin predates apply-prices.mjs, and the audit
+    authority is not sudo on production, so neither default is safe to run."""
+    no_pin = _render("--set", "priceKeeper.enabled=true", "--set", "priceKeeper.suspend=false")
+    assert no_pin.returncode != 0
+    assert "priceKeeper.image.digest is empty" in no_pin.stderr
+    no_list = _render(
+        "--set",
+        "priceKeeper.enabled=true",
+        *_PRICE_KEEPER_ARMED[:4],
+    )
+    assert no_list.returncode != 0
+    assert "priceKeeper.forbiddenAccounts is empty" in no_list.stderr
+    (cron,) = [d for d in _price_keeper_docs(*_PRICE_KEEPER_ARMED) if d["kind"] == "CronJob"]
+    (_, pod), = _pod_specs([cron])
+    env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
+    assert env["PRICE_KEEPER_FORBIDDEN_ACCOUNTS"] == "0x" + "11" * 32
+
+
+@_needs_helm
+def test_the_price_keeper_state_alerts_only_read_fresh_gauges() -> None:
+    """A Pushgateway gauge outlives its job: without the freshness guard a
+    keeper suspended after a bad run would alert forever."""
+    (rule,) = [d for d in _price_keeper_docs() if d["kind"] == "PrometheusRule"]
+    rules = {r["alert"]: r["expr"] for g in rule["spec"]["groups"] for r in g["rules"]}
+    for name in ("PriceKeeperBalanceLow", "PriceKeeperFailing", "PriceKeeperBacklog"):
+        assert "and on() (time() - hippius_price_keeper_last_run_timestamp_seconds <" in rules[name]

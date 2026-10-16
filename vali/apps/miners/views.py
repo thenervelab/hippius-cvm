@@ -30,6 +30,17 @@
       `TelemetrySource` — the §9 broker then refuses its telemetry.
       → 200 {miner_id, status} / 403 / 404.
 
+  GET  /v1/admin/miner/<miner_id>/approval
+  POST /v1/admin/miner/<miner_id>/approval
+      Auth: ServiceToken, the miner-admin principal.
+      External-miner approval (`apps.scheduler.approval`). GET reads the
+      approval state, the anchor and the heartbeat's current figures. POST
+      {cpus, memory_mb, disk_gb?, trust_class?, approved_by, reason}
+      approves a PENDING miner and sets its anchor to min(declared,
+      measured), audited.
+      → 200 / 400 wire or invalid / 403 / 404 unknown miner or no capacity
+        row yet / 409 already approved, not measured, or below committed.
+
 The miner registry is the trust anchor for miner-signed telemetry; it
 is never derived from a miner's self-report (§13/§23).
 """
@@ -67,6 +78,9 @@ from .models import (
 )
 from .permissions import IsMinerAdmin
 from .schemas import (
+    MinerApprovalRequestSerializer,
+    MinerApprovalResponseSerializer,
+    MinerApprovalStatusSerializer,
     MinerGracefulExitResponseSerializer,
     MinerIdentitySerializer,
     MinerListSerializer,
@@ -477,6 +491,136 @@ class MinerQuarantineView(APIView):
             {"miner_id": miner_id, "status": miner.status},
             status=status.HTTP_200_OK,
         )
+
+
+# ─── GET|POST /v1/admin/miner/<miner_id>/approval ────────────────────
+
+_APPROVAL_HTTP_STATUS = {
+    "not-found": status.HTTP_404_NOT_FOUND,
+    "invalid": status.HTTP_400_BAD_REQUEST,
+    "already-approved": status.HTTP_409_CONFLICT,
+    "not-measured": status.HTTP_409_CONFLICT,
+    "below-committed": status.HTTP_409_CONFLICT,
+}
+
+
+class MinerApprovalView(APIView):
+    """`GET|POST /v1/admin/miner/<miner_id>/approval` — read / approve."""
+
+    authentication_classes = [ServiceTokenAuthentication]
+    # P2 object-level authorization: fleet operator action.
+    object_scope = scoping.OPERATOR_ONLY
+    permission_classes = [IsAuthenticated, IsMinerAdmin]
+    http_method_names = ["get", "post", "options"]
+
+    @extend_schema(
+        summary="Read a miner's approval",
+        description=(
+            "Miner-admin only. Whether the miner is approved (and by whom), "
+            "whether it is held back from new placements right now, its "
+            "host-size anchor and the heartbeat's current figures."
+        ),
+        tags=["Miners"],
+        parameters=[_MINER_ID_PARAM],
+        responses={
+            200: MinerApprovalStatusSerializer,
+            403: OpenApiResponse(ErrorSerializer, "Not the miner-admin principal."),
+            404: OpenApiResponse(
+                ErrorSerializer, "Unknown miner, or not yet seen on chain."
+            ),
+        },
+    )
+    def get(self, request: Request, miner_id: str) -> Response:
+        from apps.scheduler import approval
+
+        node_id = _approval_node_id(miner_id)
+        if node_id is None:
+            return _error(status.HTTP_404_NOT_FOUND, "miner not found", "not-found")
+        readout = approval.approval_status(node_id)
+        if readout is None:
+            return _error(
+                status.HTTP_404_NOT_FOUND,
+                "miner not yet seen on chain (no capacity row)",
+                "not-found",
+            )
+        return Response({"miner_id": miner_id, **readout}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Approve a pending miner",
+        description=(
+            "Miner-admin only. Approves a miner held back by "
+            "VALI_MINER_APPROVAL_REQUIRED and sets its host-size anchor to "
+            "min(declared, fresh heartbeat figure) per term, with an audit "
+            "row per field. `?dry_run=1` computes and writes nothing."
+        ),
+        tags=["Miners"],
+        parameters=[
+            _MINER_ID_PARAM,
+            OpenApiParameter(
+                "dry_run", bool, OpenApiParameter.QUERY, description="Compute only."
+            ),
+        ],
+        request=MinerApprovalRequestSerializer,
+        responses={
+            200: MinerApprovalResponseSerializer,
+            400: OpenApiResponse(ErrorSerializer, "Malformed body / value out of range."),
+            403: OpenApiResponse(ErrorSerializer, "Not the miner-admin principal."),
+            404: OpenApiResponse(
+                ErrorSerializer, "Unknown miner, or not yet seen on chain."
+            ),
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "Already approved, no fresh heartbeat figure, or the anchor is "
+                "below what vali already placed there.",
+            ),
+        },
+    )
+    def post(self, request: Request, miner_id: str) -> Response:
+        from apps.scheduler import approval
+
+        node_id = _approval_node_id(miner_id)
+        if node_id is None:
+            return _error(status.HTTP_404_NOT_FOUND, "miner not found", "not-found")
+        body = MinerApprovalRequestSerializer(data=request.data)
+        if not body.is_valid():
+            return _error(status.HTTP_400_BAD_REQUEST, str(body.errors), "wire")
+        data = body.validated_data
+        dry_run = str(request.query_params.get("dry_run", "")).lower() in ("1", "true")
+        try:
+            result = approval.approve_miner(
+                node_id,
+                cpus=data["cpus"],
+                memory_mb=data["memory_mb"],
+                disk_gb=data.get("disk_gb"),
+                approver=data["approved_by"],
+                reason=data["reason"],
+                trust_class=data.get("trust_class"),
+                dry_run=dry_run,
+            )
+        except approval.ApprovalRefused as exc:
+            return _error(
+                _APPROVAL_HTTP_STATUS.get(exc.code, status.HTTP_409_CONFLICT),
+                exc.message,
+                exc.code,
+            )
+        if not dry_run:
+            log.warning(
+                "miner approved: miner_id=%s by=%s", miner_id, result.approved_by
+            )
+        return Response(
+            {"miner_id": miner_id, **result.as_dict()}, status=status.HTTP_200_OK
+        )
+
+
+def _approval_node_id(miner_id: str) -> str | None:
+    """The chain node id of the registered miner `miner_id`, or `None` when
+    it is unknown or not bridged to a chain node."""
+    node_id = (
+        MinerIdentity.objects.filter(miner_id=miner_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    return node_id.lower() if node_id else None
 
 
 # Hard cap on the graceful-exit envelope — it is tiny (five small fields

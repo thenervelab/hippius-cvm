@@ -192,7 +192,9 @@
   when: miner_agent_build_needed | bool
 
 # ── Host attestor components ────────────────────────────────────────
-# Rendered into [host_attestor] from `snp_generation` (host_vars). A
+# Rendered into [host_attestor] from `snp_generation` (derived from the
+# CPU by play 00's preflight, or set in host_vars — run play 00 in the
+# same invocation when host_vars does not set it). A
 # miner without it would render no attestor, never attest, and — with
 # vali's host-attestor gate enforced — never receive a VM, so it is
 # required. The files are staged by the operator (see
@@ -377,6 +379,123 @@
       miner_id {{ miner_agent_miner_id | to_json }} is not a 1-64 char
       [A-Za-z0-9._-] id. Fix the `miner_id` host var, or unset it to
       derive the id from the node id.
+
+# ── Storage pools / dedicated disks (disk-tier) ─────────────────────
+- name: Assert the storage pool and dedicated disk declarations
+  # The agent drops an invalid declaration (and runs with `default` only)
+  # rather than crash-loop; fail here instead, where the operator sees why.
+  vars:
+    _pools: "{{ miner_storage_pools | default([]) }}"
+    _disks: "{{ miner_storage_dedicated_disks | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      # Shape first, so a malformed entry fails here with the message
+      # below rather than as an evaluation error further down.
+      - _pools is sequence and _pools is not string and _pools is not mapping
+      - _disks is sequence and _disks is not string and _disks is not mapping
+      - _pools | reject('mapping') | list | length == 0
+      - _disks | reject('mapping') | list | length == 0
+      - _pools | rejectattr('id', 'defined') | list | length == 0
+      - _pools | rejectattr('class', 'defined') | list | length == 0
+      - _pools | rejectattr('budget_gb', 'defined') | list | length == 0
+      - _disks | rejectattr('id', 'defined') | list | length == 0
+      # No typo'd key passes silently (a `sorce:` would mean no bind).
+      - _pools | map('dict2items') | flatten | map(attribute='key') | reject('in', ['id', 'class', 'budget_gb', 'source', 'os_disks', 'state']) | list | length == 0
+      - _disks | map('dict2items') | flatten | map(attribute='key') | reject('in', ['id', 'state']) | list | length == 0
+      - _pools | selectattr('os_disks', 'defined') | map(attribute='os_disks') | reject('boolean') | list | length == 0
+      - _pools | length <= 3
+      - _pools | map(attribute='id') | unique | list | length == _pools | length
+      - _pools | rejectattr('id', 'match', '^[a-z0-9-]{1,32}$') | list | length == 0
+      - _pools | selectattr('id', 'equalto', 'default') | list | length == 0
+      - _pools | rejectattr('class', 'in', ['nvme', 'ssd', 'hdd']) | list | length == 0
+      - _pools | map(attribute='budget_gb') | map('string') | reject('match', '^[0-9]+$') | list | length == 0
+      - _pools | selectattr('state', 'defined') | rejectattr('state', 'in', ['active', 'draining']) | list | length == 0
+      - _pools | selectattr('source', 'defined') | rejectattr('source', 'match', '^/[A-Za-z0-9._/-]+$') | list | length == 0
+      - (miner_storage_default_class | default('nvme')) in ['nvme', 'ssd', 'hdd']
+      - _disks | length <= 24
+      - _disks | map(attribute='id') | unique | list | length == _disks | length
+      - _disks | rejectattr('id', 'match', '^(wwn|ata|scsi|nvme)-[A-Za-z0-9._:-]{1,90}$') | list | length == 0
+      - _disks | selectattr('id', 'match', '.*-part[0-9]+$') | list | length == 0
+      - _disks | selectattr('state', 'defined') | rejectattr('state', 'in', ['active', 'draining']) | list | length == 0
+    fail_msg: >-
+      miner_storage_pools: at most 3 (plus the implicit `default`), unique
+      [a-z0-9-]{1,32} ids other than `default`, class nvme|ssd|hdd, an
+      integer budget_gb, a boolean os_disks, state active|draining, an
+      absolute [A-Za-z0-9._/-] `source` if any, and no other key (got
+      {{ _pools }}). miner_storage_dedicated_disks: at most 24 unique
+      /dev/disk/by-id names (wwn-/ata-/scsi-/nvme-, not a partition), keys
+      id/state only (got {{ _disks }}).
+
+- name: Assert the v7 heartbeat is only asked for on top of v6
+  # The agent refuses `emit_pools` without `schema_agent_version`.
+  ansible.builtin.assert:
+    that:
+      - not (miner_heartbeat_emit_pools | default(false) | bool)
+        or (miner_heartbeat_schema_agent_version | default(false) | bool)
+    fail_msg: >-
+      miner_heartbeat_emit_pools needs miner_heartbeat_schema_agent_version:
+      the v7 heartbeat is the v6 body plus the storage report.
+
+- name: Assert each bind source is a mounted filesystem other than /
+  # Bound before its filesystem is mounted (this play run alone, a RAID not
+  # up yet), the pool would capture an empty directory of the root
+  # filesystem and keep it until a reboot.
+  ansible.builtin.assert:
+    that:
+      - item.source in (ansible_mounts | map(attribute='mount') | list)
+      - item.source != '/'
+    fail_msg: >-
+      storage pool {{ item.id }}: source {{ item.source }} is not a mounted
+      filesystem (or is /). Mount it first (play 04 for the data RAID).
+  loop: "{{ miner_storage_pools | default([]) | selectattr('source', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.id }} <- {{ item.source }}"
+
+- name: Ensure each storage pool's mount point exists under the pools root
+  # The agent requires every pool other than `default` at
+  # <state_dir>/pools/<id> (its sandbox's writable root). No mode: once a
+  # filesystem is mounted there, this path IS its root, whose mode is its
+  # own play's (04-data-raid), not this one's.
+  ansible.builtin.file:
+    path: "{{ miner_agent.state_dir }}/pools/{{ item.id }}"
+    state: directory
+  loop: "{{ miner_storage_pools | default([]) }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Bind-mount each storage pool's filesystem at its pool path (fstab)
+  # A pool whose filesystem is mounted elsewhere (`source`, e.g.
+  # /mnt/hippius-data) is bind-mounted at its pool path, durably: the
+  # fstab line orders the bind after the source mount. `nofail`: a bind
+  # that cannot come up at boot must not drop a remote host into emergency
+  # mode — the agent reports the pool unavailable instead.
+  # `x-systemd.before=` orders the bind before the agent at boot (nofail
+  # alone lets the agent start first, and see the pool unmounted). A pool
+  # mounted directly at its pool path has no `source`. Changing a pool's `source`
+  # later needs an unmount first (a remount keeps the old one live).
+  ansible.posix.mount:
+    path: "{{ miner_agent.state_dir }}/pools/{{ item.id }}"
+    src: "{{ item.source }}"
+    fstype: none
+    opts: "bind,nofail,x-systemd.requires-mounts-for={{ item.source }},x-systemd.before=hippius-miner-agent.service"
+    state: mounted
+  loop: "{{ miner_storage_pools | default([]) | selectattr('source', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.id }} <- {{ item.source }}"
+
+- name: Assert the orders server has a real mesh address to bind
+  # Play 04 detects it (miner_netbird_ip); `orders_bind_ip` is the
+  # fallback when play 04 is not part of this run. Under --check on a
+  # never-joined host there is no address yet.
+  ansible.builtin.assert:
+    that:
+      - (miner_netbird_ip | default(orders_bind_ip)) is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.')
+    fail_msg: >-
+      No NetBird mesh address for [orders] bind_addr (got
+      "{{ miner_netbird_ip | default(orders_bind_ip) }}"). Run play 04 in
+      the same invocation, or set orders_bind_ip in host_vars to this
+      host's `netbird status` address.
+  when: not ansible_check_mode
 
 - name: Render the miner-agent config
   ansible.builtin.template:

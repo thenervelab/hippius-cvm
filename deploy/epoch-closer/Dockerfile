@@ -7,6 +7,6 @@ LABEL org.opencontainers.image.source="https://github.com/thenervelab/hippius-co
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
-COPY close-epoch.mjs ./
+COPY close-epoch.mjs apply-prices.mjs ./
 USER node
 ENTRYPOINT ["node", "close-epoch.mjs"]

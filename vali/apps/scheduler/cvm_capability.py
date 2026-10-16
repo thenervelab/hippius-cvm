@@ -307,6 +307,7 @@ CLASSES_NOT_START_CAPABILITY = frozenset(
         "relaunch-disks-missing",  # 412 — this host lacks the VM's disks
         "relaunch-disks-unreadable",  # 503 — could not stat them (retryable)
         "net-policy-not-loaded",  # 503 — edge-mode guest rules not loaded yet
+        "vm-pool-record",  # 412/503 — the VM's pool record (A4), before any start
         # ── the order never reached the lifecycle at all ──────────────
         # Usually a vali-side minting/clock fault every miner would
         # reject identically — counting it could empty the fleet through
@@ -420,6 +421,9 @@ DEST_ACTIVATION_CLASSES_NOT_START_CAPABILITY = frozenset(
         # unmounted): `orders/migration.rs::dest_launch_failure`. No boot.
         "migration/dest-insufficient-disk",
         "migration/dest-pool-unavailable",
+        # The arriving VM's pool record could not be read or written when
+        # its launch began (A4): refused before any domain start.
+        "migration/dest-vm-pool-record",
     }
 )
 DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY = (
@@ -428,6 +432,7 @@ DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY = (
     "migration/dest-artifact-",  # artifact staging (sha mismatch, budget, …)
     "migration/chain-",  # a backup-chain restore was refused
     "backup/",  # the backup-chain restore itself failed
+    "vm-pool-record-",  # the arriving VM's pool record not written/read (A4)
 )
 
 

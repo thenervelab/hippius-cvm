@@ -321,6 +321,15 @@ pub struct LaunchOrder {
     /// before vali and vali sends it only to agents that know it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_guest_poweroff: Option<OnGuestPoweroff>,
+    /// The storage pool a FIRST launch puts the VM's writable disk on
+    /// (the golden overlay, the legacy data disk). `None` ⇒ `default`.
+    /// A VM that already ran here keeps the pool its record names
+    /// ([`crate::lifecycle::vm_pool`]); this is then ignored. Not measured,
+    /// not part of the L1 ticket. Encoded only when set, so a body without
+    /// it is byte-identical to before; vali sends it only to agents that
+    /// know it (`deny_unknown_fields` refuses it on older ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_pool: Option<String>,
 }
 
 /// What the agent does when a tenant guest powers itself off — the
@@ -631,6 +640,11 @@ pub struct MigrateActivateOrder {
     /// first packet on the destination. Encoded only when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetSpec>,
+    /// The pool the arriving VM's disks are written to when it has no
+    /// pool record here ([`LaunchOrder::os_pool`]); `None` ⇒ `default`.
+    /// Encoded only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_pool: Option<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -897,6 +911,11 @@ pub struct TenantPreflightOrder {
     pub cmdline: String,
     /// vCPU count — folded into the SNP launch digest.
     pub cpu_count: u8,
+    /// The pool the launch will put the VM's disk on
+    /// ([`LaunchOrder::os_pool`]): the disk gates check that pool.
+    /// `None` ⇒ `default`. Encoded only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_pool: Option<String>,
 }
 
 /// Common surface over the per-VM order kinds — each names exactly one
@@ -1165,6 +1184,9 @@ impl MigrateActivateOrder {
             guardian_ep: self.guardian_ep,
             net: self.net,
             on_guest_poweroff: None,
+            // The arrival recorded its pool before writing (`place_arriving`):
+            // the launch reads the record, not this.
+            os_pool: self.os_pool,
         }
     }
 }
@@ -1199,6 +1221,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         };
         assert_eq!(order.vm_id().as_str(), "tenant-1");
     }
@@ -1225,6 +1248,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         };
         let encode = |o: &LaunchOrder| {
             let mut buf = Vec::new();
@@ -1260,6 +1284,54 @@ mod tests {
         assert!(!bytes.windows(8).any(|w| w == b"cap_mbps"));
         let back: LaunchOrder = ciborium::de::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(back.net, with_net.net);
+
+        // `os_pool` (A4b): absent ⇒ not encoded, set ⇒ round-trips.
+        assert!(!first.windows(7).any(|w| w == b"os_pool"));
+        let mut on_pool = order(false);
+        on_pool.os_pool = Some("nvme0".into());
+        let back: LaunchOrder = ciborium::de::from_reader(encode(&on_pool).as_slice()).unwrap();
+        assert_eq!(back.os_pool.as_deref(), Some("nvme0"));
+    }
+
+    /// The §25 activation and the preflight carry `os_pool` the same way:
+    /// absent ⇒ not encoded; the activation hands it to the launch.
+    #[test]
+    fn os_pool_is_wire_optional_on_the_activation_and_the_preflight() {
+        fn encode<T: Serialize>(v: &T) -> Vec<u8> {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(v, &mut buf).unwrap();
+            buf
+        }
+        let mut activate = activate_order_with("quiet", 10);
+        assert!(!encode(&activate).windows(7).any(|w| w == b"os_pool"));
+        activate.os_pool = Some("nvme0".into());
+        let back: MigrateActivateOrder =
+            ciborium::de::from_reader(encode(&activate).as_slice()).unwrap();
+        assert_eq!(back.os_pool.as_deref(), Some("nvme0"));
+        assert_eq!(back.into_launch_order().os_pool.as_deref(), Some("nvme0"));
+
+        // Built as a struct, not from JSON: `serde_json` numbers do not
+        // round-trip through CBOR under `arbitrary_precision`.
+        let artifact = || PreflightArtifact {
+            url: "https://s3/x".into(),
+            sha256_hex: "00".into(),
+        };
+        let mut preflight = TenantPreflightOrder {
+            vm_id: VmId::new("tenant-1").unwrap(),
+            ovmf_path: PathBuf::from("/var/lib/hippius-miner/ovmf.fd"),
+            luks_disk: artifact(),
+            kernel: artifact(),
+            initrd: artifact(),
+            rootfs_hash: None,
+            cmdline: "quiet".into(),
+            cpu_count: 2,
+            os_pool: None,
+        };
+        assert!(!encode(&preflight).windows(7).any(|w| w == b"os_pool"));
+        preflight.os_pool = Some("nvme0".into());
+        let with: TenantPreflightOrder =
+            ciborium::de::from_reader(encode(&preflight).as_slice()).unwrap();
+        assert_eq!(with.os_pool.as_deref(), Some("nvme0"));
     }
 
     /// An unknown key inside `net` is refused like one at the top level.
@@ -1384,6 +1456,7 @@ mod tests {
                 guardian_ep: None,
                 settle_by_unix: 0,
                 net: None,
+                os_pool: None,
             },
         };
         let mut buf = Vec::new();
@@ -1466,6 +1539,7 @@ mod tests {
             guardian_ep: None,
             settle_by_unix: 0,
             net: None,
+            os_pool: None,
         }
     }
 
@@ -1747,6 +1821,7 @@ mod tests {
             guardian_ep: guardian_ep.map(String::from),
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         }
     }
 

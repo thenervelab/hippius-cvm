@@ -46,6 +46,28 @@ miner_supported_ubuntu_versions:
 miner_min_libvirt_version: "10.5.0"
 miner_min_qemu_version: "9.1.0"
 
+# ── Generic host preflight (play 00) ────────────────────────────────
+# Floors every miner host must clear, whoever operates it
+# (filter_plugins/host_preflight.py; failure codes + fixes in
+# docs/operator/external-miner-guide.md). `cpu_model_expected` /
+# `ram_gb_expected` in host_vars stay as OPTIONAL, stricter per-host
+# checks on top. `snp_generation` is derived from the CPU; a host_vars
+# value must agree with it.
+miner_preflight_min:
+  # SEV-SNP host support (kvm_amd sev_snp).
+  kernel: "6.11"
+  # Online CPU threads / GiB of RAM. The play reserves
+  # host_cvm.reserve_cpus + reserve_memory_mb for the host; below these
+  # floors too little is left to sell.
+  cpus: 16
+  ram_gb: 64
+  # The filesystem holding miner_data_disk_root must be at least
+  # host_cvm.reserve_disk_gb + this.
+  tenant_disk_gb: 200
+  # Free space where base images are staged (<state_dir>/staging, a
+  # fixed location — see `miner_data_disk_root` below).
+  staging_free_gb: 30
+
 # ── Pinned versions ─────────────────────────────────────────────────
 versions:
   # NetBird agent — keep in lockstep with `group_vars/all.yml`. Pinned
@@ -256,11 +278,13 @@ orders:
   # TCP port the orders HTTP server binds on the NetBird interface.
   port: 9700
 # The miner's own NetBird mesh address — the orders server binds it
-# (and ONLY it; the miner-agent rejects any non-NetBird bind). It is
-# assigned by NetBird at mesh-join and is therefore PER-HOST: this is a
-# placeholder, OVERRIDE it in host_vars/<miner>.yml with the real
-# `100.64.x.y` address once the box has joined the mesh.
-orders_bind_ip: "100.64.0.1"
+# (and ONLY it; the miner-agent rejects any non-NetBird bind). Play 04
+# detects it after the join (`netbird status`, cross-checked against the
+# wt0 interface) and the config uses that. `orders_bind_ip` in host_vars
+# is only a fallback for a run that renders the config WITHOUT play 04
+# (e.g. a tag-limited run); empty here, so such a run is refused rather
+# than binding a placeholder.
+orders_bind_ip: ""
 # The Edge gateway's order-signing Ed25519 PUBLIC key, 64 lowercase-hex
 # chars. The miner-agent's `verify_strict` accepts an order ONLY if the
 # detached signature checks against this key (`binaries/miner-agent/src/
@@ -357,6 +381,32 @@ miner_heartbeat_schema_host_health: true   # on 2026-10-09: the fleet runs v2026
 # and only for a host whose agent knows the key (an older agent refuses it,
 # `deny_unknown_fields`). Same host_vars-first rollout as v5.
 miner_heartbeat_schema_agent_version: true   # on 2026-10-09: vali accepts v6 (pin #1521); power-policy gating reads it
+
+# Storage pools — v7 heartbeat (v6 + each pool's state and binding, the
+# dedicated disks, the storage config revision). Requires
+# miner_heartbeat_schema_agent_version and an agent that knows the key
+# (v2026.10.16.1+; an older one refuses it). Same host_vars-first rollout.
+miner_heartbeat_emit_pools: false
+
+# ── Storage pools / dedicated disks (disk-tier) ─────────────────────
+# Extra pools for tenant disks, beside the implicit `default`
+# (`miner_data_disk_root`, budgeted as `[host] cvm_disk_gb_budget`, class
+# `miner_storage_default_class`). Each lives at
+# {{ miner_agent.state_dir }}/pools/<id>; give `source` to bind-mount an
+# existing mount there (fstab, ordered after the source). Set per host,
+# only on an agent that knows `[[storage.pools]]` (v2026.10.16.1+):
+#   miner_storage_pools:
+#     - id: nvme0
+#       class: nvme          # nvme | ssd | hdd
+#       budget_gb: 3200
+#       source: /mnt/hippius-data   # optional
+#       # os_disks: true     # default
+#       # state: active      # active | draining
+#   miner_storage_dedicated_disks:
+#     - id: wwn-0x5000c500deadbeef   # /dev/disk/by-id name
+miner_storage_pools: []
+miner_storage_dedicated_disks: []
+miner_storage_default_class: nvme
 
 # ── Edge auth model ─────────────────────────────────────────────────
 # `onchain` (default) — PERMISSIONLESS: the agent self-signs its Edge

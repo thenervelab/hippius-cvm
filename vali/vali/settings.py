@@ -712,6 +712,15 @@ VALI_SCHEDULER_MAX_BOOTING_PER_MINER = _env_int("VALI_SCHEDULER_MAX_BOOTING_PER_
 VALI_SCHEDULER_BOOT_WAIT_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_S", 900)
 VALI_SCHEDULER_BOOT_WAIT_POLL_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_POLL_S", 15)
 
+# External-miner onboarding: a miner first seen on chain while this is on
+# starts PENDING APPROVAL and takes no new placement (it is folded into the
+# cordon gate, `apps.scheduler.approval`) until an operator approves it —
+# `vali_approve_miner` or `POST /v1/admin/miner/<id>/approval` — which also
+# sets its host-size anchor to min(operator-declared, heartbeat-measured).
+# Off (default) = today's behaviour: a new row is approved on sight, and
+# every row that existed before the switch was grandfathered approved.
+VALI_MINER_APPROVAL_REQUIRED = _env_bool("VALI_MINER_APPROVAL_REQUIRED", False)
+
 # §23 admission bound — default per-miner VM-slot cap seeded into a
 # fresh `MinerCapacity` mirror row. v1 carries no detailed hardware
 # specs on-chain; operators tune `capacity_slots` per miner after.
@@ -2568,6 +2577,14 @@ VALI_STORAGE_CONFIG_MINERS = _env_list("VALI_STORAGE_CONFIG_MINERS")
 # (dev builds included — test hosts only).
 VALI_STORAGE_CONFIG_MIN_AGENT_VERSION = os.environ.get(
     "VALI_STORAGE_CONFIG_MIN_AGENT_VERSION", ""
+).strip()
+# A4b: the oldest agent release (`vYYYY.MM.DD[.N]`) that takes `os_pool` on
+# its launch, preflight and §25 activation orders — a first golden launch
+# then goes to the node's best pool other than `default`. Empty = nobody
+# (every disk on `default`, today's wire); `*` = any agent (test hosts).
+# An older agent refuses the key, so set it only to a release that has it.
+VALI_POOL_ROUTING_MIN_AGENT_VERSION = os.environ.get(
+    "VALI_POOL_ROUTING_MIN_AGENT_VERSION", ""
 ).strip()
 # Re-send an acked document this often (expiry renewal, drift repair).
 VALI_STORAGE_CONFIG_SYNC_S = _env_nonneg_int("VALI_STORAGE_CONFIG_SYNC_S", 600)

@@ -226,7 +226,7 @@ def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
 
     calls = []
 
-    def fake(spec, miner):
+    def fake(spec, miner, **_kw):
         calls.append(miner.miner_id)
         # miner-a dispatch-fails twice post-register, then accepts.
         n = calls.count("miner-a")
@@ -270,7 +270,7 @@ def test_launch_vm_terminal_when_post_register_dispatch_keeps_failing(
 
     calls = []
 
-    def fake(spec, miner):
+    def fake(spec, miner, **_kw):
         calls.append(miner.miner_id)
         return launch.LaunchOutcome(
             disposition=launch.RETRIABLE,
