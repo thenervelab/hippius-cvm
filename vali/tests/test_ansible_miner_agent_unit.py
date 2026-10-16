@@ -95,3 +95,25 @@ def test_the_storage_collector_reads_devices_and_has_no_network() -> None:
     assert "Type=oneshot" in unit
     timer = _content("Install the storage collector timer")
     assert "OnUnitActiveSec=5min" in timer
+
+
+def test_storage_pools_are_bind_mounted_durably_under_the_pools_root() -> None:
+    """A pool with a `source` gets an fstab bind at <state_dir>/pools/<id>,
+    ordered after its source mount, so a reboot brings it back before the
+    agent (a pool missing at boot reports `pool-unbound`)."""
+    tasks = yaml.safe_load(TASKS.read_text())
+    (bind,) = [
+        t
+        for t in tasks
+        if t.get("name") == "Bind-mount each storage pool's filesystem at its pool path (fstab)"
+    ]
+    mount = bind["ansible.posix.mount"]
+    assert mount["path"] == "{{ miner_agent.state_dir }}/pools/{{ item.id }}"
+    assert mount["fstype"] == "none"
+    assert mount["opts"] == (
+        "bind,nofail,x-systemd.requires-mounts-for={{ item.source }},"
+        "x-systemd.before=hippius-miner-agent.service"
+    )
+    assert mount["state"] == "mounted"
+    names = [t.get("name") for t in tasks]
+    assert names.index(bind["name"]) < names.index("Render the miner-agent config")

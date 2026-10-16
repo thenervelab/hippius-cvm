@@ -1,0 +1,41 @@
+---
+# This miner's NetBird mesh IP — tasks file imported by netbird-agent.yml
+# right after the join, and by tests/netbird_mesh_ip_wiring.yml with
+# canned command output.
+#
+# Inputs: `miner_netbird_final` (`netbird status`), `miner_netbird_iface`
+# (`ip -4 -o addr show dev wt0`), `miner_netbird_was_connected` (the
+# peer was already joined before this run). Output: `miner_netbird_ip`,
+# set ONLY to an address both sources agree on — never to a configured
+# fallback, so a failed join cannot pass with a placeholder.
+
+- name: Parse the mesh IP from netbird status and from the interface
+  ansible.builtin.set_fact:
+    miner_netbird_status_ip: >-
+      {{ miner_netbird_final.stdout | default('')
+         | regex_findall('(?m)^NetBird IP:\s+([0-9.]+)') | first | default('') }}
+    miner_netbird_iface_ips: >-
+      {{ miner_netbird_iface.stdout | default('')
+         | regex_findall('inet\s+([0-9.]+)/') }}
+
+- name: Assert the NetBird mesh IP is real (fail closed)
+  # Under --check on a host that has never joined, `netbird up` did not
+  # run, so there is nothing to find yet: not a failure of the host.
+  ansible.builtin.assert:
+    that:
+      - miner_netbird_status_ip is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.')
+      - miner_netbird_status_ip in miner_netbird_iface_ips
+    fail_msg: >-
+      No usable NetBird mesh IP: `netbird status` reports
+      "{{ miner_netbird_status_ip or 'none' }}", the wt0 interface carries
+      {{ miner_netbird_iface_ips | to_json }}. The mesh join failed or is
+      incomplete, and the orders server would bind nothing. Check
+      `netbird status`, the setup key and the management URL, then rerun.
+  when: not ansible_check_mode or miner_netbird_was_connected | bool
+
+- name: Record the mesh IP the orders server binds
+  ansible.builtin.set_fact:
+    miner_netbird_ip: "{{ miner_netbird_status_ip }}"
+  when:
+    - miner_netbird_status_ip is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.')
+    - miner_netbird_status_ip in miner_netbird_iface_ips

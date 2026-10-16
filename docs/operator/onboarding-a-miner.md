@@ -2,6 +2,10 @@
 
 How a third party brings a SEV-SNP host onto a Hippius compute fleet.
 
+> **External operator?** See
+> [`external-miner-guide.md`](./external-miner-guide.md) for the
+> dashboard-driven path, step by step. This page is the full reference.
+
 Admission is **permissionless**: there is no operator-issued client
 certificate and no approval queue. The agent generates its own Ed25519
 identity, presents a **self-signed** TLS client certificate whose
@@ -155,9 +159,7 @@ Per host, in `host_vars/<YOUR_HOST>.yml`:
 
 `ansible_host`, `ansible_user`, `ansible_ssh_private_key_file`,
 `cpu_model_expected`, `ram_gb_expected`, `nvme_system_devices`,
-`nvme_data_devices`, `netbird_setup_key_file`, `orders_bind_ip`,
-`snp_generation` (`genoa` | `turin` | `milan` — selects the host-attestor
-measurement; play 05 refuses an unknown value).
+`nvme_data_devices`, `netbird_setup_key_file`.
 
 The tenant CPU / RAM budget (`[host] cvm_*_budget`) is NOT per-host input:
 the template derives it from the host's own facts, `(threads − 2) ×
@@ -165,12 +167,14 @@ cpu_ratio` vCPU and `MemTotal − 8192` MiB (group_vars `host_cvm`). To run
 a box BELOW that, set `host_cvm_overrides: {cpu_budget_max: N,
 memory_mb_budget_max: M}`; a value above the derivation is ignored.
 
-That last one is this miner's **own** mesh address, and it is the one to
-watch: the agent's signed-order server binds it and only it. Omit it and
-the `group_vars` placeholder is used, the bind fails, and the miner never
-receives an order — with nothing visibly wrong anywhere else. NetBird
-assigns the address at mesh join, so you cannot fill it in until after
-play 04.
+Not on the list: `orders_bind_ip`, this miner's **own** mesh address,
+which the agent's signed-order server binds (and only it). NetBird assigns
+it at mesh join; play 04 reads it from `netbird status`, checks that the
+`wt0` interface carries it, and the config uses that. A failed or partial
+join stops play 04 instead of binding a placeholder. Set `orders_bind_ip`
+in host_vars only to render the config in a run that skips play 04, and
+only to the address `netbird status` shows; a run that renders the config
+with neither refuses.
 
 Do **not** set `miner_id` on a new host: it is derived from the node id
 (see [Your `miner_id`](#your-miner_id)).
@@ -188,7 +192,6 @@ ansible_user: ubuntu
 ansible_ssh_private_key_file: ~/.ssh/id_ed25519
 cpu_model_expected: "<exact string from /proc/cpuinfo, e.g. AMD EPYC 7543 32-Core Processor>"
 ram_gb_expected: <GB, assert is ">=">
-orders_bind_ip: "<MESH_IP — fill in AFTER play 04; the group_vars placeholder never binds>"
 # Name disks by /dev/disk/by-id (`ls -l /dev/disk/by-id | grep nvme`):
 # the kernel's nvmeXn1 names move between boots.
 nvme_system_devices:
@@ -731,7 +734,7 @@ existing mount (here an existing `/mnt/hippius-data` as pool `nvme0`):
 sudo mkdir -p /var/lib/hippius-miner/pools/nvme0
 # keep it across reboots: one /etc/fstab line (added once; re-running
 # this does not duplicate it)
-line='/mnt/hippius-data  /var/lib/hippius-miner/pools/nvme0  none  bind,x-systemd.requires-mounts-for=/mnt/hippius-data  0 0'
+line='/mnt/hippius-data  /var/lib/hippius-miner/pools/nvme0  none  bind,nofail,x-systemd.requires-mounts-for=/mnt/hippius-data,x-systemd.before=hippius-miner-agent.service  0 0'
 grep -qF "${line}" /etc/fstab || echo "${line}" | sudo tee -a /etc/fstab
 sudo systemctl daemon-reload
 sudo mount /var/lib/hippius-miner/pools/nvme0     # = mount --bind /mnt/hippius-data /var/lib/hippius-miner/pools/nvme0
@@ -739,6 +742,34 @@ findmnt /var/lib/hippius-miner/pools/nvme0        # must show the bind
 ```
 
 Declare the pool with `path = "/var/lib/hippius-miner/pools/nvme0"`.
+
+With the Ansible play, declare it in the host's `host_vars` instead. The
+play then creates the pool directory, writes the fstab bind and mounts it,
+and renders `[[storage.pools]]` (with `default` derived from
+`miner_data_disk_root` and the `[host]` budget). A hand-edited
+`config.toml` is overwritten by the next play run.
+
+```yaml
+miner_storage_pools:
+  - id: nvme0
+    class: nvme
+    budget_gb: 3200
+    source: /mnt/hippius-data   # a mounted filesystem; omit if mounted at the pool path
+miner_heartbeat_emit_pools: true   # v7 heartbeat: needs an agent that knows the key
+```
+
+`nofail` keeps a host booting when a pool's filesystem does not come up;
+the agent then reports that pool unavailable. `x-systemd.before=` makes the
+agent wait for the bind at boot (`nofail` alone would let it start first).
+A pool the agent has bound once comes back as soon as it is mounted again,
+without an agent restart; one mounted for the first time after the agent
+started reports `pool-unbound` until the next agent start. To change a
+pool's `source`, unmount the pool path first.
+
+Once vali has pushed a storage configuration to the host, the agent keeps
+it in `storage-config.json` under its state disk root (`miner_state_disk_root`), and that file — not
+`config.toml` — decides the pools from then on: manage them from vali. The
+play still provides the mounts.
 
 The root is fixed: `/var/lib/hippius-miner` is the agent's layout, and the
 play refuses another `miner_agent.state_dir` or a symlinked one. To put the
@@ -762,19 +793,26 @@ Dedicated disks are read by a separate oneshot,
 devices, and has no network. It writes `/run/hippius-miner/disk-facts.json`
 for the agent.
 
-To check a declaration without touching the running agent:
+To check a declaration without touching the running agent, put the
+candidate config under `/etc/hippius-miner/` and the disk facts under
+`/run/hippius-miner/`. The sandbox hides `/root` and `/home`
+(`ProtectHome=true`) and gives the check its own empty `/tmp`
+(`PrivateTmp=true`), so a file in any of those reads as missing
+(`config-read`):
 
 ```sh
-# Disk facts as the collector sees them (outside the sandbox):
-hippius-miner-agent storage-collect --out /tmp/disk-facts.json
-# The agent's view of a candidate config, under the agent's own sandbox:
-systemd-run --wait --pipe --collect \
+sudo cp candidate.toml /etc/hippius-miner/candidate.toml
+# Fresh disk facts, written by the collector (outside the sandbox) to
+# /run/hippius-miner/disk-facts.json, the default `--facts` path:
+sudo systemctl start hippius-miner-storage-collect.service
+# The agent's view of the candidate config, under the agent's own sandbox:
+sudo systemd-run --wait --pipe --collect \
   -p ProtectSystem=strict -p ProtectHome=true -p PrivateTmp=true \
   -p PrivateDevices=true -p NoNewPrivileges=true \
   -p ProtectKernelTunables=true -p ProtectControlGroups=true \
   -p ReadWritePaths=/var/lib/hippius-miner \
   /usr/local/bin/hippius-miner-agent storage-check \
-  --config /root/candidate.toml --facts /tmp/disk-facts.json
+  --config /etc/hippius-miner/candidate.toml
 ```
 
 The JSON shows each pool's state and error, its filesystem binding, and
@@ -954,6 +992,34 @@ mandatory for a real write; the audit record (who, node, before, after)
 is the last line of the output and is logged by the process you ran. With
 `kubectl exec` that output only exists in your session, so keep it.
 `--clear` puts the miner back on the flat fallback.
+
+### External miners: approval
+
+When vali runs with `VALI_MINER_APPROVAL_REQUIRED=true`, a miner first
+seen on chain is **pending approval**: it heartbeats and reports as usual,
+but takes no new placement (it rides the cordon gate, with the reason
+`pending approval`). Miners that existed before the switch were
+grandfathered approved; with the switch off (the default) a new miner is
+approved on sight, which is today's behaviour.
+
+Approving it also sets its anchor, to the smaller of what you declare and
+what its fresh heartbeat reports (cpu budget, available memory, data-disk
+size), so the miner's word can only lower your figure:
+
+```sh
+python manage.py vali_approve_miner --list-pending
+python manage.py vali_approve_miner --miner-id <MINER_ID> \
+    --cpus 64 --memory-mb 256180 --disk-gb 3500 --by <you> --reason "<why>" --dry-run
+```
+
+or, from the backend, `POST /v1/admin/miner/<MINER_ID>/approval` with the
+miner-admin token and `{cpus, memory_mb, disk_gb?, trust_class?,
+approved_by, reason}` (`GET` on the same path reads the state and the
+heartbeat's figures). It refuses a miner whose heartbeat is stale and a
+miner already approved; re-anchor an approved miner with
+`vali_set_miner_capacity`. Every field lands a `MinerCapacityAudit` row
+with the approver. Without `--trust operator` the miner stays `earned`, so
+the anchor is one more cap on what it has proven.
 
 ---
 

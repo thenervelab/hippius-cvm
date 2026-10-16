@@ -65,6 +65,7 @@ from apps.orchestration.services import flavors
 from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
 from apps.scheduler import capacity_config, chain, cvm_capability, scoring
 from apps.scheduler import service as scheduler_service
+from apps.scheduler.approval import held_back
 from apps.scheduler.capacity import DISK_GATE_OFF, DISK_UNKNOWN, HostBudget
 from apps.scheduler.models import (
     ACTIVE_PLACEMENT_STATES,
@@ -1075,7 +1076,7 @@ def _row(
         # the node id; a mirror row spelled otherwise is invisible to it.
         capacity_visible=mirror is None
         or mirror.miner_node_id == (chain_view.node_id if chain_view is not None else nid),
-        cordoned=mirror is not None and mirror.cordoned_at is not None,
+        cordoned=mirror is not None and held_back(mirror),
     )
 
     return {
@@ -1161,7 +1162,8 @@ def _placement_verdict(
         return False, "cvm-incapable"
     if cap is None or not capacity_visible:
         return False, "no-capacity-record"
-    # Gate (h), the operator cordon: no new placement, so not schedulable.
+    # Gate (h), the operator cordon (or a pending approval, which rides the
+    # same gate): no new placement, so not schedulable.
     # Reported as the existing `full` ("takes nothing now") rather than a
     # new value, so no consumer of this field has to learn one; the cordon
     # itself and its reason are in `GET /v1/scheduler/capacity` and

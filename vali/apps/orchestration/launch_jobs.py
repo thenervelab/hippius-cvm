@@ -878,10 +878,13 @@ def start_launch(
     ).exists():
         # Decommissioned before its first launch created the row
         # (`fence_launch_for_decommission`): the caller was told it is gone.
+        # (A §24 that overlaps this POST before the job row below commits
+        # still finds no launch and answers `not-found` — the caller must not
+        # decommission a vm_id whose launch POST it has not had answered.)
         raise LaunchIntentError(
             f"vm {intent.get('vm_id')!r} was decommissioned before it was launched — "
             "launch under a fresh vm_id",
-            "conflict",
+            CATEGORY_LAUNCH_CANCELLED,
         )
     if spent:
         raise LaunchIntentError(
@@ -1100,6 +1103,16 @@ def start_launch(
 #: `LaunchJob.reason` (and result outcome) of a launch a §24 cancelled.
 CANCELLED_BY_DECOMMISSION = "cancelled-by-decommission"
 
+#: Decommission API error categories for a vm_id with no `Vm` row whose
+#: launch is not the plain "never heard of it" (`not-found`): part of the
+#: contract with the caller, do not rename.
+#: - `launch-cancelled` (410): the launch was cancelled; nothing will ever
+#:   run under this vm_id. Final, like `not-found`.
+#: - `launch-pending` (409): the launch is running and was told not to
+#:   create the VM; ask again (the answer becomes `launch-cancelled`).
+CATEGORY_LAUNCH_CANCELLED = "launch-cancelled"
+CATEGORY_LAUNCH_PENDING = "launch-pending"
+
 #: [`fence_launch_for_decommission`] verdicts.
 FENCE_NO_LAUNCH = "no-launch"
 FENCE_CANCELLED = "cancelled"
@@ -1122,7 +1135,8 @@ def fence_launch_for_decommission(vm_id: str) -> str:
     - the row exists after all ⇒ `FENCE_VM_EXISTS`; the caller runs §24;
     - no in-flight launch ⇒ `FENCE_NO_LAUNCH`, nothing ever runs;
     - a queued job is failed `cancelled-by-decommission` ⇒
-      `FENCE_CANCELLED`: no worker can claim it any more;
+      `FENCE_CANCELLED`: no worker can claim it any more. Also the answer
+      for a vm_id an earlier §24 cancelled (idempotent);
     - a running job is marked `cancel_requested_at` ⇒ `FENCE_RUNNING`:
       the worker refuses to create the row, but it may still be on its way
       there, so the caller is told to ask again rather than told "gone".
@@ -1175,7 +1189,11 @@ def fence_launch_for_decommission(vm_id: str) -> str:
             vm_id,
         )
         return FENCE_RUNNING
-    return FENCE_CANCELLED if cancelled else FENCE_NO_LAUNCH
+    if cancelled or LaunchJob.objects.filter(
+        vm_id=vm_id, cancel_requested_at__isnull=False
+    ).exists():
+        return FENCE_CANCELLED
+    return FENCE_NO_LAUNCH
 
 
 # ── worker ───────────────────────────────────────────────────────────

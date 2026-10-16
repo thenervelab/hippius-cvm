@@ -368,6 +368,7 @@ fn launch_payload(vm: &str) -> LaunchOrder {
         guardian_ep: None,
         net: None,
         on_guest_poweroff: None,
+        os_pool: None,
     }
 }
 
@@ -1211,6 +1212,7 @@ fn activate_payload(vm: &str, get_url: &str) -> MigrateActivateOrder {
         guardian_ep: None,
         settle_by_unix: 0,
         net: None,
+        os_pool: None,
     }
 }
 
@@ -1582,7 +1584,7 @@ async fn a_restore_is_staged_reported_and_aborted_over_the_order_route() {
     .await;
     let vm = VmId::new("vm-a").unwrap();
     // The live disks, which a stage never touches.
-    let overlay = lifecycle.golden_overlay_path(&vm);
+    let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
     std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
     std::fs::write(&overlay, b"live").unwrap();
 

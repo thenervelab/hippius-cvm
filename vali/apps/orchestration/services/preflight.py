@@ -178,6 +178,7 @@ def build_preflight_payload(
     initrd_sha256_hex: str,
     rootfs_hash_url: str | None = None,
     rootfs_hash_sha256_hex: str | None = None,
+    os_pool: str | None = None,
 ) -> dict[str, Any]:
     """JSON payload that the ticket-validator's `encode-order` shapes
     into the canonical-CBOR `TenantPreflightOrder` the miner-agent
@@ -201,6 +202,9 @@ def build_preflight_payload(
             "url": rootfs_hash_url,
             "sha256_hex": rootfs_hash_sha256_hex,
         }
+    # A4b: the pool the launch will use, so the miner's disk gates check it.
+    if os_pool:
+        payload["os_pool"] = os_pool
     return payload
 
 
@@ -227,6 +231,7 @@ def dispatch_preflight(
     cpu_count: int,
     artifacts: PreflightArtifacts,
     timeout_s: float | None = None,
+    os_pool: str | None = None,
 ) -> PreflightResult:
     """Generate presigned URLs + dispatch the `tenant-preflight` order
     via the existing Edge sign + miner-verify chain + parse the JSON
@@ -259,6 +264,7 @@ def dispatch_preflight(
         initrd_sha256_hex=artifacts.initrd.sha256_hex,
         rootfs_hash_url=rootfs_hash_url,
         rootfs_hash_sha256_hex=rootfs_hash_sha,
+        os_pool=os_pool,
     )
     payload_bytes = json.dumps(payload).encode("utf-8")
 

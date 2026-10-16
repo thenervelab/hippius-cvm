@@ -1,0 +1,66 @@
+---
+# Generic miner host preflight: the judgement half — tasks file imported
+# by 06-miner-bootstrap.yml play "00", right after its read-only probes,
+# and by tests/preflight_wiring.yml with canned probe output.
+#
+# Inputs: `miner_host_probe` (the probe's stdout), `miner_pf_roots` (stat
+# of the two [storage] roots), `miner_pf_netbird_mgmt` (uri result) and
+# the gathered facts. The verdict is filter_plugins/host_preflight.py.
+
+- name: Judge the host
+  ansible.builtin.set_fact:
+    miner_pf: >-
+      {{ miner_host_probe.stdout | parse_host_probe | miner_host_preflight(miner_pf_facts, miner_pf_limits) }}
+  vars:
+    miner_pf_facts:
+      architecture: "{{ ansible_architecture }}"
+      distribution: "{{ ansible_distribution }}"
+      distribution_version: "{{ ansible_distribution_version }}"
+      kernel: "{{ ansible_kernel }}"
+      vcpus: "{{ ansible_processor_vcpus }}"
+      memtotal_mb: "{{ ansible_memtotal_mb }}"
+      mounts: "{{ ansible_mounts }}"
+      snp_generation_declared: "{{ snp_generation | default('') }}"
+      cpu_model_expected: "{{ cpu_model_expected | default('') }}"
+      ram_gb_expected: "{{ ram_gb_expected | default('') }}"
+      data_root: "{{ miner_data_disk_root }}"
+      data_root_exists: "{{ miner_pf_roots.results[0].stat.isdir | default(false) }}"
+      state_root: "{{ miner_state_disk_root }}"
+      state_root_exists: "{{ miner_pf_roots.results[1].stat.isdir | default(false) }}"
+      state_dir: "{{ miner_agent.state_dir }}"
+      staging_root: "{{ miner_agent.state_dir }}/staging"
+      netbird_mgmt_url: "{{ network.netbird_management_url }}"
+      netbird_mgmt_status: "{{ miner_pf_netbird_mgmt.status | default(-1) }}"
+      netbird_mgmt_error: "{{ miner_pf_netbird_mgmt.msg | default('') }}"
+    miner_pf_limits:
+      supported_ubuntu_versions: "{{ miner_supported_ubuntu_versions }}"
+      min_kernel: "{{ miner_preflight_min.kernel }}"
+      min_cpus: "{{ miner_preflight_min.cpus }}"
+      min_ram_gb: "{{ miner_preflight_min.ram_gb }}"
+      min_tenant_disk_gb: "{{ miner_preflight_min.tenant_disk_gb }}"
+      min_staging_free_gb: "{{ miner_preflight_min.staging_free_gb }}"
+      reserve_disk_gb: "{{ host_cvm.reserve_disk_gb }}"
+      snp_cmdline_tokens: "{{ grub_cmdline_required }}"
+
+- name: Report the host preflight verdict
+  # One machine-readable line for the operator dashboard / backend.
+  ansible.builtin.debug:
+    msg: "HIPPIUS_PREFLIGHT {{ miner_pf.summary | to_json }}"
+
+- name: Report the host preflight warnings
+  ansible.builtin.debug:
+    msg: "{{ miner_pf.warnings | map('miner_preflight_line', 'WARN') | list }}"
+  when: miner_pf.warnings | length > 0
+
+- name: Refuse a host that fails the preflight
+  ansible.builtin.assert:
+    that:
+      - miner_pf.failures | length == 0
+    fail_msg: "{{ miner_pf.failures | map('miner_preflight_line', 'FAIL') | list }}"
+    quiet: true
+
+- name: Take snp_generation from the CPU when host_vars does not set it
+  # The preflight refused a host_vars value that disagrees with the CPU.
+  ansible.builtin.set_fact:
+    snp_generation: "{{ miner_pf.snp_generation }}"
+  when: snp_generation is not defined

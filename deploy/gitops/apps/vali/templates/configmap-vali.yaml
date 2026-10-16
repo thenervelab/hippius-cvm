@@ -375,6 +375,18 @@ data:
   VALI_USERDATA_RESTAGE_VM_ALLOWLIST: {{ .Values.userdataRestage.vmAllowlist | quote }}
   # Operator storage-config writers — see values.yaml `operatorConfig`.
   VALI_OPERATOR_CONFIG_PRINCIPALS: {{ (.Values.operatorConfig).principals | default "" | quote }}
+  {{- /* Storage-config push loop — see values.yaml `storageConfig`. Each key
+         renders only when set; unset = the settings.py default (push off,
+         no miner, no agent version qualifies). */}}
+  {{- with (.Values.storageConfig).push }}
+  VALI_STORAGE_CONFIG_PUSH: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.storageConfig).miners }}
+  VALI_STORAGE_CONFIG_MINERS: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.storageConfig).minAgentVersion }}
+  VALI_STORAGE_CONFIG_MIN_AGENT_VERSION: {{ . | quote }}
+  {{- end }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}
   # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids
   # (distro → Succeeded golden bake_id, JSON) + the Pushgateway URL result

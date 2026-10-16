@@ -72,7 +72,7 @@ _MAX_NODE_ID = 64
 
 # `LaunchIntentError` categories that are a caller mistake (400) vs a
 # state conflict (409) vs an internal/config fault (503).
-_LAUNCH_CONFLICT_CATEGORIES = frozenset({"conflict"})
+_LAUNCH_CONFLICT_CATEGORIES = frozenset({"conflict", launch_jobs.CATEGORY_LAUNCH_CANCELLED})
 _LAUNCH_INTERNAL_CATEGORIES = frozenset({"internal"})
 
 # `StartError` categories that are a caller mistake (400) rather than
@@ -377,13 +377,17 @@ class DecommissionStartView(APIView):
             202: DecommissionJobSerializer,
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
             404: OpenApiResponse(
-                ErrorSerializer,
-                "VM not found — and no launch will create it (a queued launch "
-                "for it is cancelled).",
+                ErrorSerializer, "VM not found (`not-found`), and no launch for it exists."
             ),
             409: OpenApiResponse(
                 ErrorSerializer,
-                "VM-state conflict / job in flight (including its launch: retry).",
+                "VM-state conflict / job in flight, or `launch-pending`: its launch is "
+                "running and was told not to create the VM — retry.",
+            ),
+            410: OpenApiResponse(
+                ErrorSerializer,
+                "`launch-cancelled`: the VM was never created and its launch is "
+                "cancelled; nothing will run under this vm_id. Final.",
             ),
         },
     )
@@ -391,13 +395,19 @@ class DecommissionStartView(APIView):
         vm = Vm.objects.filter(vm_id=vm_id).first()
         if vm is None:
             # Not created YET is not gone: a queued launch would create it
-            # after this answer. `404` is only returned once no launch can.
+            # after this answer. `not-found` only when no launch exists.
             fence = launch_jobs.fence_launch_for_decommission(vm_id)
             if fence == launch_jobs.FENCE_RUNNING:
                 return _error(
                     status.HTTP_409_CONFLICT,
                     "vm is being launched; the launch was told not to create it — retry",
-                    "job-in-flight",
+                    launch_jobs.CATEGORY_LAUNCH_PENDING,
+                )
+            if fence == launch_jobs.FENCE_CANCELLED:
+                return _error(
+                    status.HTTP_410_GONE,
+                    "vm was never created; its launch is cancelled",
+                    launch_jobs.CATEGORY_LAUNCH_CANCELLED,
                 )
             if fence != launch_jobs.FENCE_VM_EXISTS:
                 return _error(status.HTTP_404_NOT_FOUND, "vm not found", "not-found")

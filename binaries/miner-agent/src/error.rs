@@ -401,9 +401,13 @@ pub enum MinerAgentError {
     /// `luksFormat`ted by the guest the moment a KEK IS released. So a
     /// relaunch refuses before any of them runs, and creates nothing.
     /// The sub-classifier names the FIRST missing disk: `state-disk`,
-    /// `overlay` (golden `/dev/vda`) or `data-disk` (legacy `/dev/vde`).
-    #[error("relaunch-disks-missing/{0}")]
-    RelaunchDisksMissing(&'static str),
+    /// `overlay` (golden `/dev/vda`) or `data-disk` (legacy `/dev/vde`),
+    /// and the pool it was looked for on (`overlay-missing:nvme0`).
+    ///
+    /// Also refused for a VM that has run here (its per-VM pool record,
+    /// a §25 restore marker, or its state disk), whatever the order says.
+    #[error("relaunch-disks-missing/{0}-missing:{1}")]
+    RelaunchDisksMissing(&'static str, String),
 
     /// A relaunch could not tell whether a per-VM disk is present: the
     /// metadata lookup itself failed (EIO, EACCES, a storage mount not up
@@ -412,6 +416,13 @@ pub enum MinerAgentError {
     /// VM. Same sub-classifiers.
     #[error("relaunch-disks-unreadable/{0}")]
     RelaunchDisksUnreadable(&'static str),
+
+    /// A VM's per-VM pool record ([`crate::lifecycle::vm_pool`]) is not
+    /// usable: `missing` (the VM has run here but has no record, after the
+    /// one-time backfill), `unreadable`, or `unwritable`. Never guessed:
+    /// the wrong pool would point every caller at the wrong disks.
+    #[error("vm-pool-record-{0}")]
+    VmPoolRecord(&'static str),
 
     /// A live VM backup (QMP capture, part upload) or a backup-chain
     /// restore failed. Sub-classifiers are compile-time `&'static str`

@@ -1,0 +1,12 @@
+# Paths that must never reach the published repository.
+#
+# One repo-relative path prefix per line; `#` comments ignored. Files under
+# these prefixes are written for us alone (approval procedures, chain admin
+# runbooks, open weaknesses), so the published branch must not track them.
+# scripts/dev/publishability-test.sh fails while any tracked path matches,
+# which is what catches one arriving on `release/**` with a merge from
+# `main`: `git rm` it there (docs/operator/cutting-the-public-repo.md).
+#
+# A banner saying "internal" inside a file excludes nothing. Put the file
+# under a prefix listed here instead.
+docs/internal/

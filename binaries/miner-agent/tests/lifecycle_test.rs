@@ -136,6 +136,7 @@ fn order(vm_id: &str) -> LaunchOrder {
         guardian_ep: None,
         net: None,
         on_guest_poweroff: None,
+        os_pool: None,
     }
 }
 
@@ -188,11 +189,13 @@ fn check_disk_budget_fail_fasts_over_the_declared_budget() {
     let lc = lifecycle_with_disk_budget(64);
     // 128 GiB against a 64 GiB budget → rejected at preflight.
     assert!(matches!(
-        lc.check_disk_budget(128),
+        lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 128),
         Err(MinerAgentError::InsufficientDisk)
     ));
     // Exactly at budget is admitted.
-    assert!(lc.check_disk_budget(64).is_ok());
+    assert!(lc
+        .check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 64)
+        .is_ok());
 }
 
 #[test]
@@ -200,7 +203,9 @@ fn check_disk_budget_zero_disables_the_fail_fast() {
     // 0 budget = disabled (back-compat) — a huge request passes; the
     // launch-time statvfs backstop still catches a genuinely full mount.
     let lc = lifecycle_with_disk_budget(0);
-    assert!(lc.check_disk_budget(1_000_000).is_ok());
+    assert!(lc
+        .check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 1_000_000)
+        .is_ok());
 }
 
 /// A lifecycle whose data-disk root is `root` — for the measured
@@ -226,13 +231,13 @@ fn check_disk_space_refuses_what_the_filesystem_cannot_hold() {
     let tmp = tempfile::tempdir().unwrap();
     let lc = lifecycle_on_root(tmp.path());
     let vm = VmId::new("tenant-space").unwrap();
-    assert!(lc.check_disk_space(&vm, 1).is_ok());
+    assert!(lc.check_disk_space(&vm, None, 1).is_ok());
     assert!(matches!(
-        lc.check_disk_space(&vm, u32::MAX),
+        lc.check_disk_space(&vm, None, u32::MAX),
         Err(MinerAgentError::InsufficientDisk)
     ));
     // 0 GiB never refuses.
-    assert!(lc.check_disk_space(&vm, 0).is_ok());
+    assert!(lc.check_disk_space(&vm, None, 0).is_ok());
 }
 
 /// Serialises the tests below whose margin a concurrent GiB-scale host
@@ -255,10 +260,10 @@ fn check_disk_space_counts_the_unwritten_tail_of_existing_disks() {
     promise_all_but(tmp.path(), "tenant-other.img", 4);
     let vm = VmId::new("tenant-new").unwrap();
     assert!(matches!(
-        lc.check_disk_space(&vm, 8),
+        lc.check_disk_space(&vm, None, 8),
         Err(MinerAgentError::InsufficientDisk)
     ));
-    assert!(lc.check_disk_space(&vm, 2).is_ok());
+    assert!(lc.check_disk_space(&vm, None, 2).is_ok());
 }
 
 #[test]
@@ -273,11 +278,11 @@ fn check_disk_space_counts_what_in_flight_writers_hold_reserved() {
     let ledger = lc.disk_space_ledger();
     let held = ledger.reserve(tmp.path(), 3 << 30, 0).expect("fits");
     assert!(matches!(
-        lc.check_disk_space(&vm, 2),
+        lc.check_disk_space(&vm, None, 2),
         Err(MinerAgentError::InsufficientDisk)
     ));
     drop(held);
-    assert!(lc.check_disk_space(&vm, 2).is_ok());
+    assert!(lc.check_disk_space(&vm, None, 2).is_ok());
 }
 
 #[test]
@@ -287,12 +292,12 @@ fn check_disk_space_never_refuses_a_vm_whose_disk_already_exists() {
     let lc = lifecycle_on_root(tmp.path());
     let vm = VmId::new("tenant-back").unwrap();
     promise_all_but(tmp.path(), "tenant-back.img", 0);
-    assert!(lc.check_disk_space(&vm, 64).is_ok());
+    assert!(lc.check_disk_space(&vm, None, 64).is_ok());
     // …and the golden overlay counts as that disk too.
     let vm2 = VmId::new("tenant-golden").unwrap();
     std::fs::create_dir_all(tmp.path().join("overlay")).unwrap();
     std::fs::write(tmp.path().join("overlay/tenant-golden.img"), b"").unwrap();
-    assert!(lc.check_disk_space(&vm2, 64).is_ok());
+    assert!(lc.check_disk_space(&vm2, None, 64).is_ok());
 }
 
 #[tokio::test]
@@ -1099,7 +1104,7 @@ async fn destroy_reclaims_a_golden_overlay_after_re_adoption() {
     // skips real disk provisioning, so materialise it here — the point is to
     // prove `destroy` reclaims THIS file (the leak was a golden overlay left
     // orphaned on a re-adopted VM).
-    let overlay = lc1.golden_overlay_path(&vm);
+    let overlay = lc1.golden_overlay_path(&vm).unwrap();
     std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
     std::fs::write(&overlay, b"luks-ciphertext").unwrap();
 
@@ -1179,19 +1184,30 @@ fn write_sidecar(root: &std::path::Path, vm: &str, cpu: u8, mem_mb: u32, cid: u3
 /// flips the answer, so this pins the number rather than bounding it.
 fn assert_committed(lc: &CvmLifecycle, cpu: u8, mem: u32) {
     assert!(
-        lc.check_cpu_mem_budget(16 - cpu, 65536 - mem).is_ok(),
+        lc.check_cpu_mem_budget(
+            &VmId::new("budget-probe").unwrap(),
+            None,
+            16 - cpu,
+            65536 - mem
+        )
+        .is_ok(),
         "expected exactly {cpu}c/{mem}MiB committed — the remainder must still fit"
     );
     assert!(
         matches!(
-            lc.check_cpu_mem_budget(16 - cpu + 1, 0),
+            lc.check_cpu_mem_budget(&VmId::new("budget-probe").unwrap(), None, 16 - cpu + 1, 0),
             Err(MinerAgentError::InsufficientResources)
         ),
         "expected exactly {cpu}c committed — one more vCPU must NOT fit"
     );
     assert!(
         matches!(
-            lc.check_cpu_mem_budget(0, 65536 - mem + 1),
+            lc.check_cpu_mem_budget(
+                &VmId::new("budget-probe").unwrap(),
+                None,
+                0,
+                65536 - mem + 1
+            ),
             Err(MinerAgentError::InsufficientResources)
         ),
         "expected exactly {mem}MiB committed — one more MiB must NOT fit"
@@ -1534,13 +1550,14 @@ async fn an_orphans_writable_volume_is_charged_to_the_disk_budget() {
     )
     .with_state_disk_root(tmp.path().to_path_buf());
     assert!(
-        lc.check_disk_budget(1).is_ok(),
+        lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 1)
+            .is_ok(),
         "the 1 GiB budget is free before adoption"
     );
     assert_eq!(lc.readopt_running().await.unwrap(), 1);
     assert!(
         matches!(
-            lc.check_disk_budget(1),
+            lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 1),
             Err(MinerAgentError::InsufficientDisk)
         ),
         "the orphan's overlay must consume the disk budget"
@@ -2766,6 +2783,26 @@ fn data_path(root: &std::path::Path, vm: &str) -> PathBuf {
     root.join("data").join(format!("{vm}.img"))
 }
 
+fn write_pool_record(state_root: &std::path::Path, vm: &str, root: &std::path::Path, ran: bool) {
+    hippius_miner_agent::lifecycle::vm_pool::write(
+        state_root,
+        &VmId::new(vm).unwrap(),
+        &hippius_miner_agent::lifecycle::vm_pool::VmPoolRecord {
+            pool_id: "default".into(),
+            root: root.to_path_buf(),
+            ran,
+        },
+    )
+    .unwrap();
+}
+
+fn read_pool_record(
+    state_root: &std::path::Path,
+    vm: &str,
+) -> Option<hippius_miner_agent::lifecycle::vm_pool::VmPoolRecord> {
+    hippius_miner_agent::lifecycle::vm_pool::read(state_root, &VmId::new(vm).unwrap()).unwrap()
+}
+
 fn relaunch(mut o: LaunchOrder) -> LaunchOrder {
     o.require_existing_disks = true;
     o
@@ -2782,7 +2819,7 @@ async fn golden_relaunch_without_its_overlay_is_refused_and_creates_nothing() {
     let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
 
     assert!(
-        matches!(err, MinerAgentError::RelaunchDisksMissing("overlay")),
+        matches!(err, MinerAgentError::RelaunchDisksMissing("overlay", ref pool) if pool == "default"),
         "got {err:?}"
     );
     assert!(
@@ -2806,7 +2843,7 @@ async fn golden_relaunch_without_its_state_disk_is_refused_and_creates_nothing()
     let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
 
     assert!(
-        matches!(err, MinerAgentError::RelaunchDisksMissing("state-disk")),
+        matches!(err, MinerAgentError::RelaunchDisksMissing("state-disk", ref pool) if pool == "default"),
         "got {err:?}"
     );
     assert!(
@@ -2829,7 +2866,7 @@ async fn legacy_relaunch_without_its_data_disk_is_refused_and_creates_nothing() 
     let err = lc.launch(relaunch(o)).await.unwrap_err();
 
     assert!(
-        matches!(err, MinerAgentError::RelaunchDisksMissing("data-disk")),
+        matches!(err, MinerAgentError::RelaunchDisksMissing("data-disk", ref pool) if pool == "default"),
         "got {err:?}"
     );
     assert!(!data_path(tmp.path(), vm).exists());
@@ -2855,11 +2892,14 @@ async fn golden_relaunch_with_its_disks_reuses_them_untouched() {
 
 #[tokio::test]
 async fn a_first_launch_still_creates_its_overlay() {
-    // The guard is scoped to relaunches: a first launch (the default)
-    // provisions its blank overlay exactly as before.
+    // The guard is scoped to VMs that have run: a first launch provisions
+    // its blank overlay exactly as before — here the retry of a first
+    // launch that failed after creating its state disk (its pool record
+    // still says it never ran), which also spares the runner mkfs.ext4.
     let tmp = tempfile::tempdir().unwrap();
     let vm = "cvm-first-launch";
-    touch(&state_path(tmp.path(), vm)); // no mkfs.ext4 needed on the runner
+    touch(&state_path(tmp.path(), vm));
+    write_pool_record(tmp.path(), vm, tmp.path(), false);
     let driver = Arc::new(MockLibvirtDriver::new());
     let lc = provisioning_lifecycle(driver.clone(), tmp.path());
     let mut o = golden_order(vm);
@@ -2899,4 +2939,357 @@ async fn a_relaunch_whose_disk_cannot_be_statted_is_unreadable_not_missing() {
     );
     assert_eq!(driver.defined_count().unwrap(), 0);
     assert_eq!(std::fs::read(&state).unwrap(), b"existing tenant bytes");
+}
+
+// ── Per-VM pool record (A4): every caller finds a VM's disks on ITS pool ─
+//
+// A VM's writable disks may live on a pool other than `default`. Rebuilding
+// their paths from `data_disk_root` would point a relaunch at the wrong
+// filesystem, and the launch would create blank disks there (plan §19.1).
+
+fn pool_root(tmp: &std::path::Path) -> PathBuf {
+    tmp.join("pools").join("nvme0")
+}
+
+fn write_nvme0_record(tmp: &std::path::Path, vm: &str, ran: bool) {
+    hippius_miner_agent::lifecycle::vm_pool::write(
+        tmp,
+        &VmId::new(vm).unwrap(),
+        &hippius_miner_agent::lifecycle::vm_pool::VmPoolRecord {
+            pool_id: "nvme0".into(),
+            root: pool_root(tmp),
+            ran,
+        },
+    )
+    .unwrap();
+}
+
+fn mark_backfilled(tmp: &std::path::Path) {
+    hippius_miner_agent::lifecycle::vm_pool::backfill(tmp, tmp, &[]).unwrap();
+    assert!(hippius_miner_agent::lifecycle::vm_pool::backfilled(tmp));
+}
+
+#[tokio::test]
+async fn a_relaunch_on_a_non_default_pool_boots_the_disks_its_record_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-on-nvme0";
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(&pool_root(tmp.path()), vm));
+    write_nvme0_record(tmp.path(), vm, true);
+    mark_backfilled(tmp.path());
+    let lc = provisioning_lifecycle(Arc::new(MockLibvirtDriver::new()), tmp.path());
+
+    lc.launch(relaunch(golden_order(vm))).await.unwrap();
+
+    let id = VmId::new(vm).unwrap();
+    assert_eq!(
+        lc.luks_disk_path_for(&id),
+        Some(overlay_path(&pool_root(tmp.path()), vm))
+    );
+    assert!(
+        !overlay_path(tmp.path(), vm).exists(),
+        "nothing created on default"
+    );
+    assert_eq!(
+        lc.golden_overlay_path(&id).unwrap(),
+        overlay_path(&pool_root(tmp.path()), vm)
+    );
+    assert_eq!(
+        lc.backup_dir(&id).unwrap(),
+        pool_root(tmp.path()).join("backup").join(vm)
+    );
+}
+
+#[tokio::test]
+async fn a_vm_that_ran_is_refused_when_its_overlay_is_missing_whatever_the_order_says() {
+    // No `require_existing_disks` (an older vali, a re-place): the record
+    // says the VM ran, so a blank overlay is never created.
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-lost-overlay";
+    touch(&state_path(tmp.path(), vm));
+    write_nvme0_record(tmp.path(), vm, true);
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(golden_order(vm)).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("overlay", ref pool) if pool == "nvme0"),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "relaunch-disks-missing/overlay-missing:nvme0"
+    );
+    assert!(!overlay_path(&pool_root(tmp.path()), vm).exists());
+    assert!(!overlay_path(tmp.path(), vm).exists());
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    // The record is kept: the VM is still the one that ran.
+    assert!(read_pool_record(tmp.path(), vm).unwrap().ran);
+}
+
+#[tokio::test]
+async fn a_vm_that_ran_without_a_record_is_refused_once_the_backfill_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-no-record";
+    // Backfilled before these disks appeared (a record lost since).
+    mark_backfilled(tmp.path());
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(tmp.path(), vm));
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::VmPoolRecord("missing")),
+        "got {err:?}"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    assert!(read_pool_record(tmp.path(), vm).is_none());
+    // Every other caller refuses the same way: no guess at `default`.
+    let id = VmId::new(vm).unwrap();
+    assert!(matches!(
+        lc.golden_overlay_path(&id),
+        Err(MinerAgentError::VmPoolRecord("missing"))
+    ));
+}
+
+#[tokio::test]
+async fn an_unreadable_record_is_refused_never_treated_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-bad-record";
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(tmp.path(), vm));
+    let id = VmId::new(vm).unwrap();
+    let path = hippius_miner_agent::lifecycle::vm_pool::record_path(tmp.path(), &id);
+    touch(&path);
+    std::fs::write(&path, b"{not json").unwrap();
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::VmPoolRecord("unreadable")),
+        "got {err:?}"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn before_the_backfill_a_vm_without_a_record_is_on_default_and_gets_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-pre-a4";
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(tmp.path(), vm));
+    let lc = provisioning_lifecycle(Arc::new(MockLibvirtDriver::new()), tmp.path());
+
+    lc.launch(relaunch(golden_order(vm))).await.unwrap();
+
+    let rec = read_pool_record(tmp.path(), vm).unwrap();
+    assert_eq!(
+        (rec.pool_id.as_str(), rec.root.as_path(), rec.ran),
+        ("default", tmp.path(), true)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_relaunch_keeps_the_record_and_a_first_launch_counts_as_run_once_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A VM that ran, whose relaunch fails at the domain start.
+    let ran = "cvm-ran-fails";
+    touch(&state_path(tmp.path(), ran));
+    touch(&overlay_path(&pool_root(tmp.path()), ran));
+    write_nvme0_record(tmp.path(), ran, true);
+    // A first launch (its state disk made, never booted) that fails too.
+    let first = "cvm-first-fails";
+    touch(&state_path(tmp.path(), first));
+    write_pool_record(tmp.path(), first, tmp.path(), false);
+    let driver = Arc::new(MockLibvirtDriver::with_post_create_state(
+        DomainState::Crashed,
+    ));
+    let lc = provisioning_lifecycle(driver, tmp.path());
+
+    assert!(lc.launch(relaunch(golden_order(ran))).await.is_err());
+    let rec = read_pool_record(tmp.path(), ran).unwrap();
+    assert!(rec.ran && rec.pool_id == "nvme0", "kept as it was: {rec:?}");
+
+    // The failed first launch reached the domain start: the guest may
+    // have used its disks, so it now counts as having run (its overlay
+    // and state disk are kept, never recreated blank).
+    // 1 GiB: the overlay is really created (fits a CI runner's disk).
+    let mut first_order = golden_order(first);
+    first_order.data_disk_size_gb = 1;
+    assert!(lc.launch(first_order).await.is_err());
+    assert!(read_pool_record(tmp.path(), first).unwrap().ran);
+    assert!(overlay_path(tmp.path(), first).exists());
+}
+
+#[tokio::test]
+async fn a_first_launch_records_its_pool_before_creating_any_disk() {
+    // No record, no disk: a real first launch. Its first disk (the state
+    // disk) cannot be created — the record must already be there, `ran`
+    // false (the domain never started).
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-first-records";
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(state_dir.join("probe"), b"").is_ok() {
+        // Running as root: permissions do not bind, nothing to prove here.
+        return;
+    }
+    let lc = provisioning_lifecycle(Arc::new(MockLibvirtDriver::new()), tmp.path());
+
+    let err = lc.launch(golden_order(vm)).await.unwrap_err();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(matches!(err, MinerAgentError::StateDisk(_)), "got {err:?}");
+    let rec = read_pool_record(tmp.path(), vm).expect("recorded before the disks");
+    assert_eq!((rec.root.as_path(), rec.ran), (tmp.path(), false));
+}
+
+#[tokio::test]
+async fn a_first_launch_marks_its_record_ran_before_the_domain_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-first-ran";
+    touch(&state_path(tmp.path(), vm));
+    write_pool_record(tmp.path(), vm, tmp.path(), false);
+    let lc = provisioning_lifecycle(Arc::new(MockLibvirtDriver::new()), tmp.path());
+
+    let mut o = golden_order(vm);
+    o.data_disk_size_gb = 1; // the overlay is really created: fit a CI runner
+    lc.launch(o).await.unwrap();
+
+    let rec = read_pool_record(tmp.path(), vm).unwrap();
+    assert!(rec.ran);
+    assert_eq!(rec.root, tmp.path());
+    assert!(overlay_path(tmp.path(), vm).exists());
+}
+
+#[tokio::test]
+async fn after_the_backfill_a_relaunch_onto_a_host_without_the_vm_is_disks_missing() {
+    // kbsc-1 on a host past its backfill: nothing of the VM here, no
+    // record — the class vali stops relaunching on, not a record refusal.
+    let tmp = tempfile::tempdir().unwrap();
+    mark_backfilled(tmp.path());
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = provisioning_lifecycle(driver.clone(), tmp.path());
+
+    let err = lc
+        .launch(relaunch(golden_order("cvm-elsewhere")))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("state-disk", ref pool) if pool == "default"),
+        "got {err:?}"
+    );
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    assert!(read_pool_record(tmp.path(), "cvm-elsewhere").is_none());
+    assert!(!overlay_path(tmp.path(), "cvm-elsewhere").exists());
+}
+
+#[tokio::test]
+async fn destroy_reclaims_a_vm_on_a_non_default_pool_and_drops_its_record_last() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-destroy-nvme0";
+    let pool = pool_root(tmp.path());
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay_path(&pool, vm));
+    touch(&pool.join("backup").join(vm).join("leftover"));
+    write_nvme0_record(tmp.path(), vm, true);
+    mark_backfilled(tmp.path());
+    let lc = provisioning_lifecycle(Arc::new(MockLibvirtDriver::new()), tmp.path());
+    let id = VmId::new(vm).unwrap();
+
+    lc.destroy(&id, None).await.unwrap();
+
+    assert!(!overlay_path(&pool, vm).exists());
+    assert!(!state_path(tmp.path(), vm).exists());
+    assert!(!pool.join("backup").join(vm).exists());
+    assert!(read_pool_record(tmp.path(), vm).is_none());
+    // Idempotent: a second destroy is the no-op it always was.
+    lc.destroy(&id, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn re_adopt_records_the_pool_the_live_domain_actually_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "readopt-nvme0";
+    // The record is wrong (says default); the live domain runs off nvme0.
+    write_pool_record(tmp.path(), vm, tmp.path(), true);
+    let live_vda = overlay_path(&pool_root(tmp.path()), vm);
+    let driver = Arc::new(MockLibvirtDriver::new());
+    driver.seed_domain_xml(
+        DomainId::new(&format!("hippius-tenant-{vm}")).unwrap(),
+        DomainState::Running,
+        &dumpxml(vm, 2, 2 * 1024 * 1024, 31, live_vda.to_str().unwrap()),
+    );
+    let lc = lifecycle(driver, ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+
+    assert_eq!(lc.readopt_running().await.unwrap(), 1);
+
+    let rec = read_pool_record(tmp.path(), vm).unwrap();
+    assert_eq!(rec.root, pool_root(tmp.path()));
+    assert!(rec.ran);
+    assert_eq!(
+        lc.golden_overlay_path(&VmId::new(vm).unwrap()).unwrap(),
+        live_vda
+    );
+}
+
+/// Removes the VM's overlay while the launch computes its digest — between
+/// the relaunch check and the domain start.
+struct RemovesOverlayMidLaunch(PathBuf);
+
+impl hippius_miner_agent::lifecycle::launch_digest::LaunchDigestComputer
+    for RemovesOverlayMidLaunch
+{
+    fn compute(&self, _config: &hippius_miner_agent::lifecycle::QemuConfig) -> Result<[u8; 48]> {
+        std::fs::remove_file(&self.0).unwrap();
+        Ok([0u8; 48])
+    }
+
+    fn recipe(
+        &self,
+        _inputs: &hippius_miner_agent::lifecycle::guardian::RecipeInputs,
+    ) -> Result<hippius_types::guardian::LaunchRecipe> {
+        Err(MinerAgentError::LaunchDigest("test"))
+    }
+}
+
+#[tokio::test]
+async fn a_disk_removed_mid_launch_of_a_vm_that_ran_is_refused_not_recreated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vm = "cvm-vanishing";
+    let overlay = overlay_path(&pool_root(tmp.path()), vm);
+    touch(&state_path(tmp.path(), vm));
+    touch(&overlay);
+    write_nvme0_record(tmp.path(), vm, true);
+    seed_snp_probe();
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let lc = CvmLifecycle::new_with_poll(
+        driver.clone(),
+        Arc::new(RemovesOverlayMidLaunch(overlay.clone())),
+        HostResources {
+            total_cpus: 16,
+            total_memory_mb: 65536,
+            total_disk_gb: 0,
+        },
+        Duration::from_millis(1),
+        5,
+    )
+    .with_state_disk_root(tmp.path().to_path_buf());
+
+    let err = lc.launch(relaunch(golden_order(vm))).await.unwrap_err();
+
+    assert!(
+        matches!(err, MinerAgentError::RelaunchDisksMissing("overlay", ref pool) if pool == "nvme0"),
+        "got {err:?}"
+    );
+    assert!(!overlay.exists(), "never recreated blank");
+    assert_eq!(driver.defined_count().unwrap(), 0);
 }

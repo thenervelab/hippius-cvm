@@ -1,0 +1,23 @@
+---
+# One refusal case for netbird_mesh_ip_wiring.yml (`case.status`,
+# `case.iface`): the capture must fail its assert and set no address.
+- name: Run the mesh-IP capture on a broken join
+  vars:
+    miner_netbird_final: { stdout: "{{ case.status }}" }
+    miner_netbird_iface: { stdout: "{{ case.iface }}" }
+    miner_netbird_was_connected: "{{ case.was_connected | default(true) }}"
+  block:
+    - name: Forget any address from an earlier case
+      ansible.builtin.set_fact:
+        miner_netbird_ip: null
+    - name: Capture
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/netbird-mesh-ip.yml
+    - name: Not reached
+      ansible.builtin.fail:
+        msg: "a broken join passed: {{ case }}"
+  rescue:
+    - name: Refused by the mesh-IP assert, with no address recorded
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_task.name == 'Assert the NetBird mesh IP is real (fail closed)'
+          - miner_netbird_ip is none

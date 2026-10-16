@@ -2,7 +2,9 @@
 # Orchestrator for the UNTRUSTED miner fleet (`miner_nodes` group).
 #
 # Run order:
-#   00 preflight         READ-ONLY, fail-closed sanity checks
+#   00 preflight         READ-ONLY, fail-closed host checks: generic
+#                        hardware/firmware/OS (codes + fixes), derives
+#                        snp_generation; alone: `--tags preflight`
 #   01 SEV-SNP cmdline   GRUB tokens — reboots ONLY if the line changed;
 #                        retires hippius-smt-off, asserts no CPU offline
 #   02 libvirt + qemu    tenant-CVM hypervisor stack
@@ -34,21 +36,120 @@
   hosts: miner_nodes
   gather_facts: true
   become: true
+  # `--tags preflight` runs this play alone (with `--check`: changes nothing).
+  tags: [preflight]
   tasks:
-    - name: Assert host is a supported Ubuntu release
-      ansible.builtin.assert:
-        that:
-          - ansible_distribution == "Ubuntu"
-          - ansible_distribution_version in miner_supported_ubuntu_versions
-        fail_msg: >-
-          Miner bootstrap supports Ubuntu {{ miner_supported_ubuntu_versions | join(' / ') }}
-          — detected {{ ansible_distribution }} {{ ansible_distribution_version }}.
-          A release qualifies only if its distro libvirt/QEMU can launch a
-          SEV-SNP guest (libvirt >= {{ miner_min_libvirt_version }}, QEMU >=
-          {{ miner_min_qemu_version }}); 24.04 cannot. See
-          `miner_supported_ubuntu_versions` in group_vars/miner_nodes.yml.
+    # ── Generic host preflight ──────────────────────────────────────
+    # Judges the host from what it IS (CPU, BIOS, firmware, kernel,
+    # sizes, clock, network), so a third-party operator with no curated
+    # host_vars gets the same refusal we would — every problem at once,
+    # each with a code and a fix (docs/operator/external-miner-guide.md
+    # lists them). The logic is filter_plugins/host_preflight.py
+    # (unit-tested: tests/test_host_preflight.py); the probe below only
+    # reads. Run this play alone with `--tags preflight` (add `--check`
+    # to change nothing at all: without it, the legacy NetBird apt source
+    # below is the one file it removes).
+    - name: Probe the host hardware, firmware and services (read-only)
+      ansible.builtin.shell:
+        cmd: |
+          set -uo pipefail
+          cpuinfo() {
+            awk -F: -v k="$1" '{f=$1; sub(/[ \t]+$/, "", f)} f == k {v=$2; sub(/^[ \t]+/, "", v); print v; exit}' /proc/cpuinfo
+          }
+          has_flag() { case " $(cpuinfo flags) " in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
+          echo "cpu_vendor=$(cpuinfo vendor_id)"
+          echo "cpu_family=$(cpuinfo 'cpu family')"
+          echo "cpu_model=$(cpuinfo model)"
+          echo "cpu_model_name=$(cpuinfo 'model name')"
+          echo "flag_sev_snp=$(has_flag sev_snp)"
+          echo "flag_hypervisor=$(has_flag hypervisor)"
+          echo "virt=$(systemd-detect-virt --vm 2>/dev/null)"
+          echo "cmdline=$(cat /proc/cmdline)"
+          echo "smt_control=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null || echo absent)"
+          echo "smt_active=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null)"
+          echo "cpus_online=$(cat /sys/devices/system/cpu/online 2>/dev/null)"
+          echo "cpus_present=$(cat /sys/devices/system/cpu/present 2>/dev/null)"
+          echo "cpus_possible=$(cat /sys/devices/system/cpu/possible 2>/dev/null)"
+          # PRESENT CPUs that are offline (cpuN dirs; cpu0 may have no
+          # `online` file) — not cpu/offline, which lists empty slots too.
+          off=""
+          for f in /sys/devices/system/cpu/cpu[0-9]*/online; do
+            [ -e "$f" ] || continue
+            if [ "$(cat "$f")" = 0 ]; then d=${f%/online}; off="$off ${d##*/}"; fi
+          done
+          echo "cpus_offline=$off"
+          if systemctl cat hippius-smt-off.service >/dev/null 2>&1; then echo smt_off_unit=1; else echo smt_off_unit=0; fi
+          if systemctl cat {{ miner_agent.systemd_unit_name }}.service >/dev/null 2>&1; then echo agent_installed=1; else echo agent_installed=0; fi
+          echo "sev_snp_param=$(cat /sys/module/kvm_amd/parameters/sev_snp 2>/dev/null || echo absent)"
+          if [ -e /dev/sev ]; then echo dev_sev=1; else echo dev_sev=0; fi
+          echo "sev_es_asids=$(awk '$1 == "sev_es" {print $2}' /sys/fs/cgroup/misc.capacity 2>/dev/null)"
+          fw_re='SEV-SNP API:[0-9]+\.[0-9]+ build:[0-9]+'
+          fw=$(dmesg 2>/dev/null | grep -oE "$fw_re" | tail -1)
+          [ -n "$fw" ] || fw=$(journalctl -k -b 0 -q --no-pager 2>/dev/null | grep -oE "$fw_re" | tail -1)
+          echo "snp_fw=${fw#SEV-SNP API:}"
+          echo "iommu_units=$(ls /sys/class/iommu 2>/dev/null | wc -l)"
+          echo "ntp_synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+          if command -v netbird >/dev/null 2>&1; then
+            echo netbird_installed=1
+            echo "netbird_mgmt=$(timeout 10 netbird status 2>/dev/null | awk -F': *' '/^Management:/ {print $2; exit}')"
+          else
+            echo netbird_installed=0
+          fi
+        executable: /bin/bash
+      register: miner_host_probe
+      changed_when: false
+      check_mode: false
 
-    # The OS check above is a proxy; this is the property itself. Read what
+    - name: Stat the [storage] roots
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ [miner_data_disk_root, miner_state_disk_root] }}"
+      register: miner_pf_roots
+
+    - name: Probe the NetBird management URL from the host
+      # Any HTTP status = reachable (TLS verified, so a broken clock or an
+      # intercepting proxy shows up here too); -1 = no answer.
+      ansible.builtin.uri:
+        url: "{{ network.netbird_management_url }}"
+        method: GET
+        follow_redirects: none
+        timeout: 10
+      register: miner_pf_netbird_mgmt
+      failed_when: false
+      check_mode: false
+
+    - name: Judge the host, report, refuse or derive snp_generation
+      ansible.builtin.import_tasks: miner-tasks/host-preflight.yml
+
+    # NetBird's OWN install script writes a legacy one-line source at
+    # `/etc/apt/sources.list.d/netbird.list` pinned to
+    # `/usr/share/keyrings/netbird-archive-keyring.gpg`. Play 04 declares
+    # the SAME repo as a deb822 source with a different keyring, and apt
+    # refuses to read its ENTIRE source list when one repo carries two
+    # `Signed-By` values:
+    #
+    #   E: Conflicting values set for option Signed-By regarding source
+    #      https://pkgs.netbird.io/debian/ stable:
+    #      /usr/share/keyrings/netbird-archive-keyring.gpg
+    #      != /etc/apt/keyrings/netbird.asc
+    #
+    # So it does not merely break NetBird — it breaks the FIRST apt task
+    # of the run, which is the libvirt install in play 02, long before
+    # play 04 could clean up after itself. Hence the removal lives here in
+    # preflight rather than next to the repo it belongs to — after the
+    # generic checks, so a refused host is left untouched, and before
+    # the apt read below, which the conflict would break too.
+    #
+    # This bites any host where netbird was installed by the vendor's
+    # script — a third party who followed NetBird's own documentation
+    # before running this playbook, or any re-run on a host bootstrapped
+    # by an older revision of it.
+    - name: Remove the legacy one-line NetBird apt source (conflicting Signed-By)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/netbird.list
+        state: absent
+
+    # The OS release is a proxy; this is the property itself. Read what
     # apt WOULD install (or has installed) before play 02 installs it, so a
     # host whose distro hypervisor cannot boot an SNP guest is refused here
     # rather than at its first tenant launch.
@@ -78,72 +179,13 @@
           - miner_hv_libvirt is version(miner_min_libvirt_version, '>=')
           - miner_hv_qemu is version(miner_min_qemu_version, '>=')
         fail_msg: >-
-          libvirt {{ miner_hv_libvirt }} / QEMU {{ miner_hv_qemu }} cannot boot a
+          [HYPERVISOR_TOO_OLD] libvirt {{ miner_hv_libvirt }} / QEMU {{ miner_hv_qemu }} cannot boot a
           SEV-SNP guest (need libvirt >= {{ miner_min_libvirt_version }} and QEMU
           >= {{ miner_min_qemu_version }}): every `<launchSecurity type='sev-snp'>`
           domain the miner-agent renders would be refused. Upgrade the OS.
       vars:
         miner_hv_libvirt: "{{ (miner_hv_resolved.stdout_lines | select('match', '^libvirt-daemon-system=') | first).split('=')[1] }}"
         miner_hv_qemu: "{{ (miner_hv_resolved.stdout_lines | select('match', '^qemu-system-x86=') | first).split('=')[1] }}"
-
-    - name: Assert host CPU is AMD x86_64 (SEV-SNP needs AMD EPYC)
-      ansible.builtin.assert:
-        that:
-          - ansible_architecture == "x86_64"
-          - "'AMD' in ansible_processor[1] or 'AMD' in ansible_processor[2]"
-        fail_msg: >-
-          Host CPU is not AMD x86_64 — SEV-SNP requires AMD EPYC.
-          Detected arch={{ ansible_architecture }} processor={{ ansible_processor }}.
-
-    - name: Show detected CPU + RAM vs the host_vars expectation
-      ansible.builtin.debug:
-        msg: |
-          CPU detected : {{ ansible_processor[2] | default(ansible_processor | join(' ')) }}
-          CPU expected : {{ cpu_model_expected | default('(not set)') }}
-          RAM detected : {{ (ansible_memtotal_mb / 1024) | round(1) }} GiB
-          RAM expected : {{ ram_gb_expected | default('(not set)') }} GiB
-
-    - name: Assert the detected CPU matches the host_vars expectation
-      ansible.builtin.assert:
-        that:
-          - cpu_model_expected in (ansible_processor | join(' '))
-        fail_msg: >-
-          CPU mismatch — host_vars expects "{{ cpu_model_expected }}"
-          but this host reports "{{ ansible_processor | join(' ') }}".
-          Fix host_vars, or confirm this is the right box.
-      when: cpu_model_expected is defined
-
-    - name: Assert the detected RAM is at least the host_vars expectation
-      ansible.builtin.assert:
-        that:
-          # 90% floor — firmware reserves a few percent of installed RAM.
-          - ansible_memtotal_mb >= (ram_gb_expected | int) * 1024 * 0.9
-        fail_msg: >-
-          RAM mismatch — host_vars expects ~{{ ram_gb_expected }} GiB
-          but this host reports {{ (ansible_memtotal_mb / 1024) | round(1) }} GiB.
-      when: ram_gb_expected is defined
-
-    - name: Assert kernel is >= 6.11 (HWE — SEV-SNP host support)
-      ansible.builtin.assert:
-        that:
-          - ansible_kernel is version('6.11', '>=')
-        fail_msg: >-
-          Kernel {{ ansible_kernel }} is too old for SEV-SNP host
-          support. Install linux-generic-hwe-24.04 and reboot.
-
-    - name: Check the kvm_amd module exposes the sev_snp parameter
-      ansible.builtin.stat:
-        path: /sys/module/kvm_amd/parameters/sev_snp
-      register: miner_sev_snp_param
-
-    - name: Assert the running kernel's kvm_amd has SEV-SNP support
-      ansible.builtin.assert:
-        that:
-          - miner_sev_snp_param.stat.exists
-        fail_msg: >-
-          /sys/module/kvm_amd/parameters/sev_snp is absent — the
-          running kernel's kvm_amd was built without SEV-SNP support.
-          Install the HWE kernel and reboot.
 
     - name: Assert system + data NVMe devices from host_vars are block devices
       ansible.builtin.stat:
@@ -158,7 +200,7 @@
           - item.stat.exists
           - item.stat.isblk | default(false)
         fail_msg: >-
-          {{ item.item }} is not a block device on this host — the
+          [NVME_LAYOUT] {{ item.item }} is not a block device on this host — the
           host_vars NVMe layout is wrong. Re-check `lsblk` BEFORE
           running anything (the §K2 near-miss lesson).
       loop: "{{ miner_nvme_stat.results }}"
@@ -193,7 +235,7 @@
           set -e
           for dev in {{ nvme_data_devices | default([]) | join(' ') }}; do
             if blkid -p "$dev" 2>/dev/null | grep -q "PTTYPE="; then
-              echo "BUSY: $dev has a partition table — refusing (likely a system disk):"
+              echo "DATA_DISK_BUSY: $dev has a partition table — refusing (likely a system disk):"
               lsblk "$dev"
               exit 1
             fi
@@ -203,14 +245,14 @@
               linux_raid_member)
                 mnts=$(lsblk -nro MOUNTPOINTS "$dev" 2>/dev/null | grep -v '^$' || true)
                 if [ -z "$mnts" ]; then
-                  echo "BUSY: $dev is an UNASSEMBLED raid member — refusing (cannot identify the array):"
+                  echo "DATA_DISK_BUSY: $dev is an UNASSEMBLED raid member — refusing (cannot identify the array):"
                   lsblk "$dev"
                   exit 1
                 fi
                 while IFS= read -r m; do
                   case "$m" in
                     /|/boot|/boot/efi|"[SWAP]")
-                      echo "BUSY: $dev backs a SYSTEM mount [$m] — refusing:"
+                      echo "DATA_DISK_BUSY: $dev backs a SYSTEM mount [$m] — refusing:"
                       lsblk "$dev"
                       exit 1
                       ;;
@@ -218,7 +260,7 @@
                 done <<< "$mnts"
                 ;;
               *)
-                echo "BUSY: $dev has an unexpected signature [$sig] — refusing:"
+                echo "DATA_DISK_BUSY: $dev has an unexpected signature [$sig] — refusing:"
                 lsblk "$dev"
                 exit 1
                 ;;
@@ -230,33 +272,6 @@
       changed_when: false
       failed_when: "'OK' not in miner_disk_check.stdout"
       check_mode: false
-
-    # NetBird's OWN install script writes a legacy one-line source at
-    # `/etc/apt/sources.list.d/netbird.list` pinned to
-    # `/usr/share/keyrings/netbird-archive-keyring.gpg`. Play 04 declares
-    # the SAME repo as a deb822 source with a different keyring, and apt
-    # refuses to read its ENTIRE source list when one repo carries two
-    # `Signed-By` values:
-    #
-    #   E: Conflicting values set for option Signed-By regarding source
-    #      https://pkgs.netbird.io/debian/ stable:
-    #      /usr/share/keyrings/netbird-archive-keyring.gpg
-    #      != /etc/apt/keyrings/netbird.asc
-    #
-    # So it does not merely break NetBird — it breaks the FIRST apt task
-    # of the run, which is the libvirt install in play 02, long before
-    # play 04 could clean up after itself. Hence the removal lives here in
-    # preflight rather than next to the repo it belongs to.
-    #
-    # This bites any host where netbird was installed by the vendor's
-    # script — a third party who followed NetBird's own documentation
-    # before running this playbook, or any re-run on a host bootstrapped
-    # by an older revision of it.
-    - name: Remove the legacy one-line NetBird apt source (conflicting Signed-By)
-      ansible.builtin.file:
-        path: /etc/apt/sources.list.d/netbird.list
-        state: absent
-
     - name: Stat the NetBird setup key on the operator workstation
       ansible.builtin.stat:
         path: "{{ operator_secret_dir }}/{{ netbird_setup_key_file }}"
@@ -269,8 +284,9 @@
         that:
           - miner_nb_key.stat.exists
         fail_msg: >-
-          NetBird setup key missing. Create a single-use key in the
-          NetBird dashboard bound to the `miner` group, then save it to
+          [NETBIRD_SETUP_KEY_MISSING] NetBird setup key missing. Save the
+          single-use key the providers dashboard shows when you prepare the
+          host (fleet operators: a key bound to the `miner` group) to
           {{ operator_secret_dir }}/{{ netbird_setup_key_file }}.
 
     - name: "INVARIANT — assert NO Vault credentials are configured for miners"
@@ -281,7 +297,7 @@
           - vault_addr is not defined
           - vault_token is not defined
         fail_msg: >-
-          INVARIANT VIOLATION — a Vault credential is defined for a
+          [VAULT_CREDENTIALS_SET] INVARIANT VIOLATION — a Vault credential is defined for a
           miner node. Miners never authenticate to the hippius-compute
           Vault. Remove vault_addr / vault_token from the miner vars.
 
@@ -298,7 +314,7 @@
         that:
           - not miner_k3s_bin.stat.exists
         fail_msg: >-
-          INVARIANT VIOLATION — /usr/local/bin/k3s exists on this host.
+          [K3S_PRESENT] INVARIANT VIOLATION — /usr/local/bin/k3s exists on this host.
           Miners are never cluster nodes and never run k3s; this box is
           mis-targeted for the miner bootstrap.
 

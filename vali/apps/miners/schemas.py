@@ -113,3 +113,67 @@ class MinerGracefulExitResponseSerializer(serializers.Serializer):
     miner_id = serializers.CharField()
     status = serializers.CharField(help_text="Always `quarantined` on accept.")
     accepted = serializers.BooleanField(help_text="Always `true` on accept.")
+
+
+class MinerApprovalRequestSerializer(serializers.Serializer):
+    """`POST /v1/admin/miner/<miner_id>/approval` body — what the operator
+    declares about the host. Each anchor column becomes min(this, the
+    miner's fresh heartbeat figure)."""
+
+    cpus = serializers.IntegerField(help_text="Declared host threads (1..1024).")
+    memory_mb = serializers.IntegerField(help_text="Declared host RAM, MiB.")
+    disk_gb = serializers.IntegerField(
+        required=False, allow_null=True, help_text="Declared tenant data-disk size, GiB."
+    )
+    trust_class = serializers.ChoiceField(
+        choices=["operator", "earned"],
+        required=False,
+        allow_null=True,
+        help_text="Also set the trust class; omitted = left as is (`earned` for a new miner).",
+    )
+    approved_by = serializers.CharField(help_text="Who approves (recorded in the audit).")
+    reason = serializers.CharField(help_text="Why (recorded in the audit).")
+
+
+class MinerMeasuredSerializer(serializers.Serializer):
+    cpus = serializers.IntegerField(allow_null=True)
+    memory_mb = serializers.IntegerField(allow_null=True)
+    disk_gb = serializers.IntegerField(allow_null=True)
+
+
+class MinerApprovalStatusSerializer(serializers.Serializer):
+    """`GET /v1/admin/miner/<miner_id>/approval` body."""
+
+    miner_id = serializers.CharField()
+    node_id = serializers.CharField()
+    approved = serializers.BooleanField()
+    approved_at = serializers.DateTimeField(allow_null=True)
+    approved_by = serializers.CharField()
+    approval_required = serializers.BooleanField()
+    held_back = serializers.BooleanField(
+        help_text="True while the miner takes no new placement for want of an approval."
+    )
+    total_cpus = serializers.IntegerField(allow_null=True)
+    total_memory_mb = serializers.IntegerField(allow_null=True)
+    total_disk_gb = serializers.IntegerField(allow_null=True)
+    trust_class = serializers.CharField()
+    measured = MinerMeasuredSerializer()
+
+
+class MinerApprovalResponseSerializer(serializers.Serializer):
+    """`POST /v1/admin/miner/<miner_id>/approval` success body."""
+
+    miner_id = serializers.CharField()
+    node_id = serializers.CharField()
+    approved_at = serializers.DateTimeField()
+    approved_by = serializers.CharField()
+    total_cpus = serializers.IntegerField()
+    total_memory_mb = serializers.IntegerField()
+    total_disk_gb = serializers.IntegerField(allow_null=True)
+    trust_class = serializers.CharField()
+    measured = MinerMeasuredSerializer()
+    binding = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Which side set each anchor term, e.g. `cpus:declared`, `memory:measured`.",
+    )
+    dry_run = serializers.BooleanField()

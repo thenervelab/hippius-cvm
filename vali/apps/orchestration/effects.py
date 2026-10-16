@@ -1482,6 +1482,34 @@ def resolve_boot_artifacts(vm: Vm) -> dict[str, Any] | None:
     return staging
 
 
+def _arrival_os_pool(dest_miner_id: str, cmdline: str) -> str | None:
+    """A4b: the pool a golden VM arriving on `dest_miner_id` is written to
+    when the dest holds no record of it (`apps.disktier.routing`; the dest
+    keeps a record it has — a migrate-back, a re-drive). Sized from the
+    measured `hippius.disk_gb=` plus the rootfs; `None` ⇒ `default`."""
+    from apps.disktier import routing
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.services.flavors import ROOTFS_DISK_GB
+
+    tokens = dict(t.split("=", 1) for t in cmdline.split() if "=" in t)
+    if "dm-verity.root" not in tokens or "hippius.luks_header_sha256" in tokens:
+        return None
+    try:
+        disk_gb = int(tokens.get("hippius.disk_gb", "0"))
+    except ValueError:
+        return None
+    if disk_gb <= 0:
+        return None
+    node_id = (
+        MinerIdentity.objects.filter(miner_id=dest_miner_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    if not node_id:
+        return None
+    return routing.choose_os_pool(node_id, disk_gb + ROOTFS_DISK_GB)
+
+
 def dispatch_migrate_activate(
     vm: Vm,
     *,
@@ -1634,6 +1662,7 @@ def dispatch_migrate_activate(
         settle_by_unix=settle_by_unix,
         staged_restore_id=staged_restore_id,
         net=net_policy.launch_net_spec(miner_id=miner_id, vm_id=vm.vm_id),
+        os_pool=_arrival_os_pool(dest_node_id, cmdline),
     )
     import json as _json
 

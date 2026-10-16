@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:6b8f661eacaf725017794a18115b26bfcdc2262f915e19b392124bbc563dd364"
+  digest: "sha256:401cff5326293aebc68d157705710ff8b9c548e575f22709c2f492a961cbd97c"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "e84995f296b2150f363efc6195635f98b0ab3ddf"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38893374706/attempts/1"
+    commitSha: "01f56fe3f29c74101abfe07666429d8a89cedf97"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38941251243/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -153,6 +153,19 @@ customerKeys:
 # (VALI_OPERATOR_CONFIG_TOKEN on its side), not its read token.
 operatorConfig:
   principals: "backend-operator-config"
+
+# Storage-config push loop (`apps.disktier.storage_config`, #1609, run in
+# the orchestration tick): sends a miner the desired storage document the
+# operator API wrote. A node is pushed only if it HAS a document
+# (MinerStorageConfig row), is in `miners` (miner_id or node_id, `*` = all)
+# and its v6 agent_version is >= `minAgentVersion`. Each key renders only
+# when set (unset = push off / nobody). v2026.10.16 is the first agent
+# release with the storage-config route; a miner with no document yet is
+# sent nothing. Roll out by canary: list one miner first, then widen.
+storageConfig:
+  push: "true"
+  miners: "*"
+  minAgentVersion: "v2026.10.16"
 
 # Userdata restage — API (POST /v1/vm/<id>/userdata/restage, root-only) and
 # CLI (docs/operator/userdata-restage-runbook.md). OFF by default; even when on,
@@ -685,6 +698,59 @@ epochClose:
   weight: "1"
   keySecretName: epoch-close-key
   weightsUrl: "http://vali.vali.svc.cluster.local:8000/v1/admin/epoch-weights"
+
+# §23 price keeper (cronjob-price-keeper.yaml). A miner's announced price
+# sits in `PendingPriceChange` until someone calls the permissionless
+# `ComputeScoring.applyPriceChange(node_id)` after its effective block; until
+# then `MinerPrice` (the raw value vali reads) keeps the old price. This job
+# lists the due changes and applies them, at most `maxPerRun` per run and at
+# most `feeBudgetPlanck` of estimated fees, never spending the keeper account
+# below `minBalancePlanck`.
+#
+# Runs `apply-prices.mjs` from the epoch-closer image, signed by its OWN key:
+# a dedicated, low-funded keeper account (the call is permissionless, so the
+# cheapest key on the chain is the right one). It refuses to run under the
+# chain sudo key, a registered miner's key or any `forbiddenAccounts` entry,
+# and the template refuses a `keySecretName` equal to
+# `epochClose.keySecretName`.
+#
+# Off twice: `enabled: false` renders nothing; once enabled, `suspend: true`
+# keeps the CronJob from firing. To arm it: put the keeper mnemonic in Vault
+# at `vaultPath` (property `mnemonic`) and grant ESO read on that leaf, fund
+# the account, pin an epoch-closer `image` built with apply-prices.mjs (the
+# current epochClose pin predates it), list the audit authority in
+# `forbiddenAccounts`, enable, run one dry run (`PRICE_KEEPER_DRY_RUN` in the
+# Job spec at creation), then unsuspend. The template refuses to render an
+# unsuspended keeper without its own digest or with an empty
+# `forbiddenAccounts`.
+priceKeeper:
+  enabled: false
+  suspend: true
+  # Empty repository ⇒ epochClose.image.repository. The digest must be set
+  # (with its provenance block) before unsuspending: the epochClose pin has
+  # no apply-prices.mjs.
+  image:
+    repository: ""
+    digest: ""
+  # Empty ⇒ epochClose.rpcUrl.
+  rpcUrl: ""
+  schedule: "*/10 * * * *"
+  # Secret holding the keeper mnemonic (key `mnemonic`), materialised by the
+  # ExternalSecret from `vaultPath`.
+  keySecretName: price-keeper-key
+  vaultPath: hippius-compute/vali/price-keeper
+  maxPerRun: 10
+  # Planck (18 decimals): 1 token of estimated fees per run.
+  feeBudgetPlanck: "1000000000000000000"
+  # Reserve the keeper never spends below; also the PriceKeeperBalanceLow line.
+  minBalancePlanck: "2000000000000000000"
+  pushgatewayUrl: "http://prometheus-pushgateway.observability.svc.cluster.local:9091"
+  # Accounts (SS58 or 0x public key) the keeper refuses to sign as. Put the
+  # epoch-close audit authority here: on production it is not sudo, so the
+  # script's sudo guard cannot recognise it on its own.
+  forbiddenAccounts: []
+  # PriceKeeperStale fires when no run has pushed for this long (unsuspended only).
+  staleAfterMinutes: 60
 
 # Blackbox host-attestor coverage reconcile CronJob (PR-9,
 # cronjob-host-attestor-reconcile.yaml). WARN-ONLY: reports host-attestor

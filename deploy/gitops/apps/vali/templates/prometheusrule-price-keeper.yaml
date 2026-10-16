@@ -1,0 +1,92 @@
+{{- if .Values.priceKeeper.enabled }}
+---
+# §23 price keeper alerts. Gauges are pushed by apply-prices.mjs to the
+# Pushgateway (job="price-keeper"). Same routing as the other vali rules:
+# a `severity` label, no custom receiver ⇒ the Alertmanager default route.
+#
+# The state alerts only read gauges a recent run pushed: a Pushgateway gauge
+# outlives its job, so a CronJob suspended after a bad run would otherwise
+# alert forever. A job that stopped running is PriceKeeperStale's business.
+{{- $fresh := printf "and on() (time() - hippius_price_keeper_last_run_timestamp_seconds < %d)" (mul .Values.priceKeeper.staleAfterMinutes 60) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-price-keeper
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-price-keeper
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-price-keeper
+      interval: 5m
+      rules:
+        - alert: PriceKeeperBalanceLow
+          # The reserve is pushed beside the balance; firing at twice the
+          # reserve the keeper stops at leaves time to top it up.
+          expr: (hippius_price_keeper_free_balance_planck < hippius_price_keeper_min_balance_planck * 2) {{ $fresh }}
+          for: 15m
+          labels:
+            severity: warning
+            component: price-keeper
+          annotations:
+            summary: "price-keeper account is close to its spending reserve"
+            description: |
+              The keeper account's free balance is under twice its reserve
+              (priceKeeper.minBalancePlanck). At the reserve it stops applying
+              price changes and MinerPrice stops following announcements.
+              Top up the keeper account; never swap in the epoch-close key.
+        - alert: PriceKeeperFailing
+          expr: (hippius_price_keeper_success == 0) {{ $fresh }}
+          for: 30m
+          labels:
+            severity: warning
+            component: price-keeper
+          annotations:
+            summary: "price-keeper runs are failing"
+            description: |
+              The last price-keeper run had a refused apply, a failed chain
+              read, a timeout, stopped at the balance reserve, or refused its
+              signer. Read the latest
+              `price-keeper` Job log in the vali namespace.
+        - alert: PriceKeeperBacklog
+          expr: (hippius_price_keeper_remaining > 0) {{ $fresh }}
+          for: 2h
+          labels:
+            severity: warning
+            component: price-keeper
+          annotations:
+            summary: "due price changes are piling up"
+            description: |
+              Due price changes have been left unapplied for two hours (per-run
+              cap, fee budget or reserve). Raise priceKeeper.maxPerRun or
+              feeBudgetPlanck, or fund the keeper account.
+        {{- if not .Values.priceKeeper.suspend }}
+        - alert: PriceKeeperStale
+          # Keyed on the run timestamp, not `success`: a gauge freezes at its
+          # last push when the CronJob stops running at all.
+          expr: time() - hippius_price_keeper_last_run_timestamp_seconds > {{ mul .Values.priceKeeper.staleAfterMinutes 60 }}
+          for: 10m
+          labels:
+            severity: warning
+            component: price-keeper
+          annotations:
+            summary: "price-keeper has not run for {{ .Values.priceKeeper.staleAfterMinutes }} minutes"
+            description: |
+              No price-keeper run has pushed metrics recently while the
+              CronJob is unsuspended. Check the CronJob and its Jobs.
+        - alert: PriceKeeperNeverReported
+          expr: absent(hippius_price_keeper_last_run_timestamp_seconds)
+          for: {{ .Values.priceKeeper.staleAfterMinutes }}m
+          labels:
+            severity: warning
+            component: price-keeper
+          annotations:
+            summary: "price-keeper is unsuspended but has never pushed metrics"
+            description: |
+              The CronJob is armed but the Pushgateway holds no price-keeper
+              run. Check that its Jobs start and can reach the Pushgateway.
+        {{- end }}
+{{- end }}

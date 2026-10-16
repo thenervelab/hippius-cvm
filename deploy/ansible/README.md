@@ -130,9 +130,35 @@ installed ones (`miner_min_libvirt_version` / `miner_min_qemu_version`).
 The set lives in `group_vars/miner_nodes.yml::miner_supported_ubuntu_versions`.
 
 Any SEV-SNP capable AMD EPYC (Milan, Genoa or Turin) works; copy
-`host_vars/miner.example.yml` to add one. Each host declares
-`snp_generation` (`genoa` | `turin` | `milan`), which selects its
-host-attestor measurement — see [Host attestor](#host-attestor) below.
+`host_vars/miner.example.yml` to add one. `snp_generation` (`genoa` |
+`turin` | `milan`), which selects the host-attestor measurement (see
+[Host attestor](#host-attestor) below), is derived from the CPU by the
+preflight; a value in host_vars must agree with it.
+
+### Host preflight
+
+Play 00 judges the host from what it is — CPU generation, BIOS SEV-SNP
+state, SEV-ES ASIDs, IOMMU, no CPU offlined at runtime, OS / kernel,
+bare metal, CPU / RAM / disk floors (`miner_preflight_min` in
+`group_vars/miner_nodes.yml`), clock sync, NetBird management reachable —
+and refuses before anything is installed, listing every problem at once
+as `FAIL [CODE] what -- fix: how`. It prints one
+`HIPPIUS_PREFLIGHT {json}` line (result, derived `snp_generation`, CPU,
+SNP firmware, codes; Ansible's output callback quotes the JSON). On a host
+that already runs the miner-agent, the disk-space, clock and NetBird
+reachability checks only warn, so an update or repair run is never
+blocked by them. `cpu_model_expected` / `ram_gb_expected` in host_vars
+stay optional stricter checks. Run it alone:
+
+```sh
+ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+  --limit <host> --tags preflight --check
+```
+
+Without `--check` the only change it makes is removing a conflicting
+legacy NetBird apt source. The codes and their fixes are listed in
+`docs/operator/external-miner-guide.md`; the logic is
+`playbooks/filter_plugins/host_preflight.py` (tests in `tests/`).
 
 ### Pre-delivery operator checklist
 

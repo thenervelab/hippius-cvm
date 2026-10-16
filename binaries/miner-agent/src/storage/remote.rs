@@ -14,7 +14,8 @@
 //!   dedicated disk the inventory of [`super::dedicated`]. A `draining`
 //!   entry is not required to be usable: it is being emptied.
 //! - **Live-disk safety**: a pool in force that holds a VM disk cannot be
-//!   removed or moved (`pool-has-disks`), and no budget may drop below
+//!   removed or moved (`pool-has-disks`), a pool in force leaves only once
+//!   it is `draining` in force (`pool-not-drained`), and no budget may drop below
 //!   what its pool already holds (`pool-budget-below-committed`).
 //!
 //! A refusal is `422 {"code": "<code>", "pool"|"disk": "<id>"}`. `dry_run`
@@ -684,6 +685,14 @@ impl StorageConfigService {
                 .any(|p| p.id == old.id && Path::new(&p.path) == old.path);
             if !kept && pools::holds_vm_disks(&old.path) != Some(false) {
                 return Err(pool("pool-has-disks", &old.id));
+            }
+        }
+        // …and leaves the set only once drained: `draining` in force first
+        // (vali empties it), then dropped — even when it holds no disk file
+        // yet (a document that merely omits it).
+        for old in current.pools.non_default() {
+            if !old.draining && !doc.pools.iter().any(|p| p.id == old.id) {
+                return Err(pool("pool-not-drained", &old.id));
             }
         }
         let (candidate, _) = self.local.document_set(doc);
@@ -1415,6 +1424,26 @@ mod tests {
         svc.accept(m.doc(3, vec![draining]), NOW).unwrap();
         // Once empty it can go.
         std::fs::remove_file(m.hdd0.path().join("overlay/vm-1.img")).unwrap();
+        svc.accept(m.doc(4, Vec::new()), NOW).unwrap();
+        assert!(state.current().pools.get("hdd0").is_none());
+    }
+
+    /// Even empty, a pool in force leaves only once it is `draining` in
+    /// force: a document that merely omits it is refused.
+    #[test]
+    fn an_empty_pool_in_force_leaves_only_drained() {
+        let m = Miner::new();
+        let (svc, state) = m.service();
+        svc.accept(m.doc(2, vec![m.hdd("hdd0", &m.hdd0)]), NOW)
+            .unwrap();
+        assert_eq!(
+            code(svc.accept(m.doc(3, Vec::new()), NOW)),
+            ("pool-not-drained", p("hdd0"))
+        );
+        let mut draining = m.hdd("hdd0", &m.hdd0);
+        draining.state = StorageDesiredState::Draining;
+        assert_eq!(state.current().revision, 2, "nothing changed");
+        svc.accept(m.doc(3, vec![draining]), NOW).unwrap();
         svc.accept(m.doc(4, Vec::new()), NOW).unwrap();
         assert!(state.current().pools.get("hdd0").is_none());
     }

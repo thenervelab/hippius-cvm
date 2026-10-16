@@ -127,6 +127,25 @@ jobs:
       # Ansible filter; stdlib-only, no Ansible install.
       - name: ansible miner_id filter
         run: python3 deploy/ansible/tests/test_miner_id_filter.py
+      # The miner play's Ansible checks, no host contacted: the generic
+      # host preflight (play 00) — its verdict filter (stdlib), then its
+      # tasks file against canned probe output — and play 04's NetBird
+      # mesh-IP capture against canned `netbird status` / `ip addr`
+      # output (set_fact/debug/assert only), plus the play's syntax.
+      - name: ansible miner play (preflight, NetBird mesh IP)
+        working-directory: deploy/ansible
+        env:
+          ANSIBLE_STDOUT_CALLBACK: default
+          ANSIBLE_FILTER_PLUGINS: playbooks/filter_plugins
+        run: |
+          python3 tests/test_host_preflight.py
+          python3 -m venv /tmp/ansible-venv
+          /tmp/ansible-venv/bin/pip install -q 'ansible-core>=2.16,<2.22'
+          /tmp/ansible-venv/bin/ansible-galaxy collection install -r requirements.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --syntax-check
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/preflight_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_check_mode.yml --check
       # Miner-agent auto-update: the updater against a mocked GitHub API,
       # cosign, systemd and journald. Its systemctl mock fails any
       # stop/restart (a graceful stop destroys every domain on a miner).
@@ -398,6 +417,14 @@ jobs:
           shellcheck -S error scripts/dev/epoch-close-guard-test.sh
           node --check deploy/epoch-closer/close-epoch.mjs
           bash scripts/dev/epoch-close-guard-test.sh
+      # The §23 price keeper (apply-prices.mjs, same image): what it applies,
+      # skips as already applied, refuses (sudo / miner signer, reserve) and
+      # pushes, against the same stubbed @polkadot/api.
+      - name: price keeper
+        run: |
+          shellcheck -S error scripts/dev/price-keeper-test.sh
+          node --check deploy/epoch-closer/apply-prices.mjs
+          bash scripts/dev/price-keeper-test.sh
       - name: release-core step-order golden
         run: |
           bash -n scripts/initramfs/hippius-release-core.sh
@@ -605,6 +632,15 @@ jobs:
             echo "shellcheck not on this runner: lint skipped"
           fi
           bash scripts/dev/agent-storage-sandbox-test.sh target/debug/hippius-miner-agent
+      # The Ansible-rendered storage declaration (`miner_storage_pools`, …),
+      # rendered as the play does and read by this agent's own rules.
+      - name: Rendered storage config accepted by the agent
+        env:
+          AGENT_BIN: target/debug/hippius-miner-agent
+        run: |
+          python3 -m venv "$RUNNER_TEMP/jinja-venv"
+          "$RUNNER_TEMP/jinja-venv/bin/pip" install -q "jinja2==3.1.6"
+          "$RUNNER_TEMP/jinja-venv/bin/python" deploy/ansible/tests/test_miner_agent_config_storage.py -v
 
   sentinel:
     runs-on: ${{ vars.CI_RUNS_ON_DEFAULT || 'ubuntu-latest' }}

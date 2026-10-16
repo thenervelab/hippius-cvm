@@ -946,6 +946,18 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         Err(err) => eprintln!("hippius-miner-agent: serve — re-adopt sweep failed: {err}"),
     }
 
+    // Once per host: a pool record for every VM an older agent placed
+    // (all on `default`). Not fatal: without its marker a missing record
+    // still means `default`, and the next start runs it again.
+    match lifecycle.backfill_vm_pools() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("hippius-miner-agent: serve — backfilled {n} VM pool record(s)"),
+        Err(err) => eprintln!(
+            "hippius-miner-agent: serve — VM pool record backfill failed (retried at the \
+             next start; missing records still mean `default`): {err}"
+        ),
+    }
+
     // Load the persisted net policy again before orders are served (the
     // boot unit loaded the last ruleset file; this re-renders it for the
     // current uplink and taps). A failure is not fatal: the previous
@@ -1008,11 +1020,11 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         // One ledger with the per-VM disk creates (`disk_space`): a backup
         // cannot take bytes promised to a live guest, nor a launch bytes a
         // backup or restore holds.
-        .with_space_ledger(Arc::new(
-            hippius_miner_agent::backup::capture::SpaceLedger::host(lifecycle.data_disk_root()),
-        )),
+        .with_space_ledger(Arc::new(lifecycle.disk_space_ledger())),
     );
-    backup.recover_on_startup(&lifecycle.backup_root()).await;
+    for root in lifecycle.backup_roots() {
+        backup.recover_on_startup(&root).await;
+    }
     let chain_restorer: Arc<dyn hippius_miner_agent::backup::restore::ChainRestorer> = Arc::new(
         hippius_miner_agent::backup::restore::BackupChainRestorer::new(
             hippius_miner_agent::backup::transfer::Transfer::new()?,
@@ -1025,7 +1037,9 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         Arc::new(hippius_miner_agent::backup::transfer::Transfer::new()?),
         backup.space_ledger(),
     ));
-    restore.recover_on_startup(&lifecycle.backup_root()).await;
+    for root in lifecycle.backup_roots() {
+        restore.recover_on_startup(&root).await;
+    }
     let state = OrderState::new(
         Arc::clone(&lifecycle),
         verifier,
@@ -1610,6 +1624,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
         guardian_ep: None,
         net: None,
         on_guest_poweroff: None,
+        os_pool: None,
     };
 
     // The lifecycle is async (`tokio::process` drives `virsh`); a

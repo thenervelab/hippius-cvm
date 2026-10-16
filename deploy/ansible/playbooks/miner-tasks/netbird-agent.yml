@@ -92,34 +92,43 @@
   when: "'Management: Connected' not in miner_netbird_status.stdout"
 
 - name: Report the NetBird peer state (no secrets)
+  # Retried: right after `netbird up` the address can take a moment.
   ansible.builtin.command:
     cmd: netbird status
   register: miner_netbird_final
   changed_when: false
   check_mode: false
   failed_when: false
+  until: "'NetBird IP:' in miner_netbird_final.stdout"
+  retries: 5
+  delay: 3
 
 # The miner's own NetBird mesh address — assigned by NetBird at join,
 # so it is PER-HOST and only known after the join. The orders HTTP
 # server (MA-5) binds it (and ONLY it; the agent rejects any non-mesh
-# bind). Captured here as a fact so the config template uses the REAL
-# address instead of the `orders_bind_ip` placeholder — no manual
-# host_vars edit per miner.
-- name: Capture this miner's NetBird mesh IP (for orders.bind_addr)
-  ansible.builtin.set_fact:
-    miner_netbird_ip: >-
-      {{ miner_netbird_final.stdout
-         | regex_findall('NetBird IP:\s+([0-9.]+)')
-         | first | default(orders_bind_ip) }}
+# bind). It must be the address `netbird status` reports AND one the
+# mesh interface actually carries: falling back to a configured value
+# here once let a failed join pass with the group_vars placeholder.
+- name: Read the IPv4 addresses on the NetBird mesh interface
+  # `wt0`: NetBird's interface, as in host-firewall.yml.
+  ansible.builtin.command:
+    cmd: ip -4 -o addr show dev wt0
+  register: miner_netbird_iface
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  # The client can report its address before it has configured wt0.
+  until: >-
+    (miner_netbird_final.stdout | regex_findall('(?m)^NetBird IP:\s+([0-9.]+)')
+     | first | default('-')) ~ '/' in miner_netbird_iface.stdout
+  retries: 5
+  delay: 3
 
-- name: Assert a NetBird mesh IP was obtained (fail closed)
-  ansible.builtin.assert:
-    that: "miner_netbird_ip is match('100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.')"
-    fail_msg: >-
-      Could not determine this miner's NetBird CGNAT IP (100.64.0.0/10)
-      from `netbird status`. The mesh join likely failed — the orders
-      server cannot bind. Re-check the NetBird setup key + management URL.
+- name: Capture this miner's NetBird mesh IP (for orders.bind_addr)
+  ansible.builtin.import_tasks: netbird-mesh-ip.yml
+  vars:
+    miner_netbird_was_connected: "{{ 'Management: Connected' in miner_netbird_status.stdout }}"
 
 - name: Show the NetBird peer state + bind IP
   ansible.builtin.debug:
-    msg: "{{ miner_netbird_final.stdout_lines }} | bind_ip={{ miner_netbird_ip }}"
+    msg: "{{ miner_netbird_final.stdout_lines }} | bind_ip={{ miner_netbird_ip | default('(none: --check before the first join)') }}"

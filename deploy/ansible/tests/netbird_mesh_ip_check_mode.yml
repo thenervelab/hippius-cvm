@@ -1,0 +1,50 @@
+---
+# --check half of the NetBird mesh-IP wiring test (run WITH --check):
+# a host that has never joined has no address yet and must not fail the
+# dry run, nor get an address recorded; a host that was already joined
+# is still refused when its address is gone.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_check_mode.yml --check
+
+- name: NetBird mesh IP under --check
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: This file only means something under --check
+      ansible.builtin.assert:
+        that: ansible_check_mode
+
+    - name: A never-joined host passes the dry run without an address
+      vars:
+        miner_netbird_final: { stdout: "Management: Disconnected" }
+        miner_netbird_iface: { stdout: "" }
+        miner_netbird_was_connected: false
+      block:
+        - name: Run the mesh-IP capture
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/netbird-mesh-ip.yml
+
+    - name: No address was recorded
+      ansible.builtin.assert:
+        that:
+          - miner_netbird_ip is not defined
+
+    - name: A non-mesh address is not recorded either
+      vars:
+        miner_netbird_final: { stdout: "NetBird IP: 10.0.0.5/24" }
+        miner_netbird_iface: { stdout: "5: wt0    inet 10.0.0.5/24 scope global wt0" }
+        miner_netbird_was_connected: false
+      block:
+        - name: Run the mesh-IP capture on a non-mesh address
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/netbird-mesh-ip.yml
+
+    - name: Still no address
+      ansible.builtin.assert:
+        that:
+          - miner_netbird_ip is not defined
+
+    - name: An already-joined host that lost its address is refused
+      ansible.builtin.include_tasks: netbird_mesh_ip_refused.yml
+      vars:
+        case: { status: "Management: Disconnected", iface: "", was_connected: true }

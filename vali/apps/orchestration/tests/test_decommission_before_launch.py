@@ -7,11 +7,11 @@ it: `POST /v1/vm/<id>/decommission` answered `404 not-found`, the owner
 filed the VM as gone, and the worker launched it two minutes later. Nobody
 owned that VM; it stayed `active` for eight days.
 
-A `404` must therefore mean "no launch will ever create this VM":
+`not-found` now only means "no launch exists for this vm_id":
 
-- a queued launch is cancelled, then `404`;
+- a queued launch is cancelled, then `410 launch-cancelled` (every time);
 - a running launch that has not created the row is told not to, and the
-  caller gets `409 job-in-flight` (asked again, it then reads `404`);
+  caller gets `409 launch-pending` (asked again: `410 launch-cancelled`);
 - a row created by a launch still dispatching gets the ordinary §24,
   which that launch's later steps already respect.
 """
@@ -67,13 +67,13 @@ def test_a_queued_launch_is_cancelled_and_never_runs(
     root_client, stub_vault_put, monkeypatch  # noqa: F811
 ) -> None:
     """THE INCIDENT. The job is queued behind another launch; the owner
-    decommissions it. Before: `404`, and the worker launched it later."""
+    decommissions it. Before: `404 not-found`, and the worker launched it later."""
     job = _queue(root_client)
 
     resp = _decommission(root_client)
 
-    assert resp.status_code == status.HTTP_404_NOT_FOUND
-    assert resp.json()["category"] == "not-found"
+    assert resp.status_code == status.HTTP_410_GONE
+    assert resp.json()["category"] == "launch-cancelled"
     job.refresh_from_db()
     assert job.state == LaunchJobState.FAILED.value
     assert job.reason == launch_jobs.CANCELLED_BY_DECOMMISSION
@@ -91,11 +91,11 @@ def test_a_second_decommission_of_a_cancelled_launch_changes_nothing(
     root_client, stub_vault_put  # noqa: F811
 ) -> None:
     job = _queue(root_client)
-    assert _decommission(root_client).status_code == status.HTTP_404_NOT_FOUND
+    assert _decommission(root_client).status_code == status.HTTP_410_GONE
     job.refresh_from_db()
     first = (job.state, job.version, job.finished_at, job.cancel_requested_at)
 
-    assert _decommission(root_client).status_code == status.HTTP_404_NOT_FOUND
+    assert _decommission(root_client).status_code == status.HTTP_410_GONE
 
     job.refresh_from_db()
     assert (job.state, job.version, job.finished_at, job.cancel_requested_at) == first
@@ -106,7 +106,7 @@ def test_a_running_launch_is_told_not_to_create_the_row(
     root_client, stub_vault_put, monkeypatch  # noqa: F811
 ) -> None:
     """Claimed, still placing (no row yet) when the §24 arrives: `409`,
-    and the worker then refuses to create the row. Asked again: `404`."""
+    and the worker then refuses to create the row. Asked again: `410 launch-cancelled`."""
     _queue(root_client)
     _stub_secrets(monkeypatch)
     answers: list[int] = []
@@ -125,22 +125,22 @@ def test_a_running_launch_is_told_not_to_create_the_row(
     assert job.reason == launch_jobs.CANCELLED_BY_DECOMMISSION
     assert not Vm.objects.filter(vm_id=VM_ID).exists()
     resp = _decommission(root_client)
-    assert resp.status_code == status.HTTP_404_NOT_FOUND
-    assert resp.json()["category"] == "not-found"
+    assert resp.status_code == status.HTTP_410_GONE
+    assert resp.json()["category"] == "launch-cancelled"
 
 
 @pytest.mark.django_db
 def test_the_running_answer_is_one_the_caller_retries(
     root_client, stub_vault_put  # noqa: F811
 ) -> None:
-    """The caller reads `409 job-in-flight` as "ask again", never as gone."""
+    """The caller reads `409 launch-pending` as "ask again", never as gone."""
     job = _queue(root_client)
     assert launch_jobs.claim_one() is not None
 
     resp = _decommission(root_client)
 
     assert resp.status_code == status.HTTP_409_CONFLICT
-    assert resp.json()["category"] == "job-in-flight"
+    assert resp.json()["category"] == "launch-pending"
     job.refresh_from_db()
     assert job.state == LaunchJobState.RUNNING.value
     assert job.cancel_requested_at is not None
@@ -200,11 +200,12 @@ def test_a_cancelled_vm_id_cannot_be_launched_again(
     """The caller was told the VM is gone; its retried launch POST must not
     bring it back."""
     _queue(root_client)
-    assert _decommission(root_client).status_code == status.HTTP_404_NOT_FOUND
+    assert _decommission(root_client).status_code == status.HTTP_410_GONE
 
     resp = root_client.post(LAUNCH_URL, _intent(), format="json")
 
     assert resp.status_code == status.HTTP_409_CONFLICT
+    assert resp.json()["category"] == "launch-cancelled"
     assert LaunchJob.objects.filter(vm_id=VM_ID).count() == 1
 
 
@@ -215,7 +216,7 @@ def test_the_worker_refuses_a_cancelled_vm_id_whatever_the_job(
     """Behind intake: a new job for a cancelled vm_id (one that slipped in
     another way) still never creates the row."""
     job = _queue(root_client)
-    assert _decommission(root_client).status_code == status.HTTP_404_NOT_FOUND
+    assert _decommission(root_client).status_code == status.HTTP_410_GONE
 
     with pytest.raises(launch.LaunchCancelled):
         launch._ensure_vm_row(_spec_of(job))

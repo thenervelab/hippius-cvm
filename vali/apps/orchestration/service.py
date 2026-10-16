@@ -6032,9 +6032,12 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
         get_url = client.presign_get(
             bucket=job.snapshot_bucket, key=job.snapshot_key, ttl_seconds=_presign_ttl()
         ).url
-        # Blank on a job that started before the state disk was carried — the
-        # dest then keeps the pre-fix blank-counter behaviour instead of being
-        # handed a presigned URL for an object that was never uploaded.
+        # Blank on a job that started before the state disk was carried, so
+        # the dest is never handed a presigned URL for an object that was
+        # never uploaded. Such a dest no longer boots a fresh blank counter:
+        # the agent records the arriving VM as having run (A4) and refuses a
+        # launch without its state disk (`relaunch-disks-missing`) — the KBS
+        # would refuse a blank counter anyway, since it holds the source's.
         if job.snapshot_state_key:
             state_get_url = client.presign_get(
                 bucket=job.snapshot_bucket,

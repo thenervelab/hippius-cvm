@@ -321,7 +321,9 @@ impl BackupManager {
         vm_id: &VmId,
     ) -> std::result::Result<Vec<String>, LiveStatusError> {
         let domain = tenant_domain(vm_id).map_err(|_| LiveStatusError::Unavailable)?;
-        let overlay = lifecycle.golden_overlay_path(vm_id);
+        let overlay = lifecycle
+            .golden_overlay_path(vm_id)
+            .map_err(|_| LiveStatusError::Unavailable)?;
         match capture::source_node(self.qmp.as_ref(), &domain, &overlay).await {
             Ok(node) => Ok(point_ids(&node)),
             // A running non-golden VM has no overlay node: no points.
@@ -398,7 +400,9 @@ impl BackupManager {
         req: &BackupRequest,
     ) -> std::result::Result<Report, RunError> {
         let domain = tenant_domain(&req.vm_id).map_err(|e| RunError(e, None))?;
-        let overlay = lifecycle.golden_overlay_path(&req.vm_id);
+        let overlay = lifecycle
+            .golden_overlay_path(&req.vm_id)
+            .map_err(|e| RunError(e, None))?;
         let bitmap = capture::bitmap_name(&req.run_id);
         let parent = req.parent_run_id.as_deref().map(capture::bitmap_name);
         let mut point_created = false;
@@ -455,7 +459,7 @@ impl BackupManager {
         if lifecycle.tenant_domain_liveness(&req.vm_id).await != DomainLiveness::Live {
             return Err(MinerAgentError::Backup("vm-not-running"));
         }
-        let work_dir = lifecycle.backup_dir(&req.vm_id);
+        let work_dir = lifecycle.backup_dir(&req.vm_id)?;
         let state_path = lifecycle.state_disk_path(&req.vm_id);
 
         // The guest writes its counter only while booting. Reading the
@@ -721,7 +725,7 @@ mod tests {
         let state = lifecycle.state_disk_path(&vm);
         std::fs::create_dir_all(state.parent().unwrap()).unwrap();
         std::fs::write(&state, vec![0u8; 1 << 20]).unwrap();
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         let ov = overlay.to_str().unwrap().to_string();
         let qmp = Arc::new(qmp::mock::MockQmp::new(move |c| {
             Ok(match c["execute"].as_str().unwrap() {
@@ -755,6 +759,63 @@ mod tests {
         );
     }
 
+    /// A4: a VM on a non-default pool is backed up from ITS overlay (the
+    /// QMP node is found by that path; the `default` path would find no
+    /// node and report no points).
+    #[tokio::test]
+    async fn a_vm_on_a_non_default_pool_is_read_from_its_pool() {
+        use crate::lifecycle::{DomainState, MockLaunchDigest, MockLibvirtDriver};
+        let root = tempfile::tempdir().unwrap();
+        let driver = Arc::new(MockLibvirtDriver::new());
+        driver.seed_domain(
+            DomainId::new("hippius-tenant-vm-a").unwrap(),
+            DomainState::Running,
+        );
+        let lifecycle = CvmLifecycle::new(
+            driver,
+            Arc::new(MockLaunchDigest::failing()),
+            crate::lifecycle::HostResources {
+                total_cpus: 1,
+                total_memory_mb: 1,
+                total_disk_gb: 0,
+            },
+        )
+        .with_state_disk_root(root.path().to_path_buf());
+        let vm = VmId::new("vm-a").unwrap();
+        let pool = root.path().join("pools/nvme0");
+        crate::lifecycle::vm_pool::write(
+            root.path(),
+            &vm,
+            &crate::lifecycle::vm_pool::VmPoolRecord {
+                pool_id: "nvme0".into(),
+                root: pool.clone(),
+                ran: true,
+            },
+        )
+        .unwrap();
+        let ov = crate::lifecycle::golden::overlay_disk_path(&pool, &vm)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let qmp = Arc::new(qmp::mock::MockQmp::new(move |_| {
+            Ok(serde_json::json!([{
+                "node-name": "libvirt-1-storage", "drv": "file", "file": ov,
+                "image": {"virtual-size": 1048576u64},
+                "dirty-bitmaps": [{"name": "hippius-bk-r7", "count": 0}]}]))
+        }));
+        let m = BackupManager::new(
+            qmp,
+            Arc::new(image_tool::QemuImg::default()),
+            Arc::new(Transfer::new().unwrap()),
+        );
+        let st = m.live_status(&lifecycle, &vm).await.unwrap();
+        assert_eq!(st.live.point_run_ids, vec!["r7".to_string()]);
+        assert_eq!(
+            lifecycle.backup_dir(&vm).unwrap(),
+            pool.join("backup").join("vm-a")
+        );
+    }
+
     #[tokio::test]
     async fn live_status_reports_points_and_no_domain() {
         use crate::lifecycle::{DomainState, MockLaunchDigest, MockLibvirtDriver};
@@ -777,6 +838,7 @@ mod tests {
         let vm = VmId::new("vm-a").unwrap();
         let ov = lifecycle
             .golden_overlay_path(&vm)
+            .unwrap()
             .to_str()
             .unwrap()
             .to_string();
@@ -892,7 +954,7 @@ mod tests {
             std::fs::write(&state, vec![0u8; 1 << 20]).unwrap();
             nodes.push(serde_json::json!({
                 "node-name": format!("libvirt-{i}-storage"), "drv": "file",
-                "file": lifecycle.golden_overlay_path(vm).to_str().unwrap(),
+                "file": lifecycle.golden_overlay_path(vm).unwrap().to_str().unwrap(),
                 "image": {"virtual-size": 1048576u64}}));
         }
         let nodes = serde_json::Value::Array(nodes);

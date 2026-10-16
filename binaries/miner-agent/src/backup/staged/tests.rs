@@ -93,7 +93,29 @@ impl Env {
     }
 
     fn build(with_original: bool) -> Self {
+        Self::build_at(with_original, None)
+    }
+
+    /// [`Self::new`] for a VM whose disks live on pool `nvme0` (its pool
+    /// record says so), not on `default`.
+    fn new_on_pool() -> Self {
+        Self::build_at(true, Some("pools/nvme0"))
+    }
+
+    fn build_at(with_original: bool, pool: Option<&str>) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        if let Some(pool) = pool {
+            crate::lifecycle::vm_pool::write(
+                &dir.path().join("statefs"),
+                &VmId::new("vm-r").unwrap(),
+                &crate::lifecycle::vm_pool::VmPoolRecord {
+                    pool_id: "nvme0".into(),
+                    root: dir.path().join(pool),
+                    ran: true,
+                },
+            )
+            .unwrap();
+        }
         let driver = Arc::new(MockLibvirtDriver::new());
         let lifecycle = CvmLifecycle::new(
             driver.clone(),
@@ -106,7 +128,7 @@ impl Env {
         )
         .with_storage_roots(dir.path().join("data"), dir.path().join("statefs"));
         let vm = VmId::new("vm-r").unwrap();
-        let p = RestorePaths::for_vm(&lifecycle, &vm, RID);
+        let p = RestorePaths::for_vm(&lifecycle, &vm, RID).unwrap();
         std::fs::create_dir_all(p.live_overlay.parent().unwrap()).unwrap();
         std::fs::create_dir_all(p.live_state.parent().unwrap()).unwrap();
         if with_original {
@@ -132,7 +154,7 @@ impl Env {
     }
 
     fn paths(&self, rid: &str) -> RestorePaths {
-        RestorePaths::for_vm(&self.lifecycle, &self.vm, rid)
+        RestorePaths::for_vm(&self.lifecycle, &self.vm, rid).unwrap()
     }
 
     fn chain(&self, rid: &str) -> RestoreChain {
@@ -415,6 +437,74 @@ async fn the_swap_completes_after_a_crash_at_every_step() {
         );
         assert_swapped(&env);
     }
+}
+
+/// A4: a VM on a non-default pool stages beside ITS overlay (the work
+/// dir on the overlay's filesystem, for the atomic rename) and the swap
+/// lands there; nothing is written under `default`.
+#[tokio::test]
+async fn a_vm_on_a_non_default_pool_stages_and_swaps_on_its_pool() {
+    let env = Env::new_on_pool();
+    let pool = env._dir.path().join("pools/nvme0");
+    let p = env.paths(RID);
+    assert!(p.live_overlay.starts_with(&pool), "{p:?}");
+    assert!(p.staging_dir.starts_with(pool.join("backup")), "{p:?}");
+    let m = env.manager(None);
+    env.stage(&m, RID).await;
+    assert_eq!(
+        swap_in(&p, RID, Some(FULL), async { true }).await.unwrap(),
+        SwapOutcome::Swapped
+    );
+    assert_swapped(&env);
+    assert!(!env._dir.path().join("data").join("overlay").exists());
+    assert!(!env._dir.path().join("data").join("backup").exists());
+}
+
+/// A4: a restore staged on a host this VM never ran on (past the host's
+/// backfill) records the VM's pool first, `ran` false; one whose state
+/// disk IS here but whose record is gone is refused, never guessed.
+#[tokio::test]
+async fn a_restore_to_another_host_records_the_vms_pool_before_staging() {
+    let env = Env::new_other_host();
+    let state_root = env._dir.path().join("statefs");
+    crate::lifecycle::vm_pool::backfill(&state_root, &env._dir.path().join("data"), &[]).unwrap();
+    let m = env.manager(None);
+    env.stage(&m, RID).await;
+    let rec = crate::lifecycle::vm_pool::read(&state_root, &env.vm)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.root, env._dir.path().join("data"));
+    assert!(!rec.ran);
+
+    let lost = VmId::new("vm-lost").unwrap();
+    std::fs::write(env.lifecycle.state_disk_path(&lost), b"x").unwrap();
+    assert!(matches!(
+        env.lifecycle.staging_pool(&lost),
+        Err(MinerAgentError::VmPoolRecord("missing"))
+    ));
+}
+
+/// A refused stage writes no pool record: only a restore that goes ahead
+/// does. Here the restore is already finished (aborted) when it is re-sent.
+#[tokio::test]
+async fn a_refused_stage_writes_no_pool_record() {
+    let env = Env::new_other_host();
+    let state_root = env._dir.path().join("statefs");
+    crate::lifecycle::vm_pool::backfill(&state_root, &env._dir.path().join("data"), &[]).unwrap();
+    let m = env.manager(None);
+    env.stage(&m, RID).await;
+    m.abort(&env.lifecycle, &env.migration, &env.vm, RID)
+        .await
+        .unwrap();
+    crate::lifecycle::vm_pool::remove(&state_root, &env.vm).unwrap();
+
+    let Err(err) = m.begin_stage(&env.lifecycle, env.req(RID)).await else {
+        panic!("a finished restore must be refused");
+    };
+    assert_backup(err, "restore-finished");
+    assert!(crate::lifecycle::vm_pool::read(&state_root, &env.vm)
+        .unwrap()
+        .is_none());
 }
 
 /// The live repro: staging reached `staged`, then (this test: a
@@ -865,8 +955,8 @@ fn restore_ids_are_32_lower_hex() {
 async fn the_decommission_footprint_names_the_retained_originals_exactly() {
     let env = Env::new();
     let m = env.manager(None);
-    let dir = env.lifecycle.backup_dir(&env.vm);
-    let ov = env.lifecycle.golden_overlay_path(&env.vm);
+    let dir = env.lifecycle.backup_dir(&env.vm).unwrap();
+    let ov = env.lifecycle.golden_overlay_path(&env.vm).unwrap();
     let stp = env.lifecycle.state_disk_path(&env.vm);
     assert!(retained_files(&dir, &ov, &stp).is_empty());
     env.stage(&m, RID).await;
@@ -908,7 +998,10 @@ async fn a_destroy_cancels_an_in_flight_staging_before_reclaiming_it() {
     else {
         panic!("expected a new staging");
     };
-    assert!(env.lifecycle.backup_dir(&env.vm).exists(), "precondition");
+    assert!(
+        env.lifecycle.backup_dir(&env.vm).unwrap().exists(),
+        "precondition"
+    );
     let runner = {
         let m = Arc::clone(&m);
         tokio::spawn(async move { m.run_stage(job).await })
@@ -937,7 +1030,7 @@ async fn a_destroy_cancels_an_in_flight_staging_before_reclaiming_it() {
         .unwrap();
 
     assert!(
-        !env.lifecycle.backup_dir(&env.vm).exists(),
+        !env.lifecycle.backup_dir(&env.vm).unwrap().exists(),
         "a destroy concurrent with an in-progress stage must leave no backup/<vm> footprint"
     );
 }

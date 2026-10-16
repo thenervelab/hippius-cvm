@@ -992,6 +992,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         }
     }
 

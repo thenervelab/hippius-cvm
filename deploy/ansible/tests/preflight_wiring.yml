@@ -1,0 +1,88 @@
+---
+# Wiring test for miner-tasks/host-preflight.yml: the real tasks file,
+# fed canned probe output and canned facts, on localhost with no
+# connection to any host and no change to this machine (set_fact,
+# debug, assert only). The verdict logic itself is unit-tested in
+# test_host_preflight.py; this proves the play hands the filter what it
+# expects and acts on the answer.
+#
+# Run (from deploy/ansible):
+#   ANSIBLE_FILTER_PLUGINS=playbooks/filter_plugins \
+#     ansible-playbook -i localhost, -c local tests/preflight_wiring.yml
+
+- name: Generic host preflight wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+  vars:
+    ansible_architecture: x86_64
+    ansible_distribution: Ubuntu
+    ansible_distribution_version: "26.04"
+    ansible_kernel: 7.0.0-15-generic
+    ansible_processor_vcpus: 24
+    ansible_memtotal_mb: 386000
+    ansible_mounts:
+      - { mount: /, size_total: 858993459200, size_available: 751619276800 }
+    miner_pf_roots:
+      results:
+        - { stat: { exists: false } }
+        - { stat: { exists: false } }
+    miner_pf_netbird_mgmt: { status: 200 }
+    good_probe: |
+      cpu_vendor=AuthenticAMD
+      cpu_family=25
+      cpu_model=17
+      cpu_model_name=AMD EPYC 9254 24-Core Processor
+      flag_sev_snp=1
+      flag_hypervisor=0
+      virt=none
+      cmdline=BOOT_IMAGE=/vmlinuz ro kvm_amd.sev=1 kvm_amd.sev_es=1 kvm_amd.sev_snp=1 mem_encrypt=on
+      smt_control=on
+      smt_active=1
+      cpus_online=0-47
+      cpus_present=0-47
+      cpus_possible=0-47
+      cpus_offline=
+      smt_off_unit=0
+      sev_snp_param=Y
+      dev_sev=1
+      sev_es_asids=99
+      snp_fw=1.55 build:21
+      iommu_units=8
+      ntp_synced=yes
+      netbird_installed=0
+  tasks:
+    - name: A healthy host passes and gets its snp_generation from the CPU
+      vars:
+        miner_host_probe: { stdout: "{{ good_probe }}" }
+      block:
+        - name: Run the preflight judgement
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/host-preflight.yml
+
+    - name: Check the derived generation and the warning
+      ansible.builtin.assert:
+        that:
+          - snp_generation == 'genoa'
+          - miner_pf.summary.result == 'pass'
+          - miner_pf.warnings | map(attribute='code') | list == ['SMT_ON']
+
+    - name: A broken host is refused with every code at once
+      vars:
+        miner_host_probe:
+          stdout: "{{ good_probe | replace('flag_sev_snp=1', 'flag_sev_snp=0') | replace('ntp_synced=yes', 'ntp_synced=no') }}"
+      block:
+        - name: Run the preflight judgement on the broken host
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/host-preflight.yml
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: the preflight accepted a host without SEV-SNP
+      rescue:
+        - name: The refusal names both problems
+          ansible.builtin.assert:
+            that:
+              - "'FAIL [SNP_BIOS_DISABLED]' in (ansible_failed_result.msg | join(' '))"
+              - "'FAIL [CLOCK_NOT_SYNCED]' in (ansible_failed_result.msg | join(' '))"
+              - ansible_failed_task.name == 'Refuse a host that fails the preflight'

@@ -108,19 +108,55 @@ pub const POOLS_ROOT: &str = "/var/lib/hippius-miner/pools";
 /// `&'static str` across the order path). Interned: each class is leaked
 /// once, on its first refused launch, however often it is refused
 /// (bounded by the pools that ever took launches).
-fn leak_class(prefix: &str, id: &str) -> &'static str {
-    static CLASSES: std::sync::Mutex<BTreeMap<String, &'static str>> =
-        std::sync::Mutex::new(BTreeMap::new());
-    let class = format!("{prefix}:{id}");
-    let mut classes = CLASSES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(leaked) = classes.get(&class) {
-        return leaked;
+fn leak_class(prefix: &'static str, id: &str) -> &'static str {
+    intern_class(prefix, id, false)
+}
+
+/// [`leak_class`] for a pool id an ORDER named but this host does not
+/// declare: at most [`MAX_ORDER_CLASSES`] of those, then the bare prefix —
+/// a declared pool's class (bounded by the config) is never crowded out.
+fn leak_order_class(prefix: &'static str, id: &str) -> &'static str {
+    intern_class(prefix, id, true)
+}
+
+const MAX_ORDER_CLASSES: usize = 64;
+
+struct Classes {
+    interned: BTreeMap<String, &'static str>,
+    from_orders: usize,
+}
+
+impl Classes {
+    const fn new() -> Self {
+        Self {
+            interned: BTreeMap::new(),
+            from_orders: 0,
+        }
     }
-    let leaked: &'static str = Box::leak(class.clone().into_boxed_str());
-    classes.insert(class, leaked);
-    leaked
+
+    fn intern(&mut self, prefix: &'static str, id: &str, from_order: bool) -> &'static str {
+        let class = format!("{prefix}:{id}");
+        if let Some(leaked) = self.interned.get(&class) {
+            return leaked;
+        }
+        if from_order {
+            if self.from_orders >= MAX_ORDER_CLASSES {
+                return prefix;
+            }
+            self.from_orders += 1;
+        }
+        let leaked: &'static str = Box::leak(class.clone().into_boxed_str());
+        self.interned.insert(class, leaked);
+        leaked
+    }
+}
+
+fn intern_class(prefix: &'static str, id: &str, from_order: bool) -> &'static str {
+    static CLASSES: std::sync::Mutex<Classes> = std::sync::Mutex::new(Classes::new());
+    CLASSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .intern(prefix, id, from_order)
 }
 
 impl StoragePools {
@@ -253,9 +289,29 @@ impl StoragePools {
             .unwrap_or(&self.pools[0])
     }
 
-    /// The pool a launch reserves on in this phase: always `default`.
+    /// The pool a launch reserves on when the order names none: `default`.
     pub fn launch_pool(&self) -> &Pool {
         self.default_pool()
+    }
+
+    /// The pool a FIRST launch (or an arrival) puts the VM's disk on: the
+    /// order's `os_pool`, `None` ⇒ [`Self::launch_pool`]. An id this host
+    /// does not declare is `pool-unavailable:<id>` (vali placed on a stale
+    /// view); one that is not a pool id at all is a bad order. Whether the
+    /// pool can take a disk now is the admission's call (`admit_pool`).
+    pub fn os_pool(&self, requested: Option<&str>) -> crate::error::Result<&Pool> {
+        let Some(id) = requested else {
+            return Ok(self.launch_pool());
+        };
+        if !hippius_types::storage_report::is_valid_pool_id(id) {
+            return Err(crate::error::MinerAgentError::LaunchInput("os-pool"));
+        }
+        self.get(id).ok_or_else(|| {
+            crate::error::MinerAgentError::PoolUnavailable(leak_order_class(
+                POOL_UNAVAILABLE_CLASS,
+                id,
+            ))
+        })
     }
 
     /// Every pool but `default` — the extra places a §24 reclaim and the
@@ -1082,6 +1138,34 @@ mod tests {
         let verdict = SystemPoolFs::default().odirect(dir.path());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(verdict, Odirect::ReadOnly);
+    }
+
+    /// Pool ids an order names but the host does not declare are interned
+    /// a bounded number of times; a declared pool's class never is
+    /// crowded out by them.
+    #[test]
+    fn order_named_pools_cannot_crowd_out_a_declared_pools_class() {
+        let mut classes = Classes::new();
+        for n in 0..(MAX_ORDER_CLASSES + 8) {
+            classes.intern(POOL_UNAVAILABLE_CLASS, &format!("ghost{n}"), true);
+        }
+        assert_eq!(
+            classes.intern(POOL_UNAVAILABLE_CLASS, "ghost-past-the-cap", true),
+            "pool-unavailable"
+        );
+        assert_eq!(
+            classes.intern(POOL_UNAVAILABLE_CLASS, "ghost0", true),
+            "pool-unavailable:ghost0",
+            "already interned"
+        );
+        assert_eq!(
+            classes.intern(POOL_UNAVAILABLE_CLASS, "hdd0", false),
+            "pool-unavailable:hdd0"
+        );
+        assert_eq!(
+            classes.intern(INSUFFICIENT_DISK_CLASS, "hdd0", false),
+            "insufficient-disk:hdd0"
+        );
     }
 
     #[test]

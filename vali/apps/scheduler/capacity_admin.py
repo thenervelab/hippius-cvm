@@ -11,7 +11,8 @@ Two classes of column:
 
 - **Audited** (`AUDITED_FIELDS`) — the decisions: the anchor, the VM
   ceiling, the ratio, the trust class, the earned ceiling, the proven
-  peak, the per-miner boot cap and the cordon. Every change is a row.
+  peak, the per-miner boot cap, the cordon and the approval. Every
+  change is a row.
 - **Working state** (`WORKING_FIELDS`) — bookkeeping the tick rewrites
   every cycle (the candidate being held, timestamps, the last reason).
   Auditing them would bury the decisions in noise; they are still only
@@ -54,6 +55,8 @@ AUDITED_FIELDS: frozenset[str] = frozenset(
         "max_booting",
         "cordoned_at",
         "cordon_reason",
+        "approved_at",
+        "approved_by",
     }
 )
 

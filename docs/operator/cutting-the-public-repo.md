@@ -61,6 +61,23 @@ It will not, until the outstanding decisions are closed; that is deliberate,
 and the failing check IS the outstanding decision rather than a note in a
 file somewhere.
 
+### Internal-only documents
+
+Some documents disclose no address and are still not for publication:
+approval procedures, chain admin runbooks, open weaknesses. A pattern scan
+cannot see them, and a banner saying "internal" inside the file excludes
+nothing. They live under a path prefix listed in `.publish-exclude`
+(today `docs/internal/`), and `scripts/dev/publishability-test.sh` reports
+`LEAK internal-path` while the tree tracks any file under one. When a
+merge from `main` brings one onto `release/opensource`, remove it there:
+
+```sh
+git rm -r docs/internal && git commit -m "scrub: drop internal-only docs"
+```
+
+Nothing on the public side may link to those files: `docs-links-test.sh`
+runs on the release branch too and would report the dangling path.
+
 ## Cutting it
 
 ```sh

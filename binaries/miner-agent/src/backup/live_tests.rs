@@ -151,7 +151,7 @@ async fn live_chain_round_trip() {
         retry.disk.as_ref().map(|d| d.size)
     );
 
-    let overlay = lifecycle.golden_overlay_path(&vm);
+    let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
     let reference = sha_file(&overlay);
     assert_ne!(reference, full.disk.as_ref().unwrap().sha256_hex);
 

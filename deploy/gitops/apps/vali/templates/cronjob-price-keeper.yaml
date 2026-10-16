@@ -1,0 +1,102 @@
+{{- if .Values.priceKeeper.enabled }}
+{{- if eq .Values.priceKeeper.keySecretName .Values.epochClose.keySecretName }}
+{{- fail "priceKeeper.keySecretName must not be the epoch-close key: the keeper signs with its own low-funded account" }}
+{{- end }}
+{{- if not .Values.priceKeeper.suspend }}
+{{- if not .Values.priceKeeper.image.digest }}
+{{- fail "priceKeeper.image.digest is empty: the epochClose pin it falls back to predates apply-prices.mjs; pin a build that ships it before unsuspending" }}
+{{- end }}
+{{- if not .Values.priceKeeper.forbiddenAccounts }}
+{{- fail "priceKeeper.forbiddenAccounts is empty: list the epoch-close audit authority (not sudo on production, so the script cannot recognise it alone) before unsuspending" }}
+{{- end }}
+{{- end }}
+{{- $repo := .Values.priceKeeper.image.repository | default .Values.epochClose.image.repository }}
+{{- $digest := .Values.priceKeeper.image.digest | default .Values.epochClose.image.digest }}
+---
+# §23 price keeper — applies due `PendingPriceChange` entries with the
+# permissionless `ComputeScoring.applyPriceChange(node_id)`, so `MinerPrice`
+# (the raw value vali reads) follows what miners announced. Runs
+# `apply-prices.mjs` from the epoch-closer image, signed by the dedicated
+# keeper key (never the epoch-close / sudo key). See `priceKeeper` in
+# values.yaml.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: price-keeper
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: price-keeper
+spec:
+  schedule: {{ .Values.priceKeeper.schedule | quote }}
+  suspend: {{ .Values.priceKeeper.suspend }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # Applies run in sequence, each waiting for inclusion (capped at 60s
+      # in the script); maxPerRun of them plus the reads fit inside this.
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            # NOT `vali.valiSelector`: that would put the pod under the vali
+            # CNP's default-deny egress (no chain RPC, no Pushgateway).
+            app.kubernetes.io/component: price-keeper
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: price-keeper
+              image: "{{ $repo }}@{{ $digest }}"
+              command: ["node", "apply-prices.mjs"]
+              env:
+                - name: THEBRAIN_RPC_URL
+                  value: {{ .Values.priceKeeper.rpcUrl | default .Values.epochClose.rpcUrl | quote }}
+                - name: PRICE_KEEPER_KEY_FILE
+                  value: /etc/price-keeper/mnemonic
+                - name: PRICE_KEEPER_MAX_PER_RUN
+                  value: {{ .Values.priceKeeper.maxPerRun | quote }}
+                - name: PRICE_KEEPER_FEE_BUDGET_PLANCK
+                  value: {{ .Values.priceKeeper.feeBudgetPlanck | quote }}
+                - name: PRICE_KEEPER_MIN_BALANCE_PLANCK
+                  value: {{ .Values.priceKeeper.minBalancePlanck | quote }}
+                - name: PRICE_KEEPER_PUSHGATEWAY_URL
+                  value: {{ .Values.priceKeeper.pushgatewayUrl | quote }}
+                - name: PRICE_KEEPER_FORBIDDEN_ACCOUNTS
+                  value: {{ join "," .Values.priceKeeper.forbiddenAccounts | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              volumeMounts:
+                - name: key
+                  mountPath: /etc/price-keeper
+                  readOnly: true
+          volumes:
+            - name: key
+              secret:
+                secretName: {{ .Values.priceKeeper.keySecretName | quote }}
+                items:
+                  - key: mnemonic
+                    path: mnemonic
+{{- end }}

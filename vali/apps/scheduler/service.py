@@ -496,8 +496,12 @@ def refresh_miner_capacity(snapshot: chain.ChainSnapshot) -> None:
     The chain-sourced fields (`status`, `quality`, epochs) are
     overwritten every refresh; `capacity_slots` is operator-managed
     and **preserved** on existing rows (only seeded with the default
-    on first sight of a miner).
+    on first sight of a miner). A new row is approved on sight unless
+    `VALI_MINER_APPROVAL_REQUIRED` is on, in which case it starts pending
+    (`apps.scheduler.approval`).
     """
+    from .approval import on_sight_approval
+
     now = timezone.now()
     default_slots = _default_capacity_slots()
     for miner in snapshot.miners:
@@ -515,6 +519,7 @@ def refresh_miner_capacity(snapshot: chain.ChainSnapshot) -> None:
                     miner_node_id=miner.node_id,
                     capacity_slots=default_slots,
                     **chain_fields,
+                    **on_sight_approval(now),
                 )
             except IntegrityError:
                 # A concurrent refresh created the row between the
@@ -1271,13 +1276,22 @@ def cordoned_node_ids() -> dict[str, str]:
     (`MinerCapacity.cordoned_at` set) — gate (h). Every caller that places
     NEW work passes it; nothing else reads it, which is the whole contract
     of a cordon: the miner's status, telemetry, drains and the VMs already
-    on it are untouched."""
-    return {
-        nid.lower(): reason
+    on it are untouched.
+
+    A miner PENDING APPROVAL (`apps.scheduler.approval`, only while
+    `VALI_MINER_APPROVAL_REQUIRED` is on) is folded in with the reason
+    `pending approval`: it is the same "no new work" hold. An operator
+    cordon's own reason wins when a miner is both."""
+    from .approval import pending_approval_node_ids
+
+    cordoned = pending_approval_node_ids()
+    cordoned.update(
+        (nid.lower(), reason)
         for nid, reason in MinerCapacity.objects.filter(cordoned_at__isnull=False).values_list(
             "miner_node_id", "cordon_reason"
         )
-    }
+    )
+    return cordoned
 
 
 def net_policy_unready_node_ids() -> dict[str, str]:
@@ -1474,11 +1488,12 @@ def capacity_views(
 def hard_gated_node_ids(rows: Iterable[MinerCapacity] | None = None) -> frozenset[str]:
     """Mirror rows `decide_placement` would hard-refuse whatever their free
     capacity: not on-chain `active`, epoch-stale, observed CVM-incapable,
-    zombie-quarantined, or operator-cordoned. Read from the mirror
+    zombie-quarantined, operator-cordoned or pending approval. Read from the mirror
     (refreshed on every chain read) so a capacity readout needs no chain
     round-trip of its own; a
     readout zeroes these hosts' FREE figures instead of advertising room
     placement would never use."""
+    from .approval import held_back
     from .cvm_capability import INCAPABLE
 
     lag = max_epoch_lag()
@@ -1492,7 +1507,7 @@ def hard_gated_node_ids(rows: Iterable[MinerCapacity] | None = None) -> frozense
             or row.observed_epoch - row.data_epoch > lag
             or capability.get(nid) == INCAPABLE
             or nid.lower() in zombies
-            or row.cordoned_at is not None
+            or held_back(row)
         ):
             out.add(nid)
     return frozenset(out)
@@ -2433,6 +2448,8 @@ def swap_placement_class(
             kbs_release_ref=row.kbs_release_ref,
             decided_by=decided_by,
         )
+        # Same host, same disks: the pools they are on carry over.
+        _carry_placement_disks(row, placement)
     log.info(
         "placement resize: vm=%s on %s %s → %s (placement=%s, %s)",
         vm.vm_id,
@@ -2675,7 +2692,7 @@ def open_placement_on_node(
         return None
     try:
         with transaction.atomic():
-            return Placement.objects.create(
+            placement = Placement.objects.create(
                 vm=vm,
                 vm_family=template.vm_family,
                 owner=template.owner,
@@ -2688,8 +2705,31 @@ def open_placement_on_node(
                 kbs_release_ref=reason[:256],
                 decided_by=decided_by,
             )
+            # Back on the host its disks are on: they are still where they were.
+            if template.miner_node_id == node_id:
+                _carry_placement_disks(template, placement)
+            return placement
     except IntegrityError:
         return None
+
+
+def _carry_placement_disks(src: Placement, dst: Placement) -> None:
+    """Copy `src`'s disk rows (`apps.disktier.PlacementDisk`: which pool
+    each disk is on) to `dst`, a new row of the same VM on the same host."""
+    from apps.disktier.models import PlacementDisk
+
+    for disk in PlacementDisk.objects.filter(placement_id=src.id):
+        PlacementDisk.objects.get_or_create(
+            placement_id=dst.id,
+            slot=disk.slot,
+            defaults={
+                "kind": disk.kind,
+                "pool_id": disk.pool_id,
+                "dedicated_disk_id": disk.dedicated_disk_id,
+                "size_gb": disk.size_gb,
+                "required_tier": disk.required_tier,
+            },
+        )
 
 
 @dataclass(frozen=True)

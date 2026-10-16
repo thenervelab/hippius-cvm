@@ -184,7 +184,7 @@ def _two_miner_fleet(monkeypatch, *, failing: str) -> list[str]:
     )
     dispatched: list[str] = []
 
-    def _fake(spec, miner):
+    def _fake(spec, miner, **_kw):
         dispatched.append(miner.chain_node_id)
         ok = miner.chain_node_id != failing
         # Mirror what the real `launch_on_miner` records at its dispatch

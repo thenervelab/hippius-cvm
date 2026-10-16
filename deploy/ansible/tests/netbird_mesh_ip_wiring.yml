@@ -1,0 +1,57 @@
+---
+# Wiring test for miner-tasks/netbird-mesh-ip.yml: the real tasks file,
+# fed canned `netbird status` / `ip addr` output, on localhost with no
+# connection to any host and no change to this machine (set_fact and
+# assert only).
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_wiring.yml
+#   ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_check_mode.yml --check
+
+- name: NetBird mesh IP wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    status_ok: |
+      Daemon version: 0.71.3
+      Management: Connected
+      Signal: Connected
+      NetBird IP: 100.64.12.34/16
+      Interface type: Kernel
+    iface_ok: '5: wt0    inet 100.64.12.34/16 brd 100.64.255.255 scope global wt0\       valid_lft forever preferred_lft forever'
+    status_down: |
+      Daemon version: 0.71.3
+      Management: Disconnected
+      Signal: Disconnected
+  tasks:
+    - name: A joined peer whose interface carries the address passes
+      vars:
+        miner_netbird_final: { stdout: "{{ status_ok }}" }
+        miner_netbird_iface: { stdout: "{{ iface_ok }}" }
+        miner_netbird_was_connected: false
+      block:
+        - name: Run the mesh-IP capture
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/netbird-mesh-ip.yml
+
+    - name: The detected address is the one recorded
+      ansible.builtin.assert:
+        that:
+          - miner_netbird_ip == '100.64.12.34'
+
+    - name: Each broken join is refused, never replaced by a fallback
+      ansible.builtin.include_tasks: netbird_mesh_ip_refused.yml
+      loop:
+        # The join failed: no address at all (the case the old
+        # placeholder fallback let through) — on a fresh host, whose
+        # first `netbird up` this run made, and on an already-joined one.
+        - { status: "{{ status_down }}", iface: "", was_connected: false }
+        - { status: "{{ status_down }}", iface: "" }
+        # status claims an address the interface does not carry.
+        - { status: "{{ status_ok }}", iface: "" }
+        - { status: "{{ status_ok }}", iface: "5: wt0    inet 100.64.1.2/16 scope global wt0" }
+        # Not a CGNAT address.
+        - { status: "NetBird IP: 10.0.0.5/24", iface: "5: wt0    inet 10.0.0.5/24 scope global wt0" }
+      loop_control:
+        loop_var: case
+        label: "{{ case.iface or 'no wt0 address' }}"

@@ -117,9 +117,28 @@ pub(crate) fn headroom_bytes(
     miner_root: &Path,
     dir: &Path,
 ) -> Result<u64, &'static str> {
+    headroom_bytes_over(reserved, std::slice::from_ref(&miner_root), dir)
+}
+
+/// [`headroom_bytes`] net of the writable disks under EVERY root in
+/// `roots` that sit on `dir`'s filesystem (each pool root once).
+pub(crate) fn headroom_bytes_over<P: AsRef<Path>>(
+    reserved: u64,
+    roots: &[P],
+    dir: &Path,
+) -> Result<u64, &'static str> {
     let (_, avail) = fs_bytes(dir).ok_or("statvfs")?;
     let dev = std::fs::metadata(dir).map_err(|_| "statvfs")?.dev();
-    let tail = unwritten_tail_bytes(miner_root, dev).ok_or("disk-list")?;
+    let mut tail: u64 = 0;
+    let mut seen: Vec<&Path> = Vec::new();
+    for root in roots {
+        let root = root.as_ref();
+        if seen.contains(&root) {
+            continue;
+        }
+        seen.push(root);
+        tail = tail.saturating_add(unwritten_tail_bytes(root, dev).ok_or("disk-list")?);
+    }
     Ok(avail.saturating_sub(tail).saturating_sub(reserved))
 }
 

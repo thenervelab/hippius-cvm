@@ -280,12 +280,23 @@ impl RestorePaths {
         }
     }
 
-    /// [`Self::new`] from the lifecycle's own roots.
-    pub fn for_vm(lifecycle: &CvmLifecycle, vm_id: &VmId, restore_id: &str) -> Self {
+    /// [`Self::new`] from the lifecycle's own roots: the VM's pool record
+    /// ([`CvmLifecycle::vm_disk_root`]) for the overlay and backup dir.
+    pub fn for_vm(lifecycle: &CvmLifecycle, vm_id: &VmId, restore_id: &str) -> Result<Self> {
+        Ok(Self::at_root(
+            lifecycle,
+            &lifecycle.vm_disk_root(vm_id)?,
+            vm_id,
+            restore_id,
+        ))
+    }
+
+    /// [`Self::new`] for a VM whose disks live under pool root `root`.
+    pub fn at_root(lifecycle: &CvmLifecycle, root: &Path, vm_id: &VmId, restore_id: &str) -> Self {
         Self::new(
-            &lifecycle.golden_overlay_path(vm_id),
+            &crate::lifecycle::golden::overlay_disk_path(root, vm_id),
             &lifecycle.state_disk_path(vm_id),
-            &lifecycle.backup_dir(vm_id),
+            &root.join("backup").join(vm_id.as_str()),
             restore_id,
         )
     }
@@ -978,7 +989,10 @@ impl RestoreManager {
                 Err(MinerAgentError::Backup("restore-busy"))
             };
         }
-        let paths = RestorePaths::for_vm(lifecycle, &req.vm_id, &req.restore_id);
+        // A restore to a host this VM never ran on builds on the launch
+        // pool; its pool record is written once the restore goes ahead.
+        let (root, pending_record) = lifecycle.staging_pool(&req.vm_id)?;
+        let paths = RestorePaths::at_root(lifecycle, &root, &req.vm_id, &req.restore_id);
         if let Some(rec) = read_record(&paths.restore_root).await {
             if rec.restore_id == req.restore_id {
                 match rec.state {
@@ -990,7 +1004,7 @@ impl RestoreManager {
                     RestoreState::Staging | RestoreState::Failed => {}
                 }
             } else {
-                let other = RestorePaths::for_vm(lifecycle, &req.vm_id, &rec.restore_id);
+                let other = RestorePaths::at_root(lifecycle, &root, &req.vm_id, &rec.restore_id);
                 let unfinished = matches!(rec.state, RestoreState::Staging | RestoreState::Staged)
                     || present(&other.pre_overlay).await?
                     || present(&other.pre_state).await?;
@@ -1005,6 +1019,9 @@ impl RestoreManager {
         // under the restore lock, which every registration holds).
         if self.running_lock()?.len() >= MAX_CONCURRENT_STAGINGS {
             return Err(MinerAgentError::Backup("restore-host-busy"));
+        }
+        if let Some(record) = &pending_record {
+            lifecycle.record_vm_pool(&req.vm_id, record)?;
         }
         remove_staging(&paths.staging_dir).await?;
         tokio::fs::create_dir_all(&paths.restore_root)
@@ -1255,7 +1272,7 @@ impl RestoreManager {
         if migration.phase(vm_id) == Some(MigrationPhase::Activating) {
             return Err(MinerAgentError::Backup("restore-activating"));
         }
-        let p = RestorePaths::for_vm(lifecycle, vm_id, restore_id);
+        let p = RestorePaths::for_vm(lifecycle, vm_id, restore_id)?;
         // A reclaimed restore is committed: its original is gone, and
         // "aborting" it would only take the good VM down.
         if read_record(&p.restore_root)
@@ -1322,7 +1339,7 @@ impl RestoreManager {
         {
             return Err(MinerAgentError::Backup("restore-reclaim-refused"));
         }
-        let p = RestorePaths::for_vm(lifecycle, vm_id, restore_id);
+        let p = RestorePaths::for_vm(lifecycle, vm_id, restore_id)?;
         // The marker check first, then the intent, durably, then the
         // deletes: a crash in between leaves `reclaimed` (which an abort
         // refuses) and a re-sent reclaim finishes the deletes.
@@ -1370,8 +1387,8 @@ impl RestoreManager {
     /// one swapped in — no libvirt, no manager state (the activation's
     /// quick check).
     pub async fn peek(lifecycle: &CvmLifecycle, vm_id: &VmId) -> Option<Peek> {
-        let rec = read_record(&lifecycle.backup_dir(vm_id).join(RESTORE_DIR_NAME)).await?;
-        let p = RestorePaths::for_vm(lifecycle, vm_id, &rec.restore_id);
+        let rec = read_record(&lifecycle.backup_dir(vm_id).ok()?.join(RESTORE_DIR_NAME)).await?;
+        let p = RestorePaths::for_vm(lifecycle, vm_id, &rec.restore_id).ok()?;
         let swapped = read_marker(&p.marker).await.as_deref()
             == Some(staged_marker(&rec.restore_id).as_str());
         Some(Peek {
@@ -1388,7 +1405,13 @@ impl RestoreManager {
         lifecycle: &CvmLifecycle,
         vm_id: &VmId,
     ) -> std::result::Result<Option<RestoreStatus>, StatusError> {
-        let root = lifecycle.backup_dir(vm_id).join(RESTORE_DIR_NAME);
+        // No pool record for the VM (it is not on this host): nothing
+        // known. One that cannot be read: ask again.
+        let root = match lifecycle.backup_dir(vm_id) {
+            Ok(dir) => dir.join(RESTORE_DIR_NAME),
+            Err(MinerAgentError::VmPoolRecord("missing")) => return Ok(None),
+            Err(_) => return Err(StatusError::Unavailable),
+        };
         let Some(rec) = read_record(&root).await else {
             return Ok(None);
         };
@@ -1397,7 +1420,8 @@ impl RestoreManager {
                 .filter(|r| r.restore_id == rec.restore_id)
                 .map(|r| r.ratchet.report(r.progress.load(Ordering::Relaxed)))
         });
-        let p = RestorePaths::for_vm(lifecycle, vm_id, &rec.restore_id);
+        let p = RestorePaths::for_vm(lifecycle, vm_id, &rec.restore_id)
+            .map_err(|_| StatusError::Unavailable)?;
         let swapped = read_marker(&p.marker).await.as_deref()
             == Some(staged_marker(&rec.restore_id).as_str());
         let pre_restore_present = present(&p.pre_overlay).await.unwrap_or(true)

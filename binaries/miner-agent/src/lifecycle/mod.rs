@@ -45,6 +45,7 @@ pub mod qemu_config;
 pub mod reboot_watcher;
 pub mod state_disk;
 pub mod ticket_peek;
+pub mod vm_pool;
 
 pub use cvm_handle::{CvmHandle, DomainProfile, DomainUuid, VmId};
 pub use infra::{InfraDomainConfig, InfraLaunchOrder, INFRA_VM_ID};
@@ -635,8 +636,316 @@ impl CvmLifecycle {
     /// `ensure_overlay_disk` finds it already present and PRESERVES it
     /// (never reformats) → the guest `luksOpen`s the migrated data with the
     /// KBS-released KEK. Same idempotency the reboot-recovery relaunch relies on.
-    pub fn golden_overlay_path(&self, vm_id: &VmId) -> std::path::PathBuf {
-        golden::overlay_disk_path(&self.data_disk_root, vm_id)
+    ///
+    /// Resolved through the VM's pool record ([`Self::vm_disk_root`]).
+    pub fn golden_overlay_path(&self, vm_id: &VmId) -> Result<std::path::PathBuf> {
+        Ok(golden::overlay_disk_path(&self.vm_disk_root(vm_id)?, vm_id))
+    }
+
+    /// The pool root `vm_id`'s writable disks live under, from its pool
+    /// record ([`vm_pool`]). Before the one-time backfill, a VM without a
+    /// record is on `default` (the only pool older agents used); after
+    /// it, a missing or unreadable record is refused, never guessed.
+    pub fn vm_disk_root(&self, vm_id: &VmId) -> Result<std::path::PathBuf> {
+        match vm_pool::read(&self.state_disk_root, vm_id) {
+            Ok(Some(record)) => Ok(record.root),
+            Ok(None) if !vm_pool::backfilled(&self.state_disk_root) => {
+                Ok(self.data_disk_root.clone())
+            }
+            Ok(None) => Err(MinerAgentError::VmPoolRecord("missing")),
+            Err(vm_pool::Unreadable) => Err(MinerAgentError::VmPoolRecord("unreadable")),
+        }
+    }
+
+    /// Where `vm_id`'s launch puts its writable disks, and whether a guest
+    /// may already have used them.
+    ///
+    /// "Has run" is any of: its pool record says so, the order is a
+    /// relaunch (`require_existing_disks`), a §25 restore marker sits next
+    /// to its boot disk, or (without a record) its state disk exists. A VM
+    /// that has run but has no record is refused once the backfill is done
+    /// (before it, it is on `default`, the only pool older agents used).
+    /// A first launch goes to the order's `os_pool` (`None` ⇒ the launch
+    /// pool); a VM that ran stays on its recorded pool, whatever the order
+    /// names.
+    fn launch_target(
+        &self,
+        vm_id: &VmId,
+        require_existing_disks: bool,
+        state_disk_path: &std::path::Path,
+        legacy_boot_disk: Option<&std::path::Path>,
+        os_pool: Option<&str>,
+    ) -> Result<LaunchTarget> {
+        let restore_marker = |root: &std::path::Path| -> Result<bool> {
+            let boot = match legacy_boot_disk {
+                Some(path) => path.to_path_buf(),
+                None => golden::overlay_disk_path(root, vm_id),
+            };
+            crate::orders::migration::restore_marker_path(&boot)
+                .try_exists()
+                .map_err(|_| MinerAgentError::RelaunchDisksUnreadable("restore-marker"))
+        };
+        match vm_pool::read(&self.state_disk_root, vm_id) {
+            Err(vm_pool::Unreadable) => Err(MinerAgentError::VmPoolRecord("unreadable")),
+            Ok(Some(on_disk)) => {
+                let ran = on_disk.ran || require_existing_disks || restore_marker(&on_disk.root)?;
+                if !ran && !self.root_holds_disk_of(&on_disk.root, vm_id)? {
+                    // A first launch that failed before its disk (or its
+                    // domain): nothing binds it to that pool — this one is
+                    // a first launch again, on the pool this order names.
+                    let record = self.first_launch_record(os_pool, legacy_boot_disk.is_some())?;
+                    return Ok(LaunchTarget {
+                        record,
+                        on_disk: Some(on_disk),
+                    });
+                }
+                if os_pool.is_some_and(|id| id != on_disk.pool_id) {
+                    eprintln!(
+                        "hippius-miner-agent: launch: vm={vm_id} keeps its pool {} ({}); the \
+                         order's os_pool {:?} applies to a first launch only",
+                        on_disk.pool_id,
+                        on_disk.root.display(),
+                        os_pool
+                    );
+                }
+                Ok(LaunchTarget {
+                    record: vm_pool::VmPoolRecord {
+                        ran,
+                        ..on_disk.clone()
+                    },
+                    on_disk: Some(on_disk),
+                })
+            }
+            Ok(None) => {
+                let state_disk = state_disk_path
+                    .try_exists()
+                    .map_err(|_| MinerAgentError::RelaunchDisksUnreadable("state-disk"))?;
+                let has_run =
+                    require_existing_disks || state_disk || restore_marker(&self.data_disk_root)?;
+                if has_run && vm_pool::backfilled(&self.state_disk_root) {
+                    // Nothing of this VM on any pool: this host never held
+                    // it (vali's relaunch went to the wrong host) — the
+                    // class vali stops relaunching on. Its disks without a
+                    // record: an operator must restore the record.
+                    if !state_disk && !self.holds_any_disk_of(vm_id, legacy_boot_disk)? {
+                        return Err(MinerAgentError::RelaunchDisksMissing(
+                            "state-disk",
+                            crate::storage::pools::DEFAULT_POOL_ID.to_string(),
+                        ));
+                    }
+                    return Err(MinerAgentError::VmPoolRecord("missing"));
+                }
+                let record = if has_run {
+                    vm_pool::VmPoolRecord {
+                        pool_id: crate::storage::pools::DEFAULT_POOL_ID.to_string(),
+                        root: self.data_disk_root.clone(),
+                        ran: true,
+                    }
+                } else {
+                    self.first_launch_record(os_pool, legacy_boot_disk.is_some())?
+                };
+                Ok(LaunchTarget {
+                    record,
+                    on_disk: None,
+                })
+            }
+        }
+    }
+
+    /// A VM that ran on a pool other than `default` needs that pool on
+    /// its bound filesystem before a missing disk means anything: right
+    /// after a host reboot the pool may not be mounted yet (a late bind).
+    /// Then `relaunch-disks-unreadable/pool-not-mounted` — retryable, and
+    /// never the `relaunch-disks-missing` vali gives up on. A root that is
+    /// no declared pool is left to the disk checks.
+    fn check_pool_mounted(&self, record: &vm_pool::VmPoolRecord) -> Result<()> {
+        if record.root == self.data_disk_root {
+            return Ok(());
+        }
+        let set = self.pools.current();
+        let Some(pool) = set.pools.iter().find(|p| p.path == record.root) else {
+            return Ok(());
+        };
+        if pool.is_default()
+            || set
+                .bindings
+                .is_bound(&pool.id, &pool.path, &self.pool_host.fs_identity)
+        {
+            return Ok(());
+        }
+        Err(MinerAgentError::RelaunchDisksUnreadable("pool-not-mounted"))
+    }
+
+    /// The record of a first launch on the order's `os_pool`. A legacy
+    /// VM stays on `default`: its handle accounts its disk by the boot
+    /// disk's path (in staging), which only `default` would match.
+    fn first_launch_record(
+        &self,
+        os_pool: Option<&str>,
+        legacy: bool,
+    ) -> Result<vm_pool::VmPoolRecord> {
+        let pools = self.pools.pools();
+        let pool = pools.os_pool(os_pool)?;
+        if legacy && !pool.is_default() {
+            return Err(MinerAgentError::LaunchInput("os-pool-legacy"));
+        }
+        Ok(vm_pool::VmPoolRecord {
+            pool_id: pool.id.clone(),
+            root: pool.path.clone(),
+            ran: false,
+        })
+    }
+
+    /// Whether `root` holds `vm_id`'s overlay or data disk.
+    fn root_holds_disk_of(&self, root: &std::path::Path, vm_id: &VmId) -> Result<bool> {
+        for path in [
+            golden::overlay_disk_path(root, vm_id),
+            data_disk::data_disk_path(root, vm_id),
+        ] {
+            match path.try_exists() {
+                Ok(false) => {}
+                Ok(true) => return Ok(true),
+                Err(_) => return Err(MinerAgentError::RelaunchDisksUnreadable("pool")),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether any writable disk of `vm_id` (overlay, data disk, §25
+    /// restore marker) is on `default` or on a declared pool.
+    fn holds_any_disk_of(
+        &self,
+        vm_id: &VmId,
+        legacy_boot_disk: Option<&std::path::Path>,
+    ) -> Result<bool> {
+        let mut roots = vec![self.data_disk_root.clone()];
+        roots.extend(self.pools.pools().iter().map(|p| p.path.clone()));
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for root in &roots {
+            let overlay = golden::overlay_disk_path(root, vm_id);
+            paths.push(crate::orders::migration::restore_marker_path(&overlay));
+            paths.push(overlay);
+            paths.push(data_disk::data_disk_path(root, vm_id));
+        }
+        if let Some(boot) = legacy_boot_disk {
+            paths.push(crate::orders::migration::restore_marker_path(boot));
+        }
+        for path in paths {
+            match path.try_exists() {
+                Ok(false) => {}
+                Ok(true) => return Ok(true),
+                Err(_) => return Err(MinerAgentError::RelaunchDisksUnreadable("pool")),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Where a staged restore beginning on this host builds, and the pool
+    /// record it must write first (`None`: nothing to write). A VM with no
+    /// record, restored to a host it never ran on, goes to the launch pool
+    /// (`ran` false); the activation marks it `ran`
+    /// ([`Self::place_arriving`]). Before the backfill a VM without a
+    /// record is on `default` and needs none; after it, one whose state
+    /// disk is here ran here and lost its record — refused. Nothing is
+    /// written here: [`Self::record_vm_pool`] does, once the restore is
+    /// known to go ahead.
+    pub fn staging_pool(
+        &self,
+        vm_id: &VmId,
+    ) -> Result<(std::path::PathBuf, Option<vm_pool::VmPoolRecord>)> {
+        match vm_pool::read(&self.state_disk_root, vm_id) {
+            Ok(Some(record)) => return Ok((record.root, None)),
+            Err(vm_pool::Unreadable) => return Err(MinerAgentError::VmPoolRecord("unreadable")),
+            Ok(None) if !vm_pool::backfilled(&self.state_disk_root) => {
+                return Ok((self.data_disk_root.clone(), None))
+            }
+            Ok(None) => {}
+        }
+        let state_disk = self
+            .state_disk_path(vm_id)
+            .try_exists()
+            .map_err(|_| MinerAgentError::RelaunchDisksUnreadable("state-disk"))?;
+        if state_disk {
+            return Err(MinerAgentError::VmPoolRecord("missing"));
+        }
+        let pools = self.pools.pools();
+        let pool = pools.launch_pool();
+        let record = vm_pool::VmPoolRecord {
+            pool_id: pool.id.clone(),
+            root: pool.path.clone(),
+            ran: false,
+        };
+        Ok((record.root.clone(), Some(record)))
+    }
+
+    /// Write `vm_id`'s pool record unless one appeared since
+    /// [`Self::staging_pool`] (a concurrent arrival's record is kept).
+    pub fn record_vm_pool(&self, vm_id: &VmId, record: &vm_pool::VmPoolRecord) -> Result<()> {
+        vm_pool::create(&self.state_disk_root, vm_id, record)
+            .map(|_| ())
+            .map_err(|_| MinerAgentError::VmPoolRecord("unwritable"))
+    }
+
+    /// The pool root a VM ARRIVING with its data (a §25 destination, a
+    /// failover restore) is written to: its existing record, else the
+    /// launch pool, recorded `ran` before any of its disks is written —
+    /// every later relaunch then requires them.
+    ///
+    /// `os_pool` is the order's pool for a VM without a record (`None` ⇒
+    /// the launch pool), admitted like a first launch's.
+    pub fn place_arriving(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        disk_gb: u32,
+        legacy: bool,
+    ) -> Result<std::path::PathBuf> {
+        let record = match vm_pool::read(&self.state_disk_root, vm_id) {
+            Ok(Some(record)) if record.ran => return Ok(record.root),
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                let pools = self.pools.pools();
+                let pool = pools.os_pool(os_pool)?;
+                // Legacy stays on `default`, as a first launch does.
+                if legacy && !pool.is_default() {
+                    return Err(MinerAgentError::LaunchInput("os-pool-legacy"));
+                }
+                // Before the download: a pool that cannot take the disk, or
+                // has no budget left for it, is refused now, not after.
+                self.admit_pool(pool)?;
+                self.check_pool_disk_budget(pool, disk_gb)?;
+                vm_pool::VmPoolRecord {
+                    pool_id: pool.id.clone(),
+                    root: pool.path.clone(),
+                    ran: true,
+                }
+            }
+            Err(vm_pool::Unreadable) => return Err(MinerAgentError::VmPoolRecord("unreadable")),
+        };
+        let record = vm_pool::VmPoolRecord {
+            ran: true,
+            ..record
+        };
+        vm_pool::write(&self.state_disk_root, vm_id, &record)
+            .map_err(|_| MinerAgentError::VmPoolRecord("unwritable"))?;
+        Ok(record.root)
+    }
+
+    /// Write the pool records of VMs placed before records existed
+    /// ([`vm_pool::backfill`]): the live/re-adopted handles and the
+    /// re-adoption snapshots, plus whatever the default pool holds on
+    /// disk. Run once at startup, after re-adoption.
+    pub fn backfill_vm_pools(&self) -> std::io::Result<usize> {
+        let mut known: Vec<VmId> = self
+            .lock_handles()
+            .map(|h| h.keys().cloned().collect())
+            .unwrap_or_default();
+        known.extend(
+            adopt::list(&self.state_disk_root)
+                .into_iter()
+                .filter_map(|ph| VmId::new(&ph.vm_id).ok()),
+        );
+        vm_pool::backfill(&self.state_disk_root, &self.data_disk_root, &known)
     }
 
     /// Per-VM anti-rollback state-disk path (`<state_disk_root>/state/
@@ -666,8 +975,32 @@ impl CvmLifecycle {
     /// The host disk ledger ([`crate::backup::capture::SpaceLedger::host`])
     /// over this host's per-VM disks — what an in-flight writer (a §25
     /// download) reserves in.
+    ///
+    /// Over EVERY pool's disks: a write lands on the VM's pool, and the
+    /// tails it competes with are that pool's.
     pub fn disk_space_ledger(&self) -> crate::backup::capture::SpaceLedger {
-        crate::backup::capture::SpaceLedger::host(self.data_disk_root.clone())
+        crate::backup::capture::SpaceLedger::host_pools(self.disk_roots())
+    }
+
+    /// Every pool root a VM's disks can be under: `default`'s, each
+    /// declared pool's, and each recorded VM pool's — read when used.
+    pub fn disk_roots(&self) -> crate::backup::capture::DiskRoots {
+        let (data_root, state_root) = (self.data_disk_root.clone(), self.state_disk_root.clone());
+        let pools = Arc::clone(&self.pools);
+        crate::backup::capture::DiskRoots::new(move || {
+            let mut roots = vec![data_root.clone()];
+            for root in pools
+                .pools()
+                .iter()
+                .map(|p| p.path.clone())
+                .chain(vm_pool::roots(&state_root))
+            {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            roots
+        })
     }
 
     /// Root of the per-VM backup work dirs (`<data_disk_root>/backup`).
@@ -677,9 +1010,24 @@ impl CvmLifecycle {
         self.data_disk_root.join("backup")
     }
 
-    /// This VM's backup work dir (`<data_disk_root>/backup/<vm_id>`).
-    pub fn backup_dir(&self, vm_id: &VmId) -> std::path::PathBuf {
-        self.backup_root().join(vm_id.as_str())
+    /// This VM's backup work dir (`<its pool root>/backup/<vm_id>`): on
+    /// the overlay's filesystem, so a restored overlay is renamed into
+    /// place atomically.
+    pub fn backup_dir(&self, vm_id: &VmId) -> Result<std::path::PathBuf> {
+        Ok(self
+            .vm_disk_root(vm_id)?
+            .join("backup")
+            .join(vm_id.as_str()))
+    }
+
+    /// Every backup root a VM's work dir can be under: `default`'s, each
+    /// declared pool's, and each recorded VM pool's (startup recovery).
+    pub fn backup_roots(&self) -> Vec<std::path::PathBuf> {
+        self.disk_roots()
+            .list()
+            .into_iter()
+            .map(|root| root.join("backup"))
+            .collect()
     }
 
     /// Per-VM staging dir (`<root>/staging/<vm_id>`) — the ONLY place this
@@ -909,15 +1257,27 @@ impl CvmLifecycle {
         // reserves its overlay just as a legacy VM reserves its data disk.
         let disk_budget_gb = order.data_disk_size_gb;
 
+        // Which pool holds this VM's writable disks, and whether a guest
+        // may already have used them (then a missing disk is refused,
+        // never created blank). Before any path is derived.
+        let legacy_boot_disk = (!is_golden).then_some(order.luks_disk_path.as_path());
+        let target = self.launch_target(
+            &vm_id,
+            require_existing_disks,
+            &state_disk_path,
+            legacy_boot_disk,
+            order.os_pool.as_deref(),
+        )?;
+
         // Disk fields differ by mode. `config.data_disk_size_gb` keeps the
         // LEGACY vde semantics (0 ⇒ no vde), so golden sets it 0 (no vde)
         // while `disk_budget_gb` above carries the overlay reservation.
         let (luks_disk_path, luks_disk_size_gb, data_disk_path, config_data_disk_size_gb) =
             if is_golden {
                 (
-                    // vda = the per-VM overlay upper, derived under the
-                    // process-owned storage root (blank; created below).
-                    golden::overlay_disk_path(&self.data_disk_root, &vm_id),
+                    // vda = the per-VM overlay upper, under the VM's pool
+                    // root (blank on a first launch; created below).
+                    golden::overlay_disk_path(&target.record.root, &vm_id),
                     disk_budget_gb,
                     None,
                     0,
@@ -930,7 +1290,7 @@ impl CvmLifecycle {
                 // `set_len`. The file is allocated by `ensure_data_disk`
                 // below, after capacity admission.
                 let ddp = if order.data_disk_size_gb > 0 {
-                    Some(data_disk::data_disk_path(&self.data_disk_root, &vm_id))
+                    Some(data_disk::data_disk_path(&target.record.root, &vm_id))
                 } else {
                     None
                 };
@@ -988,8 +1348,13 @@ impl CvmLifecycle {
         // production 2026-09-25: a relaunch onto a host that never held the
         // VM got a blank overlay + a blank boot-counter disk). Checked
         // before anything is reserved, so a refusal leaves nothing behind.
-        if require_existing_disks {
-            check_relaunch_disks(&config)?;
+        //
+        // Not only on the order's say-so: a VM that has run here (its pool
+        // record, a §25 restore marker, its state disk) needs its disks
+        // whatever the order carries.
+        if target.ran() {
+            self.check_pool_mounted(&target.record)?;
+            check_relaunch_disks(&config, &target.record.pool_id)?;
         }
 
         // ── Idempotent admission: reclaim a STALE handle ─────────────
@@ -1025,7 +1390,12 @@ impl CvmLifecycle {
         // over-budget launch returns here having allocated nothing.
         {
             let pools = self.pools.pools();
-            let pool = pools.launch_pool();
+            // The pool the VM's disks are on (by root: the record's id is
+            // informational) when it is declared; else the launch pool.
+            let pool = pools
+                .iter()
+                .find(|p| p.path == target.record.root)
+                .unwrap_or_else(|| pools.launch_pool());
             if !pool.is_default() {
                 // A new disk needs a pool that can take one (a VM whose
                 // disk is already there, on its bound filesystem, reuses
@@ -1054,8 +1424,7 @@ impl CvmLifecycle {
                 // reserve. (For legacy it equals `config.data_disk_size_gb`.)
                 disk_budget_gb,
                 &pools,
-                // Every OS disk lands on `default` in this phase.
-                pools.launch_pool(),
+                pool,
             )?;
             config.cid = self.cids.allocate(&vm_id)?;
             // A fresh launch supersedes any unverified re-adoption of this
@@ -1082,6 +1451,19 @@ impl CvmLifecycle {
                     guardian: guardian_route,
                 },
             );
+        }
+
+        // The pool record, durable BEFORE any disk is created: from here
+        // every caller (relaunch, backup, restore, §25, destroy) finds the
+        // disks where this launch puts them. (Not for the mock-libvirt
+        // tests that provision no disk: there is nothing to record.)
+        let record_pool = !self.skip_state_disk_provision;
+        if record_pool {
+            if let Err(err) = target.persist(&self.state_disk_root, &vm_id) {
+                self.unreserve_handle(&vm_id);
+                self.release_cid(&vm_id);
+                return Err(err);
+            }
         }
 
         // The guest-poweroff policy this order carries, persisted before
@@ -1127,7 +1509,21 @@ impl CvmLifecycle {
         // lifecycle integration tests (`tests/lifecycle_test.rs`)
         // which model libvirt behavior with a mock driver and have
         // no interest in mkfs side effects.
-        if !self.skip_state_disk_provision {
+        if !self.skip_state_disk_provision && target.ran() {
+            // A VM that ran creates NOTHING: its disks were required
+            // above, and are re-proven here, right before the domain, so
+            // one removed meanwhile is refused — never recreated blank by
+            // an `ensure_*` below. Its pool first: one unmounted meanwhile
+            // is retryable, not a missing disk.
+            if let Err(err) = self
+                .check_pool_mounted(&target.record)
+                .and_then(|()| check_relaunch_disks(&config, &target.record.pool_id))
+            {
+                self.unreserve_handle(&vm_id);
+                self.release_cid(&vm_id);
+                return Err(err);
+            }
+        } else if !self.skip_state_disk_provision {
             if let Err(err) = state_disk::ensure_state_disk(&self.state_disk_root, &vm_id) {
                 self.unreserve_handle(&vm_id);
                 self.release_cid(&vm_id);
@@ -1145,7 +1541,7 @@ impl CvmLifecycle {
                 //
                 // Off the async worker: the create waits on the host disk
                 // lock and lists the disk directories.
-                let (root, id) = (self.data_disk_root.clone(), vm_id.clone());
+                let (root, id) = (target.record.root.clone(), vm_id.clone());
                 let created = tokio::task::spawn_blocking(move || {
                     golden::ensure_overlay_disk(&root, &id, disk_budget_gb)
                 })
@@ -1162,7 +1558,7 @@ impl CvmLifecycle {
                 // (preserves a relaunched VM's data), fail-closed BEFORE any
                 // `virsh` call. Only when the order requested one.
                 let (root, id, gb) = (
-                    self.data_disk_root.clone(),
+                    target.record.root.clone(),
                     vm_id.clone(),
                     config.data_disk_size_gb,
                 );
@@ -1176,6 +1572,17 @@ impl CvmLifecycle {
                     self.release_cid(&vm_id);
                     return Err(err);
                 }
+            }
+        }
+
+        // The guest may use its disks from the moment the domain starts:
+        // from then on a missing disk is refused, never recreated blank.
+        // Recorded before the start, or the launch does not happen.
+        if record_pool {
+            if let Err(err) = target.mark_ran(&self.state_disk_root, &vm_id) {
+                self.unreserve_handle(&vm_id);
+                self.release_cid(&vm_id);
+                return Err(err);
             }
         }
 
@@ -1650,12 +2057,25 @@ impl CvmLifecycle {
         // "Nothing to reclaim ⇒ nothing to prove" restores the no-op by
         // CONSTRUCTION while keeping the liveness proof exactly where it
         // matters: on a host that really does hold this VM's disks.
-        let mut files: Vec<std::path::PathBuf> = vec![
-            self.golden_overlay_path(vm_id),
-            crate::orders::migration::restore_marker_path(&self.golden_overlay_path(vm_id)),
-            data_disk::data_disk_path(&self.data_disk_root, vm_id),
-            state_disk::state_disk_path(&self.state_disk_root, vm_id),
-        ];
+        //
+        // The VM's pool record says where its disks are; `default` is swept
+        // too (a VM older than the record, or a record that cannot be
+        // read: destroy reclaims what it can, it never refuses).
+        let record = vm_pool::read(&self.state_disk_root, vm_id);
+        let mut roots = vec![self.data_disk_root.clone()];
+        if let Ok(Some(rec)) = &record {
+            if rec.root != self.data_disk_root {
+                roots.push(rec.root.clone());
+            }
+        }
+        let mut files: Vec<std::path::PathBuf> =
+            vec![state_disk::state_disk_path(&self.state_disk_root, vm_id)];
+        for root in &roots {
+            let overlay = golden::overlay_disk_path(root, vm_id);
+            files.push(crate::orders::migration::restore_marker_path(&overlay));
+            files.push(overlay);
+            files.push(data_disk::data_disk_path(root, vm_id));
+        }
         // The same per-VM disks on every other storage pool: wherever a
         // disk of this VM sits, the reclaim finds it (none without
         // `[[storage.pools]]`).
@@ -1665,11 +2085,13 @@ impl CvmLifecycle {
         }
         // A staged restore's retained originals (`*.pre-restore-<id>`),
         // by the exact paths its persisted record names — never a glob.
-        files.extend(crate::backup::staged::retained_files(
-            &self.backup_dir(vm_id),
-            &self.golden_overlay_path(vm_id),
-            &self.state_disk_path(vm_id),
-        ));
+        for root in &roots {
+            files.extend(crate::backup::staged::retained_files(
+                &root.join("backup").join(vm_id.as_str()),
+                &golden::overlay_disk_path(root, vm_id),
+                &self.state_disk_path(vm_id),
+            ));
+        }
         if let Some(d) = &handle_disk {
             // The legacy boot disk, plus ITS §25 restore marker — only
             // derivable when we still hold the handle that names it.
@@ -1685,14 +2107,21 @@ impl CvmLifecycle {
         // in-flight marker, an interrupted run's leftovers, a chain
         // restore's pieces. Per-VM like staging, and derived from `vm_id`
         // alone the same way.
-        let backup = self.backup_dir(vm_id);
+        let backups: Vec<std::path::PathBuf> = roots
+            .iter()
+            .map(|root| root.join("backup").join(vm_id.as_str()))
+            .collect();
 
         // `symlink_metadata`, not `exists()`: a per-VM staging entry that
         // is a DANGLING symlink is still a footprint this destroy owns and
         // must unlink (`exists()` traverses, so it reads `false` and the
         // no-op bail below would strand it). #880's rule — stat before you
         // trust — applied to the entry itself rather than its target.
-        let mut anything = staging.symlink_metadata().is_ok() || backup.symlink_metadata().is_ok();
+        // A pool record left alone counts too: its pool may just be
+        // unmounted, and the reclaim below records that.
+        let mut anything = staging.symlink_metadata().is_ok()
+            || backups.iter().any(|b| b.symlink_metadata().is_ok())
+            || !matches!(record, Ok(None));
         for f in &files {
             if !f.as_os_str().is_empty() && f.exists() {
                 anything = true;
@@ -1857,16 +2286,33 @@ impl CvmLifecycle {
         // reading its already-unlinked target through its open fd; its
         // VM is gone either way. Best-effort, like staging: disk space,
         // not data death.
-        if let Err(e) = preflight::reclaim_staging_dir(&backup) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "hippius-miner-agent: destroy: backup work dir reclaim failed for \
-                     vm={} (disk space only)",
-                    vm_id.as_str()
-                );
+        for backup in &backups {
+            if let Err(e) = preflight::reclaim_staging_dir(backup) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "hippius-miner-agent: destroy: backup work dir reclaim failed for \
+                         vm={} (disk space only)",
+                        vm_id.as_str()
+                    );
+                }
             }
         }
+        // The pool record goes LAST: until here a retried destroy (or any
+        // other caller) still finds the disks through it.
+        self.forget_vm_pool(vm_id);
         Ok(())
+    }
+
+    /// Drop `vm_id`'s pool record (destroy). Logged, not returned: the
+    /// data death already happened, and a leftover record names a VM no
+    /// order will carry again.
+    fn forget_vm_pool(&self, vm_id: &VmId) {
+        if vm_pool::remove(&self.state_disk_root, vm_id).is_err() {
+            eprintln!(
+                "hippius-miner-agent: destroy: vm {} pool record not removed",
+                vm_id.as_str()
+            );
+        }
     }
 
     /// `virsh shutdown`-then-wait-then-`destroy` for a graceful stop,
@@ -2069,7 +2515,21 @@ impl CvmLifecycle {
         // Reconcile the sidecar against what libvirt actually runs.
         // The file is miner-local state and can be stale or edited;
         // the domain XML is the ground truth for the numbers.
+        let recorded_disk = handle.luks_disk_path.clone();
         let cid_verified = self.reconcile_handle_with_libvirt(&mut handle).await;
+        // The live disk path wins (above); persist it, so the snapshot
+        // and the pool record describe where the disks really are.
+        if handle.luks_disk_path != recorded_disk {
+            if let Err(err) = adopt::persist(&self.state_disk_root, &handle) {
+                eprintln!(
+                    "hippius-miner-agent: re-adopt: vm={vm_id_str} corrected snapshot not \
+                     persisted: {err}"
+                );
+            }
+        }
+        if !handle.is_infra() {
+            self.reconcile_vm_pool(&handle.vm_id, &handle.luks_disk_path);
+        }
 
         let cid = handle.cid;
         let is_infra = handle.is_infra();
@@ -2321,6 +2781,47 @@ impl CvmLifecycle {
         cid_verified
     }
 
+    /// Re-adopt: a running golden VM's pool record must name the pool its
+    /// overlay is actually on (`<root>/overlay/<vm>.img`, the domain's
+    /// vda). A missing or different record is corrected and persisted
+    /// (`ran`: the VM runs). A legacy VM's vda is not under a pool root;
+    /// it keeps its record.
+    fn reconcile_vm_pool(&self, vm_id: &VmId, writable_disk: &std::path::Path) {
+        let Some(root) = golden::overlay_root(writable_disk, vm_id) else {
+            return;
+        };
+        let current = vm_pool::read(&self.state_disk_root, vm_id);
+        if matches!(&current, Ok(Some(rec)) if rec.root == root && rec.ran) {
+            return;
+        }
+        let pool_id = {
+            let pools = self.pools.pools();
+            let declared = pools.iter().find(|p| p.path == root).map(|p| p.id.clone());
+            declared.unwrap_or_else(|| match &current {
+                Ok(Some(rec)) => rec.pool_id.clone(),
+                _ => crate::storage::pools::DEFAULT_POOL_ID.to_string(),
+            })
+        };
+        let record = vm_pool::VmPoolRecord {
+            pool_id,
+            root,
+            ran: true,
+        };
+        match vm_pool::write(&self.state_disk_root, vm_id, &record) {
+            Ok(()) => eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm_id} pool record set from the live \
+                 domain: {} ({}), was {current:?}",
+                record.pool_id,
+                record.root.display()
+            ),
+            Err(err) => eprintln!(
+                "hippius-miner-agent: re-adopt: vm={vm_id} pool record NOT corrected \
+                 ({err}); the live domain uses {}",
+                record.root.display()
+            ),
+        }
+    }
+
     /// Pass 2 — account for every live `hippius-tenant-*` domain that no
     /// sidecar covered.
     ///
@@ -2466,6 +2967,9 @@ impl CvmLifecycle {
                         guardian: guardian_route,
                     },
                 );
+            }
+            if let Some(disk) = &facts.writable_disk {
+                self.reconcile_vm_pool(&vm_id, disk);
             }
             eprintln!(
                 "hippius-miner-agent: re-adopt: ORPHAN vm={vm_id} cid={cid} \
@@ -2781,8 +3285,51 @@ impl CvmLifecycle {
     /// vali's re-place actually works (a dispatch-time rejection lands
     /// after KBS-register and can't be cleanly re-placed). `0` budget
     /// disables the check, exactly like `check_capacity`.
-    pub fn check_disk_budget(&self, add_disk_gb: u32) -> Result<()> {
-        self.check_pool_disk_budget(self.pools.pools().launch_pool(), add_disk_gb)
+    ///
+    /// On the pool the launch will use ([`Self::preflight_pool`]).
+    pub fn check_disk_budget(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        add_disk_gb: u32,
+    ) -> Result<()> {
+        self.check_recorded_pool_mounted(vm_id)?;
+        match self.preflight_pool(vm_id, os_pool)? {
+            Some(pool) => self.check_pool_disk_budget(&pool, add_disk_gb),
+            None => Ok(()),
+        }
+    }
+
+    /// Preflight of a VM that ran on a pool: that pool must be mounted
+    /// ([`Self::check_pool_mounted`]), or its missing disk would read as
+    /// room to find (and a pool refusal re-places a VM whose disks are
+    /// here).
+    fn check_recorded_pool_mounted(&self, vm_id: &VmId) -> Result<()> {
+        match vm_pool::read(&self.state_disk_root, vm_id) {
+            Ok(Some(record)) if record.ran => self.check_pool_mounted(&record),
+            Ok(_) => Ok(()),
+            Err(vm_pool::Unreadable) => Err(MinerAgentError::VmPoolRecord("unreadable")),
+        }
+    }
+
+    /// The pool `vm_id`'s launch will put its disk on: its recorded pool
+    /// when it has a record (a relaunch; `None` when that root is no
+    /// declared pool — the launch's own gates decide), else the order's
+    /// `os_pool` ([`crate::storage::StoragePools::os_pool`]).
+    pub fn preflight_pool(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+    ) -> Result<Option<crate::storage::pools::Pool>> {
+        let pools = self.pools.pools();
+        match vm_pool::read(&self.state_disk_root, vm_id) {
+            // Bound to its pool (it ran, or its disk is there): that pool.
+            Ok(Some(record)) if record.ran || self.root_holds_disk_of(&record.root, vm_id)? => {
+                Ok(pools.iter().find(|p| p.path == record.root).cloned())
+            }
+            Ok(_) => pools.os_pool(os_pool).map(|p| Some(p.clone())),
+            Err(vm_pool::Unreadable) => Err(MinerAgentError::VmPoolRecord("unreadable")),
+        }
     }
 
     /// [`Self::check_disk_budget`] on one storage pool: the disks of the
@@ -2816,8 +3363,17 @@ impl CvmLifecycle {
     /// relaunch) needs no new space and is never refused. `0` GiB, or a
     /// filesystem that can't be measured, never refuses here: the launch
     /// gate still runs, and fails closed.
-    pub fn check_disk_space(&self, vm_id: &VmId, add_disk_gb: u32) -> Result<()> {
-        self.check_pool_disk_space(self.pools.pools().launch_pool(), vm_id, add_disk_gb)
+    pub fn check_disk_space(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        add_disk_gb: u32,
+    ) -> Result<()> {
+        self.check_recorded_pool_mounted(vm_id)?;
+        match self.preflight_pool(vm_id, os_pool)? {
+            Some(pool) => self.check_pool_disk_space(&pool, vm_id, add_disk_gb),
+            None => Ok(()),
+        }
     }
 
     /// [`Self::check_disk_space`] on one storage pool's filesystem.
@@ -2870,18 +3426,21 @@ impl CvmLifecycle {
     /// cpu/mem grounds (the disk half is gated separately by
     /// [`Self::check_disk_budget`]; passing `0` here only re-affirms the
     /// already-admitted existing disk usage, never a new rejection).
-    pub fn check_cpu_mem_budget(&self, add_cpu: u8, add_memory_mb: u32) -> Result<()> {
+    ///
+    /// The disk half re-affirmed is that of the pool the launch will use
+    /// ([`Self::preflight_pool`], `default` when it is no declared pool).
+    pub fn check_cpu_mem_budget(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        add_cpu: u8,
+        add_memory_mb: u32,
+    ) -> Result<()> {
         let pools = self.pools.pools();
+        let pool = self.preflight_pool(vm_id, os_pool)?;
+        let pool = pool.as_ref().unwrap_or_else(|| pools.launch_pool());
         let handles = self.lock_handles()?;
-        check_capacity(
-            &handles,
-            self.host,
-            add_cpu,
-            add_memory_mb,
-            0,
-            &pools,
-            pools.launch_pool(),
-        )
+        check_capacity(&handles, self.host, add_cpu, add_memory_mb, 0, &pools, pool)
     }
 
     /// SEV-ES ASID fail-fast at PREFLIGHT (capacity v2 §2.3) — same
@@ -3684,21 +4243,62 @@ fn assert_infra_measurement_pin(
 /// (EIO, EACCES, a storage mount not up yet after a reboot) proves
 /// nothing either way, so it is its own RETRIABLE refusal — reading it as
 /// "missing" would make vali give up on a healthy VM.
-fn check_relaunch_disks(config: &QemuConfig) -> Result<()> {
-    require_disk(&config.state_disk_path, "state-disk")?;
+fn check_relaunch_disks(config: &QemuConfig, pool: &str) -> Result<()> {
+    require_disk(&config.state_disk_path, "state-disk", pool)?;
     if config.golden {
-        require_disk(&config.luks_disk_path, "overlay")?;
+        require_disk(&config.luks_disk_path, "overlay", pool)?;
     } else if let Some(data_disk) = &config.data_disk_path {
-        require_disk(data_disk, "data-disk")?;
+        require_disk(data_disk, "data-disk", pool)?;
     }
     Ok(())
 }
 
-fn require_disk(path: &std::path::Path, which: &'static str) -> Result<()> {
+fn require_disk(path: &std::path::Path, which: &'static str, pool: &str) -> Result<()> {
     match path.try_exists() {
         Ok(true) => Ok(()),
-        Ok(false) => Err(MinerAgentError::RelaunchDisksMissing(which)),
+        Ok(false) => Err(MinerAgentError::RelaunchDisksMissing(
+            which,
+            pool.to_string(),
+        )),
         Err(_) => Err(MinerAgentError::RelaunchDisksUnreadable(which)),
+    }
+}
+
+/// Where a launch puts (or finds) the VM's writable disks.
+#[derive(Debug)]
+struct LaunchTarget {
+    /// The record this launch runs under (`ran` as found or decided).
+    record: vm_pool::VmPoolRecord,
+    /// The record as it was on disk (`None`: none yet).
+    on_disk: Option<vm_pool::VmPoolRecord>,
+}
+
+impl LaunchTarget {
+    /// Whether a guest may have used this VM's disks.
+    fn ran(&self) -> bool {
+        self.record.ran
+    }
+
+    /// Write the record unless it is already on disk as is.
+    fn persist(&self, state_root: &std::path::Path, vm_id: &VmId) -> Result<()> {
+        if self.on_disk.as_ref() == Some(&self.record) {
+            return Ok(());
+        }
+        vm_pool::write(state_root, vm_id, &self.record)
+            .map_err(|_| MinerAgentError::VmPoolRecord("unwritable"))
+    }
+
+    /// Record `ran` (the domain is about to start).
+    fn mark_ran(&self, state_root: &std::path::Path, vm_id: &VmId) -> Result<()> {
+        if self.record.ran {
+            return Ok(());
+        }
+        let record = vm_pool::VmPoolRecord {
+            ran: true,
+            ..self.record.clone()
+        };
+        vm_pool::write(state_root, vm_id, &record)
+            .map_err(|_| MinerAgentError::VmPoolRecord("unwritable"))
     }
 }
 
@@ -4036,7 +4636,7 @@ mod tests {
         let lifecycle = reclaim_lifecycle(dir.path());
         let vm = VmId::new("tenant-reclaim").unwrap();
 
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         let state = lifecycle.state_disk_path(&vm);
         // The #365 legacy data disk — up to ~59 GB on an xlarge, the
         // single biggest per-VM file on the legacy path, and the one my
@@ -4339,7 +4939,7 @@ mod tests {
         .with_state_disk_root(dir.path().to_path_buf());
         let vm = VmId::new("tenant-unknown").unwrap();
 
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"POSSIBLY LIVE GUEST DATA").unwrap();
 
@@ -4383,7 +4983,7 @@ mod tests {
         )
         .with_state_disk_root(dir.path().to_path_buf());
 
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"LIVE GUEST DATA").unwrap();
 
@@ -4432,7 +5032,7 @@ mod tests {
         let vm = VmId::new("tenant-shutoff").unwrap();
         driver.seed_domain(tenant_domain(&vm), DomainState::ShutOff);
         let lifecycle = reclaim_lifecycle_with(driver.clone(), dir.path());
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"ciphertext").unwrap();
 
@@ -4525,7 +5125,7 @@ mod tests {
         inner.seed_domain(tenant_domain(&vm), DomainState::ShutOff);
         let lifecycle =
             reclaim_lifecycle_with(std::sync::Arc::new(UndefineFails(inner)), dir.path());
-        let overlay = lifecycle.golden_overlay_path(&vm);
+        let overlay = lifecycle.golden_overlay_path(&vm).unwrap();
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"ciphertext").unwrap();
 
@@ -4668,7 +5268,7 @@ mod tests {
             legacy.clone(),
             dir.path(),
         );
-        let overlay = lc.golden_overlay_path(&vm);
+        let overlay = lc.golden_overlay_path(&vm).unwrap();
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"ciphertext").unwrap();
 
@@ -4848,9 +5448,11 @@ mod tests {
             tenant_handle(&b, 40, "/elsewhere/staging/b/disk".into()),
         );
         drop(handles);
-        assert!(lc.check_disk_budget(10).is_ok());
+        assert!(lc
+            .check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 10)
+            .is_ok());
         assert!(matches!(
-            lc.check_disk_budget(11),
+            lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 11),
             Err(MinerAgentError::InsufficientDisk)
         ));
     }
@@ -4875,7 +5477,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // `default` (budget 0 = disabled) is not charged for hdd0's disk.
-        assert!(lc.check_disk_budget(1_000_000).is_ok());
+        assert!(lc
+            .check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 1_000_000)
+            .is_ok());
     }
 
     #[test]
@@ -4905,9 +5509,11 @@ mod tests {
             ),
         );
         drop(handles);
-        assert!(lc.check_disk_budget(40).is_ok());
+        assert!(lc
+            .check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 40)
+            .is_ok());
         assert!(matches!(
-            lc.check_disk_budget(41),
+            lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 41),
             Err(MinerAgentError::InsufficientDisk)
         ));
         // The launch reservation agrees with the preflight.
@@ -5074,6 +5680,288 @@ mod tests {
         }
     }
 
+    /// A4b: a FIRST launch goes to the order's `os_pool`; a VM that ran
+    /// stays on its recorded pool whatever the order names; an undeclared
+    /// pool is `pool-unavailable:<id>`, a malformed id a bad order.
+    #[test]
+    fn a_first_launch_takes_the_orders_pool_a_vm_that_ran_keeps_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("first-on-hdd0").unwrap();
+        let state = lc.state_disk_path(&vm);
+        let target = lc
+            .launch_target(&vm, false, &state, None, Some("hdd0"))
+            .unwrap();
+        assert_eq!(
+            (
+                target.record.pool_id.as_str(),
+                target.record.root.as_path(),
+                target.ran()
+            ),
+            ("hdd0", hdd.path(), false)
+        );
+        let target = lc.launch_target(&vm, false, &state, None, None).unwrap();
+        assert_eq!(target.record.pool_id, "default");
+
+        assert!(matches!(
+            lc.launch_target(&vm, false, &state, None, Some("nope")),
+            Err(MinerAgentError::PoolUnavailable("pool-unavailable:nope"))
+        ));
+        assert!(matches!(
+            lc.launch_target(&vm, false, &state, None, Some("../etc")),
+            Err(MinerAgentError::LaunchInput("os-pool"))
+        ));
+
+        // Its record says `default`: an order naming hdd0 changes nothing.
+        vm_pool::write(
+            dir.path(),
+            &vm,
+            &vm_pool::VmPoolRecord {
+                pool_id: "default".into(),
+                root: dir.path().to_path_buf(),
+                ran: true,
+            },
+        )
+        .unwrap();
+        let target = lc
+            .launch_target(&vm, false, &state, None, Some("hdd0"))
+            .unwrap();
+        assert_eq!(target.record.root, dir.path());
+
+        // A first launch that failed before its disk left a `ran: false`
+        // record on hdd0: nothing binds it there, the next order decides.
+        let retried = VmId::new("retried-first").unwrap();
+        let on_hdd0 = vm_pool::VmPoolRecord {
+            pool_id: "hdd0".into(),
+            root: hdd.path().to_path_buf(),
+            ran: false,
+        };
+        vm_pool::write(dir.path(), &retried, &on_hdd0).unwrap();
+        let state = lc.state_disk_path(&retried);
+        let target = lc
+            .launch_target(&retried, false, &state, None, None)
+            .unwrap();
+        assert_eq!(target.record.pool_id, "default");
+        assert_eq!(
+            lc.preflight_pool(&retried, None).unwrap().unwrap().id,
+            "default"
+        );
+        // Its disk IS on hdd0: it stays there.
+        let overlay = golden::overlay_disk_path(hdd.path(), &retried);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+        let target = lc
+            .launch_target(&retried, false, &state, None, None)
+            .unwrap();
+        assert_eq!(target.record.pool_id, "hdd0");
+        assert_eq!(
+            lc.preflight_pool(&retried, None).unwrap().unwrap().id,
+            "hdd0"
+        );
+
+        // A legacy VM stays on `default` (its disk is accounted there).
+        let legacy = VmId::new("legacy-first").unwrap();
+        let boot = dir.path().join("staging").join("legacy-first.qcow2");
+        assert!(matches!(
+            lc.launch_target(
+                &legacy,
+                false,
+                &lc.state_disk_path(&legacy),
+                Some(&boot),
+                Some("hdd0")
+            ),
+            Err(MinerAgentError::LaunchInput("os-pool-legacy"))
+        ));
+    }
+
+    /// A4b: an arriving VM without a record goes to the order's pool, only
+    /// if that pool can take a disk now; the preflight gates check the
+    /// pool the launch will use.
+    #[test]
+    fn an_arrival_and_the_preflight_follow_the_orders_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("arrives-on-hdd0").unwrap();
+        assert_eq!(
+            lc.place_arriving(&vm, Some("hdd0"), 10, false).unwrap(),
+            hdd.path()
+        );
+        let rec = vm_pool::read(dir.path(), &vm).unwrap().unwrap();
+        assert_eq!((rec.pool_id.as_str(), rec.ran), ("hdd0", true));
+        // Its record now decides, not the order.
+        assert_eq!(lc.preflight_pool(&vm, None).unwrap().unwrap().id, "hdd0");
+        let fresh = VmId::new("fresh").unwrap();
+        assert_eq!(
+            lc.preflight_pool(&fresh, Some("hdd0")).unwrap().unwrap().id,
+            "hdd0"
+        );
+        // hdd0's budget is 100 GiB: the preflight refuses on hdd0's.
+        assert!(lc.check_disk_budget(&fresh, Some("hdd0"), 100).is_ok());
+        assert!(matches!(
+            lc.check_disk_budget(&fresh, Some("hdd0"), 101),
+            Err(MinerAgentError::InsufficientPoolDisk(_))
+        ));
+
+        // Past the pool's budget (100 GiB): refused before any download.
+        let big = VmId::new("arrives-too-big").unwrap();
+        assert!(matches!(
+            lc.place_arriving(&big, Some("hdd0"), 101, false),
+            Err(MinerAgentError::InsufficientPoolDisk(_))
+        ));
+        assert_eq!(vm_pool::read(dir.path(), &big), Ok(None));
+
+        // A pool that cannot take a disk now (another filesystem mounted
+        // there) is never written to.
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /other {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        let other = VmId::new("arrives-on-unbound").unwrap();
+        assert!(matches!(
+            lc.place_arriving(&other, Some("hdd0"), 10, false),
+            Err(MinerAgentError::PoolUnavailable(_))
+        ));
+        assert_eq!(vm_pool::read(dir.path(), &other), Ok(None));
+    }
+
+    /// The launch itself (not only the check): a VM recorded on hdd0
+    /// whose pool is not mounted is `pool-not-mounted`, never
+    /// `relaunch-disks-missing`, and nothing is started or created.
+    #[tokio::test]
+    async fn a_launch_of_a_vm_on_a_pool_not_mounted_is_retryable() {
+        crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
+            cbitpos: 51,
+            reduced_phys_bits: 1,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("relaunch-on-hdd0").unwrap();
+        vm_pool::write(
+            dir.path(),
+            &vm,
+            &vm_pool::VmPoolRecord {
+                pool_id: "hdd0".into(),
+                root: hdd.path().to_path_buf(),
+                ran: true,
+            },
+        )
+        .unwrap();
+        std::fs::write(&mountinfo, "").unwrap();
+        let ticket = {
+            use ciborium::value::Value;
+            use coset::{iana, CborSerializable, CoseSign1Builder, HeaderBuilder};
+            let payload = Value::Map(vec![
+                (Value::Text("v".into()), Value::Integer(2.into())),
+                (Value::Text("flavor".into()), Value::Text("medium".into())),
+            ]);
+            let mut payload_buf = Vec::new();
+            ciborium::ser::into_writer(&payload, &mut payload_buf).unwrap();
+            CoseSign1Builder::new()
+                .protected(
+                    HeaderBuilder::new()
+                        .algorithm(iana::Algorithm::EdDSA)
+                        .build(),
+                )
+                .payload(payload_buf)
+                .create_signature(b"", |_| vec![0u8; 64])
+                .build()
+                .to_vec()
+                .unwrap()
+        };
+        let order = crate::orders::LaunchOrder {
+            vm_id: vm.clone(),
+            ovmf_path: "/var/lib/hippius-miner/ovmf.fd".into(),
+            kernel_path: "/var/lib/hippius-miner/vmlinuz".into(),
+            initrd_path: "/var/lib/hippius-miner/initrd".into(),
+            cmdline: format!("ro dm-verity.root={} hippius.disk_gb=10", "0".repeat(64)),
+            luks_disk_path: "/var/lib/hippius-miner/ignored.img".into(),
+            luks_disk_size_gb: 10,
+            data_disk_size_gb: 10,
+            rootfs_data_path: "/var/lib/hippius-miner/rootfs.img".into(),
+            rootfs_hash_path: "/var/lib/hippius-miner/rootfs.verity".into(),
+            cpu_count: 2,
+            memory_mb: 2048,
+            cose_ticket: serde_bytes::ByteBuf::from(ticket),
+            require_existing_disks: true,
+            guardian_ep: None,
+            net: None,
+            on_guest_poweroff: None,
+            os_pool: None,
+        };
+        let err = lc.launch(order).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MinerAgentError::RelaunchDisksUnreadable("pool-not-mounted")
+            ),
+            "got {err:?}"
+        );
+        assert!(!golden::overlay_disk_path(hdd.path(), &vm).exists());
+        assert!(lc.list_tenants().await.unwrap().is_empty());
+    }
+
+    /// After a host reboot, a pool's bind may come up after the agent: a
+    /// VM that ran on it is then `relaunch-disks-unreadable` (retryable),
+    /// never `relaunch-disks-missing`, and fine once the pool is back —
+    /// with no agent restart. Its preflight says the same.
+    #[test]
+    fn a_vm_on_a_pool_not_mounted_yet_is_unreadable_until_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("on-hdd0-at-boot").unwrap();
+        let record = vm_pool::VmPoolRecord {
+            pool_id: "hdd0".into(),
+            root: hdd.path().to_path_buf(),
+            ran: true,
+        };
+        vm_pool::write(dir.path(), &vm, &record).unwrap();
+        lc.check_pool_mounted(&record).unwrap();
+
+        // Not mounted (yet): nothing there proves the disk is gone.
+        std::fs::write(&mountinfo, "").unwrap();
+        assert!(matches!(
+            lc.check_pool_mounted(&record),
+            Err(MinerAgentError::RelaunchDisksUnreadable("pool-not-mounted"))
+        ));
+        assert!(matches!(
+            lc.check_disk_space(&vm, None, 10),
+            Err(MinerAgentError::RelaunchDisksUnreadable("pool-not-mounted"))
+        ));
+        assert!(matches!(
+            lc.check_disk_budget(&vm, None, 10),
+            Err(MinerAgentError::RelaunchDisksUnreadable("pool-not-mounted"))
+        ));
+
+        // The bind comes up: fine again, no restart.
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /hdd0 {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        lc.check_pool_mounted(&record).unwrap();
+        lc.check_disk_budget(&vm, None, 10).unwrap();
+
+        // A legacy arrival never lands off `default`.
+        let legacy = VmId::new("legacy-arrival").unwrap();
+        assert!(matches!(
+            lc.place_arriving(&legacy, Some("hdd0"), 10, true),
+            Err(MinerAgentError::LaunchInput("os-pool-legacy"))
+        ));
+        assert_eq!(vm_pool::read(dir.path(), &legacy), Ok(None));
+    }
+
     #[test]
     fn a_bound_active_pool_is_admitted_and_default_always_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -5091,7 +5979,8 @@ mod tests {
             |_| {},
         );
         lc.admit_pool(lc.storage_pools().default_pool()).unwrap();
-        lc.check_disk_budget(1).unwrap();
+        lc.check_disk_budget(&VmId::new("budget-probe").unwrap(), None, 1)
+            .unwrap();
     }
 
     #[test]

@@ -74,6 +74,18 @@ pub fn is_golden_cmdline(cmdline: &str) -> bool {
     cmdline_has_key(cmdline, CMDLINE_VERITY_ROOT) && !cmdline_has_key(cmdline, CMDLINE_LUKS_HEADER)
 }
 
+/// The pool root of a per-VM overlay path (`<root>/overlay/<vm>.img`, the
+/// inverse of [`overlay_disk_path`]); `None` for any other path.
+pub fn overlay_root(path: &Path, vm_id: &VmId) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    if path.file_name()? != std::ffi::OsStr::new(&format!("{vm_id}.img"))
+        || dir.file_name()? != OVERLAY_DIR_NAME
+    {
+        return None;
+    }
+    dir.parent().map(Path::to_path_buf)
+}
+
 /// Compute the on-host path for a tenant's overlay upper disk, without
 /// creating it. Used by config-rendering paths that need the path to
 /// interpolate into the libvirt XML (the golden `/dev/vda` source).

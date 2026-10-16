@@ -166,7 +166,7 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
         // does not hold the VM. Its own class (vali must stop relaunching
         // here and escalate, not retry), and a detail line naming WHICH
         // disk, because that is what an operator checks first.
-        MinerAgentError::RelaunchDisksMissing(_) => {
+        MinerAgentError::RelaunchDisksMissing(..) => {
             log_detail(format!(
                 "hippius-miner-agent: orders: relaunch-disks-missing-detail vm={vm_id} class={err}"
             ));
@@ -179,6 +179,20 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
                 "hippius-miner-agent: orders: relaunch-disks-unreadable-detail vm={vm_id} class={err}"
             ));
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "relaunch-disks-unreadable")
+        }
+        // The VM's pool record: absent for a VM that has run (an operator
+        // must restore it; never a blank disk on a guessed pool), or not
+        // readable/writable right now (retryable).
+        MinerAgentError::VmPoolRecord(which) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: vm-pool-record-detail vm={vm_id} class={err}"
+            ));
+            let status = if *which == "missing" {
+                StatusCode::PRECONDITION_FAILED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            OrderRejection::new(status, "vm-pool-record")
         }
         // The L1-minted OrderTicket could not be pushed to the guest
         // over vsock — a launch-blocking condition (the §21 boot
@@ -913,14 +927,15 @@ pub async fn handle_tenant_preflight(
     // can't be cleanly re-placed. The launch path still reserves under
     // the lock (the race-safe gate).
     let add_disk_gb = parse_disk_gb_token(order.cmdline.as_str());
-    if let Err(err) = lifecycle.check_disk_budget(add_disk_gb) {
+    let os_pool = order.os_pool.as_deref();
+    if let Err(err) = lifecycle.check_disk_budget(&order.vm_id, os_pool, add_disk_gb) {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
     // …and against the MEASURED free space (net of every existing disk's
     // unwritten sparse tail), so a host whose filesystem can't hold the
     // disk is refused here too — the declared budget may be 0 (disabled)
     // or simply wrong. Both answer 507 `insufficient-disk`.
-    if let Err(err) = lifecycle.check_disk_space(&order.vm_id, add_disk_gb) {
+    if let Err(err) = lifecycle.check_disk_space(&order.vm_id, os_pool, add_disk_gb) {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
     // CPU + memory capacity fail-fast — SAME pre-register rationale as the
@@ -935,7 +950,9 @@ pub async fn handle_tenant_preflight(
     let add_memory_mb = hippius_types::flavor::Flavor::from_vcpus(order.cpu_count)
         .map(|f| f.memory_mb())
         .unwrap_or(0);
-    if let Err(err) = lifecycle.check_cpu_mem_budget(order.cpu_count, add_memory_mb) {
+    if let Err(err) =
+        lifecycle.check_cpu_mem_budget(&order.vm_id, os_pool, order.cpu_count, add_memory_mb)
+    {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
     // P9/#16 — a preflight for a vm_id whose domain is ALREADY UP may only
@@ -1177,6 +1194,7 @@ mod tests {
             rootfs_hash: None,
             cmdline: "quiet".to_string(),
             cpu_count: 1,
+            os_pool: None,
         }
     }
 
@@ -1312,6 +1330,7 @@ mod tests {
             guardian_ep: None,
             net: None,
             on_guest_poweroff: None,
+            os_pool: None,
         }
     }
 
@@ -1624,7 +1643,7 @@ mod tests {
     /// (which vali reads as a SEV start failure) or `launch-input`.
     #[test]
     fn relaunch_disks_missing_has_its_own_class_and_detail_log() {
-        let err = MinerAgentError::RelaunchDisksMissing("overlay");
+        let err = MinerAgentError::RelaunchDisksMissing("overlay", "default".into());
         let (rej, line) = capture_detail(&err, "tenant-x");
         assert_eq!(rej.class, "relaunch-disks-missing");
         assert_eq!(rej.status, StatusCode::PRECONDITION_FAILED);
@@ -1632,9 +1651,27 @@ mod tests {
             line.as_deref(),
             Some(
                 "hippius-miner-agent: orders: relaunch-disks-missing-detail vm=tenant-x \
-                 class=relaunch-disks-missing/overlay"
+                 class=relaunch-disks-missing/overlay-missing:default"
             ),
         );
+    }
+
+    /// A VM that has run here but lost its pool record is a 412 an
+    /// operator must look at; an unreadable record is retryable. Neither
+    /// is `relaunch-disks-missing` (vali would give up on the VM's disks,
+    /// which are probably still here).
+    #[test]
+    fn a_vm_pool_record_refusal_has_its_own_class() {
+        for (which, status) in [
+            ("missing", StatusCode::PRECONDITION_FAILED),
+            ("unreadable", StatusCode::SERVICE_UNAVAILABLE),
+            ("unwritable", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (rej, line) = capture_detail(&MinerAgentError::VmPoolRecord(which), "tenant-x");
+            assert_eq!(rej.class, "vm-pool-record");
+            assert_eq!(rej.status, status);
+            assert!(line.is_some_and(|l| l.contains(&format!("vm-pool-record-{which}"))));
+        }
     }
 
     #[test]
