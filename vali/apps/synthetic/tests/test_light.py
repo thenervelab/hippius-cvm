@@ -503,6 +503,79 @@ def test_uptime_liveness_ignores_a_decommissioned_vm(settings) -> None:
     assert r.gauges["hippius_synthetic_uptime_stalled_vms"] == 0.0
 
 
+def _silent_vm(vm_id: str, *, signal_ago_s: int | None, boot_ago_s: int, **fields):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.lifecycle.models import Vm, VmState
+
+    now = timezone.now()
+    return Vm.objects.create(
+        vm_id=vm_id,
+        lease_id=f"lease-{vm_id}",
+        state=fields.pop("state", VmState.ACTIVE),
+        generation=1,
+        host=fields.pop("host", "node-src"),
+        lifecycle_vk=bytes(32),
+        boot_started_at=now - timedelta(seconds=boot_ago_s),
+        guest_signal_at=None if signal_ago_s is None else now - timedelta(seconds=signal_ago_s),
+        guest_signal_kind="" if signal_ago_s is None else "live_attestation",
+        **fields,
+    )
+
+
+@pytest.mark.django_db
+def test_silent_vms_flags_a_running_vm_whose_guest_went_quiet(settings) -> None:
+    """THE 2026-10-08 shape: signalled for half an hour after boot, then
+    nothing for eight days while vali kept it running."""
+    settings.VALI_SILENT_VM_ALERT_S = 21600
+    _silent_vm("ghost-1", signal_ago_s=8 * 86400, boot_ago_s=8 * 86400 + 1800)
+
+    r = checks.check_no_silent_vms()
+
+    assert not r.ok
+    assert "ghost-1" in r.detail
+    assert r.gauges["hippius_synthetic_silent_vms"] == 1.0
+
+
+@pytest.mark.django_db
+def test_silent_vms_counts_a_relaunch_that_never_signalled_from_its_boot(settings) -> None:
+    """Only the previous boot's signal: silent since the boot, not since
+    that signal."""
+    settings.VALI_SILENT_VM_ALERT_S = 21600
+    _silent_vm("relaunched-long-ago", signal_ago_s=90000, boot_ago_s=30000)
+    _silent_vm("relaunched-just-now", signal_ago_s=90000, boot_ago_s=600)
+
+    r = checks.check_no_silent_vms()
+
+    assert not r.ok
+    assert "relaunched-long-ago" in r.detail
+    assert "relaunched-just-now" not in r.detail
+    assert r.gauges["hippius_synthetic_silent_vms"] == 1.0
+
+
+@pytest.mark.django_db
+def test_silent_vms_passes_a_talking_or_young_or_stopped_vm(settings) -> None:
+    from apps.lifecycle.models import VmPowerState, VmState
+
+    settings.VALI_SILENT_VM_ALERT_S = 21600
+    _silent_vm("talking", signal_ago_s=30, boot_ago_s=10 * 86400)
+    _silent_vm("no-guest-agent", signal_ago_s=None, boot_ago_s=10 * 86400)
+    _silent_vm("stopped", signal_ago_s=86400, boot_ago_s=90000, power_state=VmPowerState.STOPPED)
+    _silent_vm("erased", signal_ago_s=86400, boot_ago_s=90000, state=VmState.DESTROYED)
+    _silent_vm("never-placed", signal_ago_s=86400, boot_ago_s=90000, host="")
+
+    r = checks.check_no_silent_vms()
+
+    assert r.ok, r.detail
+    assert r.gauges["hippius_synthetic_silent_vms"] == 0.0
+
+
+def test_silent_vms_is_registered_in_the_light_tier() -> None:
+    assert checks.check_no_silent_vms in checks.LIGHT_CHECKS
+
+
 def test_uptime_liveness_is_registered_in_the_light_tier() -> None:
     """CLAIM: the check actually RUNS. A check that exists but is not in
     the registry is decorative."""

@@ -539,10 +539,43 @@ fn config_parse_at(text: &str, e: &toml::de::Error) -> MinerAgentError {
 impl Config {
     /// Read + parse + validate the config at `path`.
     pub fn load(path: &Path) -> Result<Self> {
+        let mut config = Self::read(path)?;
+        config.drop_invalid_storage();
+        Ok(config)
+    }
+
+    /// [`Self::load`] keeping an invalid storage declaration as written
+    /// (`storage-check` reports it).
+    pub fn read(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(MinerAgentError::ConfigRead)?;
         let config: Config = toml::from_str(&text).map_err(|e| config_parse_at(&text, &e))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The first problem with `[[storage.pools]]` /
+    /// `[[storage.dedicated_disks]]`, if any.
+    pub fn storage_error(&self) -> Option<&'static str> {
+        match self.validate_storage() {
+            Err(MinerAgentError::ConfigInvalid(code)) => Some(code),
+            Err(_) => Some("storage-invalid"),
+            Ok(()) => None,
+        }
+    }
+
+    /// A storage declaration that does not validate never stops the
+    /// agent: it runs with the implicit `default` pool and no dedicated
+    /// disk, and says why (the removed-pool guard still keeps any pool
+    /// that holds disks, as `draining`). Returns the problem it dropped.
+    pub fn drop_invalid_storage(&mut self) -> Option<&'static str> {
+        let error = self.storage_error()?;
+        eprintln!(
+            "hippius-miner-agent: config: [[storage.*]] ignored ({error}); running with the \
+             implicit default pool"
+        );
+        self.storage.pools.clear();
+        self.storage.dedicated_disks.clear();
+        Some(error)
     }
 
     /// Reject a parsed-but-unusable config. All sub-classifiers are
@@ -618,7 +651,8 @@ impl Config {
                 "heartbeat.emit_pools-requires-schema_agent_version",
             ));
         }
-        self.validate_storage()?;
+        // `[[storage.*]]` is judged apart (`drop_invalid_storage`): a bad
+        // pool declaration must never keep the agent down.
 
         // `[kbs]` / `[lifecycle]` are optional. When present, the vsock
         // proxy forwards over the host's network to these HTTPS bases —
@@ -847,10 +881,33 @@ cvm_cpu_budget = 8
 cvm_memory_mb_budget = 16384
 "#;
 
+    /// The checks `load` runs, storage refusals included (as errors, so
+    /// the storage tests read them; `load` itself drops the section).
     fn parse(s: &str) -> Result<Config> {
         let c: Config = toml::from_str(s).map_err(|e| config_parse_at(s, &e))?;
         c.validate()?;
+        if let Some(code) = c.storage_error() {
+            return Err(MinerAgentError::ConfigInvalid(code));
+        }
         Ok(c)
+    }
+
+    #[test]
+    fn a_bad_storage_declaration_is_dropped_never_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A pool set without `default`.
+        std::fs::write(
+            &path,
+            format!(
+                "{VALID}\n[storage]\n[[storage.pools]]\nid = \"hdd0\"\npath = \"/srv/hdd0\"\n\
+                 class = \"hdd\"\nbudget_gb = 100\n"
+            ),
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!(c.storage.pools.is_empty());
+        assert!(c.storage.dedicated_disks.is_empty());
     }
 
     #[test]

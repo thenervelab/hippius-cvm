@@ -817,6 +817,11 @@ class LaunchJob(models.Model):
     - `reason`        operator-facing failure string on `failed`.
     - `miner_id` / `placement_id`
                       the elected miner + its `Placement` on success.
+    - `cancel_requested_at`
+                      a §24 asked for this vm_id before the launch created
+                      its `Vm` row (`fence_launch_for_decommission`). The
+                      worker then refuses to create the row
+                      (`launch._ensure_vm_row`), under the same row lock.
     - `phase_started_at` / `started_at` / `finished_at` / `decided_by`
                       / `version` — as the other job models.
 
@@ -856,6 +861,7 @@ class LaunchJob(models.Model):
     phase_started_at = models.DateTimeField()
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
     decided_by = models.ForeignKey(
         "identity.ServiceClient",
         on_delete=models.PROTECT,

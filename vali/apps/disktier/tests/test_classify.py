@@ -41,7 +41,7 @@ D1_TABLE = (
     ("seq_read_outer_mbps", True, 120),
     ("rr_iops", True, 200),
     ("qd1_p99_us", False, 60_000),
-    ("sustained_rw_iops", True, 100),
+    ("rw_sustained_iops", True, 100),
 )
 
 #: Clears nvme on every v1 axis with room to spare.
@@ -60,7 +60,7 @@ D1_GOOD = {
     "seq_read_outer_mbps": 250,
     "rr_iops": 450,
     "qd1_p99_us": 25_000,
-    "sustained_rw_iops": 300,
+    "rw_sustained_iops": 300,
     "surface_errors": 0,
     "qd1_p50_us": 4_000,
 }
@@ -201,7 +201,7 @@ def test_d1_good_disk_is_hdd_never_higher() -> None:
         seq_read_outer_mbps=3_000,
         rr_iops=500_000,
         qd1_p99_us=100,
-        sustained_rw_iops=200_000,
+        rw_sustained_iops=200_000,
         qd1_p50_us=60,
     )
     assert classify("d1", D1_GOOD).tier == HDD
@@ -267,7 +267,7 @@ def test_reported_metrics_are_accepted_and_not_graded() -> None:
     verdict = classify("v1", _v1(rw_p99_us=9_000_000, wipe_mbps=1))
     assert verdict.tier == NVME
     assert "rw_p99_us" not in verdict.per_metric
-    assert classify("d1", _d1(seq_read_middle_mbps=1, seq_write_mbps=1)).tier == HDD
+    assert classify("d1", _d1(seq_read_mid_mbps=1, seq_write_mbps=1)).tier == HDD
 
 
 def test_a_reported_metric_is_still_validated() -> None:

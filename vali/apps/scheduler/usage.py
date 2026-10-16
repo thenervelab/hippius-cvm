@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from django.conf import settings
 from django.db import transaction
 
+from apps.disktier import ingest as disktier_ingest
 from apps.telemetry import service as telemetry
 from apps.telemetry import verifier
 from apps.telemetry.models import (
@@ -196,6 +197,13 @@ def accrue_usage_once() -> AccrualReport:
             requeued += 1
             continue
 
+        # Passive disk evidence (design §3.5, P1): ONE call per verified
+        # receipt, before billing reads it. Never raises, no-op while
+        # `VALI_DISK_IO_INGEST` is off; deduped on the receipt body, so a
+        # re-queued envelope is not folded twice. Billing ignores it.
+        disktier_ingest.on_verified_receipt_safe(
+            fields, body=bytes(env.payload_cbor), source_id=env.source_id
+        )
         outcome = _accrue_one(fields, accrual_epoch, env.source_id)
         if outcome == _ACCRUED:
             accrued += 1
@@ -218,6 +226,9 @@ def accrue_usage_once() -> AccrualReport:
         skipped,
         requeued,
     )
+    disk = disktier_ingest.flush_counters_safe()
+    if set(disk) - {"skipped_flag_off"}:
+        log.info("usage-meter cycle: disk ingest %s", disk)
     return AccrualReport(
         drained=drained, accrued=accrued, skipped=skipped, requeued=requeued
     )

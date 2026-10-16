@@ -1,0 +1,84 @@
+{{- if eq (toString .Values.disktierEvaluate.enabled) "true" }}
+---
+# Passive disk-health evaluator (`vali_disktier_evaluate`,
+# docs/design/disk-tier-verification.md §3.5, phase P2). Hourly, RECORD
+# ONLY: grades the tenant receipts' disk I/O into per-pool / per-disk
+# hourly rows and "would re-probe" events, pushes its gauges. Never
+# changes a tier, a cordon, placement or rewards. DB-only + Pushgateway.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: disktier-evaluate
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: disktier-evaluate
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.disktierEvaluate.schedule | quote }}
+  # Suspended until the passive ingest is turned on (`suspend` in values).
+  suspend: {{ .Values.disktierEvaluate.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: disktier-evaluate
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: disktier-evaluate
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_disktier_evaluate"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+              resources:
+                {{- .Values.disktierEvaluate.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+{{- end }}

@@ -681,7 +681,7 @@ budget_gb = 3000                # = [host] cvm_disk_gb_budget
 
 [[storage.pools]]
 id = "hdd0"
-path = "/srv/hdd0/hippius"      # an already-mounted ext4/xfs/btrfs, root-owned, not on /
+path = "/var/lib/hippius-miner/pools/hdd0"   # = /var/lib/hippius-miner/pools/<id>: an ext4/xfs/btrfs mounted (or bind-mounted) there
 class = "hdd"
 budget_gb = 16000
 os_disks = false
@@ -718,6 +718,74 @@ The pushed document can't move `default` off `data_disk_root`, change its
 budget, or give a local pool another path. If you change one of those
 locally, the agent goes back to your local set and the dashboard shows the
 document as not applied.
+
+#### Where a pool lives, and checking it under the agent's sandbox
+
+The agent runs sandboxed (`PrivateDevices=yes`, `ProtectSystem=strict`).
+It sees no block device and can write only to its own paths. So every pool
+other than `default` lives at `/var/lib/hippius-miner/pools/<id>`, which is
+already writable to the agent. Mount the filesystem there, or bind-mount an
+existing mount (here an existing `/mnt/hippius-data` as pool `nvme0`):
+
+```sh
+sudo mkdir -p /var/lib/hippius-miner/pools/nvme0
+# keep it across reboots: one /etc/fstab line (added once; re-running
+# this does not duplicate it)
+line='/mnt/hippius-data  /var/lib/hippius-miner/pools/nvme0  none  bind,x-systemd.requires-mounts-for=/mnt/hippius-data  0 0'
+grep -qF "${line}" /etc/fstab || echo "${line}" | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo mount /var/lib/hippius-miner/pools/nvme0     # = mount --bind /mnt/hippius-data /var/lib/hippius-miner/pools/nvme0
+findmnt /var/lib/hippius-miner/pools/nvme0        # must show the bind
+```
+
+Declare the pool with `path = "/var/lib/hippius-miner/pools/nvme0"`.
+
+The root is fixed: `/var/lib/hippius-miner` is the agent's layout, and the
+play refuses another `miner_agent.state_dir` or a symlinked one. To put the
+state dir on another disk, mount that disk at `/var/lib/hippius-miner`.
+
+A pool declared anywhere else is refused with `pool-outside-pools-root`,
+except when it is `draining`: a pool being emptied keeps reporting
+`draining` wherever it sits. A path the agent cannot write to is refused
+with `pool-path-read-only`.
+
+A pool that was declared outside the root, before this rule existed, has
+one way out. You can't move a pool that holds disks (`pool-has-disks`),
+and any new declaration that keeps it active is refused. So:
+1. Declare it `draining`. Nothing new lands on it.
+2. Once it holds no disk (its VMs moved or destroyed), remove it from the
+   declaration.
+3. Declare it again at `/var/lib/hippius-miner/pools/<id>`.
+
+Dedicated disks are read by a separate oneshot,
+`hippius-miner-storage-collect`, which runs on a 5-minute timer, can read
+devices, and has no network. It writes `/run/hippius-miner/disk-facts.json`
+for the agent.
+
+To check a declaration without touching the running agent:
+
+```sh
+# Disk facts as the collector sees them (outside the sandbox):
+hippius-miner-agent storage-collect --out /tmp/disk-facts.json
+# The agent's view of a candidate config, under the agent's own sandbox:
+systemd-run --wait --pipe --collect \
+  -p ProtectSystem=strict -p ProtectHome=true -p PrivateTmp=true \
+  -p PrivateDevices=true -p NoNewPrivileges=true \
+  -p ProtectKernelTunables=true -p ProtectControlGroups=true \
+  -p ReadWritePaths=/var/lib/hippius-miner \
+  /usr/local/bin/hippius-miner-agent storage-check \
+  --config /root/candidate.toml --facts /tmp/disk-facts.json
+```
+
+The JSON shows each pool's state and error, its filesystem binding, and
+each dedicated disk.
+
+Storage never stops the agent:
+- a declaration that doesn't validate is ignored, the agent runs with the
+  implicit `default` pool, and the reason is logged;
+- a pool that fails its checks is reported `unavailable`;
+- a no-longer-declared pool that may still hold disks is kept as
+  `draining`.
 
 ### Disk capacity
 

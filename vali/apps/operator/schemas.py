@@ -515,6 +515,18 @@ class FleetMinerSerializer(serializers.Serializer):
     zombie = serializers.DictField(allow_null=True)
     usage = serializers.DictField(help_text="Current billing epoch usage + reward weight.")
     backups = serializers.DictField(allow_null=True, help_text="Backup runs over the last 24 h.")
+    disk_health = serializers.DictField(
+        allow_null=True,
+        required=False,
+        help_text=(
+            "Passive disk health, RECORD ONLY (never a gate): per pool and dedicated "
+            "disk, the latest graded hour of the last 48 h — `tier`, `verdict` "
+            "(`ok` / `suspect`, null = ungraded), `owners`, `vms`, `suspect_owners`, "
+            "median / p90 across owners of the QD>=4 read await (µs) — plus "
+            "`worst_verdict`, `latest_hour` and `last_would_reprobe_at` (24 h). "
+            "Aggregates only. Null when nothing was graded."
+        ),
+    )
     alerts = serializers.ListField(child=serializers.CharField())
 
 

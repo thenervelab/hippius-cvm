@@ -1,9 +1,13 @@
 //! Dedicated-disk inventory (docs/design/disk-tier-verification.md §4.2).
 //!
 //! Each `[[storage.dedicated_disks]]` entry names a whole physical disk by
-//! its `/dev/disk/by-id/` basename. The agent checks it READ-ONLY —
-//! `/sys/block`, `/proc/self/mountinfo`, `/proc/swaps` and `blkid -p` —
-//! and reports it in the `v7` heartbeat as `free`, `draining`,
+//! its `/dev/disk/by-id/` basename. It is checked READ-ONLY —
+//! `/sys/block`, `/proc/self/mountinfo`, `/proc/swaps` and `blkid -p` — by
+//! the collector ([`collect`], the `storage-collect` oneshot), which runs
+//! outside the agent's sandbox: the agent runs with `PrivateDevices=yes`
+//! and sees no `/dev/disk` and no block device. The agent judges the
+//! declared names from the collector's facts ([`inventory`]) and reports
+//! each in the `v7` heartbeat as `free`, `draining`,
 //! `unavailable` (with the refusal code), `failed` (gone after having been
 //! seen) or `replaced` (the by-id name now points at another device). The
 //! agent never formats, wipes, partitions or mounts a disk: an operator
@@ -349,23 +353,313 @@ fn swap_devices(swaps: &Path) -> BTreeSet<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Inspect every configured disk and build its report. `system_devs` are
-/// the `major:minor` of the filesystems the host itself needs (`/`, the
-/// state root, every pool). New identities are recorded in `identities`.
+/// What the collector found behind one `/dev/disk/by-id/` name
+/// ([`collect`]). Every check that needs a block device (the node's type
+/// and number, `blkid -p`) happens in the collector, which runs outside
+/// the agent's sandbox: the agent runs with `PrivateDevices=yes` and sees
+/// no `/dev/disk`, no block device.
+// No `deny_unknown_fields`: a newer collector may add a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskFact {
+    pub size_mb: u64,
+    /// The first refusal the collector's checks found, `""` when none.
+    /// `disk-is-system` and `disk-duplicate` are the agent's (it alone
+    /// knows its pools and its declared names).
+    pub error: String,
+    pub identity: Option<String>,
+    /// `major:minor`.
+    pub dev: Option<String>,
+    pub offline: bool,
+}
+
+/// The collector's report: every candidate disk by by-id name, and when
+/// it was read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskFacts {
+    pub collected_at_unix: u64,
+    pub disks: BTreeMap<String, DiskFact>,
+}
+
+/// Where the collector leaves its report, and the agent reads it.
+pub const DISK_FACTS_PATH: &str = "/run/hippius-miner/disk-facts.json";
+
+/// Older facts are not trusted (the collector's timer runs every 5 min).
+pub const DISK_FACTS_MAX_AGE_SECS: u64 = 15 * 60;
+
+/// Read the host's disks (collector side): every `/dev/disk/by-id/` name
+/// that could be a dedicated disk, checked with `paths` and `probe`.
+pub fn collect(paths: &SysPaths, probe: &dyn SignatureProbe, now_unix: u64) -> DiskFacts {
+    // One `blkid` per device, however many by-id aliases it has (wwn-,
+    // ata-, scsi-, nvme-eui…): each can take up to its timeout.
+    let probe = &OncePerDevice {
+        inner: probe,
+        seen: std::sync::Mutex::new(BTreeMap::new()),
+    };
+    let mounted = mounted_devs(&paths.mountinfo);
+    let swaps = swap_devices(&paths.swaps);
+    let mut disks = BTreeMap::new();
+    let names: Vec<String> = std::fs::read_dir(&paths.by_id)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| {
+                    hippius_types::storage_report::is_valid_dedicated_disk_id(n)
+                        && !is_partition_name(n)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in names {
+        let i = inspect(&name, paths, probe, &BTreeSet::new(), &mounted, &swaps);
+        if !i.found {
+            continue;
+        }
+        disks.insert(
+            name,
+            DiskFact {
+                size_mb: i.size_mb,
+                error: i.error.to_string(),
+                identity: i.identity,
+                dev: i.dev,
+                offline: i.offline,
+            },
+        );
+    }
+    DiskFacts {
+        collected_at_unix: now_unix,
+        disks,
+    }
+}
+
+/// `<name>-part<N>`: udev's link to a partition.
+fn is_partition_name(name: &str) -> bool {
+    name.rsplit_once("-part")
+        .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A probe answering once per device path.
+struct OncePerDevice<'a> {
+    inner: &'a dyn SignatureProbe,
+    seen: std::sync::Mutex<BTreeMap<PathBuf, Result<bool, ProbeFailed>>>,
+}
+
+impl SignatureProbe for OncePerDevice<'_> {
+    fn has_signature(&self, device: &Path) -> Result<bool, ProbeFailed> {
+        let mut seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *seen
+            .entry(device.to_path_buf())
+            .or_insert_with(|| self.inner.has_signature(device))
+    }
+}
+
+impl DiskFacts {
+    /// Write the report atomically (collector side).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let dir = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no parent"))?;
+        std::fs::create_dir_all(dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(&serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    /// The report at `path` (agent side), refused when missing,
+    /// unreadable or older than `max_age_secs` at `now_unix`.
+    pub fn load(path: &Path, now_unix: u64, max_age_secs: u64) -> Result<Self, &'static str> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("disk-facts-missing"),
+            Err(_) => return Err("disk-facts-unreadable"),
+        };
+        let facts: DiskFacts =
+            serde_json::from_slice(&bytes).map_err(|_| "disk-facts-unreadable")?;
+        if now_unix.saturating_sub(facts.collected_at_unix) > max_age_secs
+            || facts.collected_at_unix > now_unix.saturating_add(300)
+        {
+            return Err("disk-facts-stale");
+        }
+        Ok(facts)
+    }
+}
+
+/// Where the agent gets [`DiskFacts`].
+pub trait FactsSource: Send + Sync {
+    fn facts(&self) -> Result<DiskFacts, &'static str>;
+    /// Ask for a fresh collection now (the `storage-config` route, before
+    /// it judges declared disks). Best effort.
+    fn refresh(&self) {}
+}
+
+/// The collector's report file, refreshed by starting its unit.
+#[derive(Debug, Clone)]
+pub struct FileFacts {
+    pub path: PathBuf,
+    pub max_age_secs: u64,
+    /// The collector's systemd unit, started (and waited for) on refresh.
+    pub unit: Option<String>,
+}
+
+/// The collector's unit (`deploy/ansible/.../miner-agent-install.yml`).
+pub const COLLECTOR_UNIT: &str = "hippius-miner-storage-collect.service";
+
+impl Default for FileFacts {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from(DISK_FACTS_PATH),
+            max_age_secs: DISK_FACTS_MAX_AGE_SECS,
+            unit: Some(COLLECTOR_UNIT.to_string()),
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl FactsSource for FileFacts {
+    fn facts(&self) -> Result<DiskFacts, &'static str> {
+        DiskFacts::load(&self.path, now_unix(), self.max_age_secs)
+    }
+
+    fn refresh(&self) {
+        let Some(unit) = &self.unit else { return };
+        // `systemctl start` waits for a oneshot to finish; bounded.
+        let Ok(mut child) = std::process::Command::new("systemctl")
+            .args(["start", unit])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + REFRESH_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// How long a refresh may wait for the collector.
+/// Well under vali's 25 s order timeout; a slower collector finishes on
+/// its own and the next order or timer run reads it.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The agent's verdict for one declared name, from the collector's fact.
+fn from_fact(fact: Option<&DiskFact>, system_devs: &BTreeSet<String>) -> Inspection {
+    let Some(f) = fact else {
+        return Inspection {
+            size_mb: 0,
+            error: "disk-not-found",
+            identity: None,
+            dev: None,
+            found: false,
+            offline: false,
+        };
+    };
+    // The collector's codes, as `'static`; an unknown one (a newer
+    // collector) is unavailable.
+    let mut error = CODES
+        .iter()
+        .copied()
+        .find(|c| *c == f.error)
+        .unwrap_or("disk-unavailable");
+    // `disk-is-system` ranks before every later check (the order of
+    // [`inspect`]): the collector does not know the agent's pools.
+    if f.dev.as_ref().is_some_and(|d| system_devs.contains(d)) && AFTER_SYSTEM.contains(&error) {
+        error = "disk-is-system";
+    }
+    Inspection {
+        size_mb: f.size_mb,
+        error,
+        identity: f.identity.clone(),
+        dev: f.dev.clone(),
+        found: true,
+        offline: f.offline,
+    }
+}
+
+/// Every code [`inspect`] returns.
+const CODES: [&str; 14] = [
+    "",
+    "disk-not-found",
+    "disk-not-whole-device",
+    "disk-offline",
+    "disk-not-block-device",
+    "disk-sysfs-mismatch",
+    "disk-virtual",
+    "disk-has-partitions",
+    "disk-holder-busy",
+    "disk-in-use",
+    "disk-no-identity",
+    "disk-too-small",
+    "disk-has-signature",
+    "disk-probe-failed",
+];
+
+/// The checks [`inspect`] runs after `disk-is-system`.
+const AFTER_SYSTEM: [&str; 6] = [
+    "",
+    "disk-in-use",
+    "disk-no-identity",
+    "disk-too-small",
+    "disk-has-signature",
+    "disk-probe-failed",
+];
+
+/// Judge every declared disk from the collector's `facts` (agent side).
+/// `system_devs` are the `major:minor` of the filesystems the host itself
+/// needs (`/`, the state root, every pool). New identities are recorded in
+/// `identities`. Facts the agent cannot use (missing, stale) make every
+/// disk `unavailable` with that code: never `failed`, never forgotten.
 pub fn inventory(
     disks: &[DedicatedDiskConfig],
-    paths: &SysPaths,
-    probe: &dyn SignatureProbe,
+    facts: Result<&DiskFacts, &'static str>,
     system_devs: &BTreeSet<String>,
     identities: &mut IdentityMap,
 ) -> Vec<DedicatedDiskReport> {
-    let mounted = mounted_devs(&paths.mountinfo);
-    let swaps = swap_devices(&paths.swaps);
+    let facts = match facts {
+        Ok(f) => f,
+        Err(code) => {
+            let mut out: Vec<DedicatedDiskReport> = disks
+                .iter()
+                .map(|cfg| DedicatedDiskReport {
+                    id: cfg.id.clone(),
+                    size_mb: 0,
+                    state: DedicatedDiskState::Unavailable,
+                    vm: String::new(),
+                    error: code.to_string(),
+                })
+                .collect();
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            return out;
+        }
+    };
     let mut seen_devs: BTreeSet<String> = BTreeSet::new();
     let mut reports: Vec<DedicatedDiskReport> = disks
         .iter()
         .map(|cfg| {
-            let mut i = inspect(&cfg.id, paths, probe, system_devs, &mounted, &swaps);
+            let mut i = from_fact(facts.disks.get(&cfg.id), system_devs);
             if i.error.is_empty() {
                 if let Some(dev) = &i.dev {
                     if !seen_devs.insert(dev.clone()) {
@@ -405,6 +699,32 @@ pub fn inventory(
         .collect();
     reports.sort_by(|a, b| a.id.cmp(&b.id));
     reports
+}
+
+/// Facts read from the host directly, each time (`storage-check
+/// --collect`, tests): needs the devices the agent's sandbox hides.
+pub struct LiveFacts {
+    pub paths: SysPaths,
+    pub probe: Box<dyn SignatureProbe>,
+}
+
+impl FactsSource for LiveFacts {
+    fn facts(&self) -> Result<DiskFacts, &'static str> {
+        Ok(collect(&self.paths, self.probe.as_ref(), now_unix()))
+    }
+}
+
+/// [`collect`] then [`inventory`]: the host read directly (the collector,
+/// `storage-check --collect`, tests).
+pub fn inventory_live(
+    disks: &[DedicatedDiskConfig],
+    paths: &SysPaths,
+    probe: &dyn SignatureProbe,
+    system_devs: &BTreeSet<String>,
+    identities: &mut IdentityMap,
+) -> Vec<DedicatedDiskReport> {
+    let facts = collect(paths, probe, now_unix());
+    inventory(disks, Ok(&facts), system_devs, identities)
 }
 
 #[cfg(test)]
@@ -493,7 +813,7 @@ mod tests {
         probe: &Probe,
         ids: &mut IdentityMap,
     ) -> Vec<DedicatedDiskReport> {
-        inventory(disks, &host.paths(), probe, &BTreeSet::new(), ids)
+        inventory_live(disks, &host.paths(), probe, &BTreeSet::new(), ids)
     }
 
     fn one(host: &Host, id: &str, probe: &Probe) -> DedicatedDiskReport {
@@ -607,7 +927,7 @@ mod tests {
 
         std::fs::write(host.dir.path().join("swaps"), "Filename Type\n").unwrap();
         let system: BTreeSet<String> = ["8:16".to_string()].into();
-        let r = inventory(
+        let r = inventory_live(
             &[cfg("wwn-0x1")],
             &host.paths(),
             &CLEAN,
@@ -767,7 +1087,7 @@ mod tests {
         host.disk("wwn-0x1", "sdb", "8:16", 4 * TIB_SECTORS, "w1");
         let mut paths = host.paths();
         paths.require_block_device = true;
-        let r = inventory(
+        let r = inventory_live(
             &[cfg("wwn-0x1")],
             &paths,
             &CLEAN,
@@ -775,6 +1095,90 @@ mod tests {
             &mut IdentityMap::default(),
         );
         assert_unavailable(&r[0], "disk-not-block-device");
+    }
+
+    #[test]
+    fn the_agent_judges_from_the_collectors_facts_file() {
+        let host = Host::new();
+        host.disk("wwn-0x1", "sdb", "8:16", 4 * TIB_SECTORS, "w1");
+        // Partition and foreign names are not collected.
+        host.link("wwn-0x1-part1", "sdb");
+        host.link("usb-Generic_Flash", "sdb");
+        let facts = collect(&host.paths(), &CLEAN, 1_000);
+        assert_eq!(facts.disks.keys().collect::<Vec<_>>(), ["wwn-0x1"]);
+        let path = host.dir.path().join("facts.json");
+        facts.save(&path).unwrap();
+        let loaded = DiskFacts::load(&path, 1_100, DISK_FACTS_MAX_AGE_SECS).unwrap();
+        assert_eq!(loaded, facts);
+        let r = inventory(
+            &[cfg("wwn-0x1")],
+            Ok(&loaded),
+            &BTreeSet::new(),
+            &mut IdentityMap::default(),
+        );
+        assert_eq!(r[0].state, DedicatedDiskState::Free);
+        // The agent's own rule on top: a disk its pools sit on.
+        let system: BTreeSet<String> = ["8:16".to_string()].into();
+        let r = inventory(
+            &[cfg("wwn-0x1")],
+            Ok(&loaded),
+            &system,
+            &mut IdentityMap::default(),
+        );
+        assert_unavailable(&r[0], "disk-is-system");
+        // Stale, from the future, missing, garbage: every disk unavailable
+        // with the reason, a recorded one never `failed`.
+        assert_eq!(
+            DiskFacts::load(
+                &path,
+                1_000 + DISK_FACTS_MAX_AGE_SECS + 1,
+                DISK_FACTS_MAX_AGE_SECS
+            ),
+            Err("disk-facts-stale")
+        );
+        assert_eq!(
+            DiskFacts::load(&path, 1, DISK_FACTS_MAX_AGE_SECS),
+            Err("disk-facts-stale")
+        );
+        assert_eq!(
+            DiskFacts::load(&host.dir.path().join("none"), 1_000, 60),
+            Err("disk-facts-missing")
+        );
+        std::fs::write(&path, b"{").unwrap();
+        assert_eq!(
+            DiskFacts::load(&path, 1_000, 60),
+            Err("disk-facts-unreadable")
+        );
+        let mut ids = IdentityMap::default();
+        ids.disks.insert("wwn-0x1".into(), "w1".into());
+        let r = inventory(
+            &[cfg("wwn-0x1")],
+            Err("disk-facts-stale"),
+            &BTreeSet::new(),
+            &mut ids,
+        );
+        assert_unavailable(&r[0], "disk-facts-stale");
+    }
+
+    #[test]
+    fn a_device_with_several_names_is_probed_once() {
+        struct Count(std::sync::Mutex<u32>);
+        impl SignatureProbe for Count {
+            fn has_signature(&self, _device: &Path) -> Result<bool, ProbeFailed> {
+                *self.0.lock().unwrap() += 1;
+                Ok(false)
+            }
+        }
+        let host = Host::new();
+        host.disk("wwn-0x1", "sdb", "8:16", 4 * TIB_SECTORS, "w1");
+        host.link("ata-ST4000_Z1", "sdb");
+        host.link("scsi-0ATA_ST4000_Z1", "sdb");
+        let probe = Count(std::sync::Mutex::new(0));
+        let facts = collect(&host.paths(), &probe, 1);
+        assert_eq!(facts.disks.len(), 3);
+        assert_eq!(*probe.0.lock().unwrap(), 1);
+        assert!(is_partition_name("wwn-0x1-part2"));
+        assert!(!is_partition_name("wwn-0x1-partner"));
     }
 
     #[test]

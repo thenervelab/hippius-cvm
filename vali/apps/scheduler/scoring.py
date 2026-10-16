@@ -220,6 +220,13 @@ def _excluded_owners() -> frozenset[str]:
     # configuration in which we want to pay a miner for hosting our own
     # probes, so it is not removable via the list above.
     owners.add(str(getattr(settings, "VALI_SYNTHETIC_TENANT_ID", "") or "").strip())
+    # The disk-tier probe VMs are ours by construction too, under the same
+    # rule (`VALI_DISK_PROBE_OWNERS`: `Placement.owner` is the probe's
+    # backend-shaped user id). Lazy import: scoring must not couple to the
+    # disk-tier app at module load.
+    from apps.disktier.probe_owners import probe_user_ids
+
+    owners.update(probe_user_ids())
     # `Placement.owner` is blank for legacy/unknown rows; an empty entry
     # would exclude every one of them.
     return frozenset(owner for owner in owners if owner)

@@ -16,6 +16,7 @@
 //! - [`StorageReporter`] — the `v7` heartbeat's storage report, built from
 //!   all of it.
 
+pub mod check;
 pub mod dedicated;
 pub mod pools;
 pub mod reclaim;
@@ -64,8 +65,9 @@ pub struct StorageReporter {
     storage: Arc<state::StorageState>,
     state_root: PathBuf,
     pool_fs: Box<dyn pools::PoolFs + Send + Sync>,
-    sys: dedicated::SysPaths,
-    probe: Box<dyn dedicated::SignatureProbe>,
+    /// The dedicated-disk facts: the collector's report (the agent's
+    /// sandbox shows no block device).
+    facts: Box<dyn dedicated::FactsSource>,
     /// Loaded on first use; `None` inside = the file is corrupt, so no
     /// identity is recorded (and none forgotten) until an operator looks.
     /// Shared with the `storage-config` route.
@@ -78,14 +80,14 @@ fn gib_u32(bytes: u64) -> u32 {
 }
 
 impl StorageReporter {
-    /// The production reporter: the real filesystem, `/sys`, `blkid`.
+    /// The production reporter: the real filesystem and the collector's
+    /// disk facts.
     pub fn new(storage: Arc<state::StorageState>, state_root: PathBuf) -> Self {
         Self::with_host(
             storage,
             state_root,
             Box::new(pools::SystemPoolFs::default()),
-            dedicated::SysPaths::default(),
-            Box::new(dedicated::BlkidProbe),
+            Box::new(dedicated::FileFacts::default()),
         )
     }
 
@@ -94,15 +96,13 @@ impl StorageReporter {
         storage: Arc<state::StorageState>,
         state_root: PathBuf,
         pool_fs: Box<dyn pools::PoolFs + Send + Sync>,
-        sys: dedicated::SysPaths,
-        probe: Box<dyn dedicated::SignatureProbe>,
+        facts: Box<dyn dedicated::FactsSource>,
     ) -> Self {
         Self {
             storage,
             state_root,
             pool_fs,
-            sys,
-            probe,
+            facts,
             identities: Arc::default(),
         }
     }
@@ -124,7 +124,8 @@ impl StorageReporter {
             .bindings
             .errors_now(&set.pools, &registry::FsIdentitySource::default());
         let checks = pools::check_pools(&set.pools, self.pool_fs.as_ref(), &binding_errors);
-        set.pools
+        let mut reports = set
+            .pools
             .iter()
             .map(|pool| {
                 let check = checks.get(&pool.id).copied().unwrap_or(pools::PoolCheck {
@@ -164,7 +165,29 @@ impl StorageReporter {
                     error: check.error.to_string(),
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // At most the schema's pool count, `default` always among them:
+        // pools kept only because they may hold disks can exceed it, and a
+        // report the schema refuses would drop every pool and disk from
+        // the heartbeat.
+        // Declared pools first; those kept only because they may hold disks
+        // (no class) go first when it overflows.
+        if reports.len() > hippius_types::storage_report::MAX_DISK_POOLS {
+            let mut others: Vec<(bool, String)> = reports
+                .iter()
+                .filter(|p| p.id != DEFAULT_POOL_ID)
+                .map(|p| {
+                    (
+                        p.class == hippius_types::storage_report::PoolClass::Undeclared,
+                        p.id.clone(),
+                    )
+                })
+                .collect();
+            others.sort();
+            others.truncate(hippius_types::storage_report::MAX_DISK_POOLS - 1);
+            reports.retain(|p| p.id == DEFAULT_POOL_ID || others.iter().any(|(_, id)| *id == p.id));
+        }
+        reports
     }
 
     /// `major:minor` of the filesystems the host itself needs: `/`, the
@@ -188,8 +211,7 @@ impl StorageReporter {
                     let before = identities.clone();
                     let reports = dedicated::inventory(
                         &set.dedicated,
-                        &self.sys,
-                        self.probe.as_ref(),
+                        self.facts.facts().as_ref().map_err(|e| *e),
                         &self.system_devs(&set),
                         identities,
                     );
@@ -245,7 +267,7 @@ impl StorageReporter {
 
 /// `major:minor` of the filesystems the host itself needs: `/`, the
 /// state root and every pool. A dedicated disk carrying one is refused.
-pub(crate) fn system_devs(state_root: &std::path::Path, pools: &StoragePools) -> BTreeSet<String> {
+pub fn system_devs(state_root: &std::path::Path, pools: &StoragePools) -> BTreeSet<String> {
     let mut paths = vec![PathBuf::from("/"), state_root.to_path_buf()];
     paths.extend(pools.iter().map(|p| p.path.clone()));
     paths
@@ -363,14 +385,16 @@ mod tests {
             Box::new(Fs {
                 missing: vec![hdd.path().to_path_buf()],
             }),
-            dedicated::SysPaths {
-                by_id: h.join("by-id"),
-                sys_block: h.join("sys"),
-                mountinfo: h.join("mountinfo"),
-                swaps: h.join("swaps"),
-                require_block_device: false,
-            },
-            Box::new(Clean),
+            Box::new(dedicated::LiveFacts {
+                paths: dedicated::SysPaths {
+                    by_id: h.join("by-id"),
+                    sys_block: h.join("sys"),
+                    mountinfo: h.join("mountinfo"),
+                    swaps: h.join("swaps"),
+                    require_block_device: false,
+                },
+                probe: Box::new(Clean),
+            }),
         );
         let report = reporter.report();
         assert_eq!(report.validate(), Ok(()));
@@ -388,5 +412,41 @@ mod tests {
         // The accepted disk's identity is now on disk.
         let ids = dedicated::IdentityMap::load(root.path()).unwrap();
         assert_eq!(ids.disks["wwn-0x1"], "naa.1");
+    }
+
+    #[test]
+    fn more_pools_than_the_schema_takes_still_report_default_and_validate() {
+        let root = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let set = (*pools(root.path(), hdd.path()))
+            .clone()
+            .with_draining_paths(&[
+                ("a-old".to_string(), PathBuf::from("/srv/a")),
+                ("b-old".to_string(), PathBuf::from("/srv/b")),
+                ("c-old".to_string(), PathBuf::from("/srv/c")),
+            ]);
+        assert_eq!(set.iter().count(), 5);
+        let reporter = StorageReporter::with_host(
+            Arc::new(state::StorageState::with_pools(set)),
+            root.path().to_path_buf(),
+            Box::new(Fs {
+                missing: Vec::new(),
+            }),
+            Box::new(dedicated::LiveFacts {
+                paths: dedicated::SysPaths {
+                    by_id: root.path().join("none"),
+                    sys_block: root.path().join("none"),
+                    mountinfo: root.path().join("none"),
+                    swaps: root.path().join("none"),
+                    require_block_device: false,
+                },
+                probe: Box::new(Clean),
+            }),
+        );
+        let report = reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        let ids: Vec<_> = report.disk_pools.iter().map(|p| p.id.as_str()).collect();
+        // Declared `hdd0` stays visible; the kept ones fill what is left.
+        assert_eq!(ids, ["a-old", "b-old", "default", "hdd0"]);
     }
 }

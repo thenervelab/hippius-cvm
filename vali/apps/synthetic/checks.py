@@ -387,6 +387,64 @@ def check_uptime_liveness() -> CheckResult:
     )
 
 
+def check_no_silent_vms() -> CheckResult:
+    """No VM vali counts as running has been silent for hours.
+
+    On 2026-10-08 a VM launched after its owner had deleted it wedged, its
+    domain vanished from the miner, and vali kept it `active` / `running`
+    for eight days. Nothing vali hears from a VM says it is running except
+    the guest itself: once its in-guest signal (`Vm.guest_signal_at`, any
+    kind) is hours old, the row describes a VM that may not exist.
+
+    A VM counts as SILENT when it is `active`, `running` and bound to a
+    host, HAS signalled before, and its newest in-guest signal of the
+    CURRENT boot — or, none yet this boot, the boot itself — is older than
+    `VALI_SILENT_VM_ALERT_S` (default 6 h). Unlike `uptime_liveness` any
+    signal kind counts, served receipts included. A VM that never
+    signalled is not counted, for the reason `uptime_liveness` gives: an
+    image without the guest agent says nothing, legitimately, forever.
+
+    Alert only — vali does not tear the VM down. A silent guest may be a
+    relay outage, and a §24 is an erase: who owns the VM, and whether it
+    should run, is not something this check can know.
+    """
+    from apps.lifecycle import boot_stall
+    from apps.lifecycle.models import Vm, VmPowerState, VmState
+
+    bound_s = max(1, int(getattr(settings, "VALI_SILENT_VM_ALERT_S", 21600)))
+    now = timezone.now()
+    silent: list[tuple[str, int]] = []
+    for vm in (
+        Vm.objects.filter(
+            state=VmState.ACTIVE,
+            power_state=VmPowerState.RUNNING,
+            guest_signal_at__isnull=False,
+        )
+        .exclude(host="")
+        .only("vm_id", "guest_signal_at", "boot_started_at", "created_at")
+    ):
+        boot = boot_stall.boot_clock_start(vm)
+        last = vm.guest_signal_at if boot is None else max(vm.guest_signal_at, boot)
+        age = int((now - last).total_seconds())
+        if age > bound_s:
+            silent.append((vm.vm_id, age))
+    silent.sort(key=lambda row: -row[1])
+    gauges = {"hippius_synthetic_silent_vms": float(len(silent))}
+    if not silent:
+        return CheckResult(
+            "silent_vms", True, f"no running VM silent for more than {bound_s}s", gauges
+        )
+    named = ", ".join(f"{vm_id}(silent={age}s)" for vm_id, age in silent[:5])
+    more = "" if len(silent) <= 5 else f" (+{len(silent) - 5} more)"
+    return CheckResult(
+        "silent_vms",
+        False,
+        f"{len(silent)} VM(s) recorded running whose guest has said nothing for more "
+        f"than {bound_s}s — check the miner still runs the domain: {named}{more}",
+        gauges,
+    )
+
+
 # ── KBS running-config drift (the ConfigMap is not the config) ───────
 #
 # Three verdicts, deliberately three and not two. See
@@ -848,6 +906,7 @@ LIGHT_CHECKS = (
     check_epoch_close_advancing,
     check_no_unapplied_migrations,
     check_uptime_liveness,
+    check_no_silent_vms,
     check_kbs_config_drift,
     check_no_zombie_vms,
     check_live_vms_placed,

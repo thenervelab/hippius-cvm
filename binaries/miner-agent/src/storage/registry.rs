@@ -67,6 +67,12 @@ pub fn registry_path(state_root: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct FsIdentitySource {
     pub mountinfo: PathBuf,
+    /// udev's database (`ID_FS_UUID` per block device): readable inside
+    /// the agent's sandbox, which has no `/dev/disk`.
+    pub udev_data: PathBuf,
+    /// `<name>/dev` = `major:minor` of a block device by kernel name.
+    pub sys_class_block: PathBuf,
+    /// `/dev/disk/by-uuid` (only outside the sandbox).
     pub by_uuid: PathBuf,
 }
 
@@ -74,6 +80,8 @@ impl Default for FsIdentitySource {
     fn default() -> Self {
         Self {
             mountinfo: PathBuf::from("/proc/self/mountinfo"),
+            udev_data: PathBuf::from("/run/udev/data"),
+            sys_class_block: PathBuf::from("/sys/class/block"),
             by_uuid: PathBuf::from("/dev/disk/by-uuid"),
         }
     }
@@ -92,14 +100,66 @@ pub fn fs_identity(src: &FsIdentitySource, path: &Path) -> Option<String> {
     let dev = std::fs::metadata(path).ok()?.dev();
     let text = std::fs::read_to_string(&src.mountinfo).ok()?;
     // The last mount on `path` is the one visible there.
-    let (_, root, source) = super::pools::parse_mountinfo_sources(&text)
+    let mount = super::pools::parse_mountinfo_sources(&text)
         .into_iter()
         .rev()
-        .find(|(mount_point, _, _)| mount_point == path)?;
-    Some(match uuid_of(src, &source) {
-        Some(uuid) => format!("uuid:{uuid}:{root}"),
-        None => format!("dev:{dev}:{root}"),
+        .find(|m| m.mount_point == path)?;
+    let root = &mount.root;
+    Some(
+        match udev_uuid(src, &mount).or_else(|| uuid_of(src, &mount.source)) {
+            Some(uuid) => format!("uuid:{uuid}:{root}"),
+            None => format!("dev:{dev}:{root}"),
+        },
+    )
+}
+
+/// The filesystem UUID udev recorded for the mount's device: by the
+/// mount's `major:minor`, else (btrfs reports an anonymous device there)
+/// by the source's kernel name. No device is opened.
+fn udev_uuid(src: &FsIdentitySource, mount: &super::pools::MountEntry) -> Option<String> {
+    let by_dev = |majmin: &str| -> Option<String> {
+        let db = std::fs::read_to_string(src.udev_data.join(format!("b{majmin}"))).ok()?;
+        db.lines()
+            .find_map(|l| l.strip_prefix("E:ID_FS_UUID="))
+            .map(str::to_string)
+            .filter(|u| !u.is_empty() && u.bytes().all(|b| b.is_ascii_graphic()))
+    };
+    by_dev(&mount.dev).or_else(|| {
+        let name = Path::new(&mount.source).file_name()?.to_str()?;
+        let majmin = std::fs::read_to_string(src.sys_class_block.join(name).join("dev")).ok()?;
+        by_dev(majmin.trim())
     })
+}
+
+/// Whether the filesystem identified `now` at `path` is the one
+/// `recorded`. A `dev:<st_dev>:<root>` record (written where no UUID was
+/// readable, e.g. by an agent whose sandbox hid `/dev/disk/by-uuid`)
+/// matches a UUID identity of the same device and root: the record is
+/// upgraded rather than the pool flagged.
+fn same_fs(recorded: &str, now: Option<&str>, path: &Path) -> bool {
+    let Some(now) = now else { return false };
+    if now == recorded {
+        return true;
+    }
+    let Some(rest) = recorded.strip_prefix("dev:") else {
+        return false;
+    };
+    let (dev, root) = match rest.split_once(':') {
+        Some((dev, root)) => (dev, Some(root)),
+        None => (rest, None),
+    };
+    let now_root = now
+        .strip_prefix("uuid:")
+        .or_else(|| now.strip_prefix("dev:"))
+        .and_then(|r| r.split_once(':'))
+        .map(|(_, root)| root);
+    let same_root = match (root, now_root) {
+        (Some(a), Some(b)) => a == b,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    same_root
+        && std::fs::metadata(path).is_ok_and(|m| dev.parse::<u64>().is_ok_and(|d| d == m.dev()))
 }
 
 /// What a pool is recorded against: [`fs_identity`], except that
@@ -151,7 +211,7 @@ impl PoolBindings {
             .filter_map(|pool| {
                 let now = fs_identity(src, &pool.path)?;
                 let error = match self.recorded.get(&pool.id) {
-                    Some(recorded) if *recorded == now => return None,
+                    Some(recorded) if same_fs(recorded, Some(&now), &pool.path) => return None,
                     Some(_) => "pool-fs-changed",
                     None => "pool-unbound",
                 };
@@ -170,7 +230,7 @@ impl PoolBindings {
     pub fn is_bound(&self, id: &str, path: &Path, src: &FsIdentitySource) -> bool {
         self.recorded
             .get(id)
-            .is_some_and(|recorded| fs_identity(src, path).as_deref() == Some(recorded.as_str()))
+            .is_some_and(|recorded| same_fs(recorded, fs_identity(src, path).as_deref(), path))
     }
 }
 
@@ -194,6 +254,83 @@ pub fn enforce_with(
     let plan = plan_with(state_root, pools, src)?;
     plan.commit()?;
     Ok(plan.bindings)
+}
+
+/// [`enforce`] at startup, which never fails: the agent must not
+/// crash-loop over its storage. A remembered pool dropped from the set
+/// while it may still hold disks is put back, `draining` (its disks stay
+/// accounted and reclaimable, nothing new lands there), and logged. A
+/// record that cannot be read is left as it is for an operator, and the
+/// agent runs with no binding (non-default pools report `pool-unbound`).
+pub fn boot_enforce(
+    state_root: &Path,
+    pools: StoragePools,
+    src: &FsIdentitySource,
+) -> (StoragePools, PoolBindings) {
+    let removed = match removed_unproven(state_root, &pools, src) {
+        Ok(removed) => removed,
+        Err(()) => {
+            eprintln!(
+                "hippius-miner-agent: storage: {REGISTRY_FILE} unreadable; running without pool \
+                 bindings until it is fixed"
+            );
+            return (pools, PoolBindings::default());
+        }
+    };
+    let pools = if removed.is_empty() {
+        pools
+    } else {
+        for (id, _) in &removed {
+            eprintln!(
+                "hippius-miner-agent: storage: pool {id:?} is no longer declared but may still \
+                 hold VM disks; kept as draining"
+            );
+        }
+        pools.with_draining_paths(&removed)
+    };
+    match enforce_with(state_root, &pools, src) {
+        Ok(bindings) => (pools, bindings),
+        Err(_) => {
+            eprintln!(
+                "hippius-miner-agent: storage: {REGISTRY_FILE} not updated; running without pool \
+                 bindings"
+            );
+            (pools, PoolBindings::default())
+        }
+    }
+}
+
+/// The remembered pools absent (or moved) from `pools` that cannot be
+/// proven empty: the ones [`plan_with`] refuses. `Err` when the record
+/// cannot be read.
+pub(crate) fn removed_unproven(
+    state_root: &Path,
+    pools: &StoragePools,
+    src: &FsIdentitySource,
+) -> std::result::Result<Vec<(String, PathBuf)>, ()> {
+    let previous: Registry = match std::fs::read(registry_path(state_root)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| ())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(()),
+    };
+    Ok(previous
+        .pools
+        .iter()
+        .filter(|(id, old)| {
+            let kept = pools.get(id).is_some_and(|p| p.path == old.path);
+            !kept
+                && (!old.path.is_dir()
+                    || !same_fs(
+                        &old.fs,
+                        identity_of(src, id, &old.path).as_deref(),
+                        &old.path,
+                    )
+                    || holds_vm_disks(&old.path) != Some(false))
+        })
+        // Never a second pool at an already declared path or id.
+        .filter(|(id, old)| pools.get(id).is_none() && !pools.iter().any(|p| p.path == old.path))
+        .map(|(id, old)| (id.clone(), old.path.clone()))
+        .collect())
 }
 
 /// [`enforce_with`]'s verdict and the record it would write, not yet
@@ -248,7 +385,7 @@ pub fn plan_with(
                     // Unmounted / gone right now: the pool check reports it;
                     // remember it as it was.
                     keep_old.insert(id.clone(), old.clone());
-                } else if !is_default && now_fs.as_deref() != Some(old.fs.as_str()) {
+                } else if !is_default && !same_fs(&old.fs, now_fs.as_deref(), &old.path) {
                     // Empty or not, the new filesystem cannot vouch for the
                     // old one's disks.
                     eprintln!(
@@ -261,7 +398,7 @@ pub fn plan_with(
                 continue;
             }
             if !old.path.is_dir()
-                || now_fs.as_deref() != Some(old.fs.as_str())
+                || !same_fs(&old.fs, now_fs.as_deref(), &old.path)
                 || holds_vm_disks(&old.path) != Some(false)
             {
                 eprintln!(
@@ -383,6 +520,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let src = FsIdentitySource {
                 mountinfo: dir.path().join("mountinfo"),
+                udev_data: dir.path().join("udev"),
+                sys_class_block: dir.path().join("class-block"),
                 by_uuid: dir.path().join("by-uuid"),
             };
             let m = Self { dir, src };
@@ -518,6 +657,40 @@ mod tests {
     }
 
     #[test]
+    fn at_startup_a_removed_pool_with_disks_is_kept_draining_never_fatal() {
+        let state = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let m = Mounts::new(&[hdd.path()]);
+        enforce_on(
+            state.path(),
+            &pools(state.path(), &[("hdd0", hdd.path())]),
+            &m,
+        )
+        .unwrap();
+        put_disk(hdd.path());
+        let (set, _) = boot_enforce(state.path(), pools(state.path(), &[]), &m.src);
+        let hdd0 = set.get("hdd0").unwrap();
+        assert!(hdd0.draining && !hdd0.os_disks);
+        assert_eq!(hdd0.path, hdd.path());
+        // …recorded as kept, so the next start agrees.
+        let (again, _) = boot_enforce(state.path(), pools(state.path(), &[]), &m.src);
+        assert!(again.get("hdd0").is_some());
+        // Emptied: it goes.
+        std::fs::remove_file(hdd.path().join("overlay/vm-1.img")).unwrap();
+        let (gone, _) = boot_enforce(state.path(), pools(state.path(), &[]), &m.src);
+        assert!(gone.get("hdd0").is_none());
+        // A corrupt record: the agent still starts, unbound.
+        std::fs::write(registry_path(state.path()), b"{not json").unwrap();
+        let (set, bindings) = boot_enforce(
+            state.path(),
+            pools(state.path(), &[("hdd0", hdd.path())]),
+            &m.src,
+        );
+        assert!(set.get("hdd0").is_some());
+        assert!(bindings.recorded("hdd0").is_none());
+    }
+
+    #[test]
     fn a_corrupt_registry_refuses_to_start() {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(registry_path(state.path()), b"{not json").unwrap();
@@ -641,6 +814,94 @@ mod tests {
     }
 
     #[test]
+    fn a_dev_record_from_a_sandboxed_agent_is_upgraded_not_flagged() {
+        let state = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let m = Mounts::new(&[hdd.path()]);
+        let set = pools(state.path(), &[("hdd0", hdd.path())]);
+        enforce_on(state.path(), &set, &m).unwrap();
+        // What the old agent recorded: the device number.
+        let dev = std::fs::metadata(hdd.path()).unwrap().dev();
+        let mut reg = read(state.path());
+        reg.pools.get_mut("hdd0").unwrap().fs = format!("dev:{dev}:/");
+        write(state.path(), &reg);
+        // Now udev knows the filesystem's UUID.
+        std::fs::create_dir_all(m.dir.path().join("udev")).unwrap();
+        std::fs::write(m.dir.path().join("udev/b8:17"), "E:ID_FS_UUID=abcd\n").unwrap();
+        let bindings = enforce_on(state.path(), &set, &m).unwrap();
+        assert!(flagged(&bindings, &set, &m).is_empty());
+        assert_eq!(read(state.path()).pools["hdd0"].fs, "uuid:abcd:/");
+        // Another device under a `dev:` record is still another filesystem.
+        reg.pools.get_mut("hdd0").unwrap().fs = format!("dev:{}:/", dev ^ 1);
+        write(state.path(), &reg);
+        let bindings = enforce_on(state.path(), &set, &m).unwrap();
+        assert_eq!(
+            flagged(&bindings, &set, &m),
+            [("hdd0".to_string(), "pool-fs-changed")]
+        );
+    }
+
+    #[test]
+    fn inside_the_sandbox_the_uuid_comes_from_udev_not_dev() {
+        // The agent's `PrivateDevices=yes` hides `/dev/disk` and every
+        // block device; udev's database and sysfs stay readable.
+        let host = tempfile::tempdir().unwrap();
+        let pool = tempfile::tempdir().unwrap();
+        let h = host.path();
+        std::fs::create_dir_all(h.join("udev")).unwrap();
+        std::fs::write(
+            h.join("udev/b9:127"),
+            "S:disk/by-uuid/5a6b\nE:ID_FS_TYPE=ext4\nE:ID_FS_UUID=5a6b-7c8d\n",
+        )
+        .unwrap();
+        let src = FsIdentitySource {
+            mountinfo: h.join("mountinfo"),
+            udev_data: h.join("udev"),
+            sys_class_block: h.join("class-block"),
+            by_uuid: h.join("no-by-uuid"),
+        };
+        std::fs::write(
+            h.join("mountinfo"),
+            format!(
+                "36 1 9:127 / {} rw - ext4 /dev/md127 rw\n",
+                pool.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            fs_identity(&src, pool.path()).as_deref(),
+            Some("uuid:5a6b-7c8d:/")
+        );
+        // btrfs: an anonymous device in mountinfo, the source's kernel
+        // name leads to its device number.
+        std::fs::create_dir_all(h.join("class-block/sdc1")).unwrap();
+        std::fs::write(h.join("class-block/sdc1/dev"), "8:33\n").unwrap();
+        std::fs::write(h.join("udev/b8:33"), "E:ID_FS_UUID=b7f5\n").unwrap();
+        std::fs::write(
+            h.join("mountinfo"),
+            format!(
+                "36 1 0:45 /@data {} rw - btrfs /dev/sdc1 rw\n",
+                pool.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            fs_identity(&src, pool.path()).as_deref(),
+            Some("uuid:b7f5:/@data")
+        );
+        // No udev record: the device number.
+        std::fs::write(
+            h.join("mountinfo"),
+            format!(
+                "36 1 0:46 / {} rw - xfs /dev/sdd1 rw\n",
+                pool.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(fs_identity(&src, pool.path()).unwrap().starts_with("dev:"));
+    }
+
+    #[test]
     fn a_mounted_pool_is_identified_by_its_filesystem_uuid() {
         let host = tempfile::tempdir().unwrap();
         let pool = tempfile::tempdir().unwrap();
@@ -658,6 +919,8 @@ mod tests {
         std::fs::write(h.join("mountinfo"), mountinfo).unwrap();
         let src = FsIdentitySource {
             mountinfo: h.join("mountinfo"),
+            udev_data: h.join("udev"),
+            sys_class_block: h.join("class-block"),
             by_uuid: h.join("by-uuid"),
         };
         assert_eq!(

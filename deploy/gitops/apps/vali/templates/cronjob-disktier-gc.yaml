@@ -1,0 +1,83 @@
+{{- if eq (toString .Values.disktierGc.enabled) "true" }}
+---
+# Retention of the passive disk tables (`vali_disktier_gc`,
+# docs/design/disk-tier-verification.md §4.3): hourly I/O rows 30 d,
+# rollups and events 180 d, receipt dedupe rows once too old to replay.
+# Bounded batches. DB-only.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: disktier-gc
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/component: disktier-gc
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.disktierGc.schedule | quote }}
+  # Suspended until the passive ingest is turned on (`suspend` in values).
+  suspend: {{ .Values.disktierGc.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            {{- include "vali.labels" . | nindent 12 }}
+            app.kubernetes.io/component: disktier-gc
+            {{- include "vali.valiSelector" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            node-role.hippius.network/general-workloads: "true"
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: {{ .Values.image.pullSecret.name }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: disktier-gc
+              image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+              imagePullPolicy: IfNotPresent
+              command: ["python", "manage.py", "vali_disktier_gc"]
+              envFrom:
+                - configMapRef:
+                    name: vali-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-db
+                      key: database-url
+                - name: DJANGO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vali-django
+                      key: secret-key
+              resources:
+                {{- .Values.disktierGc.resources | toYaml | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 50Mi
+{{- end }}

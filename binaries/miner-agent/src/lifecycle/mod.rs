@@ -5042,6 +5042,8 @@ mod tests {
         .unwrap();
         let src = crate::storage::registry::FsIdentitySource {
             mountinfo: mountinfo.clone(),
+            udev_data: dir.join("no-udev"),
+            sys_class_block: dir.join("no-class-block"),
             by_uuid: dir.join("no-by-uuid"),
         };
         let mut pools = (*pools_of(dir, hdd, 0, 100)).clone();
