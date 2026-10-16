@@ -30,6 +30,7 @@ use std::process::ExitCode;
 use ciborium::value::Value;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hippius_types::cbor::assert_canonical;
+use hippius_types::disk_stats::{disk_io_from_value, DiskIoDelta, DiskProbeResult};
 use hippius_types::served_receipt::RECEIPT_DOMAIN;
 use serde::Serialize;
 
@@ -108,6 +109,104 @@ struct ReceiptFields {
     period_end: u64,
     monotonic_seq: u64,
     observed_degradation_bps: u32,
+    /// The optional per-device I/O deltas — ABSENT from the JSON when the
+    /// receipt carries none. Decoded and validated by `hippius-types`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_io: Option<Vec<DiskIoJson>>,
+    /// The optional probe result — ABSENT from the JSON when the receipt
+    /// carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_probe: Option<DiskProbeJson>,
+}
+
+/// The JSON shape of one [`DiskIoDelta`].
+#[derive(Debug, Serialize)]
+struct DiskIoJson {
+    dev: String,
+    serial: String,
+    state: &'static str,
+    r_ios: u64,
+    r_sectors: u64,
+    r_ticks_ms: u64,
+    w_ios: u64,
+    w_sectors: u64,
+    w_ticks_ms: u64,
+    io_ticks_ms: u64,
+    tiq_ms: u64,
+    inflight: u64,
+}
+
+impl From<DiskIoDelta> for DiskIoJson {
+    fn from(d: DiskIoDelta) -> Self {
+        DiskIoJson {
+            dev: d.dev,
+            serial: d.serial,
+            state: d.state.as_str(),
+            r_ios: d.r_ios,
+            r_sectors: d.r_sectors,
+            r_ticks_ms: d.r_ticks_ms,
+            w_ios: d.w_ios,
+            w_sectors: d.w_sectors,
+            w_ticks_ms: d.w_ticks_ms,
+            io_ticks_ms: d.io_ticks_ms,
+            tiq_ms: d.tiq_ms,
+            inflight: d.inflight,
+        }
+    }
+}
+
+/// The JSON shape of a [`DiskProbeResult`]: byte strings as hex, each
+/// target's metrics as an object.
+#[derive(Debug, Serialize)]
+struct DiskProbeJson {
+    run_id_hex: String,
+    nonce_hex: String,
+    vm_id: String,
+    vcpus: u32,
+    kernel: String,
+    release_version: u32,
+    started_at: u64,
+    finished_at: u64,
+    targets: Vec<DiskProbeTargetJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiskProbeTargetJson {
+    slot: String,
+    profile: String,
+    metrics: serde_json::Map<String, serde_json::Value>,
+    hist_qd1: Vec<u32>,
+    error: String,
+}
+
+impl From<DiskProbeResult> for DiskProbeJson {
+    fn from(p: DiskProbeResult) -> Self {
+        DiskProbeJson {
+            run_id_hex: hex::encode(p.run_id),
+            nonce_hex: hex::encode(p.nonce),
+            vm_id: p.vm_id,
+            vcpus: p.vcpus,
+            kernel: p.kernel,
+            release_version: p.release_version,
+            started_at: p.started_at,
+            finished_at: p.finished_at,
+            targets: p
+                .targets
+                .into_iter()
+                .map(|t| DiskProbeTargetJson {
+                    slot: t.slot,
+                    profile: t.profile,
+                    metrics: t
+                        .metrics
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::from(v)))
+                        .collect(),
+                    hist_qd1: t.hist_qd1,
+                    error: t.error,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// stdout JSON envelope for `verify-served-receipt`. On `ok` the parsed
@@ -116,7 +215,8 @@ struct ReceiptFields {
 #[derive(Serialize)]
 #[serde(tag = "tag", rename_all = "lowercase")]
 enum ReceiptOutput {
-    Ok(ReceiptFields),
+    /// Boxed: with the optional disk evidence the fields dwarf the error.
+    Ok(Box<ReceiptFields>),
     Err {
         error: String,
         category: &'static str,
@@ -137,7 +237,7 @@ pub fn run_served_receipt(args: VerifyTelemetryArgs) -> ExitCode {
     };
     let output =
         match verify(&body, &args, RECEIPT_DOMAIN).and_then(|()| extract_receipt_fields(&body)) {
-            Ok(fields) => ReceiptOutput::Ok(fields),
+            Ok(fields) => ReceiptOutput::Ok(Box::new(fields)),
             Err((category, error)) => ReceiptOutput::Err { error, category },
         };
     let exit = match &output {
@@ -312,6 +412,8 @@ fn extract_receipt_fields(body: &[u8]) -> Result<ReceiptFields, (&'static str, S
     let mut period_end: Option<u64> = None;
     let mut monotonic_seq: Option<u64> = None;
     let mut degradation: Option<u64> = None;
+    let mut disk_io: Option<Vec<DiskIoDelta>> = None;
+    let mut disk_probe: Option<DiskProbeResult> = None;
 
     for (key, val) in entries {
         let name = match key {
@@ -328,6 +430,21 @@ fn extract_receipt_fields(body: &[u8]) -> Result<ReceiptFields, (&'static str, S
             "period_end" => period_end = as_u64(val),
             "monotonic_seq" => monotonic_seq = as_u64(val),
             "observed_degradation_bps" => degradation = as_u64(val),
+            // The optional disk evidence: a PRESENT key must decode under
+            // the `hippius-types` rules, or the receipt is refused (the
+            // signer's `canonical()` could not have produced it).
+            "disk_io" => {
+                disk_io = Some(
+                    disk_io_from_value(&val)
+                        .map_err(|e| (category::CBOR, format!("disk_io: {e}")))?,
+                );
+            }
+            "disk_probe" => {
+                disk_probe = Some(
+                    DiskProbeResult::from_value(&val)
+                        .map_err(|e| (category::CBOR, format!("disk_probe: {e}")))?,
+                );
+            }
             _ => {}
         }
     }
@@ -348,8 +465,19 @@ fn extract_receipt_fields(body: &[u8]) -> Result<ReceiptFields, (&'static str, S
         )
     })?;
 
+    let vm_id = require(vm_id, "vm_id")?;
+    // A probe result names the VM that ran it; the signer refuses one for
+    // another VM, so a mismatch is a hand-rolled body.
+    if let Some(probe) = &disk_probe {
+        if probe.vm_id != vm_id {
+            return Err((
+                category::CBOR,
+                "disk_probe vm_id is not the receipt's".to_string(),
+            ));
+        }
+    }
     Ok(ReceiptFields {
-        vm_id: require(vm_id, "vm_id")?,
+        vm_id,
         lease_id: require(lease_id, "lease_id")?,
         node_id_hex: hex::encode(require(node_id, "node_id")?),
         epoch: require(epoch, "epoch")?,
@@ -358,6 +486,8 @@ fn extract_receipt_fields(body: &[u8]) -> Result<ReceiptFields, (&'static str, S
         period_end,
         monotonic_seq: require(monotonic_seq, "monotonic_seq")?,
         observed_degradation_bps: degradation,
+        disk_io: disk_io.map(|list| list.into_iter().map(DiskIoJson::from).collect()),
+        disk_probe: disk_probe.map(DiskProbeJson::from),
     })
 }
 
@@ -466,6 +596,8 @@ mod tests {
             period_start: 1000,
             period_end: 1060,
             expiry: 2000,
+            disk_io: None,
+            disk_probe: None,
         };
         let body = receipt.canonical().unwrap();
         let sig = sk.sign(&body);
@@ -482,6 +614,135 @@ mod tests {
         assert_eq!(f.period_end, 1060);
         assert_eq!(f.monotonic_seq, 5);
         assert_eq!(f.observed_degradation_bps, 250);
+    }
+
+    fn disk_receipt_body(
+        disk_io: Option<&[DiskIoDelta]>,
+        disk_probe: Option<&DiskProbeResult>,
+    ) -> Vec<u8> {
+        use hippius_types::served_receipt::ServedDeliveryReceipt;
+        let nonce = [7u8; 32];
+        ServedDeliveryReceipt {
+            validator_id: b"val-1",
+            validator_nonce: &nonce,
+            epoch: 42,
+            vm_id: "vm-abc",
+            lease_id: "lease-9",
+            family_id: b"fam",
+            node_id: &[0xab; 32],
+            resource_class: "small",
+            monotonic_seq: 5,
+            observed_degradation_bps: 0,
+            period_start: 1000,
+            period_end: 1060,
+            expiry: 2000,
+            disk_io,
+            disk_probe,
+        }
+        .canonical()
+        .unwrap()
+    }
+
+    fn sample_io() -> Vec<DiskIoDelta> {
+        use hippius_types::disk_stats::DiskIoState;
+        vec![DiskIoDelta {
+            dev: "vda".into(),
+            serial: "hippius-x0".into(),
+            state: DiskIoState::Ok,
+            r_ios: 10,
+            r_sectors: 80,
+            r_ticks_ms: 3,
+            w_ios: 4,
+            w_sectors: 32,
+            w_ticks_ms: 7,
+            io_ticks_ms: 9,
+            tiq_ms: 11,
+            inflight: 1,
+        }]
+    }
+
+    fn sample_probe(vm_id: &str) -> DiskProbeResult {
+        use hippius_types::disk_stats::{DiskProbeTarget, HIST_BUCKETS};
+        DiskProbeResult {
+            run_id: [0x55; 16],
+            nonce: [0x66; 32],
+            vm_id: vm_id.into(),
+            vcpus: 2,
+            kernel: "6.8.0".into(),
+            release_version: 5,
+            started_at: 1010,
+            finished_at: 1290,
+            targets: vec![DiskProbeTarget {
+                slot: "os".into(),
+                profile: "v1".into(),
+                metrics: vec![("qd1_p50_us".into(), 92), ("seq_read_mbps".into(), 2100)],
+                hist_qd1: vec![1; HIST_BUCKETS],
+                error: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_receipt_without_disk_keys_emits_none() {
+        let f = extract_receipt_fields(&disk_receipt_body(None, None)).unwrap();
+        let json = serde_json::to_value(ReceiptOutput::Ok(Box::new(f))).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("disk_io"));
+        assert!(!obj.contains_key("disk_probe"));
+        assert_eq!(obj["vm_id"], "vm-abc");
+    }
+
+    #[test]
+    fn disk_evidence_is_extracted() {
+        let io = sample_io();
+        let probe = sample_probe("vm-abc");
+        let f = extract_receipt_fields(&disk_receipt_body(Some(&io), Some(&probe))).unwrap();
+        let json = serde_json::to_value(ReceiptOutput::Ok(Box::new(f))).unwrap();
+        assert_eq!(json["tag"], "ok");
+        let dev = &json["disk_io"][0];
+        assert_eq!(dev["dev"], "vda");
+        assert_eq!(dev["serial"], "hippius-x0");
+        assert_eq!(dev["state"], "ok");
+        assert_eq!(dev["tiq_ms"], 11);
+        let p = &json["disk_probe"];
+        assert_eq!(p["run_id_hex"], "55".repeat(16));
+        assert_eq!(p["nonce_hex"], "66".repeat(32));
+        assert_eq!(p["vm_id"], "vm-abc");
+        assert_eq!(p["targets"][0]["slot"], "os");
+        assert_eq!(p["targets"][0]["metrics"]["seq_read_mbps"], 2100);
+        assert_eq!(p["targets"][0]["hist_qd1"].as_array().unwrap().len(), 32);
+    }
+
+    /// Splice `key: value` into a real receipt body (a hand-rolled body
+    /// the signer would refuse to produce).
+    fn body_with(key: &str, value: Value) -> Vec<u8> {
+        let v: Value = ciborium::de::from_reader(disk_receipt_body(None, None).as_slice()).unwrap();
+        let Value::Map(mut entries) = v else {
+            panic!("not a map")
+        };
+        entries.push((Value::Text(key.into()), value));
+        to_canonical_vec(&Value::Map(entries)).unwrap()
+    }
+
+    #[test]
+    fn malformed_disk_evidence_refuses_the_receipt() {
+        for (key, value) in [
+            ("disk_io", Value::Array(Vec::new())),
+            ("disk_io", Value::Text("x".into())),
+            ("disk_probe", Value::Map(Vec::new())),
+            ("disk_probe", Value::Integer(1.into())),
+        ] {
+            let (cat, _) = extract_receipt_fields(&body_with(key, value)).unwrap_err();
+            assert_eq!(cat, category::CBOR, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_probe_for_another_vm_refuses_the_receipt() {
+        let value = sample_probe("vm-other").to_value().unwrap();
+        let (cat, msg) = extract_receipt_fields(&body_with("disk_probe", value)).unwrap_err();
+        assert_eq!(cat, category::CBOR);
+        assert!(msg.contains("vm_id"), "{msg}");
     }
 
     #[test]

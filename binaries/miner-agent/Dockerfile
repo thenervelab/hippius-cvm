@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=mirror.gcr.io/docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # hippius-miner-agent — the per-miner-host orchestrator that
 # accepts §6/§14 LaunchOrders + drives libvirt to provision tenant
@@ -31,7 +31,7 @@
 #      coreutils + bash for general posture). The miner-agent itself
 #      lands at `/usr/local/bin/hippius-miner-agent`.
 
-FROM --platform=linux/amd64 rust:1.93-slim-trixie@sha256:c0a38f5662afdb298898da1d70b909af4bda4e0acff2dc52aea6360a9b9c6956 AS agent-builder
+FROM --platform=linux/amd64 mirror.gcr.io/library/rust:1.93-slim-trixie@sha256:c0a38f5662afdb298898da1d70b909af4bda4e0acff2dc52aea6360a9b9c6956 AS agent-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CARGO_TERM_COLOR=never
@@ -62,7 +62,7 @@ RUN cargo build --release -p hippius-miner-agent --features snp --bin hippius-mi
 # ───────────────────────────────────────────────────────────────────
 # Runtime image
 # ───────────────────────────────────────────────────────────────────
-FROM --platform=linux/amd64 debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+FROM --platform=linux/amd64 mirror.gcr.io/library/debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
 
 ENV DEBIAN_FRONTEND=noninteractive
 

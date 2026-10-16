@@ -188,7 +188,9 @@ def job_timeout_s(job: MigrationJob) -> float | None:
 # ─── intake ──────────────────────────────────────────────────────────
 
 
-def _validate_other_dest(vm: Vm, dest_node_id: str, *, source: str | None = None) -> None:
+def _validate_other_dest(
+    vm: Vm, dest_node_id: str, *, source: str | None = None, region: str | None = None
+) -> None:
     """Refuse (`no-eligible-miner`) an operator-named destination other than
     the VM's host unless it can boot this VM: same SNP generation, live and
     dispatchable, not observed CVM-incapable, not zombie-quarantined, not
@@ -210,8 +212,15 @@ def _validate_other_dest(vm: Vm, dest_node_id: str, *, source: str | None = None
     if not verdict.dispatchable:
         raise refuse(f"not dispatchable ({verdict.reason})")
     try:
-        if service._snp_generation(source or vm.host) != service._snp_generation(dest_node_id):
-            raise refuse("another SNP generation than the VM's host")
+        own = service._snp_generation(source or vm.host)
+        theirs = service._snp_generation(dest_node_id)
+        if own != theirs:
+            from . import cross_gen
+
+            # A restore boots the guest afresh: another generation measures
+            # its own digest, which `cross_gen` pins for the destination.
+            if not cross_gen.allowed(vm, own, theirs):
+                raise refuse("another SNP generation than the VM's host")
         service._reject_cvm_incapable_dest(dest_node_id)
         service._reject_zombie_quarantined_dest(dest_node_id)
         service._reject_cordoned_dest(dest_node_id)
@@ -219,6 +228,19 @@ def _validate_other_dest(vm: Vm, dest_node_id: str, *, source: str | None = None
         service._reject_group_colocated_dest(vm, dest_node_id)
     except service.StartError as exc:
         raise refuse(exc.message) from exc
+    # The VM's region (`region`, as `operator_region` resolved it, else
+    # vali's), and only it: a restore or failover never lands it in another
+    # country — nor anywhere when its region cannot be told.
+    region = (region if region is not None else vm_region(vm)).strip().upper()
+    if not region:
+        raise RestoreError(
+            "region-unknown",
+            f"destination {dest_node_id!r}: the vm's region cannot be told — refusing a "
+            "destination that could be in another region",
+        )
+    dest_region = sched.region_by_node().get((miner.chain_node_id or "").lower(), "")
+    if dest_region != region:
+        raise refuse(f"in region {dest_region or 'unknown'}, the vm's is {region}")
     try:
         backup_service.source_disk_bytes(vm)
         spec = _launch_flavor(vm)
@@ -289,6 +311,8 @@ def start_restore(
     accept_rollback: Any = None,
     on_behalf_of: Any = None,
     customer_authorized: Any = None,
+    region: Any = None,
+    cross_region: Any = None,
 ) -> tuple[MigrationJob, bool]:
     """Open a restore job for `vm` to backup run `run_id`. Returns `(job,
     created)`; the same `request_id` returns the job it created before.
@@ -306,7 +330,8 @@ def start_restore(
 
     The destination is the VM's current host unless the operator names
     another (`dest_node_id`), which must be able to boot the VM
-    (`_validate_other_dest`)."""
+    (`_validate_other_dest`), in the VM's region — or, with an operator's
+    `cross_region` (`service.CrossRegion`), in the region it names."""
     from apps.backup import service as backup_service
 
     from . import service
@@ -358,8 +383,17 @@ def start_restore(
         raise RestoreError("point-not-restorable", "the run is not a restorable point")
 
     dest = (dest_node_id or "").strip() or vm.host
+    if region not in (None, "") and dest == vm.host:
+        raise RestoreError(
+            "bad-request", "region applies to a restore onto another miner (dest_node_id)"
+        )
+    if cross_region is not None and dest == vm.host:
+        raise RestoreError(
+            "bad-request", "allow_cross_region applies to a restore onto another miner"
+        )
+    region, region_stated, crossed = _move_region(vm, region, cross_region)
     if dest != vm.host:
-        _validate_other_dest(vm, dest)
+        _validate_other_dest(vm, dest, region=region)
     else:
         from apps.miners.models import MinerIdentity
 
@@ -397,7 +431,10 @@ def start_restore(
                     "point_class": point.klass,
                     "dest_node_id": dest,
                     "requested_dest_node_id": (dest_node_id or "") or None,
+                    "region": region or None,
+                    "region_stated_by_operator": region_stated,
                     "requested_at": now.isoformat(),
+                    **crossed,
                 },
                 accept_rollback=rollback,
                 on_behalf_of_kind=behalf[0] if behalf else "",
@@ -424,6 +461,7 @@ def start_restore(
                 cold=prior == VmPowerState.STOPPED.value,
                 authorization=auth,
                 restore_eta_s=eta,
+                **_cross_region_fields(region, crossed),
             )
             if rollback:
                 assert behalf is not None  # `_admit_rollback` required it
@@ -873,7 +911,7 @@ def _dispatch_stage(job: MigrationJob, now: Any) -> None:
         raise StepFailed(f"stage-{_reason(exc.classifier, 'rejected')}") from exc
 
 
-def _recheck_no_active_job(vm: Vm) -> None:
+def _recheck_no_active_job(vm: Vm, *, refuse_launch: bool = True) -> None:
     """The one-active-job rule again, under the VM's row lock — the lock §25,
     §24 and the resize intake take for the same check. A resize never moves
     `Vm.state`, so without it a restore and a resize could both start."""
@@ -882,6 +920,13 @@ def _recheck_no_active_job(vm: Vm) -> None:
     Vm.objects.select_for_update().filter(pk=vm.pk).first()
     if service._has_active_job(vm):
         raise RestoreError("job-in-flight", "the vm already has an in-flight orchestration job")
+    # Its stop/start bypass the power API's launch check (`by_migration`).
+    # Not for a failover: its host is presumed dead, and a launch job there
+    # must not hold the VM's recovery for the orphan bound.
+    from .services import power
+
+    if refuse_launch and power.launch_in_flight(vm):
+        raise RestoreError("job-in-flight", "the vm has a launch job in flight")
 
 
 def _reason(raw: str, fallback: str) -> str:
@@ -996,13 +1041,16 @@ def _capture_original_checkpoint(job: MigrationJob) -> None:
 
 
 def _note_evidence(job: MigrationJob, **fields: Any) -> None:
-    """Merge `fields` into the job's authorization evidence."""
+    """Merge `fields` into the job's authorization evidence; a `None` value
+    removes its key."""
     if job.authorization_id is None:
         return
     with transaction.atomic():
         auth = DestAuthorization.objects.select_for_update().get(id=job.authorization_id)
         evidence = dict(auth.evidence or {})
-        evidence.update(fields)
+        evidence.update({k: v for k, v in fields.items() if v is not None})
+        for key in [k for k, v in fields.items() if v is None]:
+            evidence.pop(key, None)
         auth.evidence = evidence
         auth.save(update_fields=["evidence"])
     job.authorization = auth
@@ -1050,6 +1098,10 @@ def h_verifying(job: MigrationJob) -> Any:
         if locked is None:
             return None
         service._activate_dest_vm(job)
+        # Another generation: its digest is the VM's measurement from now on.
+        from . import cross_gen
+
+        cross_gen.record_dest_measurement(job)
         if consumed is not None:
             _note_committed(_event(job), consumed)
         _mark_running(vm)
@@ -1127,6 +1179,11 @@ def commit_state(job: MigrationJob) -> tuple[str, str]:
         # Never fenced: the fence precedes the KBS activate, so the KBS never
         # moved and nothing could release at `new_gen`.
         return NOT_COMMITTED, "never-fenced"
+    if job.kind in RESTORE_KINDS and kbs_moved(job) is False:
+        # The KBS never left the source's generation (no activate asked, or
+        # the ingested KBS admin log proves none was applied): nothing can
+        # have released at `new_gen`.
+        return NOT_COMMITTED, "kbs-never-moved"
     if _never_dispatched(job, vm):
         # Before any KBS read: it needs none, and the KBS may be the thing
         # that is down.
@@ -1371,6 +1428,11 @@ def _stamp_committed(job: MigrationJob) -> None:
     MigrationJob.objects.filter(id=job.id, committed_at__isnull=True).update(
         committed_at=timezone.now()
     )
+    # Past the commit, the only live copy is the destination's: another
+    # generation's digest is the one any recovery must mint.
+    from . import cross_gen
+
+    cross_gen.record_dest_measurement(job)
 
 
 def _undecided_too_long(job: MigrationJob) -> bool:
@@ -1716,12 +1778,15 @@ def dead_after_s() -> float:
     return float(getattr(settings, "VALI_FAILOVER_DEAD_AFTER_S", 600.0))
 
 
-def dead_evidence(vm: Vm, miner_id: str, *, now: Any = None) -> dict[str, Any]:
+def dead_evidence(
+    vm: Vm, miner_id: str, *, now: Any = None, after: float | None = None
+) -> dict[str, Any]:
     """Whether `miner_id` is dead, with the evidence. `dead` only when ALL
     hold: its last heartbeat is at least `VALI_FAILOVER_DEAD_AFTER_S` old,
     its NetBird peer is disconnected (or gone) and was last seen at least
     as long ago, and the Edge cannot reach it now. Anything vali cannot
-    read counts against `dead`.
+    read counts against `dead`. `after` raises the silence the heartbeat
+    and the peer need (the automatic worker's `VALI_FAILOVER_AUTO_AFTER_S`).
 
     A partitioned-but-alive host is what this guards against; the KBS
     `activate` to the new generation is what makes a failover safe anyway
@@ -1730,7 +1795,7 @@ def dead_evidence(vm: Vm, miner_id: str, *, now: Any = None) -> dict[str, Any]:
     from apps.miners.models import MinerIdentity
 
     now = now or timezone.now()
-    after = dead_after_s()
+    after = max(dead_after_s(), after or 0.0)
     evidence: dict[str, Any] = {
         "miner_id": miner_id,
         "checked_at": now.isoformat(),
@@ -1781,6 +1846,12 @@ def dead_evidence(vm: Vm, miner_id: str, *, now: Any = None) -> dict[str, Any]:
 
     edge = effects.probe_edge_session(vm, miner_id)
     evidence["edge"] = edge
+    # The heartbeat again, AFTER the two network calls: one that landed while
+    # they ran is a live miner, whatever they said.
+    seen = MinerIdentity.objects.filter(pk=miner.pk).values_list("last_seen_at", flat=True).first()
+    if seen is not None and (now - seen).total_seconds() < after:
+        heartbeat_stale = False
+        evidence.update(heartbeat_last_seen_at=seen.isoformat(), heartbeat_stale=False)
     evidence["dead"] = bool(heartbeat_stale and netbird_dead and edge == "unreachable")
     return evidence
 
@@ -1793,43 +1864,142 @@ class MinerNotDead(RestoreError):
         self.evidence = evidence
 
 
-def _pick_failover_dest(vm: Vm, source: str) -> str:
+def operator_region(vm: Vm, stated: Any) -> tuple[str, bool]:
+    """The region a restore / failover keeps the VM in: vali's (`vm_region`),
+    or — only when vali cannot tell — the one the operator states. A stated
+    region that differs from the one vali knows is refused: never a way to
+    move a VM to another country. Returns `(region, stated_by_operator)`;
+    `""` when neither is known (the destination checks then refuse
+    `region-unknown`)."""
+    known = vm_region(vm)
+    if stated is None or stated == "":
+        return known, False
+    if not isinstance(stated, str) or not re.fullmatch(r"[A-Za-z]{2}", stated.strip()):
+        raise RestoreError("bad-request", "region must be an ISO 3166-1 alpha-2 country code")
+    stated = stated.strip().upper()
+    if known and stated != known:
+        raise RestoreError(
+            "region-conflict", f"the vm is in region {known}; a restore keeps it there"
+        )
+    return stated, not known
+
+
+def _move_region(
+    vm: Vm, stated: Any, cross_region: Any
+) -> tuple[str, bool, dict[str, Any]]:
+    """`(region, stated_by_operator, evidence)` a restore or failover is
+    held to: `operator_region` — or the region an operator's cross-region
+    override names, with the evidence it records (from, to, reason)."""
+    if cross_region is None:
+        region, region_stated = operator_region(vm, stated)
+        return region, region_stated, {}
+    if stated not in (None, ""):
+        raise RestoreError(
+            "bad-request", "with allow_cross_region, region names the destination region"
+        )
+    known = vm_region(vm)
+    if known == cross_region.region:
+        raise RestoreError(
+            "not-cross-region",
+            f"the vm is already in region {known}: no cross-region override needed",
+        )
+    return (
+        cross_region.region,
+        True,
+        {
+            "cross_region": {
+                "from": known or None,
+                "to": cross_region.region,
+                "reason": cross_region.reason,
+                "operator": cross_region.operator,
+            }
+        },
+    )
+
+
+def _cross_region_fields(region: str, crossed: dict[str, Any]) -> dict[str, Any]:
+    """The `MigrationJob` fields recording the move's region and an
+    operator's cross-region override."""
+    over = crossed.get("cross_region")
+    return {
+        "region": region or "",
+        "cross_region_override": over is not None,
+        "cross_region_from": (over or {}).get("from") or "",
+        "cross_region_reason": (over or {}).get("reason") or "",
+        "cross_region_by": (over or {}).get("operator") or "",
+    }
+
+
+def vm_region(vm: Vm) -> str:
+    """The region a VM belongs to (its launch region, else its host's last
+    verified country — which survives the host's death): `""` when it
+    cannot be told."""
+    from apps.backup import service as backup_service
+
+    return backup_service.vm_region(vm).strip().upper()
+
+
+def _pick_failover_dest(vm: Vm, source: str, *, region: str | None = None) -> str:
     """The destination for a failover when the operator names none: a
-    dispatchable miner of the source's SNP generation, in the VM's launch
-    region when it was sold in one, not cordoned, with room for its flavor —
-    the one with the most free memory. `no-eligible-miner` otherwise."""
+    dispatchable miner of the source's SNP generation (or, where
+    `cross_gen.allowed`, of any — the source's preferred), in the VM's
+    region (`region`, else `vm_region`), not cordoned, with room for its
+    flavor — the one with the most free memory. `region-unknown` when the VM's region
+    cannot be told — never a destination anywhere; `no-eligible-miner`
+    otherwise."""
     from apps.miners.models import MinerIdentity
     from apps.scheduler import service as sched
 
-    region = sched.launch_region_for_vm(vm.vm_id)
-    regions = sched.region_by_node() if region else {}
+    region = (region if region is not None else vm_region(vm)).strip().upper()
+    if not region:
+        raise RestoreError(
+            "region-unknown",
+            "the vm's region cannot be told (no launch region, and its host was never "
+            "verified anywhere): refusing a destination in some other region",
+        )
+    regions = sched.region_by_node()
     free = sched.host_resources_by_node()
     # An operator-cordoned miner takes no new work (`_validate_other_dest`
     # refuses it below too; skipping it here keeps the pick honest).
     cordoned = sched.cordoned_node_ids()
-    best: tuple[int, str] | None = None
+    from . import cross_gen, service
+
+    try:
+        own = service._snp_generation(source)
+    except service.StartError:
+        own = ""
+    best: tuple[tuple[bool, bool, int], int, str] | None = None
     for miner in MinerIdentity.objects.exclude(miner_id=source).order_by("miner_id"):
         node = (miner.chain_node_id or "").lower()
         if node in cordoned:
             continue
-        if region and regions.get(node) != region:
+        if regions.get(node) != region:
             continue
         try:
-            _validate_other_dest(vm, miner.miner_id, source=source)
+            _validate_other_dest(vm, miner.miner_id, source=source, region=region)
         except RestoreError:
             continue
         mem = (free.get(miner.chain_node_id or "") or free.get(node))
         score = int(mem.free_memory_mb or 0) if mem is not None else 0
-        if best is None or score > best[0]:
-            best = (score, miner.miner_id)
+        try:
+            theirs = service._snp_generation(miner.miner_id)
+        except service.StartError:
+            theirs = ""
+        # The source's own generation first, then a newer one, then the
+        # nearest older (`cross_gen.GENERATION_ORDER`: the SIGILL risk grows
+        # with the gap): a cross-generation restore is a fallback, never a
+        # tie-break on room.
+        gap = cross_gen.GENERATION_ORDER.get(theirs, -9) - cross_gen.GENERATION_ORDER.get(own, 9)
+        rank = (theirs == own, gap >= 0, -abs(gap))
+        if best is None or (rank, score) > best[:2]:
+            best = (rank, score, miner.miner_id)
     if best is None:
         raise RestoreError(
             "no-eligible-miner",
-            "no dispatchable miner of the same SNP generation"
-            + (f" in region {region}" if region else "")
-            + " has room for the vm",
+            f"no dispatchable miner of a compatible SNP generation in region {region} "
+            "has room for the vm",
         )
-    return best[1]
+    return best[2]
 
 
 def start_failover(
@@ -1839,12 +2009,22 @@ def start_failover(
     decided_by: Any,
     run_id: Any = None,
     dest_node_id: Any = None,
+    trigger: str = "operator",
+    job_id: str = "",
+    evidence: dict[str, Any] | None = None,
+    region: Any = None,
+    cross_region: Any = None,
 ) -> tuple[MigrationJob, bool]:
     """Open a manual failover of `vm` off its dead miner, restoring the
     newest current-boot point (or `run_id`) on another miner. Returns
     `(job, created)`; the same `request_id` returns its job. Raises
     `MinerNotDead` (with the evidence) unless the miner is proven dead, and
     `RestoreError` with the C-2 codes otherwise.
+
+    The automatic worker (`failover_auto`) opens its jobs here too, with
+    `trigger="auto"` (behind `VALI_FAILOVER_AUTO_ENABLED` instead of the
+    manual flag), the `job_id` it promised while the VM waited for room,
+    and the `evidence` of its own, longer, dead-miner proof.
 
     The job enters `dest_activating` directly (no staging on a dead host,
     no stop possible): the destination downloads the chain as it activates."""
@@ -1857,8 +2037,15 @@ def start_failover(
     existing = _job_for_request(request_id)
     if existing is not None:
         return _replay(existing, vm, kind=MigrationKind.FAILOVER.value), False
-    if not failover_enabled():
+    if trigger not in ("operator", "auto"):
+        raise RestoreError("bad-request", "trigger must be operator or auto")
+    if trigger == "operator" and not failover_enabled():
         raise RestoreError("failover-disabled", "manual failover is not enabled on this deployment")
+    if trigger == "auto" and not settings.VALI_FAILOVER_AUTO_ENABLED:
+        raise RestoreError("failover-disabled", "automatic failover is not enabled")
+    if trigger == "auto" and cross_region is not None:
+        # Never automatic: only an operator moves a VM to another region.
+        raise RestoreError("bad-request", "an automatic failover never leaves the region")
     if run_id is not None and (not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id)):
         raise RestoreError("bad-request", "run_id must be 32 lower-case hex characters")
     if dest_node_id is not None and (
@@ -1897,17 +2084,19 @@ def start_failover(
     if not klass.restorable:
         raise RestoreError("point-not-restorable", "the run is not a restorable point")
 
-    evidence = dead_evidence(vm, source)
+    if evidence is None:
+        evidence = dead_evidence(vm, source)
     if not evidence.get("dead"):
         raise MinerNotDead(evidence)
 
     dest = (dest_node_id or "").strip()
+    region, region_stated, crossed = _move_region(vm, region, cross_region)
     if dest:
         if dest == source:
             raise RestoreError("no-eligible-miner", "the destination is the dead miner")
-        _validate_other_dest(vm, dest, source=source)
+        _validate_other_dest(vm, dest, source=source, region=region)
     else:
-        dest = _pick_failover_dest(vm, source)
+        dest = _pick_failover_dest(vm, source, region=region)
     _preflight_dest_ticket(vm)
 
     prior = (
@@ -1926,16 +2115,26 @@ def start_failover(
             chain = BackupChain.objects.select_for_update().get(pk=run.chain_id)
             if chain.pruned_at is not None:
                 raise RestoreError("point-not-restorable", "the point's chain is being pruned")
-            _recheck_no_active_job(vm)
+            _recheck_no_active_job(vm, refuse_launch=False)
+            if trigger == "auto":
+                _recheck_opted_in(vm)
             auth = DestAuthorization.objects.create(
                 kind=MigrationKind.FAILOVER.value,
                 requested_by=decided_by,
                 request_id=request_id,
-                evidence={**evidence, "run_id": run.run_id, "dest_node_id": dest},
+                evidence={
+                    **evidence,
+                    "run_id": run.run_id,
+                    "dest_node_id": dest,
+                    "region": region or None,
+                    "region_stated_by_operator": region_stated,
+                    **crossed,
+                },
             )
             job = MigrationJob.objects.create(
-                job_id=secrets.token_hex(16),
+                job_id=job_id or secrets.token_hex(16),
                 kind=MigrationKind.FAILOVER.value,
+                trigger=trigger,
                 vm=vm,
                 source_node_id=source,
                 dest_node_id=dest,
@@ -1951,6 +2150,7 @@ def start_failover(
                 cold=prior == VmPowerState.STOPPED.value,
                 authorization=auth,
                 restore_eta_s=eta,
+                **_cross_region_fields(region, crossed),
             )
     except IntegrityError as exc:
         existing = _job_for_request(request_id)
@@ -1960,8 +2160,9 @@ def start_failover(
             "job-in-flight", "the vm already has an in-flight orchestration job"
         ) from exc
     log.error(
-        "FAILOVER started: job=%s vm=%s off DEAD miner %s → %s, run %s, gen %d→%d "
+        "FAILOVER (%s) started: job=%s vm=%s off DEAD miner %s → %s, run %s, gen %d→%d "
         "(evidence: heartbeat %s, netbird %s, edge %s)",
+        trigger,
         job.job_id,
         vm.vm_id,
         source,
@@ -1974,6 +2175,17 @@ def start_failover(
         evidence.get("edge"),
     )
     return job, True
+
+
+def _recheck_opted_in(vm: Vm) -> None:
+    """An automatic failover opens only for a VM whose policy says `auto`
+    NOW, under the policy row's lock: a `PUT failover_mode=manual` (or a
+    disabled policy) that lands while the worker decides wins."""
+    from apps.backup.models import BackupPolicy, FailoverMode
+
+    policy = BackupPolicy.objects.select_for_update().filter(vm=vm).first()
+    if policy is None or not policy.enabled or policy.failover_mode != FailoverMode.AUTO:
+        raise RestoreError("not-opted-in", "the vm's policy does not ask for automatic failover")
 
 
 def prepare_failover_activation(job: MigrationJob) -> None:
@@ -1996,19 +2208,175 @@ def prepare_failover_activation(job: MigrationJob) -> None:
     from .models import FailoverQuarantine
 
     vm = Vm.objects.get(id=job.vm_id)
-    if vm.state == VmState.ACTIVE:
-        evidence = dead_evidence(vm, job.source_node_id)
-        if not evidence.get("dead"):
-            _note_evidence(job, recheck=evidence)
-            raise StepFailed("miner-not-dead-at-fence")
-        _note_evidence(
-            job,
-            recheck=evidence,
-            source_domain_down=True,
-            source_domain_down_at=timezone.now().isoformat(),
-        )
+    # Re-checked until the KBS has actually moved — decided from durable
+    # state and the KBS's own audit log (`kbs_moved`): a crash, a pod
+    # replacement or a transient KBS
+    # failure between the fence below and the KBS activate re-enters here
+    # with the VM `Migrating`, and the miner may have come back in that gap.
+    moved = kbs_moved(job)
+    if moved is not True:
+        _recheck_before_kbs(job, vm, moved)
+    if job.trigger == "auto" and vm.state == VmState.ACTIVE:
+        # The kill switch and the opt-out, re-read under the policy's row
+        # lock held THROUGH the fence: one that lands first wins.
+        with transaction.atomic():
+            if not _auto_still_wanted(vm):
+                raise StepFailed("failover-auto-disabled-at-fence")
+            service._fence_vm(job)
     service._fence_vm(job)
     FailoverQuarantine.objects.get_or_create(job=job, defaults={"miner_id": job.source_node_id})
+
+
+def _recheck_before_kbs(job: MigrationJob, vm: Vm, moved: bool | None) -> None:
+    """The dead-miner re-check of a failover whose KBS has not moved
+    (`moved` False) or may have (None).
+
+    - Not fenced yet: any verdict but `dead` cancels the job (the KBS never
+      moved), as does an automatic job whose worker is held (the worker
+      off or the opt-out is read under the policy lock with the fence).
+    - Fenced: a POSITIVE sign of life cancels only when the KBS provably
+      never moved; when vali cannot tell yet, the job waits (retried every
+      tick, `fence_undecided_since` noted for the alert, cleared once it
+      settles) — it never reverts
+      onto a miner that may be dead, nor activates elsewhere while its
+      source may be alive. An unreadable signal is asked again."""
+    from . import failover_auto
+
+    auto = job.trigger == "auto"
+    fenced = vm.state != VmState.ACTIVE
+    auth = job.authorization.evidence if job.authorization is not None else {}
+    evidence = dead_evidence(
+        vm,
+        job.source_node_id,
+        after=float(auth.get("auto_after_s") or 0.0) if auto else None,
+    )
+    if not evidence.get("dead"):
+        _note_evidence(job, recheck=evidence)
+        live = _live_signal(evidence)
+        if not fenced or (moved is False and live):
+            if auto:
+                failover_auto.saw_alive(job.source_node_id, "alive at the fence re-check")
+            raise StepFailed("miner-not-dead-at-fence")
+        if live:
+            _note_undecided(job, auth)
+            log.error(
+                "failover %s: the source %s answers again but vali cannot tell yet whether "
+                "the KBS moved — waiting (never reverted onto it, never activated elsewhere)",
+                job.job_id,
+                job.source_node_id,
+            )
+            raise EffectError("source alive, KBS move undecided at the fence; retrying")
+        raise EffectError("the dead-miner proof is undecided at the fence; retrying")
+    if auto and failover_auto.held():
+        _note_evidence(job, recheck=evidence)
+        if not fenced:
+            raise StepFailed("failover-auto-held-at-fence")
+        raise EffectError("automatic failover held at the fence; retrying")
+    fields: dict[str, Any] = {"recheck": evidence, "source_domain_down": True}
+    if not auth.get("source_domain_down_at"):
+        fields["source_domain_down_at"] = timezone.now().isoformat()
+    if auth.get("fence_undecided_since"):
+        # Settled (the source is dead again): the alert clears.
+        fields["fence_undecided_since"] = None
+    _note_evidence(job, **fields)
+
+
+def _auto_still_wanted(vm: Vm) -> bool:
+    """The worker on and the VM still opted in, read under the policy's row
+    lock — the caller's transaction holds it through the fence, so an
+    opt-out or the kill switch landing before the fence wins."""
+    from apps.backup.models import BackupPolicy, FailoverMode
+
+    from . import failover_auto
+
+    if not failover_auto.enabled():
+        return False
+    policy = BackupPolicy.objects.select_for_update().filter(vm=vm).first()
+    return bool(
+        policy is not None and policy.enabled and policy.failover_mode == FailoverMode.AUTO
+    )
+
+
+def _note_undecided(job: MigrationJob, auth: dict[str, Any]) -> None:
+    if not auth.get("fence_undecided_since"):
+        _note_evidence(job, fence_undecided_since=timezone.now().isoformat())
+
+
+#: Slack on the KBS's clock when matching its audit entries to an attempt.
+KBS_AUDIT_CLOCK_SKEW_S = 60
+
+
+def kbs_moved(job: MigrationJob) -> bool | None:
+    """Whether the KBS holds the job's new generation: True / False, or None
+    while vali cannot tell. Durable sources only, and only POSITIVE proof
+    says True:
+
+    - the KBS acknowledged the activate (`kbs_activated_at`) — True;
+    - no activate was ever asked (`kbs_activate_first_attempt_at` unset;
+      jobs older than the stamps were backfilled) — False, it cannot have
+      moved;
+    - an attempt that errored or was cut short may have landed: an
+      `activate` the KBS answered 200 for this VM since the first attempt,
+      within the attempts' window (± the KBS clock skew), in the
+      chain-verified admin audit log of the KBS's current epoch, is True —
+      vali is the KBS admin's only caller, and no other job of the VM asked
+      in that window (else None). Its ABSENCE proves nothing — the KBS applies before it
+      appends, an append can fail, and the log dies with its pod — so it
+      is None, never False. The §14 idempotency store is read for a
+      positive hint only."""
+    from .models import KbsAuditCursor, KbsAuditEntry, KbsAuditLog
+
+    row = (
+        MigrationJob.objects.filter(pk=job.pk)
+        .values(
+            "kbs_activated_at", "kbs_activate_first_attempt_at", "kbs_activate_last_attempt_at"
+        )
+        .first()
+    ) or {}
+    if row.get("kbs_activated_at") is not None:
+        return True
+    first = row.get("kbs_activate_first_attempt_at")
+    if first is None:
+        return False
+    from . import service
+
+    if idempotency.recall(service._mig_key(job, "dest-activating")) is not None:
+        return True
+    last = row.get("kbs_activate_last_attempt_at") or first
+    lo = first - timedelta(seconds=KBS_AUDIT_CLOCK_SKEW_S)
+    hi = last + timedelta(seconds=KBS_AUDIT_CLOCK_SKEW_S)
+    if (
+        MigrationJob.objects.filter(vm_id=job.vm_id, kbs_activate_last_attempt_at__gte=lo)
+        .exclude(pk=job.pk)
+        .exists()
+    ):
+        # Another job of this VM asked the KBS in the same window: an
+        # entry could be its, not this job's.
+        return None
+    cursor = KbsAuditCursor.objects.filter(log=KbsAuditLog.ADMIN.value).first()
+    if cursor is not None and KbsAuditEntry.objects.filter(
+        log=KbsAuditLog.ADMIN.value,
+        kbs_epoch=cursor.kbs_epoch,
+        chain_ok=True,
+        op="activate",
+        vm_id=job.vm.vm_id,
+        status_code=200,
+        event_unix__gte=int(lo.timestamp()),
+        event_unix__lte=int(hi.timestamp()),
+    ).exists():
+        return True
+    return None
+
+
+def _live_signal(evidence: dict[str, Any]) -> bool:
+    """A POSITIVE sign of life in `dead_evidence`'s verdict — a fresh
+    heartbeat, a connected NetBird peer, an Edge that reaches the miner —
+    as opposed to a signal vali could not read."""
+    return (
+        evidence.get("heartbeat_stale") is False
+        or (evidence.get("netbird") == "present" and evidence.get("netbird_connected") is True)
+        or evidence.get("edge") == "reachable"
+    )
 
 
 def failover_chain(job: MigrationJob) -> dict[str, Any]:
@@ -3460,16 +3828,18 @@ def phase(job: MigrationJob) -> str:
     if state == MigrationState.RESTORE_VERIFYING.value:
         return "verifying"
     if state == MigrationState.DONE.value:
-        # C-2: `verifying` covers the KBS evidence AND the liveness proof.
-        # The job is done on the first (the VM is activated there); the
-        # original is kept until the second, and a restored VM that never
-        # proves it runs reads `failed` once the reclaim gives up on it.
+        # C-2: the job is done on the KBS evidence (the VM is activated
+        # there); the original is kept until the liveness proof past the
+        # grace, and a restored VM that never proves it runs reads `failed`
+        # once the reclaim gives up on it. In between: `verifying` until the
+        # restored guest first signals, `settling` from then (VM-08: usable
+        # for the tenant, the original still kept).
         if job.source_reclaim_state == SourceReclaimState.SKIPPED.value and (
             job.source_reclaim_reason or ""
         ).startswith("dest-unproven"):
             return "failed"
         if job.source_reclaim_state == SourceReclaimState.PENDING.value and _not_alive_yet(job):
-            return "verifying"
+            return "settling" if _signalled_since_commit(job) else "verifying"
         if job.cold and job.cold_settled_at is None:
             return "settling"
         return "done"
@@ -3487,6 +3857,23 @@ def _not_alive_yet(job: MigrationJob) -> bool:
     return service._dest_not_alive_reason(job, vm) is not None
 
 
+def _signalled_since_commit(job: MigrationJob) -> bool:
+    """The restored guest speaks: an in-guest signal (`Vm.guest_signal_at`)
+    since the job committed (`finished_at`) and still fresh (within
+    `VALI_GUEST_LIVENESS_STALE_S`): a guest that sent one receipt and hung
+    falls back to `verifying`. The original was stopped (a restore) or is
+    presumed dead and is fenced (a failover); the same assumption as the
+    reclaim's liveness gate (`service._dest_not_alive_reason`), whose
+    residual — a cut-off source still running — it shares."""
+    from apps.lifecycle import guest_liveness
+
+    vm = Vm.objects.filter(id=job.vm_id).only("guest_signal_at").first()
+    if vm is None or vm.guest_signal_at is None:
+        return False
+    fresh = timezone.now() - timedelta(seconds=guest_liveness.staleness_bound_s())
+    return vm.guest_signal_at >= max(job.finished_at or job.started_at, fresh)
+
+
 _TERMINAL_PHASES = frozenset({"done", "failed", "reverted"})
 
 
@@ -3499,6 +3886,10 @@ def outcome(job: MigrationJob, current: str | None = None) -> str | None:
         return None
     if current == "done":
         return "committed"
+    if job.kind == MigrationKind.FAILOVER.value and cancelled_at_fence(job):
+        # Stopped before the KBS moved: the miner came back, the worker
+        # held, or it was turned off.
+        return "cancelled"
     if current == "reverted":
         return "reverted"
     if (
@@ -3510,6 +3901,19 @@ def outcome(job: MigrationJob, current: str | None = None) -> str | None:
     return "failed"
 
 
+def cancelled_at_fence(job: MigrationJob) -> str | None:
+    """`miner-back` / `held` / `disabled` for a failover its re-check stopped
+    while the KBS had not moved, else None: a job the KBS acknowledged a
+    move for reads `reverted` / `failed`, never `cancelled`."""
+    if job.kbs_activated_at is not None:
+        return None
+    return {
+        "miner-not-dead-at-fence": "miner-back",
+        "failover-auto-held-at-fence": "held",
+        "failover-auto-disabled-at-fence": "disabled",
+    }.get(job.reason or "")
+
+
 def dead_miner_evidence(job: MigrationJob) -> dict[str, Any] | None:
     """A failover's dead-miner proof, as the contract states it: how long the
     heartbeat and the NetBird peer had been silent, and whether the Edge
@@ -3517,7 +3921,11 @@ def dead_miner_evidence(job: MigrationJob) -> dict[str, Any] | None:
     there was one, else from the intake. Null for a restore."""
     if job.kind != MigrationKind.FAILOVER.value or job.authorization is None:
         return None
-    evidence = job.authorization.evidence if isinstance(job.authorization.evidence, dict) else {}
+    return _evidence_view(job.authorization.evidence)
+
+
+def _evidence_view(raw: Any) -> dict[str, Any]:
+    evidence = raw if isinstance(raw, dict) else {}
     snapshot = evidence.get("recheck") if isinstance(evidence.get("recheck"), dict) else evidence
     checked = _parse_ts(snapshot.get("checked_at"))
 
@@ -3559,15 +3967,49 @@ def last_failover_views(vm_pks: Any) -> dict[Any, dict[str, Any]]:
     query for the jobs, one for the source regions."""
     from apps.miners import geo
 
+    from .models import AutoFailover
+
+    pks = list(vm_pks)
     newest: dict[Any, MigrationJob] = {}
     for job in (
-        MigrationJob.objects.filter(vm_id__in=list(vm_pks), kind=MigrationKind.FAILOVER.value)
+        MigrationJob.objects.filter(vm_id__in=pks, kind=MigrationKind.FAILOVER.value)
         .select_related("restore_run")
         .order_by("vm_id", "-started_at")
     ):
         newest.setdefault(job.vm_id, job)
-    regions = geo.last_known_countries({job.source_node_id for job in newest.values()})
-    return {pk: last_failover_view(job, regions) for pk, job in newest.items()}
+    # An automatic failover still without a job (waiting for room, or
+    # cancelled while it waited) is the newest when it is younger.
+    waits: dict[Any, Any] = {}
+    for af in AutoFailover.objects.filter(vm_id__in=pks, job__isnull=True).order_by(
+        "vm_id", "-created_at"
+    ):
+        waits.setdefault(af.vm_id, af)
+    sources = {job.source_node_id for job in newest.values()}
+    sources |= {af.source_node_id for af in waits.values()}
+    regions = geo.last_known_countries(sources)
+    out: dict[Any, dict[str, Any]] = {}
+    for pk in set(newest) | set(waits):
+        job, af = newest.get(pk), waits.get(pk)
+        if af is not None and (job is None or af.created_at > job.started_at):
+            out[pk] = _wait_view(af, regions)
+        else:
+            out[pk] = last_failover_view(job, regions)
+    return out
+
+
+def _wait_view(af: Any, regions: dict[str, str]) -> dict[str, Any]:
+    current, result = _wait_phase(af)
+    return {
+        "failover_id": af.failover_id,
+        "at": af.created_at.isoformat(),
+        "trigger": "auto",
+        "phase": current,
+        "outcome": result,
+        "from_region": regions.get(af.source_node_id) or None,
+        "to_node_ref": None,
+        "restored_point_at": None,
+        "committed_at": None,
+    }
 
 
 def last_failover_view(
@@ -3629,18 +4071,90 @@ def serialize(job: MigrationJob) -> dict[str, Any]:
         "prior_power_state": job.prior_power_state or VmPowerState.RUNNING.value,
         "source_node_id": job.source_node_id,
         "dest_node_id": job.dest_node_id,
-        "eta_s": job.restore_eta_s,
+        "eta_s": _eta_left_s(job, current),
         "rollback": _rollback_view(job),
         "undo": _undo_view(job),
-        "created_at": job.started_at.isoformat(),
-        # Null until the phase the caller sees is final (a done job is still
-        # `verifying` / `settling` until the restored VM proved it runs).
-        "finished_at": (
-            job.finished_at.isoformat()
-            if job.finished_at and current in _TERMINAL_PHASES
+        "cross_region": (
+            {
+                "from": job.cross_region_from or None,
+                "to": job.region,
+                "reason": job.cross_region_reason,
+                "operator": job.cross_region_by or None,
+            }
+            if job.cross_region_override
             else None
         ),
+        "created_at": job.started_at.isoformat(),
+        # Null until the phase the caller sees is final (a done job is still
+        # `verifying` / `settling` until the restored VM proved it runs);
+        # then when it became final — `committed_at` is the commit (VM-11).
+        "finished_at": _public_finished_at(job, current),
     }
+
+
+def _public_finished_at(job: MigrationJob, current: str) -> str | None:
+    """When the phase the caller sees became final, or null — stable once
+    shown. A FAILED job (reverted, failed, cancelled) ended at
+    `finished_at`. A DONE job (`finished_at` dates its commit) read `done`
+    once its guest proved it runs past the liveness grace: dated at that
+    earliest instant (commit + grace) — or earlier, at its reclaim, for a VM
+    destroyed inside the grace; never in the future — or, for a VM that was
+    stopped before, when it was stopped again. Never a later reclaim, which
+    may run days after (a failover's source must come back first). One that
+    failed after its commit (dest-unproven) failed when the reclaim gave up
+    on it."""
+    from . import service
+
+    if current not in _TERMINAL_PHASES or job.finished_at is None:
+        return None
+    if job.state != MigrationState.DONE.value:
+        return job.finished_at.isoformat()
+    if current == "failed":
+        return (job.source_reclaim_at or job.finished_at).isoformat()
+    # Never in the future, and never moving: a VM destroyed inside the grace
+    # is final at its reclaim; until the reclaim tick stamps it (seconds),
+    # null rather than a time that would change between two reads.
+    proven = job.finished_at + service._reclaim_liveness_grace()
+    if job.source_reclaim_at is not None:
+        proven = min(proven, job.source_reclaim_at)
+    elif proven > timezone.now():
+        return None
+    if job.cold and job.cold_settled_at is not None:
+        proven = max(proven, job.cold_settled_at)
+    return proven.isoformat()
+
+
+def _eta_left_s(job: MigrationJob, current: str) -> int | None:
+    """Seconds the restore still has to download (VM-11), recomputed at
+    every read; null once nothing is left to download or the job is final.
+
+    Staging (a restore): the bytes left at the throughput measured so far
+    in this phase, or — before the first progress report — at the rate the
+    estimate at creation assumed. `dest_activating` of a failover (the
+    destination downloads as it activates, with no progress reported): the
+    estimate at creation less the time spent in the phase, at least 1 while
+    it lasts."""
+    estimate = int(job.restore_eta_s or 0)
+    if current in _TERMINAL_PHASES or estimate <= 0:
+        return None
+    elapsed = max(0.0, (timezone.now() - job.phase_started_at).total_seconds())
+    if job.state == MigrationState.RESTORE_STAGING.value:
+        total = int(job.restore_bytes_total or 0)
+        done = int(job.restore_bytes_done or 0)
+        if total <= 0:
+            return estimate
+        left = total - done
+        if left <= 0:
+            return None
+        # A rate measured over a few seconds is noise: the estimate's until then.
+        rate = done / elapsed if done > 0 and elapsed >= 30 else total / estimate
+        return max(1, int(left / rate))
+    if job.state == MigrationState.DEST_ACTIVATING.value and job.kind == (
+        MigrationKind.FAILOVER.value
+    ):
+        return max(1, int(estimate - elapsed))
+    return None
+
 
 
 def _undo_view(job: MigrationJob) -> dict[str, Any] | None:
@@ -3671,6 +4185,81 @@ def _rollback_view(job: MigrationJob) -> dict[str, Any] | None:
         "point_taken_at": event.point_taken_at.isoformat(),
         "requested_by": {"kind": event.requested_by_kind, "id": event.requested_by_id},
         "committed_at": event.committed_at.isoformat() if event.committed_at else None,
+    }
+
+
+def list_entries(vm: Vm, *, limit: int) -> list[dict[str, Any]]:
+    """`GET /v1/vm/<id>/restore`: the VM's restore and failover jobs, and
+    the automatic failovers that never got one (waiting for room, or
+    cancelled while they waited), newest first."""
+    from .models import AutoFailover
+
+    entries: list[tuple[Any, dict[str, Any]]] = [
+        (job.started_at, serialize(job)) for job in list_jobs(vm, limit=limit)
+    ]
+    for af in (
+        AutoFailover.objects.filter(vm=vm, job__isnull=True)
+        .select_related("vm")
+        .order_by("-created_at")[:limit]
+    ):
+        entries.append((af.created_at, serialize_wait(af)))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    return [body for _, body in entries[:limit]]
+
+
+def wait_entry(vm: Vm, failover_id: str) -> dict[str, Any] | None:
+    """An automatic failover still without a job, as a job dict."""
+    from .models import AutoFailover
+
+    af = AutoFailover.objects.filter(vm=vm, failover_id=failover_id, job__isnull=True).first()
+    return serialize_wait(af) if af is not None else None
+
+
+def _wait_phase(af: Any) -> tuple[str, str | None]:
+    from .models import AutoFailoverState
+
+    if af.state == AutoFailoverState.PENDING_CAPACITY:
+        return "pending_capacity", None
+    return "failed", "cancelled"
+
+
+def serialize_wait(af: Any) -> dict[str, Any]:
+    """An `AutoFailover` with no job yet, in the job shape: `phase`
+    `pending_capacity` while it waits for a destination with room;
+    `failed` / `outcome: cancelled` once the miner came back (or the VM
+    stopped qualifying) first. Its `job_id` is the one the job will carry."""
+    current, result = _wait_phase(af)
+    return {
+        "job_id": af.failover_id,
+        "vm_id": af.vm.vm_id,
+        "kind": MigrationKind.FAILOVER.value,
+        "failover_id": af.failover_id,
+        "trigger": "auto",
+        "outcome": result,
+        "started_at": af.created_at.isoformat(),
+        "committed_at": None,
+        "restored_point_at": None,
+        "dead_miner_evidence": _evidence_view(af.evidence),
+        "run_id": None,
+        "chain_id": None,
+        "point_taken_at": None,
+        "phase": current,
+        "pct": None,
+        "reason": af.reason or None,
+        "reverted": False,
+        "prior_power_state": (
+            VmPowerState.STOPPED.value
+            if af.vm.power_state == VmPowerState.STOPPED
+            else VmPowerState.RUNNING.value
+        ),
+        "source_node_id": af.source_node_id,
+        "dest_node_id": "",
+        "eta_s": None,
+        "rollback": None,
+        "undo": None,
+        "cross_region": None,
+        "created_at": af.created_at.isoformat(),
+        "finished_at": af.finished_at.isoformat() if af.finished_at else None,
     }
 
 

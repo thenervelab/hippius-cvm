@@ -180,8 +180,10 @@ starts when the Secret is absent; vali then refuses backup work loudly
 tick on (VALI_BACKUP_ENABLED); `vmBackup.restoreEnabled` opens
 `POST /v1/vm/<id>/restore` (VALI_RESTORE_ENABLED), and
 `vmBackup.failoverManualEnabled` `POST /v1/vm/<id>/failover`
-(VALI_FAILOVER_MANUAL_ENABLED), and `vmBackup.restoreRollbackEnabled` restores
-of points of an earlier boot (VALI_RESTORE_ROLLBACK_ENABLED).
+(VALI_FAILOVER_MANUAL_ENABLED), `vmBackup.restoreRollbackEnabled` restores
+of points of an earlier boot (VALI_RESTORE_ROLLBACK_ENABLED), and
+`vmBackup.failoverAutoEnabled` the automatic failover worker
+(VALI_FAILOVER_AUTO_ENABLED).
 */}}
 {{- define "vali.backupEnv" -}}
 {{- if .Values.vmBackup.credentials.enabled }}
@@ -226,5 +228,18 @@ of points of an earlier boot (VALI_RESTORE_ROLLBACK_ENABLED).
 - name: VALI_RESTORE_ROLLBACK_ENABLED
   value: "true"
 {{- end }}
+{{- if .Values.vmBackup.failoverAutoEnabled }}
+- name: VALI_FAILOVER_AUTO_ENABLED
+  value: "true"
+{{- end }}
+{{- /* Cross-generation restore / failover (#1577). Always rendered: vali
+       refuses to start on a GENERATIONS entry that is not a vCPU model
+       (EpycMilan / EpycGenoa / EpycTurin, case-sensitive). */}}
+- name: VALI_FAILOVER_CROSS_GEN_ENABLED
+  value: {{ ternary "true" "false" (.Values.vmBackup.failoverCrossGenEnabled | default false) | quote }}
+- name: VALI_FAILOVER_CROSS_GEN_GENERATIONS
+  value: {{ .Values.vmBackup.failoverCrossGenGenerations | default "EpycGenoa,EpycTurin" | quote }}
+- name: VALI_FAILOVER_CROSS_GEN_VM_IDS
+  value: {{ .Values.vmBackup.failoverCrossGenVmIds | default "" | quote }}
 {{- end }}
 {{- end }}

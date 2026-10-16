@@ -123,6 +123,8 @@ MINERS_BOOTING = "miners-booting"
 #: Gate (k) removed every host that passed all the others: the VM's
 #: placement group already holds each of them. Final, not a retry.
 ANTI_AFFINITY_UNSATISFIABLE = "placement-anti-affinity-unsatisfiable"
+#: Gate (m) emptied the set: no host has a failover peer.
+NO_FAILOVER_CAPABLE_HOST = "no-failover-capable-host"
 
 # The two `cvm_capability` verdicts this module acts on. Re-declared as
 # plain literals rather than imported so this module stays free of the
@@ -363,6 +365,7 @@ def decide_placement(
     cdn_local_edge: frozenset[str] | None = None,
     group_occupied: frozenset[str] | None = None,
     power_policy_capable: frozenset[str] | None = None,
+    failover_capable: frozenset[str] | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -500,6 +503,10 @@ def decide_placement(
                          passed only for an `on_guest_poweroff=stop`
                          launch. HARD, no fallback to `restart`. `None` ⇒
                          no gate.
+    - `failover_capable`  gate (m): the lower-case node_ids with a failover
+                         peer (`service.failover_capable_node_ids`), passed
+                         only for a VM launched `require_failover_peer`.
+                         HARD, no fallback. `None` ⇒ no gate.
 
     Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
     candidate that passed all the others (retry shortly);
@@ -507,7 +514,8 @@ def decide_placement(
     every one of them (the fleet is reachable, just not there);
     `placement-anti-affinity-unsatisfiable` when gate (k) removed every host
     that passed all the others; `no-miner-supports-power-policy` likewise
-    for gate (l); otherwise `no-eligible-miner`.
+    for gate (l), `no-failover-capable-host` for gate (m); otherwise
+    `no-eligible-miner`.
     """
     weights = weights or SelectionWeights()
     stake_ok = stake_sufficient_by_node or {}
@@ -557,6 +565,8 @@ def decide_placement(
     # Gate (l)'s, same rule: its own category only when IT emptied the set.
     power_seen = 0
     power_skipped = 0
+    failover_seen = 0
+    failover_skipped = 0
     zombie_skipped = 0
     disk_skipped = 0
     booting = booting_by_node or {}
@@ -622,6 +632,13 @@ def decide_placement(
             power_seen += 1
             if miner.node_id.lower() not in power_policy_capable:
                 power_skipped += 1
+                continue
+        # (m) `require_failover_peer` — only a host another miner could
+        # take the VM's failover from.
+        if failover_capable is not None:
+            failover_seen += 1
+            if miner.node_id.lower() not in failover_capable:
+                failover_skipped += 1
                 continue
         # Only on-chain Active miners are ever schedulable (§23).
         if miner.status != MINER_ACTIVE:
@@ -826,6 +843,13 @@ def decide_placement(
                 f"on_guest_poweroff=stop ({power_skipped} reachable candidate(s) "
                 "report an older version, or none)",
                 "no-miner-supports-power-policy",
+            )
+        if failover_capable is not None and failover_seen and failover_skipped == failover_seen:
+            raise PlacementError(
+                "no dispatchable miner has a failover peer (another active, uncordoned "
+                f"miner of its SNP generation in its region): {failover_skipped} reachable "
+                "candidate(s) have none",
+                NO_FAILOVER_CAPABLE_HOST,
             )
         region_note = (
             f" (constrained to region {region!r}: {region_skipped} of "

@@ -12,6 +12,12 @@
 //!   report into the disk queue every interval, and pushes the health
 //!   bits. It never touches the network, so metering and health keep
 //!   working while the backend is down.
+//!
+//! The counters file and the usage queue have one writer, the
+//! [`Checkpointer`], shared by the ticker and the feed worker: the worker
+//! also checkpoints a report as soon as it applied a new revision, so the
+//! backend learns `applied_revision` (purge status) within seconds instead
+//! of at the next interval.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,6 +65,12 @@ const JITTER_PERMILLE: u32 = 200;
 const CHALLENGE_MIN_LEN: usize = 16;
 const CHALLENGE_MAX_LEN: usize = 1_024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Floor between a usage report queued for a newly applied revision and
+/// the report before it. Each is a full report, and the feed revision is
+/// fleet-wide (any customer's purge bumps it): a burst of purges must not
+/// become a burst of reports. The first revision after a quiet spell is
+/// reported at once; within a burst, at most one report per floor.
+pub const APPLIED_REPORT_MIN_INTERVAL_S: u64 = 10;
 const LOG: &str = "hippius-cdn-agent";
 
 /// What one feed round did, for pacing the next one.
@@ -148,6 +160,7 @@ pub struct FeedWorker {
     lkg_path: PathBuf,
     listeners: Vec<Box<dyn FeedListener>>,
     attest: Option<Box<dyn SnpReportProvider>>,
+    checkpointer: Option<Arc<Mutex<Checkpointer>>>,
 
     client: BackendClient,
     issuer: Issuer,
@@ -200,6 +213,7 @@ impl FeedWorker {
             lkg_path: paths.lkg.clone(),
             listeners: Vec::new(),
             attest: None,
+            checkpointer: None,
             client,
             issuer,
             cert: None,
@@ -226,6 +240,12 @@ impl FeedWorker {
 
     pub fn set_attestation(&mut self, provider: Option<Box<dyn SnpReportProvider>>) {
         self.attest = provider;
+    }
+
+    /// Report each newly applied revision at once through `checkpointer`
+    /// (the ticker's, see [`LocalTicker::checkpointer`]).
+    pub fn set_checkpointer(&mut self, checkpointer: Arc<Mutex<Checkpointer>>) {
+        self.checkpointer = Some(checkpointer);
     }
 
     pub fn applied_revision(&self) -> u64 {
@@ -280,7 +300,8 @@ impl FeedWorker {
     }
 
     /// One iteration: re-push local state if needed, one backend round,
-    /// then a usage flush. Returns the feed round's outcome.
+    /// a usage report for a newly applied revision, then a usage flush.
+    /// Returns the feed round's outcome.
     pub fn step(&mut self, now: u64) -> Result<Poll> {
         if self.push_due(now) {
             if let Err(e) = self.push_all(now) {
@@ -288,6 +309,7 @@ impl FeedWorker {
             }
         }
         let round = self.backend_round(now);
+        self.report_applied(now);
         // A usage flush failure is retried on the next round; it does not
         // slow the feed down (the queue keeps the reports). Except a 401:
         // it dropped the session, and re-registering every round would
@@ -408,6 +430,7 @@ impl FeedWorker {
         self.control.put(control::PATH_CERTS, &store.body)?;
         self.control.put(control::PATH_CONFIG, &rendered.config)?;
         log_skipped("zone not serving", &rendered.refused);
+        log_skipped("zone setting turned off", &rendered.site_ignored);
         log_skipped("certificate skipped", &store.skipped);
         self.refresh_attestation(store.default_spki_sha256);
 
@@ -662,6 +685,22 @@ impl FeedWorker {
         );
     }
 
+    /// Queue a usage report for a revision applied since the last one, so
+    /// the flush right after carries it (rate-limited by the checkpointer;
+    /// a deferred one goes at a later step).
+    fn report_applied(&self, now: u64) {
+        let Some(checkpointer) = &self.checkpointer else {
+            return;
+        };
+        let queued = checkpointer
+            .lock()
+            .map_err(|_| CdnError::Counters("lock-poisoned"))
+            .and_then(|mut c| c.checkpoint_if_applied(now));
+        if let Err(e) = queued {
+            eprintln!("{LOG}: applied-revision report: {}", e.class());
+        }
+    }
+
     fn flush_usage(&mut self) -> Result<()> {
         let Some(session) = &self.session else {
             return Ok(());
@@ -696,77 +735,59 @@ fn log_skipped(what: &str, items: &[(String, &'static str)]) {
     eprintln!("{LOG}: {} {what}: {}", items.len(), shown.join(" "));
 }
 
-/// The network-free loop (see module docs).
-pub struct LocalTicker {
-    pub cfg: Config,
-    pub counters: Arc<Mutex<Counters>>,
-    pub counters_path: PathBuf,
-    pub queue: UsageQueue,
-    pub control: Arc<dyn ControlChannel>,
-    pub observed: Arc<Mutex<Observed>>,
-    pub geoip_db: String,
-    next_persist: u64,
-    next_usage: u64,
-    next_health: u64,
+/// The counters file and the usage queue, behind one lock: the ticker's
+/// periodic persist and interval reports, and the feed worker's report for
+/// a newly applied revision, never interleave. A persist that read the
+/// counters before a checkpoint can therefore never land after it, and the
+/// `seq` on disk is never below a queued report's (the next start's final
+/// report is `seq` + 1, so it would be dropped as a replay).
+pub struct Checkpointer {
+    cfg: Config,
+    counters: Arc<Mutex<Counters>>,
+    counters_path: PathBuf,
+    queue: UsageQueue,
+    observed: Arc<Mutex<Observed>>,
+    geoip_db: String,
+    /// `applied_revision` of the last report queued (none yet: `None`).
+    reported_revision: Option<u64>,
+    last_checkpoint_at: u64,
 }
 
-impl LocalTicker {
+impl Checkpointer {
     pub fn new(
         cfg: Config,
         counters: Arc<Mutex<Counters>>,
         paths: &StatePaths,
-        control: Arc<dyn ControlChannel>,
         observed: Arc<Mutex<Observed>>,
         geoip_db: String,
-        now: u64,
     ) -> Result<Self> {
         let queue = UsageQueue::open(paths.usage_queue.clone(), DEFAULT_MAX_QUEUED)?;
         Ok(Self {
-            next_persist: now + cfg.timing.persist_interval_s,
-            next_usage: now + cfg.timing.usage_interval_s,
-            next_health: now,
             cfg,
             counters,
             counters_path: paths.counters.clone(),
             queue,
-            control,
             observed,
             geoip_db,
+            reported_revision: None,
+            last_checkpoint_at: 0,
         })
     }
 
-    pub fn run(&mut self, shutdown: &Shutdown) -> Result<()> {
-        while shutdown.sleep(Duration::from_secs(1)) {
-            self.tick(unix_now())?;
-        }
-        Ok(())
+    /// Queued report files, oldest first.
+    pub fn pending(&self) -> Result<Vec<PathBuf>> {
+        self.queue.pending()
     }
 
-    /// Do whatever is due at `now`. Only a poisoned lock is fatal.
-    pub fn tick(&mut self, now: u64) -> Result<()> {
-        if now >= self.next_usage {
-            self.next_usage = now + self.cfg.timing.usage_interval_s;
-            self.next_persist = now + self.cfg.timing.persist_interval_s;
-            if let Err(e) = self.checkpoint(now) {
-                eprintln!("{LOG}: usage checkpoint: {}", e.class());
-            }
-        } else if now >= self.next_persist {
-            self.next_persist = now + self.cfg.timing.persist_interval_s;
-            let snap = self.lock_counters()?.clone();
-            if let Err(e) = snap.persist(&self.counters_path) {
-                eprintln!("{LOG}: counters persist: {}", e.class());
-            }
-        }
-        if now >= self.next_health {
-            self.next_health = now + self.cfg.timing.health_interval_s;
-            self.push_health(now)?;
-        }
-        Ok(())
+    /// Persist the current totals (no report).
+    pub fn persist(&self) -> Result<()> {
+        let snap = self.lock_counters()?.clone();
+        snap.persist(&self.counters_path)
     }
 
     /// Persist-then-queue: the report's totals are on disk before it can
     /// be sent, so the next start's final report is never below it.
-    fn checkpoint(&mut self, now: u64) -> Result<()> {
+    pub fn checkpoint(&mut self, now: u64) -> Result<()> {
         let snap = self.lock_counters()?.begin_checkpoint();
         if let Err(e) = snap.persist(&self.counters_path) {
             self.lock_counters()?.abort_checkpoint();
@@ -785,7 +806,122 @@ impl LocalTicker {
         );
         // Best effort: a value that cannot be read is omitted.
         report.disk = crate::disk::sample(&self.cfg, now);
-        self.queue.enqueue(&report)
+        self.queue.enqueue(&report)?;
+        self.reported_revision = Some(applied);
+        self.last_checkpoint_at = now;
+        Ok(())
+    }
+
+    /// Checkpoint now when the data plane runs a revision no queued report
+    /// carries yet (applied: pushed to OpenResty, not just received), at
+    /// most once per [`APPLIED_REPORT_MIN_INTERVAL_S`], and only into an
+    /// empty queue: reports waiting there mean the backend is not taking
+    /// them, an extra one would only fill the queue (whose oldest report
+    /// may be a closed epoch's last), and the next interval report carries
+    /// the revision anyway. Returns whether a report was queued.
+    pub fn checkpoint_if_applied(&mut self, now: u64) -> Result<bool> {
+        let (applied, feed_applied) = self
+            .observed
+            .lock()
+            .map(|o| (o.applied_revision, o.feed_applied))
+            .map_err(|_| CdnError::Counters("lock-poisoned"))?;
+        // A clock stepped back (the host sets the guest's) never holds
+        // reports back until it catches up.
+        let spaced = now >= self.last_checkpoint_at + APPLIED_REPORT_MIN_INTERVAL_S
+            || now < self.last_checkpoint_at;
+        let due = feed_applied
+            && self.reported_revision != Some(applied)
+            && spaced
+            && self.queue.pending()?.is_empty();
+        if due {
+            self.checkpoint(now)?;
+        }
+        Ok(due)
+    }
+
+    fn lock_counters(&self) -> Result<std::sync::MutexGuard<'_, Counters>> {
+        self.counters
+            .lock()
+            .map_err(|_| CdnError::Counters("lock-poisoned"))
+    }
+}
+
+/// The network-free loop (see module docs).
+pub struct LocalTicker {
+    pub cfg: Config,
+    pub control: Arc<dyn ControlChannel>,
+    pub observed: Arc<Mutex<Observed>>,
+    checkpointer: Arc<Mutex<Checkpointer>>,
+    next_persist: u64,
+    next_usage: u64,
+    next_health: u64,
+}
+
+impl LocalTicker {
+    pub fn new(
+        cfg: Config,
+        counters: Arc<Mutex<Counters>>,
+        paths: &StatePaths,
+        control: Arc<dyn ControlChannel>,
+        observed: Arc<Mutex<Observed>>,
+        geoip_db: String,
+        now: u64,
+    ) -> Result<Self> {
+        let checkpointer = Checkpointer::new(
+            cfg.clone(),
+            counters,
+            paths,
+            Arc::clone(&observed),
+            geoip_db,
+        )?;
+        Ok(Self {
+            next_persist: now + cfg.timing.persist_interval_s,
+            next_usage: now + cfg.timing.usage_interval_s,
+            next_health: now,
+            cfg,
+            control,
+            observed,
+            checkpointer: Arc::new(Mutex::new(checkpointer)),
+        })
+    }
+
+    /// The checkpointer, for the feed worker ([`FeedWorker::set_checkpointer`]).
+    pub fn checkpointer(&self) -> Arc<Mutex<Checkpointer>> {
+        Arc::clone(&self.checkpointer)
+    }
+
+    pub fn run(&mut self, shutdown: &Shutdown) -> Result<()> {
+        while shutdown.sleep(Duration::from_secs(1)) {
+            self.tick(unix_now())?;
+        }
+        Ok(())
+    }
+
+    /// Do whatever is due at `now`. Only a poisoned lock is fatal.
+    pub fn tick(&mut self, now: u64) -> Result<()> {
+        if now >= self.next_usage {
+            self.next_usage = now + self.cfg.timing.usage_interval_s;
+            self.next_persist = now + self.cfg.timing.persist_interval_s;
+            if let Err(e) = self.lock_checkpointer()?.checkpoint(now) {
+                eprintln!("{LOG}: usage checkpoint: {}", e.class());
+            }
+        } else if now >= self.next_persist {
+            self.next_persist = now + self.cfg.timing.persist_interval_s;
+            if let Err(e) = self.lock_checkpointer()?.persist() {
+                eprintln!("{LOG}: counters persist: {}", e.class());
+            }
+        }
+        if now >= self.next_health {
+            self.next_health = now + self.cfg.timing.health_interval_s;
+            self.push_health(now)?;
+        }
+        Ok(())
+    }
+
+    fn lock_checkpointer(&self) -> Result<std::sync::MutexGuard<'_, Checkpointer>> {
+        self.checkpointer
+            .lock()
+            .map_err(|_| CdnError::Counters("lock-poisoned"))
     }
 
     fn push_health(&mut self, now: u64) -> Result<()> {
@@ -807,12 +943,6 @@ impl LocalTicker {
             Err(e) => eprintln!("{LOG}: health push: {}", e.class()),
         }
         Ok(())
-    }
-
-    fn lock_counters(&self) -> Result<std::sync::MutexGuard<'_, Counters>> {
-        self.counters
-            .lock()
-            .map_err(|_| CdnError::Counters("lock-poisoned"))
     }
 }
 
@@ -929,6 +1059,8 @@ pub fn run(cfg: Config, shutdown: Shutdown) -> Result<()> {
         geoip_db,
         now,
     )?;
+
+    worker.set_checkpointer(ticker.checkpointer());
 
     let rx_counters = Arc::clone(&counters);
     let rx_stop = shutdown.clone();
@@ -1516,7 +1648,7 @@ mod tests {
         )
         .unwrap();
         t.tick(now + 60).unwrap();
-        let queued = t.queue.pending().unwrap();
+        let queued = t.checkpointer().lock().unwrap().pending().unwrap();
         let body: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&queued[0]).unwrap()).unwrap();
         let disk = &body["disk"];
@@ -1565,7 +1697,7 @@ mod tests {
         assert!(paths.counters.exists());
 
         t.tick(1_060).unwrap();
-        let queued = t.queue.pending().unwrap();
+        let queued = t.checkpointer().lock().unwrap().pending().unwrap();
         assert_eq!(queued.len(), 1);
         let report: UsageReport =
             serde_json::from_slice(&std::fs::read(&queued[0]).unwrap()).unwrap();
@@ -1581,6 +1713,170 @@ mod tests {
         *control.fail_with.lock().unwrap() = Some(RESYNC_REQUIRED);
         t.tick(1_070).unwrap();
         assert!(observed.lock().unwrap().resync_needed);
+    }
+
+    fn checkpointer_rig(dir: &Path) -> (Checkpointer, Arc<Mutex<Observed>>, StatePaths) {
+        let mut cfg = Config::from_strs(crate::config::tests::UID, NODE).unwrap();
+        cfg.paths.state_dir = dir.to_path_buf();
+        let paths = StatePaths::new(dir);
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let c = Checkpointer::new(
+            cfg,
+            Arc::new(Mutex::new(Counters::fresh())),
+            &paths,
+            Arc::clone(&observed),
+            "dbip-test".into(),
+        )
+        .unwrap();
+        (c, observed, paths)
+    }
+
+    fn queued_revisions(c: &Checkpointer) -> Vec<(u64, u64)> {
+        c.pending()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let r: UsageReport = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+                (r.seq, r.applied_revision)
+            })
+            .collect()
+    }
+
+    /// What a successful flush does to the queue.
+    fn sent(c: &Checkpointer) {
+        for p in c.pending().unwrap() {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    fn seq_on_disk(paths: &StatePaths) -> u64 {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.counters).unwrap()).unwrap();
+        v["seq"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_newly_applied_revision_is_reported_at_once_rate_limited() {
+        let floor = APPLIED_REPORT_MIN_INTERVAL_S;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut c, observed, paths) = checkpointer_rig(dir.path());
+        let applied = |rev: u64| {
+            let mut o = observed.lock().unwrap();
+            o.applied_revision = rev;
+            o.feed_applied = true;
+        };
+        // Nothing applied yet: nothing to report.
+        assert!(!c.checkpoint_if_applied(1_000).unwrap());
+        applied(10);
+        assert!(c.checkpoint_if_applied(1_000).unwrap());
+        assert_eq!(queued_revisions(&c), [(1, 10)]);
+        // Not sent yet: nothing queues behind it, whatever is applied.
+        applied(11);
+        assert!(!c.checkpoint_if_applied(1_000 + floor).unwrap());
+        sent(&c);
+        applied(10);
+        assert!(!c.checkpoint_if_applied(1_001).unwrap(), "already reported");
+        // A burst: the next revision waits out the floor, then goes.
+        applied(11);
+        assert!(!c.checkpoint_if_applied(1_001).unwrap());
+        applied(12);
+        assert!(!c.checkpoint_if_applied(1_000 + floor - 1).unwrap());
+        assert!(c.checkpoint_if_applied(1_000 + floor).unwrap());
+        assert_eq!(queued_revisions(&c), [(2, 12)]);
+        sent(&c);
+        // A clock stepped back does not hold the next one back.
+        applied(13);
+        assert!(c.checkpoint_if_applied(900).unwrap());
+        assert_eq!(queued_revisions(&c), [(3, 13)]);
+        sent(&c);
+        // Persist-then-queue: the counters file is at the last queued seq.
+        assert_eq!(seq_on_disk(&paths), 3);
+        // An interval report carries the revision too: nothing extra after it.
+        applied(14);
+        c.checkpoint(1_100).unwrap();
+        sent(&c);
+        assert!(!c.checkpoint_if_applied(1_200).unwrap());
+        // A periodic persist never moves seq back under a queued report.
+        c.persist().unwrap();
+        assert_eq!(seq_on_disk(&paths), 4);
+    }
+
+    /// A checkpointer on the rig's state dir and observed state, handed to
+    /// its worker.
+    fn rig_checkpointer(r: &mut Rig) -> Arc<Mutex<Checkpointer>> {
+        let mut cfg = Config::from_strs(crate::config::tests::UID, NODE).unwrap();
+        cfg.paths.state_dir = r.dir.path().to_path_buf();
+        let c = Arc::new(Mutex::new(
+            Checkpointer::new(
+                cfg,
+                Arc::new(Mutex::new(Counters::fresh())),
+                &r.paths,
+                Arc::clone(&r.observed),
+                "dbip-test".into(),
+            )
+            .unwrap(),
+        ));
+        r.worker.set_checkpointer(Arc::clone(&c));
+        c
+    }
+
+    #[test]
+    fn the_applied_revision_reaches_the_backend_in_the_same_round() {
+        let key = NodeKey::derive(&[7u8; 32]);
+        let mock = happy_backend(node_cert_pem(&key, SAN, 7), snapshot_with_wildcard(10));
+        let mut r = rig(&mock);
+        let c = rig_checkpointer(&mut r);
+        let now = unix_now();
+        r.worker.step(now).unwrap();
+        // Applied (pushed to OpenResty), reported and flushed in one round.
+        assert_eq!(r.control.last("/v1/config").unwrap()["revision"], 10);
+        let usage = mock.requests_to("/api/cdn/node/usage/");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].json()["applied_revision"], 10);
+        assert!(c.lock().unwrap().pending().unwrap().is_empty());
+        // Nothing new: no further report.
+        r.worker.step(now + 5).unwrap();
+        assert_eq!(mock.requests_to("/api/cdn/node/usage/").len(), 1);
+    }
+
+    #[test]
+    fn the_last_known_good_revision_is_reported_at_boot_backend_down() {
+        let key = NodeKey::derive(&[7u8; 32]);
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mock = happy_backend_until(
+            node_cert_pem(&key, SAN, 7),
+            snapshot_with_wildcard(10),
+            Arc::clone(&down),
+        );
+        let mut r = rig(&mock);
+        let c = rig_checkpointer(&mut r);
+        let Applied::New(lkg) = FeedState::default()
+            .apply(crate::feed::tests::resp(snapshot_with_wildcard(7)))
+            .unwrap()
+        else {
+            panic!()
+        };
+        r.worker.adopt_lkg(*lkg);
+        assert!(r.worker.step(unix_now()).is_err(), "the backend is down");
+        // OpenResty runs the LKG revision: that is what the report says, kept
+        // queued until the backend answers.
+        assert_eq!(r.control.last("/v1/config").unwrap()["revision"], 7);
+        assert_eq!(queued_revisions(&c.lock().unwrap()), [(1, 7)]);
+        // Still down: the queue holds it, no second report piles up.
+        assert!(r.worker.step(unix_now() + 60).is_err());
+        assert_eq!(c.lock().unwrap().pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_revision_openresty_did_not_take_is_not_reported() {
+        let key = NodeKey::derive(&[7u8; 32]);
+        let mock = happy_backend(node_cert_pem(&key, SAN, 7), snapshot_with_wildcard(10));
+        let mut r = rig(&mock);
+        let c = rig_checkpointer(&mut r);
+        *r.control.fail_with.lock().unwrap() = Some("down");
+        assert!(r.worker.step(unix_now()).is_err());
+        assert!(mock.requests_to("/api/cdn/node/usage/").is_empty());
+        assert!(c.lock().unwrap().pending().unwrap().is_empty());
     }
 
     #[test]

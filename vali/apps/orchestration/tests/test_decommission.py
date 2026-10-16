@@ -15,7 +15,7 @@ from apps.scheduler.models import Placement, PlacementStatus
 from .conftest import FakeEffects
 from .factories import make_launch_record, make_service_client, make_vm
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture(autouse=True)

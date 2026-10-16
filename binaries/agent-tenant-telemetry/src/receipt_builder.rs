@@ -12,6 +12,7 @@
 use hippius_types::served_receipt::{ServedDeliveryReceipt, SignedServedDeliveryReceipt};
 
 use crate::challenge::Challenge;
+use crate::disk_stats::{DiskEvidence, DiskEvidenceSource, NoDiskEvidence};
 use crate::error::{Result, TelemetryError};
 use crate::signer::TelemetrySigner;
 
@@ -19,6 +20,15 @@ use crate::signer::TelemetrySigner;
 /// per-`(vm_id, lease_id)`; a freshly established signer key (the key
 /// is RAM-only and regenerated each boot) starts its sequence at 1.
 const FIRST_SEQ: u64 = 1;
+
+/// One receipt's window and challenge.
+struct Window<'a> {
+    challenge: &'a Challenge,
+    observed_degradation_bps: u32,
+    period_start: u64,
+    period_end: u64,
+    expiry: u64,
+}
 
 /// Builds successive signed `ServedDeliveryReceipt`s for one VM + lease.
 pub struct ReceiptBuilder {
@@ -31,6 +41,9 @@ pub struct ReceiptBuilder {
     next_seq: u64,
     /// `period_end` of the last receipt — the next `period_start`.
     last_period_end: u64,
+    /// The optional disk evidence ([`crate::disk_stats`]); its window
+    /// moves with the receipt's.
+    disk: Box<dyn DiskEvidenceSource + Send>,
 }
 
 impl ReceiptBuilder {
@@ -53,7 +66,14 @@ impl ReceiptBuilder {
             resource_class,
             next_seq: FIRST_SEQ,
             last_period_end: genesis_period_start,
+            disk: Box::new(NoDiskEvidence),
         }
+    }
+
+    /// Carry disk evidence from `source` in every receipt.
+    pub fn with_disk_evidence(mut self, source: Box<dyn DiskEvidenceSource + Send>) -> Self {
+        self.disk = source;
+        self
     }
 
     /// The `monotonic_seq` the next [`build_next`](Self::build_next)
@@ -66,6 +86,26 @@ impl ReceiptBuilder {
     /// receipt's `period_end`).
     pub fn next_period_start(&self) -> u64 {
         self.last_period_end
+    }
+
+    fn receipt<'a>(&'a self, w: &Window<'a>, disk: &'a DiskEvidence) -> ServedDeliveryReceipt<'a> {
+        ServedDeliveryReceipt {
+            validator_id: &w.challenge.validator_id,
+            validator_nonce: &w.challenge.validator_nonce,
+            epoch: w.challenge.epoch,
+            vm_id: &self.vm_id,
+            lease_id: &self.lease_id,
+            family_id: &self.family_id,
+            node_id: &self.node_id,
+            resource_class: &self.resource_class,
+            monotonic_seq: self.next_seq,
+            observed_degradation_bps: w.observed_degradation_bps,
+            period_start: w.period_start,
+            period_end: w.period_end,
+            expiry: w.expiry,
+            disk_io: disk.io.as_deref(),
+            disk_probe: disk.probe.as_ref(),
+        }
     }
 
     /// Build + sign the receipt for the interval ending at `now_unix`.
@@ -107,28 +147,33 @@ impl ReceiptBuilder {
             .checked_add(1)
             .ok_or(TelemetryError::Receipt("seq-overflow"))?;
 
-        let receipt = ServedDeliveryReceipt {
-            validator_id: &challenge.validator_id,
-            validator_nonce: &challenge.validator_nonce,
-            epoch: challenge.epoch,
-            vm_id: &self.vm_id,
-            lease_id: &self.lease_id,
-            family_id: &self.family_id,
-            node_id: &self.node_id,
-            resource_class: &self.resource_class,
-            monotonic_seq: self.next_seq,
+        let (evidence, snapshot) = self.disk.sample();
+        let window = Window {
+            challenge,
             observed_degradation_bps,
             period_start,
             period_end,
             expiry,
         };
 
-        // Sign — only a successful signature commits the state.
-        let signed = signer.sign_served_receipt(&receipt)?;
+        // Sign — only a successful signature commits the state. Disk
+        // evidence is optional: a receipt it would break is signed
+        // without it.
+        let signed = match signer.sign_served_receipt(&self.receipt(&window, &evidence)) {
+            Ok(signed) => signed,
+            Err(_) if evidence != DiskEvidence::default() => {
+                eprintln!(
+                    "hippius-agent-tenant-telemetry: disk evidence refused, receipt sent without it"
+                );
+                signer.sign_served_receipt(&self.receipt(&window, &DiskEvidence::default()))?
+            }
+            Err(e) => return Err(e),
+        };
 
         // Signature obtained — commit. Neither assignment can fail.
         self.next_seq = next_seq_after;
         self.last_period_end = period_end;
+        self.disk.commit(snapshot);
         Ok(signed)
     }
 }
@@ -184,6 +229,8 @@ mod tests {
             period_start,
             period_end,
             expiry,
+            disk_io: None,
+            disk_probe: None,
         }
     }
 
@@ -200,6 +247,101 @@ mod tests {
         assert_eq!(signed.body, expected.canonical().unwrap());
         // And the signature verifies under the signer's own key.
         verify_served_receipt(&signer.verifying_key(), &signed, &expected).unwrap();
+    }
+
+    /// A scripted disk source: `evidence` every sample, and the commits.
+    struct Scripted {
+        evidence: DiskEvidence,
+        commits: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl DiskEvidenceSource for Scripted {
+        fn sample(&self) -> (DiskEvidence, crate::disk_stats::Snapshot) {
+            (self.evidence.clone(), Default::default())
+        }
+        fn commit(&self, _snapshot: crate::disk_stats::Snapshot) {
+            *self.commits.lock().unwrap() += 1;
+        }
+    }
+
+    fn io() -> Vec<hippius_types::disk_stats::DiskIoDelta> {
+        vec![hippius_types::disk_stats::DiskIoDelta {
+            dev: "vda".into(),
+            serial: "hippius-os".into(),
+            state: hippius_types::disk_stats::DiskIoState::Ok,
+            r_ios: 1,
+            r_sectors: 2,
+            r_ticks_ms: 3,
+            w_ios: 4,
+            w_sectors: 5,
+            w_ticks_ms: 6,
+            io_ticks_ms: 7,
+            tiq_ms: 8,
+            inflight: 0,
+        }]
+    }
+
+    #[test]
+    fn disk_evidence_is_signed_in_and_its_window_moves_only_on_success() {
+        let signer = Ed25519TelemetrySigner::generate().unwrap();
+        let ch = challenge();
+        let commits = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let evidence = DiskEvidence {
+            io: Some(io()),
+            probe: None,
+        };
+        let mut b = builder(100).with_disk_evidence(Box::new(Scripted {
+            evidence: evidence.clone(),
+            commits: commits.clone(),
+        }));
+        // A failed interval does not move the disk window.
+        assert!(b.build_next(&signer, &ch, 0, 100, 3_600).is_err());
+        assert_eq!(*commits.lock().unwrap(), 0);
+        let signed = b.build_next(&signer, &ch, 0, 160, 3_600).unwrap();
+        assert_eq!(*commits.lock().unwrap(), 1);
+        let mut expected = expect(&ch, 1, 0, 100, 160, 160 + 3_600);
+        let list = io();
+        expected.disk_io = Some(&list);
+        assert_eq!(signed.body, expected.canonical().unwrap());
+        verify_served_receipt(&signer.verifying_key(), &signed, &expected).unwrap();
+    }
+
+    #[test]
+    fn evidence_the_receipt_refuses_is_dropped_not_the_receipt() {
+        let signer = Ed25519TelemetrySigner::generate().unwrap();
+        let ch = challenge();
+        // A probe result naming another VM: `canonical()` refuses it.
+        let probe = hippius_types::disk_stats::DiskProbeResult {
+            run_id: [1; 16],
+            nonce: [2; 32],
+            vm_id: "vm-other".into(),
+            vcpus: 2,
+            kernel: "6.8".into(),
+            release_version: 5,
+            started_at: 1,
+            finished_at: 2,
+            targets: vec![hippius_types::disk_stats::DiskProbeTarget {
+                slot: "os".into(),
+                profile: "v1".into(),
+                metrics: vec![("seq_read_mbps".into(), 1)],
+                hist_qd1: vec![0; hippius_types::disk_stats::HIST_BUCKETS],
+                error: String::new(),
+            }],
+        };
+        let mut b = builder(100).with_disk_evidence(Box::new(Scripted {
+            evidence: DiskEvidence {
+                io: Some(io()),
+                probe: Some(probe),
+            },
+            commits: Default::default(),
+        }));
+        let signed = b.build_next(&signer, &ch, 0, 160, 3_600).unwrap();
+        assert_eq!(
+            signed.body,
+            expect(&ch, 1, 0, 100, 160, 160 + 3_600)
+                .canonical()
+                .unwrap()
+        );
     }
 
     #[test]

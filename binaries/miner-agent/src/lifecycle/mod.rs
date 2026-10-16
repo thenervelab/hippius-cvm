@@ -212,6 +212,19 @@ pub struct CvmLifecycle {
     /// lockstep) so the integration suite runs without root on
     /// `/var/lib/hippius-miner`.
     data_disk_root: std::path::PathBuf,
+    /// The storage pools ([`crate::storage::pools`]): the implicit
+    /// `default` at `data_disk_root` unless the operator declared
+    /// `[[storage.pools]]` or an applied `storage-config`
+    /// ([`crate::storage::state`]). Every launch reserves on `default` in
+    /// this phase; the others are accounted and reclaimed from.
+    pools: Arc<crate::storage::state::StorageState>,
+    /// Where the pool gate and destroy read the host
+    /// ([`crate::storage::PoolHost`]).
+    pool_host: Arc<crate::storage::PoolHost>,
+    /// VMs whose disks the pending-reclaim drain is unlinking on a pool
+    /// right now ([`Self::reclaim_pending_pool_disks`]): a launch of the
+    /// same id waits for it.
+    reclaiming: Mutex<std::collections::HashSet<VmId>>,
     /// Optional display-only guest-boot progress sink. When present, a
     /// successful domain start ([`Self::run_domain`]) fires a fire-and-
     /// forget `booting` milestone for the launching VM so vali's
@@ -357,6 +370,14 @@ impl CvmLifecycle {
             state_disk_root: std::path::PathBuf::from(qemu_config::MINER_ROOT),
             skip_state_disk_provision: false,
             data_disk_root: std::path::PathBuf::from(qemu_config::MINER_ROOT),
+            pools: Arc::new(crate::storage::state::StorageState::with_pools(
+                crate::storage::StoragePools::implicit(
+                    std::path::PathBuf::from(qemu_config::MINER_ROOT),
+                    host.total_disk_gb,
+                ),
+            )),
+            pool_host: Arc::new(crate::storage::PoolHost::system()),
+            reclaiming: Mutex::new(std::collections::HashSet::new()),
             progress: None,
             ticket_pushes: Mutex::new(HashMap::new()),
             ticket_delivery: Mutex::new(HashMap::new()),
@@ -403,7 +424,186 @@ impl CvmLifecycle {
     pub fn with_state_disk_root(mut self, root: std::path::PathBuf) -> Self {
         self.data_disk_root = root.clone();
         self.state_disk_root = root;
+        self.refresh_implicit_pools();
         self
+    }
+
+    /// Keep the implicit `default` pool on `data_disk_root` when the root
+    /// moves (no `[[storage.pools]]` declared).
+    fn refresh_implicit_pools(&mut self) {
+        if !self.pools.pools().is_configured() {
+            self.pools = Arc::new(crate::storage::state::StorageState::with_pools(
+                crate::storage::StoragePools::implicit(
+                    self.data_disk_root.clone(),
+                    self.host.total_disk_gb,
+                ),
+            ));
+        }
+    }
+
+    /// Use the operator's `[[storage.pools]]`. Config validation guarantees
+    /// its `default` pool is `data_disk_root` with the host disk budget, so
+    /// every existing path (launch, backups, migration) is unchanged.
+    pub fn with_storage_pools(mut self, pools: Arc<crate::storage::StoragePools>) -> Self {
+        self.pools = Arc::new(crate::storage::state::StorageState::with_pools(
+            (*pools).clone(),
+        ));
+        self
+    }
+
+    /// Run with the shared storage set (production: the one the
+    /// `storage-config` route replaces). The same guarantees as
+    /// [`Self::with_storage_pools`] hold for every set it can hold.
+    pub fn with_storage_state(mut self, state: Arc<crate::storage::state::StorageState>) -> Self {
+        self.pools = state;
+        self
+    }
+
+    /// The storage pools right now.
+    pub fn storage_pools(&self) -> Arc<crate::storage::StoragePools> {
+        self.pools.pools()
+    }
+
+    /// Read the host through `host` in the pool gate and destroy (tests).
+    pub fn with_pool_host(mut self, host: Arc<crate::storage::PoolHost>) -> Self {
+        self.pool_host = host;
+        self
+    }
+
+    /// Whether `pool` can take a new disk now. `default` always can, as
+    /// it always could (its space and budget are gated as before). Any
+    /// other pool must be `active`, open to OS disks, and pass its host
+    /// checks on its bound filesystem; else 507 `pool-unavailable:<id>`
+    /// and vali re-places.
+    pub fn admit_pool(&self, pool: &crate::storage::pools::Pool) -> Result<()> {
+        if pool.is_default() {
+            return Ok(());
+        }
+        let unavailable = || MinerAgentError::PoolUnavailable(pool.unavailable_class());
+        if pool.draining || !pool.os_disks {
+            return Err(unavailable());
+        }
+        let set = self.pools.current();
+        let binding_errors = set
+            .bindings
+            .errors_now(&set.pools, &self.pool_host.fs_identity);
+        let checks = crate::storage::pools::check_pools(
+            &set.pools,
+            self.pool_host.pool_fs.as_ref(),
+            &binding_errors,
+        );
+        let active = checks
+            .get(&pool.id)
+            .is_some_and(|c| c.state == hippius_types::storage_report::PoolState::Active)
+            && set
+                .bindings
+                .is_bound(&pool.id, &pool.path, &self.pool_host.fs_identity);
+        if active {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
+    }
+
+    /// Whether a launch of `vm_id` on `pool` goes through
+    /// [`Self::admit_pool`]: never on `default`; on another pool unless the
+    /// VM's disk is already there AND the pool is on its bound filesystem
+    /// (a file on a pool off its filesystem proves nothing, like a missing
+    /// one).
+    fn needs_admission(&self, pool: &crate::storage::pools::Pool, vm_id: &VmId) -> bool {
+        if pool.is_default() {
+            return false;
+        }
+        let existing = data_disk::data_disk_path(&pool.path, vm_id).exists()
+            || golden::overlay_disk_path(&pool.path, vm_id).exists();
+        !(existing
+            && self.pools.current().bindings.is_bound(
+                &pool.id,
+                &pool.path,
+                &self.pool_host.fs_identity,
+            ))
+    }
+
+    /// Before a launch on `pool`: let a drain unlinking this id's old
+    /// disks on a pool finish (up to 30 s). A `default` launch never lands
+    /// on another pool's files, so it never waits.
+    async fn wait_for_reclaim(&self, pool: &crate::storage::pools::Pool, vm_id: &VmId) {
+        for _ in 0..300 {
+            if pool.is_default() || !self.is_reclaiming(vm_id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Under the handles lock: a launch on a pool other than `default`
+    /// whose id a drain still holds is refused, `pool-unavailable:<pool>`.
+    fn check_not_reclaiming(&self, pool: &crate::storage::pools::Pool, vm_id: &VmId) -> Result<()> {
+        if !pool.is_default() && self.is_reclaiming(vm_id) {
+            return Err(MinerAgentError::PoolUnavailable(pool.unavailable_class()));
+        }
+        Ok(())
+    }
+
+    fn is_reclaiming(&self, vm_id: &VmId) -> bool {
+        self.reclaiming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(vm_id)
+    }
+
+    /// Unlink the disks earlier destroys could not reach on a pool that
+    /// was off its filesystem, now that it is back
+    /// ([`crate::storage::reclaim`]). Blocking. Returns how many VMs were
+    /// reclaimed.
+    pub fn reclaim_pending_pool_disks(&self) -> std::io::Result<usize> {
+        let ready = crate::storage::reclaim::ready(
+            &self.state_disk_root,
+            &self.pools.current(),
+            &self.pool_host.fs_identity,
+        )?;
+        let mut reclaimed = 0;
+        for item in ready {
+            // Reserve the id under the handles lock (a launch of it takes
+            // that lock before it creates a disk, and waits on the
+            // reservation), then unlink without holding it: a slow or
+            // dying disk must not stall the agent. A poisoned lock stops
+            // the drain (fail closed).
+            let live = {
+                let handles = self
+                    .lock_handles()
+                    .map_err(|_| std::io::Error::other("handles lock poisoned"))?;
+                let live = handles.contains_key(&item.vm);
+                if !live {
+                    self.reclaiming
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(item.vm.clone());
+                }
+                live
+            };
+            if !live {
+                let unlinked = crate::storage::reclaim::unlink(&item);
+                self.reclaiming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&item.vm);
+                if unlinked.is_err() {
+                    // Kept pending; the next items still get their turn.
+                    eprintln!(
+                        "hippius-miner-agent: storage: vm {} disks on pool {} not reclaimed yet",
+                        item.vm.as_str(),
+                        item.pool
+                    );
+                    continue;
+                }
+                reclaimed += 1;
+            }
+            // Reclaimed, or live again under the same id (its files are
+            // the new VM's): either way nothing is left to do.
+            crate::storage::reclaim::done(&self.state_disk_root, &item)?;
+        }
+        Ok(reclaimed)
     }
 
     /// Point the per-VM DATA and STATE disk roots at operator-chosen
@@ -421,6 +621,7 @@ impl CvmLifecycle {
     ) -> Self {
         self.data_disk_root = data_disk_root;
         self.state_disk_root = state_disk_root;
+        self.refresh_implicit_pools();
         self
     }
 
@@ -823,10 +1024,26 @@ impl CvmLifecycle {
         // only once the launch is admitted: a refused duplicate or an
         // over-budget launch returns here having allocated nothing.
         {
+            let pools = self.pools.pools();
+            let pool = pools.launch_pool();
+            if !pool.is_default() {
+                // A new disk needs a pool that can take one (a VM whose
+                // disk is already there, on its bound filesystem, reuses
+                // it). The host checks read the disk: outside the lock,
+                // after the cheap duplicate check.
+                if self.lock_handles()?.contains_key(&vm_id) {
+                    return Err(MinerAgentError::AlreadyLaunched);
+                }
+                if self.needs_admission(pool, &vm_id) {
+                    self.admit_pool(pool)?;
+                }
+            }
+            self.wait_for_reclaim(pool, &vm_id).await;
             let mut handles = self.lock_handles()?;
             if handles.contains_key(&vm_id) {
                 return Err(MinerAgentError::AlreadyLaunched);
             }
+            self.check_not_reclaiming(pool, &vm_id)?;
             check_capacity(
                 &handles,
                 self.host,
@@ -836,6 +1053,9 @@ impl CvmLifecycle {
                 // legacy vde — both are the per-VM writable disk to
                 // reserve. (For legacy it equals `config.data_disk_size_gb`.)
                 disk_budget_gb,
+                &pools,
+                // Every OS disk lands on `default` in this phase.
+                pools.launch_pool(),
             )?;
             config.cid = self.cids.allocate(&vm_id)?;
             // A fresh launch supersedes any unverified re-adoption of this
@@ -1177,19 +1397,13 @@ impl CvmLifecycle {
         }
 
         // ── Phase 2: confirm the domain is down (async) ──────────────
-        let destroyed = self.driver.destroy_domain(domain_id, false).await.is_ok();
-        // If the force-destroy did not clearly succeed, confirm with
-        // a state query. A query error is treated as "not confirmed
-        // down" (it may mean libvirt is unreachable — the same fail-
-        // closed reading `run_stop` applies). The query MUST precede
-        // any `undefine` — undefine removes the domain record, after
+        // A failed force-destroy is confirmed by a state query, and a
+        // query error reads as "not confirmed down" (the fail-closed
+        // rule `run_stop` shares). The query MUST precede any
+        // `undefine` — undefine removes the domain record, after
         // which a state query returns "not found" and we'd no longer
         // be able to tell "vanished cleanly" from "libvirt down".
-        let down = destroyed
-            || matches!(
-                self.driver.query_domain_state(domain_id).await,
-                Ok(DomainState::ShutOff | DomainState::Crashed | DomainState::NoState)
-            );
+        let down = self.force_destroy_confirmed(domain_id).await.is_ok();
 
         // ── Phase 3: undefine the libvirt record ────────────────────
         // Only after the domain is confirmed down. Leaving a `shut off`
@@ -1442,6 +1656,13 @@ impl CvmLifecycle {
             data_disk::data_disk_path(&self.data_disk_root, vm_id),
             state_disk::state_disk_path(&self.state_disk_root, vm_id),
         ];
+        // The same per-VM disks on every other storage pool: wherever a
+        // disk of this VM sits, the reclaim finds it (none without
+        // `[[storage.pools]]`).
+        let set = self.pools.current();
+        for pool in set.pools.non_default() {
+            files.extend(crate::storage::reclaim::pool_files(&pool.path, vm_id));
+        }
         // A staged restore's retained originals (`*.pre-restore-<id>`),
         // by the exact paths its persisted record names — never a glob.
         files.extend(crate::backup::staged::retained_files(
@@ -1531,6 +1752,30 @@ impl CvmLifecycle {
             DomainLiveness::Down => {}
             DomainLiveness::Live | DomainLiveness::Unknown => {
                 return Err(MinerAgentError::Destroy("domain-still-up"));
+            }
+        }
+
+        // On a pool off its bound filesystem (unmounted, another one
+        // mounted there) a missing file proves nothing: the disk may be on
+        // the filesystem that is gone. Now that the domain is proven down,
+        // the VM is recorded against that pool and its files there are
+        // unlinked once it is back ([`crate::storage::reclaim`]). The
+        // destroy itself goes on: the KEK erase is what kills the data.
+        if set.pools.non_default().next().is_some() {
+            let root = self.state_disk_root.clone();
+            let host = Arc::clone(&self.pool_host);
+            let set = Arc::clone(&set);
+            let vm = vm_id.clone();
+            let recorded = tokio::task::spawn_blocking(move || {
+                let unbound = crate::storage::reclaim::unbound_pools(&set, &host.fs_identity);
+                crate::storage::reclaim::record(&root, &unbound, &vm)
+            })
+            .await;
+            if !matches!(recorded, Ok(Ok(()))) {
+                eprintln!(
+                    "hippius-miner-agent: destroy: vm {} pending pool reclaim not recorded",
+                    vm_id.as_str()
+                );
             }
         }
 
@@ -1627,15 +1872,16 @@ impl CvmLifecycle {
     /// `virsh shutdown`-then-wait-then-`destroy` for a graceful stop,
     /// or a single force `destroy`.
     ///
-    /// The graceful path tolerates a guest that is already down: if
-    /// the ACPI shutdown request or the power-off wait fails it
-    /// escalates to a force destroy, and confirms the result with a
-    /// final state query — succeeding only on positive proof the
-    /// domain is down, so a libvirt outage can never make a stop
-    /// falsely report success and drop a live CVM's handle.
+    /// Both paths tolerate a guest that is already down: if the ACPI
+    /// shutdown request or the power-off wait fails the graceful path
+    /// escalates to a force destroy, and every force destroy is
+    /// confirmed by [`Self::force_destroy_confirmed`] — succeeding only
+    /// on positive proof the domain is down, so a libvirt outage can
+    /// never make a stop falsely report success and drop a live CVM's
+    /// handle.
     async fn run_stop(&self, domain_id: &DomainId, graceful: bool) -> Result<()> {
         if !graceful {
-            return self.driver.destroy_domain(domain_id, false).await;
+            return self.force_destroy_confirmed(domain_id).await;
         }
         // Best-effort ACPI shutdown + power-off wait.
         if self.driver.destroy_domain(domain_id, true).await.is_ok()
@@ -1644,15 +1890,23 @@ impl CvmLifecycle {
             return Ok(());
         }
         // Did not cleanly power off — escalate to a force destroy.
+        self.force_destroy_confirmed(domain_id).await
+    }
+
+    /// Force `virsh destroy`, then prove the domain is down if that
+    /// failed. `virsh destroy` errors on a domain that is already
+    /// `shut off` (a guest that powered itself off, or crashed), so a
+    /// bare destroy made such a tracked VM impossible to force-stop —
+    /// and therefore impossible to §24-destroy.
+    async fn force_destroy_confirmed(&self, domain_id: &DomainId) -> Result<()> {
         if self.driver.destroy_domain(domain_id, false).await.is_ok() {
             return Ok(());
         }
-        // The force destroy failed too. `run_stop` runs before any
-        // `undefine_domain` (the caller in `stop` / `teardown_failed_
-        // launch` issues that strictly after `run_stop` returns Ok),
-        // so the domain is still defined here — a query *error*
-        // therefore means libvirt itself is unreachable, not that the
-        // VM is gone. Succeed only on a positive shut-off / crashed
+        // The force destroy failed. This runs before any
+        // `undefine_domain` (`stop` / `teardown_failed_launch` issue
+        // that strictly after this returns Ok), so the domain is still
+        // defined here — a query *error* therefore means libvirt
+        // itself is unreachable, not that the VM is gone. Succeed only on a positive shut-off / crashed
         // reading; fail closed on anything else.
         match self.driver.query_domain_state(domain_id).await {
             Ok(DomainState::ShutOff | DomainState::Crashed | DomainState::NoState) => Ok(()),
@@ -2528,23 +2782,25 @@ impl CvmLifecycle {
     /// after KBS-register and can't be cleanly re-placed). `0` budget
     /// disables the check, exactly like `check_capacity`.
     pub fn check_disk_budget(&self, add_disk_gb: u32) -> Result<()> {
+        self.check_pool_disk_budget(self.pools.pools().launch_pool(), add_disk_gb)
+    }
+
+    /// [`Self::check_disk_budget`] on one storage pool: the disks of the
+    /// live tenant VMs on `pool` plus `add_disk_gb` against its budget
+    /// (`default`: `[host] cvm_disk_gb_budget`, `0` disables it).
+    pub fn check_pool_disk_budget(
+        &self,
+        pool: &crate::storage::pools::Pool,
+        add_disk_gb: u32,
+    ) -> Result<()> {
         let handles = self.lock_handles()?;
-        let mut used_disk: u64 = 0;
-        for handle in handles.values() {
-            // Infra is diskless — skip it (belt-and-suspenders; its
-            // data_disk_size_gb is 0 anyway).
-            if handle.is_infra() {
-                continue;
-            }
-            used_disk = used_disk
-                .checked_add(u64::from(handle.data_disk_size_gb))
-                .ok_or(MinerAgentError::InsufficientResources)?;
-        }
+        let used_disk = used_disk_gb(&handles, &self.pools.pools(), pool)?;
         let need_disk = used_disk
             .checked_add(u64::from(add_disk_gb))
             .ok_or(MinerAgentError::InsufficientResources)?;
-        if self.host.total_disk_gb > 0 && need_disk > self.host.total_disk_gb {
-            return Err(MinerAgentError::InsufficientDisk);
+        let budget = pool_budget_gb(self.host, pool);
+        if budget > 0 && need_disk > budget {
+            return Err(insufficient_disk(pool));
         }
         Ok(())
     }
@@ -2561,20 +2817,34 @@ impl CvmLifecycle {
     /// filesystem that can't be measured, never refuses here: the launch
     /// gate still runs, and fails closed.
     pub fn check_disk_space(&self, vm_id: &VmId, add_disk_gb: u32) -> Result<()> {
-        if add_disk_gb == 0
-            || data_disk::data_disk_path(&self.data_disk_root, vm_id).exists()
-            || golden::overlay_disk_path(&self.data_disk_root, vm_id).exists()
+        self.check_pool_disk_space(self.pools.pools().launch_pool(), vm_id, add_disk_gb)
+    }
+
+    /// [`Self::check_disk_space`] on one storage pool's filesystem.
+    pub fn check_pool_disk_space(
+        &self,
+        pool: &crate::storage::pools::Pool,
+        vm_id: &VmId,
+        add_disk_gb: u32,
+    ) -> Result<()> {
+        if add_disk_gb == 0 {
+            return Ok(());
+        }
+        // A new disk: the pool must be able to take one.
+        if self.needs_admission(pool, vm_id) {
+            self.admit_pool(pool)?;
+        }
+        if data_disk::data_disk_path(&pool.path, vm_id).exists()
+            || golden::overlay_disk_path(&pool.path, vm_id).exists()
         {
             return Ok(());
         }
         let reserved = *disk_space::create_lock();
-        let Ok(headroom) =
-            disk_space::headroom_bytes(reserved, &self.data_disk_root, &self.data_disk_root)
-        else {
+        let Ok(headroom) = disk_space::headroom_bytes(reserved, &pool.path, &pool.path) else {
             return Ok(());
         };
         if headroom < u64::from(add_disk_gb).saturating_mul(1024 * 1024 * 1024) {
-            return Err(MinerAgentError::InsufficientDisk);
+            return Err(insufficient_disk(pool));
         }
         Ok(())
     }
@@ -2601,8 +2871,17 @@ impl CvmLifecycle {
     /// [`Self::check_disk_budget`]; passing `0` here only re-affirms the
     /// already-admitted existing disk usage, never a new rejection).
     pub fn check_cpu_mem_budget(&self, add_cpu: u8, add_memory_mb: u32) -> Result<()> {
+        let pools = self.pools.pools();
         let handles = self.lock_handles()?;
-        check_capacity(&handles, self.host, add_cpu, add_memory_mb, 0)
+        check_capacity(
+            &handles,
+            self.host,
+            add_cpu,
+            add_memory_mb,
+            0,
+            &pools,
+            pools.launch_pool(),
+        )
     }
 
     /// SEV-ES ASID fail-fast at PREFLIGHT (capacity v2 §2.3) — same
@@ -3433,10 +3712,11 @@ fn check_capacity(
     add_cpu: u8,
     add_memory_mb: u32,
     add_disk_gb: u32,
+    pools: &crate::storage::StoragePools,
+    pool: &crate::storage::pools::Pool,
 ) -> Result<()> {
     let mut used_cpu: u64 = 0;
     let mut used_memory: u64 = 0;
-    let mut used_disk: u64 = 0;
     for handle in handles.values() {
         // The singleton Infra host-attestor is carved out of the tenant
         // budget separately (fixed 1 vCPU / 512 MiB) — never counted
@@ -3451,10 +3731,8 @@ fn check_capacity(
         used_memory = used_memory
             .checked_add(u64::from(handle.memory_mb))
             .ok_or(MinerAgentError::InsufficientResources)?;
-        used_disk = used_disk
-            .checked_add(u64::from(handle.data_disk_size_gb))
-            .ok_or(MinerAgentError::InsufficientResources)?;
     }
+    let used_disk = used_disk_gb(handles, pools, pool)?;
     let need_cpu = used_cpu
         .checked_add(u64::from(add_cpu))
         .ok_or(MinerAgentError::InsufficientResources)?;
@@ -3467,17 +3745,89 @@ fn check_capacity(
     if need_cpu > u64::from(host.total_cpus) || need_memory > host.total_memory_mb {
         return Err(MinerAgentError::InsufficientResources);
     }
-    // total_disk_gb == 0 disables the disk reservation (cpu/mem still
-    // apply) — back-compat for configs without `cvm_disk_gb_budget`.
-    if host.total_disk_gb > 0 && need_disk > host.total_disk_gb {
-        return Err(MinerAgentError::InsufficientDisk);
+    // A zero budget disables the disk reservation (cpu/mem still apply) —
+    // back-compat for configs without `cvm_disk_gb_budget`.
+    let budget = pool_budget_gb(host, pool);
+    if budget > 0 && need_disk > budget {
+        return Err(insufficient_disk(pool));
     }
     Ok(())
+}
+
+/// GiB the live tenant VMs reserve on `pool`: the writable disk of every
+/// handle whose disk lives there ([`StoragePools::pool_of`]). Without
+/// `[[storage.pools]]` that is every tenant handle, as it always was.
+/// Overflow fails closed.
+///
+/// [`StoragePools::pool_of`]: crate::storage::StoragePools::pool_of
+fn used_disk_gb(
+    handles: &HashMap<VmId, CvmHandle>,
+    pools: &crate::storage::StoragePools,
+    pool: &crate::storage::pools::Pool,
+) -> Result<u64> {
+    let mut used: u64 = 0;
+    for handle in handles.values() {
+        // Infra is diskless — skip it (belt-and-suspenders; its
+        // data_disk_size_gb is 0 anyway).
+        if handle.is_infra() || pools.pool_of(&handle.luks_disk_path).id != pool.id {
+            continue;
+        }
+        used = used
+            .checked_add(u64::from(handle.data_disk_size_gb))
+            .ok_or(MinerAgentError::InsufficientResources)?;
+    }
+    Ok(used)
+}
+
+/// A pool's disk budget, GiB: the historical `[host] cvm_disk_gb_budget`
+/// for `default` (config validation keeps a declared `default` equal to
+/// it), the declared `budget_gb` for the others.
+fn pool_budget_gb(host: HostResources, pool: &crate::storage::pools::Pool) -> u64 {
+    if pool.is_default() {
+        host.total_disk_gb
+    } else {
+        pool.budget_gb
+    }
+}
+
+/// The refusal of a full pool: the historical `InsufficientDisk` for
+/// `default` (507 `insufficient-disk`, the class vali knows), the
+/// pool-named class for the others.
+fn insufficient_disk(pool: &crate::storage::pools::Pool) -> MinerAgentError {
+    if pool.is_default() {
+        MinerAgentError::InsufficientDisk
+    } else {
+        MinerAgentError::InsufficientPoolDisk(pool.insufficient_class())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`check_capacity`] on the implicit single `default` pool — the
+    /// historical node-wide disk budget.
+    fn cap(
+        handles: &HashMap<VmId, CvmHandle>,
+        host: HostResources,
+        add_cpu: u8,
+        add_memory_mb: u32,
+        add_disk_gb: u32,
+    ) -> Result<()> {
+        let pools = crate::storage::StoragePools::implicit(
+            std::path::PathBuf::from(qemu_config::MINER_ROOT),
+            host.total_disk_gb,
+        );
+        check_capacity(
+            handles,
+            host,
+            add_cpu,
+            add_memory_mb,
+            add_disk_gb,
+            &pools,
+            pools.launch_pool(),
+        )
+    }
 
     /// Build a lifecycle whose state-disk + data roots point at `dir`.
     fn reclaim_lifecycle(dir: &std::path::Path) -> CvmLifecycle {
@@ -4186,6 +4536,152 @@ mod tests {
         assert!(!overlay.exists(), "the reclaim still happened");
     }
 
+    // ── force stop of a domain that is already shut off ─────────────────
+
+    /// `virsh destroy` errors on a domain that is not running; the mock
+    /// does not, so this wrapper always fails the destroy. `domstate`
+    /// answers from the seeded mock, or errors when `dark_query`.
+    struct ForceDestroyFails {
+        inner: crate::lifecycle::libvirt_driver::MockLibvirtDriver,
+        dark_query: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::lifecycle::libvirt_driver::LibvirtDriver for ForceDestroyFails {
+        async fn define_domain(&self, xml: &str) -> Result<DomainId> {
+            self.inner.define_domain(xml).await
+        }
+        async fn create_domain(&self, id: &DomainId) -> Result<()> {
+            self.inner.create_domain(id).await
+        }
+        async fn destroy_domain(&self, _id: &DomainId, _graceful: bool) -> Result<()> {
+            Err(MinerAgentError::LibvirtDriver("destroy"))
+        }
+        async fn undefine_domain(&self, id: &DomainId) -> Result<()> {
+            self.inner.undefine_domain(id).await
+        }
+        async fn query_domain_state(&self, id: &DomainId) -> Result<DomainState> {
+            if self.dark_query {
+                return Err(MinerAgentError::LibvirtDriver("dark"));
+            }
+            self.inner.query_domain_state(id).await
+        }
+        async fn list_domains(&self) -> Result<Vec<(DomainId, DomainState)>> {
+            self.inner.list_domains().await
+        }
+        async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+            self.inner.domain_xml(id).await
+        }
+    }
+
+    /// A lifecycle tracking `vm` as Running over a `ForceDestroyFails`
+    /// whose domain reads `state`.
+    fn tracked_over_failing_destroy(
+        vm: &VmId,
+        state: DomainState,
+        dark_query: bool,
+        luks_disk_path: std::path::PathBuf,
+        dir: &std::path::Path,
+    ) -> (CvmLifecycle, std::sync::Arc<ForceDestroyFails>) {
+        let inner = crate::lifecycle::libvirt_driver::MockLibvirtDriver::new();
+        inner.seed_domain(tenant_domain(vm), state);
+        let driver = std::sync::Arc::new(ForceDestroyFails { inner, dark_query });
+        let lc = reclaim_lifecycle_with(driver.clone(), dir);
+        lc.handles.lock().unwrap().insert(
+            vm.clone(),
+            CvmHandle {
+                vm_id: vm.clone(),
+                profile: DomainProfile::Tenant,
+                domain_id: tenant_domain(vm),
+                domain_uuid: DomainUuid::generate().unwrap(),
+                phase: CvmPhase::Running,
+                launch_digest: [0u8; LAUNCH_DIGEST_LEN],
+                cpu_count: 1,
+                memory_mb: 512,
+                data_disk_size_gb: 0,
+                luks_disk_path,
+                cid: 0,
+                cose_ticket: vec![1],
+                guardian: None,
+            },
+        );
+        (lc, driver)
+    }
+
+    #[tokio::test]
+    async fn force_stop_succeeds_on_a_tracked_domain_that_is_already_shut_off() {
+        // The guest powered itself off: `virsh destroy` errors, and the
+        // force path used to propagate that — the VM could never be
+        // force-stopped, so a §24 destroy retried it forever.
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VmId::new("tenant-self-off").unwrap();
+        let (lc, driver) = tracked_over_failing_destroy(
+            &vm,
+            DomainState::ShutOff,
+            false,
+            std::path::PathBuf::new(),
+            dir.path(),
+        );
+
+        lc.stop(&vm, false)
+            .await
+            .expect("a shut-off domain is down: the force stop must succeed");
+
+        assert!(!lc.handles.lock().unwrap().contains_key(&vm));
+        assert_eq!(driver.inner.undefine_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn force_stop_fails_closed_without_proof_the_domain_is_down() {
+        for (state, dark_query) in [(DomainState::Running, false), (DomainState::ShutOff, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let vm = VmId::new("tenant-unproven").unwrap();
+            let (lc, driver) = tracked_over_failing_destroy(
+                &vm,
+                state,
+                dark_query,
+                std::path::PathBuf::new(),
+                dir.path(),
+            );
+
+            assert!(
+                lc.stop(&vm, false).await.is_err(),
+                "{state:?} dark={dark_query}: a failed destroy is not a stop"
+            );
+            assert!(
+                lc.handles.lock().unwrap().contains_key(&vm),
+                "{state:?} dark={dark_query}: the handle must be kept"
+            );
+            assert_eq!(driver.inner.undefine_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn destroy_reclaims_a_tracked_vm_whose_guest_powered_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VmId::new("tenant-self-off-d").unwrap();
+        let legacy = dir.path().join("legacy-boot.img");
+        std::fs::write(&legacy, b"ciphertext").unwrap();
+        let (lc, driver) = tracked_over_failing_destroy(
+            &vm,
+            DomainState::ShutOff,
+            false,
+            legacy.clone(),
+            dir.path(),
+        );
+        let overlay = lc.golden_overlay_path(&vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"ciphertext").unwrap();
+
+        lc.destroy(&vm, None)
+            .await
+            .expect("destroy of a shut-off tracked VM must succeed");
+
+        assert!(!overlay.exists(), "the overlay must be reclaimed");
+        assert!(!legacy.exists(), "the legacy disk must be reclaimed");
+        assert!(!lc.handles.lock().unwrap().contains_key(&vm));
+        assert_eq!(driver.inner.defined_count().unwrap(), 0);
+    }
+
     #[test]
     fn check_capacity_admits_within_budget() {
         let host = HostResources {
@@ -4194,7 +4690,7 @@ mod tests {
             total_disk_gb: 0,
         };
         let handles = HashMap::new();
-        assert!(check_capacity(&handles, host, 4, 8192, 0).is_ok());
+        assert!(cap(&handles, host, 4, 8192, 0).is_ok());
     }
 
     #[test]
@@ -4206,7 +4702,7 @@ mod tests {
         };
         let handles = HashMap::new();
         assert!(matches!(
-            check_capacity(&handles, host, 4, 1024, 0),
+            cap(&handles, host, 4, 1024, 0),
             Err(MinerAgentError::InsufficientResources)
         ));
     }
@@ -4220,7 +4716,7 @@ mod tests {
         };
         let handles = HashMap::new();
         assert!(matches!(
-            check_capacity(&handles, host, 1, 4096, 0),
+            cap(&handles, host, 1, 4096, 0),
             Err(MinerAgentError::InsufficientResources)
         ));
     }
@@ -4238,11 +4734,11 @@ mod tests {
         // BEFORE the (sparse) disk is even created.
         // Its own class — a full disk is not a full host.
         assert!(matches!(
-            check_capacity(&handles, host, 1, 1024, 128),
+            cap(&handles, host, 1, 1024, 128),
             Err(MinerAgentError::InsufficientDisk)
         ));
         // Exactly at the budget is admitted.
-        assert!(check_capacity(&handles, host, 1, 1024, 64).is_ok());
+        assert!(cap(&handles, host, 1, 1024, 64).is_ok());
     }
 
     #[test]
@@ -4257,7 +4753,586 @@ mod tests {
             total_disk_gb: 0,
         };
         let handles = HashMap::new();
-        assert!(check_capacity(&handles, host, 1, 1024, 1_000_000).is_ok());
+        assert!(cap(&handles, host, 1, 1024, 1_000_000).is_ok());
+    }
+    // ── storage pools ─────────────────────────────────────────────────
+
+    /// `[[storage.pools]]` with `default` at `default_root` (host budget
+    /// `host_budget`) and `hdd0` at `hdd_root` (`hdd_budget` GiB).
+    fn pools_of(
+        default_root: &std::path::Path,
+        hdd_root: &std::path::Path,
+        host_budget: u64,
+        hdd_budget: u64,
+    ) -> Arc<crate::storage::StoragePools> {
+        use crate::config::{
+            PoolClassConfig, StorageDesiredStateConfig, StoragePoolConfig, StorageSection,
+        };
+        let pool = |id: &str, path: &std::path::Path, budget_gb: u64| StoragePoolConfig {
+            id: id.into(),
+            path: path.to_path_buf(),
+            class: PoolClassConfig::Nvme,
+            budget_gb,
+            os_disks: true,
+            state: StorageDesiredStateConfig::Active,
+        };
+        Arc::new(crate::storage::StoragePools::from_config(
+            &StorageSection {
+                data_disk_root: default_root.to_path_buf(),
+                state_disk_root: default_root.to_path_buf(),
+                pools: vec![
+                    pool("default", default_root, host_budget),
+                    pool("hdd0", hdd_root, hdd_budget),
+                ],
+                dedicated_disks: Vec::new(),
+            },
+            host_budget,
+        ))
+    }
+
+    fn tenant_handle(vm: &VmId, disk_gb: u32, disk: std::path::PathBuf) -> CvmHandle {
+        CvmHandle {
+            vm_id: vm.clone(),
+            profile: DomainProfile::Tenant,
+            domain_id: tenant_domain(vm),
+            domain_uuid: DomainUuid::generate().unwrap(),
+            phase: CvmPhase::Running,
+            launch_digest: [0u8; LAUNCH_DIGEST_LEN],
+            cpu_count: 1,
+            memory_mb: 512,
+            data_disk_size_gb: disk_gb,
+            luks_disk_path: disk,
+            cid: 0,
+            cose_ticket: vec![1],
+            guardian: None,
+        }
+    }
+
+    #[test]
+    fn without_storage_pools_the_lifecycle_has_one_implicit_default_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(dir.path());
+        let pools = lc.storage_pools();
+        assert!(!pools.is_configured());
+        assert_eq!(pools.iter().count(), 1);
+        assert_eq!(pools.default_pool().path, dir.path());
+        assert_eq!(pools.launch_pool().id, "default");
+    }
+
+    #[test]
+    fn without_storage_pools_every_tenant_disk_counts_against_the_host_budget() {
+        // The historical rule, wherever the handle's disk path points (a
+        // legacy VM's boot disk sits in staging, not the data root).
+        let dir = tempfile::tempdir().unwrap();
+        let lc = CvmLifecycle::new(
+            std::sync::Arc::new(crate::lifecycle::libvirt_driver::MockLibvirtDriver::new()),
+            std::sync::Arc::new(crate::lifecycle::launch_digest::MockLaunchDigest::fixed(
+                [0u8; 48],
+            )),
+            HostResources {
+                total_cpus: 16,
+                total_memory_mb: 65536,
+                total_disk_gb: 100,
+            },
+        )
+        .with_state_disk_root(dir.path().to_path_buf());
+        let a = VmId::new("tenant-a").unwrap();
+        let b = VmId::new("tenant-b").unwrap();
+        let mut handles = lc.handles.lock().unwrap();
+        handles.insert(
+            a.clone(),
+            tenant_handle(&a, 50, dir.path().join("overlay/a.img")),
+        );
+        handles.insert(
+            b.clone(),
+            tenant_handle(&b, 40, "/elsewhere/staging/b/disk".into()),
+        );
+        drop(handles);
+        assert!(lc.check_disk_budget(10).is_ok());
+        assert!(matches!(
+            lc.check_disk_budget(11),
+            Err(MinerAgentError::InsufficientDisk)
+        ));
+    }
+
+    #[test]
+    fn each_pool_reserves_against_its_own_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        // A pool on its bound filesystem: the gate admits it.
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let on_hdd = VmId::new("tenant-hdd").unwrap();
+        lc.handles.lock().unwrap().insert(
+            on_hdd.clone(),
+            tenant_handle(&on_hdd, 90, hdd.path().join("overlay/tenant-hdd.img")),
+        );
+        let hdd_pool = lc.storage_pools().get("hdd0").unwrap().clone();
+        assert!(lc.check_pool_disk_budget(&hdd_pool, 10).is_ok());
+        match lc.check_pool_disk_budget(&hdd_pool, 11) {
+            Err(MinerAgentError::InsufficientPoolDisk(class)) => {
+                assert_eq!(class, "insufficient-disk:hdd0");
+            }
+            other => panic!("{other:?}"),
+        }
+        // `default` (budget 0 = disabled) is not charged for hdd0's disk.
+        assert!(lc.check_disk_budget(1_000_000).is_ok());
+    }
+
+    #[test]
+    fn a_disk_on_another_pool_does_not_charge_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let mut lc = reclaim_lifecycle(dir.path()).with_storage_pools(pools_of(
+            dir.path(),
+            hdd.path(),
+            100,
+            0,
+        ));
+        lc.host.total_disk_gb = 100;
+        let on_hdd = VmId::new("tenant-hdd").unwrap();
+        let on_default = VmId::new("tenant-default").unwrap();
+        let mut handles = lc.handles.lock().unwrap();
+        handles.insert(
+            on_hdd.clone(),
+            tenant_handle(&on_hdd, 80, hdd.path().join("overlay/tenant-hdd.img")),
+        );
+        handles.insert(
+            on_default.clone(),
+            tenant_handle(
+                &on_default,
+                60,
+                dir.path().join("overlay/tenant-default.img"),
+            ),
+        );
+        drop(handles);
+        assert!(lc.check_disk_budget(40).is_ok());
+        assert!(matches!(
+            lc.check_disk_budget(41),
+            Err(MinerAgentError::InsufficientDisk)
+        ));
+        // The launch reservation agrees with the preflight.
+        let handles = lc.handles.lock().unwrap();
+        assert!(check_capacity(
+            &handles,
+            lc.host,
+            1,
+            512,
+            40,
+            &lc.pools.pools(),
+            lc.pools.pools().launch_pool()
+        )
+        .is_ok());
+        assert!(matches!(
+            check_capacity(
+                &handles,
+                lc.host,
+                1,
+                512,
+                41,
+                &lc.pools.pools(),
+                lc.pools.pools().launch_pool()
+            ),
+            Err(MinerAgentError::InsufficientDisk)
+        ));
+    }
+
+    #[tokio::test]
+    async fn destroy_reclaims_a_vm_disk_on_every_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(dir.path()).with_storage_pools(pools_of(
+            dir.path(),
+            hdd.path(),
+            0,
+            0,
+        ));
+        let vm = VmId::new("tenant-pooled").unwrap();
+        let overlay = golden::overlay_disk_path(hdd.path(), &vm);
+        let marker = crate::orders::migration::restore_marker_path(&overlay);
+        let data = data_disk::data_disk_path(hdd.path(), &vm);
+        let state = lc.state_disk_path(&vm);
+        for p in [&overlay, &data, &state] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"ciphertext").unwrap();
+        }
+        std::fs::write(&marker, b"migrations/x/y.luks").unwrap();
+        // A neighbour's disk on the same pool is never touched.
+        let other = golden::overlay_disk_path(hdd.path(), &VmId::new("tenant-other").unwrap());
+        std::fs::write(&other, b"other").unwrap();
+
+        lc.destroy(&vm, None).await.expect("destroy must succeed");
+
+        assert!(!overlay.exists() && !marker.exists() && !data.exists() && !state.exists());
+        assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn a_vm_whose_only_disk_is_on_another_pool_is_not_a_no_op_destroy() {
+        // The "nothing here ⇒ no-op" bail must see a disk on any pool.
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(dir.path()).with_storage_pools(pools_of(
+            dir.path(),
+            hdd.path(),
+            0,
+            0,
+        ));
+        let vm = VmId::new("tenant-hdd-only").unwrap();
+        let data = data_disk::data_disk_path(hdd.path(), &vm);
+        std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+        std::fs::write(&data, b"ciphertext").unwrap();
+        lc.destroy(&vm, None).await.expect("destroy must succeed");
+        assert!(!data.exists());
+    }
+
+    /// Every path a root-owned xfs mount of its own (`/` is device 1),
+    /// except `missing`.
+    struct GoodFs {
+        missing: Vec<std::path::PathBuf>,
+    }
+
+    impl crate::storage::pools::PoolFs for GoodFs {
+        fn canonical(&self, path: &std::path::Path) -> Option<std::path::PathBuf> {
+            Some(path.to_path_buf())
+        }
+        fn stat(&self, path: &std::path::Path) -> Option<crate::storage::pools::DirStat> {
+            use std::hash::{Hash, Hasher};
+            if self.missing.iter().any(|m| m == path) {
+                return None;
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            let dev = if path == std::path::Path::new("/") {
+                1
+            } else {
+                h.finish() | 2
+            };
+            Some(crate::storage::pools::DirStat {
+                dev,
+                uid: 0,
+                mode: 0o040755,
+                is_dir: true,
+            })
+        }
+        fn mount_of(&self, path: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+            Some((path.to_path_buf(), "xfs".into()))
+        }
+        fn odirect_ok(&self, _path: &std::path::Path) -> bool {
+            true
+        }
+        fn total_bytes(&self, _path: &std::path::Path) -> Option<u64> {
+            Some(10_000 * 1024 * 1024 * 1024)
+        }
+    }
+
+    /// A lifecycle over `dir` with pool `hdd0` at `hdd` (budget 100 GiB),
+    /// bound to the filesystem a scripted mount table puts there, and the
+    /// mount table's path (rewrite it to unmount / remount).
+    fn pooled_lifecycle(
+        dir: &std::path::Path,
+        hdd: &std::path::Path,
+        missing: Vec<std::path::PathBuf>,
+        mutate: impl FnOnce(&mut crate::storage::StoragePools),
+    ) -> (CvmLifecycle, std::path::PathBuf) {
+        let mountinfo = dir.join("test-mountinfo");
+        std::fs::write(
+            &mountinfo,
+            format!("36 1 8:17 /hdd0 {} rw - xfs none rw\n", hdd.display()),
+        )
+        .unwrap();
+        let src = crate::storage::registry::FsIdentitySource {
+            mountinfo: mountinfo.clone(),
+            by_uuid: dir.join("no-by-uuid"),
+        };
+        let mut pools = (*pools_of(dir, hdd, 0, 100)).clone();
+        mutate(&mut pools);
+        let pools = Arc::new(pools);
+        let bindings = crate::storage::registry::enforce_with(dir, &pools, &src).unwrap();
+        let state = Arc::new(crate::storage::state::StorageState::new(
+            crate::storage::state::EffectiveStorage {
+                pools,
+                dedicated: Vec::new(),
+                revision: 0,
+                bindings,
+            },
+        ));
+        let lc = reclaim_lifecycle(dir)
+            .with_storage_state(state)
+            .with_pool_host(Arc::new(crate::storage::PoolHost {
+                pool_fs: Box::new(GoodFs { missing }),
+                fs_identity: src,
+            }));
+        (lc, mountinfo)
+    }
+
+    fn unavailable(r: Result<()>) -> &'static str {
+        match r {
+            Err(MinerAgentError::PoolUnavailable(class)) => class,
+            other => panic!("expected pool-unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bound_active_pool_is_admitted_and_default_always_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let pools = lc.storage_pools();
+        lc.admit_pool(pools.get("hdd0").unwrap()).unwrap();
+        lc.check_pool_disk_budget(pools.get("hdd0").unwrap(), 50)
+            .unwrap();
+        // `default` is never gated, whatever the host says.
+        let (lc, _) = pooled_lifecycle(
+            dir.path(),
+            hdd.path(),
+            vec![dir.path().to_path_buf()],
+            |_| {},
+        );
+        lc.admit_pool(lc.storage_pools().default_pool()).unwrap();
+        lc.check_disk_budget(1).unwrap();
+    }
+
+    #[test]
+    fn a_pool_that_cannot_take_a_disk_answers_pool_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let vm = VmId::new("tenant-1").unwrap();
+        // Its mount is gone.
+        let (lc, _) = pooled_lifecycle(
+            dir.path(),
+            hdd.path(),
+            vec![hdd.path().to_path_buf()],
+            |_| {},
+        );
+        let hdd0 = lc.storage_pools().get("hdd0").unwrap().clone();
+        assert_eq!(unavailable(lc.admit_pool(&hdd0)), "pool-unavailable:hdd0");
+        // The preflight space gate refuses a new disk there…
+        assert_eq!(
+            unavailable(lc.check_pool_disk_space(&hdd0, &vm, 1)),
+            "pool-unavailable:hdd0"
+        );
+        // …but not a VM whose disk is already there (it reuses it), and
+        // the budget is accounting only.
+        let overlay = golden::overlay_disk_path(hdd.path(), &vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"x").unwrap();
+        lc.check_pool_disk_space(&hdd0, &vm, 1).unwrap();
+        std::fs::remove_file(&overlay).unwrap();
+        lc.check_pool_disk_budget(&hdd0, 10).unwrap();
+        // Another filesystem mounted there since.
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /other {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(unavailable(lc.admit_pool(&hdd0)), "pool-unavailable:hdd0");
+        // Draining, or closed to OS disks.
+        for close in [
+            (|p: &mut crate::storage::pools::Pool| p.draining = true)
+                as fn(&mut crate::storage::pools::Pool),
+            |p| p.os_disks = false,
+        ] {
+            let mut pool = hdd0.clone();
+            close(&mut pool);
+            let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+            assert_eq!(unavailable(lc.admit_pool(&pool)), "pool-unavailable:hdd0");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destroy_off_a_pools_filesystem_is_reclaimed_once_it_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("tenant-away").unwrap();
+        let live = VmId::new("tenant-live").unwrap();
+        // Hosted here: their state disks are on the local root.
+        for v in [&vm, &live] {
+            let state = lc.state_disk_path(v);
+            std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+            std::fs::write(&state, b"state").unwrap();
+        }
+        let overlay = golden::overlay_disk_path(hdd.path(), &vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        // The pool is unmounted: its disk is not visible.
+        std::fs::write(&mountinfo, "").unwrap();
+        lc.destroy(&vm, None).await.expect("destroy must succeed");
+        let pending = dir.path().join(crate::storage::reclaim::PENDING_FILE);
+        assert!(pending.exists());
+        // A destroy of a VM never hosted here records nothing more.
+        lc.destroy(&VmId::new("tenant-elsewhere").unwrap(), None)
+            .await
+            .unwrap();
+        assert!(!std::fs::read_to_string(&pending)
+            .unwrap()
+            .contains("tenant-elsewhere"));
+        // While it is away nothing is unlinked; the disk shows up meanwhile
+        // (as it was before the destroy).
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::write(&overlay, b"ciphertext").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&overlay)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(lc.reclaim_pending_pool_disks().unwrap(), 0);
+        assert!(overlay.exists());
+        // Back on its filesystem: reclaimed, and the record is gone.
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /hdd0 {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(lc.reclaim_pending_pool_disks().unwrap(), 1);
+        assert!(!overlay.exists());
+        assert!(!pending.exists());
+        // A VM launched again under its id meanwhile is left alone.
+        std::fs::write(&mountinfo, "").unwrap();
+        lc.destroy(&live, None).await.unwrap();
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /hdd0 {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        let live_overlay = golden::overlay_disk_path(hdd.path(), &live);
+        std::fs::write(&live_overlay, b"in use").unwrap();
+        lc.handles
+            .lock()
+            .unwrap()
+            .insert(live.clone(), tenant_handle(&live, 1, live_overlay.clone()));
+        assert_eq!(lc.reclaim_pending_pool_disks().unwrap(), 0);
+        assert!(live_overlay.exists());
+        assert!(!pending.exists());
+    }
+
+    #[tokio::test]
+    async fn one_disk_that_cannot_be_unlinked_does_not_hold_up_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let a = VmId::new("tenant-a").unwrap();
+        let b = VmId::new("tenant-b").unwrap();
+        for v in [&a, &b] {
+            let state = lc.state_disk_path(v);
+            std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+            std::fs::write(&state, b"state").unwrap();
+        }
+        std::fs::write(&mountinfo, "").unwrap();
+        lc.destroy(&a, None).await.unwrap();
+        lc.destroy(&b, None).await.unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let a_disk = golden::overlay_disk_path(hdd.path(), &a);
+        let b_disk = data_disk::data_disk_path(hdd.path(), &b);
+        for f in [&a_disk, &b_disk] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"ciphertext").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // `tenant-a` comes first and its directory refuses the unlink.
+        let overlay_dir = a_disk.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "36 1 8:17 /hdd0 {} rw - xfs none rw\n",
+                hdd.path().display()
+            ),
+        )
+        .unwrap();
+        let reclaimed = lc.reclaim_pending_pool_disks().unwrap();
+        std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(reclaimed, 1);
+        assert!(!b_disk.exists());
+        assert!(a_disk.exists());
+        // `tenant-a` is still pending, and goes once it can.
+        assert_eq!(lc.reclaim_pending_pool_disks().unwrap(), 1);
+        assert!(!a_disk.exists());
+    }
+
+    #[test]
+    fn a_disk_on_a_pool_off_its_filesystem_does_not_skip_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, mountinfo) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let hdd0 = lc.storage_pools().get("hdd0").unwrap().clone();
+        let vm = VmId::new("tenant-1").unwrap();
+        let overlay = golden::overlay_disk_path(hdd.path(), &vm);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"left behind").unwrap();
+        // Bound: the VM reuses its disk, no gate.
+        lc.check_pool_disk_space(&hdd0, &vm, 1).unwrap();
+        // Unmounted: the file is the underlying directory's, not the pool's.
+        std::fs::write(&mountinfo, "").unwrap();
+        assert_eq!(
+            unavailable(lc.check_pool_disk_space(&hdd0, &vm, 1)),
+            "pool-unavailable:hdd0"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_launch_on_another_pool_waits_on_a_reclaim_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        let vm = VmId::new("tenant-1").unwrap();
+        lc.reclaiming.lock().unwrap().insert(vm.clone());
+        let pools = lc.storage_pools();
+        // `default`: no wait, no refusal, whatever a drain holds.
+        let started = tokio::time::Instant::now();
+        lc.wait_for_reclaim(pools.default_pool(), &vm).await;
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        lc.check_not_reclaiming(pools.default_pool(), &vm).unwrap();
+        // Another pool: waits out the 30 s, then refused.
+        let hdd0 = pools.get("hdd0").unwrap();
+        lc.wait_for_reclaim(hdd0, &vm).await;
+        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+        assert_eq!(
+            unavailable(lc.check_not_reclaiming(hdd0, &vm)),
+            "pool-unavailable:hdd0"
+        );
+        // Released: admitted at once.
+        lc.reclaiming.lock().unwrap().remove(&vm);
+        lc.check_not_reclaiming(hdd0, &vm).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_destroy_on_a_bound_pool_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let (lc, _) = pooled_lifecycle(dir.path(), hdd.path(), Vec::new(), |_| {});
+        lc.destroy(&VmId::new("tenant-here").unwrap(), None)
+            .await
+            .unwrap();
+        assert!(!dir
+            .path()
+            .join(crate::storage::reclaim::PENDING_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn moving_the_storage_root_keeps_the_implicit_pool_on_it() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let lc = reclaim_lifecycle(a.path())
+            .with_storage_roots(b.path().to_path_buf(), a.path().to_path_buf());
+        assert_eq!(lc.storage_pools().default_pool().path, b.path());
     }
 }
 

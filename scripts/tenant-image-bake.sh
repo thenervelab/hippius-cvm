@@ -2217,6 +2217,9 @@ RestartSec=15
 #   78 — EX_CONFIG: the measured cmdline carries no hippius.vm_id /
 #        node_id / kbs_url, so this is not a Hippius tenant VM.
 RestartPreventExitStatus=2 78
+# On stop the agent sends one final keepalive, bounded by its own 10 s
+# deadline; systemd waits a little longer before it kills.
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

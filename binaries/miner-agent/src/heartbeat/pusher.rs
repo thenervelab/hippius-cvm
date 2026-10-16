@@ -500,6 +500,7 @@ mod tests {
             disk: hippius_types::heartbeat::DiskDeclaration::default(),
             host_health: hippius_types::heartbeat::HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: Default::default(),
         };
         SignedMinerHeartbeat {
             body: h.canonical().expect("canonical encode"),

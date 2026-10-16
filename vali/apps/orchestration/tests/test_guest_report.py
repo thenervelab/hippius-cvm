@@ -366,3 +366,60 @@ def test_the_kbs_audit_lag_and_last_check_are_reported() -> None:
 def test_no_kbs_audit_gauge_before_any_ingest() -> None:
     assert _samples(guest_report.M_KBS_AUDIT_LAG) == []
     assert _samples(guest_report.M_KBS_AUDIT_CHECKED) == []
+
+
+@pytest.mark.usefixtures("_kbs_t4")
+def test_a_final_keepalive_refused_at_a_stop_is_not_t4() -> None:
+    """The guest's final keepalive (on SIGTERM, #1562) at a §25 / failover /
+    §24 / guest-upgrade stop. Those stops all come BEFORE the hand-over that
+    supersedes the guest (the new launch is registered / accepted, or
+    released, after the old guest is down), so a refusal of that keepalive
+    is at or before the VM's last transition — never past it plus the
+    margin (`_live_on_stopped_margin_s`: clock skew + nonce lifetime)."""
+    import time
+
+    from apps.orchestration.models import KbsAuditEntry, MeasurementLedger
+
+    now = int(time.time())
+    seq = iter(range(1, 100))
+
+    def _refused(vm: str, reason: str, at: int) -> None:
+        n = next(seq)
+        KbsAuditEntry.objects.create(
+            log="release",
+            kbs_epoch="e" * 64,
+            seq=n,
+            body_cbor=b"",
+            sha256=f"{n:064x}",
+            prev_hash="0" * 64,
+            fetched_at=timezone.now(),
+            event_unix=at,
+            op="release",
+            vm_id=vm,
+            ticket_id="",
+            reason=reason,
+            granted=False,
+        )
+
+    launch = "lifecycle: superseded-launch: the attested measurement is not the VM's current launch"
+    guest = (
+        "attestation: superseded-guest: the guest released for this vm_id before its "
+        "current one still runs"
+    )
+    # A guest upgrade / restore: the old guest's final keepalive at the stop,
+    # the new launch accepted two minutes later.
+    stop = now - 600
+    MeasurementLedger.objects.create(
+        vm_id="vm-upgrade",
+        launch_digest_hex="ab" * 48,
+        allowlist_epoch=1,
+        launched_at=timezone.now() - timedelta(seconds=480),
+    )
+    _refused("vm-upgrade", launch, stop)
+    # The same, but the KBS clock runs ahead and verifies it just after the
+    # hand-over: inside the margin.
+    _refused("vm-upgrade", guest, now - 480 + guest_report._live_on_stopped_margin_s() - 5)
+    # (§25 / §24: the KBS's keepalive path does not read the VM's lifecycle
+    # state, so a fenced or decommissioning source's final keepalive is
+    # GRANTED, not refused — nothing for T4 to see.)
+    assert _samples(guest_report.M_KBS_SUPERSEDED) == []

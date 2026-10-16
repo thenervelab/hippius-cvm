@@ -742,6 +742,9 @@ def test_the_restore_id_dest_chip_is_the_one_armed(
     from apps.scheduler import service as sched
 
     MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    # The VM was sold in FR, where the destination is.
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "FR"})
     monkeypatch.setattr(
         sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None)
     )

@@ -39,7 +39,7 @@ from apps.scheduler.models import MinerCapacity
 from .conftest import FakeEffects
 from .factories import make_launch_record, make_service_client, make_vm
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 SRC_NODE = "11" * 32
 DST_NODE = "22" * 32
@@ -643,7 +643,7 @@ def test_start_migration_gate_is_disarmed_by_a_zero_threshold(settings) -> None:
 THIRD_NODE = "33" * 32
 
 
-def _departing_drain(monkeypatch) -> list[str]:
+def _departing_drain(monkeypatch, starts: list | None = None) -> list[str]:
     """Run the REAL graceful-exit enrolment (real `decide_placement`) with
     `node-src` quarantined and two live candidate destinations, recording
     the destination each enrolment chose."""
@@ -689,8 +689,10 @@ def _departing_drain(monkeypatch) -> list[str]:
     monkeypatch.setattr("apps.scheduler.chain.read_miner_status", lambda: snapshot)
     chosen: list[str] = []
 
-    def _fake_start(*, vm, dest_node_id, decided_by, cold=False):
+    def _fake_start(*, vm, dest_node_id, decided_by, cold=False, **kw):
         chosen.append(dest_node_id)
+        if starts is not None:
+            starts.append(kw)
         return type("J", (), {"job_id": "fake-job"})()
 
     monkeypatch.setattr(service, "start_migration", _fake_start)

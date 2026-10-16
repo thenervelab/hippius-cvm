@@ -79,6 +79,7 @@ def make_launch_record(
     flavor: str = "small",
     decided_by: ServiceClient | None = None,
     region: str | None = None,
+    require_failover_peer: bool = False,
 ) -> LaunchJob:
     """A SUCCEEDED `LaunchJob` for `vm` carrying `disk_mode` in `spec_json`.
 
@@ -109,6 +110,8 @@ def make_launch_record(
     }
     if region is not None:
         spec_json["region"] = region
+    if require_failover_peer:
+        spec_json["require_failover_peer"] = True  # type: ignore[assignment]
     return LaunchJob.objects.create(
         job_id=secrets.token_hex(16),
         vm_id=vm.vm_id,

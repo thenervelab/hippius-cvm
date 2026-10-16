@@ -6,6 +6,8 @@ into request handling. Fields mirror `launch_jobs.start_launch` /
 
 from __future__ import annotations
 
+from typing import Any
+
 from rest_framework import serializers
 
 from .models import GuestUpgradeState, LaunchPhase, ResizeState
@@ -162,6 +164,18 @@ class LaunchIntentSerializer(serializers.Serializer):
             "Any other value is a 400."
         ),
     )
+    require_failover_peer = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Place the VM only on a miner another miner could take its automatic "
+            "failover from (an active, uncordoned miner of the same SNP generation in "
+            "the same region). Kept by every later placement (resize, drain, "
+            "re-placement, migration). If no host qualifies the launch fails with "
+            "`no-failover-capable-host`. Regions that can: `failover_capable` in "
+            "`GET /v1/operator/regions`."
+        ),
+    )
     max_price_per_unit = serializers.IntegerField(
         required=False,
         allow_null=True,
@@ -238,6 +252,74 @@ class MigrateStartRequestSerializer(serializers.Serializer):
     dest_node_id = serializers.CharField(
         max_length=64, help_text="Destination node id (non-empty, ≤64 chars)."
     )
+    region = serializers.CharField(
+        required=False,
+        max_length=2,
+        help_text="ISO 3166-1 alpha-2 region of the VM, stated only when vali cannot tell "
+        "it (`region-unknown`); a different known region is `region-conflict`. The "
+        "destination is always in the VM's region (`cross-region`). With "
+        "`allow_cross_region: true` it NAMES the destination region instead.",
+    )
+    allow_cross_region = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Operator override: move the VM to ANOTHER region, the one `region` "
+        "names. Needs `reason`; recorded on the job (who, when, from, to, why). "
+        "Never taken by any automatic path.",
+    )
+    reason = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Why the VM leaves its region (required with `allow_cross_region`).",
+    )
+    operator = serializers.CharField(
+        required=False,
+        max_length=256,
+        help_text="Who decided the cross-region move (required with `allow_cross_region`).",
+    )
+
+
+class MinerDrainRequestSerializer(serializers.Serializer):
+    """`POST /v1/admin/miner/<miner_id>/drain` body (optional)."""
+
+    allow_cross_region = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Operator override: move the miner's VMs to the region `region` "
+        "names instead of their own. Needs `reason`; recorded on each migration.",
+    )
+    region = serializers.CharField(
+        required=False, max_length=2, help_text="The destination region (ISO alpha-2)."
+    )
+    reason = serializers.CharField(
+        required=False, max_length=256, help_text="Why the VMs leave their region."
+    )
+    operator = serializers.CharField(
+        required=False, max_length=256, help_text="Who decided the cross-region drain."
+    )
+
+
+class MinerDrainSerializer(serializers.Serializer):
+    miner_id = serializers.CharField()
+    enrolled = serializers.IntegerField(help_text="Migrations this pass opened.")
+    not_moved = serializers.DictField(
+        child=serializers.CharField(),
+        help_text="`{vm_id: reason}` of the miner's VMs this pass could not move.",
+    )
+
+
+class CrossRegionSerializer(serializers.Serializer):
+    """An operator's cross-region override, as recorded on the job."""
+
+    to = serializers.CharField()
+    reason = serializers.CharField()
+    operator = serializers.CharField(allow_null=True, help_text="Who decided it.")
+
+    def get_fields(self) -> dict[str, Any]:
+        fields = super().get_fields()
+        # `from` is a keyword: declared here.
+        fields["from"] = serializers.CharField(allow_null=True)
+        return fields
 
 
 class MigrationJobSerializer(serializers.Serializer):
@@ -250,6 +332,12 @@ class MigrationJobSerializer(serializers.Serializer):
     source_gen = serializers.IntegerField()
     new_gen = serializers.IntegerField()
     state = serializers.CharField()
+    region = serializers.CharField(allow_null=True)
+    region_stated_by_operator = serializers.BooleanField()
+    cross_region = CrossRegionSerializer(
+        allow_null=True,
+        help_text="The operator's cross-region override this move carried, else null.",
+    )
     source_ack_verified = serializers.BooleanField()
     source_reclaim_state = serializers.CharField()
     source_reclaim_at = serializers.DateTimeField(allow_null=True)

@@ -26,7 +26,7 @@
 //!
 //! ## Exit codes
 //!
-//! - `0` — never (the daemon runs until SIGTERM).
+//! - `0` — after SIGTERM/SIGINT and the final keepalive (or its deadline).
 //! - `1` — usage / config error at startup.
 //! - `2` — `/dev/sev-guest` open failure (unrecoverable; the VM
 //!   isn't a real SNP guest, so signing attestations would be a
@@ -37,6 +37,7 @@
 use clap::Parser;
 use hippius_agent_initramfs::stages::snp_report::SnpReportProvider;
 use hippius_agent_keepalive::client::KbsClient;
+use hippius_agent_keepalive::daemon;
 use hippius_agent_keepalive::relay::AttestationSink;
 use hippius_agent_keepalive::tick::{run_once_and_push, TickInputs};
 use std::process::ExitCode;
@@ -187,36 +188,57 @@ fn main() -> ExitCode {
         components: components.as_deref(),
     };
 
-    // Run forever — systemd RestartSec=10s catches a panicking exit
-    // from a transient failure (e.g. clock skew) but in normal
-    // operation we just log + sleep + retry. A successful tick
-    // produces a `tick-ok` line; a failed one a `tick-err:<class>`
-    // line — both single-line so the operator can grep the journal
-    // for keepalive health without cardinality explosions.
-    loop {
-        match run_once_and_push(&inputs, provider.as_ref(), &kbs, sink.as_ref()) {
-            Ok((_, None)) => {
-                eprintln!("hippius-agent-keepalive: tick-ok vm_id={}", cli.vm_id);
-            }
-            Ok((_, Some(relay_class))) => {
-                // The attestation WAS minted; only the last hop failed.
-                // Logged loudly: a persistent `relay-*` class means vali
-                // is not seeing this VM's liveness, which once the gate
-                // is armed means this VM's uptime is not creditable.
-                eprintln!(
-                    "hippius-agent-keepalive: tick-ok-relay-err:{relay_class} vm_id={}",
-                    cli.vm_id
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "hippius-agent-keepalive: tick-err:{e:?} vm_id={}",
-                    cli.vm_id
-                );
-            }
+    // Ticks until SIGTERM/SIGINT, then ONE final tick bounded by
+    // `FINAL_DEADLINE` (see `daemon`): the last attestation covers the
+    // window up to the stop. A successful tick logs `tick-ok`, a failed one
+    // `tick-err:<class>` — single lines the operator can grep.
+    let stop = match daemon::install_stop_latch() {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!("hippius-agent-keepalive: fail-closed: signal-register");
+            return ExitCode::from(EXIT_USAGE);
         }
-        std::thread::sleep(Duration::from_secs(cli.interval_secs));
-    }
+    };
+    let tick = || match run_once_and_push(&inputs, provider.as_ref(), &kbs, sink.as_ref()) {
+        Ok((_, None)) => {
+            eprintln!("hippius-agent-keepalive: tick-ok vm_id={}", cli.vm_id);
+            daemon::Tick::Minted
+        }
+        Ok((_, Some(relay_class))) => {
+            // The attestation WAS minted; only the last hop failed.
+            // Logged loudly: a persistent `relay-*` class means vali is
+            // not seeing this VM's liveness, which once the gate is armed
+            // means this VM's uptime is not creditable.
+            eprintln!(
+                "hippius-agent-keepalive: tick-ok-relay-err:{relay_class} vm_id={}",
+                cli.vm_id
+            );
+            daemon::Tick::Minted
+        }
+        Err(e) => {
+            eprintln!(
+                "hippius-agent-keepalive: tick-err:{e:?} vm_id={}",
+                cli.vm_id
+            );
+            daemon::Tick::Failed
+        }
+    };
+    // On the stop, the components checks keep their last pre-stop
+    // reading: the telemetry / eol-sign units are stopping alongside.
+    let frozen = components.clone();
+    daemon::run(
+        tick,
+        &stop,
+        Duration::from_secs(cli.interval_secs),
+        daemon::FINAL_DEADLINE,
+        Box::new(move || {
+            if let Some(tracker) = frozen {
+                tracker.freeze();
+            }
+        }),
+        Box::new(|| std::process::exit(0)),
+    );
+    ExitCode::SUCCESS
 }
 
 /// Build the per-tick attestation sink. Port `0` ⇒ the push is

@@ -99,7 +99,8 @@ def _attestor(
     chip_suffix: str = "",
 ) -> HostAttestor:
     return HostAttestor.objects.create(
-        chip_id=format(seed, "0128x") + chip_suffix,
+        # 128 characters with the suffix too: the column is varchar(128).
+        chip_id=format(seed, f"0{128 - len(chip_suffix)}x") + chip_suffix,
         node_id=node_id(seed),
         signer_pubkey=bytes(32),
         measurement=measurement,

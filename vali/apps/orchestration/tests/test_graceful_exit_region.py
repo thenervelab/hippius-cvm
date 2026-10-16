@@ -84,13 +84,23 @@ def test_auto_migration_enrols_nothing_when_no_miner_is_in_the_region(monkeypatc
     assert _departing_drain(monkeypatch) == []
 
 
-def test_auto_migration_is_unconstrained_for_a_pre_region_launch(monkeypatch) -> None:
-    """A VM whose `spec_json` pre-dates the field asked for nothing; the
-    drain must pick exactly as before, even with locations on file."""
+def test_a_pre_region_launch_stays_in_its_hosts_country(monkeypatch) -> None:
+    """A VM whose launch asked for no region is in the country its host is
+    in: the drain keeps it there, never wherever ranks best."""
+    _bound_vm_on_source(region=None)
+    _locate("node-src", "FR")
+    _locate("node-dst", "DE")
+    _locate("node-third", "FR")
+    assert _departing_drain(monkeypatch) == ["node-third"]
+
+
+def test_a_vm_whose_region_cannot_be_told_is_not_moved(monkeypatch) -> None:
+    """No launch region, its host never located: nowhere is safe — the VM
+    stays (logged), never moved to some other country."""
     _bound_vm_on_source(region=None)
     _locate("node-dst", "DE")
     _locate("node-third", "FR")
-    assert _departing_drain(monkeypatch) == ["node-dst"]
+    assert _departing_drain(monkeypatch) == []
 
 
 def test_the_auto_enrol_kill_switch_enrols_nothing(monkeypatch, settings) -> None:
@@ -117,6 +127,80 @@ def test_auto_migration_asks_capacity_v2_about_the_vms_flavor(monkeypatch) -> No
         return real(resource_class, **kw)
 
     monkeypatch.setattr(service, "resource_fit", record)
-    _bound_vm_on_source(region=None)
+    _bound_vm_on_source(region="FR")
+    _locate("node-third", "FR")
     _departing_drain(monkeypatch)
     assert asked == ["small"]
+
+
+def test_a_vm_the_drain_cannot_move_is_logged_when_the_reason_changes(monkeypatch) -> None:
+    """Never silent, never every tick: one ERROR per new reason."""
+    from apps.orchestration import service
+
+    errors: list[str] = []
+
+    class _Log:
+        def error(self, msg: str, *args: object, **kw: object) -> None:
+            errors.append(msg % args)
+
+        def __getattr__(self, name: str) -> object:
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(service, "log", _Log())
+    monkeypatch.setattr(service, "_drain_stuck", {})
+    vm = _bound_vm_on_source(region=None)  # host never located
+    _locate("node-dst", "DE")
+    _locate("node-third", "DE")
+    assert _departing_drain(monkeypatch) == []
+    assert _departing_drain(monkeypatch) == []
+    _locate("node-src", "FR")  # now known — but nothing in FR
+    assert _departing_drain(monkeypatch) == []
+    reasons = [m.split("(")[1].split(")")[0] for m in errors if vm.vm_id in m]
+    assert reasons == ["region-unknown", "no-miner-in-region"]
+
+
+def test_the_drain_moves_a_require_failover_peer_vm_even_without_a_peer(monkeypatch) -> None:
+    """Exempt from gate (m), never from its region: off a departing miner
+    the VM moves in-region, peer or not, and says so at WARNING."""
+    from apps.orchestration import service
+    from apps.scheduler import service as sched
+
+    warnings: list[str] = []
+
+    class _Log:
+        def warning(self, msg: str, *args: object, **kw: object) -> None:
+            warnings.append(msg % args)
+
+        def __getattr__(self, name: str) -> object:
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(service, "log", _Log())
+    vm = _bound_vm_on_source(region="FR")
+    make_launch_record(vm, region="FR", require_failover_peer=True)  # the newest
+    _locate("node-dst", "FR")
+    _locate("node-third", "DE")
+    monkeypatch.setattr(sched, "failover_capable_node_ids", lambda **kw: {})
+    starts: list[dict] = []
+    assert _departing_drain(monkeypatch, starts) == ["node-dst"], "in-region, without a peer"
+    assert starts[0].get("failover_peer_exempt") is True, "the §25 intake is told"
+    assert any("moved without failover peer" in w for w in warnings)
+
+
+def test_the_operator_drain_moves_the_vms_to_the_region_it_names(monkeypatch) -> None:
+    """The automatic drain keeps an FR VM in FR (nothing there: it stays);
+    the operator's drain with a cross-region override sends it to DE."""
+    from apps.orchestration import service
+    from apps.orchestration.service import CrossRegion
+
+    _bound_vm_on_source(region="FR")
+    _locate("node-dst", "DE")
+    _locate("node-third", "DE")
+    assert _departing_drain(monkeypatch) == []
+    over = CrossRegion("DE", "evacuate")
+    real_enroll = service.enroll_departing_miner_migrations
+
+    def operator_drain() -> int:
+        return real_enroll(only_node=SRC_NODE, cross_region=over, report={})
+
+    monkeypatch.setattr(service, "enroll_departing_miner_migrations", operator_drain)
+    assert _departing_drain(monkeypatch) == ["node-dst"]

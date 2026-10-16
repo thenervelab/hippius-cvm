@@ -475,6 +475,15 @@ class MigrationJob(models.Model):
     #: guest's key release at `new_gen`, `restore.h_verifying`); also set on a
     #: job that failed after it (`restore._stamp_committed`).
     committed_at = models.DateTimeField(null=True, blank=True)
+    #: The KBS activate to `new_gen` on the destination, recorded ON THE JOB
+    #: (not a marker in the §14 idempotency store): when it was first asked,
+    #: and when (and at which generation) the KBS acknowledged it. The
+    #: failover fence re-check reads these, then the KBS admin audit log
+    #: (`restore.kbs_moved`).
+    kbs_activate_first_attempt_at = models.DateTimeField(null=True, blank=True)
+    kbs_activate_last_attempt_at = models.DateTimeField(null=True, blank=True)
+    kbs_activated_at = models.DateTimeField(null=True, blank=True)
+    kbs_activated_gen = models.BigIntegerField(null=True, blank=True)
     # The backup point restored from. Pins its chain against pruning while
     # the job is not terminal.
     restore_run = models.ForeignKey(
@@ -536,6 +545,30 @@ class MigrationJob(models.Model):
     # migration itself still boots the OLD flavor (it replays the source's
     # measured boot); the resize relaunches at the new one afterwards.
     resize_to_flavor = models.CharField(max_length=32, blank=True, default="", db_default="")
+    #: The region the move was held to (§25: `service.move_region`), and
+    #: whether an operator stated it because vali could not tell.
+    region = models.CharField(max_length=2, blank=True, default="", db_default="")
+    region_stated_by_operator = models.BooleanField(default=False, db_default=False)
+    #: An operator's explicit cross-region move (`service.CrossRegion`):
+    #: `region` is then the region it moved the VM TO, `cross_region_from`
+    #: the one it left, with the operator's reason; who and when are
+    #: `decided_by` and `started_at`. Once it took, the VM's region is
+    #: `region` (`backup.service.vm_region`).
+    cross_region_override = models.BooleanField(default=False, db_default=False)
+    cross_region_from = models.CharField(max_length=2, blank=True, default="", db_default="")
+    cross_region_reason = models.CharField(
+        max_length=256, blank=True, default="", db_default=""
+    )
+    cross_region_by = models.CharField(max_length=256, blank=True, default="", db_default="")
+    #: A cross-generation restore / failover (`apps.orchestration.cross_gen`):
+    #: the launch digest the destination's SNP generation measures, pinned
+    #: before the KBS activate and carried by its ticket. Blank otherwise.
+    dest_measurement_hex = models.CharField(max_length=96, blank=True, default="", db_default="")
+    #: ... and the VM's recorded digest it replaces, kept pinned until the
+    #: source is reclaimed (`cross_gen.held_source_digests`).
+    source_measurement_hex = models.CharField(
+        max_length=96, blank=True, default="", db_default=""
+    )
 
     class Meta:
         ordering = ["-started_at"]
@@ -594,6 +627,107 @@ class FailoverQuarantine(models.Model):
     def __str__(self) -> str:
         state = "open" if self.cleared_at is None else "cleared"
         return f"FailoverQuarantine {self.miner_id} ({state})"
+
+
+class FailoverDeadWatch(models.Model):
+    """The automatic failover worker's view of one miner that looks dead
+    (`apps.orchestration.failover_auto`): since when the three-way proof
+    has held at every check. Deleted the moment one check fails, so
+    `dead_since` is the start of an UNBROKEN run of dead verdicts."""
+
+    miner_id = models.CharField(max_length=64, primary_key=True)
+    dead_since = models.DateTimeField()
+    checked_at = models.DateTimeField()
+    evidence = models.JSONField(default=dict, blank=True)
+
+    def __str__(self) -> str:
+        return f"FailoverDeadWatch {self.miner_id} (dead since {self.dead_since})"
+
+
+class AutoFailoverReset(models.Model):
+    """An operator's reset of a VM's failed automatic failovers
+    (`vali_failover_auto reset`): only failures after the newest reset
+    count towards the backoff and the stop."""
+
+    vm = models.ForeignKey(
+        "lifecycle.Vm", on_delete=models.CASCADE, related_name="auto_failover_resets"
+    )
+    reset_by = models.CharField(max_length=128)
+    reason = models.CharField(max_length=256, blank=True, default="")
+    reset_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-reset_at"]
+
+    def __str__(self) -> str:
+        return f"AutoFailoverReset {self.vm_id} by {self.reset_by}"
+
+
+class AutoFailoverState(models.TextChoices):
+    #: The VM qualifies but no destination has room: retried every tick.
+    PENDING_CAPACITY = "pending_capacity", "Pending capacity"
+    #: Its failover job (`job`) is open; that job's phase is the truth.
+    STARTED = "started", "Started"
+    #: The miner came back (or the VM stopped qualifying) before a job
+    #: was opened.
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class AutoFailover(models.Model):
+    """One automatic failover of a VM off a dead miner — the audit trail
+    of every decision the worker takes, and the `pending_capacity` record
+    while no destination has room. Its `failover_id` becomes the job's
+    `job_id` once a destination is found, so the id a caller saw while it
+    waited is the job it then polls."""
+
+    failover_id = models.CharField(max_length=32, unique=True)
+    vm = models.ForeignKey(
+        "lifecycle.Vm", on_delete=models.CASCADE, related_name="auto_failovers"
+    )
+    source_node_id = models.CharField(max_length=64, db_index=True)
+    state = models.CharField(max_length=32, choices=AutoFailoverState.choices)
+    job = models.OneToOneField(
+        MigrationJob,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="auto_failover",
+    )
+    # The dead-miner proof the decision rested on (`restore.dead_evidence`
+    # plus the watch's `dead_since`).
+    evidence = models.JSONField(default=dict, blank=True)
+    reason = models.CharField(max_length=256, blank=True, default="")
+    attempts = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_tried_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vm"],
+                condition=models.Q(state="pending_capacity"),
+                name="orchestration_one_pending_auto_failover_per_vm",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"AutoFailover {self.failover_id} {self.state}"
+
+
+class IdempotencyRecord(models.Model):
+    """One §14 idempotency entry: the orchestration step `key` ran, with
+    this response hash, at `recorded_at` (`apps.orchestration.idempotency`).
+    The primary key makes `record` atomic across pods."""
+
+    key = models.CharField(max_length=255, primary_key=True)
+    response_hash = models.CharField(max_length=64)
+    recorded_at = models.DateTimeField(db_index=True)
+
+    def __str__(self) -> str:
+        return f"IdempotencyRecord {self.key}"
 
 
 class LaunchJobState(models.TextChoices):
@@ -1810,3 +1944,128 @@ class GuestUpgradeAttempt(models.Model):
 
     def __str__(self) -> str:
         return f"GuestUpgradeAttempt {self.kind} job={self.job_id} {self.outcome or 'open'}"
+
+
+class UserdataRestagePhase(models.TextChoices):
+    """`UserdataRestageJob.phase` (`apps.orchestration.userdata_restage`).
+
+    - `staged`      the new version is staged and the launch record points
+                    at it; the next tick relaunches the VM.
+    - `relaunching` the tick is relaunching it: a power stop, then a start,
+                    each retried across ticks while it is transient.
+    - `running`     the relaunch was accepted, the VM is running and the
+                    launch record holds the relaunch's own (new)
+                    measurement: that boot was minted the new userdata.
+                    (Its KBS release is the VM's `VmLiveAttestation`.)
+    - `failed`      the relaunch was refused, gave up, or its outcome could
+                    not be settled. The record still points at the new
+                    version, so the VM's next relaunch takes it; `error`
+                    says what happened and in which power state the VM was
+                    left.
+    """
+
+    STAGED = "staged", "Staged"
+    RELAUNCHING = "relaunching", "Relaunching"
+    RUNNING = "running", "Running"
+    FAILED = "failed", "Failed"
+
+
+TERMINAL_USERDATA_RESTAGE_PHASES: frozenset[str] = frozenset(
+    {UserdataRestagePhase.RUNNING.value, UserdataRestagePhase.FAILED.value}
+)
+
+
+class UserdataRestageJob(models.Model):
+    """One userdata restage (or rollback) of an M0 VM, and the relaunch that
+    makes its next boot take it. Admitted — staged and pointed at — in the
+    API request; relaunched by `vali_orchestration_tick`.
+
+    Field-by-field:
+
+    - `job_id`        public opaque identifier.
+    - `request_id`    the caller's idempotency key: the same `(vm,
+                      request_id)` names the same job.
+    - `kind`          `restage` (new bytes) or `rollback` (re-point only).
+    - `from_path` / `from_version`, `to_path` / `to_version`
+                      the launch record's userdata pointer before and after.
+    - `size` / `digest_hex`
+                      byte length and sha256 of the restaged userdata (the
+                      §6 digest binds a ticket id and is minted at relaunch);
+                      `null` for a rollback, whose bytes are not read.
+    - `phase` / `outcome`
+                      see [`UserdataRestagePhase`]; `outcome` is `committed`
+                      once the relaunch is accepted, `failed` on failure,
+                      `""` while in flight.
+    - `error`         operator-facing failure, never userdata content.
+    - `measurement_before`
+                      the record's measurement at admission: `running` waits
+                      for the record to hold another one (the relaunch's).
+    - `stopped_at`    the job's power stop landed; from here it only starts.
+    - `attempts`      power dispatches in `relaunching`, for the retry cap.
+
+    Constraints: at most one non-terminal job per VM; `(vm, request_id)`
+    unique; terminal ⇒ `finished_at`.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job_id = models.CharField(max_length=64, unique=True)
+    vm = models.ForeignKey(
+        "lifecycle.Vm",
+        on_delete=models.PROTECT,
+        related_name="userdata_restage_jobs",
+    )
+    request_id = models.CharField(max_length=128)
+    kind = models.CharField(max_length=16)
+    from_path = models.CharField(max_length=512)
+    from_version = models.BigIntegerField()
+    to_path = models.CharField(max_length=512)
+    to_version = models.BigIntegerField()
+    size = models.PositiveIntegerField(null=True, blank=True)
+    digest_hex = models.CharField(max_length=64, blank=True, default="")
+    phase = models.CharField(
+        max_length=16,
+        choices=UserdataRestagePhase.choices,
+        default=UserdataRestagePhase.STAGED,
+    )
+    outcome = models.CharField(max_length=16, blank=True, default="")
+    error = models.CharField(max_length=512, blank=True, default="")
+    measurement_before = models.CharField(max_length=128, blank=True, default="")
+    stopped_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveIntegerField(default=0)
+    phase_started_at = models.DateTimeField()
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        "identity.ServiceClient",
+        on_delete=models.PROTECT,
+        related_name="userdata_restage_jobs",
+    )
+    version = models.PositiveBigIntegerField(default=1)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [models.Index(fields=["phase"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vm"],
+                condition=~models.Q(phase__in=["running", "failed"]),
+                name="orchestration_one_active_userdata_restage_per_vm",
+            ),
+            models.UniqueConstraint(
+                fields=["vm", "request_id"],
+                name="orchestration_userdata_restage_request_id_per_vm",
+            ),
+            models.CheckConstraint(
+                name="orchestration_userdata_restage_terminal_finished",
+                condition=(
+                    ~models.Q(phase__in=["running", "failed"])
+                    | models.Q(finished_at__isnull=False)
+                ),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"UserdataRestageJob {self.job_id} (vm={self.vm_id} {self.kind} "
+            f"{self.from_version}→{self.to_version}, {self.phase})"
+        )

@@ -9,6 +9,8 @@ local docs = require("hippius_cdn.docs")
 local router = require("hippius_cdn.router")
 local rules = require("hippius_cdn.rules")
 local limits = require("hippius_cdn.limits")
+local site = require("hippius_cdn.site")
+local cors = require("hippius_cdn.cors")
 local geoip = require("hippius_cdn.geoip")
 local mime = require("hippius_cdn.mime")
 local cert = require("hippius_cdn.cert")
@@ -944,6 +946,316 @@ test("zone limits: defaults, values, refusals per second", function()
     eq(select(2, limits.admit(d, "z", { rps = 100, mbps = 1 }, 201)), "mbps", "the previous second")
     truthy((limits.admit(d, "z", { rps = 100, mbps = 1 }, 202)), "two seconds later")
     limits.account(d, "z", 0, 202)
+end)
+
+-- Settings as they arrive on the wire (JSON), so `[]` and `null` are what
+-- cjson makes of them.
+local site_json = cjson.new()
+site_json.decode_array_with_array_mt(true)
+local function site_of(json)
+    return site.of(assert(site_json.decode(json)))
+end
+
+test("site: a feed without the keys is today's behaviour", function()
+    for _, json in ipairs({ '{}', '{"rules": []}', '{"index_document": null, "spa_fallback": null}' }) do
+        local s, problems = site_of(json)
+        eq(s.index, nil, json)
+        falsy(s.fallback, json)
+        eq(#problems, 0, json)
+        eq(site.object_path(s, "/"), "/", json)
+        eq(site.object_path(s, "/a/"), "/a/", json)
+        falsy(site.falls_back(s, "/x", "/x"), json)
+    end
+    local s = site.of(nil)
+    eq(s.index, nil)
+    falsy(s.fallback)
+    eq(site.object_path(s, "/"), "/")
+end)
+
+test("site: index document and fallback, with the default excludes", function()
+    local s, problems = site_of('{"index_document": "index.html", "spa_fallback": true}')
+    eq(#problems, 0)
+    eq(s.index, "index.html")
+    eq(site.object_path(s, "/"), "/index.html")
+    eq(site.object_path(s, "/docs/v1/"), "/docs/v1/index.html")
+    eq(site.object_path(s, "/app.js"), "/app.js", "only a directory path")
+    eq(site.fallback_path(s), "/index.html")
+    truthy(site.falls_back(s, "/profile/42", "/profile/42"))
+    truthy(site.falls_back(s, "/sub/", "/sub/index.html"), "a directory without its index")
+    truthy(site.falls_back(s, "/assets", "/assets"), "a prefix is a directory")
+    falsy(site.falls_back(s, "/assets/app.js", "/assets/app.js"), "the default exclude")
+    falsy(site.falls_back(s, "/index.html", "/index.html"), "the index document itself")
+    falsy(site.falls_back(s, "/", "/index.html"), "the root fetched the index document")
+    -- An explicit empty list: no excludes at all.
+    local all = site_of('{"index_document": "index.html", "spa_fallback": true, "spa_fallback_exclude": []}')
+    truthy(site.falls_back(all, "/assets/app.js", "/assets/app.js"))
+    -- Excludes are matched decoded, like purge prefixes.
+    local enc = site_of('{"index_document": "i.htm", "spa_fallback": true,'
+        .. ' "spa_fallback_exclude": ["/api/", "/a%20b/", "/x//y/"]}')
+    falsy(site.falls_back(enc, "/api/v1", "/api/v1"))
+    falsy(site.falls_back(enc, "/a b/c", "/a b/c"))
+    falsy(site.falls_back(enc, "/x/y/z", "/x/y/z"))
+    truthy(site.falls_back(enc, "/apix", "/apix"))
+    -- An index without the fallback: only directory paths change.
+    local idx = site_of('{"index_document": "index.html"}')
+    eq(site.object_path(idx, "/"), "/index.html")
+    falsy(site.falls_back(idx, "/missing", "/missing"))
+end)
+
+test("site: unusable values turn their feature off, never fail", function()
+    for _, v in ipairs({ '""', '"a/b.html"', '"../index.html"', '".."', '"."', '"a..b"', '"x y"',
+        '"index.html?x"', '"%2e%2e"', '"' .. string.rep("a", 129) .. '"', '7', '{}', '["index.html"]' }) do
+        local s, problems = site_of('{"index_document": ' .. v .. ', "spa_fallback": true}')
+        eq(s.index, nil, v)
+        falsy(s.fallback, v)
+        truthy(#problems >= 1, v)
+        eq(site.object_path(s, "/"), "/", v)
+    end
+    truthy(site.valid_index(string.rep("a", 128)))
+    truthy(site.valid_index(".well-known.html"))
+    for _, v in ipairs({ '"assets/"', '"/assets"', '"/a/../b/"', '"/a/./"', '"/%2e%2e/"', '"/a?b/"',
+        '"/a#/"', '"/a b/"', '"/a%00/"', '"/a\\\\b/"', '7', '{"a": "/x/"}', '{}', '[1]',
+        '"/' .. string.rep("a", 256) .. '/"' }) do
+        local json = '{"index_document": "index.html", "spa_fallback": true, "spa_fallback_exclude": ['
+            .. (v:sub(1, 1) == '[' and v:sub(2, -2) or v) .. ']}'
+        if v:sub(1, 1) == '{' then
+            json = '{"index_document": "index.html", "spa_fallback": true, "spa_fallback_exclude": ' .. v .. '}'
+        end
+        local s, problems = site_of(json)
+        falsy(s.fallback, json)
+        eq(s.index, "index.html", "the index stays: " .. json)
+        truthy(#problems >= 1, json)
+    end
+    local many = {}
+    for i = 1, 17 do many[i] = '"/p' .. i .. '/"' end
+    local s = site_of('{"index_document": "index.html", "spa_fallback": true, "spa_fallback_exclude": ['
+        .. table.concat(many, ",") .. ']}')
+    falsy(s.fallback, "17 excludes")
+    many[17] = nil
+    s = site_of('{"index_document": "index.html", "spa_fallback": true, "spa_fallback_exclude": ['
+        .. table.concat(many, ",") .. ']}')
+    truthy(s.fallback, "16 excludes")
+    local nf, problems = site_of('{"spa_fallback": true}')
+    falsy(nf.fallback, "no index, no fallback")
+    eq(problems[1], "spa_fallback without index_document")
+    falsy((site_of('{"index_document": "index.html", "spa_fallback": "yes"}')).fallback)
+end)
+
+test("site: compiled per zone with the config, an unusable one never refuses it", function()
+    local d = assert(docs.validate("config", config({ zones = {
+        z1 = { state = "active", serving = true, origin = { type = "s3", bucket = "media", prefix = "site/" },
+               settings = { index_document = "index.html", spa_fallback = true } },
+        z2 = { state = "active", serving = true, origin = { type = "s3", bucket = "media" },
+               settings = { index_document = "../x", spa_fallback = true } },
+        z3 = { state = "active", serving = true, origin = { type = "s3", bucket = "media" } },
+    } })))
+    eq(d.sites.z1.index, "index.html")
+    truthy(d.sites.z1.fallback)
+    eq(d.sites.z1.exclude[1], "/assets/")
+    eq(d.sites.z2.index, nil)
+    falsy(d.sites.z2.fallback)
+    eq(d.sites.z3.index, nil)
+end)
+
+test("site: the cache key of a request that may fall back", function()
+    local purge = { zone_generation = 2, prefixes = { ["/"] = 1 }, paths = { ["/index.html"] = 3 } }
+    local plain = util.cache_key_material("z1", purge, "/p", "")
+    eq(util.cache_key_material("z1", purge, "/p", "", false), plain, "default keys never change")
+    eq(util.cache_key_material("z1", purge, "/p", nil, nil), plain)
+    truthy(util.cache_key_material("z1", purge, "/p", "", true) ~= plain, "keyed apart")
+    -- The fallback and the root share the index document's entry: neither
+    -- is keyed apart (the index document never falls back).
+    local s = site_of('{"index_document": "index.html", "spa_fallback": true}')
+    falsy(site.falls_back(s, "/", site.object_path(s, "/")))
+    falsy(site.falls_back(s, site.fallback_path(s), site.fallback_path(s)))
+    local bumped = { zone_generation = 2, prefixes = { ["/"] = 1 }, paths = { ["/index.html"] = 4 } }
+    truthy(util.cache_key_material("z1", purge, "/index.html", "")
+        ~= util.cache_key_material("z1", bumped, "/index.html", ""), "a purge of the index document")
+end)
+
+-- CORS policies as they arrive on the wire (arrays marked, like docs.lua).
+local function cors_of(json)
+    return cors.of({ cors = assert(site_json.decode(json)) })
+end
+
+test("cors: absent is no policy, a usable one compiles", function()
+    eq(cors.of({}), nil)
+    eq(cors.of(nil), nil)
+    eq(select(2, cors.of({ cors = cjson.null })), nil, "null: no policy, no warning")
+    local c = assert(cors_of('{"allow_origins": ["https://a.com", "https://*.b.com", "http://localhost:3000"],'
+        .. ' "allow_headers": ["X-Custom", "content-type"], "expose_headers": ["ETag"],'
+        .. ' "max_age": 600, "allow_credentials": true, "future_key": 1}'))
+    eq(c.methods_str, "GET, HEAD", "default methods")
+    eq(c.headers_str, "x-custom, content-type")
+    eq(c.expose_str, "etag")
+    eq(c.max_age, "600")
+    truthy(c.credentials)
+    eq(assert(cors_of('{"allow_origins": ["*"], "max_age": -0}')).max_age, "0", "never \"-0\"")
+    local star = assert(cors_of('{"allow_origins": ["*"], "allow_methods": ["GET"]}'))
+    truthy(star.any)
+    eq(star.methods_str, "GET")
+end)
+
+test("cors: the backend's feed shape (every key present, max_age always set)", function()
+    local c = assert(cors_of('{"allow_origins": ["https://app.example", "https://*.tenant.example"],'
+        .. ' "allow_methods": ["GET", "HEAD"], "allow_headers": [], "expose_headers": [],'
+        .. ' "max_age": 600, "allow_credentials": false}'))
+    eq(c.methods_str, "GET, HEAD")
+    eq(c.headers_str, "")
+    eq(c.expose_str, "")
+    eq(c.max_age, "600")
+    falsy(c.credentials)
+    local h = cors.response_headers(c, "https://x.tenant.example")
+    eq(h["Access-Control-Allow-Origin"], "https://x.tenant.example")
+    eq(h["Access-Control-Allow-Credentials"], nil)
+    eq(h["Access-Control-Expose-Headers"], nil, "empty list: no header")
+    eq(h.Vary, "Origin")
+    h = cors.preflight_headers(c, "https://app.example", "GET", nil)
+    eq(h["Access-Control-Allow-Methods"], "GET, HEAD")
+    eq(h["Access-Control-Allow-Headers"], nil, "empty list: no header")
+    eq(h["Access-Control-Max-Age"], "600")
+    eq(h["Access-Control-Allow-Credentials"], nil)
+    -- An empty allow_headers refuses any requested header.
+    eq(cors.preflight_headers(c, "https://app.example", "GET", "x-custom")["Access-Control-Allow-Origin"], nil)
+end)
+
+test("cors: an unusable policy is refused whole, with the field", function()
+    local bad = {
+        { '[]', "cors" },
+        { '"x"', "cors" },
+        { '{}', "allow_origins" },
+        { '{"allow_origins": []}', "allow_origins" },
+        { '{"allow_origins": ["*"], "allow_credentials": true}', "allow_origins * with allow_credentials" },
+        { '{"allow_origins": ["https://a.com"], "allow_credentials": "yes"}', "allow_credentials" },
+        { '{"allow_origins": ["https://a.com"], "allow_methods": ["POST"]}', "allow_methods" },
+        { '{"allow_origins": ["https://a.com"], "allow_methods": []}', "allow_methods" },
+        { '{"allow_origins": ["https://a.com"], "allow_methods": ["get"]}', "allow_methods" },
+        { '{"allow_origins": ["https://a.com"], "allow_headers": ["bad header"]}', "allow_headers" },
+        { '{"allow_origins": ["https://a.com"], "allow_headers": {"a": 1}}', "allow_headers" },
+        { '{"allow_origins": ["https://a.com"], "allow_headers": ["*"], "allow_credentials": true}', "allow_headers" },
+        { '{"allow_origins": ["https://a.com"], "expose_headers": ["x\\ny"]}', "expose_headers" },
+        { '{"allow_origins": ["https://a.com"], "max_age": 86401}', "max_age" },
+        { '{"allow_origins": ["https://a.com"], "max_age": -1}', "max_age" },
+        { '{"allow_origins": ["https://a.com"], "max_age": 1.5}', "max_age" },
+    }
+    for _, o in ipairs({ "https://A.com", "https://a.com/", "https://a.com/x", "ftp://a.com", "a.com",
+        "https://a.com:443", "http://a.com:80", "https://a.com:0", "https://a.com:65536", "https://a.com:08",
+        "null", "https://*.com", "https://*.*.b.com", "https://a.*.com", "https://-a.com", "https://a_b.com",
+        "https://a..com", "*", "https://a.com?x", "https://user@a.com" }) do
+        bad[#bad + 1] = { '{"allow_origins": ["https://ok.com", "' .. o .. '"]}', "allow_origins" }
+    end
+    local many = {}
+    for i = 1, 33 do many[i] = '"https://o' .. i .. '.com"' end
+    bad[#bad + 1] = { '{"allow_origins": [' .. table.concat(many, ",") .. ']}', "allow_origins" }
+    for _, case in ipairs(bad) do
+        local c, why = cors_of(case[1])
+        eq(c, nil, case[1])
+        eq(why, case[2], case[1])
+    end
+    many[33] = nil
+    truthy(cors_of('{"allow_origins": [' .. table.concat(many, ",") .. ']}'), "32 origins")
+    truthy(cors_of('{"allow_origins": ["https://a.com:8443", "http://a.com:8080"]}'), "explicit ports")
+end)
+
+test("cors: origin matching, exact and one wildcard level", function()
+    local c = assert(cors_of('{"allow_origins": ["https://a.com", "https://*.b.com", "http://*.c.org:8080"]}'))
+    for _, o in ipairs({ "https://a.com", "https://x.b.com", "https://x-1.b.com", "http://y.c.org:8080" }) do
+        truthy(cors.allowed(c, o), o)
+    end
+    for _, o in ipairs({ "http://a.com", "https://a.com:8443", "https://a.com.evil.com", "https://xa.com",
+        "https://b.com", "https://a.x.b.com", "https://.b.com", "https://x.b.com:443", "http://x.b.com",
+        "http://y.c.org", "http://y.c.org:8081", "https://X.b.com", "null", "", "https://x.b.com/" }) do
+        falsy(cors.allowed(c, o), o)
+    end
+    falsy(cors.allowed(c, nil))
+    truthy(cors.allowed(assert(cors_of('{"allow_origins": ["*"]}')), "https://anything.example"))
+end)
+
+test("cors: response headers", function()
+    local c = assert(cors_of('{"allow_origins": ["https://a.com"], "expose_headers": ["etag", "x-y"],'
+        .. ' "allow_credentials": true}'))
+    local h = cors.response_headers(c, "https://a.com")
+    eq(h["Access-Control-Allow-Origin"], "https://a.com")
+    eq(h["Access-Control-Allow-Credentials"], "true")
+    eq(h["Access-Control-Expose-Headers"], "etag, x-y")
+    eq(h.Vary, "Origin")
+    h = cors.response_headers(c, "https://evil.com")
+    eq(h["Access-Control-Allow-Origin"], nil)
+    eq(h["Access-Control-Allow-Credentials"], nil)
+    eq(h.Vary, "Origin", "a list varies by Origin on every response")
+    h = cors.response_headers(c, nil)
+    eq(h["Access-Control-Allow-Origin"], nil)
+    eq(h.Vary, "Origin")
+    local star = assert(cors_of('{"allow_origins": ["*"]}'))
+    for _, o in ipairs({ "https://x.com", false }) do
+        h = cors.response_headers(star, o or nil)
+        eq(h["Access-Control-Allow-Origin"], "*")
+        eq(h.Vary, nil)
+        eq(h["Access-Control-Expose-Headers"], nil)
+    end
+end)
+
+test("cors: preflight headers", function()
+    local c = assert(cors_of('{"allow_origins": ["https://a.com"], "allow_methods": ["GET"],'
+        .. ' "allow_headers": ["x-custom", "content-type"], "max_age": 600, "allow_credentials": true}'))
+    local h = cors.preflight_headers(c, "https://a.com", "GET", "X-Custom, Content-Type")
+    eq(h["Access-Control-Allow-Origin"], "https://a.com")
+    eq(h["Access-Control-Allow-Methods"], "GET")
+    eq(h["Access-Control-Allow-Headers"], "x-custom, content-type")
+    eq(h["Access-Control-Max-Age"], "600")
+    eq(h["Access-Control-Allow-Credentials"], "true")
+    eq(h.Vary, "Origin")
+    for _, case in ipairs({ { "https://evil.com", "GET", nil }, { "https://a.com", "HEAD", nil },
+        { "https://a.com", "POST", nil }, { "https://a.com", "GET", "x-custom, x-other" } }) do
+        h = cors.preflight_headers(c, case[1], case[2], case[3])
+        eq(h["Access-Control-Allow-Origin"], nil, case[1] .. " " .. case[2])
+        eq(h["Access-Control-Allow-Methods"], nil)
+        eq(h.Vary, "Origin")
+    end
+    local star = assert(cors_of('{"allow_origins": ["*"], "allow_headers": ["*"]}'))
+    h = cors.preflight_headers(star, "https://x.com", "HEAD", "x-a, x-b")
+    eq(h["Access-Control-Allow-Origin"], "*")
+    eq(h["Access-Control-Allow-Headers"], "x-a, x-b", "echoed")
+    eq(h["Access-Control-Max-Age"], nil)
+    eq(h.Vary, nil)
+    -- Client bytes that are not a list of header names are never echoed.
+    h = cors.preflight_headers(star, "https://x.com", "GET", "x-a\r\nSet-Cookie: s=1")
+    eq(h["Access-Control-Allow-Origin"], "*")
+    eq(h["Access-Control-Allow-Headers"], nil)
+end)
+
+test("cors: compiled per zone, an unusable policy never refuses the config", function()
+    local d = assert(docs.validate("config", config({ zones = {
+        z1 = { state = "active", serving = true, origin = { type = "s3", bucket = "media" },
+               settings = { cors = { allow_origins = { "https://a.com" } } } },
+        z2 = { state = "active", serving = true, origin = { type = "s3", bucket = "media" },
+               settings = { cors = { allow_origins = { "*" }, allow_credentials = true } } },
+        z3 = { state = "active", serving = true, origin = { type = "s3", bucket = "media" } },
+    } })))
+    truthy(d.cors.z1 and d.cors.z1.exact["https://a.com"])
+    eq(d.cors.z2, nil)
+    eq(d.cors.z3, nil)
+end)
+
+test("meter: a CORS preflight is a request without transfer", function()
+    local rec = meter.record({ zone = "z1", billable = true, preflight = {} },
+        { bytes_sent = "312", upstream_cache_status = nil }, 204)
+    eq(rec.status, 204)
+    truthy(rec.billable)
+    eq(rec.bytes_out, 0)
+end)
+
+test("SPA fallback status: only an origin 404 of the first slice of an eligible request", function()
+    eq(router.origin_status(404, "1", "bytes=0-1048575"), router.SPA_MISSING)
+    eq(router.origin_status(404, "1", nil), 404, "no range: a background cache update")
+    eq(router.origin_status(404, "1", ""), 404)
+    eq(router.origin_status(404, "", "bytes=0-1048575"), 404, "not eligible")
+    eq(router.origin_status(404, nil, "bytes=0-1048575"), 404, "not eligible")
+    eq(router.origin_status(404, "1", "bytes=1048576-2097151"), 404, "a later slice")
+    for _, st in ipairs({ 200, 206, 304, 403, 410, 416, 500, 502, 503, 504 }) do
+        eq(router.origin_status(st, "1", "bytes=0-1048575"), st, "status " .. st)
+    end
+    truthy(router.SPA_MISSING >= 300 and router.SPA_MISSING <= 599, "error_page range")
 end)
 
 test("router helpers", function()

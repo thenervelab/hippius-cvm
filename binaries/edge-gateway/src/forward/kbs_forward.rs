@@ -542,6 +542,8 @@ mod tests {
             period_start: 100,
             period_end: 160,
             expiry: 9_999,
+            disk_io: None,
+            disk_probe: None,
         };
         let body = inner.canonical().unwrap();
         let signed = SignedServedDeliveryReceipt {

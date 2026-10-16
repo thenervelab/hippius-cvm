@@ -143,9 +143,6 @@ data:
   # POST {url}/v1/relay/{vm}/{quiesce,snapshot,…} to the SAME Edge inner
   # listener as order dispatch. Without it a MigrationJob stalls at quiescing.
   VALI_EDGE_GATEWAY_URL: {{ .Values.config.edgeOrderUrl | quote }}
-  # Dir for §24/§25 effect idempotency markers (under the pod /tmp). Without
-  # it the _guarded effect wrapper fails closed and the migration stalls.
-  VALI_IDEMPOTENCY_DIR: "/tmp/vali-idempotency"
   # KBS admin endpoint (§24/§25 lifecycle pre-registration). vali's
   # `vali_dispatch_launch` POSTs the L1-signed OrderTicket here BEFORE
   # the order-dispatch step so the downstream §7 release path has a
@@ -373,6 +370,12 @@ data:
   # Customer-held disk keys (M1 split / M2 customer) on NEW launches — see
   # values.yaml `customerKeys.enabled`.
   VALI_CUSTOMER_KEYS_ENABLED: {{ .Values.customerKeys.enabled | quote }}
+  # Userdata restage API — see values.yaml `userdataRestage`.
+  VALI_USERDATA_RESTAGE_ENABLED: {{ .Values.userdataRestage.enabled | quote }}
+  VALI_USERDATA_RESTAGE_VM_ALLOWLIST: {{ .Values.userdataRestage.vmAllowlist | quote }}
+  # Operator storage-config writers — see values.yaml `operatorConfig`.
+  VALI_OPERATOR_CONFIG_PRINCIPALS: {{ (.Values.operatorConfig).principals | default "" | quote }}
+  VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}
   # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids
   # (distro → Succeeded golden bake_id, JSON) + the Pushgateway URL result
   # metrics are pushed to. Every other VALI_SYNTHETIC_* knob keeps its

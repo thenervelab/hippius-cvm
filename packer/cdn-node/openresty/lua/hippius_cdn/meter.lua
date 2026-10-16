@@ -46,7 +46,9 @@ function M.record(ctx, var, status)
         -- Only a request that passed every check of a known zone is
         -- billable; everything the node answered itself is not.
         billable = ctx.billable == true and ctx.zone ~= nil,
-        bytes_out = tonumber(var.bytes_sent) or 0,
+        -- A CORS preflight the node answered counts as a request, never
+        -- as transfer.
+        bytes_out = ctx.preflight and 0 or tonumber(var.bytes_sent) or 0,
         cache = cache,
         bytes_from_origin = from_origin,
         bytes_from_shield = 0,

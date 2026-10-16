@@ -19,7 +19,7 @@ from .conftest import FakeEffects
 from .factories import make_service_client, make_vm
 from .test_migration import _drive_until, _same_gen_miners  # noqa: F401 — autouse fixture
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 def _stopped_vm(**kw) -> Vm:

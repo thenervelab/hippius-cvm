@@ -60,6 +60,7 @@ on:
       - "binaries/agent-initramfs/**"
       - "binaries/agent-keepalive/**"
       - "binaries/agent-tenant-telemetry/**"
+      - "binaries/agent-disk-probe/**"
       - "hippius-types/**"
       - "hippius-guest/**"
       - "kbs-core/**"
@@ -84,6 +85,7 @@ on:
       - "binaries/agent-initramfs/**"
       - "binaries/agent-keepalive/**"
       - "binaries/agent-tenant-telemetry/**"
+      - "binaries/agent-disk-probe/**"
       - "hippius-types/**"
       - "hippius-guest/**"
       - "kbs-core/**"
@@ -112,6 +114,14 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # The builder pulls Docker Hub images through mirror.gcr.io: every
+          # FROM is digest-pinned, so it resolves the SAME bytes, and
+          # BuildKit falls back to Docker Hub for anything the mirror lacks.
+          # FROMs and digests are untouched (the image content is measured).
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       # Match the existing vali / kbs / edge image workflows: push
       # to ghcr.io under thenervelab. The cluster's `ghcr-pull-

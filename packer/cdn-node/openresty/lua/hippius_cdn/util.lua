@@ -124,7 +124,13 @@ end
 -- query string never reaches the origin, so it is not part of the key.
 -- `query` (optional) is the cache rule's query-string part
 -- (rules.query_key): empty for the default, so default keys never change.
-function M.cache_key_material(zone_id, purge, path, query)
+-- `spa` (optional): the request may fall back to the zone's index document
+-- (site.falls_back). Its own key, so that whether a path falls back is
+-- never decided by an entry stored under the other answer: a plain 404
+-- cached before the zone turned the fallback on (or before an exclude
+-- changed) never shadows it, and a fallback entry never answers a request
+-- that keeps its 404.
+function M.cache_key_material(zone_id, purge, path, query, spa)
     local zgen = 0
     local prefixes, paths = {}, {}
     if purge then
@@ -141,6 +147,9 @@ function M.cache_key_material(zone_id, purge, path, query)
     }
     if query and query ~= "" then
         parts[#parts + 1] = "q=" .. query
+    end
+    if spa then
+        parts[#parts + 1] = "spa"
     end
     return table.concat(parts, "\0")
 end

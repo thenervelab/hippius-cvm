@@ -475,6 +475,10 @@ def test_a_run_the_miner_forgot_is_lost_after_the_grace(
     clock.advance(179)
     assert _tick(clock).failed == 0
     clock.advance(2)
+    # Held open for the domain-gone grace (a guest poweroff reaches vali late),
+    # then lost: nothing says the VM went down.
+    assert _tick(clock).failed == 0
+    clock.advance(service._domain_gone_grace().total_seconds())
     assert _tick(clock).failed == 1
     lost = BackupRun.objects.get(seq=1)
     assert lost.reason == "lost" and lost.upload_id in mock_s3.aborted
@@ -1404,6 +1408,8 @@ def test_state_changed_requires_a_full(clock: Clock, fake_miner: FakeMiner, mock
     _tick(clock)
     fake_miner.finish(status="failed", reason="state-changed")
     _tick(clock)
+    clock.advance(service._domain_gone_grace().total_seconds())
+    _tick(clock)
     assert _run().reason == "state-changed"
     assert BackupPolicy.objects.get().full_required
 
@@ -1455,6 +1461,8 @@ def test_no_domain_on_the_run_host_loses_the_run_after_the_grace(
     clock.advance(179)
     assert _tick(clock).failed == 0
     clock.advance(2)
+    assert _tick(clock).failed == 0, "held open: a guest poweroff reaches vali late"
+    clock.advance(service._domain_gone_grace().total_seconds())
     assert _tick(clock).failed == 1
     assert _run().reason == "lost"
 

@@ -42,6 +42,8 @@ constant. The CI gate catches it before merge.
 | `userdata_digest` | 32-byte SHA-256 | the §6 ticket-pinned user-data digest preimage |
 | `stopped_ack.basic` | `StoppedAck` | guest-signed §24/§25 EOL ack |
 | `served_delivery_receipt.basic` | `ServedDeliveryReceipt` | §23 tenant-signed receipt |
+| `served_delivery_receipt.disk_io` | `ServedDeliveryReceipt` | `basic` + the optional `disk_io` key (two devices + a `missing` dedicated slot) |
+| `served_delivery_receipt.disk_probe` | `ServedDeliveryReceipt` | `basic` + the optional `disk_probe` key (an OS-disk `v1` target + a dedicated `d1` target) |
 | `served_delivery_aggregate.basic` | `ServedDeliveryAggregate` | §23 Audit-VM-signed aggregate |
 | `map_root.single_entry` | 32-byte SHA-256 | single-entry receipt set root |
 | `totals_root.boundary` | 32-byte SHA-256 | u64::MAX + 1 boundary case for u128 served_units |

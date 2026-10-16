@@ -323,3 +323,76 @@ def test_an_unresolved_disagreement_keeps_storing_ripestat(stubs) -> None:
     assert row.verdict == LocationVerdict.MISMATCH
     assert row.verdict_reasons == [geo.R_SOURCE_DISAGREE]
     assert row.region == "FR" and row.city == ""  # PARIS carries no city
+
+
+def test_a_downgrade_keeps_the_last_verified_country(stubs, settings) -> None:
+    """A miner that stops answering drops from verified to unverified, but
+    where it last was survives: a dead miner's VMs keep their region."""
+    settings.VALI_GEO_REQUIRE_VERIFIED = True
+    miner = make_dispatchable_identity(1)
+    cmd.probe_once(stubs["now"])
+    row = MinerLocation.objects.get(miner=miner)
+    assert (row.verdict, row.last_verified_country_code) == (LocationVerdict.VERIFIED, "FR")
+    verified_at = row.last_verified_at
+    assert verified_at == stubs["now"]
+    stubs["rtt"] = None  # unreachable
+    cmd.probe_once(stubs["now"] + timedelta(minutes=10))
+    row.refresh_from_db()
+    assert row.verdict == LocationVerdict.UNVERIFIED
+    assert (row.last_verified_country_code, row.last_verified_at) == ("FR", verified_at)
+    assert geo.last_known_countries([miner.miner_id]) == {miner.miner_id: "FR"}
+    # Placement still refuses it: only the durable naming survives.
+    assert not geo.placeable_locations(now=stubs["now"]).filter(miner=miner).exists()
+
+
+def test_last_known_countries_never_derives_from_an_unverified_verdict(settings) -> None:
+    """With verified required, a miner never verified has no region, whatever
+    its unverified verdict claims."""
+    settings.VALI_GEO_REQUIRE_VERIFIED = True
+    miner = make_dispatchable_identity(2)
+    MinerLocation.objects.create(
+        miner=miner,
+        country_code="FR",
+        verdict=LocationVerdict.UNVERIFIED,
+        observed_at=timezone.now(),
+    )
+    assert geo.last_known_countries([miner.miner_id]) == {}
+    settings.VALI_GEO_REQUIRE_VERIFIED = False
+    assert geo.last_known_countries([miner.miner_id]) == {miner.miner_id: "FR"}
+
+
+def test_the_migration_backfills_currently_verified_rows() -> None:
+    import importlib
+
+    from django.apps import apps as django_apps
+
+    a, b = make_dispatchable_identity(3), make_dispatchable_identity(4)
+    now = timezone.now()
+    MinerLocation.objects.create(
+        miner=a, country_code="NL", verdict=LocationVerdict.VERIFIED, observed_at=now
+    )
+    MinerLocation.objects.create(
+        miner=b, country_code="FR", verdict=LocationVerdict.UNVERIFIED, observed_at=now
+    )
+    importlib.import_module(
+        "apps.miners.migrations.0007_minerlocation_last_verified"
+    ).from_current_verified(django_apps, None)
+    rows = {r.miner_id: r for r in MinerLocation.objects.all()}
+    assert rows[a.pk].last_verified_country_code == "NL"
+    assert rows[a.pk].last_verified_at == now
+    assert rows[b.pk].last_verified_country_code == "", "no history to recover it from"
+
+
+def test_with_verified_not_required_the_current_verdict_wins_as_for_placement(settings) -> None:
+    settings.VALI_GEO_REQUIRE_VERIFIED = False
+    miner = make_dispatchable_identity(5)
+    MinerLocation.objects.create(
+        miner=miner,
+        country_code="AU",
+        verdict=LocationVerdict.UNVERIFIED,
+        last_verified_country_code="FR",
+        observed_at=timezone.now(),
+    )
+    assert geo.last_known_countries([miner.miner_id]) == {miner.miner_id: "AU"}
+    settings.VALI_GEO_REQUIRE_VERIFIED = True
+    assert geo.last_known_countries([miner.miner_id]) == {miner.miner_id: "FR"}

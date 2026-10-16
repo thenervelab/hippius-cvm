@@ -8,6 +8,8 @@
 local cjson = require("cjson.safe")
 local limits = require("hippius_cdn.limits")
 local rules = require("hippius_cdn.rules")
+local site = require("hippius_cdn.site")
+local cors = require("hippius_cdn.cors")
 local util = require("hippius_cdn.util")
 
 local M = {}
@@ -19,6 +21,10 @@ M.REQUIRED = { "config", "secrets", "certs" }
 
 local null = cjson.null
 local cache = {}
+-- Documents are decoded with JSON arrays marked (cjson.array_mt), so a
+-- validator can tell `[]` from `{}` (site.lua's exclude list).
+local decoder = cjson.new()
+decoder.decode_array_with_array_mt(true)
 
 local function is_map(t)
     return type(t) == "table"
@@ -163,7 +169,7 @@ function validators.config(d)
     -- Cache rules, compiled once per config version. A rule this node
     -- cannot use is dropped (logged here, once per version and worker),
     -- never a refused document.
-    local zone_rules, zone_limits = {}, {}
+    local zone_rules, zone_limits, zone_sites, zone_cors = {}, {}, {}, {}
     for zid, z in pairs(d.zones) do
         local settings_doc = is_map(z.settings) and z.settings or {}
         local compiled, dropped, glob_over_cap = rules.compile(settings_doc.rules)
@@ -180,11 +186,26 @@ function validators.config(d)
         if not usable and ngx and ngx.log then
             ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": limits not usable, the defaults apply")
         end
+        -- Static site / SPA: an unusable value turns its feature off.
+        local site_doc, problems = site.of(settings_doc)
+        zone_sites[zid] = site_doc
+        if #problems > 0 and ngx and ngx.log then
+            ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": site settings not usable (",
+                table.concat(problems, ", "), "), turned off")
+        end
+        -- CORS: an unusable policy is ignored whole.
+        local policy, why = cors.of(settings_doc)
+        zone_cors[zid] = policy
+        if why and ngx and ngx.log then
+            ngx.log(ngx.WARN, "hippius-cdn: zone ", zid, ": cors not usable (", why, "), ignored")
+        end
     end
     return {
         doc = d,
         rules = zone_rules,
         limits = zone_limits,
+        sites = zone_sites,
+        cors = zone_cors,
         skipped = skipped,
         hostnames = hostnames,
         acme = acme,
@@ -235,7 +256,7 @@ end
 -- Validate a raw body. Returns (derived) or (nil, reason).
 function M.validate(name, raw)
     if not M.NAMES[name] then return bad("unknown-document") end
-    local d = cjson.decode(raw)
+    local d = decoder.decode(raw)
     if type(d) ~= "table" then return bad("json") end
     return validators[name](d)
 end

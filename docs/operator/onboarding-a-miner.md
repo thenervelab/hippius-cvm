@@ -172,6 +172,9 @@ receives an order — with nothing visibly wrong anywhere else. NetBird
 assigns the address at mesh join, so you cannot fill it in until after
 play 04.
 
+Do **not** set `miner_id` on a new host: it is derived from the node id
+(see [Your `miner_id`](#your-miner_id)).
+
 This list is the required minimum, not the whole surface — the
 `host_vars/` directory documents further optional keys (data RAID,
 private-network bonding) that only some hosts need.
@@ -256,6 +259,36 @@ the certificate's public key **is** the node id in the SAN (a
 certificate carrying more than one URI SAN is rejected outright), and
 then that the node id is on chain. Possession of the key is the
 credential.
+
+### Your `miner_id`
+
+vali also knows the miner by a `miner_id`, carried in every signed
+heartbeat. It is one namespace shared by every miner, so you do not
+choose it — it is derived from the node id:
+
+```
+miner_id = "m-" + <first 16 hex chars of node_id, lowercase>
+```
+
+For a node id `0123456789abcdef…` that is `m-0123456789abcdef`. The
+console declares the same value to vali, and the bootstrap prints it
+with the registration block. Play 05 reads `identity.pub` after
+`init-identity`, computes the id and renders it into
+`/etc/hippius-miner/config.toml`; it fails if `identity.pub` is missing
+or is not 64 hex chars.
+
+**Override — existing miners only.** A miner registered in vali before
+this rule keeps the id it was registered under: set it in its
+`host_vars/<YOUR_HOST>.yml`, where it always wins over the derivation:
+
+```yaml
+miner_id: "<THE_ID_VALI_ALREADY_HAS>"
+```
+
+Never change, or remove, the `miner_id` of a registered miner: vali
+binds its identity, telemetry and placements to that id, and a miner
+heart-beating under a new id is a different, unregistered miner. New
+miners leave `miner_id` unset.
 
 ### Back up `identity.key`
 
@@ -631,6 +664,61 @@ several GiB per distro — is a constant at `/var/lib/hippius-miner/staging`
 and is NOT configurable. Size the system disk for it even after pointing the
 roots above elsewhere.
 
+### Storage pools and dedicated disks (preview)
+
+The agent can also describe extra storage for verified disk tiers
+(`docs/design/disk-tier-verification.md`). It is **inert today**: vali
+places nothing on it yet, Ansible does not render these keys, and an
+agent older than the one that knows them refuses a config carrying them
+(the config is `deny_unknown_fields`).
+
+```toml
+[[storage.pools]]               # must include `default` at data_disk_root
+id = "default"
+path = "/srv/fast"              # = [storage] data_disk_root
+class = "nvme"
+budget_gb = 3000                # = [host] cvm_disk_gb_budget
+
+[[storage.pools]]
+id = "hdd0"
+path = "/srv/hdd0/hippius"      # an already-mounted ext4/xfs/btrfs, root-owned, not on /
+class = "hdd"
+budget_gb = 16000
+os_disks = false
+
+[[storage.dedicated_disks]]     # a whole, blank disk (run `wipefs -a` yourself)
+id = "wwn-0x5000c500a1b2c3d4"   # its /dev/disk/by-id name
+```
+
+Without `[[storage.pools]]` the agent behaves exactly as before: one pool
+`default` at `data_disk_root`. Every OS disk still lands on `default`. The
+other pools and the dedicated disks are only checked and reported, in the
+`v7` heartbeat (`[heartbeat] emit_pools = true`, which needs vali to accept
+`v7` first). The agent never formats, mounts or wipes anything. It refuses
+to start if a pool that still holds VM disks disappears from the config:
+set it to `state = "draining"` and empty it before removing it. Each pool
+is bound to the filesystem it was first seen on (its UUID, recorded in
+`<state_disk_root>/storage-pools.json`). If another filesystem shows up at
+that path, even an empty one, the pool reports `pool-fs-changed` and is
+not offered: remount the right one (checked on every heartbeat), or, if the
+swap is deliberate, delete that pool's entry from the file and restart the
+agent. A pool not mounted when the agent started reports `pool-unbound`
+once it appears, until the next restart binds it. A launch to a pool that
+is draining, closed to OS disks or off its filesystem is refused with
+`507 pool-unavailable:<pool>`, and vali places it elsewhere. A VM
+destroyed while one of its pools is off its filesystem is noted in
+`<state_disk_root>/pending-reclaim.json`, and its files there are
+deleted once the pool is back.
+
+Later, the providers dashboard will push the same document to the agent as
+a signed `storage-config` order. Once applied, it is stored in
+`<state_disk_root>/storage-config.json` and takes precedence over the local
+`[[storage.pools]]` / `[[storage.dedicated_disks]]`, also after a restart.
+The pushed document can't move `default` off `data_disk_root`, change its
+budget, or give a local pool another path. If you change one of those
+locally, the agent goes back to your local set and the dashboard shows the
+document as not applied.
+
 ### Disk capacity
 
 Three things bound how much tenant disk your host takes. The tightest
@@ -713,7 +801,9 @@ matches the row's key (your node id), vali replaces the placeholder with
 the real CHIP_ID and backfills the NetBird peer id / mesh IP (and
 `chain_node_id` / `snp_generation` if unset). It returns `200` with the
 upgraded row. `<MINER_ID>` must be the miner id the agent signs its
-heartbeats with (the row vali auto-provisioned), and `<AMD_CHIP_ID_HEX>`
+heartbeats with (the row vali auto-provisioned — `m-<first 16 hex of
+the node id>` unless the host pins one, see
+[Your `miner_id`](#your-miner_id)), and `<AMD_CHIP_ID_HEX>`
 bare hex (no `0x`) — the placeholder is replaced once, so anything else
 is refused `400` rather than stored. Until this call
 `GET /v1/operator/nodes` shows the node with `identity.platform_id =

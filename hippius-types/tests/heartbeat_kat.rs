@@ -21,8 +21,10 @@
 //! an older one. A third pair, `heartbeat_body_v4.cbor` /
 //! `signed_heartbeat_v4.cbor`, freezes the `v4` disk-declaration body,
 //! a fourth, `heartbeat_body_v5.cbor` / `signed_heartbeat_v5.cbor`,
-//! the `v5` host-health body, and a fifth, `heartbeat_body_v6.cbor` /
-//! `signed_heartbeat_v6.cbor`, the `v6` agent-version body.
+//! the `v5` host-health body, a fifth, `heartbeat_body_v6.cbor` /
+//! `signed_heartbeat_v6.cbor`, the `v6` agent-version body, and a sixth,
+//! `heartbeat_body_v7.cbor` / `signed_heartbeat_v7.cbor`, the `v7`
+//! storage-report body.
 //!
 //! Regenerate deliberately — see `test_vectors/heartbeat/REGENERATE.md`.
 
@@ -33,6 +35,10 @@ use hippius_types::heartbeat::{
     CapacityDeclaration, DiskDeclaration, HostHealthDeclaration, MinerHeartbeat,
     SignedMinerHeartbeat, DOMAIN, SCHEMA_VERSION, SCHEMA_VERSION_AGENT_VERSION,
     SCHEMA_VERSION_CAPACITY, SCHEMA_VERSION_DISK, SCHEMA_VERSION_HOST_HEALTH,
+    SCHEMA_VERSION_STORAGE,
+};
+use hippius_types::storage_report::{
+    DedicatedDiskReport, DedicatedDiskState, DiskPoolReport, PoolClass, PoolState, StorageReport,
 };
 use std::path::PathBuf;
 
@@ -85,6 +91,14 @@ fn v6_signed_vector_path() -> PathBuf {
     repo_root().join("test_vectors/heartbeat/signed_heartbeat_v6.cbor")
 }
 
+fn v7_body_vector_path() -> PathBuf {
+    repo_root().join("test_vectors/heartbeat/heartbeat_body_v7.cbor")
+}
+
+fn v7_signed_vector_path() -> PathBuf {
+    repo_root().join("test_vectors/heartbeat/signed_heartbeat_v7.cbor")
+}
+
 /// The pinned heartbeat — fixed inputs. DO NOT change without bumping
 /// `test_vectors` and regenerating the committed vectors.
 fn kat_heartbeat() -> MinerHeartbeat {
@@ -110,6 +124,7 @@ fn kat_heartbeat() -> MinerHeartbeat {
         disk: DiskDeclaration::default(),
         host_health: HostHealthDeclaration::default(),
         agent_version: String::new(),
+        storage: Default::default(),
     }
 }
 
@@ -186,6 +201,66 @@ fn kat_heartbeat_v6() -> MinerHeartbeat {
         "v1.2.3".into(),
     );
     assert_eq!(hb.schema_version, SCHEMA_VERSION_AGENT_VERSION);
+    hb
+}
+
+/// The pinned `v7` heartbeat — the `v6` tuple plus a storage report: two
+/// pools (one draining, with a refusal code) and two dedicated disks (one
+/// assigned).
+fn kat_heartbeat_v7() -> MinerHeartbeat {
+    let v6 = kat_heartbeat_v6();
+    let pool = |id: &str, class, state, error: &str| DiskPoolReport {
+        id: id.into(),
+        class,
+        total_gb: 3_576,
+        available_gb: 2_911,
+        budget_gb: 3_000,
+        committed_gb: 480,
+        os_disks: true,
+        state,
+        error: error.into(),
+    };
+    let storage = StorageReport {
+        disk_pools: vec![
+            pool("default", PoolClass::Undeclared, PoolState::Active, ""),
+            pool(
+                "hdd0",
+                PoolClass::Hdd,
+                PoolState::Draining,
+                "pool-not-a-mount",
+            ),
+        ],
+        dedicated_disks: vec![
+            DedicatedDiskReport {
+                id: "ata-ST18000NM000J_ZR5ABCDE".into(),
+                size_mb: 17_166_336,
+                state: DedicatedDiskState::Free,
+                vm: String::new(),
+                error: String::new(),
+            },
+            DedicatedDiskReport {
+                id: "wwn-0x5000c500a1b2c3d4".into(),
+                size_mb: 17_166_336,
+                state: DedicatedDiskState::Assigned,
+                vm: "vm-kat-1".into(),
+                error: String::new(),
+            },
+        ],
+        storage_config_revision: 3,
+    };
+    let hb = kat_heartbeat().with_storage(
+        CapacityDeclaration {
+            cvm_cpu_budget: v6.cvm_cpu_budget,
+            cvm_memory_mb_budget: v6.cvm_memory_mb_budget,
+            asid_capacity: v6.asid_capacity,
+            asid_used: v6.asid_used,
+        },
+        v6.disk,
+        v6.host_health,
+        v6.agent_version,
+        storage,
+    );
+    assert_eq!(hb.schema_version, SCHEMA_VERSION_STORAGE);
     hb
 }
 
@@ -393,6 +468,69 @@ fn v6_frozen_signed_vector_decodes_and_verifies() {
     let sig = ed25519_dalek::Signature::from_slice(&signed.sig).expect("sig is 64 bytes");
     vk.verify_strict(&signed.body, &sig)
         .expect("the frozen v6 KAT signature must verify under the test key");
+}
+
+#[test]
+fn v7_heartbeat_body_kat_matches_the_frozen_vector() {
+    let produced = kat_heartbeat_v7().canonical().expect("encode v7 KAT body");
+    let expected = std::fs::read(v7_body_vector_path()).expect(
+        "test_vectors/heartbeat/heartbeat_body_v7.cbor missing — run \
+         `cargo test -p hippius-types --test heartbeat_kat \
+         regenerate_v7_vectors -- --ignored --exact`",
+    );
+    assert_eq!(
+        produced, expected,
+        "v7 heartbeat canonical-CBOR body changed"
+    );
+}
+
+#[test]
+fn v7_signed_heartbeat_kat_matches_the_frozen_vector() {
+    let produced = sign(kat_heartbeat_v7())
+        .canonical()
+        .expect("encode v7 KAT envelope");
+    let expected = std::fs::read(v7_signed_vector_path())
+        .expect("test_vectors/heartbeat/signed_heartbeat_v7.cbor missing");
+    assert_eq!(produced, expected, "v7 signed heartbeat envelope changed");
+}
+
+#[test]
+fn v7_frozen_signed_vector_decodes_and_verifies() {
+    let raw = std::fs::read(v7_signed_vector_path()).expect("read signed_heartbeat_v7.cbor");
+    let signed: SignedMinerHeartbeat =
+        ciborium::de::from_reader(raw.as_slice()).expect("decode the frozen v7 envelope");
+    assert_eq!(signed.body, kat_heartbeat_v7().canonical().unwrap());
+    let vk = SigningKey::from_bytes(&KAT_SEED).verifying_key();
+    let sig = ed25519_dalek::Signature::from_slice(&signed.sig).expect("sig is 64 bytes");
+    vk.verify_strict(&signed.body, &sig)
+        .expect("the frozen v7 KAT signature must verify under the test key");
+    // And the storage report decodes back from the frozen body.
+    let body: ciborium::value::Value =
+        ciborium::de::from_reader(signed.body.as_slice()).expect("decode the v7 body");
+    let ciborium::value::Value::Map(entries) = body else {
+        panic!("body is a map")
+    };
+    assert_eq!(
+        StorageReport::from_entries(&entries).expect("decode the v7 storage report"),
+        kat_heartbeat_v7().storage
+    );
+}
+
+/// `v7` regeneration helper — writes ONLY the `v7` pair.
+///
+/// ```text
+/// cargo test -p hippius-types --test heartbeat_kat \
+///     regenerate_v7_vectors -- --ignored --exact
+/// ```
+#[test]
+#[ignore]
+fn regenerate_v7_vectors() {
+    let body = kat_heartbeat_v7().canonical().expect("encode v7 KAT body");
+    let signed = sign(kat_heartbeat_v7())
+        .canonical()
+        .expect("encode v7 KAT envelope");
+    std::fs::write(v7_body_vector_path(), &body).expect("write heartbeat_body_v7.cbor");
+    std::fs::write(v7_signed_vector_path(), &signed).expect("write signed_heartbeat_v7.cbor");
 }
 
 /// `v6` regeneration helper — writes ONLY the `v6` pair.

@@ -191,9 +191,11 @@ def test_resolves_permissionless_node_peer(
     fake_verifier: FakeGracefulExitVerifier,
 ) -> None:
     # `hippius-node:<node_id_hex>` SAN scheme: the miner is resolved by
-    # matching the node_id against the registered source verifying_key.
+    # matching the node_id against the registered source verifying_key
+    # (of an identity bound to that node).
     node_id = b"\x11" * 32
     miner = _make_miner()
+    MinerIdentity.objects.filter(miner_id=MINER_ID).update(chain_node_id=node_id.hex())
     TelemetrySource.objects.filter(
         source=SourceType.MINER.value, source_id=MINER_ID
     ).update(verifying_key=node_id)

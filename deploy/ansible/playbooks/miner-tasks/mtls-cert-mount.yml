@@ -78,7 +78,7 @@
 # wrong — SAN URI silently fails every handshake at the Edge, which is
 # a painful failure mode to debug in production. So this play
 # fail-LOUDS at apply time: if `client.crt` is present but its SAN URI
-# does not match `hippius-miner:<inventory_hostname>` exactly, the
+# does not match `hippius-miner:<miner_id>` exactly, the
 # play aborts BEFORE the agent ever tries to handshake.
 #
 # Read-only by construction: `openssl x509 -noout` does not modify the
@@ -99,7 +99,7 @@
   failed_when: false
   check_mode: false
 
-- name: "[ca] Assert client.crt carries SAN URI:hippius-miner:{{ inventory_hostname }}"
+- name: "[ca] Assert client.crt carries SAN URI:hippius-miner:{{ miner_agent_miner_id }}"
   # The previous task is `when:`-skipped if client.crt is absent;
   # `miner_mtls_san is not skipped` keeps this assertion off the
   # not-yet-provisioned path too. Don't fail the play just because
@@ -109,13 +109,13 @@
     - miner_mtls_san is defined
     - miner_mtls_san is not skipped
   vars:
-    expected_san: "URI:hippius-miner:{{ inventory_hostname }}"
+    expected_san: "URI:hippius-miner:{{ miner_agent_miner_id }}"
     # Strict match: anchored on BOTH sides — `URI:hippius-miner:<host>`
     # must be preceded by a SAN delimiter (start-of-string, whitespace,
     # or comma) AND followed by one. Prevents `host-1` from satisfying
     # a `host-12` host (right anchor) and a hypothetical future
     # openssl format that nested the URI mid-token (left anchor).
-    san_regex: "(?:^|[\\s,])URI:hippius-miner:{{ inventory_hostname | regex_escape }}(?:[\\s,]|$)"
+    san_regex: "(?:^|[\\s,])URI:hippius-miner:{{ miner_agent_miner_id | regex_escape }}(?:[\\s,]|$)"
   ansible.builtin.assert:
     that:
       # openssl actually parsed the cert — `rc != 0` means a malformed

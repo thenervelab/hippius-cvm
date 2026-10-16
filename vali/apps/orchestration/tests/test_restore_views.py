@@ -29,6 +29,7 @@ _JOB_KEYS = {
     "point_taken_at",
     "rollback",
     "undo",
+    "cross_region",
     "phase",
     "pct",
     "reason",

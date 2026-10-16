@@ -58,6 +58,17 @@ def _earned_mirror(seed: int) -> MinerCapacity:
         ("INSUFFICIENT-DISK", True, False),
         ("data-disk/insufficient-space", True, False),
         ("insufficient-space", True, False),
+        # A storage pool other than `default`: full, or unable to take a
+        # disk now (draining, unmounted). Not the host's disk capacity, not
+        # SEV (disk-tier design §4.1 / §9).
+        ("insufficient-disk:hdd0", False, False),
+        ("pool-unavailable:hdd0", False, False),
+        ("POOL-UNAVAILABLE:nvme-1", False, False),
+        # Not a pool id: an ordinary unknown class.
+        ("insufficient-disk:", False, True),
+        ("pool-unavailable:hdd 0", False, True),
+        ("pool-unavailable:" + "a" * 33, False, True),
+        ("pool-unavailable", False, True),
         ("dispatch-failed", False, True),  # a real start failure still counts
         ("insufficient-resources", False, False),
         ("", False, True),
@@ -66,6 +77,31 @@ def _earned_mirror(seed: int) -> MinerCapacity:
 def test_disk_refusals_are_capacity_not_sev(classifier: str, is_disk: bool, is_sev: bool) -> None:
     assert cvm_capability.is_disk_refusal(classifier) is is_disk
     assert cvm_capability.is_start_capability_failure(classifier) is is_sev
+
+
+@pytest.mark.parametrize("classifier", ["insufficient-disk:hdd0", "pool-unavailable:hdd0"])
+def test_a_pool_refusal_is_neither_a_capacity_cut_nor_a_start_failure(classifier: str) -> None:
+    assert cvm_capability.is_pool_refusal(classifier)
+    assert not cvm_capability.is_disk_refusal(classifier)
+    assert not cvm_capability.is_start_capability_failure(classifier)
+    assert not launch._start_failure_is_miner_attributable(507, classifier)
+
+
+# The exact classes the agent's dest activation reports for a refused
+# launch (`binaries/miner-agent/src/orders/migration.rs::dest_launch_failure`,
+# pinned there by `a_dest_launch_disk_refusal_keeps_its_class`).
+@pytest.mark.parametrize(
+    ("failure_class", "is_start_failure"),
+    [
+        ("migration/dest-insufficient-disk", False),
+        ("migration/dest-pool-unavailable", False),
+        ("migration/dest-launch-failed", True),
+    ],
+)
+def test_a_dest_activation_disk_or_pool_refusal_is_not_a_start_failure(
+    failure_class: str, is_start_failure: bool
+) -> None:
+    assert cvm_capability.is_dest_activation_start_failure(failure_class) is is_start_failure
 
 
 def test_a_dest_activation_out_of_space_never_reached_a_boot() -> None:
@@ -77,6 +113,8 @@ def test_a_dest_activation_out_of_space_never_reached_a_boot() -> None:
     ("status", "classifier", "charged"),
     [
         (507, "insufficient-disk", True),
+        (507, "insufficient-disk:hdd0", False),
+        (507, "pool-unavailable:hdd0", False),
         (500, "data-disk/insufficient-space", True),
         (502, "insufficient-disk", False),  # an Edge status is never the miner's word
         (500, "dispatch-failed", False),
@@ -171,6 +209,49 @@ def test_a_launch_disk_refusal_is_not_a_sev_failure_and_cuts_the_disk_ceiling(
     assert cvm_capability.capability_of(node_id(1)) == cvm_capability.UNKNOWN
     assert row.earned_disk_gb == 500
     # No `start-failed` halving of CPU/RAM.
+    assert (row.earned_vms, row.earned_vcpus, row.earned_memory_mb) == (10, 20, 81920)
+
+
+@pytest.mark.parametrize("classifier", ["insufficient-disk:hdd0", "pool-unavailable:hdd0"])
+def test_a_pool_refusal_re_places_at_preflight_and_cuts_nothing(
+    monkeypatch: pytest.MonkeyPatch, classifier: str
+) -> None:
+    from apps.orchestration.services import preflight as preflight_svc
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        capacity_earn, "record_event", lambda nid, kind, **_k: seen.append(kind) or True
+    )
+    _earned_mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+
+    def _refuse(*a: object, **k: object) -> None:
+        raise preflight_svc.PreflightRejected("507", classifier=classifier)
+
+    monkeypatch.setattr(preflight_svc, "dispatch_preflight", _refuse)
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+
+    assert out.disposition == launch.RETRIABLE and out.registered is False
+    assert seen == []
+    assert cvm_capability.capability_of(node_id(1)) == cvm_capability.UNKNOWN
+
+
+@pytest.mark.parametrize("classifier", ["insufficient-disk:hdd0", "pool-unavailable:hdd0"])
+def test_a_launch_pool_refusal_is_neither_a_sev_failure_nor_a_cut(
+    monkeypatch: pytest.MonkeyPatch, classifier: str
+) -> None:
+    _earned_mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=False)
+    _dispatch_answers(monkeypatch, 507, classifier)
+
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+
+    assert out.disposition == launch.RETRIABLE
+    row = MinerCapacity.objects.get(miner_node_id=node_id(1))
+    assert row.cvm_fail_streak == 0
+    assert row.earned_disk_gb is None
     assert (row.earned_vms, row.earned_vcpus, row.earned_memory_mb) == (10, 20, 81920)
 
 

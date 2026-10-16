@@ -29,6 +29,11 @@ RestartSec=15
 #   2  — /dev/sev-guest is unavailable: not a real SNP guest;
 #   78 — EX_CONFIG: the measured cmdline is not a Hippius tenant VM's.
 RestartPreventExitStatus=2 78
+# On stop the agent sends one final keepalive (the uptime meter credits a
+# liveness sample backward, so it covers the window up to the stop), bounded
+# by the agent's own 10 s deadline; systemd waits a little longer than that
+# before it kills.
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

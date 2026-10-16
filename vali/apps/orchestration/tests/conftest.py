@@ -42,7 +42,6 @@ def _orchestration_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setattr(settings, "VALI_ORCHESTRATION_ROOT_PRINCIPAL", ROOT_PRINCIPAL)
     monkeypatch.setattr(settings, "VALI_ORCHESTRATION_STEP_TIMEOUT_S", 60.0)
     monkeypatch.setattr(settings, "VALI_ORCHESTRATION_ACK_TIMEOUT_S", 60.0)
-    monkeypatch.setattr(settings, "VALI_IDEMPOTENCY_DIR", str(tmp_path / "idem"))
     monkeypatch.setattr(settings, "VALI_EDGE_GATEWAY_URL", "http://edge.test")
     monkeypatch.setattr(settings, "VALI_KBS_ADMIN_URL", "http://kbs.test")
     # The admin hop's mTLS material — pinned EMPTY so the suite exercises
@@ -229,7 +228,9 @@ class FakeEffects:
         settle_by_unix: int = 0,
         staged_restore_id: str = "",
         backup_chain: Any = None,
+        measurement_hex: str = "",
     ) -> None:
+        self.activate_measurement = measurement_hex
         self.activate_restore = {
             "staged_restore_id": staged_restore_id,
             "get_url": get_url,
@@ -425,9 +426,9 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
 
 @pytest.fixture(autouse=True)
 def _mock_idempotency(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """In-memory §14 idempotency store so the tick loop needs no
-    built Rust binary. `test_idempotency.py` opts out via the
-    `real_idempotency` marker.
+    """In-memory §14 idempotency store, so a test can reset it (and the
+    tick loop's tests stay independent of the table). Tests marked
+    `real_idempotency` use the real `IdempotencyRecord` store.
     """
     if request.node.get_closest_marker("real_idempotency"):
         return

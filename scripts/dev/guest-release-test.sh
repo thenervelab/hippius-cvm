@@ -384,7 +384,7 @@ if (( ${#missing[@]} > 0 )); then
 else
     B="${T}/bins"
     mkdir -p "${B}"
-    for b in hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs \
+    for b in hippius-agent-keepalive hippius-agent-tenant-telemetry hippius-agent-initramfs hippius-agent-disk-probe \
              hippius-guest-release hippius-vsock-ticket; do
         printf '#!/bin/sh\necho %s --attest-components\n' "${b}" > "${B}/${b}"; chmod 0755 "${B}/${b}"
     done
@@ -426,11 +426,12 @@ else
     cp "${T}/out1/components.squashfs" "${C}/rel/components.squashfs"
     boot || err "the boot step refused the builder's record: $(cat "${T}/log")"
     grep -q 'mounted=yes' "${C}/run/guest-components" || err "the builder's image did not pass the sha check"
-    for u in hippius-keepalive.service hippius-tenant-telemetry.service hippius-eol-sign.service; do
+    for u in hippius-keepalive.service hippius-tenant-telemetry.service hippius-eol-sign.service \
+             hippius-disk-probe.service; do
         link_is "${C}/root/etc/systemd/system/${u}" "/run/hippius/guest/units/${u}" \
             || err "the builder's record does not enable ${u}"
     done
-    ok "builder: its record is accepted by the boot step and enables the three units"
+    ok "builder: its record is accepted by the boot step and enables the four units"
 
     # Member contents: exactly the expected leaves + the one new dir.
     want_common="lib/hippius/guest

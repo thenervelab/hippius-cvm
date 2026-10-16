@@ -30,7 +30,7 @@ grep -qx '  config: disabled' "${T}/99-hippius-network.cfg" \
 chmod 0755 "${T}"
 chmod 0644 "${T}"/*
 
-[[ "$#" -gt 0 ]] || set -- ubuntu:24.04 debian:13 quay.io/centos/centos:stream10 fedora:43
+[[ "$#" -gt 0 ]] || set -- mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 mirror.gcr.io/library/debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 quay.io/centos/centos:stream10 mirror.gcr.io/library/fedora:43@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
 rc=0
 for image in "$@"; do
     echo "== ${image}"

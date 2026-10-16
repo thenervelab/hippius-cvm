@@ -24,7 +24,7 @@
 //! field of the signed body, so a cross-scheme replay produces
 //! different bytes and fails verification.
 //!
-//! ## Schema (`v1` / `v2` / `v3` / `v4` / `v5` / `v6`) — fixed, fail-closed
+//! ## Schema (`v1` / `v2` / `v3` / `v4` / `v5` / `v6` / `v7`) — fixed, fail-closed
 //!
 //! Every field is mandatory. [`MinerHeartbeat::validate`] runs on both
 //! the encode and (caller-side) decode paths; [`canonical`] rejects a
@@ -44,6 +44,7 @@ use alloc::{
 };
 
 use crate::cbor::to_canonical_vec;
+use crate::storage_report::StorageReport;
 use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -135,6 +136,19 @@ pub const SCHEMA_VERSION_HOST_HEALTH: u8 = 5;
 /// accept it before any miner emits it.
 pub const SCHEMA_VERSION_AGENT_VERSION: u8 = 6;
 
+/// The `schema_version` of a `v7` heartbeat — the full `v6` body PLUS the
+/// three [`StorageReport`] keys: `disk_pools` (the miner's storage pools,
+/// 1..=4), `dedicated_disks` (its whole disks for passthrough, 0..=24) and
+/// `storage_config_revision` (the storage-config order it has applied,
+/// `0` = none). docs/design/disk-tier-verification.md §4, §9.
+///
+/// Untrusted like every other declaration: pool sizes only clamp down,
+/// and a declared pool class is never a tier.
+///
+/// `v7` is OPT-IN on the miner-agent; vali's verifier MUST accept it
+/// before any miner emits it.
+pub const SCHEMA_VERSION_STORAGE: u8 = 7;
+
 /// Hard upper bound on the `v6` `agent_version` length, in bytes. Mirrors
 /// the vali `MinerCapacity.agent_version` column (`max_length=32`).
 pub const MAX_AGENT_VERSION_LEN: usize = 32;
@@ -187,6 +201,8 @@ pub enum HeartbeatError {
     /// A `v6` `agent_version` was empty, longer than
     /// [`MAX_AGENT_VERSION_LEN`], or outside `[0-9A-Za-z._-]`.
     AgentVersion,
+    /// A `v7` storage report failed [`StorageReport::validate`].
+    Storage,
 }
 
 impl core::fmt::Display for HeartbeatError {
@@ -207,6 +223,7 @@ impl HeartbeatError {
             HeartbeatError::Encode => "heartbeat-encode",
             HeartbeatError::Capacity => "heartbeat-capacity",
             HeartbeatError::AgentVersion => "heartbeat-agent-version",
+            HeartbeatError::Storage => "heartbeat-storage",
         }
     }
 }
@@ -292,8 +309,11 @@ pub struct MinerHeartbeat {
     pub host_health: HostHealthDeclaration,
     /// `v6`-only: the miner-agent's release tag. Empty (= absent) in every
     /// earlier body ([`validate`](Self::validate) rejects anything else
-    /// there); in a `v6` body it must pass [`is_valid_agent_version`].
+    /// there); in a `v6`/`v7` body it must pass [`is_valid_agent_version`].
     pub agent_version: String,
+    /// `v7`-only storage report. Default (= absent) in every earlier body
+    /// ([`validate`](Self::validate) rejects anything else there).
+    pub storage: StorageReport,
 }
 
 impl MinerHeartbeat {
@@ -305,13 +325,15 @@ impl MinerHeartbeat {
         // baseline), `v2` (the 11-field graceful-exit-flag form), `v3`
         // (`v2` + the four capacity declarations), `v4` (`v3` + the four
         // disk declarations), `v5` (`v4` + the four host-health fields)
-        // and `v6` (`v5` + `agent_version`). Any other value fails closed.
+        // `v6` (`v5` + `agent_version`) and `v7` (`v6` + the storage
+        // report). Any other value fails closed.
         if self.schema_version != SCHEMA_VERSION
             && self.schema_version != SCHEMA_VERSION_GRACEFUL_EXIT
             && self.schema_version != SCHEMA_VERSION_CAPACITY
             && self.schema_version != SCHEMA_VERSION_DISK
             && self.schema_version != SCHEMA_VERSION_HOST_HEALTH
             && self.schema_version != SCHEMA_VERSION_AGENT_VERSION
+            && self.schema_version != SCHEMA_VERSION_STORAGE
         {
             return Err(HeartbeatError::SchemaVersion);
         }
@@ -337,13 +359,22 @@ impl MinerHeartbeat {
         {
             return Err(HeartbeatError::SchemaVersion);
         }
-        // …and `agent_version` is `v6`-only, where it is mandatory and
-        // well-formed.
-        if self.schema_version == SCHEMA_VERSION_AGENT_VERSION {
+        // …`agent_version` is `v6`/`v7`-only, where it is mandatory and
+        // well-formed…
+        if self.carries_agent_version_key() {
             if !is_valid_agent_version(&self.agent_version) {
                 return Err(HeartbeatError::AgentVersion);
             }
         } else if !self.agent_version.is_empty() {
+            return Err(HeartbeatError::SchemaVersion);
+        }
+        // …and the storage report is `v7`-only, where it is mandatory and
+        // well-formed.
+        if self.schema_version == SCHEMA_VERSION_STORAGE {
+            self.storage
+                .validate()
+                .map_err(|_| HeartbeatError::Storage)?;
+        } else if self.storage != StorageReport::default() {
             return Err(HeartbeatError::SchemaVersion);
         }
         // A known ASID capacity bounds the in-use count. (`capacity == 0`
@@ -380,10 +411,16 @@ impl MinerHeartbeat {
     }
 
     /// `true` for the versions whose canonical map carries the four
-    /// host-health keys (`v5` and its superset `v6`).
+    /// host-health keys (`v5` and its supersets `v6` and `v7`).
     fn carries_host_health_keys(&self) -> bool {
-        self.schema_version == SCHEMA_VERSION_HOST_HEALTH
-            || self.schema_version == SCHEMA_VERSION_AGENT_VERSION
+        self.schema_version == SCHEMA_VERSION_HOST_HEALTH || self.carries_agent_version_key()
+    }
+
+    /// `true` for the versions whose canonical map carries
+    /// `agent_version` (`v6` and its superset `v7`).
+    fn carries_agent_version_key(&self) -> bool {
+        self.schema_version == SCHEMA_VERSION_AGENT_VERSION
+            || self.schema_version == SCHEMA_VERSION_STORAGE
     }
 
     /// `true` when any `v3`-only capacity field is non-zero.
@@ -488,11 +525,18 @@ impl MinerHeartbeat {
                 ),
             ]);
         }
-        if self.schema_version == SCHEMA_VERSION_AGENT_VERSION {
+        if self.carries_agent_version_key() {
             entries.push((
                 Value::Text("agent_version".into()),
                 Value::Text(self.agent_version.clone()),
             ));
+        }
+        if self.schema_version == SCHEMA_VERSION_STORAGE {
+            entries.extend(
+                self.storage
+                    .to_entries()
+                    .map_err(|_| HeartbeatError::Storage)?,
+            );
         }
         entries.extend([
             (
@@ -574,6 +618,7 @@ impl MinerHeartbeat {
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: StorageReport::default(),
         }
     }
 
@@ -630,6 +675,24 @@ impl MinerHeartbeat {
         let mut hb = self.with_host_health(capacity, disk, host_health);
         hb.schema_version = SCHEMA_VERSION_AGENT_VERSION;
         hb.agent_version = agent_version;
+        hb
+    }
+
+    /// Upgrade an ordinary (`v1`) heartbeat to `v7`: everything `v6`
+    /// carries plus the storage report. Every other field is preserved,
+    /// like [`with_capacity`](Self::with_capacity). A malformed report is
+    /// caught by [`validate`](Self::validate), not here.
+    pub fn with_storage(
+        self,
+        capacity: CapacityDeclaration,
+        disk: DiskDeclaration,
+        host_health: HostHealthDeclaration,
+        agent_version: String,
+        storage: StorageReport,
+    ) -> Self {
+        let mut hb = self.with_agent_version(capacity, disk, host_health, agent_version);
+        hb.schema_version = SCHEMA_VERSION_STORAGE;
+        hb.storage = storage;
         hb
     }
 }
@@ -796,6 +859,7 @@ mod tests {
             disk: DiskDeclaration::default(),
             host_health: HostHealthDeclaration::default(),
             agent_version: String::new(),
+            storage: StorageReport::default(),
         }
     }
 
@@ -1284,6 +1348,85 @@ mod tests {
         assert_eq!(stripped, v5_keys, "v6 must not move a v5 key");
     }
 
+    fn storage() -> StorageReport {
+        use crate::storage_report::{DiskPoolReport, PoolClass, PoolState};
+        StorageReport {
+            disk_pools: vec![DiskPoolReport {
+                id: "default".into(),
+                class: PoolClass::Undeclared,
+                total_gb: 3500,
+                available_gb: 2900,
+                budget_gb: 3000,
+                committed_gb: 400,
+                os_disks: true,
+                state: PoolState::Active,
+                error: String::new(),
+            }],
+            dedicated_disks: Vec::new(),
+            storage_config_revision: 0,
+        }
+    }
+
+    fn v7() -> MinerHeartbeat {
+        sample().with_storage(
+            capacity(),
+            disk(),
+            host_health(),
+            "v0.42.1".into(),
+            storage(),
+        )
+    }
+
+    #[test]
+    fn v7_canonical_is_v6_plus_three_storage_keys() {
+        let hb = v7();
+        assert_eq!(hb.schema_version, SCHEMA_VERSION_STORAGE);
+        let bytes = hb.canonical().unwrap();
+        assert_canonical(&bytes).unwrap();
+        let v6_keys = canonical_keys(&v6().canonical().unwrap());
+        let v7_keys = canonical_keys(&bytes);
+        assert_eq!(v7_keys.len(), 27);
+        let stripped: Vec<String> = v7_keys
+            .into_iter()
+            .filter(|k| {
+                !["disk_pools", "dedicated_disks", "storage_config_revision"].contains(&k.as_str())
+            })
+            .collect();
+        assert_eq!(stripped, v6_keys, "v7 must not move a v6 key");
+    }
+
+    #[test]
+    fn v7_requires_a_valid_storage_report_and_agent_version() {
+        let mut hb = v7();
+        hb.storage.disk_pools.clear();
+        assert_eq!(hb.validate(), Err(HeartbeatError::Storage));
+        assert!(hb.canonical().is_err());
+        let mut hb = v7();
+        hb.agent_version = String::new();
+        assert_eq!(hb.validate(), Err(HeartbeatError::AgentVersion));
+    }
+
+    #[test]
+    fn only_v7_may_carry_a_storage_report() {
+        let mut hb = v6();
+        hb.storage = storage();
+        assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
+        let mut hb = sample();
+        hb.storage.storage_config_revision = 1;
+        assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
+    }
+
+    #[test]
+    fn the_storage_report_is_signed() {
+        let base = v7().canonical().unwrap();
+        let mut hb = v7();
+        hb.storage.storage_config_revision = 9;
+        assert_ne!(base, hb.canonical().unwrap());
+        let mut hb = v7();
+        hb.storage.disk_pools[0].available_gb = 1;
+        assert_ne!(base, hb.canonical().unwrap());
+    }
+
     #[test]
     fn v6_accepts_the_dev_fallback_and_the_full_charset() {
         for tag in ["dev", "v1.2.3", "miner-agent_2026.10-rc.1", "A"] {
@@ -1366,9 +1509,9 @@ mod tests {
 
     #[test]
     fn wrong_schema_version_rejected() {
-        // An UNKNOWN version (not 1 through 6) still fails closed.
+        // An UNKNOWN version (not 1 through 7) still fails closed.
         let mut hb = sample();
-        hb.schema_version = 7;
+        hb.schema_version = 8;
         assert_eq!(hb.validate(), Err(HeartbeatError::SchemaVersion));
         assert!(hb.canonical().is_err());
     }

@@ -350,6 +350,9 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
         .exclude(country_code="")
     )
     bridged_total = MinerIdentity.objects.filter(chain_node_id__isnull=False).count()
+    failover_regions = set(
+        scheduler_service.failover_capable_node_ids(verified_only=verified_only).values()
+    )
 
     by_region: dict[str, dict[str, Any]] = {}
     for loc in located:
@@ -365,6 +368,7 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
                 "miners_dispatchable": 0,
                 "hosted_vm_count": 0,
                 "capacity": None,
+                "failover_capable": region in failover_regions,
                 "node_ids": [],
             },
         )

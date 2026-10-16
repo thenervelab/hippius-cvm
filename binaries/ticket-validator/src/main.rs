@@ -19,6 +19,9 @@
 //!   (`MinerStatuses`, `CurrentEpoch`, `EpochWeights`) from a
 //!   `thenervelab/thebrain` Substrate node over JSON-RPC, for the
 //!   PR-G4 vali scheduler. Reads no stdin. See `mod miner_status`.
+//! - `read-node-family` — which family runs a compute node
+//!   (`NodeIdToChild` → `ChildRegistrations`, finalized head), for vali's
+//!   operator config API. Reads no stdin. See `mod node_family`.
 //! - `idempotency-record` / `idempotency-recall` — §14 retry-dedup
 //!   over `kbs_core::persist::FileIdempotencyStore`, for the PR-G5
 //!   vali §24/§25 orchestrator. Read no stdin. See `mod idempotency`.
@@ -84,6 +87,7 @@ mod host_challenge_request;
 mod idempotency;
 mod live_attestation;
 mod miner_status;
+mod node_family;
 mod pending_prices;
 mod telemetry;
 mod vm_progress;
@@ -247,6 +251,11 @@ enum Command {
     /// node over JSON-RPC. Reads no stdin; the RPC endpoint comes from
     /// the `THEBRAIN_RPC_URL` env var.
     ReadPendingPrices(pending_prices::ReadPendingPricesArgs),
+    /// Read which family runs a compute node (`NodeIdToChild` →
+    /// `ChildRegistrations`, at the finalized head) for vali's operator
+    /// config API. Reads no stdin; the RPC endpoint comes from the
+    /// `THEBRAIN_RPC_URL` env var.
+    ReadNodeFamily(node_family::ReadNodeFamilyArgs),
     /// Record a §14 idempotency key (PR-G5 orchestration retry-dedup).
     /// Store dir from the `IDEMPOTENCY_DIR` env var.
     IdempotencyRecord(idempotency::IdempotencyRecordArgs),
@@ -310,6 +319,11 @@ enum Command {
     /// (`applied:<revision>:<sha256>`), from the same JSON payload
     /// `encode-order --kind net-policy` reads. See `mod encode_order`.
     NetPolicyDigest,
+    /// The content hash a miner acks for a `storage-config` order
+    /// (`applied:<revision>:<sha256>` / `dry-run-ok:<revision>:<sha256>`),
+    /// from the same JSON payload `encode-order --kind storage-config`
+    /// reads. See `mod encode_order`.
+    StorageConfigDigest,
     /// §7 — generate a per-VM guest lifecycle Ed25519 keypair. Reads no
     /// stdin; emits `{"seed_hex","vk_hex"}` on stdout. vali stages the
     /// seed (PRIVATE key) into Vault for the KBS to release to the
@@ -371,6 +385,7 @@ fn main() -> ExitCode {
         Command::VerifyStoppedAck(args) => cmd_verify_stopped_ack(args),
         Command::ReadMinerStatus(args) => miner_status::run(args),
         Command::ReadPendingPrices(args) => pending_prices::run(args),
+        Command::ReadNodeFamily(args) => node_family::run(args),
         Command::IdempotencyRecord(args) => idempotency::run_record(args),
         Command::IdempotencyRecall(args) => idempotency::run_recall(args),
         Command::VerifyEdgeTelemetry(args) => telemetry::run_edge_telemetry(args),
@@ -384,6 +399,7 @@ fn main() -> ExitCode {
         Command::VerifyHostChallengeRequest => host_challenge_request::run(),
         Command::EncodeOrder(args) => encode_order::run(args),
         Command::NetPolicyDigest => encode_order::run_net_policy_digest(),
+        Command::StorageConfigDigest => encode_order::run_storage_config_digest(),
         Command::GenLifecycleKey => gen_lifecycle_key::run(),
         Command::DeriveTelemetryKey => derive_telemetry_key::run(),
         Command::DeriveLifecycleVk => derive_lifecycle_vk::run(),

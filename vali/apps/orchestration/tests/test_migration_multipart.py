@@ -21,7 +21,7 @@ from .test_migration import (  # noqa: F401 — autouse fixture
     _same_gen_miners,
 )
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 GIB = 1024**3
 PART = 512 * 1024**2  # the store's per-part ceiling

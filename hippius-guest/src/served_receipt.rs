@@ -157,6 +157,8 @@ mod tests {
             period_start: 1_000,
             period_end: 1_060,
             expiry: 2_000,
+            disk_io: None,
+            disk_probe: None,
         }
     }
 

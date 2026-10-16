@@ -20,7 +20,7 @@
 # ── builder ─────────────────────────────────────────────────────────
 # Rust 1.93.0 — matches rust-toolchain.toml. Pinned by digest (§F
 # supply-chain discipline: never a floating tag).
-FROM rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS builder
+FROM mirror.gcr.io/library/rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS builder
 
 WORKDIR /src
 # The whole workspace — cargo must parse every member manifest to

@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use builder::{
     CapacityDeclarer, DiskDeclarer, DiskReading, DiskSource, HeartbeatBuilder, SequenceStore,
-    StatvfsDiskSource,
+    StatvfsDiskSource, StorageSource,
 };
 pub use metrics::{HostMetrics, MetricsSource, MockMetricsSource, ProcMetricsSource};
 pub use pusher::{

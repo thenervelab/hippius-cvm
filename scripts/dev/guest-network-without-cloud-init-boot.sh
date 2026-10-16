@@ -43,7 +43,7 @@ declare -A URL=(
 )
 
 cat > "${W}/files/Dockerfile" <<'EOF'
-FROM ubuntu:24.04
+FROM mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     libguestfs-tools qemu-system-x86 qemu-utils linux-image-generic genisoimage curl ca-certificates >/dev/null
 EOF

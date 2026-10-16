@@ -97,10 +97,11 @@ _NODE_PEER_ID_PREFIX = "hippius-node:"
 # Mirrors `apps.miners.MinerIdentity.miner_id` max_length.
 _MAX_MINER_ID_LEN = 64
 # Upper bound on a raw-CBOR heartbeat body — pinned to the SAME
-# 4096-byte cap `verify-heartbeat` enforces, so an oversize body draws
-# a clean `413` here (no subprocess spawn, no §9 poison strike) at
-# exactly the binary's security boundary.
-_MAX_HEARTBEAT_BYTES = 4096
+# 16 KiB cap `verify-heartbeat` enforces, so an oversize body draws a
+# clean `413` here (no subprocess spawn, no §9 poison strike) at exactly
+# the binary's security boundary. A worst-case `v7` (storage report) is
+# about 9 KiB; every earlier version is under 1 KiB.
+_MAX_HEARTBEAT_BYTES = 16 * 1024
 # Upper bound on a raw-CBOR graceful-exit body — matches the path-based
 # `miners.MinerGracefulExitView._MAX_GRACEFUL_EXIT_BYTES` and the
 # `verify-graceful-exit` binary's cap, so an oversize body draws a clean
@@ -1410,19 +1411,36 @@ def _resolve_peer_to_miner_id(peer_id: str | None) -> str | None:
       already vouched the node is registered + Active, so a miss here is
       a vali-side provisioning gap, not an authorisation decision.
 
+    A source whose `MinerIdentity` is bound to ANOTHER node (neither
+    `chain_node_id` nor `pubkey_hex` is this node_id) is skipped: its key
+    no longer matches the identity it serves — e.g. re-keyed by a
+    first-contact claim of a foreign `miner_id` — so it must not resolve.
+
     Returns `None` on a missing / malformed header or an unknown
     node_id — the caller fail-closes with a `400`.
     """
+    from apps.miners.models import MinerIdentity
+
     legacy = _miner_id_from_peer(peer_id)
     if legacy is not None:
         return legacy
     node_id = _node_id_from_peer(peer_id)
     if node_id is None:
         return None
-    src = TelemetrySource.objects.filter(
+    node_hex = node_id.hex()
+    for src in TelemetrySource.objects.filter(
         source=SourceType.MINER.value, verifying_key=node_id
-    ).first()
-    return src.source_id if src is not None else None
+    ):
+        ident = MinerIdentity.objects.filter(miner_id=src.source_id).first()
+        if ident is not None and node_hex not in (ident.chain_node_id, ident.pubkey_hex):
+            log.warning(
+                "peer node_id=%s… keys source miner_id=%s bound to another node; ignored",
+                node_hex[:16],
+                src.source_id,
+            )
+            continue
+        return src.source_id
+    return None
 
 
 def _node_id_hex_from_peer(peer_id: str | None) -> str | None:

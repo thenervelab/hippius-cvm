@@ -472,7 +472,7 @@ fn is_valid_path(p: &str) -> bool {
 /// and once decoded no control byte, no backslash and no "." / ".."
 /// segment (nginx's `$uri` never contains one). The data plane applies
 /// the same rule and skips what fails it.
-fn is_request_path(p: &str) -> bool {
+pub(crate) fn is_request_path(p: &str) -> bool {
     if !is_valid_path(p) {
         return false;
     }

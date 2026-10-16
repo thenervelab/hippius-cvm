@@ -55,6 +55,9 @@ def _patch_common(monkeypatch, *, ceilings, dest=None):
     monkeypatch.setattr(cmd.service, "max_epoch_lag", lambda: 2)
     monkeypatch.setattr(cmd.service, "max_host_share", lambda: 1.0)
     monkeypatch.setattr(cmd.service, "price_by_node", lambda snap: {})
+    # Every VM's region is FR (the region gate has its own test below).
+    monkeypatch.setattr(cmd.service, "move_region_for_vm", lambda vm, from_node="": "FR")
+    monkeypatch.setattr(cmd.service, "region_by_node", lambda **kw: {})
 
     def fake_decide(**kw):
         if dest is None:
@@ -243,17 +246,20 @@ def test_end_to_end_recommends_on_real_vm_ceiling(monkeypatch) -> None:
 
 
 def test_suggested_dest_is_constrained_to_the_vm_region(monkeypatch) -> None:
-    """Gate (f) on the ONLY guard this path has: an operator approving a
-    recommendation calls `start_migration`, which does not check regions,
-    so the suggestion itself must have been made inside the VM's region."""
+    """The suggestion is made inside the VM's region — and not at all when
+    that cannot be told (no launch region, host never located): an approve
+    acts on it as a §25 migration."""
     from apps.lifecycle.models import Vm
     from apps.orchestration.tests.factories import make_launch_record
+    from apps.scheduler import service as sched
 
     _bind("vm-a", node_id(1))
     _bind("vm-b", node_id(1))
     make_launch_record(Vm.objects.get(vm_id="vm-a"), region="fr")
     make_launch_record(Vm.objects.get(vm_id="vm-b"))
+    real = sched.move_region_for_vm
     _patch_common(monkeypatch, ceilings={"vm-a": 100, "vm-b": 100}, dest=node_id(9))
+    monkeypatch.setattr(cmd.service, "move_region_for_vm", real)
     seen: dict[str, dict | None] = {}
 
     def spy(**kw):
@@ -267,9 +273,9 @@ def test_suggested_dest_is_constrained_to_the_vm_region(monkeypatch) -> None:
         lambda: _report(PriceAnnouncement(node_id(1), 500, 150)),
     )
     call_command("vali_price_watch", once=True)
-    # vm-a asked for FR ⇒ the gate is armed with the (here empty) verified
-    # map; vm-b asked for nothing ⇒ inert and no map at all.
-    assert seen == {"FR": {}, "": None}
+    assert seen == {"FR": {}}, "vm-b's region cannot be told: no placement asked"
+    dests = dict(_pending().values_list("vm__vm_id", "suggested_dest_node_id"))
+    assert dests == {"vm-a": node_id(9), "vm-b": ""}
 
 
 def test_suggested_dest_is_sized_for_the_vms_own_flavor(monkeypatch) -> None:

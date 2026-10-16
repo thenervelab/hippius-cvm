@@ -60,6 +60,16 @@ class BackupPolicy(models.Model):
     #: tells boots apart. A chain is restorable iff its counter equals this.
     observed_boot_counter = models.BigIntegerField(null=True, blank=True)
     observed_at = models.DateTimeField(null=True, blank=True)
+    #: When vali saw the boot counter MOVE (a guest reboot vali did not
+    #: order: no relaunch restamps `Vm.boot_started_at` for it). One of the
+    #: boot clocks a run waits on (`service._boot_gate`).
+    boot_seen_at = models.DateTimeField(null=True, blank=True)
+    #: Why no run starts now although one is due, and since when: the VM is
+    #: stopped (`vm-stopped`), the first full waits for the guest to finish
+    #: booting (`first-full-deferred`), or a later run waits for the current
+    #: boot to finish (`boot-in-progress`). Blank when nothing is held back.
+    deferred_reason = models.CharField(max_length=32, blank=True, default="", db_default="")
+    deferred_since = models.DateTimeField(null=True, blank=True)
     last_probe_at = models.DateTimeField(null=True, blank=True)
     disabled_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -121,6 +131,10 @@ class RunStatus(models.TextChoices):
     RUNNING = "running", "Running"
     DONE = "done", "Done"
     FAILED = "failed", "Failed"
+    #: Ended because the VM went down or restarted under it (a power stop,
+    #: a guest poweroff, a relaunch): nothing failed, the domain the run
+    #: copied from is legitimately gone. `reason` says which.
+    SKIPPED = "skipped", "Skipped"
 
 
 ACTIVE_RUN_STATUSES = (RunStatus.PENDING, RunStatus.RUNNING)
@@ -160,10 +174,20 @@ class BackupRun(models.Model):
     state_sha256_hex = models.CharField(max_length=64, blank=True, default="")
     boot_counter = models.BigIntegerField(null=True, blank=True)
     bitmap_present = models.BooleanField(null=True, blank=True)
+    #: True: the run started once the VM's boot had settled (the guest still
+    #: signalling `VALI_BACKUP_BOOT_SETTLE_S` after it began,
+    #: `service._run_boot_settled`). Null: cannot be told (a run from before
+    #: this was recorded, or one taken at the wait's cap with no signal).
+    boot_settled = models.BooleanField(null=True, blank=True)
     #: Wall time the miner reports for snapshot + upload.
     miner_duration_s = models.PositiveIntegerField(null=True, blank=True)
     # Consecutive failed status polls; reset by the next successful one.
     poll_misses = models.PositiveIntegerField(default=0)
+    #: When vali first read that the run's domain was gone (the miner's
+    #: `qmp-no-domain` & co., or a forgotten run) with no sign yet of WHY:
+    #: a guest poweroff or reboot reaches vali only later. The run is held
+    #: open that long before it counts as failed (`service._went_down`).
+    domain_gone_at = models.DateTimeField(null=True, blank=True)
     #: sha256 of the exact `manifest.json` bytes stored for the run (the
     #: point an authorized rollback binds to). Empty before a DONE.
     manifest_sha256 = models.CharField(max_length=64, blank=True, default="")

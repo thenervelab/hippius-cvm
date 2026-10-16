@@ -27,6 +27,7 @@ peer never blocks the request thread.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
@@ -51,6 +52,8 @@ from .schemas import (
     MeasurementAuditSerializer,
     MigrateStartRequestSerializer,
     MigrationJobSerializer,
+    MinerDrainRequestSerializer,
+    MinerDrainSerializer,
     PowerPolicyRequestSerializer,
     PowerPolicySerializer,
 )
@@ -75,6 +78,7 @@ _LAUNCH_INTERNAL_CATEGORIES = frozenset({"internal"})
 # `StartError` categories that are a caller mistake (400) rather than
 # a VM-state conflict (409).
 _BAD_REQUEST_CATEGORIES = frozenset({"same-node"})
+_REGION_RE = re.compile(r"[A-Za-z]{2}")
 #: A §25 intake refusal that is about the SYSTEM, not the request — the
 #: same call is expected to succeed once Vault answers again. 503 says
 #: "retry", where the 409 default says "this VM cannot migrate".
@@ -137,6 +141,24 @@ class MigrateStartView(APIView):
         cold = body.get("cold", False)
         if not isinstance(cold, bool):
             return _error(status.HTTP_400_BAD_REQUEST, "cold must be a boolean", "wire")
+        # The VM's region, stated only when vali cannot tell it
+        # (`region-unknown`); a different known one is `region-conflict`.
+        region = body.get("region")
+        region = "" if region is None else region
+        if not isinstance(region, str) or (region and not _REGION_RE.fullmatch(region)):
+            return _error(
+                status.HTTP_400_BAD_REQUEST,
+                "region must be an ISO 3166-1 alpha-2 country code",
+                "wire",
+            )
+        # The operator's cross-region override: `region` then NAMES the
+        # destination region, and a reason is required (recorded).
+        try:
+            cross_region = service.parse_cross_region(
+                body.get("allow_cross_region"), region, body.get("reason"), body.get("operator")
+            )
+        except ValueError as exc:
+            return _error(status.HTTP_400_BAD_REQUEST, str(exc), "wire")
 
         try:
             vm = Vm.objects.get(vm_id=vm_id)
@@ -149,11 +171,98 @@ class MigrateStartView(APIView):
                 dest_node_id=dest_node_id,
                 decided_by=request.user,
                 cold=cold,
+                region="" if cross_region else region,
+                cross_region=cross_region,
             )
         except StartError as exc:
             return _start_error_response(exc)
         return Response(
             _serialize_migration(job), status=status.HTTP_202_ACCEPTED
+        )
+
+
+class MinerDrainView(APIView):
+    """`POST /v1/admin/miner/<miner_id>/drain` — root-only: one pass of the
+    graceful-exit drain for one departing miner, now, as the operator.
+
+    Body (optional): `allow_cross_region: true` + `region` (the destination
+    region) + `reason` — the operator's cross-region override: the miner's
+    VMs go to that region instead of their own, each migration recording
+    it. Without it, exactly the automatic drain (in-region only)."""
+
+    object_scope = scoping.OPERATOR_ONLY
+    permission_classes = [IsAuthenticated, IsOrchestrationRoot]
+    http_method_names = ["post", "options"]
+
+    @extend_schema(
+        summary="Drain a departing miner now (operator)",
+        tags=["VM orchestration"],
+        request=MinerDrainRequestSerializer,
+        responses={
+            200: MinerDrainSerializer,
+            400: OpenApiResponse(ErrorSerializer, "Malformed body."),
+            403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
+            404: OpenApiResponse(ErrorSerializer, "Miner not found."),
+            409: OpenApiResponse(ErrorSerializer, "`miner-not-departing`."),
+            503: OpenApiResponse(ErrorSerializer, "`chain-unavailable`: nothing was done."),
+        },
+    )
+    def post(self, request: Request, miner_id: str) -> Response:
+        from apps.miners.models import MinerIdentity
+
+        body = request.data if request.data else {}
+        if not isinstance(body, dict):
+            return _error(status.HTTP_400_BAD_REQUEST, "request body must be a JSON object", "wire")
+        unknown = set(body) - {"allow_cross_region", "region", "reason", "operator"}
+        if unknown:
+            return _error(
+                status.HTTP_400_BAD_REQUEST,
+                f"unknown field(s): {', '.join(sorted(unknown))}",
+                "wire",
+            )
+        try:
+            cross_region = service.parse_cross_region(
+                body.get("allow_cross_region"),
+                body.get("region"),
+                body.get("reason"),
+                body.get("operator"),
+            )
+        except ValueError as exc:
+            return _error(status.HTTP_400_BAD_REQUEST, str(exc), "wire")
+        if cross_region is None and body.get("region") not in (None, ""):
+            return _error(
+                status.HTTP_400_BAD_REQUEST,
+                "region applies with allow_cross_region only (a drain keeps each VM "
+                "in its own region)",
+                "wire",
+            )
+        miner = MinerIdentity.objects.filter(miner_id=miner_id).first()
+        if miner is None or not miner.chain_node_id:
+            return _error(status.HTTP_404_NOT_FOUND, "miner not found", "not-found")
+        from apps.scheduler import chain
+
+        stuck: dict[str, str] = {}
+        try:
+            enrolled = service.enroll_departing_miner_migrations(
+                only_node=miner.chain_node_id,
+                cross_region=cross_region,
+                decided_by=request.user,
+                report=stuck,
+            )
+        except service.NotDeparting:
+            # Quarantine it first (`POST /v1/admin/miner/<id>/quarantine`):
+            # a drain moves VMs off a miner that is leaving, nothing else.
+            return _error(
+                status.HTTP_409_CONFLICT,
+                f"miner {miner_id!r} is not departing (locally or on chain) — quarantine "
+                "it first",
+                "miner-not-departing",
+            )
+        except chain.ChainReadUnavailable as exc:
+            return _error(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), "chain-unavailable")
+        return Response(
+            {"miner_id": miner_id, "enrolled": enrolled, "not_moved": stuck},
+            status=status.HTTP_200_OK,
         )
 
 
@@ -593,6 +702,18 @@ def _serialize_migration(job: MigrationJob) -> dict[str, Any]:
         # A COLD migration (the VM was stopped): started on its source,
         # stopped again at the destination once it proved it runs.
         "cold": job.cold,
+        "region": job.region or None,
+        "region_stated_by_operator": job.region_stated_by_operator,
+        "cross_region": (
+            {
+                "from": job.cross_region_from or None,
+                "to": job.region,
+                "reason": job.cross_region_reason,
+                "operator": job.cross_region_by or None,
+            }
+            if job.cross_region_override
+            else None
+        ),
         "cold_settle_reason": job.cold_settle_reason or None,
         "source_ack_verified": job.source_ack_verified,
         # P9/#15 — whether the SOURCE host's per-VM artifacts (the tenant's

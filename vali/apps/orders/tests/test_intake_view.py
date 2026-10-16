@@ -247,4 +247,4 @@ def test_healthz_unauthenticated() -> None:
     c = APIClient()
     resp = c.get("/healthz")
     assert resp.status_code == status.HTTP_200_OK
-    assert resp.json() == {"status": "ok"}
+    assert resp.json()["status"] == "ok"

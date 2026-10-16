@@ -26,6 +26,7 @@ use alloc::{
 };
 
 use crate::cbor::to_canonical_vec;
+use crate::disk_stats::{disk_io_to_value, DiskIoDelta, DiskProbeResult};
 use crate::{HippiusTypesError, Result};
 use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,13 @@ pub const RECEIPT_DOMAIN: &str = "HIPPIUS_TENANT_SERVED_RECEIPT_V1";
 /// (§23) may only DECREASE or corroborate reward — they never raise it.
 /// The validator clamps + uses this as one input to `f`.
 pub const DEGRADATION_MAX_BPS: u32 = 10_000;
+
+/// Upper bound on each identifier of a receipt (`validator_id`, `vm_id`,
+/// `lease_id`, `family_id`, `node_id`, `resource_class`), in bytes. Far
+/// above any real value; it exists so a receipt has a finite worst case
+/// that fits the 16 KiB guest frame with its disk evidence at maximum
+/// (`worst_case_receipt_fits_the_guest_frame`).
+pub const MAX_RECEIPT_ID_LEN: usize = 256;
 
 /// The body the tenant guest signs (and the validator re-derives).
 ///
@@ -62,6 +70,11 @@ pub const DEGRADATION_MAX_BPS: u32 = 10_000;
 /// schema otherwise leaks identifiers (`vm_id`, `lease_id`, nonce)
 /// into operator logs by default. Use a redacted form intentionally
 /// (review Low).
+///
+/// `disk_io` / `disk_probe` are OPTIONAL disk evidence
+/// ([`crate::disk_stats`]): each key is emitted only when `Some`, so a
+/// receipt with both `None` encodes byte-identically to one built before
+/// they existed (the `served_delivery_receipt.basic` vector).
 #[derive(Clone)]
 pub struct ServedDeliveryReceipt<'a> {
     pub validator_id: &'a [u8],
@@ -77,6 +90,11 @@ pub struct ServedDeliveryReceipt<'a> {
     pub period_start: u64,
     pub period_end: u64,
     pub expiry: u64,
+    /// Per-device I/O deltas over the window. `Some(&[])` is refused: a
+    /// receipt without devices omits the key.
+    pub disk_io: Option<&'a [DiskIoDelta]>,
+    /// A probe VM's benchmark result; its `vm_id` must be this receipt's.
+    pub disk_probe: Option<&'a DiskProbeResult>,
 }
 
 impl core::fmt::Debug for ServedDeliveryReceipt<'_> {
@@ -95,6 +113,8 @@ impl core::fmt::Debug for ServedDeliveryReceipt<'_> {
             .field("period_start", &self.period_start)
             .field("period_end", &self.period_end)
             .field("expiry", &self.expiry)
+            .field("disk_io_len", &self.disk_io.map(<[DiskIoDelta]>::len))
+            .field("disk_probe", &self.disk_probe.is_some())
             .finish()
     }
 }
@@ -120,7 +140,22 @@ impl ServedDeliveryReceipt<'_> {
                 "receipt: expiry < period_end".into(),
             ));
         }
-        let v = Value::Map(vec![
+        if [
+            self.validator_id.len(),
+            self.vm_id.len(),
+            self.lease_id.len(),
+            self.family_id.len(),
+            self.node_id.len(),
+            self.resource_class.len(),
+        ]
+        .iter()
+        .any(|len| *len > MAX_RECEIPT_ID_LEN)
+        {
+            return Err(HippiusTypesError::Cbor(
+                "receipt: an identifier exceeds MAX_RECEIPT_ID_LEN".into(),
+            ));
+        }
+        let mut entries = vec![
             (
                 Value::Text("domain".into()),
                 Value::Text(RECEIPT_DOMAIN.into()),
@@ -174,8 +209,20 @@ impl ServedDeliveryReceipt<'_> {
                 Value::Bytes(self.validator_nonce.to_vec()),
             ),
             (Value::Text("vm_id".into()), Value::Text(self.vm_id.into())),
-        ]);
-        to_canonical_vec(&v).map_err(|e| HippiusTypesError::Cbor(format!("receipt: {e}")))
+        ];
+        if let Some(io) = self.disk_io {
+            entries.push((Value::Text("disk_io".into()), disk_io_to_value(io)?));
+        }
+        if let Some(probe) = self.disk_probe {
+            if probe.vm_id != self.vm_id {
+                return Err(HippiusTypesError::Cbor(
+                    "disk_probe: vm_id is not the receipt's".into(),
+                ));
+            }
+            entries.push((Value::Text("disk_probe".into()), probe.to_value()?));
+        }
+        to_canonical_vec(&Value::Map(entries))
+            .map_err(|e| HippiusTypesError::Cbor(format!("receipt: {e}")))
     }
 }
 
@@ -241,6 +288,8 @@ mod tests {
             period_start: 1_000,
             period_end: 1_060,
             expiry: 2_000,
+            disk_io: None,
+            disk_probe: None,
         }
     }
 
@@ -346,5 +395,196 @@ mod tests {
         // `sig` encodes shorter than `body`, so the encoder reorders).
         assert_eq!(a, b);
         assert_canonical(&a).unwrap();
+    }
+
+    fn io(dev: &str) -> crate::disk_stats::DiskIoDelta {
+        crate::disk_stats::DiskIoDelta {
+            dev: dev.into(),
+            serial: String::new(),
+            state: crate::disk_stats::DiskIoState::Ok,
+            r_ios: 1,
+            r_sectors: 8,
+            r_ticks_ms: 1,
+            w_ios: 1,
+            w_sectors: 8,
+            w_ticks_ms: 1,
+            io_ticks_ms: 2,
+            tiq_ms: 2,
+            inflight: 0,
+        }
+    }
+
+    fn probe(vm_id: &str) -> DiskProbeResult {
+        DiskProbeResult {
+            run_id: [1; 16],
+            nonce: [2; 32],
+            vm_id: vm_id.into(),
+            vcpus: 2,
+            kernel: "6.8".into(),
+            release_version: 5,
+            started_at: 1,
+            finished_at: 2,
+            targets: vec![crate::disk_stats::DiskProbeTarget {
+                slot: "os".into(),
+                profile: "v1".into(),
+                metrics: vec![("qd1_p50_us".into(), 90)],
+                hist_qd1: vec![0; crate::disk_stats::HIST_BUCKETS],
+                error: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn disk_keys_are_emitted_only_when_some() {
+        let n = [3u8; 32];
+        let plain = base(&n).canonical().unwrap();
+        let devices = [io("vda"), io("vdb")];
+        let mut with_io = base(&n);
+        with_io.disk_io = Some(&devices);
+        let io_bytes = with_io.canonical().unwrap();
+        assert_ne!(plain, io_bytes);
+        assert_canonical(&io_bytes).unwrap();
+        let p = probe("abc");
+        let mut with_probe = base(&n);
+        with_probe.disk_probe = Some(&p);
+        let probe_bytes = with_probe.canonical().unwrap();
+        assert_ne!(plain, probe_bytes);
+        assert_canonical(&probe_bytes).unwrap();
+    }
+
+    #[test]
+    fn an_empty_disk_io_is_refused() {
+        let n = [3u8; 32];
+        let mut r = base(&n);
+        r.disk_io = Some(&[]);
+        assert!(r.canonical().is_err());
+    }
+
+    #[test]
+    fn a_probe_for_another_vm_is_refused() {
+        let n = [3u8; 32];
+        let p = probe("other-vm");
+        let mut r = base(&n);
+        r.disk_probe = Some(&p);
+        assert!(r.canonical().is_err());
+    }
+
+    #[test]
+    fn an_over_long_identifier_is_refused() {
+        let n = [3u8; 32];
+        let long = "v".repeat(MAX_RECEIPT_ID_LEN + 1);
+        let mut r = base(&n);
+        r.vm_id = &long;
+        assert!(r.canonical().is_err());
+        let mut r = base(&n);
+        r.lease_id = &long[..MAX_RECEIPT_ID_LEN];
+        assert!(r.canonical().is_ok());
+    }
+
+    /// Every identifier and every disk-evidence bound at its maximum: the
+    /// signed envelope still fits the guest's 16 KiB vsock frame
+    /// (`agent-tenant-telemetry`'s `MAX_FRAME_BYTES`).
+    #[test]
+    fn worst_case_receipt_fits_the_guest_frame() {
+        use crate::disk_stats::*;
+        let id = "i".repeat(MAX_RECEIPT_ID_LEN);
+        // A probe receipt's vm_id is also the probe's, so it is bounded by
+        // the tighter MAX_PROBE_VM_ID_LEN.
+        let vm_id = "v".repeat(MAX_PROBE_VM_ID_LEN);
+        let n = [0xffu8; 32];
+        // The longest distinct serials: `hippius-x10`..`hippius-x23`,
+        // `hippius-os`, then empty.
+        let serials: Vec<String> = (10..=23)
+            .map(|i| format!("hippius-x{i}"))
+            .chain(["hippius-os".to_string(), String::new()])
+            .collect();
+        assert_eq!(serials.len(), MAX_DISK_IO_DEVICES);
+        let io: Vec<DiskIoDelta> = serials
+            .into_iter()
+            .enumerate()
+            .map(|(i, serial)| DiskIoDelta {
+                dev: format!("{i:02}{}", "d".repeat(MAX_DEV_LEN - 2)),
+                serial,
+                state: DiskIoState::Ok,
+                r_ios: u64::MAX,
+                r_sectors: u64::MAX,
+                r_ticks_ms: u64::MAX,
+                w_ios: u64::MAX,
+                w_sectors: u64::MAX,
+                w_ticks_ms: u64::MAX,
+                io_ticks_ms: u64::MAX,
+                tiq_ms: u64::MAX,
+                inflight: u64::MAX,
+            })
+            .collect();
+        let slots: Vec<String> = core::iter::once("os".to_string())
+            .chain((10..10 + MAX_PROBE_TARGETS - 1).map(|i| format!("x{i}")))
+            .collect();
+        let mut slots = slots;
+        slots.sort();
+        let probe = DiskProbeResult {
+            run_id: [0xff; 16],
+            nonce: [0xff; 32],
+            vm_id: vm_id.clone(),
+            vcpus: u32::MAX,
+            kernel: "k".repeat(MAX_KERNEL_LEN),
+            release_version: u32::MAX,
+            started_at: u64::MAX,
+            finished_at: u64::MAX,
+            targets: slots
+                .iter()
+                .map(|slot| DiskProbeTarget {
+                    slot: slot.clone(),
+                    profile: "p".repeat(MAX_PROFILE_LEN),
+                    metrics: (0..MAX_PROBE_METRICS)
+                        .map(|i| {
+                            (
+                                format!("{i:02}{}", "m".repeat(MAX_METRIC_KEY_LEN - 2)),
+                                u64::MAX,
+                            )
+                        })
+                        .collect(),
+                    hist_qd1: vec![u32::MAX; HIST_BUCKETS],
+                    error: "e".repeat(48),
+                })
+                .collect(),
+        };
+        let r = ServedDeliveryReceipt {
+            validator_id: id.as_bytes(),
+            validator_nonce: &n,
+            epoch: u64::MAX,
+            vm_id: &vm_id,
+            lease_id: &id,
+            family_id: id.as_bytes(),
+            node_id: id.as_bytes(),
+            resource_class: &id,
+            monotonic_seq: u64::MAX,
+            observed_degradation_bps: DEGRADATION_MAX_BPS,
+            period_start: u64::MAX,
+            period_end: u64::MAX,
+            expiry: u64::MAX,
+            disk_io: Some(&io),
+            disk_probe: Some(&probe),
+        };
+        let signed = SignedServedDeliveryReceipt {
+            body: r.canonical().unwrap(),
+            sig: vec![0xff; 64],
+        }
+        .canonical()
+        .unwrap();
+        // The guest frame wraps it as `{kind: "served-receipt", body}`.
+        let frame = to_canonical_vec(&Value::Map(vec![
+            (
+                Value::Text("kind".into()),
+                Value::Text("served-receipt".into()),
+            ),
+            (Value::Text("body".into()), Value::Bytes(signed)),
+        ]))
+        .unwrap();
+        assert!(
+            frame.len() < 16 * 1024,
+            "worst-case receipt frame is {} bytes",
+            frame.len()
+        );
     }
 }

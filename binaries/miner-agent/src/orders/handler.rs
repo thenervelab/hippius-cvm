@@ -47,24 +47,48 @@ pub const DEFAULT_IDEM_CAPACITY: usize = 4096;
 /// `class` is always a compile-time constant (the §H/§20 discipline):
 /// a rejection response, or a log line built from one, can never echo
 /// a path, a key byte, or any run-time value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRejection {
     /// HTTP status to return.
     pub status: StatusCode,
     /// Static classifier — the response body and the audit tag.
     pub class: &'static str,
+    /// A JSON body replacing `class` on the wire (`storage-config`
+    /// refusals name the pool or disk at fault).
+    pub json: Option<String>,
 }
 
 impl OrderRejection {
     /// Construct a rejection.
     pub fn new(status: StatusCode, class: &'static str) -> Self {
-        Self { status, class }
+        Self {
+            status,
+            class,
+            json: None,
+        }
+    }
+
+    /// A rejection whose body is `json` (`class` stays the log tag).
+    pub fn with_json(status: StatusCode, class: &'static str, json: String) -> Self {
+        Self {
+            status,
+            class,
+            json: Some(json),
+        }
     }
 }
 
 impl IntoResponse for OrderRejection {
     fn into_response(self) -> Response {
-        (self.status, self.class).into_response()
+        match self.json {
+            Some(json) => (
+                self.status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response(),
+            None => (self.status, self.class).into_response(),
+        }
     }
 }
 
@@ -111,6 +135,22 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
                 "hippius-miner-agent: orders: insufficient-disk-detail vm={vm_id} class={err}"
             ));
             OrderRejection::new(StatusCode::INSUFFICIENT_STORAGE, "insufficient-disk")
+        }
+        // A full storage pool other than `default`: the same 507, named
+        // after the pool (`insufficient-disk:<pool>`).
+        MinerAgentError::InsufficientPoolDisk(class) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: insufficient-disk-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INSUFFICIENT_STORAGE, class)
+        }
+        // The launch's storage pool cannot take a disk now (draining,
+        // unmounted, another filesystem): 507 `pool-unavailable:<pool>`.
+        MinerAgentError::PoolUnavailable(class) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: pool-unavailable-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::INSUFFICIENT_STORAGE, class)
         }
         MinerAgentError::VsockCid(_) => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "vsock-cid-exhausted")
@@ -245,6 +285,33 @@ pub async fn handle_net_policy(
         .accept(order, now)
         .await
         .map_err(|err| reject_dispatch(&err, "host"))
+}
+
+/// Dispatch a `storage-config` order: validate the whole document and,
+/// unless it is a dry run, persist it and make it the set in force
+/// ([`crate::storage::remote`]). The host reads run off the async
+/// workers. The ack is `applied:<rev>:<sha>` / `dry-run-ok:<rev>:<sha>`;
+/// a refusal is its status with `{"code", "pool"|"disk"}`.
+pub async fn handle_storage_config(
+    service: Arc<crate::storage::remote::StorageConfigService>,
+    now: u64,
+    order: crate::orders::types::StorageConfigOrder,
+) -> Result<String, OrderRejection> {
+    // One order at a time, waiting here rather than on a blocking worker.
+    let gate = Arc::clone(&service);
+    let _turn = gate.gate().lock().await;
+    match tokio::task::spawn_blocking(move || service.accept(order, now)).await {
+        Ok(Ok(ack)) => Ok(ack),
+        Ok(Err(err)) => {
+            let status =
+                StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Err(OrderRejection::with_json(status, err.code(), err.body()))
+        }
+        Err(_) => Err(OrderRejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "dispatch-panic",
+        )),
+    }
 }
 
 /// Dispatch a `launch` order.
@@ -1644,5 +1711,30 @@ mod tests {
         assert_eq!(store.begin("p").unwrap(), BeginOutcome::Claimed);
         store.finish("p", Some(&long)).unwrap();
         assert_eq!(store.begin("p").unwrap(), BeginOutcome::AlreadyOk(None));
+    }
+
+    /// A full storage pool other than `default` answers the same 507,
+    /// named after the pool.
+    #[test]
+    fn an_unavailable_pool_answers_507_with_its_pool_class() {
+        let rej = reject_dispatch(
+            &MinerAgentError::PoolUnavailable("pool-unavailable:hdd0"),
+            "tenant-1",
+        );
+        assert_eq!(rej.status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(rej.class, "pool-unavailable:hdd0");
+    }
+
+    #[test]
+    fn a_full_pool_answers_507_with_its_pool_class() {
+        let rej = reject_dispatch(
+            &MinerAgentError::InsufficientPoolDisk("insufficient-disk:hdd0"),
+            "tenant-1",
+        );
+        assert_eq!(rej.status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(rej.class, "insufficient-disk:hdd0");
+        // `default` keeps the historical class vali recognises.
+        let rej = reject_dispatch(&MinerAgentError::InsufficientDisk, "tenant-1");
+        assert_eq!(rej.class, "insufficient-disk");
     }
 }

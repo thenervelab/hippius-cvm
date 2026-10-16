@@ -31,7 +31,7 @@ from .factories import (
     node_id,
 )
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture(autouse=True)
@@ -632,6 +632,7 @@ def _locate_seed(seed: int, country: str) -> None:
     )
 
 
+@pytest.mark.usefixtures("real_regions")
 def test_place_honours_the_region_the_launch_asked_for(
     root_client: APIClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -649,6 +650,7 @@ def test_place_honours_the_region_the_launch_asked_for(
     assert resp.json()["miner_node_id"] == node_id(2)
 
 
+@pytest.mark.usefixtures("real_regions")
 def test_place_409s_no_miner_in_region_rather_than_placing_elsewhere(
     root_client: APIClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -664,6 +666,7 @@ def test_place_409s_no_miner_in_region_rather_than_placing_elsewhere(
     assert Placement.objects.count() == 0
 
 
+@pytest.mark.usefixtures("real_regions")
 def test_replace_after_fail_stays_in_the_vm_region(
     root_client: APIClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -685,6 +688,7 @@ def test_replace_after_fail_stays_in_the_vm_region(
     assert body["replacement_error"] is None
 
 
+@pytest.mark.usefixtures("real_regions")
 def test_replace_reports_no_miner_in_region_when_the_region_is_empty(
     root_client: APIClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

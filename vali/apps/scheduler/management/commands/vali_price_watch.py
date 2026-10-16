@@ -136,6 +136,7 @@ class Command(BaseCommand):
             else []
         )
         bound = [BoundVm(vm_id=p.vm.vm_id, node_id=p.miner_node_id) for p in rows]
+        vm_by_id = {p.vm.vm_id: p.vm for p in rows}
         family_by_vm = {p.vm.vm_id: p.vm_family for p in rows}
         # RA-M3 — the owner of each bound VM, so the dest suggestion honours
         # the per-owner spread (same as the real migration path).
@@ -182,6 +183,7 @@ class Command(BaseCommand):
         for intent in intents:
             dest = self._suggest_dest(
                 intent,
+                vm=vm_by_id[intent.vm_id],
                 snapshot=snapshot,
                 family=family_by_vm[intent.vm_id],
                 owner=owner_by_vm.get(intent.vm_id, ""),
@@ -203,6 +205,7 @@ class Command(BaseCommand):
         self,
         intent: MigrationIntent,
         *,
+        vm: Any,
         snapshot: Any,
         family: str,
         owner: str = "",
@@ -211,10 +214,21 @@ class Command(BaseCommand):
     ) -> str:
         """Best within-budget destination off the repricing miner, or `""`
         if the watcher cannot find one (the alert still surfaces — the
-        operator can act once capacity frees up)."""
+        operator can act once capacity frees up). In the VM's region and
+        SNP generation only — an approve acts on it as a §25 migration — and
+        none when its region cannot be told."""
+        from apps.orchestration.service import _cross_gen_chain_ids
+
         if snapshot is None:
             return ""
+        region = service.move_region_for_vm(vm, from_node=intent.node_id)
+        if not region:
+            log.warning(
+                "price-watch: no destination for vm %s: its region cannot be told", intent.vm_id
+            )
+            return ""
         cap, load, fam = service.decision_inputs(family)
+        dispatchable = service.dispatchable_node_ids()
         try:
             return decide_placement(
                 snapshot=snapshot,
@@ -224,13 +238,15 @@ class Command(BaseCommand):
                 max_family_per_node=service.cdn_family_cap(family),
                 **service.cdn_edge_arguments(family, intent.vm_id),
                 **service.group_arguments(intent.vm_id),
+                **service.failover_peer_arguments(
+                    service.launch_requires_failover_peer(intent.vm_id), intent.vm_id
+                ),
                 max_epoch_lag=service.max_epoch_lag(),
-                excluded=frozenset({intent.node_id}),
-                # Gate (f) — the suggestion is the ONLY region guard on this
-                # path: an operator's approve → `start_migration` has no
-                # region check, so a dest suggested out of region would be
-                # acted on as-is.
-                **service.region_arguments(service.launch_region_for_vm(intent.vm_id)),
+                excluded=frozenset({intent.node_id})
+                | _cross_gen_chain_ids(intent.node_id, dispatchable),
+                dispatchable=dispatchable,
+                # Gate (f) — `start_migration` refuses another region too.
+                **service.region_arguments(region),
                 weights=SelectionWeights.from_settings(),
                 max_host_share=service.max_host_share(),
                 # Price-aware suggestion: don't point at an equally-pricey miner.

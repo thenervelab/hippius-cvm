@@ -9,7 +9,12 @@
 //! A zone is `serving = false` (with a refusal class) when the origin
 //! policy refuses its origin or one of its secrets cannot be opened.
 //! OpenResty then answers that zone without contacting any origin.
+//!
+//! A zone's `settings` pass through opaque, except its static-site keys
+//! (`site`) and its CORS policy (`cors`): an unusable one is turned off
+//! and reported, the zone serves.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -21,6 +26,7 @@ use crate::feed::FeedState;
 use crate::hooks::OriginPolicy;
 use crate::unseal::FleetKeyring;
 use crate::wire::{Block, Peer, PurgeGenerations, Zone, ZoneState};
+use crate::{cors, site};
 
 /// The rendered documents.
 pub struct Rendered {
@@ -28,6 +34,9 @@ pub struct Rendered {
     pub secrets: Zeroizing<Vec<u8>>,
     /// `(zone_id, class)` of every zone that is not serving.
     pub refused: Vec<(String, &'static str)>,
+    /// `(zone_id, class)` of every static-site setting or CORS policy
+    /// turned off.
+    pub site_ignored: Vec<(String, &'static str)>,
 }
 
 #[derive(Serialize)]
@@ -37,7 +46,7 @@ struct ZoneDoc<'a> {
     refusal: Option<&'static str>,
     origin: &'a crate::wire::Origin,
     shield_region: Option<&'a str>,
-    settings: &'a serde_json::Value,
+    settings: Cow<'a, serde_json::Value>,
     secrets: Vec<&'a str>,
 }
 
@@ -69,6 +78,7 @@ pub fn render(
     fleet_wildcard: &str,
 ) -> Result<Rendered> {
     let mut refused = Vec::new();
+    let mut site_ignored = Vec::new();
     let mut zones = BTreeMap::new();
     // Opened secrets, held until the secrets document is serialised.
     let mut opened: BTreeMap<&str, Vec<(&str, Zeroizing<String>)>> = BTreeMap::new();
@@ -87,6 +97,10 @@ pub fn render(
                 Some(class)
             }
         };
+        let (settings, problems) = site::sanitize(&zone.settings);
+        site_ignored.extend(problems.into_iter().map(|p| (zone_id.clone(), p)));
+        let (settings, problem) = cors::sanitize(settings);
+        site_ignored.extend(problem.map(|p| (zone_id.clone(), p)));
         zones.insert(
             zone_id.as_str(),
             ZoneDoc {
@@ -95,7 +109,7 @@ pub fn render(
                 refusal,
                 origin: &zone.origin,
                 shield_region: zone.shield_region.as_deref(),
-                settings: &zone.settings,
+                settings,
                 secrets: zone.secrets.iter().map(|s| s.name.as_str()).collect(),
             },
         );
@@ -148,6 +162,7 @@ pub fn render(
         config,
         secrets,
         refused,
+        site_ignored,
     })
 }
 
@@ -232,6 +247,92 @@ mod tests {
         assert_eq!(sec["zones"]["z1"]["s3_credentials"], "{\"k\":\"v\"}");
         assert!(sec["zones"].get("z2").is_none());
         assert_eq!(r.refused.len(), 2);
+    }
+
+    /// Static-site keys reach OpenResty as sent when valid, turned off and
+    /// reported when not; the zone serves either way, and a zone without
+    /// them (an older backend) is rendered as before.
+    #[test]
+    fn site_settings_pass_through_or_are_turned_off() {
+        let ring = FleetKeyring::from_secrets([(1, [9u8; 32])]);
+        let mut snap = snapshot(10);
+        snap["zones"][0]["settings"] = json!({"rules": [], "index_document": "index.html",
+            "spa_fallback": true, "spa_fallback_exclude": ["/assets/", "/api/"]});
+        snap["zones"][1]["settings"] = json!({"rules": [], "index_document": "../etc/passwd",
+            "spa_fallback": true, "spa_fallback_exclude": ["/x/"]});
+        let Applied::New(state) = crate::feed::FeedState::default()
+            .apply(resp(snap.clone()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let r = render(&state, &ring, &S3OnlyPolicy, &dp(), "*.cdn.hippius.com").unwrap();
+        let cfg: serde_json::Value = serde_json::from_slice(&r.config).unwrap();
+        assert_eq!(cfg["zones"]["z1"]["settings"], snap["zones"][0]["settings"]);
+        assert_eq!(
+            cfg["zones"]["z2"]["settings"],
+            json!({"rules": [], "index_document": null, "spa_fallback": false,
+                   "spa_fallback_exclude": ["/x/"]})
+        );
+        assert_eq!(
+            r.site_ignored,
+            [
+                ("z2".to_owned(), "index-document-invalid"),
+                ("z2".to_owned(), "spa-fallback-without-index"),
+            ]
+        );
+        assert!(!String::from_utf8_lossy(&r.config).contains("passwd"));
+
+        // No site keys: the settings are rendered as they came.
+        let plain = snapshot(11);
+        let Applied::New(state) = crate::feed::FeedState::default()
+            .apply(resp(plain.clone()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let r = render(&state, &ring, &S3OnlyPolicy, &dp(), "*.cdn.hippius.com").unwrap();
+        let cfg: serde_json::Value = serde_json::from_slice(&r.config).unwrap();
+        for (i, z) in ["z1", "z2"].iter().enumerate() {
+            let sent = plain["zones"][i]
+                .get("settings")
+                .cloned()
+                .unwrap_or(json!(null));
+            assert_eq!(cfg["zones"][z]["settings"], sent, "{z}");
+        }
+        assert!(r.site_ignored.is_empty());
+    }
+
+    /// A usable CORS policy reaches OpenResty as sent; an unusable one is
+    /// removed whole and reported, next to the zone's other settings.
+    #[test]
+    fn cors_policies_pass_through_or_are_removed() {
+        let ring = FleetKeyring::from_secrets([(1, [9u8; 32])]);
+        let mut snap = snapshot(10);
+        snap["zones"][0]["settings"] = json!({"rules": [],
+            "cors": {"allow_origins": ["https://app.example"], "max_age": 600}});
+        snap["zones"][1]["settings"] = json!({"rules": [], "index_document": "../x",
+            "cors": {"allow_origins": ["*"], "allow_credentials": true}});
+        let Applied::New(state) = crate::feed::FeedState::default()
+            .apply(resp(snap.clone()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let r = render(&state, &ring, &S3OnlyPolicy, &dp(), "*.cdn.hippius.com").unwrap();
+        let cfg: serde_json::Value = serde_json::from_slice(&r.config).unwrap();
+        assert_eq!(cfg["zones"]["z1"]["settings"], snap["zones"][0]["settings"]);
+        assert_eq!(
+            cfg["zones"]["z2"]["settings"],
+            json!({"rules": [], "index_document": null})
+        );
+        assert_eq!(
+            r.site_ignored,
+            [
+                ("z2".to_owned(), "index-document-invalid"),
+                ("z2".to_owned(), "cors-star-with-credentials"),
+            ]
+        );
     }
 
     /// Contract with the backend: a zone with a private bucket at its root

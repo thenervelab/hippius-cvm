@@ -90,6 +90,11 @@ use crate::shutdown::ShutdownWatch;
 /// still name it.
 pub const VSOCK_HOST_CID: u32 = 2;
 
+/// Attempts at the final drain on shutdown, and the pause between them —
+/// three tries, 1 s apart, stay well inside `main`'s 15 s join bound.
+const FINAL_DRAIN_ATTEMPTS: u32 = 3;
+const FINAL_DRAIN_RETRY: Duration = Duration::from_secs(1);
+
 /// Receipts drained from the queue per write batch — bounds the work
 /// done under one lock acquisition and the memory held off-queue.
 const DRAIN_BATCH: usize = 50;
@@ -276,15 +281,25 @@ impl<S: ShutdownWatch> VsockPusher<S> {
             }
             backoff = next_backoff(backoff);
         }
-        // Shutdown latched. One last best-effort dial to flush what is
-        // still queued — `push_queue` stops once the queue is dry.
-        if self.queue_depth()? > 0 {
+        // Stopped. Flush what is still queued — the receipt loop's final
+        // receipt included — retrying a failed dial or write a few times,
+        // all well inside `main`'s `PUSHER_JOIN_TIMEOUT`.
+        for attempt in 0..FINAL_DRAIN_ATTEMPTS {
+            if self.queue_depth()? == 0 {
+                return Ok(());
+            }
+            if attempt > 0 {
+                thread::sleep(FINAL_DRAIN_RETRY);
+            }
             match connect() {
                 Ok(mut stream) => {
                     self.push_queue(&mut stream)?;
                 }
-                Err(e) => log_pusher("final-drain-failed", e.class()),
+                Err(e) => log_pusher("final-drain-connect-failed", e.class()),
             }
+        }
+        if self.queue_depth()? > 0 {
+            log_pusher("final-drain-incomplete", "receipts-lost");
         }
         Ok(())
     }

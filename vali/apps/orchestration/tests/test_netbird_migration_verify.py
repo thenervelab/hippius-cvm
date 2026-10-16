@@ -35,7 +35,7 @@ from apps.orchestration.models import MigrationJob, MigrationState
 from .conftest import FakeEffects
 from .factories import make_service_client, make_vm
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture(autouse=True)

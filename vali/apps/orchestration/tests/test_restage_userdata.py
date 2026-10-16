@@ -2,16 +2,17 @@
 NEXT boot, without vali ever holding a way to read the canonical copy.
 
 Pins, per claim:
-- it stages exactly what launch intake stages (the template, at
-  `…/userdata-intake`, wrapped under `ud-<vm_id>`) and points the launch
-  record at that version, audited;
+- it stages at the intake path, wrapped under `ud-<vm_id>` and stamped
+  verbatim, and points the launch record at that version, audited;
 - the relaunch afterwards (reboot-recovery = power start) hands the NEW
-  plaintext to `launch_on_miner`, which re-stages the canonical copy under
-  `kek-<vm_id>` and mints the §6 digest over it — the real launch path, with
-  a Vault fake that DENIES `transit/decrypt/kek-*` as production Vault does;
+  bytes to `launch_on_miner` VERBATIM — no NetBird key minted, no `{{…}}`
+  token substituted or required, even on a NetBird VM — which re-stages the
+  canonical copy under `kek-<vm_id>` and mints the §6 digest over it: the
+  real launch path, with a Vault fake that DENIES `transit/decrypt/kek-*`
+  as production Vault does;
+- a rollback to a launch template is substituted again as before;
 - an M1/M2 VM, a VM that is not active + running, an in-flight operation,
-  an over-cap / malformed / NetBird-less userdata are refused before any
-  write;
+  an over-cap / malformed userdata are refused before any write;
 - `--dry-run` writes nothing, and no output carries the userdata;
 - rollback (`--to-version`, `--revert-last`) re-points without new bytes
   and decrypts nothing.
@@ -53,6 +54,21 @@ FIX = (
 SECRET_MARK = b"fixed"
 
 
+def _pin_ok(monkeypatch) -> list[str]:
+    """The §22 allowlist re-pin every relaunch of an auto-pinning record
+    makes, accepted (what it pins is not what these tests measure)."""
+    from apps.orchestration.services import allowlist_pin
+
+    pinned: list[str] = []
+
+    def pin(*, measurement_hex: str, **_kw):
+        pinned.append(measurement_hex)
+        return allowlist_pin.PinResult(new_epoch=2, new_cose_sha256_hex="e" * 64, s3_url="s3://x")
+
+    monkeypatch.setattr(launch.allowlist_pin, "pin_measurement", pin)
+    return pinned
+
+
 class _Vault:
     """KV v2 + Transit, in memory, with production's custody split: vali may
     encrypt under `kek-*` and `ud-*` but decrypt ONLY under `ud-*`."""
@@ -63,6 +79,8 @@ class _Vault:
         self.encrypts: list[str] = []
 
     def put_kv(self, mount: str, path: str, value: bytes, *, cas: int | None = None):
+        if cas is not None and cas != len(self.kv.get(path) or []):
+            raise vault_kv.VaultCasConflict(f"vault-kv-put: check-and-set conflict (cas={cas})")
         self.kv.setdefault(path, []).append(bytes(value))
         return vault_kv.VaultWriteResult(version=len(self.kv[path]))
 
@@ -118,6 +136,13 @@ def vault(monkeypatch) -> _Vault:
     return v
 
 
+@pytest.fixture(autouse=True)
+def _restage_enabled(settings) -> None:
+    """The CLI is held to the API's flag and allow-list."""
+    settings.VALI_USERDATA_RESTAGE_ENABLED = True
+    settings.VALI_USERDATA_RESTAGE_VM_ALLOWLIST = VM
+
+
 def _intake() -> str:
     return f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/userdata-intake"
 
@@ -126,7 +151,11 @@ def _m0_vm(vault: _Vault, *, enable_netbird: bool = False) -> tuple[Vm, LaunchJo
     """An M0 golden VM launched through intake: the template at intake v1."""
     _miner()
     vm = _pinned_vm(VM, "hippius")
-    spec_json = {**_spec_json(VM, "hippius"), "enable_netbird": enable_netbird}
+    spec_json = {
+        **_spec_json(VM, "hippius"),
+        "enable_netbird": enable_netbird,
+        "auto_pin_allowlist": True,
+    }
     job = _succeeded_job(VM, spec_json, measured_cmdline=_measured("hippius"))
     launch.stage_userdata_intake_copy("secret", _intake(), VM, ORIGINAL)
     job.userdata_vault_path = _intake()
@@ -153,20 +182,19 @@ def _record() -> LaunchJob:
 # ── the write ────────────────────────────────────────────────────────────
 
 
-def test_it_stages_the_template_as_intake_does_and_points_the_record_at_it(
-    vault, tmp_path
-) -> None:
+def test_it_stages_the_template_as_intake_does_and_points_the_record_at_it(vault, tmp_path) -> None:
     _m0_vm(vault)
 
     out = _run(tmp_path)
 
     job = _record()
     assert (job.userdata_vault_path, job.userdata_vault_version) == (_intake(), 2)
-    # Wrapped under the vali-openable ud-<vm_id>, like intake; the canonical
+    # Wrapped under the vali-openable ud-<vm_id>, like intake (and stamped
+    # verbatim inside the wrapping); the canonical
     # copy (kek-<vm_id>) is not touched until a relaunch re-stages it.
     assert vault.kv[_intake()][1].startswith(b"vault:v1:")
     assert vault.encrypts == [vault_kv.userdata_transit_key_name(VM)] * 2
-    assert vault.plaintext(_intake(), 2) == FIX
+    assert vault.plaintext(_intake(), 2) == launch.VERBATIM_STAMP + FIX
     assert f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/userdata" not in vault.kv
     # Decrypts nothing.
     assert vault.decrypts == []
@@ -209,6 +237,7 @@ def test_the_next_relaunch_re_stages_and_digests_the_new_userdata(
 
     v = _Vault()
     v.install(monkeypatch)  # over the harness's Vault stubs
+    _pin_ok(monkeypatch)
     # The KEK the launch staged: a relaunch reads only its KV version.
     v.put_kv("secret", f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/luks-kek", b"vault:v1:kek")
     vm, _job = _m0_vm(v)
@@ -243,6 +272,111 @@ def test_the_next_relaunch_re_stages_and_digests_the_new_userdata(
     assert launch.open_userdata_working_copy("secret", working, VM, 1) == FIX
 
 
+# ── verbatim: byte for byte, nothing substituted, no key minted ───────────
+
+#: Every token the launch path knows, and one it does not.
+TOKENS = (
+    b"#cloud-config\nruncmd:\n"
+    b"  - [ netbird, up, --setup-key={{NETBIRD_SETUP_KEY}}, --hostname={{NETBIRD_HOSTNAME}} ]\n"
+    b"  - [ echo, '{{X}}' ]\n"
+)
+
+
+def _relaunch_through_the_real_launch_path(h, monkeypatch, v: _Vault, vm: Vm) -> bytes:
+    """Relaunch (= power start) with `launch_on_miner` running for real, and
+    return the canonical plaintext the KBS would release."""
+    from apps.orchestration import effects, service
+
+    minted: list[dict] = []
+    monkeypatch.setattr(
+        effects, "mint_netbird_setup_key", lambda **kw: minted.append(kw) or pytest.fail("minted")
+    )
+    assert service._reboot_recovery_relaunch(vm, "miner-ck") is True
+    assert minted == []
+    canonical = f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/userdata"
+    return v.plaintext(canonical, len(v.kv[canonical]))
+
+
+def test_a_restaged_userdata_is_released_byte_for_byte(
+    harness,  # noqa: F811 — the imported fixture, by name
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A literal `{{X}}`, and the NetBird tokens themselves, on a NetBird VM:
+    stored and released unchanged, no key minted, nothing required."""
+    from apps.lifecycle.models import VmNetbirdKey
+
+    v = _Vault()
+    v.install(monkeypatch)
+    _pin_ok(monkeypatch)
+    v.put_kv("secret", f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/luks-kek", b"vault:v1:kek")
+    vm, _job = _m0_vm(v, enable_netbird=True)
+    _run(tmp_path, userdata=TOKENS)
+
+    released = _relaunch_through_the_real_launch_path(harness, monkeypatch, v, vm)
+
+    assert released == TOKENS
+    assert not VmNetbirdKey.objects.filter(vm=vm).exists()
+    (mint,) = harness.mints
+    assert mint.allowed_userdata_digest_hex == userdata_digest.userdata_digest_hex(
+        tenant_id=mint.tenant_id,
+        vm_id=VM,
+        ticket_id=mint.ticket_id,
+        secret_type=userdata_digest.SECRET_TYPE_USERDATA,
+        path=mint.userdata_vault_path,
+        version=mint.userdata_vault_version,
+        plaintext=TOKENS,
+    )
+
+
+def test_a_rollback_to_the_launch_template_is_substituted_again(
+    harness,  # noqa: F811 — the imported fixture, by name
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """The verbatim stamp travels with the restaged bytes, not with the VM:
+    back on its launch template, the relaunch substitutes as it always did."""
+    from apps.orchestration import effects, service
+
+    v = _Vault()
+    v.install(monkeypatch)
+    _pin_ok(monkeypatch)
+    v.put_kv("secret", f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/luks-kek", b"vault:v1:kek")
+    _miner()
+    vm = _pinned_vm(VM, "hippius")
+    spec_json = {**_spec_json(VM, "hippius"), "enable_netbird": True, "auto_pin_allowlist": True}
+    job = _succeeded_job(VM, spec_json, measured_cmdline=_measured("hippius"))
+    launch.stage_userdata_intake_copy("secret", _intake(), VM, TOKENS)
+    LaunchJob.objects.filter(pk=job.pk).update(
+        userdata_vault_path=_intake(), userdata_vault_version=1
+    )
+    _run(tmp_path, userdata=TOKENS)
+    _run(tmp_path, "--to-version", "1", userdata=None)
+    monkeypatch.setattr(
+        effects,
+        "mint_netbird_setup_key",
+        lambda **kw: effects.MintedSetupKey(id="sk-1", key="live-key"),
+    )
+    monkeypatch.setattr(launch, "_netbird_relaunch_needs_no_key", lambda *a, **k: False)
+
+    assert service._reboot_recovery_relaunch(vm, "miner-ck") is True
+
+    canonical = f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/userdata"
+    released = v.plaintext(canonical, len(v.kv[canonical]))
+    assert b"--setup-key=live-key" in released
+    assert f"--hostname=hippius-tenant-{VM}".encode() in released
+    assert b"'{{X}}'" in released  # an unknown token is never touched
+
+
+def test_launch_intake_refuses_the_restage_stamp() -> None:
+    from apps.orchestration import launch_jobs
+
+    with pytest.raises(launch_jobs.LaunchIntentError, match="restage stamp"):
+        launch_jobs.start_launch(
+            intent={}, userdata=launch.VERBATIM_STAMP + b"#cloud-config\n", decided_by=None
+        )
+
+
 # ── refusals: nothing written ─────────────────────────────────────────────
 
 
@@ -260,7 +394,7 @@ def test_an_m1_m2_vm_is_refused(vault, tmp_path, mode) -> None:
     launch.stage_userdata_intake_copy("secret", _intake(), VM, ORIGINAL)
     LaunchJob.objects.filter(pk=job.pk).update(userdata_vault_path=_intake())
 
-    with pytest.raises(CommandError, match=f"not-m0:{mode}"):
+    with pytest.raises(CommandError, match=f"userdata-restage-unsupported-key-mode: vm is {mode}"):
         _run(tmp_path)
     _assert_untouched(vault)
 
@@ -271,7 +405,7 @@ def test_an_m0_pin_whose_record_measured_a_guardian_is_refused(vault, tmp_path) 
     emit = {**job.result_json["emit"], "measured_cmdline": _measured("split")}
     LaunchJob.objects.filter(pk=job.pk).update(result_json={"emit": emit})
 
-    with pytest.raises(CommandError, match="key-mode-unprovable"):
+    with pytest.raises(CommandError, match="unsupported-key-mode: key mode not provably M0"):
         _run(tmp_path)
     _assert_untouched(vault)
 
@@ -305,10 +439,17 @@ def test_a_migration_in_flight_is_refused(vault, tmp_path) -> None:
 def test_a_launch_job_in_flight_is_refused(vault, tmp_path) -> None:
     _vm, job = _m0_vm(vault)
     LaunchJob.objects.create(
-        job_id="lj-queued", vm_id=VM, tenant_id="t-ck", flavor="small",
-        spec_json=job.spec_json, userdata_vault_path=_intake(), userdata_vault_version=1,
-        kek_vault_path=job.kek_vault_path, state=LaunchJobState.QUEUED.value,
-        phase_started_at=job.phase_started_at, decided_by=job.decided_by,
+        job_id="lj-queued",
+        vm_id=VM,
+        tenant_id="t-ck",
+        flavor="small",
+        spec_json=job.spec_json,
+        userdata_vault_path=_intake(),
+        userdata_vault_version=1,
+        kek_vault_path=job.kek_vault_path,
+        state=LaunchJobState.QUEUED.value,
+        phase_started_at=job.phase_started_at,
+        decided_by=job.decided_by,
     )
 
     with pytest.raises(CommandError, match="launch-job-in-flight"):
@@ -319,9 +460,9 @@ def test_a_launch_job_in_flight_is_refused(vault, tmp_path) -> None:
 @pytest.mark.parametrize(
     ("userdata", "reason"),
     [
-        (b"", "userdata-empty"),
-        (b"vault:v1:abcd", "userdata-vault-prefixed"),
-        (b"#cloud-config\n\xff\xfe", "userdata-not-utf8"),
+        (b"", "bad-userdata: userdata is empty"),
+        (b"vault:v1:abcd", "bad-userdata: a `vault:`-prefixed value"),
+        (b"#cloud-config\n\xff\xfe", "bad-userdata: userdata is not UTF-8"),
     ],
 )
 def test_a_malformed_userdata_is_refused(vault, tmp_path, userdata, reason) -> None:
@@ -341,38 +482,38 @@ def test_a_userdata_over_the_launch_api_cap_is_refused(vault, tmp_path, settings
     _assert_untouched(vault)
 
 
-def test_a_netbird_vm_needs_the_placeholder(vault, tmp_path) -> None:
+def test_a_netbird_vm_needs_no_placeholder(vault, tmp_path) -> None:
+    """Verbatim: the caller staged the guest's complete userdata, real values
+    and all, so no token is required."""
     _m0_vm(vault, enable_netbird=True)
 
-    with pytest.raises(CommandError, match="NETBIRD_SETUP_KEY"):
-        _run(tmp_path)
-    _assert_untouched(vault)
+    _run(tmp_path)
 
-    _run(tmp_path, userdata=FIX + b"  - [ netbird, up, --setup-key={{NETBIRD_SETUP_KEY}} ]\n")
     assert _record().userdata_vault_version == 2
 
 
-def test_a_relaunch_landing_between_decision_and_write_wins(
-    vault, tmp_path, monkeypatch
-) -> None:
+def test_a_relaunch_landing_between_decision_and_write_wins(vault, tmp_path, monkeypatch) -> None:
     """Re-decided under the Vm row lock: a power op claimed after the first
     read refuses the write, and the staged version is left inert."""
-    from apps.orchestration.management.commands import vali_restage_userdata as cmd
+    from apps.orchestration import userdata_restage
 
     vm, _job = _m0_vm(vault)
-    real = cmd.verdict
+    real = userdata_restage.check_vm
     calls = {"n": 0}
 
-    def verdict_then_start(v: Vm):
+    def check_then_start(v: Vm):
         calls["n"] += 1
         if calls["n"] == 2:
             Vm.objects.filter(pk=vm.pk).update(power_state=VmPowerState.STARTING)
             v.refresh_from_db()
         return real(v)
 
-    monkeypatch.setattr(cmd, "verdict", verdict_then_start)
+    monkeypatch.setattr(userdata_restage, "check_vm", check_then_start)
 
-    with pytest.raises(CommandError, match="refused at write time: power-op-in-flight:starting"):
+    with pytest.raises(
+        CommandError,
+        match="vm-not-restageable: vm cannot be restaged now: power-op-in-flight:starting",
+    ):
         _run(tmp_path)
     # Re-decided BEFORE the Vault write, which happens under the same lock:
     # nothing is staged either (a §24 that took the VM meanwhile cannot have
@@ -381,9 +522,7 @@ def test_a_relaunch_landing_between_decision_and_write_wins(
     assert _record().userdata_vault_version == 1
 
 
-def test_a_version_pruned_between_check_and_write_is_refused(
-    vault, tmp_path, monkeypatch
-) -> None:
+def test_a_version_pruned_between_check_and_write_is_refused(vault, tmp_path, monkeypatch) -> None:
     """Re-checked under the lock: a launch intake (which stages before it
     locks) may have pushed the checked version out of Vault's history."""
     _m0_vm(vault)
@@ -399,7 +538,7 @@ def test_a_version_pruned_between_check_and_write_is_refused(
 
     monkeypatch.setattr(vault_kv, "get_kv", pruned_on_second_read)
 
-    with pytest.raises(CommandError, match="refused at write time: no-such-version"):
+    with pytest.raises(CommandError, match="rollback-unavailable: no-such-version"):
         _run(tmp_path, "--to-version", "1", userdata=None)
     assert _record().userdata_vault_version == 2
 
@@ -423,9 +562,7 @@ def test_to_version_points_back_without_writing_or_decrypting(vault, tmp_path) -
     assert "rollback: --to-version 2" in out
 
 
-@pytest.mark.parametrize(
-    ("version", "reason"), [("7", "no-such-version"), ("1", "already-on-version")]
-)
+@pytest.mark.parametrize(("version", "reason"), [("7", "no-such-version"), ("1", "already on")])
 def test_to_version_refuses_a_missing_or_current_version(vault, tmp_path, version, reason) -> None:
     _m0_vm(vault)
 
@@ -442,9 +579,7 @@ def test_revert_last_restores_a_legacy_pointer(vault, tmp_path) -> None:
     legacy = f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/userdata-pending"
     vault.put_kv("secret", legacy, b"#cloud-config\nv1\n")
     vault.put_kv("secret", legacy, ORIGINAL)  # a pre-wrapping plaintext template
-    LaunchJob.objects.filter(pk=job.pk).update(
-        userdata_vault_path=legacy, userdata_vault_version=2
-    )
+    LaunchJob.objects.filter(pk=job.pk).update(userdata_vault_path=legacy, userdata_vault_version=2)
     out = _run(tmp_path)
     assert (_record().userdata_vault_path, _record().userdata_vault_version) == (_intake(), 2)
     assert "rollback: --revert-last" in out
@@ -470,9 +605,7 @@ def test_revert_last_refuses_a_legacy_pointer_a_relaunch_cannot_read(
     legacy = f"{settings.VALI_VAULT_KV_PREFIX}/{VM}/{leaf}"
     if value is not None:
         vault.put_kv("secret", legacy, value)
-    LaunchJob.objects.filter(pk=job.pk).update(
-        userdata_vault_path=legacy, userdata_vault_version=1
-    )
+    LaunchJob.objects.filter(pk=job.pk).update(userdata_vault_path=legacy, userdata_vault_version=1)
     if value is None:
         vault.put_kv("secret", legacy, ORIGINAL)
     _run(tmp_path)
@@ -490,64 +623,47 @@ def test_revert_last_refuses_when_the_pointer_moved(vault, tmp_path) -> None:
     _run(tmp_path)
     LaunchJob.objects.filter(vm_id=VM).update(userdata_vault_version=1)
 
-    with pytest.raises(CommandError, match="pointer-moved-since-last-restage"):
+    with pytest.raises(CommandError, match="the pointer moved since"):
         _run(tmp_path, "--revert-last", userdata=None)
 
 
 # ── --relaunch ────────────────────────────────────────────────────────────
 
 
-def test_relaunch_reboots_after_the_write(vault, tmp_path, monkeypatch) -> None:
+def test_relaunch_admits_a_tracked_job_that_holds_the_vm(
+    vault, tmp_path, monkeypatch, settings
+) -> None:
+    """`--relaunch` dispatches nothing itself: it admits the same job the API
+    does, which holds the VM (launch intake included) until the tick has
+    stopped and started it."""
+    from apps.identity.models import PrincipalScope, ServiceClient
+    from apps.orchestration import launch_jobs, service
+    from apps.orchestration.models import UserdataRestageJob
     from apps.orchestration.services import power
 
-    _m0_vm(vault)
-    seen: list[tuple[str, int]] = []
-
-    def reboot(vm: Vm) -> Vm:
-        job = _record()
-        seen.append((vm.vm_id, job.userdata_vault_version))
-        return vm
-
-    monkeypatch.setattr(power, "reboot_vm", reboot)
+    settings.VALI_ORCHESTRATION_ROOT_PRINCIPAL = "orchestration-root"
+    ServiceClient.objects.create(name="orchestration-root", scope=PrincipalScope.OPERATOR.value)
+    vm, _job = _m0_vm(vault)
+    monkeypatch.setattr(power, "reboot_vm", lambda vm: pytest.fail("relaunched inline"))
 
     out = _run(tmp_path, "--relaunch")
 
-    # The relaunch runs only once the new pointer is committed.
-    assert seen == [(VM, 2)]
-    assert "relaunched" in out
+    job = UserdataRestageJob.objects.get(vm=vm)
+    assert (job.phase, job.kind, job.to_version) == ("staged", "restage", 2)
+    assert job.request_id.startswith("cli-")
+    assert f"job={job.job_id}" in out
+    assert launch_record.userdata_restages(_record())[-1]["operator"] == "op@test"
+    assert service._has_active_job(vm) is True
+    with pytest.raises(launch_jobs.LaunchIntentError, match="held by another operation"):
+        launch_jobs._refuse_held(Vm.objects.get(pk=vm.pk))
 
 
-def test_a_refused_relaunch_keeps_the_restage_and_says_so(vault, tmp_path, monkeypatch) -> None:
-    from apps.orchestration.services import power
-
+def test_relaunch_without_the_root_principal_is_refused(vault, tmp_path, settings) -> None:
+    settings.VALI_ORCHESTRATION_ROOT_PRINCIPAL = "orchestration-root"
     _m0_vm(vault)
 
-    def refuse(vm: Vm) -> Vm:
-        raise power.PowerOpRefused("relaunch-rejected", "the miner did not accept")
-
-    monkeypatch.setattr(power, "reboot_vm", refuse)
-
-    with pytest.raises(CommandError, match="the restage stands.*relaunch-rejected"):
+    with pytest.raises(CommandError, match="root principal"):
         _run(tmp_path, "--relaunch")
-    assert _record().userdata_vault_version == 2
-
-
-def test_no_relaunch_over_a_launch_that_took_the_vm_after_the_commit(
-    vault, tmp_path, monkeypatch
-) -> None:
-    from apps.orchestration.management.commands import vali_restage_userdata as cmd
-    from apps.orchestration.services import power
-
-    _m0_vm(vault)
-    rebooted: list[str] = []
-    monkeypatch.setattr(power, "reboot_vm", lambda vm: rebooted.append(vm.vm_id) or vm)
-    shadows = iter(["", "launch-job-in-flight"])
-    monkeypatch.setattr(cmd, "_shadowed_by", lambda *a: next(shadows))
-
-    with pytest.raises(CommandError, match="relaunch was NOT attempted.*launch-job-in-flight"):
-        _run(tmp_path, "--relaunch")
-    assert rebooted == []
-    assert _record().userdata_vault_version == 2
 
 
 def test_dry_run_and_relaunch_are_exclusive(vault, tmp_path) -> None:
@@ -556,3 +672,29 @@ def test_dry_run_and_relaunch_are_exclusive(vault, tmp_path) -> None:
     with pytest.raises(CommandError, match="mutually exclusive"):
         _run(tmp_path, "--dry-run", "--relaunch")
     _assert_untouched(vault)
+
+
+# ── the locks: the CLI is held to the API's flag and allow-list ───────────
+
+
+@pytest.mark.parametrize(
+    ("enabled", "allowlist", "category"),
+    [
+        (False, VM, "userdata-restage-disabled"),
+        (True, "", "userdata-restage-not-allowed"),
+        (True, "other-vm", "userdata-restage-not-allowed"),
+    ],
+)
+def test_the_cli_is_behind_the_flag_and_the_allowlist(
+    vault, tmp_path, settings, enabled, allowlist, category
+) -> None:
+    _m0_vm(vault)
+    settings.VALI_USERDATA_RESTAGE_ENABLED = enabled
+    settings.VALI_USERDATA_RESTAGE_VM_ALLOWLIST = allowlist
+
+    with pytest.raises(CommandError, match=category):
+        _run(tmp_path)
+    with pytest.raises(CommandError, match=category):
+        _run(tmp_path, "--to-version", "1", userdata=None)
+    assert len(vault.kv[_intake()]) == 1
+    assert _record().userdata_vault_version == 1

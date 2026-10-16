@@ -360,7 +360,9 @@ def _pick_destination(vm: Vm, placement: Any, to_flavor: str) -> tuple[str | Non
     cross-generation one (§25 replays the measurement); and the new size's
     fit ENFORCED — under capacity v1 (`VALI_SCHEDULER_RESOURCE_ADMISSION`
     off) it would only shadow the choice, and a resize must never move a
-    VM to a host that cannot run what it is moving for."""
+    VM to a host that cannot run what it is moving for. In the VM's region
+    only (`sched.move_region_for_vm`): `region-unknown` when it cannot be
+    told."""
     from apps.miners.models import MinerIdentity
     from apps.scheduler import chain
     from apps.scheduler import service as sched
@@ -368,6 +370,10 @@ def _pick_destination(vm: Vm, placement: Any, to_flavor: str) -> tuple[str | Non
 
     from .service import _cross_gen_chain_ids
 
+    # Never another region — nor anywhere when the VM's cannot be told.
+    region = sched.move_region_for_vm(vm, from_node=placement.miner_node_id)
+    if not region:
+        return None, "region-unknown"
     try:
         snapshot = chain.read_miner_status()
     except chain.ChainReadUnavailable as exc:
@@ -380,9 +386,10 @@ def _pick_destination(vm: Vm, placement: Any, to_flavor: str) -> tuple[str | Non
         flavor=to_flavor,
         excluded=frozenset({placement.miner_node_id})
         | _cross_gen_chain_ids(placement.miner_node_id, sched.dispatchable_node_ids()),
-        region=sched.launch_region_for_vm(vm.vm_id),
+        region=region,
         shadow_log=False,
         vm_id=vm.vm_id,
+        require_failover_peer=sched.launch_requires_failover_peer(vm.vm_id),
     )
     # The destination must hold the VM's REAL disk (its launch disk), not
     # the target flavor's.

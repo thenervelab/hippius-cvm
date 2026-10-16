@@ -245,28 +245,42 @@ def net_policy_digest(payload_json: bytes) -> str:
     net-policy-digest`` so vali and the miner share one canonical encoding.
     Raises like [`_encode_order_body`].
     """
+    return _content_digest("net-policy-digest", payload_json)
+
+
+def storage_config_digest(payload_json: bytes) -> str:
+    """The content hash a miner acks for a ``storage-config`` order
+    (``applied:<revision>:<hash>`` / ``dry-run-ok:<revision>:<hash>``), from
+    the same JSON ``encode-order --kind storage-config`` reads. Computed by
+    ``hippius-ticket-validator storage-config-digest``. Sent by the
+    storage-config push loop (``apps.disktier.storage_config``,
+    docs/design/disk-tier-verification.md §9). Raises like
+    [`_encode_order_body`].
+    """
+    return _content_digest("storage-config-digest", payload_json)
+
+
+def _content_digest(subcommand: str, payload_json: bytes) -> str:
     binary = _required_setting("VALI_TICKET_VALIDATOR_BIN")
     timeout = float(getattr(settings, "VALI_TICKET_VALIDATOR_TIMEOUT_S", 2.0))
     try:
         completed = subprocess.run(
-            [binary, "net-policy-digest"],
+            [binary, subcommand],
             input=payload_json,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
     except FileNotFoundError as exc:
-        raise OrderDispatchMisconfigured("net-policy-digest: validator binary not found") from exc
+        raise OrderDispatchMisconfigured(f"{subcommand}: validator binary not found") from exc
     except subprocess.TimeoutExpired as exc:
-        raise OrderDispatchError("net-policy-digest: validator timeout") from exc
+        raise OrderDispatchError(f"{subcommand}: validator timeout") from exc
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise OrderDispatchError(
-            f"net-policy-digest: validator exit {completed.returncode}: {stderr}"
-        )
+        raise OrderDispatchError(f"{subcommand}: validator exit {completed.returncode}: {stderr}")
     digest = completed.stdout.decode("ascii", errors="replace").strip()
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise OrderDispatchError("net-policy-digest: validator produced no digest")
+        raise OrderDispatchError(f"{subcommand}: validator produced no digest")
     return digest
 
 

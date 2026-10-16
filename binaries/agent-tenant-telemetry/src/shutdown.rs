@@ -47,6 +47,16 @@ impl ShutdownWatch for Shutdown {
 }
 
 impl Shutdown {
+    /// A latch no signal sets — only [`trigger`](Self::trigger). The
+    /// vsock pusher stops on one of these, triggered once the receipt
+    /// loop has buffered its final receipt, so the pusher's last drain
+    /// always carries it.
+    pub fn manual() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Latch the shutdown flag programmatically — as if a
     /// `SIGTERM`/`SIGINT` had been delivered.
     ///

@@ -25,6 +25,11 @@
 //!   Decommissioned` state machine; ABSENT ⇒ the implicit `Active`.
 //! - `EpochWeights[CurrentEpoch][node_id]` — `StorageDoubleMap` → the
 //!   §23 reward weight, reused as the v1 "quality" signal.
+//! - `ChildRegistrations[child]` — `StorageMap<Blake2_128Concat,
+//!   AccountId, ChildRegistration>`: the child's `family`, `node_id` and
+//!   `Active | Unbonding` status. With `NodeIdToChild` it answers "which
+//!   family runs this node" ([`fetch_node_family`], the operator-config
+//!   write check).
 //!
 //! Deterministic: no randomness, no wall-clock; the only inputs are
 //! the RPC responses.
@@ -37,6 +42,8 @@ use blake2::digest::consts::U16;
 use blake2::{Blake2b, Digest};
 use codec::Decode;
 use twox_hash::XxHash64;
+
+pub mod metadata;
 
 /// Per-RPC-call timeout. Each `state_getStorage` / `state_getKeysPaged`
 /// round-trip is bounded independently.
@@ -74,6 +81,10 @@ pub mod category {
     /// JSON — it is the metadata blob itself we refuse to interpret. We
     /// never guess: an unknown metadata layout means "cannot determine".
     pub const METADATA_SHAPE: &str = "metadata-shape";
+    /// The runtime metadata no longer names a pallet / storage item the
+    /// read depends on: its raw storage may be a fossil. Fail-closed reads
+    /// (the operator-config family check) refuse on it.
+    pub const PALLET_ABSENT: &str = "pallet-absent";
 }
 
 /// Structured read failure. `category` is drawn from [`category`];
@@ -502,6 +513,200 @@ pub fn fetch_pending_prices(
     })
 }
 
+// ─── node → family (operator config auth) ───────────────────────────
+
+/// A child registration's `ChildStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStatus {
+    Active,
+    /// Deregistered, deposit still bonded.
+    Unbonding,
+}
+
+impl ChildStatus {
+    /// Map the `ChildStatus` SCALE discriminant. An unknown discriminant
+    /// fails closed.
+    pub fn from_discriminant(discriminant: u8) -> Result<Self, RegistryError> {
+        match discriminant {
+            0 => Ok(ChildStatus::Active),
+            1 => Ok(ChildStatus::Unbonding),
+            other => Err(RegistryError::new(
+                category::SCALE_DECODE,
+                format!("unknown ChildStatus discriminant {other}"),
+            )),
+        }
+    }
+
+    /// The lowercase wire label (`active` | `unbonding`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ChildStatus::Active => "active",
+            ChildStatus::Unbonding => "unbonding",
+        }
+    }
+}
+
+/// The head of a `ChildRegistration<AccountId32, BlockNumber, Balance>`:
+/// `family`, the `node_id` it registered, and its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRegistrationHead {
+    pub family: [u8; 32],
+    pub node_id: [u8; 32],
+    pub status: ChildStatus,
+}
+
+/// Why a node has no family binding at the read block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnboundReason {
+    /// `NodeIdToChild[node_id]` is absent: the node is not registered.
+    NoChild,
+    /// The child named by `NodeIdToChild` has no `ChildRegistrations` row.
+    NoRegistration,
+    /// The registration names another node: the forward and the reverse
+    /// index disagree, so neither is trusted.
+    NodeMismatch,
+}
+
+impl UnboundReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            UnboundReason::NoChild => "no-child",
+            UnboundReason::NoRegistration => "no-registration",
+            UnboundReason::NodeMismatch => "node-mismatch",
+        }
+    }
+}
+
+/// One node's family binding, every read pinned to one finalized block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeFamilyRead {
+    /// The finalized block the reads were made at (`0x` + 64 hex).
+    pub block_hash: String,
+    pub node_id: [u8; 32],
+    /// `Ok((child, registration))` when `NodeIdToChild[node_id]` names a
+    /// child whose registration names this very node.
+    pub binding: Result<([u8; 32], ChildRegistrationHead), UnboundReason>,
+}
+
+/// Read `NodeIdToChild[node_id]` and the child's `ChildRegistrations` row
+/// at the finalized head, for the pallet named `pallet`. Blocking,
+/// fail-closed on every transport / decode error, and never echoes the
+/// RPC URL.
+pub fn fetch_node_family(
+    rpc_url: &str,
+    pallet: &str,
+    node_id: &[u8; 32],
+) -> Result<NodeFamilyRead, RegistryError> {
+    let url = rpc_url.trim();
+    if url.is_empty() {
+        return Err(RegistryError::new(
+            category::RPC_REQUEST,
+            "RPC URL is empty".to_string(),
+        ));
+    }
+    let block_hash = get_finalized_head(url)?;
+    // An authorization read must not trust a fossil: a removed pallet (or
+    // map) keeps answering raw storage reads with its last-written bytes.
+    // The runtime metadata AT THE SAME BLOCK must still name the pallet
+    // and both maps; anything else — absent, or undeterminable — fails.
+    let metadata = get_metadata_at(url, &block_hash)?;
+    require_family_maps(&metadata, pallet)?;
+    let binding = (|| {
+        let Some(raw_child) =
+            get_storage_at(url, &node_id_to_child_key(pallet, node_id), &block_hash)?
+        else {
+            return Ok(Err(UnboundReason::NoChild));
+        };
+        let child = decode_account_id(&raw_child)?;
+        let Some(raw_reg) =
+            get_storage_at(url, &child_registration_key(pallet, &child), &block_hash)?
+        else {
+            return Ok(Err(UnboundReason::NoRegistration));
+        };
+        let reg = decode_child_registration_head(&raw_reg)?;
+        if reg.node_id != *node_id {
+            return Ok(Err(UnboundReason::NodeMismatch));
+        }
+        Ok::<_, RegistryError>(Ok((child, reg)))
+    })()?;
+    Ok(NodeFamilyRead {
+        block_hash,
+        node_id: *node_id,
+        binding,
+    })
+}
+
+/// The runtime metadata (decoded structurally, [`metadata`]) must list
+/// `NodeIdToChild` and `ChildRegistrations` as `Blake2_128Concat` maps of
+/// `pallet`, under the storage prefix the keys are derived from.
+fn require_family_maps(metadata_blob: &[u8], pallet: &str) -> Result<(), RegistryError> {
+    let absent = |what: String| RegistryError::new(category::PALLET_ABSENT, what);
+    let storage = metadata::pallet_storage(metadata_blob, pallet)?
+        .ok_or_else(|| absent(format!("pallet `{pallet}` has no storage in the runtime")))?;
+    if storage.prefix != pallet {
+        return Err(absent(format!(
+            "pallet `{pallet}` stores under prefix `{}`",
+            storage.prefix
+        )));
+    }
+    for name in ["NodeIdToChild", "ChildRegistrations"] {
+        let entry = storage.entries.iter().find(|e| e.name == name);
+        if entry.and_then(|e| e.map_hashers.as_deref()) != Some(&[metadata::BLAKE2_128_CONCAT]) {
+            return Err(absent(format!(
+                "`{pallet}.{name}` is not a Blake2_128Concat map in the runtime"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `NodeIdToChild` key: `StorageMap<Blake2_128Concat, [u8; 32], AccountId>`.
+fn node_id_to_child_key(pallet: &str, node_id: &[u8; 32]) -> Vec<u8> {
+    storage_map_key(pallet, "NodeIdToChild", node_id)
+}
+
+/// `ChildRegistrations` key: `StorageMap<Blake2_128Concat, AccountId, …>`.
+/// An `AccountId32` encodes as its 32 raw bytes.
+fn child_registration_key(pallet: &str, child: &[u8; 32]) -> Vec<u8> {
+    storage_map_key(pallet, "ChildRegistrations", child)
+}
+
+/// An `AccountId32` value: exactly 32 bytes.
+fn decode_account_id(bytes: &[u8]) -> Result<[u8; 32], RegistryError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        RegistryError::new(
+            category::SCALE_DECODE,
+            format!("AccountId is {} bytes, want 32", bytes.len()),
+        )
+    })
+}
+
+/// Decode a `ChildRegistration<AccountId32, BlockNumber, Balance>`:
+/// `family (32) ++ node_id (32) ++ status (1) ++ deposit (u128, 16) ++
+/// unbonding_end (BlockNumber)`. The runtime binds `BlockNumber = u32`;
+/// a `u64` block number is accepted too (the head fields this returns sit
+/// before it either way). Any other length is a layout this reader does
+/// not know and fails closed.
+fn decode_child_registration_head(bytes: &[u8]) -> Result<ChildRegistrationHead, RegistryError> {
+    const HEAD: usize = 32 + 32 + 1 + 16;
+    if bytes.len() != HEAD + 4 && bytes.len() != HEAD + 8 {
+        return Err(RegistryError::new(
+            category::SCALE_DECODE,
+            format!("ChildRegistration is {} bytes", bytes.len()),
+        ));
+    }
+    let mut family = [0u8; 32];
+    family.copy_from_slice(&bytes[0..32]);
+    let mut node_id = [0u8; 32];
+    node_id.copy_from_slice(&bytes[32..64]);
+    let status = ChildStatus::from_discriminant(bytes[64])?;
+    Ok(ChildRegistrationHead {
+        family,
+        node_id,
+        status,
+    })
+}
+
 /// Fetch the registry from a **vali feed** (the in-cluster
 /// `GET /v1/edge/registry` endpoint) instead of directly from the
 /// chain. The Edge uses this: its egress is locked to vali (it cannot
@@ -921,6 +1126,52 @@ fn get_block_number(url: &str) -> Result<u64, RegistryError> {
 fn get_storage(url: &str, key: &[u8]) -> Result<Option<Vec<u8>>, RegistryError> {
     let key_hex = format!("0x{}", hex::encode(key));
     let result = rpc_call(url, "state_getStorage", serde_json::json!([key_hex]))?;
+    if result.is_null() {
+        return Ok(None);
+    }
+    let hex_str = result.as_str().ok_or_else(|| {
+        RegistryError::new(
+            category::RPC_RESPONSE,
+            "state_getStorage result is not a string".to_string(),
+        )
+    })?;
+    Ok(Some(decode_hex(hex_str)?))
+}
+
+/// `chain_getFinalizedHead()` → the finalized block hash (`0x` + 64 hex).
+fn get_finalized_head(url: &str) -> Result<String, RegistryError> {
+    let result = rpc_call(url, "chain_getFinalizedHead", serde_json::json!([]))?;
+    let hash = result.as_str().ok_or_else(|| {
+        RegistryError::new(
+            category::RPC_RESPONSE,
+            "chain_getFinalizedHead result is not a string".to_string(),
+        )
+    })?;
+    if decode_hex(hash)?.len() != 32 || !hash.starts_with("0x") {
+        return Err(RegistryError::new(
+            category::RPC_RESPONSE,
+            "chain_getFinalizedHead result is not a 32-byte hash".to_string(),
+        ));
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
+/// `state_getMetadata(at)` — the runtime metadata blob at block `at`.
+fn get_metadata_at(url: &str, at: &str) -> Result<Vec<u8>, RegistryError> {
+    let result = rpc_call(url, "state_getMetadata", serde_json::json!([at]))?;
+    let hex_str = result.as_str().ok_or_else(|| {
+        RegistryError::new(
+            category::RPC_RESPONSE,
+            "state_getMetadata result is not a string".to_string(),
+        )
+    })?;
+    decode_hex(hex_str)
+}
+
+/// `state_getStorage(key, at)` — `None` if the key is absent at `at`.
+fn get_storage_at(url: &str, key: &[u8], at: &str) -> Result<Option<Vec<u8>>, RegistryError> {
+    let key_hex = format!("0x{}", hex::encode(key));
+    let result = rpc_call(url, "state_getStorage", serde_json::json!([key_hex, at]))?;
     if result.is_null() {
         return Ok(None);
     }
@@ -1538,5 +1789,192 @@ mod tests {
                 .category,
             category::FEED_SIGNATURE, // 2 bytes, want 64
         );
+    }
+
+    // ── node → family ────────────────────────────────────────────────
+
+    #[test]
+    fn blake2_128_concat_matches_the_published_system_account_key() {
+        // `System.Account[Alice]`, the key every Substrate tutorial prints.
+        let alice = hex::decode("d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d")
+            .unwrap();
+        assert_eq!(
+            hex::encode(storage_map_key("System", "Account", &alice)),
+            "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9\
+             de1e86a9a8c739864cf3cc5ec2bea59f\
+             d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
+        );
+    }
+
+    #[test]
+    fn node_family_keys_are_blake2_128_concat_maps_of_the_pallet() {
+        let node_id = [0x11u8; 32];
+        let key = node_id_to_child_key("ComputeScoring", &node_id);
+        assert_eq!(&key[0..16], &twox_128(b"ComputeScoring"));
+        assert_eq!(&key[16..32], &twox_128(b"NodeIdToChild"));
+        assert_eq!(&key[32..48], &blake2_128(&node_id));
+        assert_eq!(&key[48..], &node_id);
+
+        let child = [0x22u8; 32];
+        let key = child_registration_key("ComputeScoring", &child);
+        assert_eq!(&key[16..32], &twox_128(b"ChildRegistrations"));
+        assert_eq!(&key[32..48], &blake2_128(&child));
+        assert_eq!(&key[48..], &child);
+    }
+
+    fn registration_bytes(status: u8, block_width: usize) -> Vec<u8> {
+        let mut bytes = vec![0xaau8; 32]; // family
+        bytes.extend_from_slice(&[0xbbu8; 32]); // node_id
+        bytes.push(status);
+        bytes.extend_from_slice(&5_000_000_000_000u128.to_le_bytes()); // deposit
+        bytes.extend_from_slice(&vec![0x07u8; block_width]); // unbonding_end
+        bytes
+    }
+
+    #[test]
+    fn decode_child_registration_reads_family_node_and_status() {
+        let reg = decode_child_registration_head(&registration_bytes(0, 4)).unwrap();
+        assert_eq!(reg.family, [0xaau8; 32]);
+        assert_eq!(reg.node_id, [0xbbu8; 32]);
+        assert_eq!(reg.status, ChildStatus::Active);
+        let reg = decode_child_registration_head(&registration_bytes(1, 8)).unwrap();
+        assert_eq!(reg.status, ChildStatus::Unbonding);
+        assert_eq!(reg.status.label(), "unbonding");
+    }
+
+    #[test]
+    fn decode_child_registration_fails_closed_on_unknown_layouts() {
+        for bad in [
+            registration_bytes(2, 4),  // unknown status
+            registration_bytes(0, 2),  // too short
+            registration_bytes(0, 16), // too long
+            vec![0u8; 64],
+        ] {
+            let err = decode_child_registration_head(&bad).unwrap_err();
+            assert_eq!(err.category, category::SCALE_DECODE);
+        }
+    }
+
+    #[test]
+    fn decode_account_id_wants_exactly_32_bytes() {
+        assert_eq!(decode_account_id(&[3u8; 32]).unwrap(), [3u8; 32]);
+        assert_eq!(
+            decode_account_id(&[3u8; 33]).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+    }
+
+    /// A loopback JSON-RPC stub (127.0.0.1, no outside network): answers
+    /// each call with `answer(method, params)`, one connection per call.
+    fn rpc_stub(
+        answer: impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let result = answer(request["method"].as_str().unwrap(), &request["params"]);
+                let reply =
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        url
+    }
+
+    const HEAD: &str = "0xabababababababababababababababababababababababababababababababab";
+
+    /// A chain where `node` is registered by child `[0x22; 32]` of family
+    /// `[0x33; 32]`, serving `meta` as its runtime metadata.
+    fn chain_stub(node: [u8; 32], meta: Vec<u8>) -> String {
+        rpc_stub(move |method, params| match method {
+            "chain_getFinalizedHead" => serde_json::json!(HEAD),
+            "state_getMetadata" => {
+                assert_eq!(params[0], HEAD, "metadata is read at the finalized head");
+                serde_json::json!(format!("0x{}", hex::encode(&meta)))
+            }
+            "state_getStorage" => {
+                assert_eq!(params[1], HEAD, "storage is read at the finalized head");
+                let key = decode_hex(params[0].as_str().unwrap()).unwrap();
+                if key == node_id_to_child_key("ComputeScoring", &node) {
+                    serde_json::json!(format!("0x{}", hex::encode([0x22u8; 32])))
+                } else if key == child_registration_key("ComputeScoring", &[0x22u8; 32]) {
+                    let mut reg = vec![0x33u8; 32];
+                    reg.extend_from_slice(&node);
+                    reg.push(0);
+                    reg.extend_from_slice(&[0u8; 16 + 4]);
+                    serde_json::json!(format!("0x{}", hex::encode(reg)))
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            other => panic!("unexpected RPC {other}"),
+        })
+    }
+
+    #[test]
+    fn fetch_node_family_reads_the_binding_at_the_finalized_head() {
+        let node = [0x11u8; 32];
+        let read = fetch_node_family(
+            &chain_stub(node, metadata::tests::live(14)),
+            "ComputeScoring",
+            &node,
+        )
+        .unwrap();
+        assert_eq!(read.block_hash, HEAD);
+        let (child, reg) = read.binding.unwrap();
+        assert_eq!(child, [0x22u8; 32]);
+        assert_eq!(reg.family, [0x33u8; 32]);
+        assert_eq!(reg.status, ChildStatus::Active);
+        // Another node is not registered.
+        let other = [0x44u8; 32];
+        let read = fetch_node_family(
+            &chain_stub(node, metadata::tests::live(15)),
+            "ComputeScoring",
+            &other,
+        )
+        .unwrap();
+        assert_eq!(read.binding.unwrap_err(), UnboundReason::NoChild);
+    }
+
+    #[test]
+    fn fetch_node_family_refuses_a_fossil_pallet_or_map() {
+        let node = [0x11u8; 32];
+        for (label, meta) in metadata::tests::fossils() {
+            let err =
+                fetch_node_family(&chain_stub(node, meta), "ComputeScoring", &node).unwrap_err();
+            assert_eq!(err.category, category::PALLET_ABSENT, "{label}");
+        }
+    }
+
+    #[test]
+    fn fetch_node_family_refuses_an_empty_url() {
+        let err = fetch_node_family("  ", "ComputeScoring", &[0u8; 32]).unwrap_err();
+        assert_eq!(err.category, category::RPC_REQUEST);
     }
 }

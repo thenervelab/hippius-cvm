@@ -25,7 +25,7 @@ from .factories import (
 )
 from .test_views import PLACE_URL, _fail_url, _mock_chain
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 
 @pytest.fixture

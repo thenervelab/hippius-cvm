@@ -37,6 +37,11 @@ and `hippius_miner_host_health_reported_timestamp_seconds`, labelled
 `hippius-miner-host-health` PrometheusRule alerts on them. In the same
 push, `hippius_miner_agent_version_info{node_id,miner_id,version} 1` carries
 the release tag of the miner's latest v6 heartbeat (absent before one).
+
+And the storage-config sync state of every node with a desired storage
+document (`storage_config_survey`, job `vali-storage-config`):
+`hippius_storage_config_sync{node_id,state}`, one-hot over `in_sync`,
+`pending`, `refused`, `agent-unsupported` and `drift`.
 """
 
 from __future__ import annotations
@@ -188,6 +193,50 @@ def host_health_survey() -> None:
         log.exception("host-health survey failed")
 
 
+M_STORAGE_CONFIG_SYNC = "hippius_storage_config_sync"
+
+
+def storage_config_survey() -> None:
+    """Push the storage-config sync state of every node with a desired
+    document (`apps.disktier.storage_config`, job `vali-storage-config`):
+    `hippius_storage_config_sync{node_id,state} 1` for its current state
+    and 0 for the others (`in_sync`, `pending`, `refused`,
+    `agent-unsupported`, `drift`), so an alert can match `== 1`. The
+    refusal code is in the operator API, not in a label. The group is
+    replaced each cycle. Never raises."""
+    try:
+        gateway = str(getattr(settings, "VALI_SYNTHETIC_PUSHGATEWAY_URL", "") or "")
+        if not gateway:
+            return
+        from django.utils import timezone
+
+        from apps.disktier.models import MinerStorageConfig
+        from apps.disktier.storage_config import SYNC_STATES, sync_state, sync_status
+        from apps.synthetic import metrics
+
+        now = timezone.now()
+        ms = metrics.MetricSet()
+        for row in MinerStorageConfig.objects.filter(revision__gt=0).order_by("miner_node_id"):
+            current = sync_state(sync_status(row, now=now))
+            for state in SYNC_STATES:
+                ms.gauge(
+                    M_STORAGE_CONFIG_SYNC,
+                    1.0 if state == current else 0.0,
+                    node_id=row.miner_node_id,
+                    state=state,
+                )
+        metrics.push(
+            ms,
+            gateway_url=gateway,
+            job="vali-storage-config",
+            grouping_key={},
+            replace=True,
+            timeout_s=_HOST_HEALTH_PUSH_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — observability must never break the loop.
+        log.exception("storage-config survey failed")
+
+
 class Command(BaseCommand):
     help = (
         "Continuously re-evaluate Bound placements; §13-drain miners "
@@ -245,6 +294,7 @@ class Command(BaseCommand):
                 log.exception("reeval cycle raised — continuing")
             disk_survey()
             host_health_survey()
+            storage_config_survey()
 
             if once:
                 break

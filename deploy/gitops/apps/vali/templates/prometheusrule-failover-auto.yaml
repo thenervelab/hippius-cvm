@@ -1,0 +1,136 @@
+{{- if .Values.vmBackup.failoverAutoEnabled }}
+---
+# Automatic failover alerts (docs/design/backup-failover.md §9.4; gauges
+# pushed by the orchestration tick at most once a minute while the worker
+# is on, `apps.orchestration.failover_auto`). Rendered only with the worker
+# on (which also opens the Pushgateway egress, networkpolicy.yaml). Every
+# alert ignores a report older than five minutes: the Pushgateway keeps the
+# last push forever, and a worker turned off pushes nothing. A `severity`
+# label, the Alertmanager default route.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-failover-auto
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-failover-auto
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-failover-auto
+      interval: 1m
+      rules:
+        - alert: HippiusAutoFailoverStarted
+          # Per failover, not per phase: a phase change is not a new alert.
+          expr: max by (failover_id, vm, miner) (hippius_failover_auto_jobs) > 0 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: warning
+            component: failover
+          annotations:
+            summary: "automatic failover {{`{{ $labels.failover_id }}`}} of {{`{{ $labels.vm }}`}} off dead miner {{`{{ $labels.miner }}`}}"
+            description: |
+              vali proved the miner dead (heartbeat, NetBird and the Edge, held for
+              VALI_FAILOVER_AUTO_AFTER_S) and is restoring the VM's newest backup on
+              another miner. Follow it with `GET /v1/vm/{{`{{ $labels.vm }}`}}/restore`;
+              the dead miner is failover-quarantined until an operator clears it.
+        - alert: HippiusAutoFailoverFailed
+          expr: hippius_failover_auto_failed_24h > 0 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: critical
+            component: failover
+          annotations:
+            summary: "automatic failover {{`{{ $labels.failover_id }}`}} of {{`{{ $labels.vm }}`}} off {{`{{ $labels.miner }}`}} ended {{`{{ $labels.outcome }}`}}"
+            description: |
+              The VM is not running on another miner. `reverted`: it was put back on
+              the dead miner (reboot-recovery relaunches it if the miner returns).
+              `failed`: past the commit point, the original disk is kept — an
+              operator must look (`GET /v1/vm/{{`{{ $labels.vm }}`}}/restore`).
+        - alert: HippiusAutoFailoverNoCapacity
+          expr: (time() - hippius_failover_auto_pending_capacity_since_seconds) > 300 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: critical
+            component: failover
+          annotations:
+            summary: "{{`{{ $labels.vm }}`}} off dead miner {{`{{ $labels.miner }}`}} has waited {{`{{ $value | humanizeDuration }}`}} for a destination"
+            description: |
+              No miner of the same region and SNP generation, outside the VM's
+              placement group, has room for it. The worker retries every tick; add
+              capacity, or fail it over by hand to a named miner.
+        - alert: HippiusAutoFailoverHeld
+          expr: hippius_failover_auto_dead_miners and on() hippius_failover_auto_held == 1 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 5m
+          labels:
+            severity: critical
+            component: failover
+          annotations:
+            summary: "automatic failover held: {{`{{ $value }}`}} miners look dead at once"
+            description: |
+              More miners than VALI_FAILOVER_AUTO_MAX_DEAD_MINERS look dead together,
+              which is more likely vali's own view failing (heartbeat intake,
+              NetBird, the Edge). Nothing is failed over automatically until it
+              clears; check those signals, fail VMs over by hand if the miners are
+              really gone.
+        - alert: HippiusAutoFailoverCancelled
+          expr: hippius_failover_auto_cancelled_24h > 0 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: warning
+            component: failover
+          annotations:
+            summary: "automatic failover {{`{{ $labels.failover_id }}`}} of {{`{{ $labels.vm }}`}} off {{`{{ $labels.miner }}`}} cancelled at the fence ({{`{{ $labels.why }}`}})"
+            description: |
+              Nothing moved: the KBS was never activated elsewhere. `miner-back`: the
+              miner looked dead for VALI_FAILOVER_AUTO_AFTER_S, then answered again —
+              find out why it went silent that long (network, NetBird, the Edge).
+              `held`: too many miners looked dead at once (HippiusAutoFailoverHeld).
+        - alert: HippiusFailoverFenceUndecided
+          expr: (time() - hippius_failover_fence_undecided_since_seconds) > 600 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: critical
+            component: failover
+          annotations:
+            summary: "failover {{`{{ $labels.failover_id }}`}} of {{`{{ $labels.vm }}`}} waits at the fence for {{`{{ $value | humanizeDuration }}`}}"
+            description: |
+              The source {{`{{ $labels.miner }}`}} answers again, and vali cannot tell
+              whether the KBS moved (an activate errored, and the ingested KBS admin
+              audit log does not settle it yet). The job neither reverts nor activates
+              elsewhere until it can. Check the KBS audit ingest (KbsAuditIngest*
+              alerts) and the KBS admin log for an `activate` of this VM.
+        - alert: HippiusAutoFailoverBlocked
+          # Harmless before the image that exposes it: no series, no alert.
+          expr: hippius_failover_auto_blocked > 0 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 5m
+          labels:
+            severity: critical
+            component: failover
+          annotations:
+            summary: "miner {{`{{ $labels.miner }}`}} is dead, {{`{{ $value }}`}} auto VM(s) on it, and no failover is happening"
+            description: |
+              vali has seen the miner dead for VALI_FAILOVER_AUTO_AFTER_S, but none of its
+              failover_mode=auto VMs has an automatic failover job open or waiting for room
+              (never reported while the worker is held). `hippius_failover_auto_skipped{miner=...}`
+              and the ERROR line "failover-auto: dead miner … skipped (…)" say why each one was
+              passed over (not eligible, a power order or job in flight, backoff-retry,
+              backoff-exhausted = an operator must reset it, a refusal).
+        - alert: HippiusFailoverQuarantineOpen
+          # Harmless before the image that exposes it: no series, no alert.
+          expr: hippius_failover_quarantine_open > 7200 and on() (time() - hippius_failover_auto_report_timestamp_seconds) < 300
+          for: 5m
+          labels:
+            severity: warning
+            component: failover
+          annotations:
+            summary: "miner {{`{{ $labels.miner }}`}} has been failover-quarantined for {{`{{ $value | humanizeDuration }}`}}"
+            description: |
+              A failover declared the miner dead; it stays quarantined (not dispatchable) until an
+              operator clears it. Meanwhile it is no failover peer either, so its region's
+              `failover_capable` may read false and `require_failover_peer` launches there fail.
+              Reconcile (the VMs it carried run on their new hosts, its leftover domains are
+              stopped), then `manage.py vali_failover_quarantine --clear <miner>`.
+{{- end }}

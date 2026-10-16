@@ -192,7 +192,7 @@ spec:
         - ports:
             - port: "8001"
               protocol: TCP
-    {{- $syntheticEgress := or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") (eq (toString .Values.guestReport.enabled) "true") }}
+    {{- $syntheticEgress := or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") (eq (toString .Values.guestReport.enabled) "true") .Values.vmBackup.failoverAutoEnabled }}
     {{- if $syntheticEgress }}
     # ── synthetic-monitor (apps.synthetic) + golden re-bake egress ──
     # (1) the vali public API on the listen port — the light vali_api
@@ -247,8 +247,10 @@ spec:
     - toEntities:
         - kube-apiserver
     {{- end }}
-    {{- if .Values.createVm.enabled }}
+    {{- if or .Values.createVm.enabled .Values.vmBackup.failoverAutoEnabled }}
     # ── `vali_create_vm` operator-tier egress (DEV-MODE only) ──
+    # Also with the automatic failover worker on: its dead-miner proof reads
+    # the NetBird management API (`world:443`).
     #
     # The mgmt command writes tenant secrets to Vault (KV v2 PUT) and
     # uploads the freshly-signed §22 allowlist to Hippius S3. Both

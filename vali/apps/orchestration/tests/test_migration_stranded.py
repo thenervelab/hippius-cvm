@@ -49,7 +49,7 @@ from apps.orders.models import OrderTicketIntake
 
 from .factories import make_migration_job, make_vm
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("located_fr")]
 
 _SRC_PLATFORM = "11" * 64
 _DEST_PLATFORM = "22" * 64

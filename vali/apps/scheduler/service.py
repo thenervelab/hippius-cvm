@@ -615,6 +615,11 @@ def decision_inputs(
         committed_cpus[node_id] = committed_cpus.get(node_id, 0) + cpus
         if row["vm_family"] == vm_family:
             family_load[node_id] = family_load.get(node_id, 0) + 1
+    for node_id, resource_class, _disk in in_flight_move_reservations():
+        load[node_id] = load.get(node_id, 0) + 1
+        mem, cpus = _committed_resources(resource_class)
+        committed_mb[node_id] = committed_mb.get(node_id, 0) + mem
+        committed_cpus[node_id] = committed_cpus.get(node_id, 0) + cpus
     from apps.common.cdn import cdn_role
 
     if cdn_role(vm_family):
@@ -625,6 +630,78 @@ def decision_inputs(
 
     capacity = _effective_capacity_by_node(load, committed_mb, committed_cpus)
     return capacity, load, family_load
+
+
+def in_flight_move_reservations() -> list[tuple[str, str, int | None]]:
+    """`[(chain node_id, resource_class, data_disk_gb)]` — the room a restore or failover
+    to ANOTHER miner holds on its destination from the moment the job
+    opens. The VM's placement only moves there at activation
+    (`move_placement_to_node`), so without this a launch could take the
+    room between the destination's choice and the fence. A VM whose
+    placement already sits on the destination is not counted twice."""
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.models import TERMINAL_MIGRATION_STATES, MigrationJob
+
+    jobs = list(
+        MigrationJob.objects.filter(kind__in=("restore", "failover"))
+        .exclude(state__in=TERMINAL_MIGRATION_STATES)
+        .exclude(dest_node_id="")
+        .values_list("vm_id", "source_node_id", "dest_node_id")
+    )
+    jobs = [(vm_pk, dest) for vm_pk, source, dest in jobs if dest != source]
+    if not jobs:
+        return []
+    chain_by_miner = dict(
+        MinerIdentity.objects.filter(miner_id__in={dest for _, dest in jobs})
+        .exclude(chain_node_id__isnull=True)
+        .values_list("miner_id", "chain_node_id")
+    )
+    active: dict[int, tuple[str, str, int | None]] = {
+        vm_pk: (node, rc, disk)
+        for vm_pk, node, rc, disk in Placement.objects.filter(
+            vm_id__in={vm_pk for vm_pk, _ in jobs}, status__in=ACTIVE_PLACEMENT_STATES
+        ).values_list("vm_id", "miner_node_id", "resource_class", "data_disk_gb")
+    }
+    # Keyed as the capacity mirror keys the node (the ledger and the budgets
+    # read those keys), whatever case the identity row carries.
+    mirror = {
+        nid.lower(): nid
+        for nid in MinerCapacity.objects.values_list("miner_node_id", flat=True)
+    }
+    out: list[tuple[str, str, int | None]] = []
+    for vm_pk, dest in jobs:
+        node = chain_by_miner.get(dest)
+        if not node:
+            continue
+        node = mirror.get(node.lower(), node.lower())
+        held_node, resource_class, disk = active.get(vm_pk, ("", "", None))
+        if held_node and held_node.lower() == node.lower():
+            continue
+        if not resource_class:
+            # The dead source's placement already closed (a long failover
+            # outlives its grace): the VM's own launch says what it holds.
+            resource_class, disk = _launched_size(vm_pk)
+        out.append((node, resource_class, disk))
+    return out
+
+
+def _launched_size(vm_pk: int) -> tuple[str, int | None]:
+    """`(flavor, data_disk_gb)` the VM was launched at, from its succeeded
+    LaunchJob and launch record. `""` (counted as the reference flavor, fail
+    closed) when vali has none."""
+    from apps.lifecycle.models import Vm
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+    from apps.orchestration.services.launch_record import vm_data_disk_gb
+
+    vm_id = Vm.objects.filter(pk=vm_pk).values_list("vm_id", flat=True).first() or ""
+    spec = (
+        LaunchJob.objects.filter(vm_id=vm_id, state=LaunchJobState.SUCCEEDED)
+        .order_by("-finished_at")
+        .values_list("spec_json", flat=True)
+        .first()
+    )
+    flavor = str((spec or {}).get("flavor") or "")
+    return flavor, (vm_data_disk_gb(vm_id) or None) if vm_id else None
 
 
 def cdn_node_load(tenant_id: str, *, exclude_vm_id: str = "") -> dict[str, int]:
@@ -871,6 +948,41 @@ def region_arguments(region: str) -> dict[str, Any]:
     }
 
 
+def move_region_for_vm(vm: Any, *, from_node: str = "") -> str:
+    """The region a VM that is already somewhere stays in when anything
+    moves it (§25 migration, drain, resize, re-placement, a price-watch
+    suggestion): the one its launch asked for, else the last known country
+    of its host — or of `from_node`, the chain node it is leaving — however
+    old (a dead or leaving host stops being located). `""` when none can be
+    told: every move path then refuses, never a destination that could be
+    in another region."""
+    from apps.backup import service as backup_service
+    from apps.miners import geo
+    from apps.miners.models import MinerIdentity
+
+    region = backup_service.vm_region(vm).strip().upper()
+    if region or not from_node:
+        return region
+    miner_id = (
+        MinerIdentity.objects.filter(chain_node_id=from_node)
+        .values_list("miner_id", flat=True)
+        .first()
+    )
+    return geo.last_known_countries([miner_id]).get(miner_id, "") if miner_id else ""
+
+
+def placement_region_for_vm(vm: Any) -> str | None:
+    """The region a (re-)placement of `vm` must stay in. A VM that has run
+    somewhere (`vm.host`) keeps its region (`move_region_for_vm`), and
+    `None` says it cannot be told: refuse, never another region. A VM that
+    never ran keeps only what its launch asked (`""`: nothing asked,
+    nothing to cross)."""
+    region = move_region_for_vm(vm)
+    if region or not vm.host:
+        return region
+    return None
+
+
 def launch_region_for_vm(vm_id: str) -> str:
     """The region the VM's launch asked for, or `""` when it asked for
     none — read back from the `LaunchJob.spec_json` that PUT the VM where
@@ -917,9 +1029,12 @@ def placement_arguments(
     boot_gate: bool = False,
     vm_id: str = "",
     power_policy_stop: bool = False,
+    require_failover_peer: bool = False,
 ) -> dict[str, Any]:
     """Every [`decide_placement`] argument EXCEPT `snapshot`, assembled
     from settings + the DB exactly as a real launch assembles them.
+
+    `require_failover_peer` adds gate (m): only a host with a failover peer.
 
     `power_policy_stop` adds gate (l): only miners whose agent supports
     the guest-poweroff policy (an `on_guest_poweroff=stop` launch).
@@ -989,7 +1104,117 @@ def placement_arguments(
         # Gate (l) — an `on_guest_poweroff=stop` VM only where the agent
         # knows the policy.
         **(power_policy_arguments() if power_policy_stop else {}),
+        # Gate (m) — a `require_failover_peer` VM only where a failover can
+        # ever find a destination.
+        **failover_peer_arguments(require_failover_peer, vm_id),
     }
+
+
+def failover_capable_node_ids(
+    *, verified_only: bool | None = None, same_generation: bool = False
+) -> dict[str, str]:
+    """`{lower-case node_id: region}` of the miners a VM could be failed
+    over FROM: dispatchable, active locally AND with a positive on-chain
+    `active` mirror row (`active_mirror_node_ids`: a miner gone from the
+    chain keeps its last row, a missing row is no proof), not hard-gated
+    (`hard_gated_node_ids`: cordoned, epoch-stale, CVM-incapable, zombie),
+    located now, and with at least one OTHER such miner of the same SNP
+    generation (of any, with cross-generation restores on) in the same
+    region. Gate (m)'s input, and
+    the regions report's `failover_capable` (a region holds one such pair
+    or more)."""
+    from apps.miners.models import MinerIdentity, MinerStatus
+    from apps.orchestration import cross_gen
+    from apps.orchestration.effects import EffectError
+    from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
+
+    regions = region_by_node(verified_only=verified_only)
+    dispatchable = dispatchable_node_ids()
+    gated = {nid.lower() for nid in hard_gated_node_ids()} | set(cordoned_node_ids())
+    on_chain = active_mirror_node_ids()
+    groups: dict[tuple[str, str], list[str]] = {}
+    for chain_node_id, platform_id, snp_generation in MinerIdentity.objects.filter(
+        status=MinerStatus.ACTIVE, chain_node_id__isnull=False
+    ).values_list("chain_node_id", "platform_id", "snp_generation"):
+        node = str(chain_node_id).lower()
+        region = regions.get(node, "")
+        if not region or node not in dispatchable or node in gated or node not in on_chain:
+            continue
+        try:
+            generation = _vcpu_type_for_platform(platform_id, snp_generation)
+        except EffectError:
+            continue
+        # Cross-generation restores on: one pool per region for their
+        # generations (`cross_gen.pool`), unless `same_generation` (a VM with
+        # an operator-pinned measurement never crosses).
+        key = generation if same_generation else cross_gen.pool(generation)
+        groups.setdefault((region, key), []).append(node)
+    return {
+        node: region
+        for (region, _), nodes in groups.items()
+        if len(nodes) >= 2
+        for node in nodes
+    }
+
+
+def active_mirror_node_ids() -> frozenset[str]:
+    """Lower-case node_ids whose capacity mirror reads on-chain `active` in
+    a recent chain read — a positive allow-list. A miner with no row is not
+    in it, nor one the chain dropped: `refresh_miner_capacity` upserts only
+    the miners in the snapshot, at the snapshot's epoch, so the dropped
+    one's last row falls behind. "Recent" is the epoch of the most recently
+    refreshed row (not the highest epoch on file: a stale row from before a
+    chain reset must not disqualify the live ones), less `max_epoch_lag`
+    (a refresh is row by row: one caught mid-way leaves some rows an epoch
+    behind for a moment — or, off an RPC a block behind, ahead). The price:
+    a miner the chain dropped stays a peer for up to `max_epoch_lag`
+    epochs."""
+    latest = (
+        MinerCapacity.objects.order_by("-refreshed_at")
+        .values_list("observed_epoch", flat=True)
+        .first()
+    )
+    if latest is None:
+        return frozenset()
+    lag = max_epoch_lag()
+    return frozenset(
+        nid.lower()
+        for nid in MinerCapacity.objects.filter(
+            status=MINER_ACTIVE,
+            observed_epoch__gte=latest - lag,
+            observed_epoch__lte=latest + lag,
+        ).values_list("miner_node_id", flat=True)
+    )
+
+
+def _launch_spec(vm_id: str) -> dict[str, Any]:
+    """The `spec_json` of the VM's launch, read back like
+    `launch_region_for_vm` (the newest succeeded, else the newest)."""
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+
+    jobs = LaunchJob.objects.filter(vm_id=vm_id).order_by("-started_at")
+    return (
+        jobs.filter(state=LaunchJobState.SUCCEEDED.value)
+        .values_list("spec_json", flat=True)
+        .first()
+    ) or jobs.values_list("spec_json", flat=True).first() or {}
+
+
+def launch_requires_failover_peer(vm_id: str) -> bool:
+    """Whether the VM's launch asked for `require_failover_peer`: every
+    later placement of it (resize, drain, `/place`, `/fail`, a §25 move)
+    keeps the constraint."""
+    return _launch_spec(vm_id).get("require_failover_peer") is True
+
+
+def failover_peer_arguments(required: bool, vm_id: str = "") -> dict[str, Any]:
+    """Gate (m)'s [`decide_placement`] argument, for a VM launched
+    `require_failover_peer` (`{}` otherwise: no query). A VM with an
+    operator-pinned measurement counts only same-generation peers."""
+    if not required:
+        return {}
+    pinned = bool(vm_id and _launch_spec(vm_id).get("measurement_hex"))
+    return {"failover_capable": frozenset(failover_capable_node_ids(same_generation=pinned))}
 
 
 def power_policy_arguments() -> dict[str, Any]:
@@ -1298,6 +1523,11 @@ def host_resources_by_node() -> dict[str, HostResources]:
         mem, cpus = _committed_resources(row["resource_class"])
         committed_mb[node_id] = committed_mb.get(node_id, 0) + mem
         committed_cpus[node_id] = committed_cpus.get(node_id, 0) + cpus
+    for node_id, resource_class, _disk in in_flight_move_reservations():
+        load[node_id] = load.get(node_id, 0) + 1
+        mem, cpus = _committed_resources(resource_class)
+        committed_mb[node_id] = committed_mb.get(node_id, 0) + mem
+        committed_cpus[node_id] = committed_cpus.get(node_id, 0) + cpus
 
     out: dict[str, HostResources] = {}
     for nid, result in _capacity_results_by_node(load, committed_mb, committed_cpus).items():
@@ -1418,6 +1648,14 @@ def _committed_by_node() -> dict[str, _Committed]:
         entry[1] += mem
         entry[2] += 1
         entry[3] += placement_disk_gb(row["resource_class"], row["data_disk_gb"])
+    # The room an open restore / failover holds on its destination.
+    for node_id, resource_class, disk in in_flight_move_reservations():
+        mem, cpus = _committed_resources(resource_class)
+        entry = acc.setdefault(node_id, [0, 0, 0, 0])
+        entry[0] += cpus
+        entry[1] += mem
+        entry[2] += 1
+        entry[3] += placement_disk_gb(resource_class, disk)
     return {nid: _Committed(v, m, n, d) for nid, (v, m, n, d) in acc.items()}
 
 

@@ -47,6 +47,23 @@ for bad in 5 95 x; do
     echo "render.sh cache-auto accepted percent $bad" >&2; exit 1
   fi
 done
+# The SPA fallback location repeats the customer location's cache and
+# proxy directives: they must not drift apart (only the 469 error_page
+# and the X-Hippius-SPA header are the customer location's own).
+python3 -I - "$root/nginx.conf.in" <<'EOF'
+import re, sys
+text = open(sys.argv[1]).read()
+def directives(start):
+    block = text[text.index(start):]
+    block = block[block.index("slice 1m;"):block.index("proxy_pass http://hippius_origin")]
+    lines = [l.strip() for l in block.splitlines()]
+    own = re.compile(r"^(proxy_intercept_errors|error_page 469 |proxy_cache_valid 469 |proxy_set_header X-Hippius-SPA )")
+    return [l for l in lines if l and not l.startswith("#") and not own.match(l)]
+customer = directives("# ── customer traffic")
+fallback = directives("location @hippius_spa_fallback {")
+if customer != fallback or len(customer) < 30:
+    sys.exit("nginx.conf.in: the SPA fallback location's directives drifted from the customer location's")
+EOF
 echo "ok"
 
 echo "== GeoIP test databases"

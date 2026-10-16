@@ -25,6 +25,9 @@ use hippius_types::audit_vm::{
     map_root, totals_root, ResourceClassTotal, ServedDeliveryAggregate, ServedReceiptEntry,
 };
 use hippius_types::digest::userdata_digest;
+use hippius_types::disk_stats::{
+    DiskIoDelta, DiskIoState, DiskProbeResult, DiskProbeTarget, HIST_BUCKETS,
+};
 use hippius_types::release::ReleaseContext;
 use hippius_types::served_receipt::ServedDeliveryReceipt;
 use hippius_types::stopped::StoppedAck;
@@ -163,12 +166,169 @@ fn vector_served_delivery_receipt() {
         period_start: 1_000,
         period_end: 1_060,
         expiry: 2_000,
+        disk_io: None,
+        disk_probe: None,
     };
     let body = r.canonical().unwrap();
     check(
         "served_delivery_receipt.basic",
         &body,
         "69f4bb21ccf75c904929eaa70d78afcbc4a46e6a8dfd4c0f593e991a4725cb75",
+    );
+}
+
+/// The `basic` receipt plus `disk_io`: an OS-disk device and a dedicated
+/// slot, plus a dedicated slot the guest could not find.
+#[test]
+fn vector_served_delivery_receipt_disk_io() {
+    let nonce = [0x44u8; 32];
+    let io = [
+        DiskIoDelta {
+            dev: String::new(),
+            serial: "hippius-x1".into(),
+            state: DiskIoState::Missing,
+            r_ios: 0,
+            r_sectors: 0,
+            r_ticks_ms: 0,
+            w_ios: 0,
+            w_sectors: 0,
+            w_ticks_ms: 0,
+            io_ticks_ms: 0,
+            tiq_ms: 0,
+            inflight: 0,
+        },
+        DiskIoDelta {
+            dev: "vda".into(),
+            serial: String::new(),
+            state: DiskIoState::Ok,
+            r_ios: 1_200,
+            r_sectors: 96_000,
+            r_ticks_ms: 340,
+            w_ios: 800,
+            w_sectors: 64_000,
+            w_ticks_ms: 910,
+            io_ticks_ms: 1_100,
+            tiq_ms: 1_250,
+            inflight: 2,
+        },
+        DiskIoDelta {
+            dev: "vde".into(),
+            serial: "hippius-x0".into(),
+            state: DiskIoState::Ok,
+            r_ios: 30,
+            r_sectors: 61_440,
+            r_ticks_ms: 450,
+            w_ios: 12,
+            w_sectors: 24_576,
+            w_ticks_ms: 160,
+            io_ticks_ms: 600,
+            tiq_ms: 610,
+            inflight: 0,
+        },
+    ];
+    let r = ServedDeliveryReceipt {
+        validator_id: b"validator-1",
+        validator_nonce: &nonce,
+        epoch: 42,
+        vm_id: "abc",
+        lease_id: "lease-1",
+        family_id: b"family-1",
+        node_id: b"node-1",
+        resource_class: "std",
+        monotonic_seq: 1,
+        observed_degradation_bps: 0,
+        period_start: 1_000,
+        period_end: 1_060,
+        expiry: 2_000,
+        disk_io: Some(&io),
+        disk_probe: None,
+    };
+    let body = r.canonical().unwrap();
+    check(
+        "served_delivery_receipt.disk_io",
+        &body,
+        "7712fa8220685dce4c53cd5fa36f4b4f10c7dba195678f1f1d65f4033b84138f",
+    );
+}
+
+/// The `basic` receipt plus a probe result for the OS disk (profile `v1`)
+/// and one dedicated disk (profile `d1`).
+#[test]
+fn vector_served_delivery_receipt_disk_probe() {
+    let nonce = [0x44u8; 32];
+    let mut hist = vec![0u32; HIST_BUCKETS];
+    hist[6] = 900;
+    hist[7] = 95;
+    hist[10] = 5;
+    let metrics = |pairs: &[(&str, u64)]| -> Vec<(String, u64)> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    };
+    let probe = DiskProbeResult {
+        run_id: [0x55u8; 16],
+        nonce: [0x66u8; 32],
+        vm_id: "abc".into(),
+        vcpus: 2,
+        kernel: "6.8.0-110-generic".into(),
+        release_version: 5,
+        started_at: 1_010,
+        finished_at: 1_290,
+        targets: vec![
+            DiskProbeTarget {
+                slot: "os".into(),
+                profile: "v1".into(),
+                metrics: metrics(&[
+                    ("qd1_p50_us", 92),
+                    ("qd1_p99_us", 410),
+                    ("rr_iops", 61_000),
+                    ("rr_p99_us", 2_900),
+                    ("rw_iops", 24_000),
+                    ("rw_p99_us", 6_100),
+                    ("seq_read_mbps", 2_100),
+                    ("seq_write_mbps", 1_150),
+                    ("wipe_mbps", 1_400),
+                ]),
+                hist_qd1: hist.clone(),
+                error: String::new(),
+            },
+            DiskProbeTarget {
+                slot: "x0".into(),
+                profile: "d1".into(),
+                metrics: metrics(&[
+                    ("qd1_p50_us", 4_100),
+                    ("qd1_p99_us", 24_000),
+                    ("rr_iops", 420),
+                    ("seq_read_inner_mbps", 110),
+                    ("seq_read_outer_mbps", 260),
+                    ("surface_errors", 0),
+                    ("sustained_rw_iops", 310),
+                ]),
+                hist_qd1: hist,
+                error: String::new(),
+            },
+        ],
+    };
+    let r = ServedDeliveryReceipt {
+        validator_id: b"validator-1",
+        validator_nonce: &nonce,
+        epoch: 42,
+        vm_id: "abc",
+        lease_id: "lease-1",
+        family_id: b"family-1",
+        node_id: b"node-1",
+        resource_class: "std",
+        monotonic_seq: 1,
+        observed_degradation_bps: 0,
+        period_start: 1_000,
+        period_end: 1_060,
+        expiry: 2_000,
+        disk_io: None,
+        disk_probe: Some(&probe),
+    };
+    let body = r.canonical().unwrap();
+    check(
+        "served_delivery_receipt.disk_probe",
+        &body,
+        "576cfa368fe962486137e7549ea47852c288171342e08c2834b436ff4da714b1",
     );
 }
 

@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -625,6 +626,112 @@ def test_the_kbs_audit_ingest_runs_in_the_orchestration_tick_and_is_alerted() ->
     # after a roll must not page; it has its own two-report rule.
     assert "hippius_kbs_audit_checked_timestamp_seconds > 0" in rules["KbsAuditIngestStale"]
     assert "== 0" in rules["KbsAuditIngestNeverChecked"]
+
+
+@_needs_helm
+def test_power_policy_min_agent_version_is_one_shared_value() -> None:
+    """The web pods (VM views, launch intake), the launch tick and the
+    scheduler paths all judge which miners support the guest-poweroff
+    policy: one ConfigMap key, never a per-pod override."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_POWER_POLICY_MIN_AGENT_VERSION"] == "v2026.10.09"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_POWER_POLICY_MIN_AGENT_VERSION" not in env, label
+
+
+@_needs_helm
+def test_the_auto_failover_worker_is_on_with_its_alerts_and_egress() -> None:
+    """The worker runs in the orchestration tick; the web pod reads the same
+    flag for a policy's failover_auto_eligible. Its alerts and the egress its
+    dead-miner proof needs render with it, and only with it."""
+    docs = _docs()
+    env = _env_by_workload(docs)
+    for label in ("Deployment/vali", "Deployment/vali-orchestration-tick"):
+        assert env[label]["VALI_FAILOVER_AUTO_ENABLED"] == "true", label
+    assert "VALI_FAILOVER_AUTO_AFTER_S" not in env["Deployment/vali-orchestration-tick"]
+    rules = {
+        d["metadata"]["name"] for d in docs if d.get("kind") == "PrometheusRule"
+    }
+    assert "hippius-failover-auto" in rules
+    off = _docs("--set", "vmBackup.failoverAutoEnabled=false")
+    for label, workload in _env_by_workload(off).items():
+        assert "VALI_FAILOVER_AUTO_ENABLED" not in workload, label
+    assert "hippius-failover-auto" not in {
+        d["metadata"]["name"] for d in off if d.get("kind") == "PrometheusRule"
+    }
+
+
+_CROSS_GEN_KEYS = (
+    "VALI_FAILOVER_CROSS_GEN_ENABLED",
+    "VALI_FAILOVER_CROSS_GEN_GENERATIONS",
+    "VALI_FAILOVER_CROSS_GEN_VM_IDS",
+)
+
+
+def _import_settings_with(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Import vali's settings in a fresh interpreter with `env` on top of
+    this one's — what a pod does at start."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import django; django.setup(); from django.conf import settings; "
+            "print(settings.VALI_FAILOVER_CROSS_GEN_ENABLED, "
+            "','.join(settings.VALI_FAILOVER_CROSS_GEN_GENERATIONS))",
+        ],
+        cwd=REPO_ROOT / "vali",
+        env={
+            **os.environ,
+            "DJANGO_SETTINGS_MODULE": os.environ.get(
+                "DJANGO_SETTINGS_MODULE", "vali.settings_test"
+            ),
+            **env,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@_needs_helm
+def test_cross_gen_failover_renders_off_with_the_known_generations() -> None:
+    """#1577 reads three variables on the pods that carry vali.backupEnv.
+    The flag stays off, and the generations are exactly the vCPU models
+    settings.py accepts: any other entry makes vali refuse to start."""
+    env = _env_by_workload(_docs())
+    for label in ("Deployment/vali", "Deployment/vali-orchestration-tick"):
+        assert env[label]["VALI_FAILOVER_CROSS_GEN_ENABLED"] == "false", label
+        assert env[label]["VALI_FAILOVER_CROSS_GEN_GENERATIONS"] == "EpycGenoa,EpycTurin", label
+        assert env[label]["VALI_FAILOVER_CROSS_GEN_VM_IDS"] == "", label
+    for label, workload in env.items():
+        if label not in ("Deployment/vali", "Deployment/vali-orchestration-tick"):
+            assert not set(_CROSS_GEN_KEYS) & set(workload), label
+
+
+@_needs_helm
+def test_the_rendered_cross_gen_env_lets_vali_start() -> None:
+    """The rendered values pass settings.py's start-time check; a typo does
+    not (the check this test leans on is real)."""
+    tick = _env_by_workload(_docs())["Deployment/vali-orchestration-tick"]
+    ok = _import_settings_with({k: tick[k] for k in _CROSS_GEN_KEYS})
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stdout.split()[-2:] == ["False", "EpycGenoa,EpycTurin"]
+    bad = _import_settings_with({"VALI_FAILOVER_CROSS_GEN_GENERATIONS": "genoa,EpycTurin"})
+    assert bad.returncode != 0
+    assert "VALI_FAILOVER_CROSS_GEN_GENERATIONS names no vCPU model" in bad.stderr
+
+
+@_needs_helm
+def test_operator_config_writers_are_one_shared_value() -> None:
+    """The operator storage-config writers are read wherever the operator
+    API is served: one ConfigMap key, never a per-pod override. Unset, it
+    renders empty, which refuses every write."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_OPERATOR_CONFIG_PRINCIPALS"] == "backend-operator-config"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_OPERATOR_CONFIG_PRINCIPALS" not in env, label
+    off = _configmap_data(_docs("--set", "operatorConfig.principals="))
+    assert off["VALI_OPERATOR_CONFIG_PRINCIPALS"] == ""
 
 
 @_needs_helm

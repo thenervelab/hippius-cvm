@@ -1,0 +1,20 @@
+# Hippius guest components release — the disk-tier probe
+# (docs/design/disk-tier-verification.md §4.2). Dormant in every tenant
+# VM: it starts only when vali's probe userdata, KBS-released before
+# switch_root, left its request in /run. Never in health_mask: a unit
+# that does nothing must not count against an upgrade.
+[Unit]
+Description=Hippius disk-tier probe (vali probe VMs only)
+ConditionPathExists=/run/hippius/disk-probe/request.json
+After=local-fs.target
+RequiresMountsFor=/run/hippius/guest
+
+[Service]
+Type=exec
+ExecStart=/run/hippius/guest/bin/hippius-agent-disk-probe
+# Started at once (Type=exec): the request's delay (up to 72 h) and the run
+# never hold boot. No restart: a probe that dies leaves no result, and vali
+# times the run out.
+
+[Install]
+WantedBy=multi-user.target

@@ -50,6 +50,8 @@ fn tenant_receipts_roll_into_audit_vm_aggregate() {
         period_start: 1_000,
         period_end: 1_060,
         expiry: 2_000,
+        disk_io: None,
+        disk_probe: None,
     };
     let receipt_b = ServedDeliveryReceipt {
         validator_id: b"validator-1",
@@ -65,6 +67,8 @@ fn tenant_receipts_roll_into_audit_vm_aggregate() {
         period_start: 1_000,
         period_end: 1_060,
         expiry: 2_000,
+        disk_io: None,
+        disk_probe: None,
     };
     let signed_a = sign_served_receipt(&tenant_a_key, &receipt_a).unwrap();
     let signed_b = sign_served_receipt(&tenant_b_key, &receipt_b).unwrap();
@@ -244,6 +248,8 @@ fn digest_in_map_but_wrong_nonce_window_rejected() {
         period_start: 5_000,
         period_end: 5_060,
         expiry: 6_000,
+        disk_io: None,
+        disk_probe: None,
     };
     let signed_receipt = sign_served_receipt(&tenant_key, &receipt).unwrap();
     let entries = [ServedReceiptEntry {

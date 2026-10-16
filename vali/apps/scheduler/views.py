@@ -201,6 +201,18 @@ class SchedulerPlaceView(APIView):
         if active is not None:
             return _idempotent_or_conflict(active, resource_class)
 
+        # Gate (f) — `/place` sees no intent of its own: the region is the
+        # VM's (its launch's, else where it ran). A VM that ran somewhere
+        # whose region cannot be told is placed nowhere.
+        region = service.placement_region_for_vm(vm)
+        if region is None:
+            return _error(
+                status.HTTP_409_CONFLICT,
+                f"vm {vm_id!r}'s region cannot be told (no launch region, its host never "
+                "located): refusing a placement that could be in another region",
+                "region-unknown",
+            )
+
         # Authoritative on-chain read — fail closed (503) if it fails.
         try:
             snapshot = chain.read_miner_status()
@@ -220,12 +232,13 @@ class SchedulerPlaceView(APIView):
                 max_family_per_node=service.cdn_family_cap(vm_family),
                 **service.cdn_edge_arguments(vm_family, vm_id),
                 **service.group_arguments(vm_id),
+                # Gate (m) — a `require_failover_peer` VM keeps it.
+                **service.failover_peer_arguments(
+                    service.launch_requires_failover_peer(vm_id), vm_id
+                ),
                 max_epoch_lag=service.max_epoch_lag(),
                 dispatchable=service.dispatchable_node_ids(),
-                # Gate (f) — the region the VM's launch asked for, if any.
-                # `/place` sees no intent of its own, so it is read back
-                # from the LaunchJob; a VM with none stays unconstrained.
-                **service.region_arguments(service.launch_region_for_vm(vm_id)),
+                **service.region_arguments(region),
                 weights=SelectionWeights.from_settings(),
                 max_host_share=service.max_host_share(),
                 # §23 marketplace — cheaper announced prices rank up.
@@ -966,6 +979,23 @@ def _idempotent_or_conflict(existing: Placement, resource_class: str) -> Respons
     return Response(_serialize_placement(existing), status=status.HTTP_200_OK)
 
 
+def _dest_miner_id(node_id: str) -> str:
+    """The `miner_id` `start_migration` keys on, for a suggestion the price
+    watch took from `decide_placement` — a chain `node_id`. A value that is
+    already a `miner_id` (or resolves to nothing) passes through, and the
+    intake refuses what it cannot resolve."""
+    from apps.miners.models import MinerIdentity
+
+    if MinerIdentity.objects.filter(miner_id=node_id).exists():
+        return node_id
+    return (
+        MinerIdentity.objects.filter(chain_node_id=node_id)
+        .values_list("miner_id", flat=True)
+        .first()
+        or node_id
+    )
+
+
 def _replace(
     vm: Vm, failed: Placement, actor: Any
 ) -> tuple[Placement | None, dict[str, str] | None]:
@@ -975,6 +1005,16 @@ def _replace(
     chain read failed or no miner was eligible. Excludes the miner
     the failed placement was on so the VM genuinely moves.
     """
+    # Gate (f) — a re-placement stays in the VM's region (its launch's,
+    # else where it ran); one that ran somewhere unknown goes nowhere.
+    region = service.placement_region_for_vm(vm)
+    if region is None:
+        log.warning("re-placement skipped — vm %s's region cannot be told", vm.vm_id)
+        return None, {
+            "error": "the vm's region cannot be told (no launch region, its host never "
+            "located): refusing a placement that could be in another region",
+            "category": "region-unknown",
+        }
     try:
         snapshot = chain.read_miner_status()
     except chain.ChainReadUnavailable as exc:
@@ -993,12 +1033,13 @@ def _replace(
             max_family_per_node=service.cdn_family_cap(failed.vm_family),
             **service.cdn_edge_arguments(failed.vm_family, vm.vm_id),
             **service.group_arguments(vm.vm_id),
+            **service.failover_peer_arguments(
+                service.launch_requires_failover_peer(vm.vm_id), vm.vm_id
+            ),
             max_epoch_lag=service.max_epoch_lag(),
             excluded=frozenset({failed.miner_node_id}),
             dispatchable=service.dispatchable_node_ids(),
-            # Gate (f) — a re-placement must stay in the region the VM was
-            # sold in; the failed row does not carry it, the LaunchJob does.
-            **service.region_arguments(service.launch_region_for_vm(vm.vm_id)),
+            **service.region_arguments(region),
             weights=SelectionWeights.from_settings(),
             max_host_share=service.max_host_share(),
             price_by_node=service.price_by_node(snapshot),
@@ -1473,7 +1514,7 @@ class PriceRecommendationApproveView(APIView):
                 # StartError rolls the APPROVE back (rec stays Pending).
                 job = orch.start_migration(
                     vm=rec.vm,
-                    dest_node_id=rec.suggested_dest_node_id,
+                    dest_node_id=_dest_miner_id(rec.suggested_dest_node_id),
                     decided_by=request.user,
                 )
         except _CASLost:

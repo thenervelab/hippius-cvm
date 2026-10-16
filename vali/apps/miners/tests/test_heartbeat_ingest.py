@@ -70,6 +70,7 @@ class FakeHeartbeatVerifier:
         self.declared_disk: verifier.DeclaredDisk | None = None
         self.declared_host_health: verifier.DeclaredHostHealth | None = None
         self.agent_version: str | None = None
+        self.declared_storage: verifier.DeclaredStorage | None = None
         self.fail_category = "signature_invalid"
         self.calls: list[tuple[bytes, bytes]] = []
 
@@ -99,6 +100,7 @@ class FakeHeartbeatVerifier:
             declared_disk=self.declared_disk,
             declared_host_health=self.declared_host_health,
             agent_version=self.agent_version,
+            declared_storage=self.declared_storage,
         )
 
 
@@ -376,7 +378,7 @@ def test_heartbeat_rejects_empty_body() -> None:
 
 def test_heartbeat_rejects_oversize_body() -> None:
     _make_miner()
-    resp = _post_heartbeat(body=b"\x00" * 9000)
+    resp = _post_heartbeat(body=b"\x00" * (16 * 1024 + 1))
     assert resp.status_code == 413
     assert resp.json()["category"] == "too-large"
 
@@ -1264,3 +1266,100 @@ def test_the_reeval_survey_drops_the_version_info_after_a_downgrade_to_v5(
         reeval.host_health_survey()
     assert len(pushed) == 1
     assert "hippius_miner_agent_version_info" not in pushed[0]
+
+
+# ─── v7 storage report → apps.disktier (record only) ─────────────────
+
+
+def _v7(fake: FakeHeartbeatVerifier) -> None:
+    fake.schema_version = 7
+    fake.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 2)
+    fake.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+    fake.declared_host_health = verifier.DeclaredHostHealth(True, 0, 3, 0)
+    fake.agent_version = "v2026.10.15"
+    fake.declared_storage = verifier.DeclaredStorage(
+        pools=(
+            verifier.DeclaredPool(
+                pool_id="default",
+                declared_class="nvme",
+                total_gb=3500,
+                available_gb=3200,
+                budget_gb=3000,
+                committed_gb=400,
+                os_disks=True,
+                state="active",
+                error="",
+            ),
+        ),
+        dedicated_disks=(
+            verifier.DeclaredDedicatedDisk(
+                disk_id="wwn-0x5000c500a1b2c3d4", size_mb=1_000_000, state="free", vm="",
+                error="",
+            ),
+        ),
+        storage_config_revision=0,
+    )
+
+
+def test_v7_heartbeat_records_the_storage_report_and_still_the_v4_figures(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.disktier.models import DedicatedDisk, MinerStoragePool
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c7" * 32
+    _make_bridged_miner(node)
+    _v7(fake_heartbeat_verifier)
+
+    assert _post_heartbeat().status_code == 202
+    mc = MinerCapacity.objects.get(miner_node_id=node)
+    assert _disk(mc) == (3000, 3500, 3200, 400)
+    assert mc.agent_version == "v2026.10.15"
+    pool = MinerStoragePool.objects.get(miner_node_id=node)
+    assert (pool.pool_id, pool.total_gb, pool.reported_state) == ("default", 3500, "active")
+    assert pool.tier == "unknown"
+    assert DedicatedDisk.objects.get(miner_node_id=node).state == "pending_probe"
+
+
+def test_v7_storage_record_failure_never_costs_the_heartbeat(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.disktier import ingest
+    from apps.disktier.models import MinerStoragePool
+    from apps.scheduler.models import MinerCapacity
+    from apps.telemetry import service
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("injected")
+
+    logged: list[str] = []
+    monkeypatch.setattr(ingest, "record_storage_report", boom)
+    monkeypatch.setattr(service.log, "exception", lambda msg, *a: logged.append(msg % a))
+    node = "c8" * 32
+    miner = _make_bridged_miner(node)
+    _v7(fake_heartbeat_verifier)
+
+    assert _post_heartbeat().status_code == 202
+    miner.refresh_from_db()
+    assert miner.last_heartbeat_sequence == 1
+    assert MinerCapacity.objects.get(miner_node_id=node).agent_version == "v2026.10.15"
+    assert not MinerStoragePool.objects.exists()
+    assert logged and "storage report not recorded" in logged[0]
+
+
+def test_v7_heartbeat_without_bridge_records_no_storage(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from apps.disktier.models import MinerStoragePool
+
+    _make_miner()  # no chain_node_id
+    _v7(fake_heartbeat_verifier)
+    assert _post_heartbeat().status_code == 202
+    assert not MinerStoragePool.objects.exists()
+
+
+def test_a_v7_size_heartbeat_is_not_refused_as_oversize() -> None:
+    _make_miner()
+    # Past the old 4096-byte cap, inside the 16 KiB one.
+    assert _post_heartbeat(b"x" * 9_000).status_code == 202

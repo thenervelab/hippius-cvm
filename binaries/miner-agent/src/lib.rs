@@ -51,6 +51,7 @@ pub mod orders;
 pub mod release;
 pub mod sev_asid;
 pub mod snp_config;
+pub mod storage;
 pub mod vsock;
 
 pub use config::Config;

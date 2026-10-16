@@ -12,6 +12,7 @@ import hashlib
 import secrets
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -253,6 +254,10 @@ def make_vm(
         generation=1,
         host=host,
         lifecycle_vk=bytes(32),
+        # Booted long ago and its guest alive throughout (`_boot_gate`); the
+        # boot-gate tests set their own.
+        boot_started_at=timezone.now() - timedelta(days=30),
+        guest_signal_at=timezone.now() + timedelta(days=3650),
     )
     spec: dict[str, Any] = {"vm_id": vm_id, "flavor": flavor}
     if golden:
