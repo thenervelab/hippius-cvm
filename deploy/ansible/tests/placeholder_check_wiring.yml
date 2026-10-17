@@ -24,7 +24,12 @@
     miner_data_fs_gb: 800
     miner_data_fs_mount: /
   tasks:
-    - name: The fleet group_vars carry no placeholder
+    # The published group_vars carry `<VALI_LIFECYCLE_URL>` on purpose
+    # (the next task proves it is refused); this one checks the template
+    # with that value filled in, as a deployer's host_vars would.
+    - name: The group_vars with the deployer's values carry no placeholder
+      vars:
+        miner_vali_lifecycle_url: "https://vali.example:8446"
       block:
         - name: Run the placeholder check on the group_vars as they are
           ansible.builtin.import_tasks: ../playbooks/miner-tasks/placeholder-check.yml
