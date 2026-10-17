@@ -631,6 +631,16 @@ async fn handle_stopped(vm_id: &VmId, domain_name: &str, ctx: &WatchCtx<'_>) {
         );
         return;
     }
+    // A live storage move: its copy died with QEMU (abort — the domain
+    // starts on its source), or it pivoted (redefine first — never start
+    // the stale source). `Err`: not started.
+    if let Err(err) = lifecycle.settle_move_before_restart(vm_id).await {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} not restarted: storage move {err}",
+            vm_id.as_str()
+        );
+        return;
+    }
     match control.start(domain_name).await {
         Ok(()) => {
             eprintln!(

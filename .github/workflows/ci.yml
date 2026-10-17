@@ -131,8 +131,9 @@ jobs:
       # host preflight (play 00) — its verdict filter (stdlib), then its
       # tasks file against canned probe output — and play 04's NetBird
       # mesh-IP capture against canned `netbird status` / `ip addr`
-      # output (set_fact/debug/assert only), plus the play's syntax.
-      - name: ansible miner play (preflight, NetBird mesh IP)
+      # output (set_fact/debug/assert only), play 05's registration JSON
+      # after play 00 and its placeholder refusal, plus the play's syntax.
+      - name: ansible miner play (preflight, NetBird mesh IP, registration JSON, placeholders)
         working-directory: deploy/ansible
         env:
           ANSIBLE_STDOUT_CALLBACK: default
@@ -144,6 +145,8 @@ jobs:
           /tmp/ansible-venv/bin/ansible-galaxy collection install -r requirements.yml
           /tmp/ansible-venv/bin/ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --syntax-check
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/preflight_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/registration_output_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/placeholder_check_wiring.yml
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_wiring.yml
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_check_mode.yml --check
       # Miner-agent auto-update: the updater against a mocked GitHub API,

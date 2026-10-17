@@ -335,7 +335,10 @@ pub enum MinerAgentError {
     /// `&'static str`): `encode` (canonical-CBOR of the request/envelope
     /// failed), `runtime` (tokio runtime build failed), `client` (the
     /// `reqwest` client could not be built / the POST failed to send),
-    /// `rejected` (vali answered a non-2xx status).
+    /// `rejected` (vali answered a non-2xx status), `miner-id-missing` /
+    /// `edge-url-missing` (no flag and no config to read it from),
+    /// `client-cert-key-pair` (only one of `--client-cert` /
+    /// `--client-key`).
     #[error("graceful-exit/{0}")]
     GracefulExit(&'static str),
 
@@ -416,6 +419,12 @@ pub enum MinerAgentError {
     /// VM. Same sub-classifiers.
     #[error("relaunch-disks-unreadable/{0}")]
     RelaunchDisksUnreadable(&'static str),
+
+    /// A live storage move ([`crate::lifecycle::storage_move`]) refused or
+    /// failed, by its closed code (`move-busy`, `move-pool-unknown`,
+    /// `vm-storage-move-in-progress`, …).
+    #[error("{0}")]
+    StorageMove(&'static str),
 
     /// A VM's per-VM pool record ([`crate::lifecycle::vm_pool`]) is not
     /// usable: `missing` (the VM has run here but has no record, after the

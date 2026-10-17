@@ -676,3 +676,88 @@ class MinerStorageConfigAudit(models.Model):
 
     def __str__(self) -> str:
         return f"MinerStorageConfigAudit {self.miner_node_id[:12]} r{self.revision} {self.action}"
+
+
+class StorageMoveState(models.TextChoices):
+    """vali's side of a live storage move (`apps.disktier.storage_move`)."""
+
+    #: Accepted; `start` not acknowledged by the agent yet.
+    REQUESTED = "requested", "requested"
+    #: The agent copies / pivots.
+    MOVING = "moving", "moving"
+    #: The agent redefined the VM onto the target: vali waits for a served
+    #: receipt from the guest before it releases the source.
+    VERIFYING = "verifying", "verifying"
+    #: Verified: `release` sent until the agent reports `done`.
+    RELEASING = "releasing", "releasing"
+    DONE = "done", "done"
+    #: The agent aborted (the VM stays on its source) or refused the start.
+    ABORTED = "aborted", "aborted"
+    #: A failure an operator must look at (`code`): a verification timeout
+    #: (the agent keeps the source), a pivot of unknown outcome.
+    FAILED = "failed", "failed"
+
+
+TERMINAL_MOVE_STATES = (StorageMoveState.DONE, StorageMoveState.ABORTED, StorageMoveState.FAILED)
+
+
+class VmStorageMove(models.Model):
+    """One live storage move of a VM's OS disk to another pool of its host.
+    `id` is the `move_id` the agent journals it under (32 hex chars on the
+    wire)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    vm = models.ForeignKey(Vm, on_delete=models.CASCADE, related_name="storage_moves")
+    miner_node_id = models.CharField(max_length=64)
+    miner_id = models.CharField(max_length=256)
+    source_pool = models.CharField(max_length=POOL_ID_MAX_LEN)
+    target_pool = models.CharField(max_length=POOL_ID_MAX_LEN)
+    bandwidth_mib_s = models.PositiveIntegerField()
+    state = models.CharField(
+        max_length=12, choices=StorageMoveState.choices, default=StorageMoveState.REQUESTED
+    )
+    #: The agent's last reported phase and code.
+    agent_phase = models.CharField(max_length=16, blank=True, default="")
+    code = models.CharField(max_length=48, blank=True, default="")
+    bytes_total = models.BigIntegerField(default=0)
+    bytes_done = models.BigIntegerField(default=0)
+    #: When vali first saw the agent report `redefined` (the VM runs and
+    #: boots from the target). A served receipt whose window ends after it
+    #: proves the guest still runs: then vali releases the source.
+    redefined_at = models.DateTimeField(null=True, blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    last_polled_at = models.DateTimeField(null=True, blank=True)
+    #: When the last `start` went out (recorded before it goes): a move
+    #: without one never reached the agent.
+    start_sent_at = models.DateTimeField(null=True, blank=True)
+    #: When vali first saw the VM bound and hosted elsewhere: from then on
+    #: the move never holds the VM, books nothing and releases nothing.
+    left_host_at = models.DateTimeField(null=True, blank=True)
+    #: Orders in a row the agent did not answer (backoff).
+    failures = models.PositiveSmallIntegerField(default=0)
+    last_error = models.CharField(max_length=256, blank=True, default="")
+    requested_by_principal = models.CharField(max_length=128, blank=True, default="")
+    requested_by_family = models.CharField(max_length=64, blank=True, default="")
+    requested_by_user = models.CharField(max_length=128, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # One move in flight per VM.
+            models.UniqueConstraint(
+                fields=["vm"],
+                condition=~Q(state__in=["done", "aborted", "failed"]),
+                name="disktier_one_live_storage_move_per_vm",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"VmStorageMove {self.vm_id} {self.source_pool}->{self.target_pool} {self.state}"
+
+    @property
+    def move_id(self) -> str:
+        return self.id.hex

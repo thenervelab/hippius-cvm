@@ -886,3 +886,202 @@ def test_the_former_familys_accepted_document_neither_binds_nor_leaks(
     storage_config._push(MinerIdentity.objects.get(miner_id="miner-01"), old, now=timezone.now())
     row = _row()
     assert row.acked_body == {} and row.acked_revision == 1  # unchanged from before
+
+
+# ─── a pool leaves only once drained (`pool-not-drained`) ────────────
+
+
+def _in_force(doc: dict[str, Any]) -> MinerStorageConfig:
+    """Stage `doc` and make it the document the agent runs."""
+    row = _stage(doc)
+    MinerStorageConfig.objects.filter(pk=row.pk).update(
+        acked_revision=row.revision, acked_body=doc, reported_revision=row.revision
+    )
+    return _row()
+
+
+def _reports(pool_id: str, **fields: Any) -> MinerStoragePool:
+    fields.setdefault("reported_state", "active")
+    fields.setdefault("committed_gb", 0)
+    return MinerStoragePool.objects.create(miner_node_id=NODE, pool_id=pool_id, **fields)
+
+
+def _refused(doc: dict[str, Any]) -> str:
+    with pytest.raises(storage_config.PoolNotDrained) as exc:
+        _stage(doc)
+    return exc.value.pool
+
+
+def test_a_document_cannot_drop_a_pool_the_agent_runs_from_its_local_config() -> None:
+    # A node before any push: nvme0 declared locally, reported v7.
+    _reports("default")
+    _reports("nvme0")
+    assert _refused(_doc()) == "nvme0"
+    assert not MinerStorageConfig.objects.filter(miner_node_id=NODE, revision__gt=0).exists()
+    # Keeping it is fine.
+    _stage(_doc(_pool("nvme0")))
+
+
+def test_a_pool_in_force_leaves_only_drained_and_empty() -> None:
+    _reports("default")
+    nvme0 = _reports("nvme0", committed_gb=40)
+    _in_force(_doc(_pool("nvme0")))
+    assert _refused(_doc()) == "nvme0", "active in force"
+    _in_force(_doc(_pool("nvme0", state="draining")))
+    MinerStoragePool.objects.filter(pk=nvme0.pk).update(reported_state="draining")
+    assert _refused(_doc()) == "nvme0", "draining but still holds disks"
+    MinerStoragePool.objects.filter(pk=nvme0.pk).update(committed_gb=0)
+    row = _stage(_doc())
+    assert [p["id"] for p in row.body["pools"]] == ["default"]
+
+
+def test_a_draining_pool_no_longer_reported_can_leave() -> None:
+    _reports("default")
+    _in_force(_doc(_pool("hdd0", state="draining")))
+    _stage(_doc())
+
+
+def test_only_the_set_in_force_binds() -> None:
+    # Desired but never applied: removing it removes nothing on the host.
+    _reports("default")
+    _stage(_doc(_pool("hdd0")))
+    _stage(_doc())
+    # Draining in the desired document only (not yet in force) is not drained.
+    _reports("nvme0")
+    _in_force(_doc(_pool("nvme0")))
+    _stage(_doc(_pool("nvme0", state="draining")))
+    assert _refused(_doc()) == "nvme0"
+
+
+def test_every_write_path_is_guarded_adopt_included() -> None:
+    _reports("default", budget_gb=3000, declared_class="nvme", reported_at=timezone.now())
+    _reports("nvme0", budget_gb=500, declared_class="hdd", reported_at=timezone.now())
+    _in_force(_doc(_pool("nvme0")))
+
+    def drop(doc: dict[str, Any]) -> dict[str, Any]:
+        doc["pools"] = [p for p in doc["pools"] if p["id"] != "nvme0"]
+        return doc
+
+    with pytest.raises(storage_config.PoolNotDrained):
+        storage_config.edit(NODE, drop, actor=ACTOR, action="pool-update")
+    # An adopt that would drop it (the report lost it) is refused too.
+    MinerStoragePool.objects.filter(miner_node_id=NODE, pool_id="nvme0").update(
+        retired_at=timezone.now()
+    )
+    with pytest.raises(storage_config.PoolNotDrained) as exc:
+        storage_config.adopt(
+            NODE, {"default": {"path": "/var/lib/hippius-miner"}}, actor=ACTOR, force=True
+        )
+    assert (exc.value.pool, exc.value.field) == ("nvme0", "removed")
+
+
+def test_moving_or_re_classing_a_pool_in_force_needs_a_drain() -> None:
+    _reports("default")
+    _reports("nvme0")
+    _in_force(_doc(_pool("nvme0")))
+    for change, field in (({"path": "/srv/elsewhere"}, "path"), ({"class": "ssd"}, "class")):
+        with pytest.raises(storage_config.PoolNotDrained) as exc:
+            _stage(_doc(_pool("nvme0", **change)))
+        assert (exc.value.pool, exc.value.field) == ("nvme0", field)
+    # Other fields are free.
+    _stage(_doc(_pool("nvme0", budget_gb=400)))
+
+
+def test_a_vm_disk_placed_on_a_pool_keeps_it_from_leaving() -> None:
+    from apps.disktier.models import OS_SLOT, PlacementDisk
+    from apps.orchestration.tests.factories import make_vm
+    from apps.scheduler.models import PlacementStatus
+    from apps.scheduler.tests.factories import make_placement
+
+    _reports("default")
+    _reports("hdd0", reported_state="draining", committed_gb=0)
+    _in_force(_doc(_pool("hdd0", state="draining")))
+    placement = make_placement(
+        make_vm("vm-on-hdd0"), NODE, status=PlacementStatus.BOUND.value, resource_class="small"
+    )
+    PlacementDisk.objects.create(
+        placement=placement,
+        slot=OS_SLOT,
+        kind="pool",
+        pool_id="hdd0",
+        size_gb=50,
+        required_tier="nvme",
+    )
+    assert _refused(_doc()) == "hdd0"
+    placement.status = PlacementStatus.MIGRATED.value
+    placement.reason = "moved"
+    placement.save(update_fields=["status", "reason"])
+    _stage(_doc())
+
+
+def test_a_new_family_is_held_to_the_set_the_node_runs() -> None:
+    _reports("default")
+    _reports("nvme0")
+    _in_force(_doc(_pool("nvme0")))
+    other = Actor(
+        principal="backend-operator-config", family="5Fb", user="7", account=FAMILY_B.hex()
+    )
+    with pytest.raises(storage_config.PoolNotDrained):
+        storage_config.stage(NODE, _doc(), actor=other, action="put")
+
+
+@pytest.mark.usefixtures("push_on")
+def test_a_document_staged_before_the_guard_is_not_pushed(agent: FakeAgent) -> None:
+    _miner()
+    _reports("default")
+    _reports("nvme0")
+    # Written straight to the row, as a pre-guard staging would have been.
+    _stage(_doc(_pool("nvme0")))
+    MinerStorageConfig.objects.filter(miner_node_id=NODE).update(body=_doc(), content_key="")
+    assert storage_config.sync_node(NODE, force=True) == "pool-not-drained:nvme0"
+    assert agent.sent == []
+
+
+def test_a_pool_reported_with_an_out_of_range_committed_is_not_empty() -> None:
+    # `None` is a figure past the decoder's range, never "nothing".
+    _reports("default")
+    _reports("hdd0", reported_state="draining", committed_gb=None)
+    _in_force(_doc(_pool("hdd0", state="draining")))
+    assert _refused(_doc()) == "hdd0"
+
+
+@pytest.mark.usefixtures("push_on")
+def test_vali_keeps_a_drained_pool_while_a_vm_disk_is_placed_on_it(
+    agent: FakeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.disktier.models import OS_SLOT, PlacementDisk
+    from apps.orchestration.tests.factories import make_vm
+    from apps.scheduler.models import PlacementStatus
+    from apps.scheduler.tests.factories import make_placement
+
+    _miner()
+    _stage(_doc(_pool("hdd0", state="draining")))
+    storage_config.reconcile()
+    acked = _row().acked_at
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="hdd0", reported_state="draining", committed_gb=0
+    )
+    # A queued launch on it: its disk is not created yet.
+    placement = make_placement(make_vm("vm-queued"), NODE, resource_class="small")
+    assert placement.status == PlacementStatus.PENDING.value
+    PlacementDisk.objects.create(
+        placement=placement,
+        slot=OS_SLOT,
+        kind="pool",
+        pool_id="hdd0",
+        size_gb=50,
+        required_tier="nvme",
+    )
+    _heartbeat(1, at=acked + timedelta(seconds=5))
+    late = timezone.now() + timedelta(seconds=settings.VALI_STORAGE_CONFIG_SYNC_S + 1)
+    warned: list[str] = []
+    monkeypatch.setattr(storage_config.log, "warning", lambda msg, *a: warned.append(msg % a))
+    storage_config.reconcile(now=late)
+    assert [p["id"] for p in _row().body["pools"]] == ["default", "hdd0"]
+    # Not even attempted (the guard would refuse it, every tick).
+    assert not [w for w in warned if "drained-pool removal refused" in w]
+    # The launch's placement ends: the next pass removes it.
+    PlacementDisk.objects.filter(placement=placement).delete()
+    _heartbeat(1, at=late + timedelta(seconds=5))
+    storage_config.reconcile(now=late + timedelta(seconds=10))
+    assert [p["id"] for p in _row().body["pools"]] == ["default"]

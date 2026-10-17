@@ -1,0 +1,74 @@
+---
+# The registration values play 05 hands the operator — tasks file
+# imported by miner-agent-install.yml right after it reads the CHIP_ID,
+# and by tests/registration_output_wiring.yml with canned values.
+#
+# Inputs: `miner_agent_miner_id`, `miner_identity_init` (the
+# `--print-pubkey` result), `miner_platform_id` (the `platform-id`
+# result), `miner_netbird_ip` (play 04) and `miner_pf` (play 00's
+# preflight verdict).
+
+- name: Collect the registration values
+  # `snp_generation` is the one play 00 derived from the CPU
+  # (filter_plugins/host_preflight.py `epyc_snp_generation`), never a
+  # host_vars value alone: when host_vars sets it, play 00 refuses a value
+  # that disagrees with the CPU, so the two only differ when play 00 did
+  # not run in this invocation. Then it is left empty and the JSON below
+  # is withheld: vali reads an empty generation as unset and infers it
+  # from the CHIP_ID length, which registers a Milan host as Genoa and
+  # fails every launch.
+  ansible.builtin.set_fact:
+    miner_registration:
+      miner_id: "{{ miner_agent_miner_id }}"
+      node_id: "{{ miner_identity_init.stdout }}"
+      platform_id: "{{ miner_platform_id.stdout }}"
+      netbird_ip: "{{ miner_netbird_ip | default('') }}"
+      snp_generation: "{{ miner_pf.snp_generation | default('', true) }}"
+
+- name: "OPERATOR ACTION — register this miner with vali"
+  # `--print-pubkey` prints ONLY the 64-hex public key to stdout (the
+  # agent's info lines go to stderr). The private key is never printed.
+  # `platform-id` prints the real CHIP_ID — NO placeholder to
+  # hand-fill. node_id == the identity pubkey (the on-chain register_child
+  # node_id), so chain_node_id is the same value.
+  ansible.builtin.debug:
+    msg: |
+      ============================================================
+      MINER REGISTRATION — record with vali's admin API
+      (POST /v1/admin/miner/register), all fields REAL (no placeholders):
+
+        miner_id:       "{{ miner_registration.miner_id }}"
+        pubkey:         "{{ miner_registration.node_id }}"
+        chain_node_id:  "{{ miner_registration.node_id }}"
+        platform_id:    "{{ miner_registration.platform_id }}"   # real CHIP_ID
+        netbird_ip:     "{{ miner_registration.netbird_ip or '<run netbird-agent first>' }}"
+        snp_generation: "{{ miner_registration.snp_generation or '<run play 00 in the same invocation>' }}"
+
+      Also register the node_id on-chain via deploy/register-miner/
+      (register_child + the agent's sign-registration node_sig).
+
+      Until the identity is registered, vali rejects this miner's
+      telemetry as an unknown source, and the scheduler will not place
+      VMs on it (the dispatchability gate requires a complete identity).
+      ============================================================
+
+- name: "OPERATOR ACTION — the same block as ONE JSON (paste into the console)"
+  # The console's compute-miner onboarding (Dashboard → Compute miners →
+  # Continue setup) takes this object as-is, then the JSON printed by
+  # `hippius-miner-agent sign-registration --family 0x… --child 0x… --nonce N`
+  # (the family/child hex the console showed at preparation). Same values
+  # as above; a second rendering so nothing is re-typed by hand.
+  ansible.builtin.debug:
+    msg: "{{ miner_registration | to_json }}"
+  register: miner_registration_json
+  when: miner_registration.snp_generation | length > 0
+
+- name: Warn that the registration JSON was withheld
+  ansible.builtin.debug:
+    msg: >-
+      WARN [SNP_GENERATION_NOT_DERIVED] play 00 (preflight) did not run in
+      this invocation, so the processor generation is unknown and the
+      registration JSON is withheld -- fix: run the full play (no --tags
+      that leaves out preflight, no --skip-tags preflight, no
+      --start-at-task past play 00).
+  when: miner_registration.snp_generation | length == 0

@@ -256,6 +256,7 @@ fn build(args: &EncodeOrderArgs, payload_json: &[u8]) -> Result<Vec<u8>, &'stati
         "net-policy" => build_net_policy(payload_obj)?,
         "power-policy" => build_power_policy(payload_obj)?,
         "storage-config" => build_storage_config(payload_obj)?,
+        "move-vm-storage" => build_move_vm_storage(payload_obj)?,
         _ => return Err("bad-kind"),
     };
 
@@ -458,6 +459,88 @@ fn build_power_policy(obj: &serde_json::Map<String, Json>) -> Result<Value, &'st
         ),
         (Value::Text("vm_id".into()), Value::Text(vm_id)),
     ]))
+}
+
+/// Bounds of a live storage move's copy bandwidth (MiB/s), as the
+/// miner-agent's `MoveVmStorageOrder::bandwidth_mib_s`.
+const MOVE_BANDWIDTH_MIB_S: std::ops::RangeInclusive<u64> = 10..=1000;
+
+/// `kind=move-vm-storage` (the disk-tier live storage move). Mirrors the miner-agent's
+/// `MoveVmStorageOrder`: `vm_id`, `move_id` (32 lower-case hex), `action`
+/// (`start` | `cancel` | `status` | `release`), `not_after_unix`; on `start` only —
+/// and then all required — `target_pool`, `expected_source_pool` (pool
+/// ids) and `bandwidth_mib_s` (`10..=1000`). Any other key, or a `start`
+/// key on another action, is refused: this bridge copies only what it
+/// lists.
+fn build_move_vm_storage(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static str> {
+    const KEYS: [&str; 7] = [
+        "vm_id",
+        "move_id",
+        "action",
+        "target_pool",
+        "expected_source_pool",
+        "bandwidth_mib_s",
+        "not_after_unix",
+    ];
+    if obj.keys().any(|k| !KEYS.contains(&k.as_str())) {
+        return Err("move-unknown-field");
+    }
+    let vm_id = string_field(obj, "vm_id")?;
+    let move_id = string_field(obj, "move_id")?;
+    if move_id.len() != 32
+        || !move_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("bad-move-id");
+    }
+    let action = match obj.get("action").and_then(Json::as_str) {
+        Some(a @ ("start" | "cancel" | "status" | "release")) => a,
+        _ => return Err("bad-move-action"),
+    };
+    let not_after = obj
+        .get("not_after_unix")
+        .and_then(Json::as_u64)
+        .ok_or("bad-not-after-unix")?;
+    let mut entries = vec![
+        (Value::Text("action".into()), Value::Text(action.into())),
+        (Value::Text("move_id".into()), Value::Text(move_id)),
+        (
+            Value::Text("not_after_unix".into()),
+            Value::Integer(not_after.into()),
+        ),
+        (Value::Text("vm_id".into()), Value::Text(vm_id)),
+    ];
+    let start_keys = ["target_pool", "expected_source_pool", "bandwidth_mib_s"];
+    if action != "start" {
+        if start_keys
+            .iter()
+            .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
+        {
+            return Err("move-start-field-on-other-action");
+        }
+        return Ok(Value::Map(entries));
+    }
+    for key in ["target_pool", "expected_source_pool"] {
+        let pool = obj.get(key).and_then(Json::as_str).ok_or("bad-move-pool")?;
+        if !hippius_types::storage_report::is_valid_pool_id(pool) {
+            return Err("bad-move-pool");
+        }
+        entries.push((Value::Text(key.into()), Value::Text(pool.into())));
+    }
+    if obj.get("target_pool") == obj.get("expected_source_pool") {
+        return Err("move-same-pool");
+    }
+    let bandwidth = obj
+        .get("bandwidth_mib_s")
+        .and_then(Json::as_u64)
+        .filter(|b| MOVE_BANDWIDTH_MIB_S.contains(b))
+        .ok_or("bad-move-bandwidth")?;
+    entries.push((
+        Value::Text("bandwidth_mib_s".into()),
+        Value::Integer(bandwidth.into()),
+    ));
+    Ok(Value::Map(entries))
 }
 
 /// Highest cap the miner-agent accepts (`netpolicy::MAX_VM_CAP_MBPS`).
@@ -3800,6 +3883,112 @@ mod tests {
             }),
             "net-policy-bad-uint"
         );
+    }
+
+    fn move_vector() -> Json {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/move_vm_storage_v1.json"
+        );
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn move_build(payload: &Json) -> Result<Vec<u8>, &'static str> {
+        let v = move_vector();
+        build(
+            &EncodeOrderArgs {
+                order_id: v["order_id"].as_str().unwrap().to_string(),
+                kind: "move-vm-storage".to_string(),
+                target_miner_id: v["target_miner_id"].as_str().unwrap().to_string(),
+                issued_at_unix: v["issued_at_unix"].as_u64().unwrap(),
+            },
+            &serde_json::to_vec(payload).unwrap(),
+        )
+    }
+
+    /// The shared vectors the edge-gateway and miner-agent tests consume.
+    #[test]
+    fn move_vm_storage_matches_the_shared_vectors() {
+        for case in move_vector()["cases"].as_array().unwrap() {
+            let body = move_build(&case["payload"]).unwrap();
+            assert_canonical(&body).unwrap();
+            assert_eq!(
+                hex::encode(&body),
+                case["body_hex"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn move_vm_storage_refuses_what_it_does_not_list() {
+        let start = move_vector()["cases"][0]["payload"].clone();
+        let status = move_vector()["cases"][1]["payload"].clone();
+        let with = |base: &Json, key: &str, value: Json| {
+            let mut p = base.clone();
+            p[key] = value;
+            move_build(&p).unwrap_err()
+        };
+        let without = |base: &Json, key: &str| {
+            let mut p = base.clone();
+            p.as_object_mut().unwrap().remove(key);
+            move_build(&p).unwrap_err()
+        };
+        assert_eq!(
+            with(&start, "extra", Json::Bool(true)),
+            "move-unknown-field"
+        );
+        assert_eq!(with(&start, "move_id", "ABC".into()), "bad-move-id");
+        assert_eq!(
+            with(&start, "move_id", "g".repeat(32).into()),
+            "bad-move-id"
+        );
+        assert_eq!(
+            with(&start, "move_id", "0123456789ABCDEF".repeat(2).into()),
+            "bad-move-id"
+        );
+        assert_eq!(
+            with(&start, "target_pool", "a".repeat(33).into()),
+            "bad-move-pool"
+        );
+        assert_eq!(with(&start, "target_pool", "".into()), "bad-move-pool");
+        assert_eq!(
+            with(&start, "target_pool", "default".into()),
+            "move-same-pool"
+        );
+        assert_eq!(without(&start, "bandwidth_mib_s"), "bad-move-bandwidth");
+        let cancel = move_vector()["cases"][2]["payload"].clone();
+        assert_eq!(
+            with(&cancel, "bandwidth_mib_s", 100.into()),
+            "move-start-field-on-other-action"
+        );
+        // A null start field on another action is no field.
+        let mut p = status.clone();
+        p["target_pool"] = Json::Null;
+        move_build(&p).unwrap();
+        assert_eq!(with(&start, "action", "pause".into()), "bad-move-action");
+        assert_eq!(with(&start, "target_pool", "NVMe".into()), "bad-move-pool");
+        assert_eq!(without(&start, "expected_source_pool"), "bad-move-pool");
+        assert_eq!(
+            with(&start, "bandwidth_mib_s", 9.into()),
+            "bad-move-bandwidth"
+        );
+        assert_eq!(
+            with(&start, "bandwidth_mib_s", 1001.into()),
+            "bad-move-bandwidth"
+        );
+        assert_eq!(without(&start, "not_after_unix"), "bad-not-after-unix");
+        assert_eq!(
+            with(&status, "target_pool", "nvme0".into()),
+            "move-start-field-on-other-action"
+        );
+        // Bounds are inclusive.
+        let mut p = start.clone();
+        p["bandwidth_mib_s"] = 10.into();
+        move_build(&p).unwrap();
+        p["bandwidth_mib_s"] = 1000.into();
+        move_build(&p).unwrap();
     }
 
     fn storage_config_vector() -> Json {

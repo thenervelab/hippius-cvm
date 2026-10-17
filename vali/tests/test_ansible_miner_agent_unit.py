@@ -117,3 +117,43 @@ def test_storage_pools_are_bind_mounted_durably_under_the_pools_root() -> None:
     assert mount["state"] == "mounted"
     names = [t.get("name") for t in tasks]
     assert names.index(bind["name"]) < names.index("Render the miner-agent config")
+
+
+def test_the_play_builds_from_source_only_when_asked() -> None:
+    """A missing or foreign binary stops play 05 with the release install
+    steps (fail-closed) unless the host opts in to the source build: the
+    published group_vars cannot clone a repository only we can read."""
+    group_vars = yaml.safe_load((REPO / "deploy/ansible/group_vars/miner_nodes.yml").read_text())
+    assert group_vars["miner_agent_build_from_source"] is False
+    tasks = yaml.safe_load(TASKS.read_text())
+    names = [t.get("name") for t in tasks]
+    gate = "Refuse to build the miner-agent from source unless asked to"
+    (task,) = [t for t in tasks if t.get("name") == gate]
+    assert task["ansible.builtin.assert"]["that"] == [
+        "not (miner_agent_build_needed | bool) or (miner_agent_build_from_source | bool)"
+    ]
+    builds = [i for i, t in enumerate(tasks) if t.get("when") == "miner_agent_build_needed | bool"]
+    assert builds and names.index(gate) < min(builds)
+
+
+def test_placeholders_are_refused_before_the_config_is_rendered() -> None:
+    tasks = yaml.safe_load(TASKS.read_text())
+    names = [t.get("name") for t in tasks]
+    check = "Refuse an unfilled placeholder before rendering the config"
+    (task,) = [t for t in tasks if t.get("name") == check]
+    assert task["ansible.builtin.import_tasks"] == "placeholder-check.yml"
+    assert names.index(check) < names.index("Render the miner-agent config")
+
+
+def test_the_play_expects_the_crate_version_the_releases_report() -> None:
+    """Play 05 refuses a binary whose `--version` lacks `versions.miner_agent`
+    (no silent rebuild any more), so a crate bump without the group_vars one
+    would stop every re-run on an up-to-date host."""
+    group_vars = yaml.safe_load((REPO / "deploy/ansible/group_vars/miner_nodes.yml").read_text())
+    cargo = (REPO / "binaries/miner-agent/Cargo.toml").read_text()
+    (crate_version,) = [
+        line.split("=", 1)[1].strip().strip('"')
+        for line in cargo.split("[package]", 1)[1].split("\n[", 1)[0].splitlines()
+        if line.startswith("version")
+    ]
+    assert group_vars["versions"]["miner_agent"] == crate_version

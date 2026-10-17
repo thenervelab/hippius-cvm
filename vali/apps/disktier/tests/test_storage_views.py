@@ -228,6 +228,32 @@ def test_put_stages_and_get_reads_it_back(owned: dict[str, Any], writer_client: 
     ]
 
 
+def test_put_refuses_to_drop_a_pool_that_is_not_drained(
+    owned: dict[str, Any], writer_client: APIClient
+) -> None:
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="hdd0", reported_state="active", committed_gb=0
+    )
+    response = _put(writer_client, _doc())
+    assert response.status_code == 409
+    assert response.json()["code"] == "pool-not-drained"
+    assert (response.json()["pool"], response.json()["field"]) == ("hdd0", "removed")
+    assert _put(writer_client, _doc(_pool("hdd0"))).status_code == 202
+
+
+def test_validate_refuses_to_drop_a_pool_that_is_not_drained(
+    owned: dict[str, Any], writer_client: APIClient
+) -> None:
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="hdd0", reported_state="active", committed_gb=0
+    )
+    response = writer_client.post(
+        _url("operator_storage_validate"), _doc(), format="json", **HEADERS
+    )
+    assert response.status_code == 409
+    assert (response.json()["code"], response.json()["pool"]) == ("pool-not-drained", "hdd0")
+
+
 def test_put_checks_if_match(owned: dict[str, Any], writer_client: APIClient) -> None:
     assert _put(writer_client, _doc(), HTTP_IF_MATCH='"0"').status_code == 202
     response = _put(writer_client, _doc(_pool("a")), HTTP_IF_MATCH="0")

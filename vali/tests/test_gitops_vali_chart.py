@@ -763,6 +763,20 @@ def test_storage_config_push_is_one_shared_value_and_renders_only_when_set() -> 
 
 
 @_needs_helm
+def test_pool_routing_min_agent_version_is_one_shared_value() -> None:
+    """Every process that builds a launch order (web, launch tick,
+    orchestration tick for §25) judges `os_pool` support the same way: one
+    ConfigMap key, never a per-pod override. Unset, it renders empty and
+    no miner qualifies."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_POOL_ROUTING_MIN_AGENT_VERSION"] == "v2026.10.16.2"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_POOL_ROUTING_MIN_AGENT_VERSION" not in env, label
+    off = _configmap_data(_docs("--set", "scheduler.poolRoutingMinAgentVersion="))
+    assert off["VALI_POOL_ROUTING_MIN_AGENT_VERSION"] == ""
+
+
+@_needs_helm
 def test_net_policy_push_off_renders_no_miner_list() -> None:
     tick = _env_by_workload(_docs("--set", "orchestrationTick.netPolicy.push=false"))[
         "Deployment/vali-orchestration-tick"

@@ -331,7 +331,7 @@ pub(crate) fn interface_taps(xml: &str) -> Vec<(String, String)> {
 /// / `vdc` are the read-only dm-verity base, `vdd` the state disk and
 /// `vde` the legacy data disk, so anchoring on `vda` is what identifies
 /// the volume §24 reclaims.
-fn writable_disk_path(xml: &str) -> Option<PathBuf> {
+pub(crate) fn writable_disk_path(xml: &str) -> Option<PathBuf> {
     for block in sections(xml, "disk") {
         let is_vda = tag_attrs(&block, "target")
             .and_then(|a| attr(&a, "dev"))

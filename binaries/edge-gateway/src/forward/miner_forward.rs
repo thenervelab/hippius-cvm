@@ -212,6 +212,10 @@ pub enum OrderKind {
     /// no VM; the miner answers `applied:<revision>:<sha256>` (or
     /// `dry-run-ok:…`), or 422 with a closed refusal code.
     StorageConfig,
+    /// Move a running VM's OS disk to another storage pool of the same
+    /// host, live (`start` | `cancel` | `status` | `release`); the miner answers the
+    /// move's phase and progress, or a closed refusal code.
+    MoveVmStorage,
 }
 
 impl OrderKind {
@@ -235,6 +239,7 @@ impl OrderKind {
             OrderKind::NetPolicy => "net-policy",
             OrderKind::PowerPolicy => "power-policy",
             OrderKind::StorageConfig => "storage-config",
+            OrderKind::MoveVmStorage => "move-vm-storage",
         }
     }
 
@@ -283,6 +288,8 @@ impl OrderKind {
             "power-policy" => Some(OrderKind::PowerPolicy),
             // vali's storage-config reconcile (dashboard-managed pools).
             "storage-config" => Some(OrderKind::StorageConfig),
+            // vali's live storage move driver (disk-tier live storage move).
+            "move-vm-storage" => Some(OrderKind::MoveVmStorage),
             _ => None,
         }
     }
@@ -1007,6 +1014,12 @@ mod tests {
             OrderKind::StorageConfig.max_order_body(),
             MAX_MINER_ORDER_BODY
         );
+        // Must match the miner-agent's `/v1/miner/order/move-vm-storage`.
+        assert_eq!(OrderKind::MoveVmStorage.route_segment(), "move-vm-storage");
+        assert_eq!(
+            OrderKind::MoveVmStorage.max_order_body(),
+            MAX_MINER_ORDER_BODY
+        );
     }
 
     #[test]
@@ -1025,6 +1038,7 @@ mod tests {
             ("net-policy", OrderKind::NetPolicy),
             ("power-policy", OrderKind::PowerPolicy),
             ("storage-config", OrderKind::StorageConfig),
+            ("move-vm-storage", OrderKind::MoveVmStorage),
         ] {
             assert_eq!(OrderKind::from_header(text), Some(expected));
         }

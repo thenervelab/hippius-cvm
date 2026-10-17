@@ -162,6 +162,9 @@ fn reject_dispatch_with_log<L: FnOnce(String)>(
         MinerAgentError::NotYetWired => {
             OrderRejection::new(StatusCode::NOT_IMPLEMENTED, "not-yet-wired")
         }
+        // A live storage move holds the VM (`vm-storage-move-in-progress`,
+        // 409: retry once it settles), or refused / failed.
+        MinerAgentError::StorageMove(code) => OrderRejection::new(move_refusal_status(code), code),
         // A relaunch found none of the VM's disks to reuse — this host
         // does not hold the VM. Its own class (vali must stop relaunching
         // here and escalate, not retry), and a detail line naming WHICH
@@ -452,6 +455,79 @@ pub async fn handle_power_policy(
     }
 }
 
+/// Dispatch a `move-vm-storage` order (the live storage move,
+/// [`crate::lifecycle::storage_move`]): 200 with the move's status as JSON,
+/// or its refusal code. A start is refused while the VM is backed up or
+/// migrated.
+pub async fn handle_move_vm_storage(
+    lifecycle: &Arc<CvmLifecycle>,
+    migration: &MigrationStore,
+    backup: Option<&crate::backup::BackupManager>,
+    order: crate::orders::MoveVmStorageOrder,
+) -> std::result::Result<String, OrderRejection> {
+    // A re-sent start of a move that did start answers its journal: the
+    // conflicts below are for a new move only.
+    if order.action == crate::orders::MoveAction::Start
+        && !lifecycle.is_journaled_move(&order.vm_id, &order.move_id)
+    {
+        if migration.phase(&order.vm_id).is_some_and(|p| {
+            !matches!(
+                p,
+                super::migration::MigrationPhase::Activated
+                    | super::migration::MigrationPhase::Failed
+            )
+        }) {
+            return Err(OrderRejection::new(
+                StatusCode::CONFLICT,
+                "move-conflict-migration",
+            ));
+        }
+        if backup
+            .and_then(|b| b.status(&order.vm_id))
+            .is_some_and(|run| run.status == crate::backup::RunPhase::Running)
+        {
+            return Err(OrderRejection::new(
+                StatusCode::CONFLICT,
+                "move-conflict-backup",
+            ));
+        }
+    }
+    match lifecycle.storage_move(&order).await {
+        Ok(status) => serde_json::to_string(&status)
+            .map_err(|_| OrderRejection::new(StatusCode::INTERNAL_SERVER_ERROR, "move-status")),
+        Err(MinerAgentError::StorageMove(code)) => {
+            Err(OrderRejection::new(move_refusal_status(code), code))
+        }
+        Err(err) => Err(reject_dispatch(&err, order.vm_id.as_str())),
+    }
+}
+
+/// The HTTP status of a storage-move refusal code.
+pub fn move_refusal_status(code: &str) -> StatusCode {
+    match code {
+        "move-vm-not-found" | "move-not-found" => StatusCode::NOT_FOUND,
+        "move-not-golden"
+        | "move-domain-not-running"
+        | "move-pool-unknown"
+        | "move-pool-not-active"
+        | "move-pool-no-os-disks"
+        | "move-pool-unavailable"
+        | "move-pool-insufficient-space"
+        | "move-order-expired"
+        | "move-start-field-missing" => StatusCode::UNPROCESSABLE_ENTITY,
+        "move-busy"
+        | "move-same-pool"
+        | "move-source-mismatch"
+        | "move-dst-exists"
+        | "move-past-pivot"
+        | "move-not-releasable"
+        | "move-pivot-unknown"
+        | "move-release-in-use"
+        | "vm-storage-move-in-progress" => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Dispatch a `destroy` order (§24 decommission). The lifecycle's
 /// `destroy` is itself idempotent — a destroy of an already-gone CVM
 /// is a success no-op.
@@ -490,6 +566,11 @@ pub async fn handle_migrate_quiesce(
     order: MigrateQuiesceOrder,
 ) -> std::result::Result<String, OrderRejection> {
     let vm_id_str = order.vm_id.as_str().to_owned();
+    // A VM mid storage move migrates once it runs on the destination; the
+    // source is released first.
+    if let Err(err) = lifecycle.release_before_departure(&order.vm_id).await {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     // §25 M3 — derive the producer inputs (vali's nonce + source_gen) from
     // the order. `None` for an M1 caller ⇒ a plain clean stop.
     let ack_inputs = order.source_ack_inputs();
@@ -851,6 +932,10 @@ pub fn handle_backup(
     order: crate::orders::types::BackupOrder,
 ) -> std::result::Result<String, OrderRejection> {
     let req = order.into_request();
+    // A VM mid storage move is backed up once the move settles.
+    if let Err(err) = lifecycle.check_no_move(&req.vm_id) {
+        return Err(reject_dispatch(&err, req.vm_id.as_str()));
+    }
     match backup.begin(&req) {
         Ok(true) => {}
         Ok(false) => return Ok("backup-already-accepted".to_string()),

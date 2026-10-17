@@ -1,0 +1,104 @@
+---
+# Wiring test for miner-tasks/registration-output.yml: the real tasks
+# file, fed canned identity values, on localhost with no connection to
+# any host and no change to this machine (set_fact, debug, assert only).
+# The second case runs the real preflight tasks file first, as play 00
+# does before play 05 in one invocation.
+#
+# Run (from deploy/ansible):
+#   ANSIBLE_FILTER_PLUGINS=playbooks/filter_plugins \
+#     ansible-playbook -i localhost, -c local tests/registration_output_wiring.yml
+
+- name: Registration output wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+  vars:
+    miner_agent_miner_id: m-0123456789abcdef
+    miner_identity_init: { stdout: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+    miner_platform_id: { stdout: "{{ 'ab' * 64 }}" }
+    miner_netbird_ip: 100.64.12.34
+    # Play 00's inputs for an EPYC 7543 (family 25, model 1 = Milan).
+    ansible_architecture: x86_64
+    ansible_distribution: Ubuntu
+    ansible_distribution_version: "26.04"
+    ansible_kernel: 7.0.0-15-generic
+    ansible_processor_vcpus: 64
+    ansible_memtotal_mb: 256180
+    ansible_mounts:
+      - { mount: /, size_total: 858993459200, size_available: 751619276800 }
+    miner_pf_roots:
+      results:
+        - { stat: { exists: false } }
+        - { stat: { exists: false } }
+    miner_pf_netbird_mgmt: { status: 200 }
+    miner_host_probe:
+      stdout: |
+        cpu_vendor=AuthenticAMD
+        cpu_family=25
+        cpu_model=1
+        cpu_model_name=AMD EPYC 7543 32-Core Processor
+        flag_sev_snp=1
+        flag_hypervisor=0
+        virt=none
+        cmdline=BOOT_IMAGE=/vmlinuz ro kvm_amd.sev=1 kvm_amd.sev_es=1 kvm_amd.sev_snp=1 mem_encrypt=on
+        smt_control=notsupported
+        smt_active=0
+        cpus_online=0-63
+        cpus_present=0-63
+        cpus_possible=0-63
+        cpus_offline=
+        smt_off_unit=0
+        sev_snp_param=Y
+        dev_sev=1
+        sev_es_asids=99
+        snp_fw=1.58 build:3
+        iommu_units=8
+        ntp_synced=yes
+        netbird_installed=0
+  tasks:
+    # First, before any preflight fact exists in this run.
+    - name: Without play 00, the generation is left empty, never guessed
+      vars:
+        # A host_vars value alone is a declaration nobody checked.
+        snp_generation: genoa
+      block:
+        - name: Render the registration output without a preflight verdict
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/registration-output.yml
+
+    - name: Check the empty generation and the withheld JSON
+      ansible.builtin.assert:
+        that:
+          - miner_registration.snp_generation == ''
+          - miner_registration_json is skipped
+
+    - name: Play 00 then play 05 — the generation derived from the CPU
+      block:
+        - name: Run the preflight judgement (play 00)
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/host-preflight.yml
+        - name: Render the registration output (play 05)
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/registration-output.yml
+
+    - name: Check the JSON the console takes
+      ansible.builtin.assert:
+        that:
+          - miner_pf.summary.result == 'pass'
+          - registration_json == expected
+          # The exact line the console parses, key order included.
+          - miner_registration_json.msg == expected_line
+      vars:
+        expected_line: >-
+          {"miner_id": "m-0123456789abcdef",
+          "node_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "platform_id": "{{ 'ab' * 64 }}",
+          "netbird_ip": "100.64.12.34", "snp_generation": "milan"}
+        expected:
+          miner_id: m-0123456789abcdef
+          node_id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          platform_id: "{{ 'ab' * 64 }}"
+          netbird_ip: 100.64.12.34
+          snp_generation: milan
+        registration_json: "{{ miner_registration_json.msg | from_json }}"

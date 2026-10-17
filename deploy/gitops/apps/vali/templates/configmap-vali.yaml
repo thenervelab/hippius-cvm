@@ -363,6 +363,8 @@ data:
   VALI_SCHEDULER_MAX_FLAVOR: {{ .Values.scheduler.maxFlavor | quote }}
   # Guest-poweroff policy — see values.yaml `scheduler.powerPolicyMinAgentVersion`.
   VALI_POWER_POLICY_MIN_AGENT_VERSION: {{ .Values.scheduler.powerPolicyMinAgentVersion | quote }}
+  # Pool routing (os_pool) — see values.yaml `scheduler.poolRoutingMinAgentVersion`.
+  VALI_POOL_ROUTING_MIN_AGENT_VERSION: {{ .Values.scheduler.poolRoutingMinAgentVersion | default "" | quote }}
   # Capacity v2 — see values.yaml `scheduler.resourceAdmission`.
   VALI_SCHEDULER_RESOURCE_ADMISSION: {{ .Values.scheduler.resourceAdmission | quote }}
   VALI_SCHEDULER_CPU_OVERCOMMIT: {{ .Values.scheduler.cpuOvercommit | quote }}

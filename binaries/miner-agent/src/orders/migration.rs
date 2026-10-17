@@ -1581,6 +1581,10 @@ pub async fn activate_dest_with_chain(
         crate::orders::handler::parse_disk_gb_token(&order.cmdline),
         !is_golden,
     )?;
+    // Arriving onto a moved VM's old source path: that move is over.
+    lifecycle
+        .close_superseded_move(&vm_id, &arriving_root)
+        .await?;
     let disk_path = if is_golden {
         crate::lifecycle::golden::overlay_disk_path(&arriving_root, &vm_id)
     } else {

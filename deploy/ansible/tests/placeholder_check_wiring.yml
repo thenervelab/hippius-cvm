@@ -1,0 +1,92 @@
+---
+# Wiring test for miner-tasks/placeholder-check.yml: the real tasks file
+# and the real config template, fed the real group_vars plus canned host
+# facts, on localhost with no connection to any host and no change to
+# this machine (set_fact and assert only).
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/placeholder_check_wiring.yml
+
+- name: Placeholder check wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+  vars:
+    miner_agent_config_template: ../playbooks/miner-tasks/templates/miner-agent-config.toml.j2
+    miner_agent_miner_id: m-0123456789abcdef
+    miner_netbird_ip: 100.64.12.34
+    snp_generation: genoa
+    ansible_processor_vcpus: 48
+    ansible_memtotal_mb: 386000
+    miner_data_fs_gb: 800
+    miner_data_fs_mount: /
+  tasks:
+    # The published group_vars carry `<VALI_LIFECYCLE_URL>` on purpose
+    # (the next task proves it is refused); this one checks the template
+    # with that value filled in, as a deployer's host_vars would.
+    - name: The group_vars with the deployer's values carry no placeholder
+      vars:
+        miner_vali_lifecycle_url: "https://vali.example:8446"
+      block:
+        - name: Run the placeholder check on the group_vars as they are
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/placeholder-check.yml
+
+    - name: The rendered config was really checked
+      ansible.builtin.assert:
+        that:
+          - miner_placeholder_config_lines | select('match', '^vali_url = "https://') | list | length == 1
+          - miner_placeholder_config_lines | select('match', '^order_signing_pubkey = "[0-9a-f]{64}"') | list | length == 1
+
+    # The published tree: hippius-cvm ships `miner_vali_lifecycle_url:
+    # "<VALI_LIFECYCLE_URL>"`.
+    - name: The published lifecycle placeholder is refused, with its key
+      vars:
+        miner_vali_lifecycle_url: "<VALI_LIFECYCLE_URL>"
+      block:
+        - name: Run the placeholder check with the published placeholder
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/placeholder-check.yml
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: the lifecycle placeholder was not refused
+      rescue:
+        - name: Check the refusal names the rendered key
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is search('PLACEHOLDER_VALUE')
+              - ansible_failed_result.msg is search('vali_url = \\\\"<VALI_LIFECYCLE_URL>\\\\"')
+
+    - name: A placeholder in a nested dict value is refused too
+      vars:
+        network:
+          edge_endpoint: "<EDGE_ENDPOINT>"
+          netbird_management_url: "https://vpn.example"
+          netbird_group: "miner"
+      block:
+        - name: Run the placeholder check with a placeholder edge endpoint
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/placeholder-check.yml
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: the edge endpoint placeholder was not refused
+      rescue:
+        - name: Check the refusal names the endpoint
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is search('EDGE_ENDPOINT')
+
+    - name: A placeholder in a play input outside the config is refused
+      vars:
+        miner_tenant_ovmf_url: "<TENANT_OVMF_URL>"
+      block:
+        - name: Run the placeholder check with a placeholder firmware URL
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/placeholder-check.yml
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: the firmware URL placeholder was not refused
+      rescue:
+        - name: Check the refusal names the variable
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is search('miner_tenant_ovmf_url')

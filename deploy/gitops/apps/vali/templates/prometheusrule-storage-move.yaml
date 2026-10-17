@@ -1,0 +1,67 @@
+{{- if eq (toString .Values.storageMove.alerts.enabled) "true" }}
+---
+# Live storage move alerts (apps.disktier.storage_move; gauges pushed by the
+# orchestration tick at most once a minute while moves are on, or while a
+# move is left to resolve). Every alert ignores a report older than five
+# minutes: the Pushgateway keeps the last push forever. No series exists
+# until a move runs. A `severity` label, the Alertmanager default route.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-storage-move
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-storage-move
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-storage-move
+      interval: 1m
+      rules:
+        - alert: HippiusStorageMovePivotUnknown
+          # The guest stopped mid-pivot: the agent holds the VM (down) and
+          # both copies until an operator decides which one boots.
+          expr: (time() - max by (vm, miner, move_id) (hippius_storage_move_pivot_unknown_since_seconds)) > {{ mul .Values.storageMove.alerts.pivotUnknownAfterMinutes 60 }} and on() (time() - hippius_storage_move_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: critical
+            component: disk-tier
+          annotations:
+            summary: "storage move of {{`{{ $labels.vm }}`}} stuck mid-pivot on {{`{{ $labels.miner }}`}}"
+            description: |
+              The VM is down and held by the agent: it stopped while its OS disk
+              was pivoting to the new pool, and which copy holds its last writes
+              is unknown. Follow docs/operator/storage-move-runbook.md, then
+              `vali_storage_move resolve --vm-id {{`{{ $labels.vm }}`}} --on source|target`.
+        - alert: HippiusStorageMoveFailed
+          # Every failed move leaves something on the miner for an operator:
+          # a journal that holds the host's move slot, a source not released.
+          expr: max by (code) (hippius_storage_move_failed_24h) > 0 and on() (time() - hippius_storage_move_report_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "{{`{{ $value }}`}} storage move(s) failed ({{`{{ $labels.code }}`}}) in 24 h"
+            description: |
+              `vali_storage_move status` lists them. What each code leaves on the
+              miner and how to settle it: docs/operator/storage-move-runbook.md,
+              "Other failed moves".
+        - alert: HippiusStorageMoveReportStale
+          # A held pivot is known but vali stopped reporting: the alert
+          # above would go silent while the VM is still down.
+          expr: (time() - hippius_storage_move_report_timestamp_seconds) > 600 and on() count(hippius_storage_move_pivot_unknown_since_seconds) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "storage-move report stale while a move is held mid-pivot"
+            description: |
+              vali's orchestration tick has not pushed the storage-move gauges for
+              10 minutes while a move held mid-pivot was last reported. Check the
+              vali-orchestration-tick logs (`storage-move:`), and the held move
+              with `vali_storage_move status`.
+{{- end }}

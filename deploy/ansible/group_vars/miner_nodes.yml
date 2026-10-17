@@ -258,9 +258,11 @@ miner_cosign:
 # inherit by accident. `miner-agent-install.yml` asserts it has been
 # filled in and refuses to run on an unfilled placeholder.
 #
-# If you would rather not build on the production host at all, skip play
-# 05 and place your own binary at /usr/local/bin/hippius-miner-agent —
-# built with `--features snp`, which is load-bearing.
+# Only used with `miner_agent_build_from_source: true`: by default play 05
+# requires the release binary at /usr/local/bin/hippius-miner-agent (any
+# binary you place there must be built with `--features snp`, which is
+# load-bearing) and refuses to build on the production host.
+miner_agent_build_from_source: false
 miner_agent_source_repo: "https://github.com/thenervelab/hippius-compute-internal.git"
 
 # ── UKI image fetch ─────────────────────────────────────────────────

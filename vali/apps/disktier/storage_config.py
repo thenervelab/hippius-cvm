@@ -104,6 +104,85 @@ class StageConflict(Exception):
         self.current = current
 
 
+class PoolNotDrained(Exception):
+    """A write would drop, move or re-class a pool of the set in force that
+    is not drained: not `draining` there, or not empty (`committed_gb > 0`
+    reported, or a VM disk placed on it)."""
+
+    def __init__(self, pool: str, field: str = "removed") -> None:
+        super().__init__(f"pool {pool!r} is not drained ({field})")
+        self.pool = pool
+        #: What the write did to it: `removed`, or changed its `path` /
+        #: `class` (a pool in use can't be moved or re-classed either).
+        self.field = field
+
+
+def _set_in_force(node_id: str, row: MinerStorageConfig | None) -> dict[str, dict[str, Any]]:
+    """`{pool_id: {state, path, class}}` of the pool set the node runs: the
+    document its agent accepted while it is the one in force, else the
+    pools its v7 heartbeat reports (an agent on its local config; no path
+    is reported, and a class only when declared)."""
+    in_force = (
+        row is not None
+        and row.acked_revision > 0
+        and row.reported_revision == row.acked_revision
+        and bool(row.acked_body)
+    )
+    if in_force:
+        assert row is not None
+        return {
+            p["id"]: {"state": p["state"], "path": p["path"], "class": p["class"]}
+            for p in row.acked_body.get("pools", [])
+        }
+    return {
+        p.pool_id: {"state": p.reported_state, "path": None, "class": p.declared_class or None}
+        for p in MinerStoragePool.objects.filter(miner_node_id=node_id, retired_at__isnull=True)
+    }
+
+
+def _drained(node_id: str, pool_id: str) -> bool:
+    """The agent reports `pool_id` empty (or no longer reports it) and vali
+    places no VM disk on it."""
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES
+
+    from .models import PlacementDisk
+
+    pool = MinerStoragePool.objects.filter(
+        miner_node_id=node_id, pool_id=pool_id, retired_at__isnull=True
+    ).first()
+    if pool is not None and pool.committed_gb != 0:
+        return False
+    return not PlacementDisk.objects.filter(
+        pool_id=pool_id,
+        placement__miner_node_id=node_id,
+        placement__status__in=list(ACTIVE_PLACEMENT_STATES),
+    ).exists()
+
+
+def check_removals(node_id: str, row: MinerStorageConfig | None, doc: dict[str, Any]) -> None:
+    """Raise `PoolNotDrained` when `doc` drops a pool of the set in force,
+    or changes its path or class, unless that pool is `draining` in force
+    AND empty ([`_drained`]). A pool leaves only through an explicit
+    drain, whoever writes (a push, an adopt, a dry run): a document that
+    merely omits an empty, active pool would make the agent drop it."""
+    wanted = {p["id"]: p for p in doc.get("pools", [])}
+    for pool_id, now in sorted(_set_in_force(node_id, row).items()):
+        if pool_id == storage_doc.DEFAULT_POOL_ID:
+            # Never drained nor dropped: the agent pins it to its data root.
+            continue
+        new = wanted.get(pool_id)
+        if new is None:
+            field = "removed"
+        else:
+            field = next(
+                (k for k in ("path", "class") if now[k] is not None and new[k] != now[k]), ""
+            )
+        if not field:
+            continue
+        if now["state"] != "draining" or not _drained(node_id, pool_id):
+            raise PoolNotDrained(pool_id, field)
+
+
 @dataclass(frozen=True)
 class Actor:
     """Who a write is made by: the service principal and the family +
@@ -238,6 +317,7 @@ def stage(
         if if_match is not None and if_match != seen:
             raise StageConflict(seen)
         new_owner = not actor.system and row.owner_family != actor.account
+        check_removals(node_id, row, doc)
         if row.revision > 0 and row.content_key == key and not new_owner:
             audit(node_id, row.revision, action, actor, doc=doc, outcome="unchanged", now=now)
             return row, False
@@ -621,9 +701,14 @@ def _remove_drained_pools(row: MinerStorageConfig, *, now: datetime) -> MinerSto
     empty = set()
     for pool_id in draining:
         pool = reported.get(pool_id)
-        if pool is None or pool.retired_at is not None:
-            empty.add(pool_id)
-        elif pool.reported_state == "draining" and pool.committed_gb == 0:
+        reported_empty = (
+            pool is None
+            or pool.retired_at is not None
+            or (pool.reported_state == "draining" and pool.committed_gb == 0)
+        )
+        # The guard's own test (`_drained`): no VM disk placed on it either
+        # (a queued launch whose disk is not created yet).
+        if reported_empty and _drained(row.miner_node_id, pool_id):
             empty.add(pool_id)
     if not empty:
         return row
@@ -641,6 +726,15 @@ def _remove_drained_pools(row: MinerStorageConfig, *, now: datetime) -> MinerSto
             if_match=row.revision,
             now=now,
         )
+    except PoolNotDrained as exc:
+        # Never expected (the pass removes only drained, empty pools):
+        # loud, and the next pass looks again.
+        log.warning(
+            "storage-config: node=%s drained-pool removal refused (pool %s not drained)",
+            row.miner_node_id,
+            exc.pool,
+        )
+        return MinerStorageConfig.objects.get(pk=row.pk)
     except (StageConflict, LookupError, storage_doc.DocError):
         # An operator wrote meanwhile (or the document no longer passes):
         # the next pass looks again.
@@ -740,6 +834,20 @@ def sync_node(node_id: str, *, now: datetime | None = None, force: bool = False)
         return "skipped"
     # The fresh chain read happens only for a push about to go out.
     held = _owner_hold(row)
+    if not held:
+        # A document staged before the guard existed (or a set in force
+        # that changed since) is held too: the push would drop the pool.
+        try:
+            check_removals(node_id, row, row.body)
+        except PoolNotDrained as exc:
+            log.warning(
+                "storage-config: node=%s revision %d not pushed: it drops pool %s, "
+                "which is not drained",
+                node_id,
+                row.revision,
+                exc.pool,
+            )
+            held = f"pool-not-drained:{exc.pool}"
     if held:
         # Counted as an attempt, so a held node is looked at again after
         # the retry period, not on every tick.
