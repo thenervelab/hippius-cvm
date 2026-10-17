@@ -839,6 +839,125 @@ fn require_https(url: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
+/// Where `serve` and the one-shot commands read the config by default.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/hippius-miner/config.toml";
+
+/// Where the play installs the Edge server CA
+/// (`{{ mtls.cert_dir }}/ca.crt` in the config template) — the fallback
+/// of the one-shot commands on a host without a config.
+pub const PLAY_EDGE_CA_CERT: &str = "/var/lib/hippius-miner/mtls/ca.crt";
+
+/// The identity files `init-identity` writes by default.
+pub const DEFAULT_IDENTITY_KEY: &str = "/var/lib/hippius-miner/identity.key";
+/// See [`DEFAULT_IDENTITY_KEY`].
+pub const DEFAULT_IDENTITY_PUB: &str = "/var/lib/hippius-miner/identity.pub";
+
+impl Config {
+    /// [`Self::read`] for the one-shot commands. `None` (no explicit
+    /// path) reads [`DEFAULT_CONFIG_PATH`] and answers `None` when no
+    /// file is there; an explicit path that is missing, or any config
+    /// that does not parse or validate, is an error — never a silent
+    /// fallback to defaults that would contradict the running agent.
+    pub fn read_optional(path: Option<&Path>) -> Result<Option<Self>> {
+        Self::read_optional_or(path, Path::new(DEFAULT_CONFIG_PATH))
+    }
+
+    fn read_optional_or(path: Option<&Path>, default: &Path) -> Result<Option<Self>> {
+        let explicit = path.is_some();
+        match Self::read(path.unwrap_or(default)) {
+            Ok(config) => Ok(Some(config)),
+            Err(MinerAgentError::ConfigRead(e))
+                if !explicit && e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The flags of `request-graceful-exit`; each one left out falls back to
+/// this host's config, then to the play's paths ([`EdgeCliFlags::resolve`]).
+#[derive(Debug, Clone, Default)]
+pub struct EdgeCliFlags {
+    pub miner_id: Option<String>,
+    pub edge_url: Option<String>,
+    pub ca_cert: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+    pub pub_path: Option<PathBuf>,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+}
+
+/// What a one-shot Edge command signs with and talks to.
+#[derive(Debug, Clone)]
+pub struct EdgeCliTarget {
+    pub miner_id: String,
+    pub key_path: PathBuf,
+    pub pub_path: PathBuf,
+    /// `order_signing_pubkey` is empty: it only gates inbound orders,
+    /// never an outbound POST.
+    pub edge: EdgeSection,
+}
+
+impl EdgeCliFlags {
+    /// Whether the config must be read: not when the operator gave the
+    /// miner id, the Edge URL and the CA, so a drain run with every flag
+    /// works even past a config the binary cannot parse (and keeps the
+    /// pre-fallback behaviour: identity at the default paths, a
+    /// self-signed client cert unless both client flags are given).
+    pub fn needs_config(&self) -> bool {
+        self.miner_id.is_none() || self.edge_url.is_none() || self.ca_cert.is_none()
+    }
+
+    /// Flag, else `config`, else the play default. `miner_id` and the
+    /// Edge URL have no default: without a flag and a config they are an
+    /// error. The client cert/key pair is taken as a pair — both flags,
+    /// else the config's pair (legacy operator-CA mode), else none
+    /// (self-signed from the identity key).
+    pub fn resolve(self, config: Option<&Config>) -> Result<EdgeCliTarget> {
+        let miner_id = self
+            .miner_id
+            .or_else(|| config.map(|c| c.miner.miner_id.clone()))
+            .ok_or(MinerAgentError::GracefulExit("miner-id-missing"))?;
+        let endpoint = self
+            .edge_url
+            .or_else(|| config.map(|c| c.edge.endpoint.clone()))
+            .ok_or(MinerAgentError::GracefulExit("edge-url-missing"))?;
+        let ca_cert = self
+            .ca_cert
+            .or_else(|| config.map(|c| c.edge.ca_cert.clone()))
+            .unwrap_or_else(|| PathBuf::from(PLAY_EDGE_CA_CERT));
+        let key_path = self
+            .key_path
+            .or_else(|| config.map(|c| c.identity.key_path.clone()))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_KEY));
+        let pub_path = self
+            .pub_path
+            .or_else(|| config.map(|c| c.identity.pub_path.clone()))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PUB));
+        let (client_cert, client_key) = match (self.client_cert, self.client_key) {
+            (None, None) => config
+                .map(|c| (c.edge.client_cert.clone(), c.edge.client_key.clone()))
+                .unwrap_or((None, None)),
+            (Some(cert), Some(key)) => (Some(cert), Some(key)),
+            _ => return Err(MinerAgentError::GracefulExit("client-cert-key-pair")),
+        };
+        Ok(EdgeCliTarget {
+            miner_id,
+            key_path,
+            pub_path,
+            edge: EdgeSection {
+                endpoint,
+                client_cert,
+                client_key,
+                ca_cert,
+                order_signing_pubkey: String::new(),
+            },
+        })
+    }
+}
+
 /// Require a non-empty, absolute path — the miner-agent runs as a
 /// systemd service with no stable working directory.
 fn require_absolute(path: &Path, field: &'static str) -> Result<()> {
@@ -890,6 +1009,161 @@ cvm_memory_mb_budget = 16384
             return Err(MinerAgentError::ConfigInvalid(code));
         }
         Ok(c)
+    }
+
+    fn edge_cli_flags_error(flags: EdgeCliFlags, config: Option<&Config>) -> &'static str {
+        match flags.resolve(config) {
+            Err(MinerAgentError::GracefulExit(code)) => code,
+            other => panic!("expected a graceful-exit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graceful_exit_flags_fall_back_to_the_agent_config() {
+        let config = parse(VALID).unwrap();
+        let t = EdgeCliFlags::default().resolve(Some(&config)).unwrap();
+        assert_eq!(t.miner_id, "miner-a");
+        assert_eq!(t.edge.endpoint, "https://edge.hippius.network:443");
+        assert_eq!(
+            t.edge.ca_cert,
+            Path::new("/var/lib/hippius-miner/edge-ca.crt")
+        );
+        assert_eq!(t.key_path, Path::new("/var/lib/hippius-miner/identity.key"));
+        assert_eq!(t.pub_path, Path::new("/var/lib/hippius-miner/identity.pub"));
+        // The config's operator-CA pair: a self-signed cert would be
+        // refused by an Edge in `ca` mode.
+        assert_eq!(
+            t.edge.client_cert.as_deref(),
+            Some(Path::new("/var/lib/hippius-miner/edge-mtls.crt"))
+        );
+        assert_eq!(
+            t.edge.client_key.as_deref(),
+            Some(Path::new("/var/lib/hippius-miner/edge-mtls.key"))
+        );
+    }
+
+    #[test]
+    fn graceful_exit_flags_win_over_the_config() {
+        let config = parse(VALID).unwrap();
+        let flags = EdgeCliFlags {
+            miner_id: Some("m-0123456789abcdef".into()),
+            edge_url: Some("https://edge.example:8443".into()),
+            ca_cert: Some("/tmp/ca.pem".into()),
+            key_path: Some("/tmp/id.key".into()),
+            pub_path: Some("/tmp/id.pub".into()),
+            client_cert: Some("/tmp/c.crt".into()),
+            client_key: Some("/tmp/c.key".into()),
+        };
+        let t = flags.resolve(Some(&config)).unwrap();
+        assert_eq!(t.miner_id, "m-0123456789abcdef");
+        assert_eq!(t.edge.endpoint, "https://edge.example:8443");
+        assert_eq!(t.edge.ca_cert, Path::new("/tmp/ca.pem"));
+        assert_eq!(t.key_path, Path::new("/tmp/id.key"));
+        assert_eq!(t.pub_path, Path::new("/tmp/id.pub"));
+        assert_eq!(t.edge.client_cert.as_deref(), Some(Path::new("/tmp/c.crt")));
+        assert_eq!(t.edge.client_key.as_deref(), Some(Path::new("/tmp/c.key")));
+    }
+
+    #[test]
+    fn graceful_exit_without_a_config_uses_the_play_paths() {
+        let flags = EdgeCliFlags {
+            miner_id: Some("m-0123456789abcdef".into()),
+            edge_url: Some("https://edge.example:8443".into()),
+            ..EdgeCliFlags::default()
+        };
+        let t = flags.resolve(None).unwrap();
+        assert_eq!(
+            t.edge.ca_cert,
+            Path::new("/var/lib/hippius-miner/mtls/ca.crt")
+        );
+        assert_eq!(t.key_path, Path::new(DEFAULT_IDENTITY_KEY));
+        assert_eq!(t.pub_path, Path::new(DEFAULT_IDENTITY_PUB));
+        assert_eq!(t.edge.client_cert, None);
+        assert_eq!(t.edge.client_key, None);
+    }
+
+    #[test]
+    fn graceful_exit_refuses_what_it_cannot_resolve() {
+        assert_eq!(
+            edge_cli_flags_error(EdgeCliFlags::default(), None),
+            "miner-id-missing"
+        );
+        let no_url = EdgeCliFlags {
+            miner_id: Some("m-0123456789abcdef".into()),
+            ..EdgeCliFlags::default()
+        };
+        assert_eq!(edge_cli_flags_error(no_url, None), "edge-url-missing");
+        // Half a pair never silently falls back to the self-signed cert.
+        let config = parse(VALID).unwrap();
+        let half = EdgeCliFlags {
+            client_cert: Some("/tmp/c.crt".into()),
+            ..EdgeCliFlags::default()
+        };
+        assert_eq!(
+            edge_cli_flags_error(half, Some(&config)),
+            "client-cert-key-pair"
+        );
+        let other_half = EdgeCliFlags {
+            client_key: Some("/tmp/c.key".into()),
+            ..EdgeCliFlags::default()
+        };
+        assert_eq!(
+            edge_cli_flags_error(other_half, Some(&config)),
+            "client-cert-key-pair"
+        );
+    }
+
+    #[test]
+    fn graceful_exit_with_every_target_flag_skips_the_config() {
+        let mut flags = EdgeCliFlags {
+            miner_id: Some("m-0123456789abcdef".into()),
+            edge_url: Some("https://edge.example:8443".into()),
+            ca_cert: Some("/tmp/ca.pem".into()),
+            ..EdgeCliFlags::default()
+        };
+        assert!(!flags.needs_config());
+        flags.ca_cert = None;
+        assert!(flags.needs_config());
+        assert!(EdgeCliFlags::default().needs_config());
+    }
+
+    #[test]
+    fn play_edge_ca_is_where_the_play_installs_it() {
+        // mtls-cert-mount.yml copies the Edge CA to `{{ mtls.cert_dir }}/ca.crt`
+        // and the template renders `[edge].ca_cert` from the same path.
+        let template = include_str!(
+            "../../../deploy/ansible/playbooks/miner-tasks/templates/miner-agent-config.toml.j2"
+        );
+        assert!(template.contains("ca_cert = \"{{ mtls.cert_dir }}/ca.crt\""));
+        let group_vars = include_str!("../../../deploy/ansible/group_vars/miner_nodes.yml");
+        let cert_dirs: Vec<&str> = group_vars
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("cert_dir:"))
+            .map(|v| v.trim().trim_matches('"'))
+            .collect();
+        assert_eq!(cert_dirs.len(), 1, "one mtls.cert_dir in group_vars");
+        assert_eq!(format!("{}/ca.crt", cert_dirs[0]), PLAY_EDGE_CA_CERT);
+    }
+
+    #[test]
+    fn read_optional_skips_only_a_missing_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.toml");
+        assert!(Config::read_optional_or(None, &missing).unwrap().is_none());
+        // An explicit path must exist.
+        assert!(matches!(
+            Config::read_optional_or(Some(&missing), &missing),
+            Err(MinerAgentError::ConfigRead(_))
+        ));
+        // A default config that is there but broken is an error, not a
+        // silent fallback.
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[miner]\nminer_id = \"\"\n").unwrap();
+        assert!(Config::read_optional_or(None, &broken).is_err());
+        let good = dir.path().join("config.toml");
+        std::fs::write(&good, VALID).unwrap();
+        let c = Config::read_optional_or(None, &good).unwrap().unwrap();
+        assert_eq!(c.miner.miner_id, "miner-a");
     }
 
     #[test]

@@ -109,19 +109,20 @@ a `host_vars/<YOUR_HOST>.yml`. The eight plays, in order:
 | 02 | libvirt + qemu install | `libvirt-daemon-system`, `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `virtinst`; enables `libvirtd`. Distro versions, deliberately unpinned. **Also stages the TENANT OVMF** (`miner_tenant_ovmf_*`) and refuses to continue unless the file on disk matches the pinned digest — see below. |
 | 03 | Tenant CVM networking bridge | Enables libvirt's `default` NAT network for tenant virtio-net. |
 | 04 | NetBird agent | Installs and joins the mesh with your setup key; asserts the assigned address is inside `100.64.0.0/10`. |
-| 05 | miner-agent install + identity self-gen | Builds and installs `hippius-miner-agent`, renders `/etc/hippius-miner/config.toml`, runs `init-identity`, reads the AMD CHIP_ID, prints the registration block, installs the systemd unit **without starting it**. |
+| 05 | miner-agent install + identity self-gen | Requires an installed `hippius-miner-agent` reporting `versions.miner_agent` — the release binary (refuses to build it unless `miner_agent_build_from_source: true`), refuses any `<…>` placeholder left in the variables, renders `/etc/hippius-miner/config.toml`, runs `init-identity`, reads the AMD CHIP_ID, prints the registration block, installs the systemd unit **without starting it**. |
 | 06 | mTLS cert mount point | Creates `/var/lib/hippius-miner/mtls` (0700) and installs the Edge **server** CA so the agent can verify the Edge. In permissionless mode nothing else is placed here. |
 | 07 | Host firewall | UFW default-deny inbound; allow `22/tcp`, `51820/udp`, and all traffic on `wt0`. |
 
 > **`--features snp` is load-bearing.** The agent must be built with it
 > or every launch order fail-closes with
-> `cvm-launch-digest/feature-disabled`. Play 05 does this; if you build
-> the binary yourself, do not omit it.
+> `cvm-launch-digest/feature-disabled`. The release binary is; if you
+> build the binary yourself, do not omit it.
 
-> **Play 05 builds from source on the production host.** That is marked
-> TEMPORARY in the playbook. If that is unacceptable in your
-> environment, build the binary elsewhere and drop it at
-> `/usr/local/bin/hippius-miner-agent` before running the play.
+> **Play 05 does not build the agent by default.** Install the release
+> binary first ([Prebuilt binary](#prebuilt-binary)); without it the play
+> stops with `[MINER_AGENT_BINARY_MISSING]` and the install steps. Set
+> `miner_agent_build_from_source: true` in host_vars to have play 05
+> clone `miner_agent_source_repo` and build on the host instead.
 
 ### Prebuilt binary
 
@@ -145,10 +146,12 @@ sudo install -m 0755 -o root -g root hippius-miner-agent-x86_64-linux-gnu \
 /usr/local/bin/hippius-miner-agent --version
 ```
 
-Install it **before** running play 05. The play skips its source build
-only when `hippius-miner-agent --version` prints `versions.miner_agent`
-(`group_vars/miner_nodes.yml`); otherwise it rebuilds and overwrites
-the binary. A checksum only proves the download matches the release;
+Install it **before** running play 05. The play accepts the binary when
+`hippius-miner-agent --version` prints `versions.miner_agent`
+(`group_vars/miner_nodes.yml`); otherwise it stops with
+`[MINER_AGENT_BINARY_MISSING]`, or, with
+`miner_agent_build_from_source: true`, rebuilds and overwrites the
+binary. A checksum only proves the download matches the release;
 releases from the tag workflow also carry a build-provenance attestation,
 checked in [Verifying a release by hand](#verifying-a-release-by-hand).
 Once installed, [auto-update](#4b-auto-update) keeps it current.
@@ -222,7 +225,12 @@ copied from an example:
 | `edge_ca_cert_file` | path on YOUR workstation to the CA that signed the Edge's **server** certificate; defaults to `~/.config/hippius/edge-ca.crt` and is copied to the host by `mtls-cert-mount.yml` |
 | `miner_tenant_ovmf_url` / `_sha256` | the firmware every tenant CVM boots. **Not** the distro `ovmf` package — this exact image is folded into the SNP launch measurement, and the validator recomputes against the copy it pins. A different build measures differently, so the KBS refuses every release on your host. Fetched and digest-verified by play 02; a host without it answers every launch `tenant-preflight/ovmf-missing`. |
 | `miner_kbs_ca_cert_file` / `_src` | CA the agent trusts when dialling the KBS to relay a guest's §21 release. The KBS serves a private certificate by default (internal service on the mesh, not a public ACME endpoint). Leave empty only for a publicly-trusted KBS certificate. |
-| `miner_agent_source_repo` | the git repository play 05 clones and **builds the agent from**. A code-delivery path, not a link — whatever is here is what runs on your confidential host. The play refuses to run on an unfilled placeholder. |
+| `miner_agent_source_repo` | with `miner_agent_build_from_source: true` only: the git repository play 05 clones and **builds the agent from**. A code-delivery path, not a link — whatever is here is what runs on your confidential host. The play refuses to run on an unfilled placeholder. |
+
+Play 05 refuses any of these still set to a `<…>` placeholder
+(`[PLACEHOLDER_VALUE]`, naming the config key or the variable) before it
+renders the agent config: rendered as is, the agent would only refuse it
+at its first start, after the play had finished green.
 
 > **Auto-update is on by default.** The host installs each new agent
 > release by itself once it is a day old and verified. See
@@ -335,10 +343,13 @@ account cannot be a family until it registers a node there first. The
 account must also hold at least the existential deposit, or the
 extrinsic fails on funding before it fails on anything else.
 
-Slots and deposit: the first `FreeChildSlotsPerFamily` children of any
-family cost no deposit; the next one reserves `BaseChildDeposit` and
-each further one doubles. Both are chain parameters — read them from
-chain state (Developer → Chain state → `computeScoring`) before you plan. One family
+Slots and deposit: `LockupEnabled` is off on mainnet today, so every
+`register_child` reserves **no deposit**, whatever the slot count.
+`FreeChildSlotsPerFamily` is **3**. If lockup is enabled on chain, the first three children of a
+family stay free; each further one reserves the global next deposit,
+which starts at the base child deposit, doubles after every paid
+registration network-wide, and halves (never below the base) for every
+14,400 blocks (~24 h) without one. One family
 per purpose (production fleet, test bench) is a reasonable way to use
 the free slots; the scheduler never looks at families, so this is
 bookkeeping and dashboard scoping, not isolation.
@@ -394,12 +405,14 @@ The signature is over a domain-separated message
 (`HIPPIUS_COMPUTE_NODE_REG_V1` ‖ family ‖ child ‖ node_id ‖ nonce), so a
 signature captured from one registration cannot be replayed into
 another. The pallet enforces child/node_id uniqueness, per-family and
-global caps, and cooldowns on re-registration.
+global caps, and a cooldown of about 12 h (7,200 blocks) after
+`deregister_child` before the same child account or node id can register
+again.
 
-**Deposit.** The first `FreeChildSlotsPerFamily` registrations per
-family are free. Beyond that a global deposit is reserved that
-**doubles** with each paid registration and halves back down over time.
-Plan your family's slots accordingly.
+**Deposit.** None today: lockup is disabled on mainnet, so every
+registration is free. If lockup is enabled, the first
+`FreeChildSlotsPerFamily` registrations per family stay free and beyond
+that the global deposit described above is reserved on the family.
 
 On success the node's status is `Active`. Status is stored sparsely —
 only non-default statuses are written — so *absent* means `Active`. The
@@ -948,7 +961,22 @@ the Django admin. See
 admin token and the quarantine/list endpoints.
 
 The bootstrap prints exactly this block at the end of play 05, filled
-in with the real values — keep that output.
+in with the real values — keep that output. It prints the same values
+once more as one JSON object, the one the console takes:
+
+```json
+{"miner_id": "<MINER_ID>", "node_id": "<NODE_ID_64_HEX>", "platform_id": "<AMD_CHIP_ID_HEX>",
+ "netbird_ip": "<MESH_IP>", "snp_generation": "milan"}
+```
+
+`snp_generation` there is the generation play 00's preflight derived from
+the CPU (family/model, `epyc_snp_generation` in
+`deploy/ansible/playbooks/filter_plugins/host_preflight.py`), never a
+host_vars value alone. When play 00 did not run in the same invocation
+(`--skip-tags preflight`, `--start-at-task` past it), play 05 withholds
+the JSON and prints `WARN [SNP_GENERATION_NOT_DERIVED]`: an empty
+generation would read as unset, and vali would infer Genoa from a
+Milan's 64-byte CHIP_ID. Run play 00 with it.
 
 ## 6b. Register the host's size (fleet operator)
 
@@ -1031,7 +1059,7 @@ someone else's, you must be given them:
 
 | Item | Why |
 |---|---|
-| A registered, funded **family account** on chain | `register_child` fails with `FamilyNotRegistered` without one, and the deposit must come from somewhere |
+| A registered, funded **family account** on chain | `register_child` fails with `FamilyNotRegistered` without one, and any deposit (none while lockup is off) is reserved on it |
 | A **`pallet_proxy` delegation** from that family to your child account | `register_child` gates on `ProxyVerifier::can_register_child`; without it the extrinsic fails `ProxyVerificationFailed` — *after* you have already produced the `node_sig`. `NonTransfer` with `delay = 0` is enough (the check does not filter on proxy type), and it can be removed once the registration is in a block, since nothing reads the gate afterwards |
 | A **NetBird setup key** bound to the miner group, on the fleet's NetBird instance | A key from a different NetBird instance fails to log in |
 | The **Edge server CA** certificate | The agent verifies the Edge's server certificate against it |
@@ -1048,8 +1076,25 @@ routing and mesh membership. Your node key stays yours.
 ## Leaving
 
 Do not just power off. A miner that stops heart-beating strands the VMs
-it hosts. Use the graceful-exit path so vali migrates tenants off first,
-and request unstake on chain. See
+it hosts. Per node, in this order:
+
+1. On the box, with the agent running:
+   `sudo hippius-miner-agent request-graceful-exit`. Vali quarantines the
+   node and warm-migrates its tenants off. The bare command needs an
+   agent newer than v2026.10.16.2 (PR #1645); older agents need
+   `--miner-id`, `--edge-url` and
+   `--ca-cert /var/lib/hippius-miner/mtls/ca.crt`.
+2. Wait until the node hosts no VMs.
+3. From the family: `deregister_child(child)`, then
+   `claim_unbonded(child)` once the unbonding period is over (immediately
+   when no deposit was reserved, the case today). The child account and
+   node id can register again after a cooldown of about 12 h (7,200
+   blocks).
+
+Deregistering before the node is drained loses the warm migration: the
+node drops out of vali's snapshot and its VMs are only cold re-placed.
+There is no on-chain unstake step: `request_unstake` needs existing stake
+and staking is off. See
 [`stranded-migration-runbook.md`](./stranded-migration-runbook.md) for
 what to do if a migration gets stuck part-way.
 

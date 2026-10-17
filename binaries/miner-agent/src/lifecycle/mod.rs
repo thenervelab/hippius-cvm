@@ -44,6 +44,7 @@ pub mod preflight;
 pub mod qemu_config;
 pub mod reboot_watcher;
 pub mod state_disk;
+pub mod storage_move;
 pub mod ticket_peek;
 pub mod vm_pool;
 
@@ -226,6 +227,9 @@ pub struct CvmLifecycle {
     /// right now ([`Self::reclaim_pending_pool_disks`]): a launch of the
     /// same id waits for it.
     reclaiming: Mutex<std::collections::HashSet<VmId>>,
+    /// Live storage moves ([`storage_move`]): the VMs whose move a driver
+    /// task runs in this process, and how often it polls libvirt.
+    moves: storage_move::MoveRuntime,
     /// Optional display-only guest-boot progress sink. When present, a
     /// successful domain start ([`Self::run_domain`]) fires a fire-and-
     /// forget `booting` milestone for the launching VM so vali's
@@ -379,6 +383,7 @@ impl CvmLifecycle {
             )),
             pool_host: Arc::new(crate::storage::PoolHost::system()),
             reclaiming: Mutex::new(std::collections::HashSet::new()),
+            moves: storage_move::MoveRuntime::default(),
             progress: None,
             ticket_pushes: Mutex::new(HashMap::new()),
             ticket_delivery: Mutex::new(HashMap::new()),
@@ -900,6 +905,8 @@ impl CvmLifecycle {
         disk_gb: u32,
         legacy: bool,
     ) -> Result<std::path::PathBuf> {
+        // No arrival while a copy may still write here.
+        self.check_arrival_clear(vm_id)?;
         let record = match vm_pool::read(&self.state_disk_root, vm_id) {
             Ok(Some(record)) if record.ran => return Ok(record.root),
             Ok(Some(record)) => record,
@@ -1206,6 +1213,9 @@ impl CvmLifecycle {
         // Before anything is reserved: covers order launches, relaunches
         // and the §25 destination's boot.
         self.check_net_policy_gate()?;
+        // A VM in the middle of a live storage move is launched from
+        // neither copy until the move settles.
+        self.check_no_move(&order.vm_id)?;
         let vm_id = order.vm_id.clone();
         let domain_uuid = DomainUuid::generate()?;
         // Capture the COSE ticket bytes BEFORE moving the order into the
@@ -1268,6 +1278,10 @@ impl CvmLifecycle {
             legacy_boot_disk,
             order.os_pool.as_deref(),
         )?;
+        // Back on a moved VM's old source path: that move is over, and its
+        // late `release` must find nothing to delete.
+        self.close_superseded_move(&vm_id, &target.record.root)
+            .await?;
 
         // Disk fields differ by mode. `config.data_disk_size_gb` keeps the
         // LEGACY vde semantics (0 ⇒ no vde), so golden sets it 0 (no vde)
@@ -1409,6 +1423,9 @@ impl CvmLifecycle {
                 }
             }
             self.wait_for_reclaim(pool, &vm_id).await;
+            // The second copy a live storage move holds on this pool.
+            let move_held = u32::try_from(self.move_held_gb(&pool.path))
+                .map_err(|_| MinerAgentError::InsufficientResources)?;
             let mut handles = self.lock_handles()?;
             if handles.contains_key(&vm_id) {
                 return Err(MinerAgentError::AlreadyLaunched);
@@ -1422,7 +1439,9 @@ impl CvmLifecycle {
                 // `disk_budget_gb` is the golden overlay upper OR the
                 // legacy vde — both are the per-VM writable disk to
                 // reserve. (For legacy it equals `config.data_disk_size_gb`.)
-                disk_budget_gb,
+                disk_budget_gb
+                    .checked_add(move_held)
+                    .ok_or(MinerAgentError::InsufficientResources)?,
                 &pools,
                 pool,
             )?;
@@ -2020,6 +2039,11 @@ impl CvmLifecycle {
         vm_id: &VmId,
         restore: Option<&crate::backup::staged::RestoreManager>,
     ) -> Result<()> {
+        // A live storage move stops first: no block job may still write
+        // the copy the reclaim below unlinks (every pool's overlay). No
+        // move step runs until the destroy is over.
+        let _move_ops = self.move_ops_for(vm_id).await;
+        self.abort_move_for_destroy(vm_id).await?;
         // The handle carries the LEGACY disk path when we still track the
         // VM. It is OPTIONAL: §24 always sends a graceful `stop` ORDER
         // before the `destroy` order, and that stop drops the handle — so
@@ -2146,6 +2170,8 @@ impl CvmLifecycle {
             // reclaimed) is NOT this case: it falls through so the record
             // is undefined below. A libvirt error (`None`) keeps the
             // misrouted-destroy no-op: "cannot tell" must not fail §24.
+            // A move journal left by an earlier destroy goes too.
+            self.forget_move(vm_id);
             return Ok(());
         }
 
@@ -2298,7 +2324,9 @@ impl CvmLifecycle {
             }
         }
         // The pool record goes LAST: until here a retried destroy (or any
-        // other caller) still finds the disks through it.
+        // other caller) still finds the disks through it. So does a live
+        // storage move's journal.
+        self.forget_move(vm_id);
         self.forget_vm_pool(vm_id);
         Ok(())
     }
@@ -3340,10 +3368,12 @@ impl CvmLifecycle {
         pool: &crate::storage::pools::Pool,
         add_disk_gb: u32,
     ) -> Result<()> {
+        let held = self.move_held_gb(&pool.path);
         let handles = self.lock_handles()?;
         let used_disk = used_disk_gb(&handles, &self.pools.pools(), pool)?;
         let need_disk = used_disk
             .checked_add(u64::from(add_disk_gb))
+            .and_then(|n| n.checked_add(held))
             .ok_or(MinerAgentError::InsufficientResources)?;
         let budget = pool_budget_gb(self.host, pool);
         if budget > 0 && need_disk > budget {

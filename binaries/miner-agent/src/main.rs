@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use hippius_image_provenance::store::HippiusS3ImageStore;
+use hippius_miner_agent::config::EdgeCliFlags;
 use hippius_miner_agent::heartbeat::{CapacityDeclarer, DiskDeclarer, StatvfsDiskSource};
 use hippius_miner_agent::orders::{IdempotencyStore, OrderState, OrderVerifier, OrdersServer};
 use hippius_miner_agent::sev_asid::SysfsAsidSource;
@@ -169,28 +170,44 @@ enum Command {
     /// already-provisioned Edge mTLS leg (the same `[edge]` material the
     /// heartbeat pusher uses).
     RequestGracefulExit {
+        /// The agent's config. Every flag below that is left out is read
+        /// from it (`[miner]`, `[edge]`, `[identity]`), so on a host the
+        /// play configured the bare command works. Default
+        /// `/etc/hippius-miner/config.toml`, skipped when absent; a given
+        /// path must exist. Not read at all when `--miner-id`,
+        /// `--edge-url` and `--ca-cert` are all given (and no `--config`).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Secret identity key (the same file `init-identity` wrote).
-        #[arg(long, default_value = "/var/lib/hippius-miner/identity.key")]
-        key_path: PathBuf,
-        /// Public identity key path.
-        #[arg(long, default_value = "/var/lib/hippius-miner/identity.pub")]
-        pub_path: PathBuf,
+        /// Default: `[identity].key_path`, else
+        /// `/var/lib/hippius-miner/identity.key`.
+        #[arg(long)]
+        key_path: Option<PathBuf>,
+        /// Public identity key path. Default: `[identity].pub_path`, else
+        /// `/var/lib/hippius-miner/identity.pub`.
+        #[arg(long)]
+        pub_path: Option<PathBuf>,
         /// This miner's registry id — MUST match vali's
         /// `MinerIdentity.miner_id` (the key under which its public key
-        /// is registered).
+        /// is registered). Default: `[miner].miner_id`.
         #[arg(long)]
-        miner_id: String,
+        miner_id: Option<String>,
         /// Edge gateway base URL, e.g. `https://edge.hippius.network:443`
         /// (the same endpoint the `[edge]` heartbeat config targets).
+        /// Default: `[edge].endpoint`.
         #[arg(long)]
-        edge_url: String,
+        edge_url: Option<String>,
         /// CA cert (PEM) pinning the Edge server — the same
-        /// `[edge].ca_cert` the heartbeat pusher uses.
-        #[arg(long, default_value = "/var/lib/hippius-miner/edge-ca.crt")]
-        ca_cert: PathBuf,
-        /// Optional operator-issued client cert (PEM). Omit (the prod
-        /// default) to mTLS with a self-signed cert minted from the
-        /// identity key. Must be set together with `--client-key`.
+        /// `[edge].ca_cert` the heartbeat pusher uses. Default: that
+        /// value, else `/var/lib/hippius-miner/mtls/ca.crt` (where the
+        /// play installs it).
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// Optional operator-issued client cert (PEM). Must be set
+        /// together with `--client-key`. Both omitted: the config's
+        /// `[edge]` pair if it has one (legacy operator-CA mode), else a
+        /// self-signed cert minted from the identity key (the prod
+        /// default).
         #[arg(long)]
         client_cert: Option<PathBuf>,
         /// Optional operator-issued client key (PEM); see `--client-cert`.
@@ -360,6 +377,7 @@ fn run() -> Result<()> {
         } => cmd_sign_registration(&key_path, &pub_path, &family, &child, nonce),
         Command::PlatformId => cmd_platform_id(),
         Command::RequestGracefulExit {
+            config,
             key_path,
             pub_path,
             miner_id,
@@ -368,16 +386,18 @@ fn run() -> Result<()> {
             client_cert,
             client_key,
             sequence,
-        } => cmd_request_graceful_exit(
-            &key_path,
-            &pub_path,
-            &miner_id,
-            &edge_url,
-            &ca_cert,
-            client_cert.as_deref(),
-            client_key.as_deref(),
-            sequence,
-        ),
+        } => {
+            let flags = EdgeCliFlags {
+                miner_id,
+                edge_url,
+                ca_cert,
+                key_path,
+                pub_path,
+                client_cert,
+                client_key,
+            };
+            cmd_request_graceful_exit(config.as_deref(), flags, sequence)
+        }
         Command::GracefulExitHeartbeat { config } => cmd_graceful_exit_heartbeat(&config),
         Command::Serve { config } => cmd_serve(&config),
         Command::StorageCollect { out } => cmd_storage_collect(&out),
@@ -426,27 +446,29 @@ fn cmd_platform_id() -> Result<()> {
 /// unchanged from the direct-to-vali path; only the transport differs —
 /// a real miner box cannot reach vali directly, but it reaches the Edge
 /// over the already-provisioned mTLS leg. Signs + sends only.
-#[allow(clippy::too_many_arguments)]
 fn cmd_request_graceful_exit(
-    key_path: &Path,
-    pub_path: &Path,
-    miner_id: &str,
-    edge_url: &str,
-    ca_cert: &Path,
-    client_cert: Option<&Path>,
-    client_key: Option<&Path>,
+    config: Option<&Path>,
+    flags: EdgeCliFlags,
     sequence: u64,
 ) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use hippius_miner_agent::build_edge_mtls_client;
-    use hippius_miner_agent::config::EdgeSection;
     use hippius_miner_agent::EnvelopeKind;
     use hippius_types::graceful_exit::{
         GracefulExitRequest, SignedGracefulExit, DOMAIN, SCHEMA_VERSION,
     };
 
-    let identity = MinerIdentity::load(key_path, pub_path)?;
+    // The flags the operator left out come from the agent's own config,
+    // so the bare command signs and dials exactly what the agent does.
+    let file = if config.is_some() || flags.needs_config() {
+        Config::read_optional(config)?
+    } else {
+        None
+    };
+    let target = flags.resolve(file.as_ref())?;
+    let miner_id = target.miner_id.as_str();
+    let identity = MinerIdentity::load(&target.key_path, &target.pub_path)?;
     // A real binary on real hardware — wall-clock is the signed
     // `timestamp_unix` vali anti-skew-checks (±300 s).
     let now = SystemTime::now()
@@ -472,24 +494,14 @@ fn cmd_request_graceful_exit(
     .map_err(|_| MinerAgentError::GracefulExit("encode"))?;
 
     // Reuse the SAME mTLS client builder the heartbeat pusher uses — the
-    // CLI args map onto the `[edge]` config shape (endpoint + CA + the
+    // resolved target has the `[edge]` config shape (endpoint + CA + the
     // optional operator-issued client cert/key, else the self-signed
     // identity cert). The miner never reaches vali directly; the Edge is
     // the transport.
-    let edge = EdgeSection {
-        endpoint: edge_url.to_string(),
-        client_cert: client_cert.map(Path::to_path_buf),
-        client_key: client_key.map(Path::to_path_buf),
-        ca_cert: ca_cert.to_path_buf(),
-        // Unused for this one-shot transport — `order_signing_pubkey`
-        // only gates inbound lifecycle orders (MA-5), never an outbound
-        // POST. A placeholder keeps the struct buildable here.
-        order_signing_pubkey: String::new(),
-    };
-    let client = build_edge_mtls_client(&edge, &identity)?;
+    let client = build_edge_mtls_client(&target.edge, &identity)?;
     let url = format!(
         "{}{}",
-        edge_url.trim_end_matches('/'),
+        target.edge.endpoint.trim_end_matches('/'),
         EnvelopeKind::GracefulExit.edge_route(),
     );
 
@@ -944,6 +956,13 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         Ok(0) => {}
         Ok(n) => eprintln!("hippius-miner-agent: serve — re-adopted {n} running tenant CVM(s)"),
         Err(err) => eprintln!("hippius-miner-agent: serve — re-adopt sweep failed: {err}"),
+    }
+    // Live storage moves a previous agent left mid-way: their libvirt
+    // jobs survive an agent restart, so they are driven on (or aborted).
+    match lifecycle.resume_moves().await {
+        Ok(0) => {}
+        Ok(n) => eprintln!("hippius-miner-agent: serve — resumed {n} storage move(s)"),
+        Err(err) => eprintln!("hippius-miner-agent: serve — storage moves not resumed: {err}"),
     }
 
     // Once per host: a pool record for every VM an older agent placed

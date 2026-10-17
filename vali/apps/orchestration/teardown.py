@@ -232,7 +232,7 @@ def force_destroy(vm_id: str, *, handoff_reason: str, label: str) -> str:
     vm = Vm.objects.filter(vm_id=vm_id).first()
     if vm is None:
         return "forced: vm row vanished"
-    if service._has_active_job(vm):
+    if service._has_active_job(vm, ignore_storage_move=True):
         # A §24 job (the API teardown, or one handed off on an earlier reap)
         # owns this VM; tearing it down underneath would tombstone a VM the
         # job then cannot finish properly (placements, host, erase stamp).
@@ -340,7 +340,7 @@ def hand_teardown_to_tick(vm: Any, *, reason: str, label: str) -> str:
         LaunchJob,
     )
 
-    if service._has_active_job(vm):
+    if service._has_active_job(vm, ignore_storage_move=True):
         return "left-to-in-flight-job"
     last = DecommissionJob.objects.filter(vm=vm).order_by("-started_at").first()
     if last is not None and last.state == DecommissionState.FAILED.value:

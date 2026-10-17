@@ -165,6 +165,13 @@ host identity**, **Register on chain**, **Declare to the validator** and
 
 From your Ansible checkout (`deploy/ansible`):
 
+0. On the host, install the release `hippius-miner-agent`
+   ([`onboarding-a-miner.md`](./onboarding-a-miner.md#prebuilt-binary),
+   "Prebuilt binary") and stage the host-attestor files
+   ([`deploy/ansible/README.md`](../../deploy/ansible/README.md#host-attestor)).
+   Play 05 does not build the agent: it refuses to run without the
+   binary (`MINER_AGENT_BINARY_MISSING`) or with attestor files that do
+   not match their pinned digests.
 1. Save the generated file as `host_vars/<hostname>.yml`:
    - Fill the connection details and the disks, by
      `/dev/disk/by-id/...`, never `/dev/nvmeXn1`.
@@ -199,7 +206,16 @@ From your Ansible checkout (`deploy/ansible`):
    `bind_ip=` it prints matches `netbird status`. Without a mesh address
    the agent never receives an order, and nothing else looks wrong.
 6. Keep the **JSON block play 05 prints**: node id, CHIP_ID, miner id,
-   mesh address.
+   mesh address and processor generation:
+   ```json
+   {"miner_id": "m-<16 hex>", "node_id": "<64 hex>", "platform_id": "<128 hex>",
+    "netbird_ip": "<mesh address>", "snp_generation": "milan | genoa | turin"}
+   ```
+   `snp_generation` is the one play 00 derived from the CPU. When play 00
+   did not run in the same invocation (`--skip-tags preflight`,
+   `--start-at-task` past it), play 05 withholds the JSON and prints
+   `WARN [SNP_GENERATION_NOT_DERIVED]` instead: run the full command
+   again.
 
 The agent is installed **enabled but stopped**. Leave it stopped until
 step 6. Auto-update is on by default (§6).
@@ -229,8 +245,10 @@ Back in the wizard:
 2. **Register on chain**: your extension signs one atomic batch with the
    family: add the child as a `NonTransfer` proxy, `register_child`,
    remove the proxy (or `register_child` alone if the child is already a
-   proxy). A family's first registration is free; later ones may reserve
-   a deposit on the family, which the wizard shows before you sign.
+   proxy). Registration reserves no deposit while on-chain lockup is
+   off (today). If lockup is enabled, a family's first three
+   registrations stay free and later ones reserve a deposit on the
+   family, which the wizard shows before you sign.
 3. **Declare to the validator** runs by itself once the batch is
    included: it binds your node to its real CHIP_ID, mesh address and
    processor generation. If it fails, the wizard offers **Retry
@@ -349,6 +367,8 @@ alone with `--tags preflight --check` after each fix.
 | `NVME_LAYOUT` | A disk listed in host_vars isn't a block device. | Fix the `/dev/disk/by-id/` names in host_vars (`lsblk`). |
 | `DATA_DISK_BUSY` | A disk listed as a data disk has a partition table, a filesystem, or backs a system mount. | List only blank disks as data disks. Never list a system disk. |
 | `NETBIRD_SETUP_KEY_MISSING` | The setup-key file isn't on your workstation. | Save the key from the dashboard to the path the message gives. |
+| `MINER_AGENT_BINARY_MISSING` (play 05) | `/usr/local/bin/hippius-miner-agent` is missing, or its `--version` does not report `versions.miner_agent`. | Install the release binary as the message says (`onboarding-a-miner.md`, "Prebuilt binary"), then re-run. |
+| `PLACEHOLDER_VALUE` (play 05) | A variable is still a `<…>` placeholder (the message names the config key or the variable). | Set it in host_vars (the dashboard's generated file carries the fleet values), then re-run. |
 | `VAULT_CREDENTIALS_SET`, `K3S_PRESENT` | The host or its variables look like a control-plane node. | A miner host carries neither; use a clean machine and the generated host_vars. |
 
 ### Heartbeats
@@ -456,23 +476,25 @@ state.
 1. **Start the graceful exit on the host.** Keep the agent running: it
    does the migrations.
    ```sh
-   sudo hippius-miner-agent request-graceful-exit \
-       --miner-id m-<first 16 hex of your node id> \
-       --edge-url https://<edge endpoint from group_vars> \
-       --ca-cert /var/lib/hippius-miner/mtls/ca.crt
+   sudo hippius-miner-agent request-graceful-exit
    ```
-   Or `sudo hippius-miner-agent graceful-exit-heartbeat`, which reads
-   everything from `/etc/hippius-miner/config.toml`. Either one
+   It reads the miner id, the Edge endpoint, its CA, the identity key
+   (and a legacy client cert/key pair, if configured) from
+   `/etc/hippius-miner/config.toml`, the file the play rendered;
+   `--miner-id`, `--edge-url` and `--ca-cert` override them. Agents up
+   to v2026.10.16.2 do not read the file and need all three passed
+   (`--ca-cert /var/lib/hippius-miner/mtls/ca.crt`). Or
+   `sudo hippius-miner-agent graceful-exit-heartbeat`, which reads the
+   same file. Either one
    quarantines the node: no new VMs land on it, and the VMs it hosts are
    migrated off live. After this the agent's regular heartbeats show as
    `rejected` (quarantined). That is expected.
 2. **Wait** until the node page shows **Quarantined** and **Hosted VMs: 0**.
 3. **Deregister** from the node page (**Actions** → **Deregister**),
-   signed by the family. Without a deposit, one transaction deregisters
-   the child and frees it. With a deposit, the child unbonds first and
-   the dashboard shows the block when the deposit can be claimed (about 7
-   days by default). The node id and the child account then wait out a
-   cooldown of about 12 h before either can register again.
+   signed by the family. One transaction deregisters the child and frees
+   it (when no deposit is held; otherwise contact support). The node id
+   and the child account then wait out a cooldown of about 12 h (7,200
+   blocks) before either can register again.
 4. Only now stop the agent and wipe or repurpose the machine. A stopped
    agent no longer manages any VM still on the host, and wiping the
    machine destroys them: never stop before **Hosted VMs: 0**.

@@ -1897,3 +1897,56 @@ async fn domain_state_reports_a_guest_poweroff_stop() {
         (200, r#"{"running":true}"#.to_string())
     );
 }
+
+/// The `move-vm-storage` route: decoded, dispatched, its refusals typed.
+#[tokio::test]
+async fn move_vm_storage_orders_reach_the_move_engine() {
+    use hippius_miner_agent::orders::{MoveAction, MoveVmStorageOrder};
+    seed_snp_probe();
+    let root = tempfile::tempdir().unwrap();
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let (addr, sk, ..) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        None,
+        Arc::clone(&driver),
+        Some(root.path()),
+    )
+    .await;
+    let mv = |order_id: &str, vm: &str, action: MoveAction| {
+        let start = action == MoveAction::Start;
+        signed_wire(
+            &sk,
+            order_id,
+            OrderKind::MoveVmStorage,
+            MoveVmStorageOrder {
+                vm_id: VmId::new(vm).unwrap(),
+                move_id: "ab".repeat(16),
+                action,
+                target_pool: start.then(|| "nvme0".into()),
+                expected_source_pool: start.then(|| "default".into()),
+                bandwidth_mib_s: start.then_some(200),
+                not_after_unix: u64::MAX,
+            },
+        )
+    };
+    let route = "/v1/miner/order/move-vm-storage";
+    assert_eq!(
+        post(addr, route, &mv("mv-1", "tenant-ghost", MoveAction::Start)).await,
+        (404, "move-vm-not-found".to_string())
+    );
+    assert_eq!(
+        post(addr, route, &mv("mv-2", "tenant-ghost", MoveAction::Status)).await,
+        (404, "move-not-found".to_string())
+    );
+    // Another kind on this route is refused before any dispatch.
+    let wrong = signed_wire(
+        &sk,
+        "mv-3",
+        OrderKind::PowerPolicy,
+        PowerPolicyOrder {
+            vm_id: VmId::new("tenant-ghost").unwrap(),
+            on_guest_poweroff: OnGuestPoweroff::Stop,
+        },
+    );
+    assert_eq!(post(addr, route, &wrong).await.0, 400);
+}

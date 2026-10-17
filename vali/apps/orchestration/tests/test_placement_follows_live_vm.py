@@ -450,6 +450,27 @@ def test_sweep_skips_a_vm_whose_migration_is_in_flight() -> None:
     assert _active(vm) == []
 
 
+def test_sweep_re_binds_a_vm_whose_storage_move_is_in_flight() -> None:
+    # A storage move stays on the host, and waits for a bound placement to
+    # release its source: it must not hold the re-bind.
+    from apps.disktier.models import VmStorageMove
+
+    vm = _running_vm()
+    _drained(vm)
+    VmStorageMove.objects.create(
+        vm=vm,
+        miner_node_id=HOST,
+        miner_id="miner-b",
+        source_pool="default",
+        target_pool="nvme0",
+        bandwidth_mib_s=200,
+        state="verifying",
+    )
+    assert service._has_active_job(vm) is True
+    assert service.sweep_live_vm_placements() == 1
+    assert [p.miner_node_id for p in _active(vm)] == [HOST]
+
+
 def test_sweep_skips_a_vm_whose_launch_is_in_flight() -> None:
     # The launch path owns the Pending→Bound (or →Failed) transition.
     vm = _running_vm()

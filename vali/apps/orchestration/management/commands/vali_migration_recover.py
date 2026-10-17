@@ -314,7 +314,8 @@ class Command(BaseCommand):
                 "the failed job records no snapshot object — there is nothing "
                 "for the destination to restore"
             )
-        if service._has_active_job(vm):
+        # A storage move waits while the VM is fenced: not a job here.
+        if service._has_active_job(vm, ignore_storage_move=True):
             return "the VM already has an in-flight orchestration job"
         # The failed job's destination stopped counting for the VM's
         # placement group when the job ended: a sibling may be there now.

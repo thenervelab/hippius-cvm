@@ -71,10 +71,32 @@
       {{ miner_agent_version_check.rc != 0
          or versions.miner_agent not in (miner_agent_version_check.stdout | default('')) }}
 
+# The supported install is the release binary (onboarding-a-miner.md §1
+# "Prebuilt binary"); auto-update keeps it current. Building on the host
+# is an explicit opt-in: by default a missing or foreign binary stops the
+# play here instead of cloning a repository the operator may not be able
+# to read, or code nobody pinned, and building it on a confidential host.
+- name: Refuse to build the miner-agent from source unless asked to
+  ansible.builtin.assert:
+    that:
+      - not (miner_agent_build_needed | bool) or (miner_agent_build_from_source | bool)
+    fail_msg: >-
+      [MINER_AGENT_BINARY_MISSING] {{ miner_agent.install_path }} is missing or
+      does not report version {{ versions.miner_agent }} (`--version` said:
+      {{ miner_agent_version_check.stdout | default('', true) or 'nothing' }}).
+      Install the release binary on the host first:
+      download hippius-miner-agent-x86_64-linux-gnu and SHA256SUMS from
+      https://github.com/{{ miner_auto_update_release_repo }}/releases/latest,
+      `sha256sum -c SHA256SUMS`, then
+      `sudo install -m 0755 -o root -g root hippius-miner-agent-x86_64-linux-gnu
+      {{ miner_agent.install_path }}` (docs/operator/onboarding-a-miner.md,
+      "Prebuilt binary"), and re-run. To build from
+      `miner_agent_source_repo` on this host instead, set
+      `miner_agent_build_from_source: true` in host_vars.
+
 # ── Binary install ──────────────────────────────────────────────────
-# MVP: build from source on the host. This is TEMPORARY — once a
-# signed GitHub Release / GHCR artifact for `hippius-miner-agent`
-# exists, replace this block with a `get_url` of the pinned digest.
+# Opt-in source build on the host (`miner_agent_build_from_source`); the
+# default path is the signed release binary, installed before the play.
 # Tracked alongside the §MA phase-2 roadmap.
 # Building from source needs a build environment, and the playbook used
 # to install only the Rust half of it. Each of these was found by running
@@ -111,11 +133,12 @@
       - "'<' not in miner_agent_source_repo_resolved"
     fail_msg: >-
       `miner_agent_source_repo` is still the unfilled placeholder
-      ({{ miner_agent_source_repo_resolved }}). Play 05 builds the
-      miner-agent from source, so it needs a git URL it can actually
-      clone. Set `miner_agent_source_repo` in group_vars/miner_nodes.yml
-      to the repository you build the agent from, or skip this play and
-      place a binary at /usr/local/bin/hippius-miner-agent yourself.
+      ({{ miner_agent_source_repo_resolved }}). With
+      `miner_agent_build_from_source: true` play 05 builds the miner-agent
+      from source, so it needs a git URL it can actually clone. Set
+      `miner_agent_source_repo` to the repository you build the agent
+      from, or drop `miner_agent_build_from_source` and install the
+      release binary at /usr/local/bin/hippius-miner-agent.
   vars:
     miner_agent_source_repo_resolved: "{{ miner_agent_source_repo | default('') }}"
   when: miner_agent_build_needed | bool
@@ -497,6 +520,9 @@
       host's `netbird status` address.
   when: not ansible_check_mode
 
+- name: Refuse an unfilled placeholder before rendering the config
+  ansible.builtin.import_tasks: placeholder-check.yml
+
 - name: Render the miner-agent config
   ansible.builtin.template:
     # Explicit playbook-relative path — unambiguous regardless of the
@@ -524,42 +550,7 @@
   check_mode: false
 
 - name: "OPERATOR ACTION — register this miner with vali"
-  # `--print-pubkey` prints ONLY the 64-hex public key to stdout (the
-  # agent's info lines go to stderr). The private key is never printed.
-  # `platform-id` (above) prints the real CHIP_ID — NO placeholder to
-  # hand-fill. node_id == the identity pubkey (the on-chain register_child
-  # node_id), so chain_node_id is the same value.
-  ansible.builtin.debug:
-    msg: |
-      ============================================================
-      MINER REGISTRATION — record with vali's admin API
-      (POST /v1/admin/miner/register), all fields REAL (no placeholders):
-
-        miner_id:      "{{ miner_agent_miner_id }}"
-        pubkey:        "{{ miner_identity_init.stdout }}"
-        chain_node_id: "{{ miner_identity_init.stdout }}"
-        platform_id:   "{{ miner_platform_id.stdout }}"   # real CHIP_ID
-        netbird_ip:    "{{ miner_netbird_ip | default('<run netbird-agent first>') }}"
-
-      Also register the node_id on-chain via deploy/register-miner/
-      (register_child + the agent's sign-registration node_sig).
-
-      Until the identity is registered, vali rejects this miner's
-      telemetry as an unknown source, and the scheduler will not place
-      VMs on it (the dispatchability gate requires a complete identity).
-      ============================================================
-
-- name: "OPERATOR ACTION — the same block as ONE JSON (paste into the console)"
-  # The console's compute-miner onboarding (Dashboard → Compute miners →
-  # Continue setup) takes this object as-is, then the JSON printed by
-  # `hippius-miner-agent sign-registration --family 0x… --child 0x… --nonce N`
-  # (the family/child hex the console showed at preparation). Same values
-  # as above; a second rendering so nothing is re-typed by hand.
-  ansible.builtin.debug:
-    msg: "{{ {'miner_id': miner_agent_miner_id,
-              'node_id': miner_identity_init.stdout,
-              'platform_id': miner_platform_id.stdout,
-              'netbird_ip': miner_netbird_ip | default('')} | to_json }}"
+  ansible.builtin.import_tasks: registration-output.yml
 
 # ── systemd unit ────────────────────────────────────────────────────
 # The [storage] roots must be writable to the agent: with

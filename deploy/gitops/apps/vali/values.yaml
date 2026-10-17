@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:401cff5326293aebc68d157705710ff8b9c548e575f22709c2f492a961cbd97c"
+  digest: "sha256:36c50e193fbd2492445afab9c724272cc806701469bdcd919c7c065a9663c009"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "01f56fe3f29c74101abfe07666429d8a89cedf97"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38941251243/attempts/1"
+    commitSha: "bdb0baf52c9effaab1b643e45a9427bdfdbee1b7"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38969494354/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -125,6 +125,15 @@ scheduler:
   # v2026.10.09 is the first hippius-cvm release carrying the agent's
   # power-policy order.
   powerPolicyMinAgentVersion: "v2026.10.09"
+  # The first miner-agent release tag that takes `os_pool` on a launch
+  # order (A4b, #1636 / agent #1629): a first golden launch and a §25
+  # arrival are routed to the node's best storage pool only on an agent at
+  # or above it (v6 heartbeat agent_version). Empty = no miner qualifies,
+  # every VM lands on the default pool. Read wherever a launch order is
+  # built (web, launch tick, orchestration tick), hence the shared
+  # ConfigMap. v2026.10.16.2 is the first release that takes it; older
+  # agents stay gated.
+  poolRoutingMinAgentVersion: "v2026.10.16.2"
   # Capacity v2 (`scheduler.capacity_config`). resourceAdmission "true"
   # (enable it after `vali_capacity_report --preflight` passes): v2 is
   # gate (a) — vCPU / RAM + per-VM overhead / VM count per flavor. "false"
@@ -1018,6 +1027,14 @@ disktierGc:
     limits:
       cpu: 250m
       memory: 256Mi
+# Live storage moves (apps.disktier.storage_move). The feature itself is
+# env-gated, dark by default (VALI_STORAGE_MOVE_ENABLED etc., no chart key);
+# the alert has no series until a move runs.
+storageMove:
+  alerts:
+    enabled: "true"
+    # A move held mid-pivot this long pages (the VM is down meanwhile).
+    pivotUnknownAfterMinutes: 10
 # The disk-tier probe orchestrator (docs/design/disk-tier-verification.md
 # §4.4, R1; `vali_disk_probe`): RECORD ONLY. SUSPENDED, and
 # VALI_DISK_PROBE_ENABLED keeps its code default (off, no chart key), so the

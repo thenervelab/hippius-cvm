@@ -2586,6 +2586,37 @@ VALI_STORAGE_CONFIG_MIN_AGENT_VERSION = os.environ.get(
 VALI_POOL_ROUTING_MIN_AGENT_VERSION = os.environ.get(
     "VALI_POOL_ROUTING_MIN_AGENT_VERSION", ""
 ).strip()
+# ── Live storage move (`apps.disktier.storage_move`): a running VM's OS disk
+# moves to another pool of its host, no downtime. ALL DARK by default: off,
+# no miner selected, and no agent version good enough. Turning it OFF stops
+# NEW moves only: a move whose start went out is still driven to its end
+# (it holds its VM's backups, migrations and resizes until then).
+VALI_STORAGE_MOVE_ENABLED = _env_bool("VALI_STORAGE_MOVE_ENABLED", False)
+# miner_ids or chain node_ids; `*` = every miner. Empty = none.
+VALI_STORAGE_MOVE_MINERS = _env_list("VALI_STORAGE_MOVE_MINERS")
+# The oldest agent release that serves `move-vm-storage`. Empty = nobody.
+VALI_STORAGE_MOVE_MIN_AGENT_VERSION = os.environ.get(
+    "VALI_STORAGE_MOVE_MIN_AGENT_VERSION", ""
+).strip()
+# The copy's bandwidth cap when the request names none (MiB/s, 10..1000).
+VALI_STORAGE_MOVE_BANDWIDTH_MIB_S = _env_nonneg_int("VALI_STORAGE_MOVE_BANDWIDTH_MIB_S", 200)
+if not 10 <= VALI_STORAGE_MOVE_BANDWIDTH_MIB_S <= 1000:
+    raise RuntimeError("VALI_STORAGE_MOVE_BANDWIDTH_MIB_S must be 10..1000")
+# Poll a running move this often.
+VALI_STORAGE_MOVE_POLL_S = _env_nonneg_int("VALI_STORAGE_MOVE_POLL_S", 30)
+# After the pivot, a served receipt from the guest must arrive within this,
+# or the move fails (the agent keeps the source copy). The receipt must end
+# past the redefine plus the meter's clock skew (VALI_BILLING_RECEIPT_MAX_SKEW_S).
+VALI_STORAGE_MOVE_VERIFY_TIMEOUT_S = _env_nonneg_int("VALI_STORAGE_MOVE_VERIFY_TIMEOUT_S", 1800)
+if VALI_STORAGE_MOVE_VERIFY_TIMEOUT_S <= 1200:
+    raise RuntimeError(
+        "VALI_STORAGE_MOVE_VERIFY_TIMEOUT_S must exceed 1200 s: the receipt that verifies a "
+        "move ends past the redefine plus the meter's 600 s clock skew"
+    )
+# Validity of one order (`not_after_unix`).
+VALI_STORAGE_MOVE_ORDER_TTL_S = _env_nonneg_int("VALI_STORAGE_MOVE_ORDER_TTL_S", 300)
+# Wall-clock budget of one move pass in the orchestration tick.
+VALI_STORAGE_MOVE_TICK_BUDGET_S = _env_float("VALI_STORAGE_MOVE_TICK_BUDGET_S", 30.0)
 # Re-send an acked document this often (expiry renewal, drift repair).
 VALI_STORAGE_CONFIG_SYNC_S = _env_nonneg_int("VALI_STORAGE_CONFIG_SYNC_S", 600)
 # Re-send an unacked (or drifted) document this often...

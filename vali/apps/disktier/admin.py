@@ -19,6 +19,7 @@ from .models import (
     MinerStoragePool,
     PlacementDisk,
     VmDiskIoHourly,
+    VmStorageMove,
 )
 
 
@@ -145,3 +146,20 @@ class MinerStorageConfigAuditAdmin(_ReadOnlyAdmin):
     list_display = ("miner_node_id", "revision", "action", "outcome", "principal", "family", "at")
     list_filter = ("action",)
     search_fields = ("miner_node_id", "family", "user")
+
+
+@admin.register(VmStorageMove)
+class VmStorageMoveAdmin(_ReadOnlyAdmin):
+    list_display = (
+        "vm",
+        "miner_node_id",
+        "source_pool",
+        "target_pool",
+        "state",
+        "agent_phase",
+        "code",
+        "created_at",
+        "finished_at",
+    )
+    list_filter = ("state",)
+    search_fields = ("vm__vm_id", "miner_node_id")

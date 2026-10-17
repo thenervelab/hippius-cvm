@@ -382,7 +382,7 @@ def _try_one(
     if vm.power_state in (VmPowerState.STARTING, VmPowerState.STOPPING):
         # A power order in flight: whatever it does decides what to restore.
         return _skip(vm, miner_id, f"power-{vm.power_state}")
-    if service._has_active_job(vm):
+    if service._has_active_job(vm, ignore_storage_move=True):
         return _skip(vm, miner_id, "job-in-flight")
     if (
         LaunchJob.objects.filter(vm_id=vm.vm_id)

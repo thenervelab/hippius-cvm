@@ -662,6 +662,42 @@ def build_migrate_payload(*, vm_id: str) -> dict[str, Any]:
     return {"vm_id": vm_id}
 
 
+def build_move_vm_storage_payload(
+    *,
+    vm_id: str,
+    move_id: str,
+    action: str,
+    not_after_unix: int,
+    target_pool: str | None = None,
+    expected_source_pool: str | None = None,
+    bandwidth_mib_s: int | None = None,
+) -> dict[str, Any]:
+    """JSON payload of a ``move-vm-storage`` order (the disk-tier live
+    storage move) — mirrors the Rust ``MoveVmStorageOrder``.
+    ``target_pool``, ``expected_source_pool`` and ``bandwidth_mib_s`` are
+    all given on ``start`` and none on any other action (``cancel`` /
+    ``status`` / ``release``): `ValueError` otherwise. Every other check
+    (ids, pools, bandwidth bounds) is the encoder's and the agent's."""
+    start_fields = {
+        "target_pool": target_pool,
+        "expected_source_pool": expected_source_pool,
+        "bandwidth_mib_s": bandwidth_mib_s,
+    }
+    if action == "start" and any(v is None for v in start_fields.values()):
+        raise ValueError("a move start names target_pool, expected_source_pool, bandwidth_mib_s")
+    if action != "start" and any(v is not None for v in start_fields.values()):
+        raise ValueError(f"a move {action} carries no start field")
+    payload: dict[str, Any] = {
+        "vm_id": vm_id,
+        "move_id": move_id,
+        "action": action,
+        "not_after_unix": int(not_after_unix),
+    }
+    if action == "start":
+        payload.update(start_fields)
+    return payload
+
+
 def build_migrate_activate_payload(
     *,
     vm_id: str,

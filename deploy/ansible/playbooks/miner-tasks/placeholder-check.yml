@@ -1,0 +1,53 @@
+---
+# Refuse a `<…>` placeholder left in group_vars / host_vars — tasks file
+# imported by miner-agent-install.yml right before it renders the agent
+# config, and by tests/placeholder_check_wiring.yml with canned values.
+#
+# The published tree ships fleet values the operator must fill in as
+# `<UPPER_CASE>` placeholders (`miner_vali_lifecycle_url` today). Rendered
+# as is, the agent refuses its config at its first start — after the
+# play has finished green, since the unit is installed stopped. So the
+# config is rendered here first and every non-comment line is checked,
+# which covers any value the template consumes, present or future; the
+# play inputs that never reach the config are checked by name.
+
+- name: Render the miner-agent config for the placeholder check
+  ansible.builtin.set_fact:
+    miner_placeholder_config_lines: >-
+      {{ lookup('ansible.builtin.template', miner_agent_config_template
+                | default(playbook_dir ~ '/miner-tasks/templates/miner-agent-config.toml.j2')).splitlines()
+         | reject('match', '^\s*(#|$)') | list }}
+
+- name: Refuse placeholder values (fail closed, before the agent sees them)
+  ansible.builtin.assert:
+    that:
+      - miner_placeholder_config_hits | length == 0
+      - miner_placeholder_input_hits | length == 0
+    fail_msg: >-
+      [PLACEHOLDER_VALUE] still an unfilled `<…>` placeholder —
+      in the agent config: {{ miner_placeholder_config_hits | to_json }};
+      in the play variables: {{ miner_placeholder_input_hits | to_json }}.
+      Set the real value in host_vars/{{ inventory_hostname }}.yml (the
+      providers dashboard generates it; e.g. `vali_url` comes from
+      `miner_vali_lifecycle_url`, `endpoint` from `network.edge_endpoint`,
+      `[kbs]` from `miner_kbs_endpoint`), then re-run. Rendered as is,
+      the agent would refuse its config at its first start.
+    quiet: true
+  vars:
+    # Any `<…>` span: no rendered value carries a `<` legitimately.
+    miner_placeholder_re: '<[^<>"]+>'
+    miner_placeholder_config_hits: >-
+      {{ miner_placeholder_config_lines | select('search', miner_placeholder_re) | map('trim') | list }}
+    # Play inputs that do not reach config.toml (they are consumed by the
+    # NetBird join, the firmware fetch, the KBS CA copy and the updater).
+    miner_placeholder_inputs:
+      network.netbird_management_url: "{{ network.netbird_management_url | default('') }}"
+      network.netbird_group: "{{ network.netbird_group | default('') }}"
+      miner_tenant_ovmf_url: "{{ miner_tenant_ovmf_url | default('') }}"
+      miner_tenant_ovmf_sha256: "{{ miner_tenant_ovmf_sha256 | default('') }}"
+      miner_kbs_ca_cert_src: "{{ miner_kbs_ca_cert_src | default('') }}"
+      miner_auto_update_release_repo: "{{ miner_auto_update_release_repo | default('') }}"
+    miner_placeholder_input_hits: >-
+      {{ miner_placeholder_inputs | dict2items
+         | selectattr('value', 'search', miner_placeholder_re)
+         | map(attribute='key') | list }}

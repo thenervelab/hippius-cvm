@@ -911,14 +911,16 @@ def _dispatch_stage(job: MigrationJob, now: Any) -> None:
         raise StepFailed(f"stage-{_reason(exc.classifier, 'rejected')}") from exc
 
 
-def _recheck_no_active_job(vm: Vm, *, refuse_launch: bool = True) -> None:
+def _recheck_no_active_job(
+    vm: Vm, *, refuse_launch: bool = True, ignore_storage_move: bool = False
+) -> None:
     """The one-active-job rule again, under the VM's row lock — the lock §25,
     §24 and the resize intake take for the same check. A resize never moves
     `Vm.state`, so without it a restore and a resize could both start."""
     from . import service
 
     Vm.objects.select_for_update().filter(pk=vm.pk).first()
-    if service._has_active_job(vm):
+    if service._has_active_job(vm, ignore_storage_move=ignore_storage_move):
         raise RestoreError("job-in-flight", "the vm already has an in-flight orchestration job")
     # Its stop/start bypass the power API's launch check (`by_migration`).
     # Not for a failover: its host is presumed dead, and a launch job there
@@ -2054,7 +2056,8 @@ def start_failover(
         raise RestoreError("bad-request", "dest_node_id must be a non-empty string")
     if vm.state != VmState.ACTIVE or not vm.host:
         raise RestoreError("vm-not-restorable", f"the vm is {vm.state}, not active on a host")
-    if service._has_active_job(vm):
+    # A storage move on the dead host is moot: the VM leaves it.
+    if service._has_active_job(vm, ignore_storage_move=True):
         raise RestoreError("job-in-flight", "the vm already has an in-flight orchestration job")
     source = vm.host
 
@@ -2115,7 +2118,7 @@ def start_failover(
             chain = BackupChain.objects.select_for_update().get(pk=run.chain_id)
             if chain.pruned_at is not None:
                 raise RestoreError("point-not-restorable", "the point's chain is being pruned")
-            _recheck_no_active_job(vm, refuse_launch=False)
+            _recheck_no_active_job(vm, refuse_launch=False, ignore_storage_move=True)
             if trigger == "auto":
                 _recheck_opted_in(vm)
             auth = DestAuthorization.objects.create(

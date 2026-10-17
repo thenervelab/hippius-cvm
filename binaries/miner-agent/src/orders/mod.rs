@@ -81,10 +81,10 @@ pub use migration::{
 };
 pub use types::{
     BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
-    MigrateQuiesceOrder, MigrateSnapshotOrder, NetEndpoint, NetPolicyLocalAction, NetPolicyMode,
-    NetPolicyOrder, NetProto, NetSpec, OnGuestPoweroff, Order, OrderBody, OrderKind, OrderSubject,
-    PowerPolicyOrder, PreflightArtifact, RestoreOrder, SignedOrder, StopOrder, StorageConfigOrder,
-    TenantPreflightOrder, ORDER_DOMAIN,
+    MigrateQuiesceOrder, MigrateSnapshotOrder, MoveAction, MoveVmStorageOrder, NetEndpoint,
+    NetPolicyLocalAction, NetPolicyMode, NetPolicyOrder, NetProto, NetSpec, OnGuestPoweroff, Order,
+    OrderBody, OrderKind, OrderSubject, PowerPolicyOrder, PreflightArtifact, RestoreOrder,
+    SignedOrder, StopOrder, StorageConfigOrder, TenantPreflightOrder, ORDER_DOMAIN,
 };
 
 /// Default TCP port the orders HTTP server binds (on the NetBird
@@ -356,6 +356,10 @@ pub fn build_orders_router(state: OrderState) -> Router {
         )
         .route("/v1/miner/order/net-policy", post(route_net_policy))
         .route("/v1/miner/order/power-policy", post(route_power_policy))
+        .route(
+            "/v1/miner/order/move-vm-storage",
+            post(route_move_vm_storage),
+        )
         .route("/v1/miner/order/storage-config", post(route_storage_config))
         .route("/healthz", get(route_healthz))
         // Size cap BEFORE any decode — an oversize body never buffers.
@@ -562,6 +566,20 @@ async fn route_power_policy(State(st): State<OrderState>, body: Bytes) -> Respon
         OrderKind::PowerPolicy,
         |lifecycle, order: PowerPolicyOrder| async move {
             handler::handle_power_policy(&lifecycle, order).await
+        },
+    )
+    .await
+}
+
+async fn route_move_vm_storage(State(st): State<OrderState>, body: Bytes) -> Response {
+    let migration = Arc::clone(&st.migration);
+    let backup = st.backup.clone();
+    process_order(
+        st,
+        body,
+        OrderKind::MoveVmStorage,
+        move |lifecycle, order: MoveVmStorageOrder| async move {
+            handler::handle_move_vm_storage(&lifecycle, &migration, backup.as_deref(), order).await
         },
     )
     .await

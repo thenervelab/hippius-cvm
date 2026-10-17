@@ -85,6 +85,10 @@ pub enum OrderKind {
     /// validated, persisted under a revision floor and put in force
     /// ([`crate::storage::remote`]).
     StorageConfig,
+    /// Move a running VM's OS disk to another storage pool of this host,
+    /// live ([`MoveVmStorageOrder`]). No route serves it yet: an order of
+    /// this kind is refused by every route's kind check.
+    MoveVmStorage,
 }
 
 impl OrderKind {
@@ -104,6 +108,7 @@ impl OrderKind {
             OrderKind::NetPolicy => "net-policy",
             OrderKind::PowerPolicy => "power-policy",
             OrderKind::StorageConfig => "storage-config",
+            OrderKind::MoveVmStorage => "move-vm-storage",
         }
     }
 }
@@ -1084,6 +1089,126 @@ pub struct StorageConfigOrder {
 }
 
 impl Order for LaunchOrder {
+    fn vm_id(&self) -> &VmId {
+        &self.vm_id
+    }
+}
+
+/// What a [`MoveVmStorageOrder`] asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MoveAction {
+    /// Begin the move (idempotent on `move_id`).
+    Start,
+    /// Abort it — honoured only before the pivot.
+    Cancel,
+    /// Report its phase and progress.
+    Status,
+    /// After the move is redefined and vali verified the guest on the new
+    /// disk: unlink the source copy, which the agent keeps until then.
+    Release,
+}
+
+/// Bounds of a move's copy bandwidth, MiB/s.
+pub const MOVE_BANDWIDTH_MIB_S: std::ops::RangeInclusive<u32> = 10..=1000;
+
+/// Move a running golden VM's OS disk (the overlay, `/dev/vda`) from one
+/// storage pool of this host to another, with no downtime: libvirt block
+/// copy, then pivot, then the persistent definition is rewritten (the
+/// disk-tier live storage move). One move per host.
+///
+/// `target_pool`, `expected_source_pool` and `bandwidth_mib_s` are set on
+/// `start` only, and then all of them. `move_id` is 32 lower-case hex
+/// chars, vali's id for the move. All of it is checked at decode
+/// ([`RawMoveVmStorageOrder`]): a body the encoder would refuse never
+/// reaches a route. Wire type only: no route serves it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RawMoveVmStorageOrder")]
+pub struct MoveVmStorageOrder {
+    pub vm_id: VmId,
+    pub move_id: String,
+    pub action: MoveAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pool: Option<String>,
+    /// The pool the VM must be on now (`move-source-mismatch` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_source_pool: Option<String>,
+    /// The copy's bandwidth cap, [`MOVE_BANDWIDTH_MIB_S`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_mib_s: Option<u32>,
+    pub not_after_unix: u64,
+}
+
+/// [`MoveVmStorageOrder`] as decoded, before its checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawMoveVmStorageOrder {
+    vm_id: VmId,
+    move_id: String,
+    action: MoveAction,
+    #[serde(default)]
+    target_pool: Option<String>,
+    #[serde(default)]
+    expected_source_pool: Option<String>,
+    #[serde(default)]
+    bandwidth_mib_s: Option<u32>,
+    not_after_unix: u64,
+}
+
+impl TryFrom<RawMoveVmStorageOrder> for MoveVmStorageOrder {
+    type Error = &'static str;
+
+    fn try_from(raw: RawMoveVmStorageOrder) -> std::result::Result<Self, Self::Error> {
+        use hippius_types::storage_report::is_valid_pool_id;
+        if raw.move_id.len() != 32
+            || !raw
+                .move_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err("bad-move-id");
+        }
+        match raw.action {
+            MoveAction::Start => {
+                let (Some(target), Some(source), Some(bandwidth)) = (
+                    raw.target_pool.as_deref(),
+                    raw.expected_source_pool.as_deref(),
+                    raw.bandwidth_mib_s,
+                ) else {
+                    return Err("move-start-field-missing");
+                };
+                if !is_valid_pool_id(target) || !is_valid_pool_id(source) {
+                    return Err("bad-move-pool");
+                }
+                if target == source {
+                    return Err("move-same-pool");
+                }
+                if !MOVE_BANDWIDTH_MIB_S.contains(&bandwidth) {
+                    return Err("bad-move-bandwidth");
+                }
+            }
+            MoveAction::Cancel | MoveAction::Status | MoveAction::Release => {
+                if raw.target_pool.is_some()
+                    || raw.expected_source_pool.is_some()
+                    || raw.bandwidth_mib_s.is_some()
+                {
+                    return Err("move-start-field-on-other-action");
+                }
+            }
+        }
+        Ok(Self {
+            vm_id: raw.vm_id,
+            move_id: raw.move_id,
+            action: raw.action,
+            target_pool: raw.target_pool,
+            expected_source_pool: raw.expected_source_pool,
+            bandwidth_mib_s: raw.bandwidth_mib_s,
+            not_after_unix: raw.not_after_unix,
+        })
+    }
+}
+
+impl Order for MoveVmStorageOrder {
     fn vm_id(&self) -> &VmId {
         &self.vm_id
     }

@@ -228,7 +228,21 @@ def _write(fn: Any) -> Response:
             "not-found",
             code="storage-config-missing",
         )
+    except storage_config.PoolNotDrained as exc:
+        return _pool_not_drained(exc)
     return _stage_response(row, changed)
+
+
+def _pool_not_drained(exc: storage_config.PoolNotDrained) -> Response:
+    return _error(
+        409,
+        "a pool is removed, moved or re-classed only once drained: set it draining "
+        "(DELETE …/pools/{id}) and wait for it to empty",
+        "conflict",
+        code="pool-not-drained",
+        pool=exc.pool[:32],
+        field=exc.field,
+    )
 
 
 # ─── readouts ────────────────────────────────────────────────────────
@@ -387,13 +401,20 @@ class OperatorStorageView(_NodeStorageView):
             "Validated like the agent validates it without the host (ids, count, `default` "
             "kept at the host budget, class, budget > 0, plain absolute paths, dedicated "
             "disk ids, no duplicates); a refusal carries the agent's `code` and the `pool` "
-            "or `disk`. Unchanged content keeps the revision. Delivered by the push loop."
+            "or `disk`. Unchanged content keeps the revision. Delivered by the push loop. "
+            "A pool the node runs leaves the document only once drained (`draining` in "
+            "force and reported empty): otherwise `409 pool-not-drained`."
         ),
         tags=["Operator"],
         parameters=[*_COMMON_PARAMS, _IF_MATCH],
         request=doc_schemas.StorageDocSerializer,
         responses={
             202: doc_schemas.StagedSerializer,
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "`code: pool-not-drained`, `pool`, `field` (`removed` | `path` | `class`): "
+                "drain the pool first.",
+            ),
             412: OpenApiResponse(ErrorSerializer, "`If-Match` is not the current revision."),
             **_AUTH_RESPONSES,
         },
@@ -614,6 +635,16 @@ class OperatorStorageValidateView(_NodeStorageView):
                 code="storage-config-missing",
             )
         revision = row.revision if row is not None else 1
+        # The same guard as a write: a dry run of a document that drops an
+        # undrained pool says so instead of asking the agent.
+        try:
+            storage_config.check_removals(
+                call.node_id,
+                MinerStorageConfig.objects.filter(miner_node_id=call.node_id).first(),
+                doc,
+            )
+        except storage_config.PoolNotDrained as exc:
+            return _pool_not_drained(exc)
         try:
             verdict = storage_config.dry_run(call.node_id, doc, revision=revision)
         except storage_config.DryRunUnavailable as exc:
@@ -684,6 +715,8 @@ class OperatorStorageAdoptView(_NodeStorageView):
                 code="storage-config-exists",
                 revision=exc.current,
             )
+        except storage_config.PoolNotDrained as exc:
+            return _pool_not_drained(exc)
         return _stage_response(row, changed)
 
 

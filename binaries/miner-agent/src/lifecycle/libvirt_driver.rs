@@ -181,6 +181,92 @@ pub trait LibvirtDriver: Send + Sync {
     /// become `KiB`, aliases/addresses are added), so callers must parse
     /// the emitted form, not the form the agent defined.
     async fn domain_xml(&self, id: &DomainId) -> Result<String>;
+
+    // ── live storage move (block copy) ──────────────────────────────
+    // Defaults refuse: only the drivers that implement a move have them.
+
+    /// The domain's PERSISTENT definition (`virsh dumpxml --inactive`):
+    /// what the next `virsh start` boots, which a pivot does not change.
+    async fn domain_xml_inactive(&self, _id: &DomainId) -> Result<String> {
+        Err(MinerAgentError::LibvirtDriver("dumpxml-inactive"))
+    }
+
+    /// Start copying `disk` (`vda`) into the pre-created file described
+    /// by the disk XML at `dest_xml` (`virsh blockcopy … --xml
+    /// --reuse-external --transient-job --bandwidth`); returns once the
+    /// job runs. No pivot.
+    async fn blockcopy_start(
+        &self,
+        _id: &DomainId,
+        _disk: &str,
+        _dest_xml: &std::path::Path,
+        _bandwidth_mib_s: u32,
+    ) -> Result<()> {
+        Err(MinerAgentError::LibvirtDriver("blockcopy"))
+    }
+
+    /// The block job on `disk`, `None` when there is none.
+    async fn blockjob_info(&self, _id: &DomainId, _disk: &str) -> Result<Option<BlockJobInfo>> {
+        Err(MinerAgentError::LibvirtDriver("blockjob-info"))
+    }
+
+    /// Switch `disk` to the copy (`virsh blockjob --pivot`).
+    async fn blockjob_pivot(&self, _id: &DomainId, _disk: &str) -> Result<()> {
+        Err(MinerAgentError::LibvirtDriver("blockjob-pivot"))
+    }
+
+    /// Abort the block job on `disk`, the copy left as it is
+    /// (`virsh blockjob --abort`); no job is success.
+    async fn blockjob_abort(&self, _id: &DomainId, _disk: &str) -> Result<()> {
+        Err(MinerAgentError::LibvirtDriver("blockjob-abort"))
+    }
+}
+
+/// A block job's progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockJobInfo {
+    /// Bytes copied.
+    pub cur: u64,
+    /// Bytes to copy (it can grow while the guest writes).
+    pub end: u64,
+    /// The mirror is in sync: a pivot can happen.
+    pub ready: bool,
+}
+
+/// `cur=` / `end=` of `virsh blockjob --info --raw` (`None`: no job).
+fn parse_blockjob_raw(out: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        out.split([',', '\n'])
+            .filter_map(|kv| kv.trim().strip_prefix(name)?.strip_prefix('='))
+            .find_map(|v| v.trim().parse::<u64>().ok())
+    };
+    Some((field("cur")?, field("end")?))
+}
+
+/// The `<driver type=…>` of the domain XML's `vda` (`raw`, `qcow2`).
+pub(crate) fn vda_driver_type(xml: &str) -> Option<String> {
+    let block = xml.split("<disk ").find(|block| {
+        block
+            .split("</disk>")
+            .next()
+            .is_some_and(|b| b.contains("dev='vda'"))
+    })?;
+    let driver = block.split("<driver ").nth(1)?.split('>').next()?;
+    let rest = driver.split("type='").nth(1)?;
+    Some(rest.split('\'').next()?.to_string())
+}
+
+/// Whether the live XML's `vda` carries a mirror libvirt marked ready.
+fn mirror_ready(xml: &str, disk: &str) -> bool {
+    xml.split("<disk ")
+        .filter(|block| block.contains(&format!("dev='{disk}'")))
+        .any(|block| {
+            block.split("<mirror ").nth(1).is_some_and(|m| {
+                m.split('>')
+                    .next()
+                    .is_some_and(|a| a.contains("ready='yes'"))
+            })
+        })
 }
 
 /// Run a built `virsh` command, mapping a spawn failure or a non-zero
@@ -387,6 +473,71 @@ impl LibvirtDriver for VirshDriver {
         cmd.arg("dumpxml").arg(id.as_str());
         run_virsh(cmd, "dumpxml").await
     }
+
+    async fn domain_xml_inactive(&self, id: &DomainId) -> Result<String> {
+        let mut cmd = self.virsh();
+        cmd.arg("dumpxml")
+            .arg("--inactive")
+            .arg("--security-info")
+            .arg(id.as_str());
+        run_virsh(cmd, "dumpxml-inactive").await
+    }
+
+    async fn blockcopy_start(
+        &self,
+        id: &DomainId,
+        disk: &str,
+        dest_xml: &std::path::Path,
+        bandwidth_mib_s: u32,
+    ) -> Result<()> {
+        let mut cmd = self.virsh();
+        cmd.arg("blockcopy")
+            .arg(id.as_str())
+            .arg(disk)
+            .arg("--xml")
+            .arg(dest_xml)
+            .arg("--reuse-external")
+            .arg("--transient-job")
+            .arg("--bandwidth")
+            .arg(bandwidth_mib_s.to_string());
+        run_virsh(cmd, "blockcopy").await.map(|_| ())
+    }
+
+    async fn blockjob_info(&self, id: &DomainId, disk: &str) -> Result<Option<BlockJobInfo>> {
+        let mut cmd = self.virsh();
+        cmd.arg("blockjob")
+            .arg(id.as_str())
+            .arg(disk)
+            .arg("--info")
+            .arg("--raw");
+        let out = run_virsh(cmd, "blockjob-info").await?;
+        let Some((cur, end)) = parse_blockjob_raw(&out) else {
+            return Ok(None);
+        };
+        let ready = mirror_ready(&self.domain_xml(id).await?, disk);
+        Ok(Some(BlockJobInfo { cur, end, ready }))
+    }
+
+    async fn blockjob_pivot(&self, id: &DomainId, disk: &str) -> Result<()> {
+        let mut cmd = self.virsh();
+        cmd.arg("blockjob")
+            .arg(id.as_str())
+            .arg(disk)
+            .arg("--pivot");
+        run_virsh(cmd, "blockjob-pivot").await.map(|_| ())
+    }
+
+    async fn blockjob_abort(&self, id: &DomainId, disk: &str) -> Result<()> {
+        if self.blockjob_info(id, disk).await?.is_none() {
+            return Ok(());
+        }
+        let mut cmd = self.virsh();
+        cmd.arg("blockjob")
+            .arg(id.as_str())
+            .arg(disk)
+            .arg("--abort");
+        run_virsh(cmd, "blockjob-abort").await.map(|_| ())
+    }
 }
 
 /// In-memory test double — no `virsh`, no libvirt, deterministic.
@@ -420,6 +571,28 @@ pub struct MockLibvirtDriver {
     /// falling back to the real map — lets a test change a domain's state
     /// between two reads (a start racing a check).
     scripted_states: Mutex<std::collections::VecDeque<DomainState>>,
+    /// The LIVE definition where it differs from the persistent one (after
+    /// a pivot): `domain_xml` serves it, `domain_xml_inactive` never does.
+    live_xml: Mutex<HashMap<DomainId, String>>,
+    /// The block job on each domain's `vda` (one at a time).
+    jobs: Mutex<HashMap<DomainId, MockBlockJob>>,
+    /// The next `blockjob_pivot` fails.
+    fail_pivot: std::sync::atomic::AtomicBool,
+    fail_abort: std::sync::atomic::AtomicBool,
+    /// The next pivot happens, but its answer times out.
+    pivot_times_out: std::sync::atomic::AtomicBool,
+    /// The next blockcopy times out, its job showing up only after this
+    /// many `blockjob --info` calls (0 = no late job).
+    late_job: Mutex<Option<(usize, std::path::PathBuf)>>,
+    /// How many of the next `domain_xml` calls fail (a stressed libvirtd).
+    domain_xml_failures: AtomicUsize,
+}
+
+/// A [`MockLibvirtDriver`] block copy.
+#[derive(Debug, Clone)]
+struct MockBlockJob {
+    dest: std::path::PathBuf,
+    info: BlockJobInfo,
 }
 
 impl MockLibvirtDriver {
@@ -434,6 +607,13 @@ impl MockLibvirtDriver {
             undefine_calls: AtomicUsize::new(0),
             cid_conflicts_remaining: AtomicUsize::new(0),
             scripted_states: Mutex::new(std::collections::VecDeque::new()),
+            live_xml: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(HashMap::new()),
+            fail_pivot: std::sync::atomic::AtomicBool::new(false),
+            fail_abort: std::sync::atomic::AtomicBool::new(false),
+            pivot_times_out: std::sync::atomic::AtomicBool::new(false),
+            late_job: Mutex::new(None),
+            domain_xml_failures: AtomicUsize::new(0),
         }
     }
 
@@ -449,6 +629,13 @@ impl MockLibvirtDriver {
             undefine_calls: AtomicUsize::new(0),
             cid_conflicts_remaining: AtomicUsize::new(0),
             scripted_states: Mutex::new(std::collections::VecDeque::new()),
+            live_xml: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(HashMap::new()),
+            fail_pivot: std::sync::atomic::AtomicBool::new(false),
+            fail_abort: std::sync::atomic::AtomicBool::new(false),
+            pivot_times_out: std::sync::atomic::AtomicBool::new(false),
+            late_job: Mutex::new(None),
+            domain_xml_failures: AtomicUsize::new(0),
         }
     }
 
@@ -516,6 +703,69 @@ impl MockLibvirtDriver {
     /// initiate, so the in-process handle lingers while libvirt no
     /// longer runs the domain. Test helper for the idempotent-admission
     /// reclaim path in `CvmLifecycle::launch`.
+    /// The domain's block job copied `cur` of `end` bytes, `ready` or not.
+    pub fn set_block_job(&self, id: &DomainId, cur: u64, end: u64, ready: bool) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            if let Some(job) = jobs.get_mut(id) {
+                job.info = BlockJobInfo { cur, end, ready };
+            }
+        }
+    }
+
+    /// The domain's block job dies (libvirtd restarted, QEMU exited): no
+    /// job, nothing pivoted.
+    pub fn kill_block_job(&self, id: &DomainId) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(id);
+        }
+    }
+
+    /// Whether the domain has a block job.
+    pub fn has_block_job(&self, id: &DomainId) -> bool {
+        self.jobs.lock().is_ok_and(|j| j.contains_key(id))
+    }
+
+    /// The next `n` `domain_xml` calls fail.
+    pub fn fail_domain_xml(&self, n: usize) {
+        self.domain_xml_failures.store(n, Ordering::Relaxed);
+    }
+
+    /// The next pivot fails.
+    pub fn fail_next_pivot(&self) {
+        self.fail_pivot.store(true, Ordering::Relaxed);
+    }
+
+    /// What the running domain's live definition says from now on.
+    pub fn set_live_xml(&self, id: &DomainId, xml: &str) {
+        if let Ok(mut live) = self.live_xml.lock() {
+            live.insert(id.clone(), xml.to_string());
+        }
+    }
+
+    /// The next pivot lands, but its answer times out.
+    pub fn pivot_lands_then_times_out(&self) {
+        self.pivot_times_out.store(true, Ordering::Relaxed);
+    }
+
+    /// The next blockcopy answers a timeout; its job appears after
+    /// `after_infos` `blockjob --info` calls.
+    pub fn blockcopy_times_out_job_appears_after(&self, after_infos: usize) {
+        if let Ok(mut late) = self.late_job.lock() {
+            *late = Some((after_infos, std::path::PathBuf::new()));
+        }
+    }
+
+    /// A late job armed by [`Self::blockcopy_times_out_job_appears_after`]
+    /// that never showed up (nobody looked for it).
+    pub fn late_job_pending(&self) -> bool {
+        self.late_job.lock().map(|l| l.is_some()).unwrap_or(true)
+    }
+
+    /// The next `blockjob --abort` fails (a job libvirt is pivoting).
+    pub fn fail_next_abort(&self) {
+        self.fail_abort.store(true, Ordering::Relaxed);
+    }
+
     pub fn force_all_to_state(&self, state: DomainState) -> Result<()> {
         let mut domains = self
             .domains
@@ -590,6 +840,13 @@ impl LibvirtDriver for MockLibvirtDriver {
             .get_mut(id)
             .ok_or(MinerAgentError::LibvirtDriver("destroy"))?;
         *state = DomainState::ShutOff;
+        // QEMU is gone: so is its block job and its live definition.
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(id);
+        }
+        if let Ok(mut live) = self.live_xml.lock() {
+            live.remove(id);
+        }
         Ok(())
     }
 
@@ -640,6 +897,23 @@ impl LibvirtDriver for MockLibvirtDriver {
     }
 
     async fn domain_xml(&self, id: &DomainId) -> Result<String> {
+        if self
+            .domain_xml_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(MinerAgentError::LibvirtDriver("dumpxml"));
+        }
+        if let Some(live) = self
+            .live_xml
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .get(id)
+        {
+            return Ok(live.clone());
+        }
         self.xml
             .lock()
             .map_err(|_| MinerAgentError::LockPoisoned)?
@@ -647,6 +921,190 @@ impl LibvirtDriver for MockLibvirtDriver {
             .cloned()
             .ok_or(MinerAgentError::LibvirtDriver("dumpxml"))
     }
+
+    async fn domain_xml_inactive(&self, id: &DomainId) -> Result<String> {
+        self.xml
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .get(id)
+            .cloned()
+            .ok_or(MinerAgentError::LibvirtDriver("dumpxml-inactive"))
+    }
+
+    async fn blockcopy_start(
+        &self,
+        id: &DomainId,
+        disk: &str,
+        dest_xml: &std::path::Path,
+        _bandwidth_mib_s: u32,
+    ) -> Result<()> {
+        if disk != "vda" || self.query_domain_state(id).await? != DomainState::Running {
+            return Err(MinerAgentError::LibvirtDriver("blockcopy"));
+        }
+        let xml = std::fs::read_to_string(dest_xml)
+            .map_err(|_| MinerAgentError::LibvirtDriver("blockcopy"))?;
+        let dest = xml
+            .split("file='")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .ok_or(MinerAgentError::LibvirtDriver("blockcopy"))?;
+        let dest = std::path::PathBuf::from(dest);
+        if !dest.is_file() {
+            // `--reuse-external`: the file must exist.
+            return Err(MinerAgentError::LibvirtDriver("blockcopy"));
+        }
+        {
+            let mut late = self
+                .late_job
+                .lock()
+                .map_err(|_| MinerAgentError::LockPoisoned)?;
+            if let Some((after, _)) = late.take() {
+                *late = Some((after, dest));
+                return Err(MinerAgentError::StorageMove("move-libvirt-timeout"));
+            }
+        }
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?;
+        if jobs.contains_key(id) {
+            return Err(MinerAgentError::LibvirtDriver("blockcopy"));
+        }
+        jobs.insert(
+            id.clone(),
+            MockBlockJob {
+                dest,
+                info: BlockJobInfo {
+                    cur: 0,
+                    end: 1,
+                    ready: false,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    async fn blockjob_info(&self, id: &DomainId, _disk: &str) -> Result<Option<BlockJobInfo>> {
+        {
+            let mut late = self
+                .late_job
+                .lock()
+                .map_err(|_| MinerAgentError::LockPoisoned)?;
+            if let Some((after, dest)) = late.take() {
+                if dest.as_os_str().is_empty() {
+                    // Armed, the blockcopy not sent yet.
+                    *late = Some((after, dest));
+                } else if after == 0 {
+                    self.jobs
+                        .lock()
+                        .map_err(|_| MinerAgentError::LockPoisoned)?
+                        .insert(
+                            id.clone(),
+                            MockBlockJob {
+                                dest,
+                                info: BlockJobInfo {
+                                    cur: 0,
+                                    end: 1,
+                                    ready: false,
+                                },
+                            },
+                        );
+                } else {
+                    *late = Some((after - 1, dest));
+                }
+            }
+        }
+        Ok(self
+            .jobs
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .get(id)
+            .map(|j| j.info))
+    }
+
+    async fn blockjob_pivot(&self, id: &DomainId, _disk: &str) -> Result<()> {
+        if self.fail_pivot.swap(false, Ordering::Relaxed) {
+            return Err(MinerAgentError::LibvirtDriver("blockjob-pivot"));
+        }
+        let job = {
+            let jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| MinerAgentError::LockPoisoned)?;
+            match jobs.get(id) {
+                Some(job) if job.info.ready => job.clone(),
+                _ => return Err(MinerAgentError::LibvirtDriver("blockjob-pivot")),
+            }
+        };
+        // The live definition now names the copy; the persistent one is
+        // unchanged (`--transient-job`).
+        let current = {
+            let live = self
+                .live_xml
+                .lock()
+                .map_err(|_| MinerAgentError::LockPoisoned)?;
+            match live.get(id) {
+                Some(xml) => xml.clone(),
+                None => self
+                    .xml
+                    .lock()
+                    .map_err(|_| MinerAgentError::LockPoisoned)?
+                    .get(id)
+                    .cloned()
+                    .ok_or(MinerAgentError::LibvirtDriver("blockjob-pivot"))?,
+            }
+        };
+        let pivoted = replace_vda_source(&current, &job.dest)
+            .ok_or(MinerAgentError::LibvirtDriver("blockjob-pivot"))?;
+        self.live_xml
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .insert(id.clone(), pivoted);
+        self.jobs
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .remove(id);
+        if self.pivot_times_out.swap(false, Ordering::Relaxed) {
+            return Err(MinerAgentError::StorageMove("move-libvirt-timeout"));
+        }
+        Ok(())
+    }
+
+    async fn blockjob_abort(&self, id: &DomainId, _disk: &str) -> Result<()> {
+        if self.fail_abort.swap(false, Ordering::Relaxed) {
+            return Err(MinerAgentError::LibvirtDriver("blockjob-abort"));
+        }
+        self.jobs
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?
+            .remove(id);
+        Ok(())
+    }
+}
+
+/// `xml` with the `vda` disk's `<source file=…>` set to `path` (the first
+/// source of the vda block); `None` if there is no such source.
+pub(crate) fn replace_vda_source(xml: &str, path: &std::path::Path) -> Option<String> {
+    let start = xml.match_indices("<disk ").map(|(i, _)| i).find(|&i| {
+        xml[i..]
+            .split("</disk>")
+            .next()
+            .is_some_and(|b| b.contains("dev='vda'"))
+    })?;
+    let block_end = start + xml[start..].find("</disk>")?;
+    let rel = xml[start..block_end].find("<source file='")?;
+    let value_start = start + rel + "<source file='".len();
+    let value_end = value_start + xml[value_start..].find('\'')?;
+    let path = path.to_str()?;
+    if path.contains(['\'', '<', '>', '&', '"']) {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        &xml[..value_start],
+        path,
+        &xml[value_end..]
+    ))
 }
 
 #[cfg(test)]

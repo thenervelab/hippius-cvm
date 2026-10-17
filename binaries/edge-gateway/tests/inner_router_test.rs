@@ -343,6 +343,58 @@ async fn a_storage_config_vector_is_signed_and_decodes_on_the_miner() {
     }
 }
 
+/// `move-vm-storage`: the ticket-validator's encoded bodies from the shared
+/// vector are signed verbatim, forwarded under their kind, and verify and
+/// decode on the miner-agent side into its `MoveVmStorageOrder`.
+#[tokio::test]
+async fn a_move_vm_storage_vector_is_signed_and_decodes_on_the_miner() {
+    use hippius_miner_agent::orders::types::{OrderBody, SignedOrder};
+    use hippius_miner_agent::orders::{MoveVmStorageOrder, OrderVerifier};
+    use serde_bytes::ByteBuf;
+
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_vectors/orders/move_vm_storage_v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let signer = test_signer();
+    let verifier =
+        OrderVerifier::from_hex(&hex::encode(signer.verifying_key().to_bytes())).unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+        let mock = Arc::new(MockMinerForward::with_response(200, Vec::new()));
+        let forward: Arc<dyn MinerForward> = mock.clone();
+        let (status, _) = post(
+            signer.clone(),
+            forward,
+            "100.100.100.100:9700",
+            "move-vm-storage",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}");
+        let calls = mock.calls();
+        assert_eq!(calls[0].kind, OrderKind::MoveVmStorage, "{name}");
+        assert_eq!(calls[0].body, body, "{name}");
+        let signed = SignedOrder {
+            body: ByteBuf::from(calls[0].body.clone()),
+            sig: ByteBuf::from(calls[0].sig.to_vec()),
+        };
+        verifier.verify(&signed).unwrap();
+        let order: OrderBody<MoveVmStorageOrder> =
+            ciborium::de::from_reader(body.as_slice()).unwrap();
+        assert_eq!(
+            order.payload.move_id,
+            case["payload"]["move_id"].as_str().unwrap(),
+            "{name}"
+        );
+    }
+}
+
 /// A `storage-config` refusal is a 422 with a short machine body naming
 /// the code and the pool (`{"code","pool"}`); the dashboard shows it, so
 /// the Edge must relay it unchanged.

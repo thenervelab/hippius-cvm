@@ -306,12 +306,18 @@ def _short(exc: Exception, limit: int = 180) -> str:
 
 
 def _has_active_job(
-    vm: Vm, *, ignore_resize: bool = False, ignore_guest_upgrade: bool = False
+    vm: Vm,
+    *,
+    ignore_resize: bool = False,
+    ignore_guest_upgrade: bool = False,
+    ignore_storage_move: bool = False,
 ) -> bool:
     """True iff the VM already has an in-flight migration, decommission,
-    resize, userdata restage, or a guest upgrade that holds it (past
+    resize, userdata restage, a guest upgrade that holds it (past
     `pending`; a pending upgrade waits for its window and re-checks
-    everything when it leaves it — `apps.orchestration.guest_upgrade`).
+    everything when it leaves it — `apps.orchestration.guest_upgrade`),
+    or a live storage move (`apps.disktier.storage_move`; a §24 passes
+    `ignore_storage_move`: the agent's destroy aborts the copy).
 
     Same-kind double-starts are closed at the database by each
     model's partial unique index. A cross-kind race (a migration and
@@ -351,6 +357,12 @@ def _has_active_job(
         .exists()
     ):
         return True
+    # A storage move owns the VM's OS disk until it ends.
+    if not ignore_storage_move:
+        from apps.disktier.storage_move import in_flight as storage_move_in_flight
+
+        if storage_move_in_flight(vm):
+            return True
     # A guest upgrade owns the VM's power state and launch record from the
     # moment it leaves `pending` until it ends.
     from .models import HOLDING_GUEST_UPGRADE_STATES, GuestUpgradeJob
@@ -983,14 +995,14 @@ def start_decommission(*, vm: Vm, decided_by: Any) -> DecommissionJob:
     """Create a §24 `DecommissionJob` in `Draining`. Raises `StartError`."""
     if vm.state != VmState.ACTIVE:
         raise StartError(f"vm is {vm.state!r}, not Active", "vm-not-active")
-    if _has_active_job(vm):
+    if _has_active_job(vm, ignore_storage_move=True):
         raise StartError("vm already has an in-flight orchestration job", "job-in-flight")
     now = timezone.now()
     try:
         with transaction.atomic():
             # Re-checked under the VM's row lock (see `start_migration`).
             Vm.objects.select_for_update().filter(pk=vm.pk).first()
-            if _has_active_job(vm):
+            if _has_active_job(vm, ignore_storage_move=True):
                 raise StartError("vm already has an in-flight orchestration job", "job-in-flight")
             job = DecommissionJob.objects.create(
                 job_id=secrets.token_hex(16),
@@ -1285,7 +1297,9 @@ def sweep_live_vm_placements() -> int:
     repaired = 0
     for drift in live_vm_placement_drift():
         vm = drift.vm
-        if _has_active_job(vm) or (
+        # A storage move does not hold the re-bind: it is on the same host,
+        # and the move waits for a bound placement to release its source.
+        if _has_active_job(vm, ignore_storage_move=True) or (
             LaunchJob.objects.filter(vm_id=vm.vm_id)
             .exclude(state__in=TERMINAL_LAUNCH_STATES)
             .exists()
@@ -2040,8 +2054,9 @@ def _reboot_recovery_step(vm: Vm, *, now: Any, cutoff: Any) -> bool:
     ):
         return False
 
-    # (3) No competing lifecycle job for this VM.
-    if _has_active_job(vm):
+    # (3) No competing lifecycle job for this VM. A storage move is not one:
+    # the agent settles it before any restart (`settle_move_before_restart`).
+    if _has_active_job(vm, ignore_storage_move=True):
         return False
     if LaunchJob.objects.filter(vm_id=vm.vm_id).exclude(state__in=TERMINAL_LAUNCH_STATES).exists():
         return False
@@ -2362,7 +2377,7 @@ def _reboot_recovery_fire(
         from .models import TERMINAL_LAUNCH_STATES, LaunchJob
 
         if (
-            _has_active_job(vm)
+            _has_active_job(vm, ignore_storage_move=True)
             or LaunchJob.objects.filter(vm_id=vm.vm_id)
             .exclude(state__in=TERMINAL_LAUNCH_STATES)
             .exists()
@@ -3768,6 +3783,15 @@ def tick_once() -> TickReport:
         reconcile_storage_configs()
     except Exception:  # noqa: BLE001 — the sweep must not break the tick.
         log.exception("storage-config: unhandled error in reconcile")
+
+    # Live storage moves: start, follow, verify and release each one.
+    # Inert unless VALI_STORAGE_MOVE_ENABLED.
+    try:
+        from apps.disktier.storage_move import reconcile as reconcile_storage_moves
+
+        reconcile_storage_moves()
+    except Exception:  # noqa: BLE001 — the sweep must not break the tick.
+        log.exception("storage-move: unhandled error in reconcile")
 
     # The CDN fleet: launch, ready, drain and replace nodes per region.
     # Inert unless VALI_CDN_ENABLED and VALI_CDN_RECONCILE_ENABLED.
