@@ -2081,6 +2081,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "hex",
+ "hippius-host-inventory",
  "hippius-miner-agent",
  "hippius-onchain-registry",
  "hippius-types",
@@ -2146,6 +2147,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "hippius-host-inventory"
+version = "0.0.1"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "hippius-types",
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]
@@ -2284,6 +2297,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "hippius-host-inventory",
  "hippius-image-provenance",
  "hippius-miner-uki-fetch",
  "hippius-types",
@@ -2364,6 +2378,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hippius-guest",
+ "hippius-host-inventory",
  "hippius-onchain-registry",
  "hippius-types",
  "kbs-core",

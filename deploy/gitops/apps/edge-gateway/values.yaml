@@ -18,7 +18,7 @@ image:
   # nor alerts; it goes quietly inert, and tenants never come back after a
   # host reboot. Roll new order kinds (backup, restore, §25 snapshots) on
   # the Edge BEFORE the vali release that dispatches them.
-  digest: "sha256:9d7db9e7d183ee951c609a08da6ad902ae2136650a6796c1a6280168d1e1e898"
+  digest: "sha256:f5b55b50419194189d2c343d0a7a14dfbaef7c7e077fee93bd930148e999c2b6"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED, not a comment: `.github/scripts/verify_image_
   # provenance.py` runs `cosign verify` with these exact values as
@@ -32,8 +32,8 @@ image:
     # Fulcio SAN on the signature — workflow AND the git ref it ran on.
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/edge-image.yml@refs/heads/main"
     # `githubWorkflowSha` on the signing cert — the exact source commit.
-    commitSha: "df21723827bef9bf7d3a7b6e51b923b83b3030bb"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38867012842/attempts/1"
+    commitSha: "ae55adc306ec3f25e7458754cafce0aeca95a241"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39054678063/attempts/1"
     # false ⇒ built from a ref other than refs/heads/main, i.e. from a
     # tree that is NOT in this repo's history.
     mergedSource: true

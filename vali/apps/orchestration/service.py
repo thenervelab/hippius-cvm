@@ -3869,6 +3869,52 @@ def tick_once() -> TickReport:
 # ─── idempotency-guarded side-effects ────────────────────────────────
 
 
+#: A §25 dest's refusal of the named pool BEFORE it recorded anything:
+#: its arrival placement (`place_arriving`) refused the pool, reported as
+#: the agent error itself (`cvm-pool-unavailable:<pool>`,
+#: `cvm-insufficient-disk[:<pool>]`). NOT `migration/dest-pool-unavailable`
+#: / `dest-insufficient-disk`: those are the launch's refusals, after the
+#: dest recorded the pool — that record then wins, the pin must stay.
+_DEST_POOL_REFUSED_BEFORE_RECORD = ("cvm-pool-unavailable", "cvm-insufficient-disk")
+
+
+def _pin_dest_os_pool(job: MigrationJob) -> str | None:
+    """A4b: the pool the destination's activate order names, chosen once
+    and pinned on the job before the first dispatch (write-ahead): a retry
+    — whose first try the dest may have applied, recording that pool — must
+    name the same one. `None` = none (`default`)."""
+    if not job.dest_os_pool_pinned:
+        # A job whose first order went out before this pin existed (carried
+        # over a deploy): what it named is unknown — none is recorded.
+        chosen = (
+            ""
+            if _attempt_dispatched(job, 0)
+            else effects.arrival_os_pool(job.vm, job.dest_node_id) or ""
+        )
+        MigrationJob.objects.filter(pk=job.pk, dest_os_pool_pinned=False).update(
+            dest_os_pool=chosen, dest_os_pool_pinned=True
+        )
+        job.refresh_from_db(fields=["dest_os_pool", "dest_os_pool_pinned"])
+    return job.dest_os_pool or None
+
+
+def _record_dest_os_pool(job: MigrationJob, placement: Any) -> None:
+    """A4b: the destination placement's OS disk is on the pool the activate
+    order named (none named: `default`, no row). Attribution only (passive
+    disk stats): a failure is logged, never fails the activation."""
+    if placement is None or not job.dest_os_pool:
+        return
+    try:
+        from apps.orchestration.services.launch import _record_os_pool
+
+        with transaction.atomic():
+            _record_os_pool(placement, job.dest_os_pool)
+    except Exception:  # noqa: BLE001 — attribution must not break custody.
+        log.exception(
+            "migration: job=%s dest os pool %s not recorded", job.job_id, job.dest_os_pool
+        )
+
+
 def _guarded(key: str, effect: Callable[[], None]) -> None:
     """Run an external side-effect, deduplicated across tick retries.
 
@@ -5450,7 +5496,7 @@ def _activate_dest_vm(job: MigrationJob) -> None:
         )
 
         try:
-            move_placement_to_node(
+            moved = move_placement_to_node(
                 vm,
                 node_id=dest_chain_node_id,
                 decided_by=job.decided_by,
@@ -5473,6 +5519,7 @@ def _activate_dest_vm(job: MigrationJob) -> None:
             # re-drives the activation. Half-moving custody is the one
             # outcome this must never produce.
             raise EffectError(str(exc)) from exc
+        _record_dest_os_pool(job, moved)
         # REBOOT-RECOVERY SCOPE — same transaction, same winning branch,
         # for the same reason as the two blocks above: `RebootRecovery`
         # holds HOST-scoped state (the relaunch cap, the backoff window,
@@ -6143,11 +6190,13 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
             # chain is set.
             backup_chain = _restore().failover_chain(job)
             get_url = backup_chain["full"]["url"]
+        os_pool = _pin_dest_os_pool(job)
         _guarded(
             _mig_key(job, _dispatch_step(attempt)),
             lambda: effects.dispatch_migrate_activate(
                 job.vm,
                 dest_node_id=job.dest_node_id,
+                os_pool=os_pool,
                 new_gen=job.new_gen,
                 get_url=get_url,
                 state_get_url=state_get_url,
@@ -6214,6 +6263,13 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
             _mig_key(job, _failure_step(attempt)),
             lambda: _record_dest_activation_failure(job, failure_class),
         )
+        refused = (failure_class or "").strip().lower()
+        if refused.startswith(_DEST_POOL_REFUSED_BEFORE_RECORD) and job.dest_os_pool:
+            # The dest refused the named pool before recording anything
+            # (A4b, as a launch's `_retry_os_pool`): the next attempt names
+            # none, the dest's launch pool.
+            MigrationJob.objects.filter(pk=job.pk).update(dest_os_pool="")
+            job.dest_os_pool = ""
         if (
             job.kind != MigrationKind.MIGRATE.value
             and failure_class in _TERMINAL_RESTORE_ACTIVATION_CLASSES

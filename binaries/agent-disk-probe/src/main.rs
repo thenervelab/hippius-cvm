@@ -12,7 +12,13 @@ use hippius_agent_disk_probe::result::{self, Host};
 const RESULT_PATH: &str = "/run/hippius/disk-probe/result.cbor";
 
 fn main() -> std::process::ExitCode {
-    let req = match Request::load(std::path::Path::new(REQUEST_PATH)) {
+    // Up to 30 s for a request the path unit saw created but not yet
+    // written (the unit's `-` prefix means a refusal is not retried).
+    let req = match Request::load_settled(
+        std::path::Path::new(REQUEST_PATH),
+        30,
+        Duration::from_secs(1),
+    ) {
         Ok(Some(req)) => req,
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(e) => {

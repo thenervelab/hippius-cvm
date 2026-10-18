@@ -1,6 +1,7 @@
 """The miner-agent config template's storage rendering
 (`miner_storage_pools`, `miner_storage_dedicated_disks`,
-`miner_heartbeat_emit_pools`).
+`miner_heartbeat_emit_pools`) and its `[inventory]` switch
+(`miner_inventory_enabled`).
 
 Renders `templates/miner-agent-config.toml.j2` the way Ansible does
 (Jinja2, `trim_blocks`, the `bool` filter) and checks the TOML. With
@@ -57,6 +58,8 @@ def render(**overrides: object) -> str:
         "ansible_processor_vcpus": 32,
         "ansible_memtotal_mb": 131072,
         "miner_data_fs_gb": 1000,
+        "miner_data_disk_reserve_gb": 100,
+        "miner_cvm_disk_budget_gb": 900,
         "miner_data_fs_mount": "/",
         "host_cvm": {
             "reserve_cpus": 2,
@@ -79,6 +82,16 @@ NVME0 = {"id": "nvme0", "class": "nvme", "budget_gb": 3200, "source": "/mnt/hipp
 
 
 class StorageRenderingTest(unittest.TestCase):
+    def test_the_disk_budget_is_the_derived_fact(self) -> None:
+        # miner-tasks/disk-budget.yml derives it (#1641; its wiring test
+        # covers usable − reserve and the clamp): the template renders it
+        # for [host] and for the `default` pool alike.
+        cfg = tomllib.loads(
+            render(miner_cvm_disk_budget_gb=698, miner_storage_pools=[NVME0])
+        )
+        self.assertEqual(cfg["host"]["cvm_disk_gb_budget"], 698)
+        self.assertEqual(cfg["storage"]["pools"][0]["budget_gb"], 698)
+
     def test_nothing_declared_renders_no_pool_no_disk_no_v7(self) -> None:
         cfg = tomllib.loads(render())
         self.assertNotIn("pools", cfg["storage"])
@@ -128,13 +141,6 @@ class StorageRenderingTest(unittest.TestCase):
         )
         self.assertIs(cfg["heartbeat"]["emit_pools"], True)
 
-    def test_the_default_budget_follows_a_host_override(self) -> None:
-        cfg = tomllib.loads(
-            render(miner_storage_pools=[NVME0], host_cvm_overrides={"disk_gb_budget_max": 500})
-        )
-        self.assertEqual(cfg["host"]["cvm_disk_gb_budget"], 500)
-        self.assertEqual(cfg["storage"]["pools"][0]["budget_gb"], 500)
-
     def test_dedicated_disks_render_without_pools(self) -> None:
         cfg = tomllib.loads(
             render(
@@ -175,6 +181,46 @@ class StorageRenderingTest(unittest.TestCase):
         report = json.loads(out.stdout)
         self.assertIsNone(report["storage_error"], report)
         self.assertEqual([p["id"] for p in report["pools"]], ["default", "nvme0"])
+
+
+
+class InventoryRenderingTest(unittest.TestCase):
+    """`[inventory]` follows `miner_inventory_enabled`: absent when off
+    (an agent older than the table refuses it; off is the agent's
+    default), `enabled = true` when on, nothing else (the cadence
+    defaults live in the agent)."""
+
+    def test_off_by_default_renders_no_inventory_table(self) -> None:
+        for overrides in ({}, {"miner_inventory_enabled": False},
+                          {"miner_inventory_enabled": "false"}):
+            doc = tomllib.loads(render(**overrides))
+            self.assertNotIn("inventory", doc, overrides)
+
+    def test_on_renders_enabled_true_and_nothing_else(self) -> None:
+        for value in (True, "true", "yes"):
+            doc = tomllib.loads(render(miner_inventory_enabled=value))
+            self.assertEqual(doc["inventory"], {"enabled": True}, value)
+            # The table sits beside the others, not inside one.
+            self.assertNotIn("enabled", doc.get("storage", {}))
+
+    @unittest.skipUnless(os.environ.get("AGENT_BIN"), "AGENT_BIN not set")
+    def test_the_agent_accepts_the_inventory_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "config.toml"
+            config.write_text(render(miner_inventory_enabled=True))
+            facts = pathlib.Path(tmp) / "facts.json"
+            subprocess.run(
+                [os.environ["AGENT_BIN"], "storage-collect", "--out", str(facts)],
+                check=True,
+            )
+            out = subprocess.run(
+                [os.environ["AGENT_BIN"], "storage-check", "--config", str(config),
+                 "--facts", str(facts)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertIsNone(json.loads(out.stdout)["storage_error"])
 
 
 if __name__ == "__main__":

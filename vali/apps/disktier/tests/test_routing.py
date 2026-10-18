@@ -268,9 +268,38 @@ def test_a_same_miner_retry_names_the_first_pool_unless_it_was_refused(monkeypat
             chosen_os_pool="nvme0",
         )
 
-    assert launch._retry_os_pool(failed("dispatch-failed")) == "nvme0"
-    assert launch._retry_os_pool(failed("insufficient-disk:nvme0")) is None
-    assert launch._retry_os_pool(failed("pool-unavailable:nvme0")) is None
+    spec = _spec()
+    assert launch._retry_os_pool(spec, failed("dispatch-failed")) == "nvme0"
+    assert launch._retry_os_pool(spec, failed("insufficient-disk:nvme0")) is None
+    assert launch._retry_os_pool(spec, failed("pool-unavailable:nvme0")) is None
+    # The disk probe's pinned pool: named again even when refused (the
+    # probe measures that pool or nothing), and `default` stays unnamed.
+    pinned = _spec(pinned_os_pool="nvme0")
+    assert launch._retry_os_pool(pinned, failed("dispatch-failed")) == "nvme0"
+    assert launch._retry_os_pool(pinned, failed("insufficient-disk:nvme0")) == "nvme0"
+    assert launch._retry_os_pool(pinned, failed("pool-unavailable:nvme0")) == "nvme0"
+    on_default = _spec(pinned_os_pool="default")
+    assert launch._retry_os_pool(on_default, failed("dispatch-failed")) is None
+
+
+@override_settings(VALI_POOL_ROUTING_MIN_AGENT_VERSION=MIN)
+def test_a_pinned_pool_is_named_instead_of_chosen(monkeypatch) -> None:
+    """The disk probe's pin (`pinned_os_pool`) wins over the chooser: a
+    pool the chooser would never pick (below the sold tier) is named in
+    the preflight and the launch, and a `default` pin names none although
+    the chooser would pick nvme0."""
+    miner, seen = _rig(monkeypatch)
+    _pool("slow0", node_id=miner.chain_node_id, declared_class="hdd")
+    out = launch.launch_on_miner(_spec(pinned_os_pool="slow0"), miner)
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert seen == {"preflight": ["slow0"], "launch": ["slow0"]}
+    assert out.os_pool == "slow0"
+    seen["preflight"].clear()
+    seen["launch"].clear()
+    out = launch.launch_on_miner(_spec(pinned_os_pool="default"), miner)
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert seen == {"preflight": [None], "launch": [None]}
+    assert out.os_pool is None
 
 
 @override_settings(VALI_POOL_ROUTING_MIN_AGENT_VERSION=MIN)
@@ -289,6 +318,11 @@ def test_a_relaunch_or_a_legacy_launch_names_no_pool(monkeypatch) -> None:
     )
     assert out.disposition == launch.ACCEPTED, out.emit
     assert seen == {"preflight": [None, None], "launch": [None, None]}
+    # A relaunch of a pinned spec names nothing either: the miner keeps the
+    # pool its record names.
+    out = launch.launch_on_miner(_spec(pinned_os_pool="nvme0"), miner, require_existing_disks=True)
+    assert out.disposition == launch.ACCEPTED, out.emit
+    assert seen["launch"][-1] is None and seen["preflight"][-1] is None
 
 
 def test_a_bound_placement_records_its_os_pool() -> None:
@@ -354,3 +388,128 @@ def test_the_routing_setting_defaults_to_nobody(settings) -> None:
     _pool("nvme0")
     assert routing.choose_os_pool(NODE, 10) is None
     assert json.dumps(order_dispatch.build_launch_payload(**_LAUNCH)).find("os_pool") == -1
+
+
+def test_a_retry_answered_by_its_own_loops_boot_records_that_pool() -> None:
+    def answered(chosen: str | None) -> launch.LaunchOutcome:
+        return launch.LaunchOutcome(
+            disposition=launch.ACCEPTED,
+            emit={"classifier": "already-launched"},
+            exit_code=0,
+            registered=True,
+            chosen_os_pool=chosen,
+        )
+
+    out = answered("nvme0")
+    launch._own_retry_pool(out, dispatch_retries=1)
+    assert out.os_pool == "nvme0"
+    # A first attempt answered so: an older boot's, pool unknown.
+    out = answered("nvme0")
+    launch._own_retry_pool(out, dispatch_retries=0)
+    assert out.os_pool is None
+    # The retry named no pool (an earlier one was refused): default.
+    out = answered(None)
+    launch._own_retry_pool(out, dispatch_retries=2)
+    assert out.os_pool is None
+
+
+def _activate_rig(monkeypatch) -> list[dict]:
+    from apps.orchestration.services import customer_keys, migration_ticket
+
+    sent: list[dict] = []
+    monkeypatch.setattr(effects, "_miner_identity", lambda n: ("dest-1", "100.64.0.9"))
+    monkeypatch.setattr(migration_ticket, "remint_dest_ticket", lambda *a, **k: b"cose")
+    monkeypatch.setattr(customer_keys, "resolve_for_remint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        effects,
+        "_launch_paths",
+        lambda v: {
+            "ovmf_path": "/o",
+            "kernel_path": "/k",
+            "initrd_path": "/i",
+            "cmdline": f"ro dm-verity.root={'e' * 64} hippius.disk_gb=40",
+            "luks_disk_path": "/d",
+            "luks_disk_size_gb": 10,
+            "rootfs_data_path": "/r",
+            "rootfs_hash_path": "/h",
+            "cpu_count": 2,
+            "memory_mb": 2048,
+        },
+    )
+    monkeypatch.setattr(
+        order_dispatch,
+        "dispatch_order",
+        lambda **kw: (
+            sent.append(json.loads(kw["payload_json"]))
+            or order_dispatch.DispatchResult(ok=True, status=200, classifier="accepted")
+        ),
+    )
+    return sent
+
+
+def test_the_activate_order_names_the_pinned_pool_never_a_new_choice(monkeypatch) -> None:
+    from apps.orchestration.tests.factories import make_vm
+
+    sent = _activate_rig(monkeypatch)
+    vm = make_vm("vm-arrive")
+
+    def no_choice(*a, **k):
+        raise AssertionError("a pinned pool is never chosen again")
+
+    monkeypatch.setattr(effects, "_arrival_os_pool", no_choice)
+    for pinned in ("nvme0", None):
+        effects.dispatch_migrate_activate(
+            vm,
+            dest_node_id="dest-1",
+            new_gen=6,
+            get_url="https://s3/x",
+            boot_artifacts=None,
+            os_pool=pinned,
+        )
+    assert sent[0]["os_pool"] == "nvme0"
+    assert "os_pool" not in sent[1]
+
+
+def test_the_dest_pool_is_pinned_once_and_recorded_at_activation(monkeypatch) -> None:
+    from apps.orchestration import service
+    from apps.orchestration.tests.factories import make_migration_job, make_vm
+    from apps.scheduler.models import PlacementStatus
+    from apps.scheduler.tests.factories import make_placement
+
+    vm = make_vm("vm-pin")
+    job = make_migration_job(vm)
+    choices = iter(["nvme0", "nvme1"])
+    monkeypatch.setattr(effects, "arrival_os_pool", lambda v, dest: next(choices))
+    assert service._pin_dest_os_pool(job) == "nvme0"
+    # A retry: the pinned pool, not a second choice.
+    assert service._pin_dest_os_pool(job) == "nvme0"
+    job.refresh_from_db()
+    assert (job.dest_os_pool, job.dest_os_pool_pinned) == ("nvme0", True)
+
+    placement = make_placement(vm, NODE, status=PlacementStatus.BOUND.value, resource_class="small")
+    service._record_dest_os_pool(job, placement)
+    assert PlacementDisk.objects.get(placement_id=placement.id).pool_id == "nvme0"
+    # No pool named (`default`), or no new row: nothing recorded.
+    other = make_migration_job(make_vm("vm-pin-2"))
+    monkeypatch.setattr(effects, "arrival_os_pool", lambda v, dest: None)
+    assert service._pin_dest_os_pool(other) is None
+    other.refresh_from_db()
+    assert (other.dest_os_pool, other.dest_os_pool_pinned) == ("", True)
+    service._record_dest_os_pool(other, None)
+
+
+def test_a_job_dispatched_before_the_pin_existed_records_no_pool(monkeypatch) -> None:
+    from apps.orchestration import idempotency, service
+    from apps.orchestration.tests.factories import make_migration_job, make_vm
+
+    job = make_migration_job(make_vm("vm-carried"))
+    key = service._mig_key(job, service._dispatch_step(0))
+    idempotency.record(key, idempotency.marker_hash(key))
+
+    def no_choice(*a, **k):
+        raise AssertionError("what the first order named is unknown")
+
+    monkeypatch.setattr(effects, "arrival_os_pool", no_choice)
+    assert service._pin_dest_os_pool(job) is None
+    job.refresh_from_db()
+    assert (job.dest_os_pool, job.dest_os_pool_pinned) == ("", True)

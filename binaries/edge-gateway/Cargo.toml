@@ -130,6 +130,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "
 # (opacity discipline — see `src/forward/miner_forward.rs` module docs).
 hippius-miner-agent = { path = "../miner-agent" }
 serde_bytes = "0.11"
+# §18.10: `tests/miner_router_test.rs` pins the host-inventory route cap to
+# the crate's envelope cap. ONLY a dev-dep: the Edge relays the bytes
+# opaquely and never decodes them.
+hippius-host-inventory = { path = "../../hippius-host-inventory" }
 # PR-H4 — dynamic CA + valid + revoked client cert generation,
 # minted at test start so no test key material lives in git.
 # `crypto` enables the `ring`-backed signing; `pem` enables PEM

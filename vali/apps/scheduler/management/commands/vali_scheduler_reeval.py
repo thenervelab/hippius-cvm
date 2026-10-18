@@ -38,10 +38,16 @@ and `hippius_miner_host_health_reported_timestamp_seconds`, labelled
 push, `hippius_miner_agent_version_info{node_id,miner_id,version} 1` carries
 the release tag of the miner's latest v6 heartbeat (absent before one).
 
+Then the automatic miner approval (`auto_approval`,
+`approval.auto_approve_pending`): with `VALI_MINER_APPROVAL_REQUIRED` and
+`VALI_MINER_AUTO_APPROVE` on, every pending miner that meets the conditions
+is approved (`actor = auto:attested-soak`); one summary line per cycle with
+pending miners. Off, it does nothing.
+
 And the storage-config sync state of every node with a desired storage
 document (`storage_config_survey`, job `vali-storage-config`):
 `hippius_storage_config_sync{node_id,state}`, one-hot over `in_sync`,
-`pending`, `refused`, `agent-unsupported` and `drift`.
+`pending`, `refused`, `agent-unsupported`, `drift` and `held`.
 """
 
 from __future__ import annotations
@@ -194,6 +200,27 @@ def host_health_survey() -> None:
 
 
 M_STORAGE_CONFIG_SYNC = "hippius_storage_config_sync"
+M_POOL_UNAVAILABLE_SINCE = "hippius_storage_pool_unavailable_since_seconds"
+M_POOL_UNAVAILABLE_VMS = "hippius_storage_pool_unavailable_vms"
+M_STORAGE_SURVEY_TS = "hippius_storage_survey_timestamp_seconds"
+
+
+def auto_approval() -> None:
+    """Run the automatic miner approval once. Never raises: a failure is
+    logged and retried next cycle, and never costs the loop its drains."""
+    from apps.scheduler import approval
+
+    try:
+        report = approval.auto_approve_pending()
+    except Exception:  # noqa: BLE001 — the loop must survive.
+        log.exception("automatic miner approval failed")
+        return
+    if report.approved or report.blocked:
+        log.info(
+            "auto-approval: approved=%s still_pending=%s",
+            sorted(report.approved),
+            dict(sorted(report.blocked.items())),
+        )
 
 
 def storage_config_survey() -> None:
@@ -201,9 +228,13 @@ def storage_config_survey() -> None:
     document (`apps.disktier.storage_config`, job `vali-storage-config`):
     `hippius_storage_config_sync{node_id,state} 1` for its current state
     and 0 for the others (`in_sync`, `pending`, `refused`,
-    `agent-unsupported`, `drift`), so an alert can match `== 1`. The
-    refusal code is in the operator API, not in a label. The group is
-    replaced each cycle. Never raises."""
+    `agent-unsupported`, `drift`, `held`), so an alert can match `== 1`. The
+    refusal code is in the operator API, not in a label. Plus every pool
+    off its filesystem while it holds VMs (`apps.disktier.pool_health`,
+    #1638): `hippius_storage_pool_unavailable_since_seconds{node_id,pool,
+    error}` (unix ts) and `…_unavailable_vms{node_id,pool}`, and the
+    report's own timestamp. The group is replaced each cycle. Never
+    raises."""
     try:
         gateway = str(getattr(settings, "VALI_SYNTHETIC_PUSHGATEWAY_URL", "") or "")
         if not gateway:
@@ -211,6 +242,7 @@ def storage_config_survey() -> None:
         from django.utils import timezone
 
         from apps.disktier.models import MinerStorageConfig
+        from apps.disktier.pool_health import unavailable_holding_vms
         from apps.disktier.storage_config import SYNC_STATES, sync_state, sync_status
         from apps.synthetic import metrics
 
@@ -225,6 +257,24 @@ def storage_config_survey() -> None:
                     node_id=row.miner_node_id,
                     state=state,
                 )
+        for pool in unavailable_holding_vms():
+            ms.gauge(
+                M_POOL_UNAVAILABLE_SINCE,
+                int(pool.since.timestamp()),
+                help_text="Since when (unix ts) the node reports the pool unavailable while "
+                "it holds VMs.",
+                node_id=pool.node_id,
+                pool=pool.pool_id,
+                error=pool.error or "unknown",
+            )
+            ms.gauge(
+                M_POOL_UNAVAILABLE_VMS,
+                pool.vms,
+                help_text="VMs vali places on a pool the node reports unavailable.",
+                node_id=pool.node_id,
+                pool=pool.pool_id,
+            )
+        ms.gauge(M_STORAGE_SURVEY_TS, int(now.timestamp()), help_text="Unix ts of this report.")
         metrics.push(
             ms,
             gateway_url=gateway,
@@ -292,6 +342,7 @@ class Command(BaseCommand):
                 log.error("reeval cycle skipped — chain read failed: %s", exc)
             except Exception:  # noqa: BLE001 — daemon loop must survive.
                 log.exception("reeval cycle raised — continuing")
+            auto_approval()
             disk_survey()
             host_health_survey()
             storage_config_survey()

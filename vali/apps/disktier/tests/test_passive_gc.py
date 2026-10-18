@@ -56,6 +56,9 @@ def test_each_table_keeps_its_retention() -> None:
         "disk_passive_event": 1,
         # Only the 1-hour-old dedupe row can still stop a replay.
         "disk_io_receipt": 3,
+        "host_inventory_change": 0,
+        "host_disk_advisory_event": 0,
+        "host_disk_advisory_resolved": 0,
     }
     assert VmDiskIoHourly.objects.count() == 2
     assert MinerDiskHealthHourly.objects.count() == 3

@@ -252,6 +252,123 @@ def test_launch_vm_retries_same_miner_on_post_register_dispatch_failure(
     ).count() == 0
 
 
+def test_a_same_miner_retry_answered_by_its_own_boot_records_its_pool(monkeypatch) -> None:
+    """#1639: the retry finds the domain the first attempt of this launch
+    started (`already-launched`): the placement records the pool both
+    attempts named."""
+    from apps.disktier.models import OS_SLOT, PlacementDisk
+
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    _register_miner(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(launch, "max_dispatch_retries", lambda: 3)
+    answers = [
+        launch.LaunchOutcome(
+            disposition=launch.RETRIABLE,
+            emit={"ok": False, "outcome": "miner-rejected"},
+            exit_code=2,
+            registered=True,
+            chosen_os_pool="nvme0",
+        ),
+        launch.LaunchOutcome(
+            disposition=launch.ACCEPTED,
+            emit={"ok": True, "outcome": "miner-accepted", "classifier": "already-launched"},
+            exit_code=0,
+            registered=True,
+            ticket_id="t",
+            chosen_os_pool="nvme0",
+        ),
+    ]
+    monkeypatch.setattr(launch, "launch_on_miner", lambda spec, miner, **_kw: answers.pop(0))
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.ok is True
+    placement = Placement.objects.get(id=result.placement_id)
+    assert PlacementDisk.objects.get(placement=placement, slot=OS_SLOT).pool_id == "nvme0"
+
+
+def test_a_same_miner_retry_of_a_pinned_launch_keeps_its_pool(monkeypatch) -> None:
+    """The disk probe's pinned pool (`pinned_os_pool`): every same-miner
+    retry names it again, even after the miner refused that pool — never
+    `default`, where the probe would measure the wrong disk."""
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    _register_miner(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(launch, "max_dispatch_retries", lambda: 3)
+    named: list[object] = []
+    answers = [
+        launch.LaunchOutcome(
+            disposition=launch.RETRIABLE,
+            emit={
+                "ok": False,
+                "outcome": "miner-rejected",
+                "classifier": "insufficient-disk:nvme0",
+            },
+            exit_code=2,
+            registered=True,
+            chosen_os_pool="nvme0",
+        ),
+        launch.LaunchOutcome(
+            disposition=launch.RETRIABLE,
+            emit={"ok": False, "outcome": "miner-rejected"},
+            exit_code=2,
+            registered=True,
+            chosen_os_pool="nvme0",
+        ),
+        _outcome(launch.ACCEPTED, "miner-1"),
+    ]
+
+    def fake(spec, miner, *, os_pool=launch._CHOOSE_OS_POOL, **_kw):
+        named.append(os_pool)
+        return answers.pop(0)
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(_spec(pinned_os_pool="nvme0"), actor)
+
+    assert result.ok is True
+    assert named == [launch._CHOOSE_OS_POOL, "nvme0", "nvme0"]
+
+
+def test_a_preflight_pool_refusal_never_moves_a_pinned_probe_off_its_chip(monkeypatch) -> None:
+    """The disk probe's launch is pinned to its run's chip (`platform_id`)
+    and pool. A preflight refusal of that pool (before the KBS register)
+    is retriable — `_place_and_launch` excludes the miner and re-places —
+    but the chip pin leaves no other miner: the launch fails, it never
+    lands on another node (where the pool means nothing)."""
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    first = _register_miner(1)
+    _register_miner(2)
+    monkeypatch.setattr(
+        chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1), make_miner(2)])
+    )
+    monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+    tried: list[tuple[str, object]] = []
+
+    def fake(spec, miner, *, os_pool=launch._CHOOSE_OS_POOL, **_kw):
+        tried.append((miner.miner_id, os_pool))
+        return launch.LaunchOutcome(
+            disposition=launch.RETRIABLE,
+            emit={"ok": False, "outcome": "preflight-rejected",
+                  "classifier": "insufficient-disk:nvme0"},
+            exit_code=2,
+            registered=False,
+        )
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(
+        _spec(pinned_os_pool="nvme0", platform_id=first.platform_id), actor
+    )
+
+    assert result.ok is False
+    assert tried and {m for m, _ in tried} == {"miner-a"}, tried
+    assert Placement.objects.filter(miner_node_id=node_id(2)).count() == 0
+
+
 def test_launch_vm_terminal_when_post_register_dispatch_keeps_failing(
     monkeypatch,
 ) -> None:

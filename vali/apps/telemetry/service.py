@@ -870,6 +870,22 @@ def ingest_heartbeat(
                     reported_memory_available_mib=hb.memory_available_mib,
                     reported_at=now,
                 )
+            # Automatic-approval soak of a PENDING miner. Before the v3 /
+            # v4 stamps below: it reads the PREVIOUS complete heartbeat's
+            # `declared_at` / `disk_reported_at` to tell an unbroken run
+            # from a gap. Approved rows are never written.
+            if miner.chain_node_id:
+                from apps.scheduler.approval import record_heartbeat_soak
+
+                record_heartbeat_soak(
+                    miner.chain_node_id,
+                    complete=(
+                        hb.declared_capacity is not None
+                        and hb.declared_disk is not None
+                        and hb.memory_available_mib is not None
+                    ),
+                    now=now,
+                )
             # The `v3` capacity declarations (capacity v2 §4.2) — the
             # miner's own #668 budget and SEV-ES ASID figures. UNTRUSTED,
             # consumed only as DOWN-ONLY clamps (`budget_inputs`), so this

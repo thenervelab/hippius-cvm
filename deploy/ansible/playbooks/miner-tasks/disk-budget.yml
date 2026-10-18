@@ -1,0 +1,115 @@
+---
+# The tenant disk budget (`[host] cvm_disk_gb_budget`, and the `default`
+# pool's `budget_gb`): imported by miner-agent-install.yml, and by
+# tests/disk_budget_wiring.yml with a canned `stat -f` and installed config.
+#
+# Budget = the usable size of the filesystem holding the data root (its
+# blocks minus the root-reserved ones: `stat -f`, since `ansible_mounts`
+# has no f_bfree) − `host_cvm.reserve_disk_gb` (− `reserve_disk_root_extra_gb`
+# on `/`), clamped down by `host_cvm_overrides.disk_gb_budget_max`.
+
+- name: Find the filesystem that holds the tenant data-disk root
+  # The longest `ansible_mounts` mount point that is a path prefix of
+  # `miner_data_disk_root` — the root itself is usually a directory, not a
+  # mount point. Play 05 has already created it under its real mount.
+  ansible.builtin.set_fact:
+    miner_data_fs_mount: >-
+      {%- set ns = namespace(mount='') -%}
+      {%- set root = miner_data_disk_root.rstrip('/') ~ '/' -%}
+      {%- for m in ansible_mounts -%}
+      {%-   if root.startswith(m.mount.rstrip('/') ~ '/') and m.mount | length > ns.mount | length -%}
+      {%-     set ns.mount = m.mount -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.mount }}
+
+- name: Read the block counts of the data filesystem
+  # Fundamental block size, blocks, free, available. `ansible_mounts` has
+  # no f_bfree: its sizes include the root-reserved blocks (#1641). The
+  # wiring test hands a canned answer (`miner_data_statfs_canned`).
+  ansible.builtin.command:
+    argv: [timeout, "10", stat, -f, -c, "%S %b %f %a", "{{ miner_data_fs_mount }}"]
+  register: miner_data_statfs_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: miner_data_statfs_canned is not defined
+
+- name: Derive the tenant disk budget from the data filesystem size
+  # What the agent can fill: the filesystem's blocks minus the root-reserved
+  # ones (ext4: 5%), never `size_total` (#1641). The reserve grows by
+  # `reserve_disk_root_extra_gb` when the data root is on `/`.
+  ansible.builtin.set_fact:
+    miner_data_fs_gb: >-
+      {{ (miner_data_statfs_canned
+          | default(miner_data_statfs_probe.stdout | default(''))) | miner_statfs_usable_gib }}
+    miner_data_disk_reserve_gb: >-
+      {{ miner_data_fs_mount | miner_disk_reserve_gib(host_cvm.reserve_disk_gb,
+                                                      host_cvm.reserve_disk_root_extra_gb) }}
+
+- name: Assert the disk budget inputs
+  # Same fail-loud rule as the CPU/RAM inputs: a typo'd reserve must never
+  # turn into 0 and hand the whole filesystem to tenants.
+  ansible.builtin.assert:
+    that:
+      - (host_cvm.reserve_disk_gb | string) is match('^[0-9]+$')
+      - host_cvm.reserve_disk_gb | int >= 50
+      - (host_cvm.reserve_disk_root_extra_gb | string) is match('^[0-9]+$')
+      - miner_data_fs_mount | length > 0
+      - miner_data_fs_gb | int > 0
+      - miner_data_fs_gb | int > miner_data_disk_reserve_gb | int
+    fail_msg: >-
+      host_cvm.reserve_disk_gb must be an integer >= 50 (got
+      {{ host_cvm.reserve_disk_gb | default('unset') }}) and
+      host_cvm.reserve_disk_root_extra_gb an integer (got
+      {{ host_cvm.reserve_disk_root_extra_gb | default('unset') }}), and the
+      usable part of the filesystem holding {{ miner_data_disk_root }}
+      ({{ miner_data_fs_mount | default('not found', true) }}, {{ miner_data_fs_gb }} GiB
+      without root-reserved blocks) must be larger than the reserve
+      ({{ miner_data_disk_reserve_gb }} GiB).
+
+- name: The tenant disk budget the config will declare
+  # usable − reserve, clamped down (never up) by
+  # `host_cvm_overrides.disk_gb_budget_max`. The template renders this
+  # fact: the guard below and the config can't disagree.
+  ansible.builtin.set_fact:
+    miner_cvm_disk_budget_gb: >-
+      {{ [(miner_data_fs_gb | int) - (miner_data_disk_reserve_gb | int),
+          (host_cvm_overrides | default({})).disk_gb_budget_max
+            | default((miner_data_fs_gb | int) - (miner_data_disk_reserve_gb | int)) | int] | min }}
+
+- name: Read the disk budget the installed config declares
+  # Absent on a first install; any other read error is fatal (the guard
+  # below must not pass on a config it could not read).
+  ansible.builtin.slurp:
+    src: "{{ miner_agent.config_path }}"
+  register: miner_installed_config
+  failed_when: >-
+    (miner_installed_config.failed | default(false))
+    and 'not found' not in (miner_installed_config.msg | default('') | lower)
+  check_mode: false
+
+- name: Refuse to lower the disk budget without an acknowledgement
+  # The agent admits a launch — a relaunch after a reboot too — only while
+  # its running VMs' disks fit the budget: a budget below what the host
+  # already commits strands the last relaunches (507 insufficient-disk).
+  # So a run that LOWERS it stops here until the operator has checked the
+  # committed disk on `default` against the new figure and says so, for
+  # that one run: `-e miner_disk_budget_lower_ack=true` (never in host_vars:
+  # it would switch the guard off for good).
+  vars:
+    _installed: >-
+      {{ (miner_installed_config.content | default('') | b64decode
+          | regex_findall('(?m)^cvm_disk_gb_budget\s*=\s*([0-9]+)')
+          | first | default('')) }}
+    _new: "{{ miner_cvm_disk_budget_gb }}"
+  ansible.builtin.assert:
+    that:
+      - _installed | length == 0 or (_new | int) >= (_installed | int)
+        or (miner_disk_budget_lower_ack | default(false) | bool)
+    fail_msg: >-
+      This run lowers [host] cvm_disk_gb_budget from {{ _installed }} to {{ _new }} GiB
+      (#1641: usable size without root-reserved blocks, reserve on `/`). If the
+      VMs already on `default` commit more than {{ _new }} GiB, the last ones
+      would not relaunch after a reboot. Check, move VMs off `default` if needed,
+      then re-run with -e miner_disk_budget_lower_ack=true.

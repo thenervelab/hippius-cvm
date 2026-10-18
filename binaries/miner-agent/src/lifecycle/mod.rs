@@ -5082,7 +5082,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_undefines_a_shut_off_domain_whose_disks_are_already_gone() {
-        // Seen in production: an earlier destroy
+        // The live case (a production VM on one miner): an earlier destroy
         // reclaimed every file but left the shut-off definition. With
         // nothing on disk the early no-op return used to strand it.
         let dir = tempfile::tempdir().unwrap();

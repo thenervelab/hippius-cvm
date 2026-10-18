@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from django.urls import path
 
+from .hardware_views import (
+    OperatorDiskInventoryView,
+    OperatorHardwareHistoryView,
+    OperatorHardwareView,
+    OperatorHostDiskAdvisoriesView,
+)
 from .storage_views import (
     OperatorDedicatedDiskDrainView,
     OperatorDedicatedDisksView,
     OperatorDiskTiersView,
     OperatorStorageAdoptView,
     OperatorStorageHistoryView,
+    OperatorStoragePoolForceRemoveView,
     OperatorStoragePoolsView,
     OperatorStoragePoolView,
     OperatorStorageValidateView,
@@ -35,6 +42,11 @@ urlpatterns = [
         name="operator_storage_pool",
     ),
     path(
+        f"{_NODE}/storage/pools/<str:pool_id>/force-remove",
+        OperatorStoragePoolForceRemoveView.as_view(),
+        name="operator_storage_pool_force_remove",
+    ),
+    path(
         f"{_NODE}/storage/validate",
         OperatorStorageValidateView.as_view(),
         name="operator_storage_validate",
@@ -59,5 +71,21 @@ urlpatterns = [
         f"{_NODE}/dedicated-disks/<str:disk_id>/drain",
         OperatorDedicatedDiskDrainView.as_view(),
         name="operator_dedicated_disk_drain",
+    ),
+    path(f"{_NODE}/hardware", OperatorHardwareView.as_view(), name="operator_hardware"),
+    path(
+        f"{_NODE}/hardware/history",
+        OperatorHardwareHistoryView.as_view(),
+        name="operator_hardware_history",
+    ),
+    path(
+        f"{_NODE}/disk-inventory",
+        OperatorDiskInventoryView.as_view(),
+        name="operator_disk_inventory",
+    ),
+    path(
+        f"{_NODE}/host-disk-advisories",
+        OperatorHostDiskAdvisoriesView.as_view(),
+        name="operator_host_disk_advisories",
     ),
 ]

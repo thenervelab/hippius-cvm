@@ -4,7 +4,11 @@
 - `MinerDiskHealthHourly` and `DiskPassiveEvent` past
   `VALI_DISK_HEALTH_RETENTION_DAYS` (180 d);
 - `DiskIoReceipt` once older than any receipt the ingest still accepts
-  (`ingest.dedupe_keep`): past that, a replay is refused by its age.
+  (`ingest.dedupe_keep`): past that, a replay is refused by its age;
+- `HostInventoryChange` and `HostDiskAdvisoryEvent` past
+  `VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS` (180 d, §18.10); a resolved
+  `HostDiskAdvisory` past `VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS`
+  (90 d).
 
 Bounded: each table is reaped in DELETEs of at most `VALI_DISK_GC_BATCH`
 rows, at most `VALI_DISK_GC_MAX_BATCHES` per table and run; the next run
@@ -19,7 +23,15 @@ from django.db import models
 from django.utils import timezone
 
 from .ingest import dedupe_keep
-from .models import DiskIoReceipt, DiskPassiveEvent, MinerDiskHealthHourly, VmDiskIoHourly
+from .models import (
+    DiskIoReceipt,
+    DiskPassiveEvent,
+    HostDiskAdvisory,
+    HostDiskAdvisoryEvent,
+    HostInventoryChange,
+    MinerDiskHealthHourly,
+    VmDiskIoHourly,
+)
 
 
 def _reap(
@@ -48,11 +60,20 @@ def gc(*, now: datetime | None = None) -> dict[str, int]:
     batches = max(1, int(settings.VALI_DISK_GC_MAX_BATCHES))
     io_cutoff = now - timedelta(days=int(settings.VALI_DISK_IO_RETENTION_DAYS))
     health_cutoff = now - timedelta(days=int(settings.VALI_DISK_HEALTH_RETENTION_DAYS))
+    history_cutoff = now - timedelta(days=int(settings.VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS))
     plan: list[tuple[str, type[models.Model], str, datetime]] = [
         ("vm_disk_io_hourly", VmDiskIoHourly, "hour", io_cutoff),
         ("miner_disk_health_hourly", MinerDiskHealthHourly, "hour", health_cutoff),
         ("disk_passive_event", DiskPassiveEvent, "created_at", health_cutoff),
         ("disk_io_receipt", DiskIoReceipt, "ingested_at", now - dedupe_keep()),
+        ("host_inventory_change", HostInventoryChange, "at", history_cutoff),
+        ("host_disk_advisory_event", HostDiskAdvisoryEvent, "at", history_cutoff),
+        (
+            "host_disk_advisory_resolved",
+            HostDiskAdvisory,
+            "resolved_at",
+            now - timedelta(days=int(settings.VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS)),
+        ),
     ]
     return {
         name: _reap(model, field, cutoff, batch=batch, batches=batches)

@@ -4,7 +4,8 @@
 # and by tests/preflight_wiring.yml with canned probe output.
 #
 # Inputs: `miner_host_probe` (the probe's stdout), `miner_pf_roots` (stat
-# of the two [storage] roots), `miner_pf_netbird_mgmt` (uri result) and
+# of the two [storage] roots), `miner_pf_data_statfs` (`stat -f` of the
+# data root's filesystem), `miner_pf_netbird_mgmt` (uri result) and
 # the gathered facts. The verdict is filter_plugins/host_preflight.py.
 
 - name: Judge the host
@@ -25,6 +26,7 @@
       ram_gb_expected: "{{ ram_gb_expected | default('') }}"
       data_root: "{{ miner_data_disk_root }}"
       data_root_exists: "{{ miner_pf_roots.results[0].stat.isdir | default(false) }}"
+      data_fs_statfs: "{{ miner_pf_data_statfs.stdout | default('') }}"
       state_root: "{{ miner_state_disk_root }}"
       state_root_exists: "{{ miner_pf_roots.results[1].stat.isdir | default(false) }}"
       state_dir: "{{ miner_agent.state_dir }}"
@@ -40,6 +42,7 @@
       min_tenant_disk_gb: "{{ miner_preflight_min.tenant_disk_gb }}"
       min_staging_free_gb: "{{ miner_preflight_min.staging_free_gb }}"
       reserve_disk_gb: "{{ host_cvm.reserve_disk_gb }}"
+      reserve_disk_root_extra_gb: "{{ host_cvm.reserve_disk_root_extra_gb }}"
       snp_cmdline_tokens: "{{ grub_cmdline_required }}"
 
 - name: Report the host preflight verdict

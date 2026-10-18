@@ -119,7 +119,8 @@ class SyncSerializer(serializers.Serializer):
     status = serializers.CharField(
         help_text=(
             "in_sync | pending | refused:<code>:<pool or disk> | agent-unsupported | drift "
-            "| unmanaged"
+            "| held:<reason> (the current revision is not pushed: pool-not-drained:<pool>, "
+            "family-changed, chain-unavailable) | unmanaged"
         )
     )
     acked_revision = serializers.IntegerField(required=False)
@@ -200,3 +201,10 @@ class DiskTiersSerializer(serializers.Serializer):
 class DedicatedDisksSerializer(serializers.Serializer):
     node_id = serializers.CharField()
     disks = DedicatedDiskRowSerializer(many=True)
+
+
+class ForceRemoveSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        max_length=256,
+        help_text="Why the pool's disk is gone (audited). Required.",
+    )

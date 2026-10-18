@@ -24,6 +24,9 @@ tls = ["hippius-onchain-registry/tls"]
 
 [dependencies]
 hippius-types = { path = "../../hippius-types" }
+# §18.10 `verify-host-inventory`: the host inventory wire format, its own
+# crate so the guest UKIs (which link hippius-types) never move with it.
+hippius-host-inventory = { path = "../../hippius-host-inventory" }
 # `hippius-guest::verify_stopped_ack` is the byte-exact verifier for
 # §24/§25 guest-signed end-of-life ack envelopes — vali shells out
 # here so the canonical-CBOR + Ed25519 semantics stay identical

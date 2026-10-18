@@ -135,6 +135,28 @@ class MinerApprovalRequestSerializer(serializers.Serializer):
     reason = serializers.CharField(help_text="Why (recorded in the audit).")
 
 
+class MinerApprovalRevokeRequestSerializer(serializers.Serializer):
+    """`POST /v1/admin/miner/<miner_id>/approval` body that REVOKES: the
+    miner goes back to pending and is never approved automatically again
+    (only an operator approval clears the revocation)."""
+
+    revoke = serializers.BooleanField(help_text="Must be `true`.")
+    revoked_by = serializers.CharField(help_text="Who revokes (recorded in the audit).")
+    reason = serializers.CharField(help_text="Why (recorded in the audit).")
+
+    def validate_revoke(self, value: bool) -> bool:
+        if value is not True:
+            raise serializers.ValidationError("must be true")
+        return value
+
+
+class MinerApprovalRevokeResponseSerializer(serializers.Serializer):
+    miner_id = serializers.CharField()
+    node_id = serializers.CharField()
+    revoked_at = serializers.DateTimeField()
+    revoked_by = serializers.CharField()
+
+
 class MinerMeasuredSerializer(serializers.Serializer):
     cpus = serializers.IntegerField(allow_null=True)
     memory_mb = serializers.IntegerField(allow_null=True)
@@ -152,6 +174,19 @@ class MinerApprovalStatusSerializer(serializers.Serializer):
     approval_required = serializers.BooleanField()
     held_back = serializers.BooleanField(
         help_text="True while the miner takes no new placement for want of an approval."
+    )
+    revoked_at = serializers.DateTimeField(allow_null=True)
+    revoked_by = serializers.CharField()
+    auto_approve = serializers.BooleanField(
+        help_text="Whether automatic approval (VALI_MINER_AUTO_APPROVE) is in force."
+    )
+    auto_approval_soak_since = serializers.DateTimeField(
+        allow_null=True,
+        help_text="Start of the current unbroken run of complete heartbeats (pending only).",
+    )
+    auto_approval_blocker = serializers.CharField(
+        allow_null=True,
+        help_text="The first automatic-approval condition the miner fails; null = eligible.",
     )
     total_cpus = serializers.IntegerField(allow_null=True)
     total_memory_mb = serializers.IntegerField(allow_null=True)

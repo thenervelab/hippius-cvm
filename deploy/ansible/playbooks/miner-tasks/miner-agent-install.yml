@@ -284,41 +284,10 @@
       reserve_memory_mb >= 8192 (got {{ host_cvm }}); host_cvm_overrides values
       must be integers (got {{ host_cvm_overrides | default({}) }}).
 
-- name: Find the filesystem that holds the tenant data-disk root
-  # The longest `ansible_mounts` mount point that is a path prefix of
-  # `miner_data_disk_root` — the root itself is usually a directory, not a
-  # mount point. Play 05 has already created it under its real mount.
-  ansible.builtin.set_fact:
-    miner_data_fs_mount: >-
-      {%- set ns = namespace(mount='') -%}
-      {%- set root = miner_data_disk_root.rstrip('/') ~ '/' -%}
-      {%- for m in ansible_mounts -%}
-      {%-   if root.startswith(m.mount.rstrip('/') ~ '/') and m.mount | length > ns.mount | length -%}
-      {%-     set ns.mount = m.mount -%}
-      {%-   endif -%}
-      {%- endfor -%}
-      {{ ns.mount }}
-
-- name: Derive the tenant disk budget from the data filesystem size
-  ansible.builtin.set_fact:
-    miner_data_fs_gb: >-
-      {{ (ansible_mounts | selectattr('mount', 'equalto', miner_data_fs_mount)
-          | map(attribute='size_total') | first | default(0) | int) // 1073741824 }}
-
-- name: Assert the disk budget inputs
-  # Same fail-loud rule as the CPU/RAM inputs: a typo'd reserve must never
-  # turn into 0 and hand the whole filesystem to tenants.
-  ansible.builtin.assert:
-    that:
-      - (host_cvm.reserve_disk_gb | string) is match('^[0-9]+$')
-      - host_cvm.reserve_disk_gb | int >= 50
-      - miner_data_fs_mount | length > 0
-      - miner_data_fs_gb | int > host_cvm.reserve_disk_gb | int
-    fail_msg: >-
-      host_cvm.reserve_disk_gb must be an integer >= 50 (got
-      {{ host_cvm.reserve_disk_gb | default('unset') }}), and the filesystem
-      holding {{ miner_data_disk_root }} ({{ miner_data_fs_mount | default('not found', true) }},
-      {{ miner_data_fs_gb }} GiB) must be larger than it.
+- name: Derive and check the tenant disk budget
+  # The data filesystem's usable size, the reserve, and the guard against
+  # lowering the budget under what the host already commits (#1641).
+  ansible.builtin.import_tasks: disk-budget.yml
 
 - name: Assert the v5 heartbeat is only asked for on top of v4
   # The agent refuses `schema_host_health` without `schema_disk` and
@@ -532,6 +501,15 @@
     owner: root
     group: root
     mode: "0644"
+    # With `[inventory]` rendered (`miner_inventory_enabled`), the installed
+    # agent must accept it: one older than the table refuses unknown config
+    # and would crash-loop at its next restart. `storage-check` parses the
+    # whole config like `serve` (no subcommand only parses); besides, it
+    # writes and removes one O_DIRECT probe file per pool, as the running
+    # agent does on every heartbeat. A refusal keeps the previous config.
+    validate: >-
+      {{ (miner_agent.install_path ~ ' storage-check --config %s --facts /nonexistent-disk-facts.json')
+         if (miner_inventory_enabled | default(false) | bool) else omit }}
 
 - name: Read this host's real SEV-SNP CHIP_ID (the launch/attestation platform_id)
   # The `platform_id` vali stores in `MinerIdentity` MUST be the real
@@ -787,3 +765,12 @@
     enabled: "{{ miner_auto_update_enabled | bool }}"
     state: "{{ 'started' if (miner_auto_update_enabled | bool) else 'stopped' }}"
     daemon_reload: true
+
+# ── Host inventory (§18.10) ─────────────────────────────────────────
+# The collector units + timers (miner-tasks/host-inventory.yml): always
+# installed, the timers running only with `miner_inventory_enabled`. The
+# agent's `[inventory]` (the poster) follows the same switch in the
+# config above. Tagged `miner_inventory`.
+- name: Install the host-inventory collector units and timers
+  ansible.builtin.import_tasks: host-inventory.yml
+  tags: [miner_inventory]

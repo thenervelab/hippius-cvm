@@ -1510,6 +1510,15 @@ def _arrival_os_pool(dest_miner_id: str, cmdline: str) -> str | None:
     return routing.choose_os_pool(node_id, disk_gb + ROOTFS_DISK_GB)
 
 
+def arrival_os_pool(vm: Vm, dest_miner_id: str) -> str | None:
+    """`_arrival_os_pool` for `vm`'s measured cmdline (its launch record)."""
+    return _arrival_os_pool(dest_miner_id, _launch_paths(vm)["cmdline"])
+
+
+#: `dispatch_migrate_activate(os_pool=…)` not given: choose one.
+_CHOOSE_POOL: Any = object()
+
+
 def dispatch_migrate_activate(
     vm: Vm,
     *,
@@ -1526,8 +1535,12 @@ def dispatch_migrate_activate(
     settle_by_unix: int = 0,
     staged_restore_id: str = "",
     measurement_hex: str = "",
+    os_pool: Any = _CHOOSE_POOL,
 ) -> None:
     """§25 M4 — dispatch the ``migrate-activate`` order to the DEST miner.
+
+    ``os_pool``: the pool the order names (the job's pinned
+    `MigrationJob.dest_os_pool`; `None` = none), chosen here when not given.
 
     ``measurement_hex`` (a cross-generation restore / failover,
     `apps.orchestration.cross_gen`): the ticket carries the destination
@@ -1662,7 +1675,7 @@ def dispatch_migrate_activate(
         settle_by_unix=settle_by_unix,
         staged_restore_id=staged_restore_id,
         net=net_policy.launch_net_spec(miner_id=miner_id, vm_id=vm.vm_id),
-        os_pool=_arrival_os_pool(dest_node_id, cmdline),
+        os_pool=_arrival_os_pool(dest_node_id, cmdline) if os_pool is _CHOOSE_POOL else os_pool,
     )
     import json as _json
 

@@ -70,9 +70,9 @@ bind_addr = "{{ miner_netbird_ip | default(orders_bind_ip) }}:{{ orders.port }}"
    math exactly. #}
 {% set _cvm_cpu = ((ansible_processor_vcpus | int) - (host_cvm.reserve_cpus | int)) * (host_cvm.cpu_ratio_pct | int) // 100 %}
 {% set _cvm_mem = (ansible_memtotal_mb | int) - (host_cvm.reserve_memory_mb | int) %}
-{% set _cvm_disk = (miner_data_fs_gb | int) - (host_cvm.reserve_disk_gb | int) %}
 {% set _ov = host_cvm_overrides | default({}) %}
-{% set _disk_budget = [_cvm_disk, _ov.disk_gb_budget_max | default(_cvm_disk) | int] | min %}
+{# usable − reserve, clamped down by host_cvm_overrides (miner-tasks/disk-budget.yml) #}
+{% set _disk_budget = miner_cvm_disk_budget_gb | int %}
 [host]
 # CPU / RAM the host allots to tenant CVMs — a deliberate RESERVATION
 # (headroom is kept for the host OS + miner-agent), not the full
@@ -86,7 +86,9 @@ cvm_memory_mb_budget = {{ [_cvm_mem, _ov.memory_mb_budget_max | default(_cvm_mem
 # past it (507 insufficient-disk) and declares it to vali, which may only
 # use it to LOWER its own disk ledger. Independently, the agent always
 # refuses a disk the filesystem cannot physically hold.
-# Derived: {{ miner_data_fs_mount }} is {{ miner_data_fs_gb }} GiB − {{ host_cvm.reserve_disk_gb }} (group_vars `host_cvm`).
+# Derived: {{ miner_data_fs_mount }} has {{ miner_data_fs_gb }} GiB usable (root-reserved blocks
+# excluded) − a {{ miner_data_disk_reserve_gb }} GiB reserve (group_vars `host_cvm`: reserve_disk_gb,
+# + reserve_disk_root_extra_gb when the data root is on `/`).
 cvm_disk_gb_budget = {{ _disk_budget }}
 # Leave the tenant CVMs RUNNING when the agent stops: a `systemctl
 # restart`/upgrade is then transparent to tenants and the new process
@@ -244,6 +246,15 @@ state = "draining"
 # uncomment BOTH the `[backup]` header and the key — the key alone lands
 # in `[storage]` above, and the agent refuses to start.
 # host_speed_bytes_per_sec = 402653184
+{% if miner_inventory_enabled | default(false) | bool %}
+
+[inventory]
+# The §18.10 host-inventory poster (`miner_inventory_enabled`): signs and
+# posts the collector's sections. Rendered only when on: an agent older
+# than the table refuses unknown config (`deny_unknown_fields`), and off
+# is the agent's default. The cadence defaults live in the agent.
+enabled = true
+{% endif %}
 {% if snp_generation is defined %}
 
 [host_attestor]

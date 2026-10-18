@@ -7,15 +7,21 @@
 //!
 //! ## Routes
 //!
-//! | Method · path                      | `MessageKind`     |
-//! |------------------------------------|-------------------|
-//! | `POST /v1/edge/kbs-request`        | `KbsRequest`      |
-//! | `POST /v1/edge/served-receipt`     | `ServedReceipt`   |
-//! | `POST /v1/edge/served-aggregate`   | `ServedAggregate` |
-//! | `POST /v1/edge/stopped-ack`        | `StoppedAck`      |
-//! | `POST /v1/edge/heartbeat`          | `Heartbeat`       |
-//! | `POST /v1/edge/graceful-exit`      | `GracefulExit`    |
-//! | `GET  /healthz`                    | — (liveness)      |
+//! | Method · path                           | `MessageKind`           |
+//! |-----------------------------------------|-------------------------|
+//! | `POST /v1/edge/kbs-request`             | `KbsRequest`            |
+//! | `POST /v1/edge/served-receipt`          | `ServedReceipt`         |
+//! | `POST /v1/edge/served-aggregate`        | `ServedAggregate`       |
+//! | `POST /v1/edge/stopped-ack`             | `StoppedAck`            |
+//! | `POST /v1/edge/heartbeat`               | `Heartbeat`             |
+//! | `POST /v1/edge/graceful-exit`           | `GracefulExit`          |
+//! | `POST /v1/edge/vm-progress`             | `VmProgress`            |
+//! | `POST /v1/edge/host-inventory`          | `HostInventory`         |
+//! | `POST /v1/edge/host-attestor-challenge` | `HostAttestorChallenge` |
+//! | `POST /v1/edge/host-attestor-enroll`    | `HostAttestorEnroll`    |
+//! | `POST /v1/edge/host-attestor-beacon`    | `HostAttestorBeacon`    |
+//! | `POST /v1/edge/vm-live-attestation`     | `VmLiveAttestation`     |
+//! | `GET  /healthz`                         | — (liveness)            |
 //!
 //! There is **no `KbsResponse` route**: that kind is `Inner→Miner`
 //! and never ingresses here (the direction gate would reject it
@@ -24,9 +30,11 @@
 //! ## Per-request pipeline (each `POST` handler)
 //!
 //! 1. **Body-size cap** — [`DefaultBodyLimit::max`] with
-//!    [`MAX_ENVELOPE_BYTES`] is layered on the router, so an oversized
-//!    body is rejected `413` **before** the handler runs and therefore
-//!    before any CBOR decode / recursion-bounded canonical check.
+//!    [`MAX_ENVELOPE_BYTES`] is layered on the router (the host-inventory
+//!    route overrides it with its tighter [`HOST_INVENTORY_MAX_BYTES`]),
+//!    so an oversized body is rejected `413` **before** the handler runs
+//!    and therefore before any CBOR decode / recursion-bounded canonical
+//!    check.
 //! 2. **Envelope shell** — wrap the body bytes in a [`RawEnvelope`]
 //!    tagged `Direction::MinerToInner` + the route's fixed
 //!    `MessageKind`.
@@ -113,8 +121,10 @@ impl MinerRouterState {
 /// connection is one already-terminated mTLS peer).
 ///
 /// The [`DefaultBodyLimit`] layer caps every request body at
-/// [`MAX_ENVELOPE_BYTES`]; axum answers `413` itself for an oversized
-/// body, before any handler — and so before any CBOR decode — runs.
+/// [`MAX_ENVELOPE_BYTES`] (the host-inventory route at its own
+/// [`HOST_INVENTORY_MAX_BYTES`]); axum answers `413` itself for an
+/// oversized body, before any handler — and so before any CBOR decode —
+/// runs.
 pub fn build_router(state: MinerRouterState) -> Router {
     Router::new()
         .route("/v1/edge/kbs-request", post(handle_kbs_request))
@@ -124,6 +134,11 @@ pub fn build_router(state: MinerRouterState) -> Router {
         .route("/v1/edge/heartbeat", post(handle_heartbeat))
         .route("/v1/edge/graceful-exit", post(handle_graceful_exit))
         .route("/v1/edge/vm-progress", post(handle_vm_progress))
+        // Its own, tighter cap: what vali accepts (64 KiB envelope).
+        .route(
+            "/v1/edge/host-inventory",
+            post(handle_host_inventory).layer(DefaultBodyLimit::max(HOST_INVENTORY_MAX_BYTES)),
+        )
         .route(
             "/v1/edge/host-attestor-challenge",
             post(handle_host_attestor_challenge),
@@ -235,6 +250,25 @@ async fn handle_vm_progress(
     relay(&state, &peer, MessageKind::VmProgress, body).await
 }
 
+/// The `SignedHostInventory` envelope cap — `hippius_host_inventory::
+/// MAX_ENVELOPE_BYTES`, which is vali's request-body cap: anything larger
+/// is refused here (413) before it costs vali a request.
+pub const HOST_INVENTORY_MAX_BYTES: usize = 64 * 1024;
+
+/// `POST /v1/edge/host-inventory` → [`MessageKind::HostInventory`].
+///
+/// Mirrors [`handle_heartbeat`]: the connection's mTLS [`PeerId`] is the
+/// only miner-identity the Edge stamps; vali resolves which registered
+/// key to verify the opaque `SignedHostInventory` body against from it
+/// (the Edge never decodes the body — §5.6).
+async fn handle_host_inventory(
+    State(state): State<MinerRouterState>,
+    Extension(peer): Extension<PeerId>,
+    body: Bytes,
+) -> Response {
+    relay(&state, &peer, MessageKind::HostInventory, body).await
+}
+
 /// `POST /v1/edge/host-attestor-challenge` →
 /// [`MessageKind::HostAttestorChallenge`] (PR-10).
 ///
@@ -310,7 +344,9 @@ async fn handle_vm_live_attestation(
 ///
 /// - wire-gate reject (non-canonical / schema-invalid / decode) →
 ///   `400`,
-/// - forward transport failure OR upstream non-2xx → `502`,
+/// - forward transport failure OR upstream non-2xx → `502` (except a
+///   host inventory's `404`/`409`/`429`, relayed with its small body —
+///   [`relays_refusal`]),
 /// - relayed OK → the upstream status (typically `200`/`202`), body
 ///   relayed verbatim.
 ///
@@ -392,6 +428,7 @@ async fn relay(
         MessageKind::Heartbeat => state.forward.forward_heartbeat(&validated).await,
         MessageKind::GracefulExit => state.forward.forward_graceful_exit(&validated).await,
         MessageKind::VmProgress => state.forward.forward_vm_progress(&validated).await,
+        MessageKind::HostInventory => state.forward.forward_host_inventory(&validated).await,
         MessageKind::HostAttestorChallenge => {
             state
                 .forward
@@ -425,6 +462,17 @@ async fn relay(
             emit(resp.body.len() as u64, false, None);
             forward_response_relay(resp)
         }
+        Ok(resp) if relays_refusal(kind, resp.status) => {
+            // vali refused a host inventory for a reason the agent acts
+            // on (ingest off, replay, budget): pass the status and its
+            // small JSON error through, so the agent can tell them apart.
+            log_relay(peer, kind, bytes_in, "forward-refused");
+            // A refusal is still a shed; what egresses is vali's small
+            // error answer, counted.
+            let (out, egress) = refusal_relay(resp);
+            emit(egress, true, Some("forward-upstream-status"));
+            out
+        }
         Ok(_resp) => {
             // Upstream answered, but non-2xx. Not a transport failure
             // — a {accepted + forward-failed} record. The miner sees
@@ -441,6 +489,50 @@ async fn relay(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// The upstream refusals relayed as-is rather than mapped to `502`: only
+/// vali's host-inventory answers the agent acts on — `404` (ingest off),
+/// `409` (sequence replay / no node id), `429` (hourly budget). Every
+/// other kind and status keeps the opaque `502`.
+fn relays_refusal(kind: MessageKind, status: u16) -> bool {
+    kind == MessageKind::HostInventory && matches!(status, 404 | 409 | 429)
+}
+
+/// The largest refusal body relayed: vali's `{error, category}` JSON is
+/// well under it. A larger body is dropped, the status still relayed.
+pub const MAX_REFUSAL_BODY: usize = 1024;
+
+/// Relay a [`relays_refusal`] answer: its status, its body when it is
+/// small JSON (vali's `{error, category}` shape; anything else, e.g. an
+/// HTML not-found page, is dropped), and on a `429` vali's `Retry-After`
+/// (the rest of its hourly window), bounded to a day.
+/// Returns the response and the body bytes it relays.
+fn refusal_relay(resp: ForwardResponse) -> (Response, u64) {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let json = resp.body.len() <= MAX_REFUSAL_BODY && resp.body.first() == Some(&b'{');
+    let egress = if json { resp.body.len() as u64 } else { 0 };
+    let mut out = if json {
+        (
+            status,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            resp.body,
+        )
+            .into_response()
+    } else {
+        status.into_response()
+    };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(secs) = resp.retry_after_secs.filter(|s| *s <= 86_400) {
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                out.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+    }
+    (out, egress)
 }
 
 /// Relay a successful [`ForwardResponse`] back to the miner: the

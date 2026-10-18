@@ -1,0 +1,146 @@
+---
+# Wiring test for miner-tasks/disk-budget.yml (#1641): the real tasks
+# file, fed a canned `stat -f` answer and canned mounts, on localhost with
+# no connection to any host. The only change to this machine is a scratch
+# "installed config" under a fresh temp dir.
+#
+# Run (from deploy/ansible):
+#   ANSIBLE_FILTER_PLUGINS=playbooks/filter_plugins \
+#     ansible-playbook -i localhost, -c local tests/disk_budget_wiring.yml
+
+- name: Disk budget wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+  vars:
+    ansible_mounts:
+      - { mount: /, size_total: 957777477632, size_available: 4294967296 }
+    miner_data_disk_root: /var/lib/hippius-miner
+    # A 892 GiB root filesystem: 44 GiB root-reserved, 4 GiB available
+    # (`%S %b %f %a`): 848 GiB usable.
+    miner_data_statfs_canned: "4096 233832448 12582912 1048576"
+  tasks:
+    - name: A scratch dir for the installed config
+      ansible.builtin.tempfile:
+        state: directory
+      register: scratch
+
+    - name: A fresh host (no installed config) gets usable − reserve − root extra
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/absent.toml" }
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: Usable size excludes the root-reserved blocks; `/` adds the extra
+      ansible.builtin.assert:
+        that:
+          - miner_data_fs_mount == '/'
+          - miner_data_fs_gb | int == 848
+          - miner_data_disk_reserve_gb | int == 150
+
+    - name: An installed config with a higher budget
+      ansible.builtin.copy:
+        dest: "{{ scratch.path }}/config.toml"
+        content: "[host]\ncvm_disk_gb_budget = 792\n"
+        mode: "0600"
+
+    - name: Lowering the budget without an acknowledgement is refused
+      block:
+        - name: Run the budget tasks (must fail)
+          vars:
+            miner_agent: { config_path: "{{ scratch.path }}/config.toml" }
+          ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+        - name: Not reached
+          ansible.builtin.set_fact:
+            miner_lower_refused: false
+      rescue:
+        - name: Refused by the guard itself, not by a broken expression
+          ansible.builtin.set_fact:
+            miner_lower_refused: >-
+              {{ 'lowers [host] cvm_disk_gb_budget from 792 to 698'
+                 in (ansible_failed_result.msg | default('')) }}
+
+    - name: The lowering was refused
+      ansible.builtin.assert:
+        that:
+          - miner_lower_refused | default(false)
+
+    - name: With the acknowledgement it goes through
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/config.toml" }
+        miner_disk_budget_lower_ack: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: An installed config at or below the new budget passes
+      ansible.builtin.copy:
+        dest: "{{ scratch.path }}/config.toml"
+        content: "[host]\ncvm_disk_gb_budget = 698\n"
+        mode: "0600"
+
+    - name: Run the budget tasks (equal budget)
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/config.toml" }
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: The clamp only lowers the budget
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/absent.toml" }
+        host_cvm_overrides: { disk_gb_budget_max: 500 }
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: Clamped to 500
+      ansible.builtin.assert:
+        that:
+          - miner_cvm_disk_budget_gb | int == 500
+
+    - name: A clamp above the derivation is ignored
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/absent.toml" }
+        host_cvm_overrides: { disk_gb_budget_max: 5000 }
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: Still 698
+      ansible.builtin.assert:
+        that:
+          - miner_cvm_disk_budget_gb | int == 698
+
+    - name: An unreadable installed config is not taken for a first install
+      block:
+        - name: Run the budget tasks against a directory as the config (must fail)
+          vars:
+            miner_agent: { config_path: "{{ scratch.path }}" }
+          ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+        - name: Not reached
+          ansible.builtin.set_fact:
+            miner_unreadable_refused: false
+      rescue:
+        - name: Refused
+          ansible.builtin.set_fact:
+            miner_unreadable_refused: true
+
+    - name: The unreadable config was refused
+      ansible.builtin.assert:
+        that:
+          - miner_unreadable_refused | default(false)
+
+    - name: A dedicated data mount gets no root extra
+      vars:
+        miner_agent: { config_path: "{{ scratch.path }}/absent.toml" }
+        miner_data_disk_root: /srv/data/vms
+        ansible_mounts:
+          - { mount: /, size_total: 107374182400, size_available: 64424509440 }
+          - { mount: /srv/data, size_total: 957777477632, size_available: 4294967296 }
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/disk-budget.yml
+
+    - name: Only reserve_disk_gb on a dedicated mount
+      ansible.builtin.assert:
+        that:
+          - miner_data_fs_mount == '/srv/data'
+          - miner_data_disk_reserve_gb | int == 100
+
+    - name: Remove the scratch dir
+      ansible.builtin.file:
+        path: "{{ scratch.path }}"
+        state: absent

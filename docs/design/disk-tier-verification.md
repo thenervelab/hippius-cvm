@@ -594,7 +594,7 @@ Every PR touching the UKI closure carries its KAT re-pin.
 | E4 | vali | `dedicated_disks` + `pinned_ack`, assignment, measured `hippius.dedicated=`, pinned refusals, failover skip | `VALI_DEDICATED_ENABLED`, `VALI_DEDICATED_ALLOWED_OWNERS` |
 | X2′ | ops | live e2e on a host with a spare whole disk: declare → probe → launch → write → reboot → §24 → KEK 403, header wiped, re-probe → free | internal owner only |
 | E5 | vali | replace API, per-slot compliance, exit notice for pinned VMs | flags |
-| C1/C2 | vali | pool state machine, cordon / pool-cordon, merit, tier unit factor | `VALI_DISK_TIER_CONSEQUENCES`, `VALI_REWARD_DISK_HEALTH_PENALTY`, `VALI_DISK_TIER_UNIT_FACTOR` |
+| C1/C2 | vali | pool state machine, cordon / pool-cordon, merit, tier unit factor. **TODO(C1)**: once verdicts change the tier, the probe's "sellable" test (`apps/disktier/probe.py` `_sellable`, today operator-declared/overridden nvme only) must follow what routing actually sells (a pool that holds or can receive OS disks), without an unfit verdict making its own pool unsold | `VALI_DISK_TIER_CONSEQUENCES`, `VALI_REWARD_DISK_HEALTH_PENALTY`, `VALI_DISK_TIER_UNIT_FACTOR` |
 | E3 | vali | per-VM compliance + remediation engine | `VALI_DISK_TIER_REMEDIATION=off\|notify\|migrate` |
 | B1/B2/B3/B4 | backend | tier prices + segment freeze; launch/feasibility/regions with the tier, tier-aware boot budgets; compliance segment split; dedicated disk lines | `COMPUTE_SELLABLE_OS_TIERS=["nvme"]`, `COMPUTE_DEDICATED_ENABLED=false` |
 | U1/U2 | console | OS tier selector; dedicated-disk picker + acknowledgement + slot states | hidden unless sellable |

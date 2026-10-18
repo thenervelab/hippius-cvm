@@ -130,7 +130,8 @@ and serves receipts before closing the incident. The alert clears with
 
 # Other failed moves (`HippiusStorageMoveFailed`)
 
-`vali_storage_move status --vm-id <vm>` gives the code. A failed move can
+`vali_storage_move status --vm-id <vm>` gives the code (the VM's move in
+flight, else its latest; `--all` lists every move). A failed move can
 leave the agent's journal active on its miner: while it is `redefined` the
 host takes no other move (`move-busy`) and the source copy stays on disk.
 

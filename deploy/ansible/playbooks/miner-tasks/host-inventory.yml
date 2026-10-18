@@ -1,0 +1,66 @@
+---
+# The §18.10 host-inventory collector units (HW7). Tasks file imported by
+# miner-agent-install.yml. Tagged `miner_inventory`, so
+# `--tags miner_inventory` applies it alone.
+#
+# Three oneshots of the agent binary, `hippius-host-inventory@<mode>`
+# (`full` daily, `counters` every 6 h, `kernel` every 5 min), each with its
+# timer. The unit files are ALWAYS installed; the timers are enabled and
+# started only when `miner_inventory_enabled` is true, else stopped and
+# disabled (the auto-update pattern). The sandbox is in the template
+# (templates/hippius-host-inventory.service.j2).
+#
+# `miner_inventory_unit_dir`, `miner_inventory_file_owner` / `_group`,
+# `miner_inventory_templates` and `miner_inventory_manage_systemd` exist
+# for the wiring test
+# (tests/host_inventory_wiring.yml), which renders into a scratch
+# directory and never touches systemd.
+
+- name: Render the host-inventory collector units and timers
+  tags: [miner_inventory]
+  ansible.builtin.template:
+    src: "{{ miner_inventory_templates | default(playbook_dir ~ '/miner-tasks/templates') }}/hippius-host-inventory.{{ item.1 }}.j2"
+    dest: "{{ miner_inventory_unit_dir | default('/etc/systemd/system') }}/hippius-host-inventory@{{ item.0 }}.{{ item.1 }}"
+    owner: "{{ miner_inventory_file_owner | default('root') }}"
+    group: "{{ miner_inventory_file_group | default('root') }}"
+    mode: "0644"
+  vars:
+    miner_inventory_mode: "{{ item.0 }}"
+  loop: "{{ ['full', 'counters', 'kernel'] | product(['service', 'timer']) | list }}"
+
+- name: Plan the host-inventory timers (running only with miner_inventory_enabled)
+  tags: [miner_inventory]
+  ansible.builtin.set_fact:
+    miner_inventory_timers:
+      - hippius-host-inventory@full.timer
+      - hippius-host-inventory@counters.timer
+      - hippius-host-inventory@kernel.timer
+    miner_inventory_timer_enabled: "{{ miner_inventory_enabled | bool }}"
+    miner_inventory_timer_state: "{{ 'started' if (miner_inventory_enabled | bool) else 'stopped' }}"
+    # Switched off: a run in progress is stopped too.
+    miner_inventory_services_to_stop: >-
+      {{ [] if (miner_inventory_enabled | bool) else
+         ['hippius-host-inventory@full.service',
+          'hippius-host-inventory@counters.service',
+          'hippius-host-inventory@kernel.service'] }}
+
+# `daemon_reload` picks up the rendered units. Disabled: stop + disable the
+# timers so a previously enabled host stops collecting. The oneshot
+# services are never enabled themselves: only their timers start them.
+- name: Enable + start, or stop + disable, the host-inventory timers
+  tags: [miner_inventory]
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: "{{ miner_inventory_timer_enabled }}"
+    state: "{{ miner_inventory_timer_state }}"
+    daemon_reload: true
+  loop: "{{ miner_inventory_timers }}"
+  when: miner_inventory_manage_systemd | default(true) | bool
+
+- name: Stop the host-inventory services when switched off
+  tags: [miner_inventory]
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ miner_inventory_services_to_stop }}"
+  when: miner_inventory_manage_systemd | default(true) | bool

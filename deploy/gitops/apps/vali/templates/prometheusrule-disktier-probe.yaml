@@ -11,6 +11,15 @@
 # probe is turned off again, the last push ages out of the guard within an
 # hour (a gauge frozen in the Pushgateway cannot keep an alert alive).
 #
+# PER POOL. Every per-node series carries `node` and `pool` (the storage
+# pool whose OS disk the probe measured; `default` on a node without a
+# storage report): one pool's verdicts never mask, reset or raise
+# another's, so each rule fires per (node, pool). Every pool taking OS
+# disks is watched whatever the probe skips it for (an old agent,
+# inactive, draining, no room), so a skipped pool ages into
+# DiskProbeStale instead of going silent; a node with no such pool keeps
+# a `default` series.
+#
 # Same routing as hippius-synthetic-monitor: a `severity` label, no custom
 # receiver ⇒ the Alertmanager default route. `warning` only during the
 # record-only calibration (R2): nothing acts on these verdicts yet.
@@ -31,7 +40,7 @@ spec:
       interval: 5m
       rules:
         - alert: DiskProbeFailing
-          # Failed or timed-out probe runs in a row since the node's last
+          # Failed or timed-out probe runs of a pool in a row since its last
           # verified one. A timeout counts: a miner cannot dodge by failing
           # launches (design §5.1).
           expr: (hippius_disk_probe_node_consecutive_failures >= {{ .Values.disktierProbe.alerts.failingRuns }}) {{ $guard }}
@@ -40,10 +49,11 @@ spec:
             severity: warning
             component: disk-tier
           annotations:
-            summary: "disk probe failing on node {{`{{ $labels.node }}`}}"
+            summary: "disk probe failing on node {{`{{ $labels.node }}`}} pool {{`{{ $labels.pool }}`}}"
             description: |
-              The last {{`{{ $value }}`}} disk-tier probe runs on node
-              {{`{{ $labels.node }}`}} failed or timed out. Record only: no
+              The last {{`{{ $value }}`}} disk-tier probe runs of pool
+              {{`{{ $labels.pool }}`}} on node {{`{{ $labels.node }}`}}
+              failed or timed out. Record only: no
               tier or cordon changes. Check `DiskProbeRun.failure_reason`
               in the vali admin (launch-failed / probe-timeout /
               io-error / precondition-incomplete / suspect-cache).
@@ -56,10 +66,10 @@ spec:
             severity: warning
             component: disk-tier
           annotations:
-            summary: "disk probe suspect-cache on node {{`{{ $labels.node }}`}}"
+            summary: "disk probe suspect-cache on node {{`{{ $labels.node }}`}} pool {{`{{ $labels.pool }}`}}"
             description: |
-              The newest disk-tier probe on node {{`{{ $labels.node }}`}}
-              reported a QD1 read latency only host RAM can serve
+              The newest disk-tier probe of pool {{`{{ $labels.pool }}`}}
+              on node {{`{{ $labels.node }}`}} reported a QD1 read latency only host RAM can serve
               (cache=writeback, tmpfs or a RAM-backed image). The probe is
               FAILED (no tier). Record only; investigate the host.
         - alert: DiskProbeStale
@@ -71,28 +81,40 @@ spec:
             severity: warning
             component: disk-tier
           annotations:
-            summary: "no verified disk probe of node {{`{{ $labels.node }}`}} in {{ .Values.disktierProbe.alerts.staleDays }} days"
+            summary: "no verified disk probe of node {{`{{ $labels.node }}`}} pool {{`{{ $labels.pool }}`}} in {{ .Values.disktierProbe.alerts.staleDays }} days"
             description: |
-              Node {{`{{ $labels.node }}`}} has not had a verified disk-tier
-              probe for more than {{ .Values.disktierProbe.alerts.staleDays }} days
-              (healthy: 7 d ± 2 d, plus a start delay of up to 2 d; a node
-              never verified counts from when the probe started watching it).
+              Pool {{`{{ $labels.pool }}`}} of node {{`{{ $labels.node }}`}}
+              has not had a verified disk-tier probe for more than
+              {{ .Values.disktierProbe.alerts.staleDays }} days (healthy: 7 d ± 2 d,
+              plus a start delay of up to 2 d; a pool never verified counts
+              from when the probe started watching it).
               Check the probe's skip reasons
               (`hippius_disk_probe_skipped`): capacity, boot cap, busy,
-              concurrency, gated.
+              concurrency, gated, no-room. A node whose agent cannot route
+              `os_pool` ages its non-default pools into this alert until it
+              is upgraded (needs-os-pool-order / os-pool-unavailable).
         - alert: MinerDiskSevere
           # What C1 WOULD grade severe (design §5.1): an unfit OS-pool
-          # verdict, suspect-cache, or two timeouts in a row.
+          # verdict, suspect-cache, or two timeouts in a row. Emitted only
+          # for a SELLABLE pool (OS disks, active, routable, sold as nvme by
+          # declaration or operator override: an OS disk is sold on it); a
+          # pool probed to explore or diagnose reports
+          # hippius_disk_probe_node_would_be_unfit_unsold instead, which
+          # promises nothing and pages nobody. A pool that flips between
+          # sellable and unsold (agent upgrade or rollback, draining, an
+          # override) switches metric, so a firing MinerDiskSevere can
+          # resolve without any new verdict.
           expr: (hippius_disk_probe_node_would_be_severe == 1) {{ $guard }}
           for: 15m
           labels:
             severity: warning
             component: disk-tier
           annotations:
-            summary: "node {{`{{ $labels.node }}`}} would be disk-severe (record only)"
+            summary: "node {{`{{ $labels.node }}`}} pool {{`{{ $labels.pool }}`}} would be disk-severe (record only)"
             description: |
               Under VALI_DISK_TIER_CONSEQUENCES=enforce (C1) node
-              {{`{{ $labels.node }}`}} would be auto-cordoned: its newest
-              probe classified the OS pool unfit, was suspect-cache, or the
-              last two runs timed out. Nothing is cordoned in R1.
+              {{`{{ $labels.node }}`}} would be auto-cordoned: the newest
+              probe of its sellable pool {{`{{ $labels.pool }}`}} classified
+              that pool unfit, was suspect-cache, or that pool's last two runs
+              timed out. Nothing is cordoned in R1.
 {{- end }}

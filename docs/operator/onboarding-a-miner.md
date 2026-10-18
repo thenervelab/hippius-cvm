@@ -719,7 +719,14 @@ that path, even an empty one, the pool reports `pool-fs-changed` and is
 not offered: remount the right one (checked on every heartbeat), or, if the
 swap is deliberate, delete that pool's entry from the file and restart the
 agent. A pool not mounted when the agent started reports `pool-unbound`
-once it appears, until the next restart binds it. A launch to a pool that
+once it appears, until the next restart binds it. A pool whose binding was recorded by
+device number (`dev:<st_dev>:<root>`, when no filesystem UUID is readable)
+can stay unbound for good on LVM or md RAID if its minor number changes
+across a reboot: its VMs then cannot relaunch, and vali raises
+`HippiusStoragePoolOffItsFilesystem` once such a pool holding VMs has been
+off its filesystem for 15 minutes. Mount the right filesystem, then delete
+the pool's entry from `storage-pools.json` and restart the agent, or
+restore the filesystem UUID (udev). A launch to a pool that
 is draining, closed to OS disks or off its filesystem is refused with
 `507 pool-unavailable:<pool>`, and vali places it elsewhere. A VM
 destroyed while one of its pools is off its filesystem is noted in
@@ -843,11 +850,14 @@ Storage never stops the agent:
 Three things bound how much tenant disk your host takes. The tightest
 one wins:
 
-1. **`[host] cvm_disk_gb_budget`**, which the play derives: the size of
-   the filesystem holding `miner_data_disk_root`, minus
-   `host_cvm.reserve_disk_gb` (default 100 GiB). The reserve covers §25
-   migration downloads, backup/restore staging, and base-image staging
-   when the data root is on the system disk. You can lower the budget
+1. **`[host] cvm_disk_gb_budget`**, which the play derives: the usable
+   size of the filesystem holding `miner_data_disk_root` (its blocks minus
+   the root-reserved ones, 5% on ext4 by default), minus
+   `host_cvm.reserve_disk_gb` (default 100 GiB), minus
+   `host_cvm.reserve_disk_root_extra_gb` (default 50 GiB) when that
+   filesystem is `/`. The reserve covers §25 migration downloads and
+   backup/restore staging; the extra covers the OS, the image cache and
+   base-image staging, which share `/` with the tenant disks. You can lower the budget
    per host with `host_cvm_overrides: {disk_gb_budget_max: N}`. You
    can't raise it above the derivation. The agent refuses any launch
    past the budget. Before a VM is registered, that's at preflight.
@@ -1048,6 +1058,64 @@ miner already approved; re-anchor an approved miner with
 `vali_set_miner_capacity`. Every field lands a `MinerCapacityAudit` row
 with the approver. Without `--trust operator` the miner stays `earned`, so
 the anchor is one more cap on what it has proven.
+
+**Automatic approval** (self-service onboarding): with
+`VALI_MINER_AUTO_APPROVE=true` as well, the scheduler re-evaluation loop
+approves a pending miner by itself (audit actor `auto:attested-soak`) once
+all of these hold:
+
+- its host-attestor is `attested` on a pinned release, beaconing, and its
+  AMD-signed CHIP_ID is the `platform_id` the miner registered, and no
+  other registered miner names that chip;
+- it registered through `/v1/admin/miner/register` with a real CHIP_ID and
+  an explicit `snp_generation`, and is not quarantined;
+- its heartbeats have carried the v3 capacity, the v4 disk figures and the
+  free RAM without a gap for `VALI_MINER_AUTO_APPROVE_SOAK_S` (default
+  1800 s);
+- it is not cordoned, and the approval above would not refuse it.
+
+The anchor is then the heartbeat's own figure (or an anchor already on the
+row, if lower), and the miner stays `earned`. `--list-pending` and the
+`GET` show the first condition a pending miner still fails.
+
+`chip-shared` is deliberate, not a bug: another registered miner already
+names this host's CHIP_ID (or a prefix of it), typically the same host
+re-onboarded under a new identity. A known chip coming back needs an
+operator approval.
+
+Before turning it on, check the rule against the fleet — read-only, every
+miner including the approved ones:
+
+```sh
+python manage.py vali_approve_miner --auto-evaluate [--json]
+```
+
+Per miner: every condition passed or failed, `would_approve` (what the
+next pass would do, switch as configured) and `would_approve_if_pending`
+(the miner alone, as a new pending miner with the switch on). Approved and
+revoked miners never soak, so their soak reads `null` and does not count
+against them. The anchor is shown twice, term by term (declared side,
+heartbeat figure, result): `anchor` keeps the row's current anchor as the
+declared side, as the real pass would; `anchor_as_new` is what a new miner
+on this hardware gets (the heartbeat figures, with the RAM vali's VMs hold
+on it added back to the free-RAM figure — vali's placement ledger, not a
+measurement: pending or power-stopped VMs make it read high — so the sum
+is capped at the host's memory as known, `cap` / `cap_source`: the v3
+heartbeat's CVM memory budget, else the row's anchor). `failed` also
+names `anchor` /
+`anchor_as_new` when that anchor would be refused.
+
+To take an approval back — automatic or not, grandfathered included:
+
+```sh
+python manage.py vali_approve_miner --miner-id <MINER_ID> --revoke --by <you> --reason "<why>"
+```
+
+or `POST .../approval` with `{"revoke": true, "revoked_by", "reason"}`. The
+miner is pending again (no new placements; its VMs stay) and is marked
+revoked: the automatic approval never takes it again, only an operator
+approval does. Revoking a pending miner keeps it out of the automatic
+approval for good.
 
 ---
 

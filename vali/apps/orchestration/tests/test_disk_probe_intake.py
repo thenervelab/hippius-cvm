@@ -7,6 +7,9 @@ rewards and billing (`scoring._excluded_owners`).
   staged, whoever calls;
 - the orchestrator's in-process launch (`disk_probe=True`) passes, through
   the real intake, and must itself name its own run and a probe owner;
+- only the probe pins its OS pool (`os_pool`, `_check_os_pool_pin`): any
+  other launch naming one is refused `os-pool-reserved`, and the probe's
+  launch must pin exactly its run's pool;
 - a probe owner's VMs earn no reward weight and no bill."""
 
 from __future__ import annotations
@@ -99,6 +102,25 @@ def test_a_closed_probe_vm_id_stays_reserved(
     assert resp.json()["category"] == "disk-probe-id-reserved"
 
 
+@pytest.mark.parametrize("pool", ["nvme0", "default", "", None, 7])
+def test_an_http_launch_naming_an_os_pool_is_refused(
+    root_client: Any,
+    stub_vault_put: list,  # noqa: F811
+    pool: Any,
+) -> None:
+    """vali chooses every VM's OS pool; the key alone is refused, whatever
+    its value (`null` is absent)."""
+    resp = root_client.post(LAUNCH_URL, {**_intent(), "os_pool": pool}, format="json")
+    if pool is None:
+        assert resp.status_code == 202, resp.content
+        assert "pinned_os_pool" not in LaunchJob.objects.get().spec_json
+        return
+    assert resp.status_code == 400, resp.content
+    assert resp.json()["category"] == "os-pool-reserved"
+    assert stub_vault_put == []
+    assert not LaunchJob.objects.exists()
+
+
 def test_a_tenant_launch_is_untouched(
     root_client: Any,
     stub_vault_put: list,  # noqa: F811
@@ -133,6 +155,47 @@ def test_the_orchestrator_must_name_its_run_and_a_probe_owner() -> None:
         launch_jobs._check_disk_probe_role(ok, disk_probe=False)
 
 
+def test_the_orchestrator_must_pin_exactly_its_runs_pool_and_chip() -> None:
+    run = make_run(state=ProbeRunState.SCHEDULED, pool="nvme0")
+    ok = {"vm_id": run.vm_id, "os_pool": "nvme0", "platform_id": run.chip_id}
+    launch_jobs._check_os_pool_pin(ok, run)
+    for bad in (
+        {**ok, "os_pool": "default"},  # another pool than the one recorded
+        {**ok, "os_pool": "nvme1"},
+        {"vm_id": run.vm_id, "platform_id": run.chip_id},  # unpinned: the chooser picks
+        {**ok, "os_pool": ""},
+        # A pool is one node's: the launch is bound to the run's chip at intake.
+        {**ok, "platform_id": ""},
+        {"vm_id": run.vm_id, "os_pool": "nvme0"},
+        {**ok, "platform_id": "cd" * 32},
+    ):
+        with pytest.raises(launch_jobs.LaunchIntentError) as exc:
+            launch_jobs._check_os_pool_pin(bad, run)
+        assert exc.value.category == "os-pool-reserved"
+    # Any other launch (no probe run): the key alone is refused.
+    with pytest.raises(launch_jobs.LaunchIntentError) as exc:
+        launch_jobs._check_os_pool_pin(ok, None)
+    assert exc.value.category == "os-pool-reserved"
+    launch_jobs._check_os_pool_pin({"vm_id": "x"}, None)
+    # The probe's run comes from the identity check, read once.
+    assert launch_jobs._check_disk_probe_role(
+        {"vm_id": run.vm_id, "user_id": USER, "tenant_id": TENANT}, disk_probe=True
+    ) == run
+    assert launch_jobs._check_disk_probe_role({"vm_id": "x"}, disk_probe=False) is None
+
+
+def test_a_pin_needs_a_golden_launch_and_a_pool_id() -> None:
+    """`_build_spec_json` past the identity gates: a legacy launch's OS disk
+    is always on `default` (a pin would be silently ignored), and the pin
+    is a pool id."""
+    with pytest.raises(launch_jobs.LaunchIntentError, match="golden") as exc:
+        launch_jobs._build_spec_json({**_intent(), "os_pool": "nvme0"})
+    assert exc.value.category == "bad-field"
+    with pytest.raises(launch_jobs.LaunchIntentError, match="os_pool") as exc:
+        launch_jobs._build_spec_json({**_intent(), "os_pool": "NVMe/0"})
+    assert exc.value.category == "bad-field"
+
+
 def test_the_orchestrator_launches_through_the_real_intake(
     settings: Any,
     make_golden_bake: Any,  # noqa: F811
@@ -149,20 +212,26 @@ def test_the_orchestrator_launches_through_the_real_intake(
         image_name="ubuntu", distro="ubuntu", bake_id="golden-probe-1", blessed_at=timezone.now()
     )
     settings.VALI_DISK_PROBE_ENABLED = True
-    run = probe.new_run(
-        node_id=NODE, pool_id="default", trigger="onboarding", chip_id="ab" * 32,
-        now=timezone.now(),
-    )
-    assert probe.launch(run, now=timezone.now()) is True
-    run.refresh_from_db()
-    assert run.state == ProbeRunState.LAUNCHING
-    job = LaunchJob.objects.get(job_id=run.launch_job_id)
-    assert job.vm_id == run.vm_id
-    assert job.tenant_id == TENANT
-    assert job.flavor == "medium"
-    assert job.spec_json["platform_id"] == "ab" * 32
-    assert job.spec_json["user_id"] == USER
-    assert job.decided_by.name == probe.ACTOR_NAME
+    for pool in ("default", "nvme0"):
+        run = probe.new_run(
+            node_id=NODE, pool_id=pool, trigger="onboarding", chip_id="ab" * 32,
+            now=timezone.now(),
+        )
+        assert probe.launch(run, now=timezone.now()) is True
+        run.refresh_from_db()
+        assert run.state == ProbeRunState.LAUNCHING
+        job = LaunchJob.objects.get(job_id=run.launch_job_id)
+        assert job.vm_id == run.vm_id
+        assert job.tenant_id == TENANT
+        assert job.flavor == "medium"
+        assert job.spec_json["platform_id"] == "ab" * 32
+        assert job.spec_json["user_id"] == USER
+        assert job.decided_by.name == probe.ACTOR_NAME
+        # The pool under test rides the job to the worker (`LaunchSpec`);
+        # `default` pinned ⇒ the order names no pool.
+        assert job.spec_json["pinned_os_pool"] == pool
+        spec = launch_jobs.launch.LaunchSpec(**job.spec_json, kek_bytes=None, userdata=b"")
+        assert spec.pinned_os_pool == pool
 
 
 # ─── rewards and billing ─────────────────────────────────────────────

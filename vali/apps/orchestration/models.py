@@ -564,6 +564,12 @@ class MigrationJob(models.Model):
     #: the launch digest the destination's SNP generation measures, pinned
     #: before the KBS activate and carried by its ticket. Blank otherwise.
     dest_measurement_hex = models.CharField(max_length=96, blank=True, default="", db_default="")
+    #: A4b: the storage pool the destination's activate order names
+    #: (`effects.arrival_os_pool`), pinned before the first dispatch so every
+    #: retry names the same one; recorded on the destination placement at
+    #: activation. "" = none (`default`); meaningful once `dest_os_pool_pinned`.
+    dest_os_pool = models.CharField(max_length=32, blank=True, default="", db_default="")
+    dest_os_pool_pinned = models.BooleanField(default=False, db_default=False)
     #: ... and the VM's recorded digest it replaces, kept pinned until the
     #: source is reclaimed (`cross_gen.held_source_digests`).
     source_measurement_hex = models.CharField(

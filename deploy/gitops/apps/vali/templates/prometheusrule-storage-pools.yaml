@@ -1,0 +1,44 @@
+{{- if eq (toString .Values.storagePools.alerts.enabled) "true" }}
+---
+# Storage pools off their filesystem while they hold VMs (#1638;
+# apps.disktier.pool_health, pushed by the scheduler re-eval loop with the
+# storage-config sync gauges, job `vali-storage-config`). Every alert
+# ignores a report older than five minutes: the Pushgateway keeps the last
+# push forever. A `severity` label, the Alertmanager default route.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-storage-pools
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-storage-pools
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-storage-pools
+      interval: 1m
+      rules:
+        - alert: HippiusStoragePoolOffItsFilesystem
+          # The VMs recorded there cannot relaunch (vali sees
+          # `relaunch-disks-unreadable/pool-not-mounted` again and again).
+          expr: (time() - max by (node_id, pool, error) (hippius_storage_pool_unavailable_since_seconds)) > {{ mul .Values.storagePools.alerts.unavailableAfterMinutes 60 }} and on() (time() - hippius_storage_survey_timestamp_seconds) < 300
+          for: 0m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "pool {{`{{ $labels.pool }}`}} on node {{`{{ $labels.node_id }}`}} off its filesystem ({{`{{ $labels.error }}`}}) while it holds VMs"
+            description: |
+              The node reports the pool unavailable ({{`{{ $labels.error }}`}}) for over
+              {{ .Values.storagePools.alerts.unavailableAfterMinutes }} minutes and VMs live
+              there (`hippius_storage_pool_unavailable_vms`): they cannot relaunch.
+              `pool-not-a-mount` / `pool-path-missing`: mount it. `pool-unbound` /
+              `pool-fs-changed` after a
+              reboot on LVM / md RAID (a binding by device number whose minor
+              changed): once the right filesystem is mounted, delete the pool's entry
+              from `<state_disk_root>/storage-pools.json` and restart the agent, or
+              restore the filesystem UUID (udev). docs/operator/onboarding-a-miner.md,
+              "Storage pools".
+{{- end }}

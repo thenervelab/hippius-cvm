@@ -40,6 +40,10 @@ prod-root = ["hippius-miner-uki-fetch/prod-root"]
 # `SignedMinerHeartbeat`, the canonical-CBOR encoder. Crypto-free; the
 # Ed25519 signing is the miner-agent's own `MinerIdentity`.
 hippius-types = { path = "../../hippius-types" }
+# The §18.10 host-inventory wire format the `host-inventory-collect`
+# oneshot writes (one `<section>.json` per section). Its own crate, so the
+# guest UKIs, which link `hippius-types`, are untouched.
+hippius-host-inventory = { path = "../../hippius-host-inventory" }
 # The miner-side UKI fetch + §22-verify pipeline — consumed as a
 # library. `fetch` already does cached fetch, always-verify (even on a
 # cache hit), hash-gating, and crash-safe atomic install.
@@ -157,8 +161,10 @@ sha2 = "0.10"
 raw-cpuid = "11"
 # `statvfs` for the data-disk free-space pre-check — convert the in-guest
 # mid-format ENOSPC into a clean pre-create reject (and catch a miner
-# that over-declares its disk budget). `fs` feature only.
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+# that over-declares its disk budget). `signal`: `killpg`, so the
+# host-inventory collector's tool timeout reaches the whole process group
+# (the workspace forbids the `unsafe` a raw `libc::killpg` needs).
+nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
 
 [dev-dependencies]
 # `test-util` — paused time, so a test can run the backup release's real

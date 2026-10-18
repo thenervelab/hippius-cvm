@@ -15,6 +15,9 @@ EXPECTED = {
     "v1/operator/miners/<str:node_id>/storage": "OperatorStorageView",
     "v1/operator/miners/<str:node_id>/storage/pools": "OperatorStoragePoolsView",
     "v1/operator/miners/<str:node_id>/storage/pools/<str:pool_id>": "OperatorStoragePoolView",
+    "v1/operator/miners/<str:node_id>/storage/pools/<str:pool_id>/force-remove": (
+        "OperatorStoragePoolForceRemoveView"
+    ),
     "v1/operator/miners/<str:node_id>/storage/validate": "OperatorStorageValidateView",
     "v1/operator/miners/<str:node_id>/storage/adopt": "OperatorStorageAdoptView",
     "v1/operator/miners/<str:node_id>/storage/history": "OperatorStorageHistoryView",
@@ -23,6 +26,11 @@ EXPECTED = {
     "v1/operator/miners/<str:node_id>/dedicated-disks/<str:disk_id>/drain": (
         "OperatorDedicatedDiskDrainView"
     ),
+    # §18.10 host inventory: read-only, owner-only (serials).
+    "v1/operator/miners/<str:node_id>/hardware": "OperatorHardwareView",
+    "v1/operator/miners/<str:node_id>/hardware/history": "OperatorHardwareHistoryView",
+    "v1/operator/miners/<str:node_id>/disk-inventory": "OperatorDiskInventoryView",
+    "v1/operator/miners/<str:node_id>/host-disk-advisories": "OperatorHostDiskAdvisoriesView",
 }
 
 

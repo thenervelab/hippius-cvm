@@ -492,8 +492,11 @@ def test_no_public_path_swallows_the_admin_surface() -> None:
         if (doc or {}).get("kind") == "Ingress"
         for rule in doc["spec"]["rules"]
         for p in rule["http"]["paths"]
+        if p.get("pathType") == "Prefix"
     ]
     admin = sorted(p for p in paths if p.rstrip("/").startswith("/v1/admin"))
+    # The one admin regex (`/v1/admin/miner/{id}/approval`) lives on its own
+    # Ingress and is pinned by `test_the_miner_approval_route_is_published_narrowly`.
     # Each entry is an EXACT route and carries its own reason in values.yaml:
     #   - the measurement ledger, root-only, needed by the SDK;
     #   - the miner declaration, behind the single `IsMinerAdmin` principal,
@@ -774,6 +777,152 @@ def test_pool_routing_min_agent_version_is_one_shared_value() -> None:
         assert "VALI_POOL_ROUTING_MIN_AGENT_VERSION" not in env, label
     off = _configmap_data(_docs("--set", "scheduler.poolRoutingMinAgentVersion="))
     assert off["VALI_POOL_ROUTING_MIN_AGENT_VERSION"] == ""
+
+
+@_needs_helm
+def test_storage_move_canary_is_one_shared_value_and_renders_only_when_set() -> None:
+    """The move driver (orchestration tick) and the operator command (web
+    pod) read the same three keys from the shared ConfigMap. Unset, none
+    renders and settings.py keeps every move off."""
+    data = _configmap_data(_docs())
+    assert data["VALI_STORAGE_MOVE_ENABLED"] == "true"
+    assert data["VALI_STORAGE_MOVE_MINERS"] == "*"
+    assert data["VALI_STORAGE_MOVE_MIN_AGENT_VERSION"] == "v2026.10.17"
+    for label, env in _env_by_workload(_docs()).items():
+        assert not any(k.startswith("VALI_STORAGE_MOVE_") for k in env), label
+    off = _configmap_data(
+        _docs(
+            "--set", "storageMove.enabled=",
+            "--set", "storageMove.miners=",
+            "--set", "storageMove.minAgentVersion=",
+        )
+    )
+    assert not any(k.startswith("VALI_STORAGE_MOVE_") for k in off)
+
+
+@_needs_helm
+def test_miner_approval_flag_is_one_shared_value_and_off() -> None:
+    """Every process that admits a miner (chain refresh in the ticks, the
+    web API, the launch tick) reads one ConfigMap key, never a per-pod
+    override. It stays "false" until flipped on purpose; unset renders
+    "false" too."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_MINER_APPROVAL_REQUIRED"] == "false"
+    for label, env in _env_by_workload(docs).items():
+        assert "VALI_MINER_APPROVAL_REQUIRED" not in env, label
+    unset = _configmap_data(_docs("--set", "scheduler.minerApprovalRequired=null"))
+    assert unset["VALI_MINER_APPROVAL_REQUIRED"] == "false"
+    on = _configmap_data(_docs("--set-string", "scheduler.minerApprovalRequired=true"))
+    assert on["VALI_MINER_APPROVAL_REQUIRED"] == "true"
+
+
+def _public_ingresses(docs: list[dict]) -> dict[str, dict]:
+    return {
+        d["metadata"]["name"]: d
+        for d in docs
+        if d.get("kind") == "Ingress" and d["metadata"]["name"].startswith("vali-public-api")
+    }
+
+
+def _ingress_paths(ingress: dict) -> list[dict]:
+    return [p for rule in ingress["spec"]["rules"] for p in rule["http"]["paths"]]
+
+
+def _vali_routes() -> list[str]:
+    """Every vali URL route, as `/v1/...` with each converter replaced by a
+    sample value (a path element that matches `[A-Za-z0-9._-]+`)."""
+    from django.urls import URLPattern, URLResolver, get_resolver
+
+    out: list[str] = []
+
+    def walk(patterns, at: str = "") -> None:
+        for p in patterns:
+            if isinstance(p, URLResolver):
+                walk(p.url_patterns, at + str(p.pattern))
+            elif isinstance(p, URLPattern):
+                out.append("/" + re.sub(r"<[^>]+>", "miner-a", at + str(p.pattern)))
+
+    walk(get_resolver().url_patterns)
+    return out
+
+
+@_needs_helm
+def test_the_miner_approval_route_is_published_narrowly() -> None:
+    """`/v1/admin/miner/{id}/approval` is published through an anchored
+    regex on its own Ingress — never a prefix that takes `/quarantine`,
+    `/drain`, the bare miner or the list with it."""
+    ingress = _public_ingresses(_docs())["vali-public-api-regex"]
+    assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/use-regex"] == "true"
+    paths = _ingress_paths(ingress)
+    assert [p["path"] for p in paths] == ["/v1/admin/miner/[A-Za-z0-9._-]+/approval$"]
+    assert all(p["pathType"] == "ImplementationSpecific" for p in paths)
+    # What ingress-nginx serves: `location ~* "^<path>"`.
+    served = re.compile("^" + paths[0]["path"], re.IGNORECASE)
+    for ok in (
+        "/v1/admin/miner/miner-a/approval",
+        "/v1/admin/miner/" + "ab" * 32 + "/approval",
+    ):
+        assert served.search(ok), ok
+    for hidden in (
+        "/v1/admin/miner/miner-a/drain",
+        "/v1/admin/miner/miner-a/quarantine",
+        "/v1/admin/miner/miner-a",
+        "/v1/admin/miner/list",
+        "/v1/admin/miner/register",
+        "/v1/admin/miner/a/b/approval",
+        "/v1/admin/miner/miner-a/approval/x",
+        "/v1/admin/miner//approval",
+    ):
+        assert not served.search(hidden), hidden
+
+
+@_needs_helm
+def test_no_vali_route_leaks_through_a_regex_prefix() -> None:
+    """With `use-regex` on the host, ingress-nginx serves every Prefix path
+    as `~* "^<path>"`: case-insensitive, no path-element boundary. No vali
+    route may start with a published prefix without being AT or UNDER it,
+    and the regex paths may match no route but the approval one."""
+    docs = _docs()
+    ingresses = _public_ingresses(docs)
+    prefixes = [p["path"] for p in _ingress_paths(ingresses["vali-public-api"])]
+    regexes = [
+        re.compile("^" + p["path"], re.IGNORECASE)
+        for p in _ingress_paths(ingresses["vali-public-api-regex"])
+    ]
+    routes = _vali_routes()
+    assert routes
+    for route in routes:
+        for prefix in prefixes:
+            if route.lower().startswith(prefix.lower()):
+                assert route == prefix or route.startswith(prefix + "/"), (
+                    f"{route} would be published by the regex form of {prefix}"
+                )
+    matched = sorted({r for r in routes for rx in regexes if rx.search(r)})
+    assert matched == ["/v1/admin/miner/miner-a/approval"], matched
+
+
+@_needs_helm
+def test_miner_auto_approve_is_one_shared_value_and_off() -> None:
+    """The reeval pass (approval) and the web pods (heartbeat soak) read the
+    same two keys from the shared ConfigMap; off by default, 1800 s soak."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    assert data["VALI_MINER_AUTO_APPROVE"] == "false"
+    assert data["VALI_MINER_AUTO_APPROVE_SOAK_S"] == "1800"
+    env = _env_by_workload(docs)
+    for label, workload in env.items():
+        assert "VALI_MINER_AUTO_APPROVE" not in workload, label
+        assert "VALI_MINER_AUTO_APPROVE_SOAK_S" not in workload, label
+    unset = _configmap_data(
+        _docs(
+            "--set", "scheduler.minerAutoApprove=null",
+            "--set", "scheduler.minerAutoApproveSoakS=null",
+        )
+    )
+    assert (unset["VALI_MINER_AUTO_APPROVE"], unset["VALI_MINER_AUTO_APPROVE_SOAK_S"]) == (
+        "false",
+        "1800",
+    )
 
 
 @_needs_helm

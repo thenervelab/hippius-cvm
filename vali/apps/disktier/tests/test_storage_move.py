@@ -1093,3 +1093,45 @@ def test_the_command_starts_shows_and_cancels(host: Vm, agent: FakeMoveAgent) ->
     assert (_move().state, _move().code) == (StorageMoveState.FAILED, "operator-abandoned")
     assert BackupPolicy.objects.get(vm=host).full_required is True
     assert agent.sent == [], "nothing sent"
+
+
+def test_status_of_a_vm_is_its_move_in_flight_else_its_latest(host: Vm) -> None:
+    def move(state: str, created: datetime, target: str) -> VmStorageMove:
+        m = VmStorageMove.objects.create(
+            vm=host,
+            miner_node_id=NODE,
+            miner_id="miner-7",
+            source_pool="default",
+            target_pool=target,
+            bandwidth_mib_s=200,
+            state=state,
+        )
+        VmStorageMove.objects.filter(pk=m.pk).update(created_at=created)
+        return m
+
+    def status(*extra: str) -> list[dict]:
+        out = StringIO()
+        call_command("vali_storage_move", "status", "--vm-id", VM, *extra, stdout=out)
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    now = timezone.now()
+    first = move(StorageMoveState.DONE, now - timedelta(hours=2), "nvme0")
+    back = move(StorageMoveState.DONE, now - timedelta(hours=1), "default")
+    assert [r["move_id"] for r in status()] == [back.move_id]
+    # A move in flight wins, even over a finished one stamped later.
+    live = move(StorageMoveState.MOVING, now - timedelta(hours=3), "nvme0")
+    assert [r["move_id"] for r in status()] == [live.move_id]
+    assert [r["move_id"] for r in status("--all")] == [
+        back.move_id,
+        first.move_id,
+        live.move_id,
+    ]
+
+
+@pytest.mark.usefixtures("move_on")
+def test_no_receipts_says_to_wait_for_the_first_after_a_boot(host: Vm) -> None:
+    ReceiptWatermark.objects.all().delete()
+    with pytest.raises(MoveRefused) as exc:
+        storage_move.request_move(vm_id=VM, target_pool="nvme0")
+    assert exc.value.code == "move-no-receipts"
+    assert "first periodic receipt (~5 min)" in str(exc.value)

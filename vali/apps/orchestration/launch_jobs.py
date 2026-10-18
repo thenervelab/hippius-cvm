@@ -16,13 +16,14 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from apps.disktier.storage_doc import is_valid_pool_id
 from apps.identity import scoping
 from apps.orchestration import power_policy, webhook
 from apps.orchestration.effects import EffectError, EffectUnavailable
@@ -34,6 +35,9 @@ from apps.orchestration.models import (
 )
 from apps.orchestration.services import customer_keys, flavors, launch, vault_kv
 from apps.scheduler.placement import REGION_RE
+
+if TYPE_CHECKING:
+    from apps.disktier.models import DiskProbeRun
 
 log = logging.getLogger("apps.orchestration.launch_jobs")
 
@@ -250,6 +254,18 @@ def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
         raise LaunchIntentError("require_failover_peer must be a boolean", "bad-field")
     if rfp:
         spec["require_failover_peer"] = True
+
+    # The disk probe's OS-pool pin (`_check_os_pool_pin` admitted it, from a
+    # disk-probe launch only). Written only when set, like the two above.
+    pin = intent.get(_OS_POOL_KEY)
+    if pin is not None:
+        if not isinstance(pin, str) or not is_valid_pool_id(pin):
+            raise LaunchIntentError("os_pool must match [a-z0-9-]{1,32}", "bad-field")
+        if spec["disk_mode"] != _DISK_MODE_GOLDEN_VERITY:
+            # A legacy launch's OS disk always lands on `default`: a pin
+            # there would be silently ignored.
+            raise LaunchIntentError("os_pool needs a golden launch", "bad-field")
+        spec["pinned_os_pool"] = pin
 
     # Tenant price ceiling — optional positive int (USD/unit ×1e6) or None
     # (no ceiling ⇒ the VM is never migrated on a miner price change).
@@ -547,7 +563,7 @@ def _check_cdn_role(intent: dict[str, Any], *, cdn_node: bool) -> None:
         )
 
 
-def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> None:
+def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> DiskProbeRun | None:
     """The disk-tier probe identity at intake (`apps.disktier.probe`),
     before anything is staged. A probe VM's vm id and the probe owners
     (`VALI_DISK_PROBE_OWNERS`, user or tenant id) are launched only by the
@@ -555,14 +571,16 @@ def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> None:
     never through the HTTP API, whoever calls it (`disk-probe-id-reserved`,
     400). Symmetric: the orchestrator's launch must name one of its own
     runs AND a probe owner, so a bug there cannot launch a probe VM under
-    a real tenant's identity."""
+    a real tenant's identity. Returns the probe's run (`None` for any
+    other launch)."""
     from apps.disktier.models import DiskProbeRun
     from apps.disktier.probe_owners import probe_tenant_ids, probe_user_ids
 
     vm_id = str(intent.get("vm_id") or "")
     user_id = str(intent.get("user_id") or "")
     tenant_id = str(intent.get("tenant_id") or "")
-    is_run = bool(vm_id) and DiskProbeRun.objects.filter(vm_id=vm_id).exists()
+    run = DiskProbeRun.objects.filter(vm_id=vm_id).first() if vm_id else None
+    is_run = run is not None
     probe_user = user_id in probe_user_ids()
     probe_tenant = tenant_id in probe_tenant_ids()
     if not disk_probe:
@@ -572,11 +590,51 @@ def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> None:
                 "only the probe orchestrator launches it",
                 "disk-probe-id-reserved",
             )
-        return
-    if not (is_run and probe_user and probe_tenant):
+        return None
+    if not (run is not None and probe_user and probe_tenant):
         raise LaunchIntentError(
             f"a disk-probe launch must name its own run ({vm_id!r}) and a probe owner",
             "disk-probe-id-reserved",
+        )
+    return run
+
+
+#: The category of an `os_pool` in a launch that is not the disk probe's.
+CATEGORY_OS_POOL_RESERVED = "os-pool-reserved"
+#: The intent key the disk-tier probe pins its pool under test with.
+_OS_POOL_KEY = "os_pool"
+
+
+def _check_os_pool_pin(intent: dict[str, Any], run: DiskProbeRun | None) -> None:
+    """The OS-disk pool pin at intake, after `_check_disk_probe_role`. vali
+    chooses every VM's OS pool (A4b, `launch._choose_os_pool`); only the
+    disk-tier probe pins one — the pool it measures — so any other launch
+    naming `os_pool`, whoever calls, is refused `os-pool-reserved` (400)
+    before anything is staged. A disk-probe launch must name exactly its
+    run's pool (`DiskProbeRun.os_pool_id`; `default` included), so its OS
+    disk never lands on a pool other than the one its verdict is recorded
+    against — and its run's chip (`platform_id`): a pool is one node's, so
+    the launch is bound to that node at intake, never placed elsewhere.
+    `run` is the probe's own (`_check_disk_probe_role`), `None` for any
+    other launch."""
+    pin = intent.get(_OS_POOL_KEY)
+    if run is None:
+        if pin is not None:
+            raise LaunchIntentError(
+                "os_pool is chosen by vali; only the disk-tier probe pins it",
+                CATEGORY_OS_POOL_RESERVED,
+            )
+        return
+    if not isinstance(pin, str) or not pin or pin != run.os_pool_id:
+        raise LaunchIntentError(
+            f"a disk-probe launch must pin its run's pool ({run.os_pool_id!r}), not {pin!r}",
+            CATEGORY_OS_POOL_RESERVED,
+        )
+    platform = intent.get("platform_id")
+    if not run.chip_id or platform != run.chip_id:
+        raise LaunchIntentError(
+            "a disk-probe launch must be pinned to its run's chip (platform_id)",
+            CATEGORY_OS_POOL_RESERVED,
         )
 
 
@@ -851,7 +909,8 @@ def start_launch(
         raise LaunchIntentError(str(exc), "bad-field") from exc
     # The disk-probe identity, before any lookup or Vault write: a tenant
     # launch naming a probe's vm id or owner stages nothing.
-    _check_disk_probe_role(intent, disk_probe=disk_probe)
+    probe_run = _check_disk_probe_role(intent, disk_probe=disk_probe)
+    _check_os_pool_pin(intent, probe_run)
     # #587 Phase 1C — bake→launch chaining: if the intent names a
     # `bake_id`, fill the artifact fields a Succeeded TenantBake already
     # determined (the qcow2/kernel/initrd SHAs + the LUKS-header MAC + the

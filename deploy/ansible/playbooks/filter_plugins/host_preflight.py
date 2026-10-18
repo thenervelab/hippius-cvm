@@ -86,6 +86,39 @@ def _cmdline_keys(cmdline: str) -> set[str]:
     return {token.split("=", 1)[0] for token in cmdline.split()}
 
 
+def statfs_usable_gib(statfs: Any) -> int:
+    """The GiB of a filesystem the agent (not root) can fill, from
+    `stat -f -c '%S %b %f %a' <mount>` (fundamental block size, blocks,
+    free, available): (blocks − free + available) × size — every block but
+    the root-reserved ones (ext4: 5% by default). `ansible_mounts` cannot
+    give it: it carries no f_bfree (its `block_used` is f_blocks − f_bavail,
+    so used + available is the whole filesystem, reserve included). 0 for
+    anything unreadable: every caller treats 0 as "too small", never as
+    "unbounded"."""
+    try:
+        size, blocks, free, available = (int(x) for x in str(statfs).split())
+    except (TypeError, ValueError):
+        return 0
+    if min(size, blocks, free, available) < 0 or free > blocks:
+        return 0
+    return (blocks - free + available) * size // _GIB
+
+
+def disk_reserve_gib(mount_point: str, reserve_gb: Any, root_extra_gb: Any) -> int:
+    """What the agent keeps off the tenants on the data filesystem:
+    `reserve_disk_gb`, plus `reserve_disk_root_extra_gb` when that
+    filesystem is `/` (the OS, the image cache and the base-image staging
+    live there too)."""
+    extra = _int(root_extra_gb, 0) if str(mount_point).rstrip("/") == "" else 0
+    return _int(reserve_gb, 0) + extra
+
+
+def mount_point_for(path: str, mounts: list[dict[str, Any]]) -> str:
+    """The mount point holding `path` ("" when none does)."""
+    mount = _mount_for(path, list(mounts or []))
+    return str(mount.get("mount", "")) if mount else ""
+
+
 def _mount_for(path: str, mounts: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The longest mount point that is a path prefix of `path` (the same
     rule miner-agent-install.yml uses for the disk budget)."""
@@ -395,15 +428,24 @@ def _check_storage(facts: dict[str, Any], limits: dict[str, Any], report: _Repor
                 "miner_state_disk_root from host_vars to use the default.",
             )
 
-    reserve_gb = _int(limits.get("reserve_disk_gb"), 0)
     min_tenant_gb = _int(limits.get("min_tenant_disk_gb"), 0)
     data_mount = _mount_for(data_root, mounts)
-    data_gb = _int(data_mount.get("size_total"), 0) // _GIB if data_mount else 0
+    data_gb = statfs_usable_gib(facts.get("data_fs_statfs"))
+    reserve_gb = disk_reserve_gib(
+        str(data_mount.get("mount", "")) if data_mount else "",
+        limits.get("reserve_disk_gb"),
+        limits.get("reserve_disk_root_extra_gb"),
+    )
     if data_gb < reserve_gb + min_tenant_gb:
+        size = (
+            f"{data_gb} GiB usable"
+            if data_gb
+            else "unreadable (`stat -f` gave no answer)"
+        )
         report.fail_first_install(
             "DATA_ROOT_TOO_SMALL",
             f"the filesystem holding {data_root} "
-            f"({data_mount['mount'] if data_mount else 'not found'}) is {data_gb} GiB; "
+            f"({data_mount['mount'] if data_mount else 'not found'}) is {size}; "
             f"needs >= {reserve_gb + min_tenant_gb} GiB ({reserve_gb} reserve + "
             f"{min_tenant_gb} for tenant disks)",
             "Point miner_data_disk_root at a larger filesystem (a dedicated NVMe / RAID "
@@ -516,5 +558,8 @@ class FilterModule:
         return {
             "miner_host_preflight": miner_host_preflight,
             "miner_preflight_line": preflight_line,
+            "miner_statfs_usable_gib": statfs_usable_gib,
+            "miner_mount_for": mount_point_for,
+            "miner_disk_reserve_gib": disk_reserve_gib,
             "parse_host_probe": parse_probe,
         }

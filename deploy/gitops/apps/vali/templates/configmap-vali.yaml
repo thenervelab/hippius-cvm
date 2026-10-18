@@ -365,6 +365,11 @@ data:
   VALI_POWER_POLICY_MIN_AGENT_VERSION: {{ .Values.scheduler.powerPolicyMinAgentVersion | quote }}
   # Pool routing (os_pool) — see values.yaml `scheduler.poolRoutingMinAgentVersion`.
   VALI_POOL_ROUTING_MIN_AGENT_VERSION: {{ .Values.scheduler.poolRoutingMinAgentVersion | default "" | quote }}
+  # External-miner approval gate — see values.yaml `scheduler.minerApprovalRequired`.
+  VALI_MINER_APPROVAL_REQUIRED: {{ .Values.scheduler.minerApprovalRequired | default "false" | toString | quote }}
+  # Automatic approval after an attested soak — see values.yaml `scheduler.minerAutoApprove`.
+  VALI_MINER_AUTO_APPROVE: {{ .Values.scheduler.minerAutoApprove | default "false" | toString | quote }}
+  VALI_MINER_AUTO_APPROVE_SOAK_S: {{ .Values.scheduler.minerAutoApproveSoakS | default "1800" | toString | quote }}
   # Capacity v2 — see values.yaml `scheduler.resourceAdmission`.
   VALI_SCHEDULER_RESOURCE_ADMISSION: {{ .Values.scheduler.resourceAdmission | quote }}
   VALI_SCHEDULER_CPU_OVERCOMMIT: {{ .Values.scheduler.cpuOvercommit | quote }}
@@ -388,6 +393,18 @@ data:
   {{- end }}
   {{- with (.Values.storageConfig).minAgentVersion }}
   VALI_STORAGE_CONFIG_MIN_AGENT_VERSION: {{ . | quote }}
+  {{- end }}
+  {{- /* Live storage move (§19) — see values.yaml `storageMove`. Each key
+         renders only when set; unset = the settings.py default (off, no
+         miner, no agent version qualifies). */}}
+  {{- with (.Values.storageMove).enabled }}
+  VALI_STORAGE_MOVE_ENABLED: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.storageMove).miners }}
+  VALI_STORAGE_MOVE_MINERS: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.storageMove).minAgentVersion }}
+  VALI_STORAGE_MOVE_MIN_AGENT_VERSION: {{ . | quote }}
   {{- end }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}
   # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids

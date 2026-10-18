@@ -63,6 +63,7 @@ from .schemas import (
     HostAttestorReleaseRequestSerializer,
     HostAttestorReleaseResponseSerializer,
     HostBeaconResponseSerializer,
+    HostInventoryResponseSerializer,
     TelemetryIngestRequestSerializer,
     TelemetryIngestResponseSerializer,
     TelemetryPullResponseSerializer,
@@ -111,6 +112,9 @@ _MAX_GRACEFUL_EXIT_BYTES = 4096
 # `verify-vm-progress` binary's cap, so an oversize body draws a clean
 # `413` here at exactly the verifier's security boundary.
 _MAX_VM_PROGRESS_BYTES = 4096
+# Upper bound on a raw-CBOR host-inventory envelope — the
+# `verify-host-inventory` binary's cap, sized to `DATA_UPLOAD_MAX_MEMORY_SIZE`.
+_MAX_HOST_INVENTORY_BYTES = 64 * 1024
 # Upper bounds on the raw-CBOR blackbox host-attestor bodies — matched to
 # the `verify-host-attestor-cert` / `verify-host-beacon` binary caps, so
 # an oversize body draws a clean `413` at the verifier's boundary.
@@ -449,6 +453,138 @@ class MinerGracefulExitIngestView(APIView):
                 "miner_id": miner_id,
                 "status": MinerStatus.QUARANTINED,
                 "accepted": True,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ─── POST /v1/telemetry/host-inventory ───────────────────────────────
+
+
+class MinerHostInventoryIngestView(APIView):
+    """`POST /v1/telemetry/host-inventory` — Edge-relayed §18.10 host
+    inventory.
+
+    UNTRUSTED, owner-facing only: the report is stored for the node's
+    owner (`apps.disktier.host_inventory`) and decides nothing. Same
+    ingress shape as the graceful exit: raw `application/cbor`, the miner
+    resolved from the Edge-stamped `X-Hippius-Peer-Id`, no bearer token
+    (the Ed25519 signature over the body is the credential). Gates, in
+    order: flag → size → peer → registered key → node id → Rust verifier
+    → body `miner_id` = peer → skew → hourly budget → sequence → merge.
+    The body carries serials: never logged.
+    """
+
+    authentication_classes: list[Any] = []
+    object_scope = scoping.PUBLIC
+    permission_classes = [AllowAny]
+    throttle_scope = "host_inventory"
+    http_method_names = ["post", "options"]
+
+    @extend_schema(
+        summary="Ingest an Edge-relayed miner host inventory",
+        description=(
+            "The Edge relays a signed `SignedHostInventory` (raw application/"
+            "cbor) here. No bearer token — the Ed25519 signature is the "
+            "credential; the miner is resolved from the Edge-stamped "
+            "`X-Hippius-Peer-Id` header. Untrusted, shown to the node owner "
+            "only. 404 while `VALI_HOST_INVENTORY_INGEST` is off."
+        ),
+        tags=["Telemetry"],
+        request=OpenApiTypes.BINARY,
+        responses={
+            200: HostInventoryResponseSerializer,
+            400: OpenApiResponse(ErrorSerializer, "Empty body / bad peer-id header."),
+            403: OpenApiResponse(
+                ErrorSerializer, "Verify failed / miner_id mismatch / timestamp skew."
+            ),
+            404: OpenApiResponse(ErrorSerializer, "Ingest off / miner not found."),
+            409: OpenApiResponse(ErrorSerializer, "Sequence replay / miner has no node id."),
+            413: OpenApiResponse(ErrorSerializer, "Body too large."),
+            429: OpenApiResponse(ErrorSerializer, "Hourly report budget exhausted."),
+            500: OpenApiResponse(ErrorSerializer, "Registry key malformed."),
+            503: OpenApiResponse(ErrorSerializer, "Verifier unavailable."),
+        },
+    )
+    def post(self, request: Request) -> Response:
+        from datetime import UTC, datetime
+
+        from apps.disktier.host_inventory import InventoryRefused, record_host_inventory
+        from apps.miners.models import MinerIdentity
+
+        if not settings.VALI_HOST_INVENTORY_INGEST:
+            return _error(status.HTTP_404_NOT_FOUND, "host-inventory ingest is off", "disabled")
+        envelope = request.body
+        if not envelope:
+            return _error(status.HTTP_400_BAD_REQUEST, "empty host-inventory body", "wire")
+        if len(envelope) > _MAX_HOST_INVENTORY_BYTES:
+            return _error(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"host-inventory exceeds {_MAX_HOST_INVENTORY_BYTES} bytes",
+                "too-large",
+            )
+        miner_id = _resolve_peer_to_miner_id(request.headers.get(_PEER_ID_HEADER))
+        if miner_id is None:
+            return _error(
+                status.HTTP_400_BAD_REQUEST,
+                f"missing or malformed {_PEER_ID_HEADER} header",
+                "wire",
+            )
+        miner = MinerIdentity.objects.filter(miner_id=miner_id).first()
+        if miner is None:
+            return _error(status.HTTP_404_NOT_FOUND, "miner not found", "not-found")
+        try:
+            vk = bytes.fromhex(miner.pubkey_hex)
+        except ValueError:
+            return _error(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, "registry key malformed", "internal"
+            )
+        if not miner.chain_node_id:
+            return _error(status.HTTP_409_CONFLICT, "miner has no node id yet", "no-node-id")
+        try:
+            report = verifier.verify_host_inventory(envelope=bytes(envelope), verifying_key=vk)
+        except verifier.VerifierFailed as exc:
+            return _error(
+                status.HTTP_403_FORBIDDEN, "host-inventory verification failed", exc.category
+            )
+        except verifier.VerifierUnavailable:
+            return _error(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "verifier unavailable", "internal"
+            )
+        if report.miner_id != miner_id:
+            return _error(status.HTTP_403_FORBIDDEN, "body miner_id mismatch", "identity")
+        now = timezone.now()
+        skew = abs(report.timestamp_unix - int(now.timestamp()))
+        if skew > int(settings.VALI_HOST_INVENTORY_MAX_SKEW_S):
+            return _error(
+                status.HTTP_403_FORBIDDEN, "timestamp outside skew window", "timestamp-skew"
+            )
+        try:
+            recorded = record_host_inventory(
+                miner.chain_node_id,
+                miner_id,
+                report.body,
+                report.section_digests,
+                reported_at=datetime.fromtimestamp(report.timestamp_unix, tz=UTC),
+                now=now,
+            )
+        except InventoryRefused as exc:
+            if exc.category == "rate-limited":
+                return _error(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    str(exc),
+                    exc.category,
+                    retry_after=exc.retry_after_s,
+                )
+            if exc.category == "replay":
+                return _error(status.HTTP_409_CONFLICT, str(exc), exc.category)
+            return _error(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), exc.category)
+        return Response(
+            {
+                "accepted": True,
+                "sequence": report.sequence,
+                "sections": list(recorded.sections),
+                "changed": list(recorded.changed),
             },
             status=status.HTTP_200_OK,
         )

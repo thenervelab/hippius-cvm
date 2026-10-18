@@ -2,15 +2,16 @@
 
 This guide is for an operator who brings their own AMD SEV-SNP server to
 the Hippius compute network. You keep the machine, its keys, and your
-wallet. Hippius approves your family account once, sets a capacity anchor
-for each host, and routes confidential VMs to you.
+wallet. Your compute family is the coldkey of your Arion storage miner;
+Hippius sets a capacity anchor for each host and routes confidential VMs
+to you.
 
 Background and design detail are in
 [`onboarding-a-miner.md`](./onboarding-a-miner.md). This page is the path
 through it, in order.
 
 ```
- wallet + family request ─▶ dashboard "Add a node" ─▶ Ansible (06-miner-bootstrap.yml)
+ Arion coldkey (family) ─▶ dashboard "Add a node" ─▶ Ansible (06-miner-bootstrap.yml)
                                                               │
         node visible + attested ◀─ start agent ◀─ family-signed registration
                  │
@@ -105,8 +106,6 @@ They are routing and mesh membership.
 
 **Done by Hippius:**
 
-- **Family approval.** Your family account is registered once, after you
-  request it (§3, step 2).
 - **Capacity anchor.** For each new host, Hippius records its CPU/RAM size
   from hardware facts it can check itself, never from a figure you send.
   Until it is set, the network sizes the host with a conservative
@@ -129,19 +128,26 @@ They are routing and mesh membership.
    is free, but the batch that registers a node also creates the child's
    proxy entry.
 
-### Step 2: Request the family
+### Step 2: Your family is your Arion coldkey
 
-In **Accounts**, the **Family** column of your linked account shows
-**Request onboarding**. Click it. This opens a support ticket naming the
-account, and Hippius answers there. Once approved, the column reads
-**Registered**.
+Your compute family **is** the coldkey of your Arion storage miner,
+already registered on chain (`Registration.OwnerToNode`). There is
+nothing to register: go straight to adding compute nodes from the
+dashboard (step 3).
 
-If the account already owns a node registered on the Hippius chain (for
-example as an existing storage-miner family), it is already a family:
-skip the approval itself, but still open the ticket if the dashboard
-shows "Compute registration is in private beta" — compute registration
-is open to approved operators only for now, and the same ticket gets
-your login added.
+**New operator without an Arion storage node:** first register an Arion
+storage miner. It needs a Bittensor miner UID on the subnet, and
+registration goes through the Arion tooling: see the public
+[storage miner overview](https://docs.hippius.com/earn/storage-miner) and
+[Arion miner setup](https://docs.hippius.com/earn/arion/running-blockchain-node)
+(coldkey registration, then the miner). Then add your compute nodes from
+the dashboard.
+
+Registering a family any other way is an exception handled by support,
+not a path to plan for.
+
+Linking a self-custody account in the dashboard (step 1) gives you
+access to the wizard automatically.
 
 ### Step 3: Prepare the host (dashboard)
 

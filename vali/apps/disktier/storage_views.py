@@ -12,6 +12,7 @@ design §9; the providers dashboard, proxied 1:1 by the backend).
     GET    …/disk-tiers                    verified tier / health per pool
     GET    …/dedicated-disks               dedicated-disk inventory
     POST   …/dedicated-disks/{disk_id}/drain
+    POST   …/storage/pools/{pool_id}/force-remove   a dead pool (audited)
 
 Auth, every call:
 
@@ -867,3 +868,86 @@ class OperatorDedicatedDiskDrainView(_NodeStorageView):
             return doc
 
         return _pool_edit(call, request, _drain, "disk-drain")
+
+
+class OperatorStoragePoolForceRemoveView(_NodeStorageView):
+    """`POST …/storage/pools/{pool_id}/force-remove` — #1640."""
+
+    http_method_names = ["post", "options"]
+
+    @extend_schema(
+        summary="Force the removal of a dead pool",
+        description=(
+            "For a pool whose disk is gone: the node reports it `unavailable`, it holds "
+            "nothing (`committed_gb == 0`) and no VM disk is placed on it. The pool is set "
+            "`draining` and recorded as forced; vali removes it from the document once the "
+            "agent applied that and still reports it unavailable and empty (a dead pool is "
+            "never reported `draining`). Your statement that the disk is gone, never "
+            "vali's guess: an unmounted pool may hold files the agent cannot see. Audited "
+            "with the principal, family, user, `reason` and the pool's last report. "
+            "`409 {code, pool}`: `pool-not-unavailable` (drain it instead), "
+            "`pool-not-empty`, `pool-has-placements`, `pool-default`, "
+            "`force-reason-required`."
+        ),
+        tags=["Operator"],
+        parameters=[
+            *_COMMON_PARAMS,
+            OpenApiParameter("pool_id", str, OpenApiParameter.PATH),
+            _IF_MATCH,
+        ],
+        request=doc_schemas.ForceRemoveSerializer,
+        responses={
+            202: doc_schemas.StagedSerializer,
+            404: OpenApiResponse(ErrorSerializer, "No such pool / no document."),
+            409: OpenApiResponse(ErrorSerializer, "The pool is not provably dead and empty."),
+            412: OpenApiResponse(ErrorSerializer, "`If-Match` is not the current revision."),
+            **_AUTH_RESPONSES,
+        },
+    )
+    def post(self, request: Request, node_id: str, pool_id: str) -> Response:
+        call = self._call(request, node_id)
+        if isinstance(call, Response):
+            return call
+        if_match = _if_match(request)
+        if isinstance(if_match, Response):
+            return if_match
+        reason = request.data.get("reason") if isinstance(request.data, dict) else None
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
+            return _error(
+                400,
+                "a force removal needs a `reason` (1..256 chars)",
+                "validation",
+                code="force-reason-required",
+                pool=pool_id[:32],
+            )
+        missing = OperatorStoragePoolView._missing_pool(call, pool_id)
+        if missing is not None:
+            return missing
+        try:
+            row, changed = storage_config.force_remove_pool(
+                call.node_id, pool_id, actor=call.actor, reason=reason, if_match=if_match
+            )
+        except storage_config.ForceRefused as exc:
+            return _error(409, str(exc), "conflict", code=exc.code, pool=exc.pool[:32])
+        except storage_config.PoolNotDrained as exc:
+            # The current document already drops another pool not drained
+            # (a held, pre-guard document): fix that first.
+            return _pool_not_drained(exc)
+        except storage_config.StageConflict as exc:
+            return _error(
+                412,
+                "the document changed: re-read it and retry",
+                "conflict",
+                code="revision-mismatch",
+                revision=exc.current,
+            )
+        except LookupError:
+            return _error(
+                404,
+                "the node has no desired storage document (PUT or adopt one first)",
+                "not-found",
+                code="storage-config-missing",
+            )
+        except storage_doc.DocError as exc:
+            return Response(exc.body(), status=status.HTTP_400_BAD_REQUEST)
+        return _stage_response(row, changed)

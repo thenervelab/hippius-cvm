@@ -310,7 +310,7 @@ fn inspect(
 /// Whether sysfs places the disk under a virtual device or a virtio
 /// transport (`/sys/block/<dev>` is a link into `/sys/devices/…`): a
 /// virtio-SCSI disk is named `sdX` like a real one.
-fn is_virtual_device(sys: &Path) -> bool {
+pub(crate) fn is_virtual_device(sys: &Path) -> bool {
     let Ok(real) = std::fs::canonicalize(sys) else {
         return false;
     };
@@ -321,12 +321,22 @@ fn is_virtual_device(sys: &Path) -> bool {
 }
 
 fn has_partitions(sys: &Path, name: &str) -> bool {
+    !partition_names(sys, name).is_empty()
+}
+
+/// The partitions of the whole disk `name` at `sys` (`/sys/block/<name>`):
+/// its `<name>…` subdirectories holding a `partition` file, sorted.
+pub(crate) fn partition_names(sys: &Path, name: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(sys) else {
-        return false;
+        return Vec::new();
     };
-    entries.flatten().any(|e| {
-        e.file_name().to_string_lossy().starts_with(name) && e.path().join("partition").exists()
-    })
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(name) && sys.join(n).join("partition").exists())
+        .collect();
+    names.sort();
+    names
 }
 
 /// `major:minor` of every mounted filesystem.
@@ -433,7 +443,7 @@ pub fn collect(paths: &SysPaths, probe: &dyn SignatureProbe, now_unix: u64) -> D
 }
 
 /// `<name>-part<N>`: udev's link to a partition.
-fn is_partition_name(name: &str) -> bool {
+pub(crate) fn is_partition_name(name: &str) -> bool {
     name.rsplit_once("-part")
         .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }

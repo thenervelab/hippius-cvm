@@ -573,3 +573,73 @@ def test_history_hides_another_familys_calls_in_between(
     # Back with family A: its history has its own entries only.
     entries = writer_client.get(_url("operator_storage_history"), **HEADERS).json()["entries"]
     assert [e["user"] for e in entries] == ["user-42"]
+
+
+# ─── force-remove a dead pool (#1640) ────────────────────────────────
+
+
+def test_force_remove_a_dead_pool(owned: dict[str, Any], writer_client: APIClient) -> None:
+    assert _put(writer_client, _doc(_pool("nvme0"))).status_code == 202
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE,
+        pool_id="nvme0",
+        reported_state="unavailable",
+        reported_error="pool-path-missing",
+        committed_gb=0,
+        reported_at=timezone.now(),
+    )
+    url = _url("operator_storage_pool_force_remove", pool_id="nvme0")
+    # A reason is required.
+    resp = writer_client.post(url, {}, format="json", **HEADERS)
+    assert (resp.status_code, resp.json()["code"]) == (400, "force-reason-required")
+    resp = writer_client.post(url, {"reason": "disk pulled"}, format="json", **HEADERS)
+    assert resp.status_code == 202, resp.json()
+    row = MinerStorageConfig.objects.get(miner_node_id=NODE)
+    assert [p["state"] for p in row.body["pools"] if p["id"] == "nvme0"] == ["draining"]
+    assert row.forced_pools["nvme0"]["user"] == "user-42"
+    actions = [a[0] for a in _audit()]
+    assert actions[-2:] == ["pool-force", "pool-force-drain"]
+    forced = MinerStorageConfigAudit.objects.get(action="pool-force")
+    assert (forced.family, forced.user, forced.doc["reason"]) == (FAM_A, "user-42", "disk pulled")
+
+
+def test_force_remove_refuses_a_live_pool(owned: dict[str, Any], writer_client: APIClient) -> None:
+    assert _put(writer_client, _doc(_pool("nvme0"))).status_code == 202
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="nvme0", reported_state="active", committed_gb=0
+    )
+    url = _url("operator_storage_pool_force_remove", pool_id="nvme0")
+    resp = writer_client.post(url, {"reason": "x"}, format="json", **HEADERS)
+    assert resp.status_code == 409
+    assert (resp.json()["code"], resp.json()["pool"]) == ("pool-not-unavailable", "nvme0")
+    missing = _url("operator_storage_pool_force_remove", pool_id="hdd9")
+    assert writer_client.post(missing, {"reason": "x"}, format="json", **HEADERS).status_code == 404
+
+
+def test_force_remove_needs_the_config_writer(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    url = _url("operator_storage_pool_force_remove", pool_id="nvme0")
+    resp = operator_client.post(url, {"reason": "x"}, format="json", **HEADERS)
+    assert resp.status_code == 403
+
+
+def test_force_remove_on_a_document_that_drops_another_pool_is_409(
+    owned: dict[str, Any], writer_client: APIClient
+) -> None:
+    assert _put(writer_client, _doc(_pool("nvme0"), _pool("hdd0"))).status_code == 202
+    row = MinerStorageConfig.objects.get(miner_node_id=NODE)
+    # hdd0 in force (active), the body (pre-guard) drops it.
+    MinerStorageConfig.objects.filter(pk=row.pk).update(
+        acked_revision=row.revision,
+        acked_body=_doc(_pool("nvme0"), _pool("hdd0")),
+        reported_revision=row.revision,
+        body=_doc(_pool("nvme0")),
+    )
+    MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="nvme0", reported_state="unavailable", committed_gb=0
+    )
+    url = _url("operator_storage_pool_force_remove", pool_id="nvme0")
+    resp = writer_client.post(url, {"reason": "x"}, format="json", **HEADERS)
+    assert (resp.status_code, resp.json()["code"]) == (409, "pool-not-drained")
+    assert MinerStorageConfig.objects.get(pk=row.pk).forced_pools == {}

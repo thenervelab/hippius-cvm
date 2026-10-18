@@ -199,6 +199,8 @@ async fn served_aggregate_stopped_ack_and_heartbeat_route_to_their_methods() {
         ("/v1/edge/heartbeat", MessageKind::Heartbeat),
         // The graceful-exit route relays via `forward_graceful_exit`.
         ("/v1/edge/graceful-exit", MessageKind::GracefulExit),
+        // §18.10: the host inventory relays via `forward_host_inventory`.
+        ("/v1/edge/host-inventory", MessageKind::HostInventory),
     ] {
         let mock = Arc::new(MockForwardClient::with_response(200, Vec::new()));
         let (status, _b, events) = post(mock.clone(), path, signed_envelope_body()).await;
@@ -292,6 +294,54 @@ async fn body_over_the_size_cap_is_rejected_413_before_decode() {
         mock.calls().is_empty(),
         "an oversized body must not be forwarded"
     );
+}
+
+#[tokio::test]
+async fn host_inventory_has_its_own_cap_at_vali_s() {
+    use hippius_edge_gateway::listeners::miner_router::HOST_INVENTORY_MAX_BYTES;
+    assert_eq!(
+        HOST_INVENTORY_MAX_BYTES,
+        hippius_host_inventory::MAX_ENVELOPE_BYTES
+    );
+    // An envelope exactly at the cap is relayed …
+    let at_cap = |len: usize| {
+        let mut body_len = len - 80;
+        loop {
+            let v = Value::Map(vec![
+                (
+                    Value::Text("body".into()),
+                    Value::Bytes(vec![0u8; body_len]),
+                ),
+                (Value::Text("sig".into()), Value::Bytes(vec![0u8; 64])),
+            ]);
+            let bytes = to_canonical_vec(&v).unwrap();
+            match bytes.len().cmp(&len) {
+                std::cmp::Ordering::Equal => return bytes,
+                std::cmp::Ordering::Less => body_len += 1,
+                std::cmp::Ordering::Greater => body_len -= 1,
+            }
+        }
+    };
+    let mock = Arc::new(MockForwardClient::with_response(200, Vec::new()));
+    let (status, _b, _e) = post(
+        mock.clone(),
+        "/v1/edge/host-inventory",
+        at_cap(HOST_INVENTORY_MAX_BYTES),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(mock.calls().len(), 1);
+    // … one byte more is 413 before any decode, though under the
+    // listener-wide cap.
+    let mock = Arc::new(MockForwardClient::with_response(200, Vec::new()));
+    let (status, _b, _e) = post(
+        mock.clone(),
+        "/v1/edge/host-inventory",
+        at_cap(HOST_INVENTORY_MAX_BYTES + 1),
+    )
+    .await;
+    assert_eq!(status, 413);
+    assert!(mock.calls().is_empty());
 }
 
 // ─── bad / non-canonical CBOR → 400 ─────────────────────────────────
@@ -460,6 +510,116 @@ async fn a_fully_arrived_envelope_with_a_slow_forward_is_still_relayed_and_audit
     // outcome — the slow forward was audited, never cut short.
     assert_eq!(telemetry.events().len(), 1);
     assert!(!telemetry.events()[0].shed);
+}
+
+// ─── host inventory: vali's refusals relayed ────────────────────────
+
+#[tokio::test]
+async fn host_inventory_refusals_relay_their_status_and_small_body() {
+    use hippius_edge_gateway::listeners::miner_router::MAX_REFUSAL_BODY;
+
+    let error = br#"{"error":"sequence not above the last accepted report","category":"replay"}"#;
+    for status in [404u16, 409, 429] {
+        let mock = Arc::new(MockForwardClient::with_response(status, error.to_vec()));
+        let (got, body, events) = post(
+            mock.clone(),
+            "/v1/edge/host-inventory",
+            signed_envelope_body(),
+        )
+        .await;
+        assert_eq!(got, status);
+        assert_eq!(body, error.to_vec());
+        assert_eq!(events.len(), 1);
+        assert!(events[0].shed);
+    }
+    // A body at the cap relays; one byte more, or a non-JSON body (an
+    // HTML not-found page), is dropped — the status still relays.
+    let mut at_cap = vec![b' '; MAX_REFUSAL_BODY];
+    at_cap[0] = b'{';
+    let mock = Arc::new(MockForwardClient::with_response(409, at_cap.clone()));
+    let (got, body, events) = post(
+        mock.clone(),
+        "/v1/edge/host-inventory",
+        signed_envelope_body(),
+    )
+    .await;
+    assert_eq!((got, body), (409, at_cap.clone()));
+    assert_eq!(events[0].bytes_out, MAX_REFUSAL_BODY as u64);
+    assert_eq!(events[0].shed_reason, Some("forward-upstream-status"));
+    for dropped in [
+        [at_cap.clone(), b" ".to_vec()].concat(),
+        b"<h1>Not Found</h1>".to_vec(),
+    ] {
+        let mock = Arc::new(MockForwardClient::with_response(404, dropped));
+        let (got, body, events) = post(
+            mock.clone(),
+            "/v1/edge/host-inventory",
+            signed_envelope_body(),
+        )
+        .await;
+        assert_eq!((got, body.len()), (404, 0));
+        assert_eq!(events[0].bytes_out, 0);
+    }
+    // Any other status stays an opaque 502 …
+    for status in [400u16, 403, 413, 500, 503] {
+        let mock = Arc::new(MockForwardClient::with_response(status, error.to_vec()));
+        let (got, body, _) = post(
+            mock.clone(),
+            "/v1/edge/host-inventory",
+            signed_envelope_body(),
+        )
+        .await;
+        assert_eq!((got, body.len()), (502, 0), "status {status}");
+    }
+    // … and so does a 404 / 429 for another kind.
+    for (path, status) in [
+        ("/v1/edge/kbs-request", 404u16),
+        ("/v1/edge/served-receipt", 429),
+    ] {
+        let body = if path.ends_with("kbs-request") {
+            kbs_request_body()
+        } else {
+            signed_envelope_body()
+        };
+        let mock = Arc::new(MockForwardClient::with_response(status, error.to_vec()));
+        let (got, _, _) = post(mock.clone(), path, body).await;
+        assert_eq!(got, 502, "{path} {status}");
+    }
+    // … and so does a 409 for any other kind.
+    let mock = Arc::new(MockForwardClient::with_response(409, error.to_vec()));
+    let (got, body, _) = post(mock.clone(), "/v1/edge/heartbeat", signed_envelope_body()).await;
+    assert_eq!((got, body.len()), (502, 0));
+}
+
+#[tokio::test]
+async fn a_host_inventory_429_relays_vali_s_retry_after() {
+    async fn post_429(retry: u64) -> axum::response::Response {
+        let mock = Arc::new(MockForwardClient::with_retry_after(
+            429,
+            b"{}".to_vec(),
+            retry,
+        ));
+        let telemetry: Arc<dyn TelemetrySink + Send + Sync> =
+            Arc::new(RecordingTelemetry::default());
+        let state = MinerRouterState::new(mock, telemetry, test_limiter());
+        let router = build_router(state).layer(Extension(PeerId::new("hippius-miner:kat")));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/edge/host-inventory")
+            .header("content-type", "application/cbor")
+            .body(Body::from(signed_envelope_body()))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+    let resp = post_429(1234).await;
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "1234");
+    // Past a day it is not relayed.
+    assert!(post_429(86_401)
+        .await
+        .headers()
+        .get("retry-after")
+        .is_none());
 }
 
 // ─── forward failure → 502 + audited forward failure ────────────────

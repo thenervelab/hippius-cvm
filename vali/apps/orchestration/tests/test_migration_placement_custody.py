@@ -128,6 +128,32 @@ def test_a_completed_migration_moves_the_placement(fx: FakeEffects) -> None:
     assert closed.kbs_release_ref == "order-launch"
 
 
+def test_the_destination_placement_records_the_pool_its_order_named(fx: FakeEffects) -> None:
+    """A4b (#1639): the arrival's pool, pinned before the first dispatch,
+    is the destination placement's OS disk row."""
+    from apps.disktier.models import OS_SLOT, PlacementDisk
+
+    fx.arrival_pool = "nvme0"
+    vm = _placed_vm(generation=5, host="node-src")
+    job = _drive(_start(vm))
+    assert job.state == MigrationState.DONE.value
+    assert fx.activate_os_pools and set(fx.activate_os_pools) == {"nvme0"}
+    [dest] = _active(vm)
+    disk = PlacementDisk.objects.get(placement=dest, slot=OS_SLOT)
+    assert disk.pool_id == "nvme0"
+
+
+def test_no_pool_named_leaves_the_destination_on_default(fx: FakeEffects) -> None:
+    from apps.disktier.models import PlacementDisk
+
+    vm = _placed_vm(generation=5, host="node-src")
+    job = _drive(_start(vm))
+    assert job.state == MigrationState.DONE.value
+    assert fx.activate_os_pools == [None]
+    [dest] = _active(vm)
+    assert not PlacementDisk.objects.filter(placement=dest).exists()
+
+
 # ─── consequence 3 — the graceful-exit drain ─────────────────────────
 
 

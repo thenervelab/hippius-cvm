@@ -787,3 +787,45 @@ def test_auto_migration_never_enrols_a_cdn_node(monkeypatch, cdn_node: bool) -> 
     _mirror(SRC_NODE)
     _mirror(DST_NODE)
     assert bool(_departing_drain(monkeypatch)) is not cdn_node
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        "cvm-pool-unavailable:nvme0",
+        # Past the agent's interner cap, the class has no pool.
+        "cvm-pool-unavailable",
+        "cvm-insufficient-disk:nvme0",
+        "cvm-insufficient-disk",
+    ],
+)
+def test_a_dest_that_refused_the_named_pool_is_retried_on_none(
+    fx: FakeEffects, failure_class: str
+) -> None:
+    """#1639: the arrival's own admission refused the pool before the dest
+    recorded anything: the retry names none (its launch pool). Not a SEV
+    start failure either."""
+    fx.arrival_pool = "nvme0"
+    job = _fail_one_attempt_with(fx, failure_class)
+    assert fx.activate_os_pools[:2] == ["nvme0", None]
+    assert (job.dest_os_pool, job.dest_os_pool_pinned) == ("", True)
+    assert MinerCapacity.objects.get(miner_node_id=DST_NODE).cvm_fail_streak == 0
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        "migration/dest-settle-by-passed",
+        # The launch's refusals: the dest already recorded the pool, which
+        # then wins on the retry — the pin stays.
+        "migration/dest-pool-unavailable",
+        "migration/dest-insufficient-disk",
+    ],
+)
+def test_a_failure_after_the_record_keeps_the_named_pool(
+    fx: FakeEffects, failure_class: str
+) -> None:
+    fx.arrival_pool = "nvme0"
+    job = _fail_one_attempt_with(fx, failure_class)
+    assert fx.activate_os_pools[:2] == ["nvme0", "nvme0"]
+    assert job.dest_os_pool == "nvme0"

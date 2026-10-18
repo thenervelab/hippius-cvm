@@ -248,6 +248,30 @@ enum Command {
         #[arg(long, default_value = hippius_miner_agent::storage::dedicated::DISK_FACTS_PATH)]
         out: PathBuf,
     },
+    /// Read the host's hardware and software for the §18.10 host
+    /// inventory and write one `<section>.json` per section to
+    /// `--out-dir`. Run by the `hippius-host-inventory@<mode>` oneshots,
+    /// OUTSIDE the agent's sandbox (which shows no DMI table and no
+    /// device), read-only on the host.
+    HostInventoryCollect {
+        /// `full`: all eight sections (system, cpu, memory, storage,
+        /// network, pci, sensors, software). `counters`: memory (EDAC),
+        /// sensors, storage (disk advisories) and software (uptime).
+        /// `kernel`: the kernel journal tail (every 5 min), no section
+        /// written; its advisories go out with the next storage run.
+        #[arg(long, value_enum, default_value_t = InventoryMode::Full)]
+        mode: InventoryMode,
+        /// Where to write the sections (and the storage counters the
+        /// next run compares with).
+        #[arg(long, default_value = hippius_miner_agent::host_inventory::INVENTORY_DIR)]
+        out_dir: PathBuf,
+        /// The agent's config: its pools, state root and dedicated disks
+        /// classify the storage devices (read-only, with the applied
+        /// `storage-config` document). Unreadable: the storage section is
+        /// `partial`, the other sections unaffected.
+        #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
+        config: PathBuf,
+    },
     /// Print, as JSON, what the agent would make of the storage
     /// declaration in `--config` on this host: pools, filesystem
     /// bindings, dedicated disks. Read-only (the `O_DIRECT` write test
@@ -274,6 +298,15 @@ enum Command {
         #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
         config: PathBuf,
     },
+}
+
+/// `host-inventory-collect --mode`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum InventoryMode {
+    Full,
+    Counters,
+    /// The kernel journal tail only (every 5 min): no section written.
+    Kernel,
 }
 
 /// Arguments for the `launch-test` subcommand.
@@ -406,6 +439,11 @@ fn run() -> Result<()> {
             collect,
             facts,
         } => cmd_storage_check(&config, collect, &facts),
+        Command::HostInventoryCollect {
+            mode,
+            out_dir,
+            config,
+        } => cmd_host_inventory_collect(mode, &out_dir, &config),
     }
 }
 
@@ -560,6 +598,126 @@ fn cmd_storage_collect(out: &Path) -> Result<()> {
         "hippius-miner-agent: storage-collect: {} disk(s) written to {}",
         facts.disks.len(),
         out.display()
+    );
+    Ok(())
+}
+
+/// `host-inventory-collect --mode kernel`: the journal tail. Busy (a
+/// `full` / `counters` run holds the lock) and every journal fault exit 0
+/// — the next 5-min tick tries again.
+fn cmd_host_inventory_kernel(out_dir: &Path, started: std::time::Instant, now: i64) -> Result<()> {
+    use hippius_miner_agent::host_inventory::{
+        self, kernel, HostPaths, KernelOutcome, SystemClock, SystemRunner,
+    };
+    let outcome = host_inventory::run_kernel(
+        &HostPaths::default(),
+        &SystemRunner::default(),
+        now,
+        out_dir,
+        started,
+        &SystemClock,
+        kernel::KERNEL_LOCK_WAIT,
+    )
+    .map_err(|e| {
+        eprintln!(
+            "hippius-miner-agent: host-inventory-collect: mode=kernel write failed: {:?}",
+            e.kind()
+        );
+        MinerAgentError::ConfigInvalid("host-inventory-unwritable")
+    })?;
+    let line = match outcome {
+        KernelOutcome::Busy => "skipped: another run holds the lock".to_string(),
+        KernelOutcome::NoTime => "skipped: past the kernel run deadline".to_string(),
+        KernelOutcome::NoJournal => "journalctl not installed".to_string(),
+        KernelOutcome::JournalFault(e) => format!("journal not read ({e:?})"),
+        KernelOutcome::Read(s) => format!(
+            "entries={} matched={} unresolved={} overflow={}",
+            s.entries, s.matched, s.unresolved, s.overflow
+        ),
+    };
+    eprintln!("hippius-miner-agent: host-inventory-collect: mode=kernel {line}");
+    Ok(())
+}
+
+fn cmd_host_inventory_collect(mode: InventoryMode, out_dir: &Path, config: &Path) -> Result<()> {
+    // The run's deadline counts from here (`host_inventory::RUN_DEADLINE`).
+    let started = std::time::Instant::now();
+    use hippius_miner_agent::host_inventory::{self, HostPaths, Mode, StorageView, SystemRunner};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let (mode, label) = match mode {
+        InventoryMode::Full => (Mode::Full, "full"),
+        InventoryMode::Counters => (Mode::Counters, "counters"),
+        InventoryMode::Kernel => return cmd_host_inventory_kernel(out_dir, started, now),
+    };
+    // The error's Display names a class and a position, never content.
+    let view = match Config::load(config) {
+        Ok(c) => Some(StorageView::from_config(&c)),
+        Err(e) => {
+            eprintln!(
+                "hippius-miner-agent: host-inventory-collect: config unreadable ({e}); storage \
+                 roles unknown"
+            );
+            None
+        }
+    };
+    let summary = host_inventory::run_collect(
+        mode,
+        &HostPaths::default(),
+        &SystemRunner::default(),
+        now,
+        out_dir,
+        view.as_ref(),
+        started,
+    )
+    .map_err(|e| {
+        eprintln!(
+            "hippius-miner-agent: host-inventory-collect: write failed: {:?}",
+            e.kind()
+        );
+        MinerAgentError::ConfigInvalid("host-inventory-unwritable")
+    })?;
+    if let Some(why) = summary.skipped {
+        let why = match why {
+            host_inventory::Skip::LockHeld => format!(
+                "another run holds {}/{} past {} s",
+                out_dir.display(),
+                host_inventory::LOCK_NAME,
+                host_inventory::RunDeadline::lock_wait_cap(mode).as_secs()
+            ),
+            host_inventory::Skip::NoTime => format!(
+                "less than {} s of probe time left before the {} s run deadline",
+                host_inventory::MIN_PROBE_WINDOW.as_secs(),
+                host_inventory::RUN_DEADLINE.as_secs()
+            ),
+        };
+        return match host_inventory::on_skip(mode) {
+            host_inventory::BusyOutcome::Skip => {
+                eprintln!(
+                    "hippius-miner-agent: host-inventory-collect: mode={label} skipped: {why}"
+                );
+                Ok(())
+            }
+            host_inventory::BusyOutcome::Fail => {
+                eprintln!(
+                    "hippius-miner-agent: host-inventory-collect: mode={label} FAILED: {why}; \
+                     exiting non-zero so the unit retries"
+                );
+                Err(MinerAgentError::ConfigInvalid("host-inventory-busy"))
+            }
+        };
+    }
+    // The sections are written either way; a refusal here is a collector
+    // bug the agent's encode would hit too.
+    let verdict = match summary.valid {
+        Ok(()) => "valid",
+        Err(class) => class,
+    };
+    eprintln!(
+        "hippius-miner-agent: host-inventory-collect: mode={label} {} section(s) written to {} ({verdict})",
+        summary.written.len(),
+        out_dir.display()
     );
     Ok(())
 }
@@ -1412,6 +1570,16 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         _ => None,
     };
 
+    // §18.10 host inventory (HW6): spawned ONLY when `[inventory]
+    // enabled` (default off); it reads the collector's sections, signs
+    // them with the node identity and posts them over the Edge mTLS leg.
+    let inventory_task = hippius_miner_agent::host_inventory::poster::spawn_if_enabled(
+        &config,
+        Arc::clone(&identity),
+        Arc::clone(&edge) as Arc<dyn hippius_miner_agent::host_inventory::poster::InventoryClient>,
+        cancel.clone(),
+    );
+
     eprintln!(
         "hippius-miner-agent: serve — up (miner_id={}, identity={pubkey}, \
          orders={orders_addr}). Awaiting shutdown signal.",
@@ -1477,6 +1645,15 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     if let Some(task) = host_relay_task {
         if tokio::time::timeout(VSOCK_DRAIN_GRACE, task).await.is_err() {
             eprintln!("hippius-miner-agent: serve — host-attestor-relay-drain-timeout");
+        }
+    }
+
+    // (2a-quater) Drain the host-inventory poster (if it was spawned): it
+    // returns on cancel, an in-flight post is dropped (its sequence is
+    // already persisted, never reused).
+    if let Some(task) = inventory_task {
+        if tokio::time::timeout(VSOCK_DRAIN_GRACE, task).await.is_err() {
+            eprintln!("hippius-miner-agent: serve — inventory-drain-timeout");
         }
     }
 

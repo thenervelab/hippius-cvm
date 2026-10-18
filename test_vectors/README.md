@@ -48,6 +48,10 @@ constant. The CI gate catches it before merge.
 | `map_root.single_entry` | 32-byte SHA-256 | single-entry receipt set root |
 | `totals_root.boundary` | 32-byte SHA-256 | u64::MAX + 1 boundary case for u128 served_units |
 
+The miner's signed reports that carry frozen CBOR files instead of hashes
+have their own directory and `REGENERATE.md`: `heartbeat/`,
+`host_inventory/` (the §18.10 host inventory).
+
 ## Implementing a parallel encoder
 
 The deterministic-CBOR rules every encoder MUST satisfy are:

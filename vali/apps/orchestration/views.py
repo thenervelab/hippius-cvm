@@ -504,7 +504,9 @@ class LaunchStartView(APIView):
                 ErrorSerializer,
                 "Malformed body / bad field (`wire`/`bad-field`), or a flavor above "
                 "the largest offered size (`flavor-not-offered`), or a vm id / owner "
-                "reserved for the disk-tier probe (`disk-probe-id-reserved`).",
+                "reserved for the disk-tier probe (`disk-probe-id-reserved`), or an "
+                "`os_pool` (vali chooses it; only the disk-tier probe pins one: "
+                "`os-pool-reserved`).",
             ),
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
             409: OpenApiResponse(ErrorSerializer, "In-flight launch already exists for this VM."),

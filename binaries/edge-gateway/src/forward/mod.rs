@@ -80,6 +80,9 @@ pub struct ForwardResponse {
     pub status: u16,
     /// Upstream response body bytes — relayed to the miner verbatim.
     pub body: Vec<u8>,
+    /// The upstream `Retry-After` in seconds, when it sent a plain
+    /// integer one (relayed only on a host-inventory `429`).
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Static-classifier error from a forward attempt. Same
@@ -203,6 +206,15 @@ pub trait ForwardClient: Send + Sync {
         env: &ValidatedEnvelope,
     ) -> Result<ForwardResponse, ForwardError>;
 
+    /// Relay a `HostInventory` body to the vali host-inventory ingest.
+    /// Stamps the connection's mTLS `PeerId` like
+    /// [`forward_heartbeat`](Self::forward_heartbeat) so vali resolves
+    /// the miner from the relay metadata, never from the opaque body.
+    async fn forward_host_inventory(
+        &self,
+        env: &ValidatedEnvelope,
+    ) -> Result<ForwardResponse, ForwardError>;
+
     /// Relay a `HostAttestorChallenge` body to the vali nonce authority
     /// (PR-10). Stamps the connection's mTLS `PeerId` like
     /// [`forward_heartbeat`](Self::forward_heartbeat) so vali binds the
@@ -300,7 +312,11 @@ mod mock {
         /// A mock that returns `status` + `body` for every call.
         pub fn with_response(status: u16, body: Vec<u8>) -> Self {
             Self {
-                outcome: Mutex::new(Ok(ForwardResponse { status, body })),
+                outcome: Mutex::new(Ok(ForwardResponse {
+                    status,
+                    body,
+                    retry_after_secs: None,
+                })),
                 calls: Mutex::new(Vec::new()),
                 delay: None,
             }
@@ -315,9 +331,27 @@ mod mock {
             delay: std::time::Duration,
         ) -> Self {
             Self {
-                outcome: Mutex::new(Ok(ForwardResponse { status, body })),
+                outcome: Mutex::new(Ok(ForwardResponse {
+                    status,
+                    body,
+                    retry_after_secs: None,
+                })),
                 calls: Mutex::new(Vec::new()),
                 delay: Some(delay),
+            }
+        }
+
+        /// A mock that answers `status` + `body` + a `Retry-After` of
+        /// `retry_after_secs` for every call.
+        pub fn with_retry_after(status: u16, body: Vec<u8>, retry_after_secs: u64) -> Self {
+            Self {
+                outcome: Mutex::new(Ok(ForwardResponse {
+                    status,
+                    body,
+                    retry_after_secs: Some(retry_after_secs),
+                })),
+                calls: Mutex::new(Vec::new()),
+                delay: None,
             }
         }
 
@@ -435,6 +469,14 @@ mod mock {
             env: &ValidatedEnvelope,
         ) -> Result<ForwardResponse, ForwardError> {
             self.delay_record_and_answer(MessageKind::VmProgress, env)
+                .await
+        }
+
+        async fn forward_host_inventory(
+            &self,
+            env: &ValidatedEnvelope,
+        ) -> Result<ForwardResponse, ForwardError> {
+            self.delay_record_and_answer(MessageKind::HostInventory, env)
                 .await
         }
 

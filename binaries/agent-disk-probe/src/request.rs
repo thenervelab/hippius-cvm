@@ -149,6 +149,26 @@ impl Request {
         let bytes = std::fs::read(path).map_err(|_| invalid("unreadable"))?;
         Self::parse(&bytes).map(Some)
     }
+
+    /// [`Self::load`], waiting out a request still being written: the
+    /// writer (cloud-init's write_files) creates the file before it writes
+    /// it, and the path unit starts the probe on the creation. A refusal is
+    /// re-read every `interval`, `attempts` times in all, before it stands.
+    pub fn load_settled(
+        path: &Path,
+        attempts: u32,
+        interval: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        let mut last = Self::load(path);
+        for _ in 1..attempts.max(1) {
+            if last.is_ok() {
+                break;
+            }
+            std::thread::sleep(interval);
+            last = Self::load(path);
+        }
+        last
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +198,37 @@ mod tests {
         assert_eq!(slots, ["os", "x0", "x1"]);
         assert_eq!(r.targets[0].profile, Profile::V1);
         assert_eq!(r.targets[1].profile, Profile::D1);
+    }
+
+    #[test]
+    fn a_request_still_being_written_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        // Created, not yet written: the moment the path unit fires.
+        std::fs::write(&path, b"").unwrap();
+        let full = req(r#"[{"slot":"os","profile":"v1"}]"#);
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::fs::write(&path, full.as_bytes()).unwrap();
+            })
+        };
+        let r = Request::load_settled(&path, 50, std::time::Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(r.vm_id, "probe-1");
+        // A request that never becomes valid still refuses, after the wait.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(Request::load_settled(&path, 3, std::time::Duration::from_millis(1)).is_err());
+        // No request: dormant at once.
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            Request::load_settled(&path, 3, std::time::Duration::from_secs(60))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

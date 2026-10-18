@@ -120,6 +120,7 @@ pub fn validate(env: RawEnvelope) -> Result<ValidatedEnvelope, EdgeError> {
         | MessageKind::Heartbeat
         | MessageKind::GracefulExit
         | MessageKind::VmProgress
+        | MessageKind::HostInventory
         | MessageKind::HostAttestorBeacon
         // The tenant-CVM live attestation (§23) is a KBS-L0-signed
         // `{body, sig}` envelope like the rest — Edge checks the shape

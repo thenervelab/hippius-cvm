@@ -5,7 +5,7 @@ its host (`apps.disktier.storage_move`).
 
     python manage.py vali_storage_move start --vm-id <vm_id> --to nvme0 \\
         [--bandwidth 200] --by ops@hippius
-    python manage.py vali_storage_move status [--vm-id <vm_id>]
+    python manage.py vali_storage_move status [--vm-id <vm_id> [--all]]
     python manage.py vali_storage_move cancel --vm-id <vm_id>
     python manage.py vali_storage_move release --vm-id <vm_id> --by ops@hippius
     python manage.py vali_storage_move abandon --vm-id <vm_id> --by ops@hippius
@@ -62,6 +62,12 @@ class Command(BaseCommand):
             "action", choices=["start", "status", "cancel", "release", "abandon", "resolve"]
         )
         parser.add_argument("--vm-id", default="")
+        parser.add_argument(
+            "--all",
+            action="store_true",
+            help="status --vm-id: every move of the VM, newest first (default: its "
+            "move in flight, else its latest).",
+        )
         parser.add_argument("--to", default="", help="The target pool (start).")
         parser.add_argument("--bandwidth", type=int, default=None, help="MiB/s, 10..1000.")
         parser.add_argument("--by", default="", help="Who asks (every write).")
@@ -76,9 +82,14 @@ class Command(BaseCommand):
         action: str = opts["action"]
         vm_id: str = opts["vm_id"].strip()
         if action == "status":
-            moves = VmStorageMove.objects.select_related("vm")
+            moves = VmStorageMove.objects.select_related("vm").order_by("-created_at", "-id")
             if vm_id:
                 moves = moves.filter(vm__vm_id=vm_id)
+                if not opts["all"]:
+                    # The move in flight, else the latest: never an older,
+                    # finished one while a new one copies.
+                    live = list(moves.exclude(state__in=TERMINAL_MOVE_STATES)[:50])
+                    moves = live or list(moves[:1])
             else:
                 moves = moves.exclude(state__in=TERMINAL_MOVE_STATES)
             for move in moves[:50]:

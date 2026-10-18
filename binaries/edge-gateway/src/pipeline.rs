@@ -170,6 +170,15 @@ pub enum MessageKind {
     /// [`HEARTBEAT_PEER_ID_HEADER`](crate::forward::vali_forward::HEARTBEAT_PEER_ID_HEADER);
     /// Edge only checks the `{body, sig}` envelope shape.
     VmProgress,
+    /// `Miner → Inner`. `hippius_host_inventory::SignedHostInventory` —
+    /// the §18.10 host inventory (hardware, disks, health), UNTRUSTED and
+    /// owner-facing only. Like `Heartbeat`, vali verifies the
+    /// miner-identity Ed25519 signature and resolves the miner from the
+    /// mTLS
+    /// [`HEARTBEAT_PEER_ID_HEADER`](crate::forward::vali_forward::HEARTBEAT_PEER_ID_HEADER);
+    /// Edge checks the `{body, sig}` envelope shape and its own size cap
+    /// ([`HOST_INVENTORY_MAX_BYTES`](crate::listeners::miner_router::HOST_INVENTORY_MAX_BYTES)).
+    HostInventory,
     /// `Miner → Inner`. `hippius_types::host_attestor_challenge::
     /// HostChallengeRequest` — a blackbox host-attestor asking vali to
     /// mint a fresh single-use enrollment nonce (PR-10). Unlike the
@@ -215,6 +224,7 @@ impl MessageKind {
             | MessageKind::Heartbeat
             | MessageKind::GracefulExit
             | MessageKind::VmProgress
+            | MessageKind::HostInventory
             | MessageKind::HostAttestorChallenge
             | MessageKind::HostAttestorEnroll
             | MessageKind::HostAttestorBeacon
@@ -233,6 +243,7 @@ impl MessageKind {
             MessageKind::Heartbeat => "heartbeat",
             MessageKind::GracefulExit => "graceful-exit",
             MessageKind::VmProgress => "vm-progress",
+            MessageKind::HostInventory => "host-inventory",
             MessageKind::HostAttestorChallenge => "host-attestor-challenge",
             MessageKind::HostAttestorEnroll => "host-attestor-enroll",
             MessageKind::HostAttestorBeacon => "host-attestor-beacon",

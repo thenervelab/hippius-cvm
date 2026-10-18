@@ -673,8 +673,11 @@ def test_the_sync_metric_is_one_hot(monkeypatch: pytest.MonkeyPatch) -> None:
         "refused": 1.0,
         "agent-unsupported": 0.0,
         "drift": 0.0,
+        "held": 0.0,
     }
-    assert {s.labels["node_id"] for s in ms.samples} == {NODE}
+    assert {
+        s.labels["node_id"] for s in ms.samples if s.name == "hippius_storage_config_sync"
+    } == {NODE}
 
 
 def test_the_digest_stub_leaves_the_expiry_out() -> None:
@@ -1085,3 +1088,208 @@ def test_vali_keeps_a_drained_pool_while_a_vm_disk_is_placed_on_it(
     _heartbeat(1, at=late + timedelta(seconds=5))
     storage_config.reconcile(now=late + timedelta(seconds=10))
     assert [p["id"] for p in _row().body["pools"]] == ["default"]
+
+
+# ─── a dead pool: the operator's force (#1640) ───────────────────────
+
+
+def _dead(pool_id: str = "nvme0", **fields: Any) -> MinerStoragePool:
+    fields.setdefault("reported_state", "unavailable")
+    fields.setdefault("reported_error", "pool-path-missing")
+    fields.setdefault("reported_at", timezone.now())
+    return _reports(pool_id, **fields)
+
+
+def _force(pool_id: str = "nvme0", reason: str = "disk pulled, RMA 4711") -> MinerStorageConfig:
+    row, _ = storage_config.force_remove_pool(NODE, pool_id, actor=ACTOR, reason=reason)
+    return row
+
+
+@pytest.mark.usefixtures("push_on")
+def test_a_dead_pool_leaves_through_the_force_and_only_through_it(agent: FakeAgent) -> None:
+    _miner()
+    _reports("default")
+    dead = _dead()
+    _stage(_doc(_pool("nvme0")))
+    storage_config.reconcile()
+    acked = _row().acked_at
+    # The plain drain never ends: the agent reports a dead pool
+    # `unavailable`, never `draining`.
+    storage_config.edit(
+        NODE,
+        lambda d: {
+            **d,
+            "pools": [dict(p, state="draining") if p["id"] == "nvme0" else p for p in d["pools"]],
+        },
+        actor=ACTOR,
+        action="pool-drain",
+    )
+    t1 = timezone.now() + timedelta(seconds=1)
+    storage_config.reconcile(now=t1)
+    _heartbeat(_row().revision, at=_row().acked_at + timedelta(seconds=5))
+    t2 = t1 + timedelta(seconds=settings.VALI_STORAGE_CONFIG_SYNC_S + 1)
+    storage_config.reconcile(now=t2)
+    assert "nvme0" in [p["id"] for p in _row().body["pools"]], "not without the force"
+    assert acked is not None
+
+    row = _force()
+    record = row.forced_pools["nvme0"]
+    assert record["reason"] == "disk pulled, RMA 4711"
+    assert record["principal"] == ACTOR.principal and record["user"] == "42"
+    assert record["report"]["reported_state"] == "unavailable"
+    forced = MinerStorageConfigAudit.objects.get(miner_node_id=NODE, action="pool-force")
+    assert forced.doc["pool"] == "nvme0" and forced.doc["reason"] == "disk pulled, RMA 4711"
+    assert (forced.principal, forced.family, forced.user) == (ACTOR.principal, "5Fam", "42")
+
+    # The next pass removes it (applied draining, still unavailable, empty).
+    t3 = t2 + timedelta(seconds=settings.VALI_STORAGE_CONFIG_SYNC_S + 1)
+    storage_config.reconcile(now=t3)
+    _heartbeat(_row().revision, at=t3 + timedelta(seconds=5))
+    storage_config.reconcile(now=t3 + timedelta(seconds=10))
+    row = _row()
+    assert [p["id"] for p in row.body["pools"]] == ["default"]
+    assert row.forced_pools == {}
+    assert dead.pool_id == "nvme0"
+
+
+@pytest.mark.parametrize(
+    ("setup", "code"),
+    [
+        (dict(reported_state="active"), "pool-not-unavailable"),
+        (dict(reported_state="draining"), "pool-not-unavailable"),
+        (dict(committed_gb=40), "pool-not-empty"),
+        (dict(committed_gb=None), "pool-not-empty"),
+    ],
+)
+def test_the_force_is_refused_unless_the_pool_is_dead_and_empty(
+    setup: dict[str, Any], code: str
+) -> None:
+    _reports("default")
+    _dead(**setup)
+    _stage(_doc(_pool("nvme0")))
+    revision = _row().revision
+    with pytest.raises(storage_config.ForceRefused) as exc:
+        _force()
+    assert (exc.value.code, exc.value.pool) == (code, "nvme0")
+    row = _row()
+    assert (row.revision, row.forced_pools) == (revision, {})
+    assert not MinerStorageConfigAudit.objects.filter(action="pool-force").exists()
+
+
+def test_the_force_needs_a_reason_no_vm_disk_and_a_real_pool() -> None:
+    from apps.disktier.models import OS_SLOT, PlacementDisk
+    from apps.orchestration.tests.factories import make_vm
+    from apps.scheduler.models import PlacementStatus
+    from apps.scheduler.tests.factories import make_placement
+
+    _reports("default")
+    _dead()
+    _stage(_doc(_pool("nvme0")))
+    for pool_id, reason, code in (
+        ("nvme0", "  ", "force-reason-required"),
+        ("default", "x", "pool-default"),
+        ("hdd9", "x", "pool-not-found"),
+    ):
+        with pytest.raises(storage_config.ForceRefused) as exc:
+            _force(pool_id, reason)
+        assert exc.value.code == code
+    placement = make_placement(
+        make_vm("vm-on-nvme0"), NODE, status=PlacementStatus.BOUND.value, resource_class="small"
+    )
+    PlacementDisk.objects.create(
+        placement=placement,
+        slot=OS_SLOT,
+        kind="pool",
+        pool_id="nvme0",
+        size_gb=50,
+        required_tier="nvme",
+    )
+    with pytest.raises(storage_config.ForceRefused) as exc:
+        _force()
+    assert exc.value.code == "pool-has-placements"
+
+
+@pytest.mark.usefixtures("push_on")
+def test_a_forced_pool_that_comes_back_is_not_removed_by_the_force(agent: FakeAgent) -> None:
+    _miner()
+    _reports("default")
+    dead = _dead()
+    _stage(_doc(_pool("nvme0")))
+    storage_config.reconcile()
+    _force()
+    t1 = timezone.now() + timedelta(seconds=settings.VALI_STORAGE_CONFIG_SYNC_S + 1)
+    storage_config.reconcile(now=t1)
+    # The disk is back: reported usable again — no longer the force's to
+    # remove (the plain drain takes over once the agent reports it draining).
+    MinerStoragePool.objects.filter(pk=dead.pk).update(reported_state="active", committed_gb=0)
+    _heartbeat(_row().revision, at=t1 + timedelta(seconds=5))
+    storage_config.reconcile(now=t1 + timedelta(seconds=10))
+    assert "nvme0" in [p["id"] for p in _row().body["pools"]]
+
+
+# ─── a held push shows in sync_status (#1640) ────────────────────────
+
+
+@pytest.mark.usefixtures("push_on")
+def test_a_held_push_is_the_sync_status(agent: FakeAgent) -> None:
+    _miner()
+    _reports("default")
+    _reports("nvme0")
+    _stage(_doc(_pool("nvme0")))
+    MinerStorageConfig.objects.filter(miner_node_id=NODE).update(body=_doc(), content_key="")
+    assert storage_config.sync_node(NODE, force=True) == "pool-not-drained:nvme0"
+    row = _row()
+    assert storage_config.sync_status(row) == "held:pool-not-drained:nvme0"
+    assert storage_config.sync_state(storage_config.sync_status(row)) == "held"
+    assert "held" in storage_config.SYNC_STATES
+    # A new revision is judged afresh, and a push clears it.
+    _stage(_doc(_pool("nvme0")))
+    assert _row().held == ""
+    storage_config.sync_node(NODE, force=True)
+    assert _row().held == ""
+    assert storage_config.sync_status(_row()) != "held:pool-not-drained:nvme0"
+
+
+def test_a_force_is_spent_once_its_pool_is_no_longer_draining() -> None:
+    _reports("default")
+    _dead()
+    _stage(_doc(_pool("nvme0")))
+    _force()
+    assert "nvme0" in _row().forced_pools
+    # Set back active (the disk came back): the force is spent.
+    _stage(_doc(_pool("nvme0")))
+    assert _row().forced_pools == {}
+    # Forced again, then a new family writes: spent too.
+    _force()
+    other = Actor(
+        principal="backend-operator-config", family="5Fb", user="7", account=FAMILY_B.hex()
+    )
+    storage_config.stage(NODE, _doc(_pool("nvme0", state="draining")), actor=other, action="put")
+    assert _row().forced_pools == {}
+
+
+@pytest.mark.usefixtures("push_on")
+def test_a_held_status_never_hides_the_gate_or_an_applied_revision(
+    agent: FakeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _miner()
+    _reports("default")
+    _reports("nvme0")
+    _stage(_doc(_pool("nvme0")))
+    MinerStorageConfig.objects.filter(miner_node_id=NODE).update(body=_doc(), content_key="")
+    storage_config.sync_node(NODE, force=True)
+    assert _row().held == "pool-not-drained:nvme0"
+    # The push switched off since: the gate says it, the old hold goes.
+    monkeypatch.setattr(settings, "VALI_STORAGE_CONFIG_PUSH", False)
+    storage_config.sync_node(NODE, force=True)
+    row = _row()
+    assert row.held == "" and row.last_error.startswith("held: storage-config-push-disabled")
+    # A re-push of an applied revision held by the chain stays in_sync.
+    monkeypatch.setattr(settings, "VALI_STORAGE_CONFIG_PUSH", True)
+    _stage(_doc(_pool("nvme0")))
+    storage_config.sync_node(NODE, force=True)
+    _heartbeat(_row().revision, at=_row().acked_at + timedelta(seconds=5))
+    assert storage_config.sync_status(_row()) == "in_sync"
+    monkeypatch.setattr(storage_config, "_owner_hold", lambda row: "chain-unavailable")
+    assert storage_config.sync_node(NODE, force=True) == "chain-unavailable"
+    assert storage_config.sync_status(_row()) == "in_sync"

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "hippius-types",
+    "hippius-host-inventory",
     "hippius-onchain-registry",
     "kbs-core",
     "kbs-transport",

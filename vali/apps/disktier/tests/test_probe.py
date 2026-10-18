@@ -184,11 +184,122 @@ def test_a_run_in_flight_is_not_history() -> None:
 # ─── pools ───────────────────────────────────────────────────────────
 
 
-def test_the_os_pool_is_default_today() -> None:
-    """TODO(A4): a probe of pool P launches its OS disk on P once the order
-    carries `os_pool`; until then only `default` can be probed."""
-    assert probe.probe_os_pool("default") == "default"
-    assert probe.probe_os_pool("fast") is None
+ROUTING_MIN = "v2026.10.17"
+
+
+def _routing_agent(settings: Any, node: str = NODE, version: str = ROUTING_MIN) -> None:
+    """`node`'s agent reports `version`; `os_pool` needs `ROUTING_MIN`."""
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    settings.VALI_POOL_ROUTING_MIN_AGENT_VERSION = ROUTING_MIN
+    now = timezone.now()
+    MinerCapacity.objects.update_or_create(
+        miner_node_id=node,
+        defaults=dict(
+            status="active", capacity_slots=4, observed_epoch=10, data_epoch=10,
+            refreshed_at=now, agent_version=version, agent_version_reported_at=now,
+        ),
+    )
+
+
+def _os_pool(node: str, pool_id: str, **kw: Any) -> MinerStoragePool:
+    """A pool A4b can name: OS disks, active, reported now, room."""
+    from django.utils import timezone
+
+    fields: dict[str, Any] = dict(
+        os_disks=True, reported_state="active", reported_at=timezone.now(),
+        declared_class="nvme", available_gb=1000,
+    )
+    fields.update(kw)
+    return _pool(node, pool_id, **fields)
+
+
+def test_default_is_always_probeable() -> None:
+    """An order without `os_pool` lands on `default`: no agent version, no
+    report, no room check needed."""
+    assert probe.probe_os_pool(NODE, "default") == "default"
+    assert probe.os_pool_skip(NODE, "default") == ""
+
+
+def test_a_pool_is_probed_on_itself_once_the_agent_takes_os_pool(settings: Any) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "nvme0")
+    due, report = _due()
+    assert [(d.node_id, d.pool_id) for d in due] == [(NODE, "default"), (NODE, "nvme0")]
+    assert not report.skipped
+    assert probe.probe_os_pool(NODE, "nvme0") == "nvme0"
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        # Its tier and health are what the probe measures: never a reason.
+        dict(declared_class="hdd"),
+        dict(declared_class="ssd", tier="hdd"),
+        dict(health="degraded"),
+        dict(health="severe"),
+    ],
+)
+def test_a_pool_is_probed_whatever_its_tier_or_health(settings: Any, kw: dict) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "nvme0", **kw)
+    assert probe.probe_os_pool(NODE, "nvme0") == "nvme0"
+
+
+def test_an_agent_too_old_for_os_pool_skips_needs_os_pool_order(settings: Any) -> None:
+    _routing_agent(settings, version="v2026.10.16")
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "nvme0")
+    due, report = _due()
+    assert [d.pool_id for d in due] == ["default"]
+    assert report.skipped == {"needs-os-pool-order": 1}
+    assert probe.os_pool_skip(NODE, "nvme0") == "needs-os-pool-order"
+
+
+def test_a_pool_without_os_disks_skips_not_os_eligible(settings: Any) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "bulk", os_disks=False)
+    due, report = _due()
+    assert due == []
+    assert report.skipped["not-os-eligible"] == 1
+    assert probe.os_pool_skip(NODE, "bulk") == "not-os-eligible"
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(available_gb=89),  # the probe's OS disk is 90 GiB (medium + rootfs)
+        dict(available_gb=None),
+        dict(available_gb=5000, budget_gb=500, committed_gb=420),
+        dict(available_gb=5000, earned_gb=60),
+    ],
+)
+def test_a_full_pool_skips_no_room(settings: Any, kw: dict) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "nvme0", **kw)
+    due, report = _due()
+    assert [d.pool_id for d in due] == ["default"]
+    assert report.skipped == {"no-room": 1}
+    assert probe.probe_os_pool(NODE, "nvme0") is None
+
+
+def test_a_pool_just_big_enough_is_probed(settings: Any) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "nvme0", available_gb=probe.probe_os_disk_gb())
+    assert probe.probe_os_pool(NODE, "nvme0") == "nvme0"
+
+
+def test_a_pool_not_reported_lately_is_not_probed(settings: Any) -> None:
+    from apps.disktier import routing
+
+    _routing_agent(settings)
+    _os_pool(NODE, "nvme0", reported_at=NOW - routing.REPORT_MAX_AGE - timedelta(days=1))
+    assert probe.os_pool_skip(NODE, "nvme0") == "pool-not-active"
+    assert probe.os_pool_skip(NODE, "unknown") == "pool-not-active"
 
 
 def test_a_node_without_a_storage_report_has_the_implicit_default_pool() -> None:
@@ -219,6 +330,14 @@ def test_a_node_reporting_pools_without_default_is_skipped() -> None:
     due, report = _due()
     assert due == []
     assert report.skipped["os-pool-unavailable"] == 1
+
+
+def test_a_node_without_default_is_probed_on_its_pools_once_routed(settings: Any) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "fast")
+    due, report = _due()
+    assert [d.pool_id for d in due] == ["fast"]
+    assert not report.skipped
 
 
 # ─── node gates and concurrency ──────────────────────────────────────
@@ -347,6 +466,26 @@ def test_a_launch_creates_a_fresh_run_and_launches_it_pinned(
     assert intent["image"] == "ubuntu"
     assert intent["cmdline"] == "console=ttyS0 root=/dev/vda"
     assert intent["enable_netbird"] is True and intent["auto_pin_allowlist"] is True
+    # `default`: the intake pins it, and the order then carries no `os_pool`.
+    assert intent["os_pool"] == "default"
+
+
+def test_a_probe_of_a_pool_launches_its_os_disk_on_that_pool(
+    probe_on: FakeIntake, settings: Any
+) -> None:
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "nvme0")
+    make_run(pool="default", state=ProbeRunState.VERIFIED, finished_at=NOW - DAY,
+             torn_down_at=NOW - DAY, scheduled_at=NOW - 2 * DAY)
+    assert probe.tick(now=NOW).launched == 1
+    run = DiskProbeRun.objects.get(state=ProbeRunState.LAUNCHING)
+    assert run.os_pool_id == "nvme0"
+    assert run.targets == [{"slot": "os", "kind": "pool", "pool_id": "nvme0", "profile": "v1"}]
+    (call,) = probe_on.calls
+    assert call["disk_probe"] is True
+    assert call["intent"]["os_pool"] == "nvme0"
+    assert call["intent"]["vm_id"] == run.vm_id
 
 
 def test_every_run_gets_its_own_nonce_and_run_id(probe_on: FakeIntake, monkeypatch) -> None:
@@ -510,6 +649,63 @@ def test_an_operator_request(probe_on: FakeIntake) -> None:
     with pytest.raises(ValueError, match="this period"):
         probe.request_manual(node_id(1), now=NOW + 6 * DAY)
     probe.request_manual(node_id(1), now=NOW + 8 * DAY)
+
+
+def test_an_operator_request_for_a_pool(probe_on: FakeIntake, settings: Any) -> None:
+    from apps.scheduler.tests.factories import make_dispatchable_identity, node_id
+
+    make_dispatchable_identity(1)
+    nid = node_id(1)
+    _os_pool(nid, "nvme0")
+    _os_pool(nid, "full", available_gb=10)
+    _os_pool(nid, "bulk", os_disks=False)
+    with pytest.raises(ValueError, match="needs-os-pool-order"):
+        probe.request_manual(nid, pool_id="nvme0", now=NOW)
+    _routing_agent(settings, node=nid)
+    with pytest.raises(ValueError, match="no-room"):
+        probe.request_manual(nid, pool_id="full", now=NOW)
+    with pytest.raises(ValueError, match="not-os-eligible"):
+        probe.request_manual(nid, pool_id="bulk", now=NOW)
+    with pytest.raises(ValueError, match="not a pool id"):
+        probe.request_manual(nid, pool_id="NVMe/0", now=NOW)
+    run = probe.request_manual(nid, pool_id="nvme0", now=NOW)
+    assert (run.os_pool_id, run.trigger) == ("nvme0", ProbeTrigger.MANUAL)
+    assert run.targets[0]["pool_id"] == "nvme0"
+    # Launched as queued: the intent pins the requested pool.
+    probe.tick(now=NOW)
+    (call,) = probe_on.calls
+    assert call["intent"]["vm_id"] == run.vm_id and call["intent"]["os_pool"] == "nvme0"
+
+
+def test_a_queued_request_whose_pool_filled_up_waits(probe_on: FakeIntake, settings: Any) -> None:
+    """It never launches onto another pool: skipped `no-room` and kept
+    queued (it expires on its own TTL)."""
+    _routing_agent(settings)
+    _os_pool(NODE, "nvme0", available_gb=10)
+    queued = make_run(pool="nvme0", state=ProbeRunState.SCHEDULED, trigger=ProbeTrigger.MANUAL)
+    report = probe.tick(now=NOW)
+    assert report.skipped["no-room"] == 2  # the queued run and the automatic item
+    assert report.launched == 0 and probe_on.calls == []
+    queued.refresh_from_db()
+    assert queued.state == ProbeRunState.SCHEDULED
+
+
+def test_the_command_requests_a_pool(
+    probe_on: FakeIntake, settings: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from apps.scheduler.tests.factories import make_dispatchable_identity, node_id
+
+    make_dispatchable_identity(1)
+    nid = node_id(1)
+    _routing_agent(settings, node=nid)
+    _os_pool(nid, "nvme0")
+    call_command("vali_disk_probe", "--request", nid, "--pool", "nvme0")
+    assert "pool nvme0" in capsys.readouterr().out
+    assert DiskProbeRun.objects.get(miner_node_id=nid).os_pool_id == "nvme0"
+    with pytest.raises(CommandError, match="only goes with --request"):
+        call_command("vali_disk_probe", "--pool", "nvme0")
+    with pytest.raises(CommandError, match="no-room|this period"):
+        call_command("vali_disk_probe", "--request", nid, "--pool", "nvme0")
 
 
 # ─── launch → running → verdict, the timeout ─────────────────────────
@@ -858,7 +1054,9 @@ def test_the_metrics(probe_on: FakeIntake, monkeypatch) -> None:
     # here the fleet's first probe, so DiskProbeStale covers it too.
     first = DiskProbeRun.objects.earliest("scheduled_at")
     (value,) = re.findall(
-        rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{NODE}"}} (\S+)', text
+        rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{NODE}",pool="default"}}'
+        r" (\S+)",
+        text,
     )
     assert float(value) == pytest.approx(first.scheduled_at.timestamp())
     assert "hippius_disk_probe_enabled 1" in text
@@ -867,17 +1065,217 @@ def test_the_metrics(probe_on: FakeIntake, monkeypatch) -> None:
     assert 'hippius_disk_probe_results_total{outcome="rejected_wrong_nonce"} 3' in text
     assert 'hippius_disk_probe_results_7d{verdict="nvme"} 1' in text
     assert 'hippius_disk_probe_results_7d{verdict="probe-timeout"} 2' in text
-    assert f'hippius_disk_probe_node_consecutive_failures{{node="{NODE3}"}} 2' in text
-    assert f'hippius_disk_probe_node_would_be_severe{{node="{NODE3}"}} 1' in text
-    assert f'hippius_disk_probe_node_would_be_severe{{node="{NODE2}"}} 0' in text
-    assert f'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{NODE2}"}}' in text
+    n2, n3 = f'node="{NODE2}",pool="default"', f'node="{NODE3}",pool="default"'
+    assert f"hippius_disk_probe_node_consecutive_failures{{{n3}}} 2" in text
+    assert f"hippius_disk_probe_node_would_be_severe{{{n3}}} 1" in text
+    assert f"hippius_disk_probe_node_would_be_severe{{{n2}}} 0" in text
+    assert f"hippius_disk_probe_node_last_verified_timestamp_seconds{{{n2}}}" in text
     assert (
         f'hippius_disk_probe_node_would_be_tier{{node="{NODE2}",pool="default",tier="nvme"}} 1'
         in text
     )
-    # Never a probe's vm id or owner.
-    assert USER not in text.replace(NODE, "").replace(NODE2, "").replace(NODE3, "")
+    assert 'hippius_disk_probe_skipped{reason="no-room"} 0' in text
 
+
+def test_a_probeable_pool_never_probed_is_watched_from_its_first_report(settings: Any) -> None:
+    """DiskProbeStale covers a new pool the probe keeps skipping, from when
+    it was first reported (not the fleet's first probe); a pool the probe
+    cannot take (an hdd-only one) is not watched."""
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    fresh = _os_pool(NODE, "nvme0")
+    _pool(NODE, "bulk", os_disks=False)
+    make_run(node=NODE2, state=ProbeRunState.TIMEOUT, finished_at=NOW - 30 * DAY,
+             torn_down_at=NOW, scheduled_at=NOW - 30 * DAY)
+    text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW, nodes=(NODE,)).render()
+    (v,) = re.findall(
+        rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{NODE}",pool="nvme0"}}'
+        r" (\S+)",
+        text,
+    )
+    assert float(v) == pytest.approx(fresh.created_at.timestamp())
+    assert 'pool="bulk"' not in text
+
+
+def _stale_watch(node: str = NODE) -> dict[str, float]:
+    """`{pool: last_verified_timestamp}` of `node`'s series."""
+    text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW, nodes=(node,)).render()
+    return {
+        pool: float(v)
+        for pool, v in re.findall(
+            rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{node}",'
+            r'pool="([^"]+)"} (\S+)',
+            text,
+        )
+    }
+
+
+def _fleet_started(days: int = 30) -> None:
+    """The fleet's first probe, on another node, `days` ago."""
+    make_run(node=NODE2, state=ProbeRunState.TIMEOUT, finished_at=NOW - days * DAY,
+             torn_down_at=NOW, scheduled_at=NOW - days * DAY)
+
+
+def test_an_old_agent_s_pools_age_into_stale(settings: Any) -> None:
+    """os-pool-unavailable / needs-os-pool-order: the probe skips every
+    pool of a node that reports pools but no `default` on an agent that
+    cannot route, and its non-default pools elsewhere — each still has a
+    watch series, from its first report."""
+    _routing_agent(settings, version="v2026.10.16")
+    _fleet_started()
+    fast = _os_pool(NODE, "fast")
+    _os_pool(NODE2, "default")
+    nvme = _os_pool(NODE2, "nvme0")
+    due, report = _due((NODE, NODE2))
+    assert report.skipped["os-pool-unavailable"] == 1
+    assert report.skipped["needs-os-pool-order"] == 2
+    assert _stale_watch(NODE) == {"fast": pytest.approx(fast.created_at.timestamp())}
+    assert _stale_watch(NODE2)["nvme0"] == pytest.approx(nvme.created_at.timestamp())
+
+
+def test_an_inactive_default_ages_into_stale_on_the_node_clock() -> None:
+    """A draining `default` is skipped (`pool-not-active`) but watched, and
+    `default` is watched from the node-level start (the fleet's first
+    probe / the registration), never its row's first report: a node that
+    starts reporting late does not restart its Stale clock."""
+    _fleet_started()
+    _pool(NODE, "default", os_disks=True, reported_state="draining")
+    _, report = _due()
+    assert report.skipped["pool-not-active"] == 1
+    assert _stale_watch() == {"default": pytest.approx((NOW - 30 * DAY).timestamp())}
+
+
+def test_a_never_probed_full_pool_ages_into_stale(settings: Any) -> None:
+    _routing_agent(settings)
+    _fleet_started()
+    _os_pool(NODE, "default")
+    full = _os_pool(NODE, "nvme0", available_gb=10)
+    _, report = _due()
+    assert report.skipped["no-room"] == 1
+    watch = _stale_watch()
+    assert watch["nvme0"] == pytest.approx(full.created_at.timestamp())
+    assert watch["default"] == pytest.approx((NOW - 30 * DAY).timestamp())
+
+
+def test_a_node_without_an_os_pool_keeps_a_default_series() -> None:
+    """Only hdd pools (or no report): the node still has one watch series."""
+    _fleet_started()
+    _pool(NODE, "bulk", os_disks=False)
+    assert _stale_watch() == {"default": pytest.approx((NOW - 30 * DAY).timestamp())}
+    assert _stale_watch(NODE3) == {"default": pytest.approx((NOW - 30 * DAY).timestamp())}
+
+
+def test_severe_only_for_a_sellable_pool(settings: Any) -> None:
+    """An unfit verdict on a pool an OS disk is sold on raises
+    `would_be_severe`; on a pool probed only to explore or diagnose
+    (draining, or on an agent that cannot route) it raises the info gauge
+    only, never `would_be_severe` (no cordon claim)."""
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "nvme0")
+    _os_pool(NODE, "drain0", reported_state="draining")
+    for pool in ("nvme0", "drain0"):
+        make_run(state=ProbeRunState.VERIFIED, pool=pool, finished_at=NOW - DAY,
+                 torn_down_at=NOW, classified_tier="unfit")
+
+    def gauges() -> dict[tuple[str, str], float]:
+        text = probe.report_metrics(
+            probe.TickReport(enabled=True), now=NOW, nodes=(NODE,)
+        ).render()
+        return {
+            (name, pool): float(v)
+            for name, pool, v in re.findall(
+                r'hippius_disk_probe_node_(would_be_severe|would_be_unfit_unsold)'
+                rf'{{node="{NODE}",pool="([^"]+)"}} (\S+)',
+                text,
+            )
+        }
+
+    assert gauges() == {
+        ("would_be_severe", "nvme0"): 1,
+        ("would_be_unfit_unsold", "drain0"): 1,
+    }
+    # Sold as what the operator side says, never what a verdict demoted it
+    # to: nvme0 stays sellable with a probed `unfit` tier and bad health.
+    MinerStoragePool.objects.filter(pool_id="nvme0").update(tier="unfit", health="severe")
+    assert gauges()[("would_be_severe", "nvme0")] == 1
+    # An operator override away from nvme makes it unsold; one to nvme
+    # makes a declared-ssd pool sellable.
+    MinerStoragePool.objects.filter(pool_id="nvme0").update(operator_override="ssd")
+    assert gauges()[("would_be_unfit_unsold", "nvme0")] == 1
+    MinerStoragePool.objects.filter(pool_id="nvme0").update(
+        operator_override="nvme", declared_class="ssd"
+    )
+    assert gauges()[("would_be_severe", "nvme0")] == 1
+    MinerStoragePool.objects.filter(pool_id="nvme0").update(
+        operator_override="", declared_class="nvme"
+    )
+    # The same unfit nvme0 on an agent that cannot route: unsold.
+    _routing_agent(settings, version="v2026.10.16")
+    assert gauges() == {
+        ("would_be_unfit_unsold", "nvme0"): 1,
+        ("would_be_unfit_unsold", "drain0"): 1,
+    }
+
+
+@pytest.mark.parametrize("declared", ["ssd", "hdd", ""])
+def test_an_active_pool_not_sold_as_nvme_is_unsold(settings: Any, declared: str) -> None:
+    """A4b routes OS disks only to the nvme class: an active SATA-SSD (or
+    hdd, or undeclared) pool on an agent that takes `os_pool` is probed
+    to explore, and its unfit verdict raises the info gauge only."""
+    _routing_agent(settings)
+    _os_pool(NODE, "default")
+    _os_pool(NODE, "ssd0", declared_class=declared)
+    make_run(state=ProbeRunState.VERIFIED, pool="ssd0", finished_at=NOW - DAY,
+             torn_down_at=NOW, classified_tier="unfit")
+    text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW, nodes=(NODE,)).render()
+    assert f'hippius_disk_probe_node_would_be_unfit_unsold{{node="{NODE}",pool="ssd0"}} 1' in text
+    assert f'hippius_disk_probe_node_would_be_severe{{node="{NODE}",pool="ssd0"}}' not in text
+
+
+def test_every_node_gauge_is_per_pool(settings: Any) -> None:
+    """A pool's verdicts never mask, reset or raise another's: nvme0's
+    fresh verify leaves default's failures, stale timestamp and severe
+    grade alone; slow0's unfit verdict raises slow0 only; a retired
+    pool's series drop out."""
+    _routing_agent(settings)
+    for pool, kw in (("default", {}), ("nvme0", {}), ("slow0", {}), ("gone", {"retired_at": NOW})):
+        _pool(NODE, pool, os_disks=True, reported_state="active", declared_class="nvme", **kw)
+    make_run(state=ProbeRunState.VERIFIED, pool="default", finished_at=NOW - 9 * DAY,
+             torn_down_at=NOW, classified_tier="ssd")
+    for days in (3, 2):
+        make_run(state=ProbeRunState.TIMEOUT, pool="default", finished_at=NOW - days * DAY,
+                 torn_down_at=NOW, failure_reason="probe-timeout")
+    make_run(state=ProbeRunState.VERIFIED, pool="nvme0", finished_at=NOW - DAY,
+             torn_down_at=NOW, classified_tier="nvme")
+    make_run(state=ProbeRunState.VERIFIED, pool="slow0", finished_at=NOW - DAY / 2,
+             torn_down_at=NOW, classified_tier="unfit")
+    make_run(state=ProbeRunState.VERIFIED, pool="gone", finished_at=NOW - DAY / 4,
+             torn_down_at=NOW, classified_tier="unfit")
+    text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW, nodes=(NODE,)).render()
+
+    def value(name: str, pool: str) -> float:
+        (v,) = re.findall(rf'hippius_disk_probe_node_{name}{{node="{NODE}",pool="{pool}"}} (\S+)',
+                          text)
+        return float(v)
+
+    assert value("consecutive_failures", "default") == 2
+    assert value("consecutive_failures", "nvme0") == 0
+    assert value("would_be_severe", "default") == 1  # two timeouts of default
+    assert value("would_be_severe", "nvme0") == 0
+    assert value("would_be_severe", "slow0") == 1  # unfit
+    assert value("suspect_cache", "nvme0") == 0
+    stamp = "last_verified_timestamp_seconds"
+    assert value(stamp, "default") == pytest.approx((NOW - 9 * DAY).timestamp())
+    assert value(stamp, "nvme0") == pytest.approx((NOW - DAY).timestamp())
+    tiers = re.findall(r'hippius_disk_probe_node_would_be_tier\{([^}]*)\} 1', text)
+    assert tiers == [
+        f'node="{NODE}",pool="default",tier="ssd"',
+        f'node="{NODE}",pool="nvme0",tier="nvme"',
+        f'node="{NODE}",pool="slow0",tier="unfit"',
+    ]
+    assert 'pool="gone"' not in text
+    assert f'node="{NODE}"}}' not in text, "no node-only series left"
 
 def test_the_command_pushes_while_on(
     probe_on: FakeIntake, monkeypatch: pytest.MonkeyPatch, settings: Any
@@ -937,7 +1335,8 @@ def test_a_new_miner_is_watched_from_its_registration() -> None:
     text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW,
                                 nodes=(node_id(7),)).render()
     (value,) = re.findall(
-        rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{node_id(7)}"}} (\S+)',
+        rf'hippius_disk_probe_node_last_verified_timestamp_seconds{{node="{node_id(7)}",'
+        r'pool="default"} (\S+)',
         text,
     )
     assert float(value) == pytest.approx(joined.timestamp())
@@ -983,4 +1382,4 @@ def test_vali_s_own_backlog_is_not_a_miner_failure() -> None:
     make_run(state=ProbeRunState.TIMEOUT, failure_reason="probe-timeout",
              finished_at=NOW - 2 * DAY, torn_down_at=NOW, scheduled_at=NOW - 3 * DAY)
     text = probe.report_metrics(probe.TickReport(enabled=True), now=NOW, nodes=(NODE,)).render()
-    assert f'hippius_disk_probe_node_consecutive_failures{{node="{NODE}"}} 1' in text
+    assert f'hippius_disk_probe_node_consecutive_failures{{node="{NODE}",pool="default"}} 1' in text
