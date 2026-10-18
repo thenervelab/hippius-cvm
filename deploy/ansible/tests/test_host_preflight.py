@@ -19,6 +19,39 @@ _spec.loader.exec_module(host_preflight)
 
 GIB = 1024**3
 
+
+def mnt(point: str, total_gib: int, available_gib: int) -> dict:
+    """An `ansible_mounts` entry as Ansible builds it: no f_bfree, so its
+    `block_used` is f_blocks − f_bavail (the root-reserved blocks hide in
+    it) — the reason the usable size comes from `stat -f` instead."""
+    bs = 4096
+    total = total_gib * GIB // bs
+    available = available_gib * GIB // bs
+    return {
+        "mount": point,
+        "size_total": total_gib * GIB,
+        "size_available": available_gib * GIB,
+        "block_size": bs,
+        "block_total": total,
+        "block_available": available,
+        "block_used": total - available,
+    }
+
+
+def statfs(total_gib: int, available_gib: int, reserved_gib: int = 0) -> str:
+    """`stat -f -c '%S %b %f %a'`: free = available + root-reserved."""
+    bs = 4096
+    return " ".join(
+        str(x)
+        for x in (
+            bs,
+            total_gib * GIB // bs,
+            (available_gib + reserved_gib) * GIB // bs,
+            available_gib * GIB // bs,
+        )
+    )
+
+
 # A healthy Genoa host, as the play 00 probe prints it.
 GOOD_PROBE = """\
 cpu_vendor=AuthenticAMD
@@ -54,9 +87,10 @@ GOOD_FACTS = {
     "vcpus": 24,
     "memtotal_mb": 386000,
     "mounts": [
-        {"mount": "/", "size_total": 800 * GIB, "size_available": 700 * GIB},
-        {"mount": "/boot", "size_total": 1 * GIB, "size_available": 1 * GIB},
+        mnt("/", 800, 700),
+        mnt("/boot", 1, 1),
     ],
+    "data_fs_statfs": statfs(800, 700, reserved_gib=40),
     "snp_generation_declared": "",
     "cpu_model_expected": "",
     "ram_gb_expected": "",
@@ -79,6 +113,7 @@ LIMITS = {
     "min_tenant_disk_gb": 200,
     "min_staging_free_gb": 30,
     "reserve_disk_gb": 100,
+    "reserve_disk_root_extra_gb": 50,
     "snp_cmdline_tokens": [
         "kvm_amd.sev=1",
         "kvm_amd.sev_es=1",
@@ -319,34 +354,70 @@ class FailureTest(unittest.TestCase):
     def test_storage(self) -> None:
         self.assertFails(
             "DATA_ROOT_TOO_SMALL",
-            facts={"mounts": [{"mount": "/", "size_total": 250 * GIB, "size_available": 200 * GIB}]},
+            facts={"mounts": [mnt("/", 250, 200)], "data_fs_statfs": statfs(250, 200)},
         )
         # The longest mount prefix holds the root: a big /srv does not
         # rescue a small / when the root is under /var.
         self.assertFails(
             "DATA_ROOT_TOO_SMALL",
-            facts={"mounts": [
-                {"mount": "/", "size_total": 250 * GIB, "size_available": 200 * GIB},
-                {"mount": "/srv/data", "size_total": 7000 * GIB, "size_available": 7000 * GIB},
-            ]},
+            facts={
+                "mounts": [mnt("/", 250, 200), mnt("/srv/data", 7000, 7000)],
+                "data_fs_statfs": statfs(250, 200),
+            },
         )
         dedicated = {
             "data_root": "/srv/data/vms",
             "data_root_exists": True,
-            "mounts": [
-                {"mount": "/", "size_total": 100 * GIB, "size_available": 60 * GIB},
-                {"mount": "/srv/data", "size_total": 7000 * GIB, "size_available": 7000 * GIB},
-            ],
+            "mounts": [mnt("/", 100, 60), mnt("/srv/data", 7000, 7000)],
+            "data_fs_statfs": statfs(7000, 7000),
         }
         self.assertEqual(run(facts=dedicated)["failures"], [])
         self.assertFails("DATA_ROOT_MISSING", facts=dict(dedicated, data_root_exists=False))
         self.assertFails(
             "STAGING_ROOT_LOW",
-            facts=dict(dedicated, mounts=[
-                {"mount": "/", "size_total": 100 * GIB, "size_available": 10 * GIB},
-                {"mount": "/srv/data", "size_total": 7000 * GIB, "size_available": 7000 * GIB},
-            ]),
+            facts=dict(dedicated, mounts=[mnt("/", 100, 10), mnt("/srv/data", 7000, 7000)]),
         )
+
+    def test_storage_counts_only_what_the_agent_can_fill(self) -> None:
+        # 400 GiB on `/`, 20 GiB root-reserved: 380 usable covers 100 + 50
+        # (root extra) + 200 (tenant floor); with 120 reserved, 280 does not
+        # — though `ansible_mounts` says 400 either way.
+        root = {"mounts": [mnt("/", 400, 250)]}
+        ok = dict(root, data_fs_statfs=statfs(400, 250, reserved_gib=20))
+        self.assertEqual(run(facts=ok)["failures"], [])
+        self.assertFails(
+            "DATA_ROOT_TOO_SMALL", facts=dict(root, data_fs_statfs=statfs(400, 150, reserved_gib=120))
+        )
+        # On `/` the root extra counts (340 < 350); on a dedicated mount not.
+        self.assertFails(
+            "DATA_ROOT_TOO_SMALL",
+            facts={"mounts": [mnt("/", 340, 300)], "data_fs_statfs": statfs(340, 300)},
+        )
+        dedicated = {
+            "data_root": "/srv/data/vms",
+            "data_root_exists": True,
+            "mounts": [mnt("/", 100, 60), mnt("/srv/data", 310, 300)],
+            "data_fs_statfs": statfs(310, 300),
+        }
+        self.assertEqual(run(facts=dedicated)["failures"], [])
+        # No `stat -f` answer: refused, never taken as unbounded.
+        self.assertFails("DATA_ROOT_TOO_SMALL", facts=dict(ok, data_fs_statfs=""))
+
+    def test_usable_gib_and_reserve(self) -> None:
+        # 892 GiB, 44 GiB root-reserved, 4 GiB available ⇒ 848 usable.
+        self.assertEqual(host_preflight.statfs_usable_gib(statfs(892, 4, reserved_gib=44)), 848)
+        # What `ansible_mounts` would have said: the whole 892.
+        m1 = mnt("/", 892, 4)
+        self.assertEqual((m1["block_used"] + m1["block_available"]) * 4096 // GIB, 892)
+        for bad in ("", None, "4096 10 20 5", "a b c d", "4096 10 5"):
+            self.assertEqual(host_preflight.statfs_usable_gib(bad), 0, bad)
+        self.assertEqual(host_preflight.disk_reserve_gib("/", 100, 50), 150)
+        self.assertEqual(host_preflight.disk_reserve_gib("/srv/data", 100, 50), 100)
+        self.assertEqual(host_preflight.disk_reserve_gib("/", "100", "0"), 100)
+        self.assertEqual(
+            host_preflight.mount_point_for("/var/lib/hippius-miner", [mnt("/", 1, 1)]), "/"
+        )
+        self.assertEqual(host_preflight.mount_point_for("/x", []), "")
 
     def test_clock_and_netbird(self) -> None:
         self.assertFails("CLOCK_NOT_SYNCED", {"ntp_synced": "no"})
@@ -361,7 +432,8 @@ class FailureTest(unittest.TestCase):
         live = {"agent_installed": "1", "ntp_synced": "no"}
         small = {
             "netbird_mgmt_status": -1,
-            "mounts": [{"mount": "/", "size_total": 250 * GIB, "size_available": 10 * GIB}],
+            "mounts": [mnt("/", 250, 10)],
+            "data_fs_statfs": statfs(250, 10),
         }
         result = run(live, small)
         self.assertEqual(result["failures"], [])

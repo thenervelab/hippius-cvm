@@ -105,6 +105,15 @@ pub const GRACEFUL_EXIT_INGEST_PATH: &str = "/v1/telemetry/graceful-exit";
 /// trust gate; vali advances the VM's `boot_phase` display field.
 pub const VM_PROGRESS_INGEST_PATH: &str = "/v1/telemetry/vm-progress";
 
+/// vali path a `HostInventory` relays to — the §18.10 host inventory
+/// ingest. Like the graceful-exit relay it POSTs the raw canonical-CBOR
+/// `SignedHostInventory` verbatim under `content-type: application/cbor`,
+/// never decodes it, and stamps the connection's mTLS
+/// [`HEARTBEAT_PEER_ID_HEADER`] so vali resolves the miner from the relay
+/// metadata (§5.6). The Ed25519 signature on the body remains vali's trust
+/// gate; vali stores the report for the node's owner and decides nothing.
+pub const HOST_INVENTORY_INGEST_PATH: &str = "/v1/telemetry/host-inventory";
+
 /// vali path a `HostAttestorChallenge` relays to (PR-10). vali is the
 /// nonce authority: it mints a fresh single-use enrollment nonce bound to
 /// the mTLS-stamped `node_id` + the request's `signer_pubkey`, and returns
@@ -175,6 +184,12 @@ mod tests {
         // rename on either side surfaces here.
         assert_eq!(GRACEFUL_EXIT_INGEST_PATH, "/v1/telemetry/graceful-exit");
         assert_ne!(GRACEFUL_EXIT_INGEST_PATH, TELEMETRY_INGEST_PATH);
+    }
+
+    #[test]
+    fn host_inventory_path_is_dedicated_and_stable() {
+        assert_eq!(HOST_INVENTORY_INGEST_PATH, "/v1/telemetry/host-inventory");
+        assert_ne!(HOST_INVENTORY_INGEST_PATH, TELEMETRY_INGEST_PATH);
     }
 
     #[test]

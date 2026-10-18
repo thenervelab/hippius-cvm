@@ -1363,3 +1363,76 @@ def test_a_v7_size_heartbeat_is_not_refused_as_oversize() -> None:
     _make_miner()
     # Past the old 4096-byte cap, inside the 16 KiB one.
     assert _post_heartbeat(b"x" * 9_000).status_code == 202
+
+
+# ─── automatic-approval soak (apps.scheduler.approval) ───────────────
+
+
+def _complete(fake: FakeHeartbeatVerifier, sequence: int) -> None:
+    fake.schema_version = 4
+    fake.sequence = sequence
+    fake.memory_available_mib = 250_000
+    fake.declared_capacity = verifier.DeclaredCapacity(44, 120_000, 99, 2)
+    fake.declared_disk = verifier.DeclaredDisk(3000, 3500, 3200, 400)
+
+
+def test_complete_heartbeats_run_the_soak_of_a_pending_miner(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from datetime import timedelta
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c1" * 32
+    _make_bridged_miner(node)
+    _complete(fake_heartbeat_verifier, 1)
+    assert _post_heartbeat().status_code == 202
+    started = MinerCapacity.objects.get(miner_node_id=node).approval_soak_since
+    assert started is not None
+    # The next one inside the liveness timeout keeps the run.
+    _complete(fake_heartbeat_verifier, 2)
+    assert _post_heartbeat().status_code == 202
+    assert MinerCapacity.objects.get(miner_node_id=node).approval_soak_since == started
+    # A gap past it (the previous stamps aged) starts a new run.
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        declared_at=started - timedelta(hours=1), disk_reported_at=started - timedelta(hours=1)
+    )
+    _complete(fake_heartbeat_verifier, 3)
+    assert _post_heartbeat().status_code == 202
+    assert MinerCapacity.objects.get(miner_node_id=node).approval_soak_since > started
+    # A heartbeat without the v4 disk figures ends it.
+    _complete(fake_heartbeat_verifier, 4)
+    fake_heartbeat_verifier.declared_disk = None
+    assert _post_heartbeat().status_code == 202
+    assert MinerCapacity.objects.get(miner_node_id=node).approval_soak_since is None
+
+
+@pytest.mark.parametrize("missing", ["memory_available_mib", "declared_capacity", "declared_disk"])
+def test_a_heartbeat_missing_a_figure_starts_no_soak(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier, missing: str
+) -> None:
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c3" * 32
+    _make_bridged_miner(node)
+    _complete(fake_heartbeat_verifier, 1)
+    setattr(fake_heartbeat_verifier, missing, None)
+    assert _post_heartbeat().status_code == 202
+    assert MinerCapacity.objects.get(miner_node_id=node).approval_soak_since is None
+
+
+def test_the_soak_never_touches_an_approved_miner(
+    fake_heartbeat_verifier: FakeHeartbeatVerifier,
+) -> None:
+    from django.utils import timezone
+
+    from apps.scheduler.models import MinerCapacity
+
+    node = "c2" * 32
+    _make_bridged_miner(node)
+    MinerCapacity.objects.filter(miner_node_id=node).update(
+        approved_at=timezone.now(), approved_by="grandfathered"
+    )
+    _complete(fake_heartbeat_verifier, 1)
+    assert _post_heartbeat().status_code == 202
+    assert MinerCapacity.objects.get(miner_node_id=node).approval_soak_since is None

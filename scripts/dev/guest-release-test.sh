@@ -427,11 +427,16 @@ else
     boot || err "the boot step refused the builder's record: $(cat "${T}/log")"
     grep -q 'mounted=yes' "${C}/run/guest-components" || err "the builder's image did not pass the sha check"
     for u in hippius-keepalive.service hippius-tenant-telemetry.service hippius-eol-sign.service \
-             hippius-disk-probe.service; do
+             hippius-disk-probe.service hippius-disk-probe.path; do
         link_is "${C}/root/etc/systemd/system/${u}" "/run/hippius/guest/units/${u}" \
             || err "the builder's record does not enable ${u}"
     done
-    ok "builder: its record is accepted by the boot step and enables the four units"
+    # The probe's path unit watches from paths.target, before cloud-init
+    # writes the request.
+    link_is "${C}/root/etc/systemd/system/paths.target.wants/hippius-disk-probe.path" \
+        "../hippius-disk-probe.path" \
+        || err "the builder's record does not link hippius-disk-probe.path into paths.target"
+    ok "builder: its record is accepted by the boot step and enables the five units"
 
     # Member contents: exactly the expected leaves + the one new dir.
     want_common="lib/hippius/guest
@@ -697,11 +702,32 @@ done
 for u in "${REPO}"/scripts/guest/components/units/*.service; do
     [[ "$(grep -c '^RequiresMountsFor=/run/hippius/guest$' "${u}")" -eq 1 ]] \
         || err "$(basename "${u}"): needs exactly one RequiresMountsFor=/run/hippius/guest"
-    if grep -E '^(ExecStart|ExecStop|ExecStartPre|ExecStopPost)=' "${u}" | grep -vqE '=/run/hippius/guest/|=/bin/true$'; then
+    if grep -E '^(ExecStart|ExecStop|ExecStartPre|ExecStopPost)=' "${u}" | grep -vqE '=-?/run/hippius/guest/|=/bin/true$'; then
         err "$(basename "${u}"): runs something from outside the image"
     fi
 done
 ok "release units: same directives as the bake's, paths into the image only, ordered on the image mount"
+
+# The disk-tier probe: started by its path unit when the request appears,
+# never twice in a boot (`-` + RemainAfterExit + OOMPolicy=continue keep the
+# unit active whatever the probe's end, so PathExists cannot re-trigger it),
+# and ONE request path everywhere it is named.
+probe_svc="${REPO}/scripts/guest/components/units/hippius-disk-probe.service"
+probe_path="${REPO}/scripts/guest/components/units/hippius-disk-probe.path"
+req_path="$(sed -n 's/^pub const REQUEST_PATH: &str = "\(.*\)";$/\1/p' "${REPO}/binaries/agent-disk-probe/src/request.rs")"
+vali_req="$(sed -n 's/^REQUEST_PATH = "\(.*\)"$/\1/p' "${REPO}/vali/apps/disktier/probe_userdata.py")"
+[[ -n "${req_path}" && "${req_path}" == "${vali_req}" ]] \
+    || err "the probe request path differs: agent '${req_path}', vali '${vali_req}'"
+grep -qx "PathExists=${req_path}" "${probe_path}" || err "hippius-disk-probe.path does not watch ${req_path}"
+grep -qx "Unit=hippius-disk-probe.service" "${probe_path}" || err "hippius-disk-probe.path does not start the probe"
+grep -qx "ConditionPathExists=${req_path}" "${probe_svc}" || err "hippius-disk-probe.service is not conditioned on ${req_path}"
+grep -qx "ExecStart=-/run/hippius/guest/bin/hippius-agent-disk-probe" "${probe_svc}" \
+    || err "hippius-disk-probe.service: its exit must not fail the unit (ExecStart=-)"
+grep -qx "RemainAfterExit=yes" "${probe_svc}" || err "hippius-disk-probe.service must stay active after the probe (RemainAfterExit=yes)"
+grep -qx "OOMPolicy=continue" "${probe_svc}" || err "hippius-disk-probe.service: an OOM kill must not fail the unit (OOMPolicy=continue)"
+grep -qE '^Restart=' "${probe_svc}" && err "hippius-disk-probe.service must not restart"
+grep -qx "WantedBy=paths.target" "${probe_path}" || err "hippius-disk-probe.path must start with paths.target"
+ok "disk probe: path-started on one request path, never re-run in a boot"
 
 if [[ ${fail} -ne 0 ]]; then
     echo "guest-release-test: FAILED" >&2

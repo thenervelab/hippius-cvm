@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:36c50e193fbd2492445afab9c724272cc806701469bdcd919c7c065a9663c009"
+  digest: "sha256:3497a54ef60bd37e8df2c9c372d1d766b850c5ddf2192841a01c9c7d59f174f9"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "bdb0baf52c9effaab1b643e45a9427bdfdbee1b7"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38969494354/attempts/1"
+    commitSha: "3355f11bd2a8569252fe6a4d5b938720aed92767"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39078999741/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -134,6 +134,22 @@ scheduler:
   # ConfigMap. v2026.10.16.2 is the first release that takes it; older
   # agents stay gated.
   poolRoutingMinAgentVersion: "v2026.10.16.2"
+  # External-miner approval gate (#1631, `apps.scheduler.approval`): while
+  # "true", a miner the chain refresh first sees starts PENDING (no
+  # placement, no rewards) until an operator runs `vali_approve_miner`,
+  # which also sets its host-size anchor. Read by the chain refresh
+  # (orchestration tick, scheduler reeval), the web pods (miner register /
+  # approve API) and the launch tick, hence the shared ConfigMap. Every
+  # miner known before #1631 was grandfathered (scheduler 0021). OFF for
+  # now; to be flipped on deliberately.
+  minerApprovalRequired: "false"
+  # Automatic approval (#1671, `apps.scheduler.approval`): while "true" AND
+  # minerApprovalRequired is "true", the scheduler reeval pass approves a
+  # pending miner once its attested heartbeats have soaked
+  # `minerAutoApproveSoakS` seconds (the soak is recorded at heartbeat
+  # ingest, web pods). Shared ConfigMap: reeval, web, ticks. OFF for now.
+  minerAutoApprove: "false"
+  minerAutoApproveSoakS: "1800"
   # Capacity v2 (`scheduler.capacity_config`). resourceAdmission "true"
   # (enable it after `vali_capacity_report --preflight` passes): v2 is
   # gate (a) — vCPU / RAM + per-VM overhead / VM count per flavor. "false"
@@ -1027,10 +1043,28 @@ disktierGc:
     limits:
       cpu: 250m
       memory: 256Mi
+# Storage pools off their filesystem while they hold VMs (#1638,
+# apps.disktier.pool_health): the alert has no series until a pool is.
+storagePools:
+  alerts:
+    enabled: "true"
+    unavailableAfterMinutes: 15
 # Live storage moves (apps.disktier.storage_move). The feature itself is
 # env-gated, dark by default (VALI_STORAGE_MOVE_ENABLED etc., no chart key);
 # the alert has no series until a move runs.
 storageMove:
+  # Live storage move (§19, `apps.disktier.storage_move`): a running VM's OS
+  # disk moves to another pool of its host, no downtime. Driven by the
+  # orchestration tick; requested by an operator (`vali_storage_move`, the
+  # web pod). A move starts only when `enabled`, the miner is in `miners`
+  # (miner_id or node_id, `*` = all) and its agent is >= `minAgentVersion`.
+  # Each key renders only when set. Turning `enabled` off stops NEW moves;
+  # a started one is still driven to its end. v2026.10.17 is the first
+  # agent release with the move-vm-storage route. Roll out by canary: one
+  # miner first, the operator starting its first move by hand.
+  enabled: "true"
+  miners: "*"
+  minAgentVersion: "v2026.10.17"
   alerts:
     enabled: "true"
     # A move held mid-pivot this long pages (the VM is down meanwhile).
@@ -1659,9 +1693,13 @@ publicApiIngress:
     - /v1/operator/disk-profiles
     # A miner's storage configuration (`apps.disktier`, #1609):
     # `/v1/operator/miners/{node_id}/{storage, storage/pools[/{id}],
-    # storage/validate, storage/adopt, storage/history, disk-tiers,
-    # dedicated-disks, dedicated-disks/{id}/drain}`. Published because the
-    # operator dashboard edits its own nodes' pools there. A PREFIX, the
+    # storage/pools/{id}/force-remove, storage/validate, storage/adopt,
+    # storage/history, disk-tiers, dedicated-disks, dedicated-disks/{id}/drain,
+    # hardware, hardware/history, disk-inventory, host-disk-advisories}`.
+    # Published because the
+    # operator dashboard edits its own nodes' pools there, and shows each
+    # node's host-reported hardware (§18.10, read-only, carries serials:
+    # owner-only by the same family check). A PREFIX, the
     # one exception to the exact-path rule above: every route under it is
     # `OPERATOR_ONLY`, reads need an operator principal, WRITES need
     # `IsOperatorConfigWriter` (the principals in `operatorConfig.principals`), and
@@ -1689,6 +1727,25 @@ publicApiIngress:
     - /v1/cdn
     - /v1/public/docs
     - /v1/public/schema
+  # Routes with a variable middle segment, which no Prefix can publish
+  # without its siblings: anchored regexes, served by a second Ingress
+  # (`vali-public-api-regex`, `use-regex`). Written WITHOUT a leading `^`:
+  # ingress-nginx renders each path as `location ~* "^<path>"`, anchored at
+  # the start anyway; end each one with `$`.
+  # ⚠️ ingress-nginx applies use-regex to EVERY path of the host, so while
+  # this list is non-empty the Prefix entries above are matched as
+  # `~* "^<path>"` too (case-insensitive, no path-element boundary).
+  # `test_no_vali_route_leaks_through_a_regex_prefix` walks every vali route
+  # and fails if one would be published that way.
+  allowedRegexPaths:
+    # Miner approval (`GET/POST /v1/admin/miner/{miner_id}/approval`, #1631).
+    # `IsMinerAdmin`: exactly ONE named principal (the backend's miner-admin
+    # token), like `/v1/admin/miner/register` above. Published for the
+    # console's approve step. ⚠️ The middle segment is ONE path element and
+    # the regex ends at `approval$`: `/v1/admin/miner/{id}/quarantine`,
+    # `/{id}/drain`, `/v1/admin/miner/{id}` and `/list` stay unpublished
+    # (pinned by the chart test).
+    - /v1/admin/miner/[A-Za-z0-9._-]+/approval$
   # The nginx controller that serves the Ingress above. Named here because
   # the vali CiliumNetworkPolicy is default-deny: it has to admit these
   # pods on the listen port explicitly, or the route exists and every

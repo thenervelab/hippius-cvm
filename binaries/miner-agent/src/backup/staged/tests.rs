@@ -339,6 +339,37 @@ async fn one_restore_per_vm_idempotent_per_id() {
 }
 
 #[tokio::test]
+async fn a_staging_whose_record_says_staged_answers_staged() {
+    // `run_stage` writes the `Staged` record, then leaves the running map:
+    // a stage order landing in between must say staged, as status does.
+    let env = Env::new();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let m = env.manager(Some(gate));
+    let StageStart::Started(_job) = m.begin_stage(&env.lifecycle, env.req(RID)).await.unwrap()
+    else {
+        panic!("expected a new staging");
+    };
+    assert!(matches!(
+        m.begin_stage(&env.lifecycle, env.req(RID)).await.unwrap(),
+        StageStart::Staging
+    ));
+    let p = env.paths(RID);
+    stage_for_tests(&p, RID, b"overlay", b"state").await;
+    assert!(matches!(
+        m.begin_stage(&env.lifecycle, env.req(RID)).await.unwrap(),
+        StageStart::Staged
+    ));
+    // Another id is still refused while that staging is registered.
+    assert_backup(
+        m.begin_stage(&env.lifecycle, env.req(RID2))
+            .await
+            .err()
+            .unwrap(),
+        "restore-busy",
+    );
+}
+
+#[tokio::test]
 async fn a_new_restore_waits_for_the_last_ones_retained_originals() {
     let env = Env::new();
     let m = env.manager(None);

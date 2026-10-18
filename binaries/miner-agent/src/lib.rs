@@ -43,6 +43,7 @@ pub mod edge_client;
 pub mod error;
 pub mod heartbeat;
 pub mod host_health;
+pub mod host_inventory;
 pub mod identity;
 pub mod image_cache;
 pub mod lifecycle;

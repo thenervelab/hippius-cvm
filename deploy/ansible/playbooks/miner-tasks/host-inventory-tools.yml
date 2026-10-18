@@ -1,0 +1,107 @@
+---
+# The host-inventory collector's tools (§18.10.2). Tasks file imported by
+# 06-miner-bootstrap.yml play "02", next to the hypervisor stack: distro
+# packages from the signed Ubuntu archive, not version-pinned (as
+# libvirt-install.yml). Tagged `miner_inventory`.
+#
+# - smartmontools: `smartctl -j` (SATA/SAS SMART, `-d megaraid,N`, the
+#   NVMe fallback);
+# - nvme-cli: `nvme smart-log -o json`;
+# - hwdata: pci.ids (PCI vendor / device names; read in-process);
+# - ethtool: `ethtool -i` (NIC firmware). The base image usually has it
+#   (play 00 already calls `ethtool -P`); listed so it is never assumed.
+# - ipmitool, for a local BMC: see below.
+#
+# Installing them changes nothing by itself: the collector only runs from
+# its timers (`miner_inventory_enabled`).
+#
+# The decisions are computed first (`miner_inventory_*` facts), then
+# applied; `miner_inventory_manage_packages: false` and
+# `miner_inventory_ipmi_probe_paths` are the wiring test's seams
+# (tests/host_inventory_wiring.yml): it plans against scratch paths and
+# never touches packages, modules or services.
+
+- name: Install the host-inventory collector's tools
+  tags: [miner_inventory]
+  ansible.builtin.apt:
+    name:
+      - smartmontools
+      - nvme-cli
+      - hwdata
+      - ethtool
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: miner_inventory_manage_packages | default(true) | bool
+
+# A BMC is there when the kernel's IPMI system interface is (ipmi_si is
+# loaded from the SMBIOS type 38 / ACPI IPI0001 record), or the device
+# interface already is. /dev/ipmi0 alone is not enough to look for: it
+# needs ipmi_devintf, which nothing loads by default.
+- name: Look for a local BMC
+  tags: [miner_inventory]
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ miner_inventory_ipmi_probe_paths | default(['/sys/module/ipmi_si', '/sys/class/ipmi', '/dev/ipmi0']) }}"
+  register: miner_inventory_ipmi_probe
+
+- name: Plan the IPMI and smartd steps
+  tags: [miner_inventory]
+  ansible.builtin.set_fact:
+    miner_inventory_bmc_present: >-
+      {{ miner_inventory_ipmi_probe.results | selectattr('stat.exists') | list | length > 0 }}
+    miner_inventory_install_ipmitool: >-
+      {{ (miner_inventory_ipmitool | bool)
+         and ((miner_inventory_ipmi_probe.results | selectattr('stat.exists') | list | length > 0)
+              or (miner_inventory_ipmitool_force | bool)) }}
+    # smartd stays as it is unless the operator opts out of it explicitly:
+    # they may rely on its alerts.
+    miner_inventory_stop_smartd: >-
+      {{ (miner_inventory_enabled | bool) and (miner_inventory_disable_smartd | bool) }}
+
+- name: Install ipmitool for the local BMC
+  tags: [miner_inventory]
+  ansible.builtin.apt:
+    name: ipmitool
+    state: present
+  when:
+    - miner_inventory_install_ipmitool | bool
+    - miner_inventory_manage_packages | default(true) | bool
+
+# /dev/ipmi0 comes from ipmi_devintf: loaded now and at every boot.
+- name: Load the IPMI device interface at boot
+  tags: [miner_inventory]
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/hippius-ipmi.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (miner-tasks/host-inventory-tools.yml): /dev/ipmi0
+      # for the host-inventory collector's local, in-band IPMI.
+      ipmi_devintf
+  when:
+    - miner_inventory_install_ipmitool | bool
+    - miner_inventory_manage_packages | default(true) | bool
+
+- name: Load the IPMI device interface now
+  tags: [miner_inventory]
+  community.general.modprobe:
+    name: ipmi_devintf
+    state: present
+  when:
+    - miner_inventory_install_ipmitool | bool
+    - miner_inventory_manage_packages | default(true) | bool
+
+# smartmontools enables its own smartd daemon, which polls every disk on a
+# schedule of its own. Left running unless the operator opts out
+# (`miner_inventory_disable_smartd`, with the inventory on).
+- name: Stop and disable smartd (explicit opt-in only)
+  tags: [miner_inventory]
+  ansible.builtin.systemd:
+    name: smartmontools
+    enabled: false
+    state: stopped
+  when:
+    - miner_inventory_stop_smartd | bool
+    - miner_inventory_manage_packages | default(true) | bool

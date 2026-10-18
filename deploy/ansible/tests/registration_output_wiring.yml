@@ -35,6 +35,9 @@
         - { stat: { exists: false } }
         - { stat: { exists: false } }
     miner_pf_netbird_mgmt: { status: 200 }
+    # `stat -f -c '%S %b %f %a'` of the data filesystem: 800 GiB, 40 GiB
+    # root-reserved, 700 GiB available ⇒ 760 GiB usable.
+    miner_pf_data_statfs: { stdout: "4096 209715200 193986560 183500800" }
     miner_host_probe:
       stdout: |
         cpu_vendor=AuthenticAMD

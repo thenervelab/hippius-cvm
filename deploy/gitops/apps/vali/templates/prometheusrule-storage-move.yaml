@@ -46,7 +46,8 @@ spec:
           annotations:
             summary: "{{`{{ $value }}`}} storage move(s) failed ({{`{{ $labels.code }}`}}) in 24 h"
             description: |
-              `vali_storage_move status` lists them. What each code leaves on the
+              `vali_storage_move status --vm-id <vm> --all` shows them (plain
+              `status` lists only moves in flight). What each code leaves on the
               miner and how to settle it: docs/operator/storage-move-runbook.md,
               "Other failed moves".
         - alert: HippiusStorageMoveReportStale

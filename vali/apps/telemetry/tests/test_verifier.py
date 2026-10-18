@@ -1693,3 +1693,63 @@ def test_a_v7_body_without_the_earlier_declarations_raises_unavailable(
 def test_probe_kernel_rules_are_rechecked(overrides: dict[str, object]) -> None:
     with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
         verifier._served_receipt_fields({**_RECEIPT_OK, **overrides})
+
+
+# ─── verify_host_inventory wrapper (§18.10) ───────────────────────────
+
+_REAL_VERIFY_HOST_INVENTORY = verifier.verify_host_inventory
+_HI_BODY = {"miner_id": "m", "timestamp_unix": 1, "sequence": 2, "sections": {"cpu": {}}}
+
+
+def _hi(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]) -> Any:
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: _stub_completed(json.dumps(payload).encode(), 0)
+    )
+    return _REAL_VERIFY_HOST_INVENTORY(envelope=b"env", verifying_key=b"\x11" * 32)
+
+
+def test_host_inventory_ok_returns_body_and_digests(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    report = _hi(monkeypatch, {"ok": True, "body": _HI_BODY, "section_digests": {"cpu": "a" * 64}})
+    assert (report.miner_id, report.timestamp_unix, report.sequence) == ("m", 1, 2)
+    assert report.section_digests == {"cpu": "a" * 64}
+
+
+def test_host_inventory_reject_carries_its_class(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    with pytest.raises(verifier.VerifierFailed) as exc:
+        _hi(monkeypatch, {"ok": False, "error_class": "body_invalid", "detail": "x"})
+    assert exc.value.category == "body_invalid"
+
+
+def test_host_inventory_sequence_past_bigint_is_the_miners_reject(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path
+) -> None:
+    body = {**_HI_BODY, "sequence": 2**63}
+    with pytest.raises(verifier.VerifierFailed) as exc:
+        _hi(monkeypatch, {"ok": True, "body": body, "section_digests": {"cpu": "a" * 64}})
+    assert exc.value.category == "body_invalid"
+    body["sequence"] = 2**63 - 1
+    assert _hi(monkeypatch, {"ok": True, "body": body, "section_digests": {}}).sequence == body[
+        "sequence"
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": False, "error_class": "internal", "detail": "host-inventory-encode"},
+        {"ok": False, "error_class": "storage_invalid"},
+        {"ok": True, "body": _HI_BODY},
+        {"ok": True, "body": _HI_BODY, "section_digests": {"cpu": "A" * 64}},
+        {"ok": True, "body": {**_HI_BODY, "sequence": "2"}, "section_digests": {}},
+        {"ok": True, "body": {**_HI_BODY, "timestamp_unix": True}, "section_digests": {}},
+    ],
+)
+def test_host_inventory_contract_drift_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_binary: Path, payload: dict[str, Any]
+) -> None:
+    with pytest.raises(verifier.VerifierUnavailable):
+        _hi(monkeypatch, payload)

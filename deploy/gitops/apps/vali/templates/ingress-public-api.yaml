@@ -62,3 +62,36 @@ spec:
                   number: 8000
           {{- end }}
 {{- end }}
+{{- if and .Values.publicApiIngress.enabled .Values.publicApiIngress.allowedRegexPaths }}
+---
+# The anchored-regex half of the allow-list above: routes whose variable
+# middle segment no Prefix can publish without its siblings. A separate
+# Ingress so the Prefix list keeps its own object. ⚠️ ingress-nginx applies
+# `use-regex` host-wide: while this exists, the Prefix paths above are
+# matched as case-insensitive `^<path>` regexes too (see values.yaml
+# `publicApiIngress.allowedRegexPaths`).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vali-public-api-regex
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.publicApiIngress.maxBodySize | quote }}
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.publicApiIngress.host | quote }}
+      http:
+        paths:
+          {{- range .Values.publicApiIngress.allowedRegexPaths }}
+          - path: {{ . | quote }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: vali
+                port:
+                  number: 8000
+          {{- end }}
+{{- end }}

@@ -557,12 +557,19 @@ pub fn parse_mountinfo_sources(text: &str) -> Vec<MountEntry> {
             let dev = fields.nth(2)?;
             let root = fields.next()?;
             let mount_point = fields.next()?;
-            let source = right.split(' ').nth(1)?;
+            let mount_options = fields.next().unwrap_or("");
+            let mut right = right.split(' ');
+            let fstype = right.next()?;
+            let source = right.next()?;
+            let super_options = right.next().unwrap_or("");
+            let ro = |opts: &str| opts.split(',').any(|o| o == "ro");
             Some(MountEntry {
                 mount_point: PathBuf::from(unescape_octal(mount_point)),
                 dev: dev.to_string(),
                 root: unescape_octal(root),
                 source: unescape_octal(source),
+                fstype: fstype.to_string(),
+                read_only: ro(mount_options) || ro(super_options),
             })
         })
         .collect()
@@ -578,6 +585,9 @@ pub struct MountEntry {
     pub root: String,
     /// The mount source (`/dev/md127`, …).
     pub source: String,
+    pub fstype: String,
+    /// `ro` in the per-mount or the superblock options.
+    pub read_only: bool,
 }
 
 fn unescape_octal(raw: &str) -> String {

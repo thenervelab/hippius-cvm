@@ -89,6 +89,10 @@ class FakeEffects:
         self.activate_snapshot: tuple[int, str] | None = None
         # `settle_by_unix` of each `dispatch_migrate_activate`, in order.
         self.activate_settle_by: list[int] = []
+        #: What `arrival_os_pool` chooses, and the `os_pool` each
+        #: `dispatch_migrate_activate` named, in order.
+        self.arrival_pool: str | None = None
+        self.activate_os_pools: list[str | None] = []
         # §25 M4 — what `poll_dest_activation` returns (the dest's async
         # restore/boot outcome). Defaults to a happy `done`.
         self.dest_activation_status = "done"
@@ -212,6 +216,10 @@ class FakeEffects:
         self._maybe_fail("resolve_boot_artifacts")
         return self.boot_artifacts
 
+    def arrival_os_pool(self, vm: Any, dest_miner_id: str) -> str | None:
+        self._maybe_fail("arrival_os_pool")
+        return self.arrival_pool
+
     def dispatch_migrate_activate(
         self,
         vm: Any,
@@ -229,7 +237,9 @@ class FakeEffects:
         staged_restore_id: str = "",
         backup_chain: Any = None,
         measurement_hex: str = "",
+        os_pool: Any = None,
     ) -> None:
+        self.activate_os_pools.append(os_pool)
         self.activate_measurement = measurement_hex
         self.activate_restore = {
             "staged_restore_id": staged_restore_id,
@@ -388,6 +398,7 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
         "poll_source_ack",
         "kbs_activate_dest",
         "resolve_boot_artifacts",
+        "arrival_os_pool",
         "dispatch_migrate_activate",
         "poll_dest_activation",
         "poll_dest_activation_status",

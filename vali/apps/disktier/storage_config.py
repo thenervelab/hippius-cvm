@@ -90,7 +90,8 @@ REFUSED = "refused"
 AGENT_UNSUPPORTED = "agent-unsupported"
 DRIFT = "drift"
 UNMANAGED = "unmanaged"
-SYNC_STATES = (IN_SYNC, PENDING, REFUSED, AGENT_UNSUPPORTED, DRIFT)
+HELD = "held"
+SYNC_STATES = (IN_SYNC, PENDING, REFUSED, AGENT_UNSUPPORTED, DRIFT, HELD)
 
 #: Who an automatic change is attributed to in the audit.
 SYSTEM_PRINCIPAL = "vali"
@@ -181,6 +182,15 @@ def check_removals(node_id: str, row: MinerStorageConfig | None, doc: dict[str, 
             continue
         if now["state"] != "draining" or not _drained(node_id, pool_id):
             raise PoolNotDrained(pool_id, field)
+
+
+class ForceRefused(Exception):
+    """A force removal vali refuses: `code` says which condition fails."""
+
+    def __init__(self, code: str, message: str, pool: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.pool = pool
 
 
 @dataclass(frozen=True)
@@ -322,6 +332,15 @@ def stage(
             audit(node_id, row.revision, action, actor, doc=doc, outcome="unchanged", now=now)
             return row, False
         _bump(row, doc, key)
+        # A force covers its pool only while that pool stays `draining` in
+        # the document: set back active, dropped, or a new family's write
+        # and it is spent (a later drain is a plain drain again).
+        still_draining = {p["id"] for p in doc.get("pools", []) if p["state"] == "draining"}
+        row.forced_pools = {
+            k: v
+            for k, v in (row.forced_pools or {}).items()
+            if k in still_draining and not new_owner
+        }
         if new_owner:
             row.owner_family = actor.account
             row.owner_since = now
@@ -372,6 +391,7 @@ def _bump(row: MinerStorageConfig, doc: dict[str, Any], key: str) -> None:
     row.body_sha = ""
     row.apply_failures = 0
     row.last_error = ""
+    row.held = ""
     row.refusal_code = row.refusal_pool = row.refusal_disk = ""
 
 
@@ -399,6 +419,115 @@ def edit(
             raise StageConflict(row.revision)
         new = storage_doc.normalize(change(json.loads(json.dumps(row.body))), **limits)
         return stage(node_id, new, actor=actor, action=action, now=now)
+
+
+def force_remove_pool(
+    node_id: str,
+    pool_id: str,
+    *,
+    actor: Actor,
+    reason: str,
+    if_match: int | None = None,
+    now: datetime | None = None,
+) -> tuple[MinerStorageConfig, bool]:
+    """An operator's statement that a dead pool's disk is gone (#1640): the
+    pool is set `draining` and recorded as forced, so it leaves the
+    document once the agent applied that and still reports it
+    `unavailable` and empty — a dead pool is never reported `draining`.
+
+    Refused (`ForceRefused`) unless the node reports the pool `unavailable`
+    with `committed_gb == 0` and vali places no VM disk on it: an unmounted
+    pool may hold files the agent cannot see, so this is never vali's
+    guess. `committed_gb == 0` is no proof of an empty disk (the agent
+    reads 0 off a directory it cannot read): the agent's own removal
+    check — no disk file under the pool path, else `pool-has-disks` — is
+    the backstop. Audited (`pool-force`) with the actor, the reason and the
+    pool's last report. Raises `LookupError` without a document,
+    `StageConflict` on `if_match`."""
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES
+
+    from .models import PlacementDisk
+
+    now = now or timezone.now()
+    reason = reason.strip()
+    if not reason:
+        raise ForceRefused("force-reason-required", "a force removal needs a reason", pool_id)
+    if pool_id == storage_doc.DEFAULT_POOL_ID:
+        raise ForceRefused("pool-default", "pool default is the data root", pool_id)
+    with transaction.atomic():
+        _lock_node(node_id)
+        row = MinerStorageConfig.objects.select_for_update().filter(miner_node_id=node_id).first()
+        if visible_revision(row, actor) == 0:
+            raise LookupError("the node has no desired storage document")
+        assert row is not None
+        if if_match is not None and if_match != row.revision:
+            raise StageConflict(row.revision)
+        if not any(p["id"] == pool_id for p in row.body.get("pools", [])):
+            raise ForceRefused("pool-not-found", "no such pool in the document", pool_id)
+        pool = MinerStoragePool.objects.filter(
+            miner_node_id=node_id, pool_id=pool_id, retired_at__isnull=True
+        ).first()
+        if pool is None or pool.reported_state != "unavailable":
+            raise ForceRefused(
+                "pool-not-unavailable",
+                f"the node reports the pool {pool.reported_state if pool else 'nowhere'!r}, "
+                "not unavailable: drain it instead",
+                pool_id,
+            )
+        if pool.committed_gb != 0:
+            raise ForceRefused(
+                "pool-not-empty",
+                f"the node reports {pool.committed_gb} GB committed on the pool",
+                pool_id,
+            )
+        if PlacementDisk.objects.filter(
+            pool_id=pool_id,
+            placement__miner_node_id=node_id,
+            placement__status__in=list(ACTIVE_PLACEMENT_STATES),
+        ).exists():
+            raise ForceRefused("pool-has-placements", "a VM disk is placed on the pool", pool_id)
+        report = {
+            "reported_state": pool.reported_state,
+            "reported_error": pool.reported_error,
+            "committed_gb": pool.committed_gb,
+            "reported_at": pool.reported_at.isoformat() if pool.reported_at else None,
+        }
+        record = {
+            "at": now.isoformat(),
+            "principal": actor.principal[:128],
+            "family": actor.family[:64],
+            "user": actor.user[:128],
+            "reason": reason[:256],
+            "report": report,
+        }
+        row.forced_pools = {**(row.forced_pools or {}), pool_id: record}
+        MinerStorageConfig.objects.filter(pk=row.pk).update(forced_pools=row.forced_pools)
+        audit(
+            node_id,
+            row.revision,
+            "pool-force",
+            actor,
+            doc={"pool": pool_id, "reason": reason[:256], "report": report},
+            outcome="forced",
+            now=now,
+        )
+
+        def _drain(doc: dict[str, Any]) -> dict[str, Any]:
+            for p in doc["pools"]:
+                if p["id"] == pool_id:
+                    p["state"] = "draining"
+            return doc
+
+        result = edit(node_id, _drain, actor=actor, action="pool-force-drain", now=now)
+    log.warning(
+        "storage-config: node=%s pool %s force-removed by %s (%s): %s",
+        node_id,
+        pool_id,
+        actor.principal,
+        actor.user,
+        reason[:256],
+    )
+    return result
 
 
 def adopt_document(node_id: str, overrides: dict[str, Any], account: str = "") -> dict[str, Any]:
@@ -591,10 +720,15 @@ def drifted(row: MinerStorageConfig) -> bool:
 
 def sync_status(row: MinerStorageConfig | None, *, now: datetime | None = None) -> str:
     """`in_sync` | `pending` | `refused:<code>:<id>` | `agent-unsupported`
-    | `drift`, or `unmanaged` (no desired document)."""
+    | `drift` | `held:<reason>` (the current revision is not pushed:
+    `pool-not-drained:<pool>`, `family-changed`, `chain-unavailable`), or
+    `unmanaged` (no desired document)."""
     if row is None or row.revision == 0:
         return UNMANAGED
     now = now or timezone.now()
+    if row.held:
+        # The current revision is not being sent: say why.
+        return f"{HELD}:{row.held}"[:192]
     if unsupported_held(row, now=now):
         return AGENT_UNSUPPORTED
     if row.refusal_code:
@@ -705,6 +839,13 @@ def _remove_drained_pools(row: MinerStorageConfig, *, now: datetime) -> MinerSto
             pool is None
             or pool.retired_at is not None
             or (pool.reported_state == "draining" and pool.committed_gb == 0)
+            # An operator's force: the agent never reports a dead pool
+            # `draining`, only `unavailable` (still empty, still checked).
+            or (
+                pool_id in (row.forced_pools or {})
+                and pool.reported_state == "unavailable"
+                and pool.committed_gb == 0
+            )
         )
         # The guard's own test (`_drained`): no VM disk placed on it either
         # (a queued launch whose disk is not created yet).
@@ -814,8 +955,10 @@ def sync_node(node_id: str, *, now: datetime | None = None, force: bool = False)
     miner, why = push_gate(node_id)
     if why:
         held = f"held: {why}"[:256]
-        MinerStorageConfig.objects.filter(pk=row.pk).exclude(last_error=held).update(
-            last_error=held
+        # The gate's holds are global (push off, not selected, agent too
+        # old): `last_error` says them, a row hold of before is stale.
+        MinerStorageConfig.objects.filter(pk=row.pk).exclude(last_error=held, held="").update(
+            last_error=held, held=""
         )
         return why
     assert miner is not None
@@ -852,9 +995,16 @@ def sync_node(node_id: str, *, now: datetime | None = None, force: bool = False)
         # Counted as an attempt, so a held node is looked at again after
         # the retry period, not on every tick.
         MinerStorageConfig.objects.filter(pk=row.pk, revision=row.revision).update(
-            sent_at=now, sent_revision=row.revision, last_error=f"held: {held}"
+            sent_at=now,
+            sent_revision=row.revision,
+            last_error=f"held: {held}",
+            # A re-push of a revision the agent already runs is not news:
+            # the node stays `in_sync`.
+            held="" if row.acked_current else held[:96],
         )
         return held
+    if row.held:
+        MinerStorageConfig.objects.filter(pk=row.pk).update(held="")
     return _push(miner, row, now=now)
 
 

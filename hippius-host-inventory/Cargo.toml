@@ -1,0 +1,20 @@
+[package]
+name = "hippius-host-inventory"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The miner host inventory wire format (disk-tier design §18.10): an untrusted, owner-only hardware / storage / health report in its own signed envelope. Its own crate so the guest UKIs, which link hippius-types, are untouched."
+
+[lints]
+workspace = true
+
+[dependencies]
+hippius-types = { path = "../hippius-types" }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+hex = "0.4"

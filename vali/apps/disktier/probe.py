@@ -15,13 +15,14 @@ One `tick` (the `vali_disk_probe` CronJob):
 3. **Launch** (only while `VALI_DISK_PROBE_ENABLED`): the due set, in
    order — pools never verified (`onboarding`), then periodic ones
    (`PERIOD ± JITTER` after the last verified probe), then queued runs
-   (operator requests, `vali_disk_probe --request`). Skipped, and retried
-   next tick: a node not dispatchable or hard-gated (cordoned, epoch-stale,
-   zombie), a node with a run already in flight (1 per miner), the
-   fleet-wide cap (`VALI_DISK_PROBE_MAX_CONCURRENT`), fewer than
-   `VALI_DISK_PROBE_MIN_FREE_SLOTS` free admission slots for the probe
-   flavor, or the node's boot cap reached (the scheduler's own capacity and
-   gate-(g) reads).
+   (operator requests, `vali_disk_probe --request <node> [--pool <id>]`).
+   Skipped, and retried next tick: a node not dispatchable or hard-gated
+   (cordoned, epoch-stale, zombie), a node with a run already in flight
+   (1 per miner), the fleet-wide cap (`VALI_DISK_PROBE_MAX_CONCURRENT`),
+   fewer than `VALI_DISK_PROBE_MIN_FREE_SLOTS` free admission slots for
+   the probe flavor, the node's boot cap reached (the scheduler's own
+   capacity and gate-(g) reads), or a queued run whose pool cannot take
+   the probe's OS disk any more (`os_pool_skip`).
 
 A run launches ONE probe VM, in-process and pinned to the node's chip
 (`launch_jobs.start_launch(..., disk_probe=True)`), with a probe owner
@@ -32,12 +33,17 @@ pair a launch with the I/O burst (§2). The run's targets are the OS slot
 on the pool the VM's OS disk sits on.
 
 **Pools.** A node without a storage report has one implicit pool,
-`default`. Today the agent puts every OS disk on `default` (the launch
-order carries no `os_pool` before A4), so only `default` can be probed; a
-node's other OS-eligible pools are counted `needs-os-pool-order`, and
-hdd-only pools (`os_disks=false`) are R3's (a dedicated-style extra disk),
-counted `not-os-eligible`. Once A4 exists, `probe_os_pool` returns the
-pool itself and the launch names it.
+`default`. A probe of pool P puts its OS disk ON P: the run's
+`os_pool_id` rides the launch intent (`os_pool`, accepted from a
+disk-probe launch only) to the order's `os_pool` (A4b), every same-miner
+retry names it again, and the verdict is recorded against it. `default`
+is always probeable and its order carries no `os_pool` (byte for byte
+today's). Another pool is probeable when the node's agent takes
+`os_pool` (else `needs-os-pool-order`) and the pool is one A4b could
+name — active, recently reported, not retired (else `pool-not-active`)
+— with room for the probe's OS disk (else `no-room`), whatever its tier
+or health (`probe_os_pool`). Hdd-only pools (`os_disks=false`) are R3's
+(a dedicated-style extra disk), counted `not-os-eligible`.
 
 **Record only.** A verdict is stored on the run (per target: metrics, the
 tier it classifies as, the verdict detail) and in metrics. Nothing here
@@ -65,10 +71,10 @@ from django.utils import timezone
 
 from apps.synthetic import metrics
 
-from . import probe_userdata
+from . import probe_userdata, routing
 from .models import OS_SLOT, DiskKind, DiskProbeRun, MinerStoragePool, ProbeRunState, ProbeTrigger
 from .probe_owners import ProbeOwner, probe_owners
-from .storage_doc import DEFAULT_POOL_ID
+from .storage_doc import DEFAULT_POOL_ID, is_valid_pool_id
 from .tiers import DiskTier
 
 log = logging.getLogger("apps.disktier.probe")
@@ -94,14 +100,70 @@ _rng = secrets.SystemRandom()
 # ─── pools and the due set ───────────────────────────────────────────
 
 
-def probe_os_pool(pool_id: str) -> str | None:
-    """The pool a probe of `pool_id` puts its OS disk on, or `None` when it
-    cannot be probed yet.
+def probe_os_disk_gb() -> int:
+    """What the probe VM's OS disk takes on its pool: the probe flavor's
+    data disk plus the rootfs (`launch._os_disk_need_gb` of the probe's
+    spec, which is never resized)."""
+    from apps.orchestration.services.flavors import ROOTFS_DISK_GB, resolve_flavor
 
-    TODO(A4): once the launch order carries `os_pool`, a probe of pool P
-    launches its OS disk ON P (return `pool_id`, and name it in the
-    intent). Until then the agent places every OS disk on `default`."""
-    return pool_id if pool_id == DEFAULT_POOL_ID else None
+    return resolve_flavor(str(settings.VALI_DISK_PROBE_FLAVOR)).data_disk_size_gb + ROOTFS_DISK_GB
+
+
+@dataclass(frozen=True)
+class _NodeRouting:
+    """What `_routed_pool_skip` reads of a node, read once per node: its
+    agent takes `os_pool`, and its pools A4b could name (by pk)."""
+
+    supported: bool
+    nameable: frozenset[int]
+
+    @classmethod
+    def of(cls, node_id: str) -> _NodeRouting:
+        if not routing.supported(node_id):
+            return cls(supported=False, nameable=frozenset())
+        pks = routing.os_disk_pools(node_id).values_list("pk", flat=True)
+        return cls(supported=True, nameable=frozenset(pks))
+
+
+def _routed_pool_skip(pool: MinerStoragePool, node: _NodeRouting, need_gb: int) -> str:
+    """Why a launch order cannot name `pool` (not `default`, OS-eligible)
+    as the probe's `os_pool`, `""` when it can: the node's agent takes
+    `os_pool` (`needs-os-pool-order`), the pool is one A4b would name
+    (`routing.os_disk_pools`: active, recently reported, not retired —
+    else `pool-not-active`) and it has room for the probe's `need_gb` OS
+    disk (`routing.free_gb`, else `no-room`). Its tier and health do not
+    matter: measuring them is the point."""
+    if not node.supported:
+        return "needs-os-pool-order"
+    if pool.pk not in node.nameable:
+        return "pool-not-active"
+    free = routing.free_gb(pool)
+    if free is None or free < need_gb:
+        return "no-room"
+    return ""
+
+
+def os_pool_skip(node_id: str, pool_id: str) -> str:
+    """Why a probe of `node_id`'s pool `pool_id` cannot put its OS disk on
+    that pool now, `""` when it can. `default` always can: an order
+    without `os_pool` lands there, byte for byte today's."""
+    if pool_id == DEFAULT_POOL_ID:
+        return ""
+    pool = MinerStoragePool.objects.filter(
+        miner_node_id=node_id, pool_id=pool_id, retired_at__isnull=True
+    ).first()
+    if pool is None:
+        return "pool-not-active"
+    if not pool.os_disks:
+        return "not-os-eligible"
+    return _routed_pool_skip(pool, _NodeRouting.of(node_id), probe_os_disk_gb())
+
+
+def probe_os_pool(node_id: str, pool_id: str) -> str | None:
+    """The pool a probe of `node_id`'s `pool_id` puts its OS disk on —
+    the pool itself, named in the launch (`os_pool`) — or `None` when it
+    cannot be probed now (`os_pool_skip` says why)."""
+    return None if os_pool_skip(node_id, pool_id) else pool_id
 
 
 @dataclass(frozen=True)
@@ -162,21 +224,26 @@ def _pool_due(pool_runs: list[DiskProbeRun], now: datetime) -> tuple[str, float]
     return ProbeTrigger.PERIODIC, (now - due_at).total_seconds()
 
 
-def _node_pools(node_id: str, rows: list[MinerStoragePool]) -> list[tuple[str, str]]:
-    """`[(pool_id, skip_reason)]` for the node's live pools; `""` = probeable."""
+def _node_pools(
+    node_id: str, rows: list[MinerStoragePool], *, need_gb: int
+) -> list[tuple[str, str]]:
+    """`[(pool_id, skip_reason)]` for the node's live pools; `""` = probeable
+    (for a `need_gb` probe OS disk)."""
     if not rows:
         # No storage report: the implicit `default` pool (design §4.1).
         return [(DEFAULT_POOL_ID, "")]
+    node: _NodeRouting | None = None
     out = []
     for p in rows:
         if not p.os_disks:
             out.append((p.pool_id, "not-os-eligible"))
         elif p.reported_state not in ("", "active"):
             out.append((p.pool_id, "pool-not-active"))
-        elif probe_os_pool(p.pool_id) is None:
-            out.append((p.pool_id, "needs-os-pool-order"))
-        else:
+        elif p.pool_id == DEFAULT_POOL_ID:
             out.append((p.pool_id, ""))
+        else:
+            node = node or _NodeRouting.of(node_id)
+            out.append((p.pool_id, _routed_pool_skip(p, node, need_gb)))
     return out
 
 
@@ -209,8 +276,9 @@ def due_set(*, nodes: Iterable[str], now: datetime, report: TickReport) -> list[
 
     onboarding: list[Due] = []
     periodic: list[Due] = []
+    need_gb = probe_os_disk_gb()
     for nid in node_ids:
-        for pool_id, skip in _node_pools(nid, rows.get(nid, [])):
+        for pool_id, skip in _node_pools(nid, rows.get(nid, []), need_gb=need_gb):
             if skip:
                 report.skipped[skip] += 1
                 continue
@@ -220,9 +288,13 @@ def due_set(*, nodes: Iterable[str], now: datetime, report: TickReport) -> list[
             trigger, overdue = got
             item = Due(node_id=nid, pool_id=pool_id, trigger=trigger, overdue_s=overdue)
             (onboarding if trigger == ProbeTrigger.ONBOARDING else periodic).append(item)
-        if rows.get(nid) and DEFAULT_POOL_ID not in {p.pool_id for p in rows[nid]}:
-            # The node reports pools but no `default`: its OS disks land on
-            # a pool vali cannot name yet.
+        if (
+            rows.get(nid)
+            and DEFAULT_POOL_ID not in {p.pool_id for p in rows[nid]}
+            and not routing.supported(nid)
+        ):
+            # The node reports pools but no `default`, and its agent takes
+            # no `os_pool`: its OS disks land on a pool vali cannot name.
             report.skipped["os-pool-unavailable"] += 1
     onboarding.sort(key=lambda d: (-d.overdue_s, d.node_id))
     periodic.sort(key=lambda d: (-d.overdue_s, d.node_id))
@@ -392,6 +464,10 @@ def launch_intent(run: DiskProbeRun, owner: ProbeOwner) -> dict[str, Any]:
         "platform_id": run.chip_id,
         "enable_netbird": bool(settings.VALI_DISK_PROBE_NETBIRD),
         "auto_pin_allowlist": True,
+        # The pool under test: the OS disk goes ON it (`default` ⇒ the
+        # order carries no `os_pool`). Only a disk-probe launch may pin it
+        # (`launch_jobs._check_os_pool_pin`).
+        "os_pool": run.os_pool_id,
     }
 
 
@@ -505,14 +581,20 @@ def _close_refused(run: DiskProbeRun, reason: str, *, now: datetime) -> None:
     )
 
 
-def request_manual(node_id: str, *, now: datetime | None = None) -> DiskProbeRun:
-    """Queue an operator-requested probe of `node_id`'s OS pool (design §2:
-    announced, so it runs `start_delay_s` later like any probe; at most one
-    per node per `VALI_DISK_PROBE_MANUAL_INTERVAL_S`). Raises `ValueError`."""
+def request_manual(
+    node_id: str, *, pool_id: str = DEFAULT_POOL_ID, now: datetime | None = None
+) -> DiskProbeRun:
+    """Queue an operator-requested probe of `node_id`'s pool `pool_id`
+    (default `default`; design §2: announced, so it runs `start_delay_s`
+    later like any probe; at most one per node per
+    `VALI_DISK_PROBE_MANUAL_INTERVAL_S`). The pool must be probeable now
+    (`os_pool_skip`). Raises `ValueError`."""
     from apps.miners.models import MinerIdentity
 
     now = now or timezone.now()
     nid = node_id.strip().lower()
+    if not is_valid_pool_id(pool_id):
+        raise ValueError(f"{pool_id!r} is not a pool id ([a-z0-9-]{{1,32}})")
     since = now - timedelta(seconds=int(settings.VALI_DISK_PROBE_MANUAL_INTERVAL_S))
     if (
         DiskProbeRun.objects.filter(
@@ -532,9 +614,10 @@ def request_manual(node_id: str, *, now: datetime | None = None) -> DiskProbeRun
     )
     if not chip:
         raise ValueError(f"node {nid[:12]} has no registered chip id")
-    pool = probe_os_pool(DEFAULT_POOL_ID)
-    assert pool is not None
-    return new_run(node_id=nid, pool_id=pool, trigger=ProbeTrigger.MANUAL, chip_id=chip, now=now)
+    skip = os_pool_skip(nid, pool_id)
+    if skip:
+        raise ValueError(f"pool {pool_id!r} of node {nid[:12]} cannot be probed now: {skip}")
+    return new_run(node_id=nid, pool_id=pool_id, trigger=ProbeTrigger.MANUAL, chip_id=chip, now=now)
 
 
 def _image_ready() -> bool:
@@ -579,6 +662,10 @@ def schedule(*, now: datetime, report: TickReport) -> None:
             report.skipped["concurrency"] += 1
             continue
         skip = _node_skip(g, item.node_id)
+        if not skip and item.run is not None:
+            # A queued request's pool may have filled up or gone since:
+            # it waits (and expires) rather than launch onto another pool.
+            skip = os_pool_skip(item.node_id, item.pool_id)
         if skip:
             report.skipped[skip] += 1
             continue
@@ -827,6 +914,7 @@ M_NODE_FAILURES = "hippius_disk_probe_node_consecutive_failures"
 M_NODE_SUSPECT_CACHE = "hippius_disk_probe_node_suspect_cache"
 M_NODE_SEVERE = "hippius_disk_probe_node_would_be_severe"
 M_NODE_TIER = "hippius_disk_probe_node_would_be_tier"
+M_NODE_UNFIT_UNSOLD = "hippius_disk_probe_node_would_be_unfit_unsold"
 
 #: Failures that are vali's, not the miner's: not counted against a node.
 VALI_SIDE_FAILURES = frozenset({"launch-timeout:queued"})
@@ -853,6 +941,7 @@ _SKIP_REASONS = (
     "not-os-eligible",
     "pool-not-active",
     "needs-os-pool-order",
+    "no-room",
     "os-pool-unavailable",
     "no-probe-owner",
     "image-not-ready",
@@ -958,28 +1047,50 @@ def report_metrics(
 
 
 def _node_metrics(ms: metrics.MetricSet, nodes: set[str]) -> None:
-    """Per node of `nodes`: the newest verified probe, the run of failures
-    since, and what C1 WOULD conclude (record only). A node never verified
-    reports its watch start instead (its first attempt, else the fleet's
-    first probe), so `DiskProbeStale` also covers a node the probe keeps
-    skipping."""
+    """Per pool of each node of `nodes` (every series carries `node` and
+    `pool`: a pool's verdicts never mask, reset or raise another's): the
+    newest verified probe, the run of failures since, and what C1 WOULD
+    conclude (record only). The pools are the node's not-retired ones
+    with a verdict, plus every not-retired pool taking OS disks, whatever
+    the probe's skip reason (an old agent, inactive, no room); a node with
+    none of those (no storage report, or only hdd pools) has `default`, so
+    every node of `nodes` keeps a series. A pool never verified reports
+    its watch start instead (its first attempt, else the latest of the
+    fleet's first probe, the miner's registration and — not for `default`,
+    the node's own data root — the pool's first report), so
+    `DiskProbeStale` also covers a pool the probe keeps skipping. A
+    retired pool's series drop out.
+
+    `would_be_severe` (what C1 would cordon on) is emitted only for a
+    SELLABLE pool (`_sellable`); a pool probed to explore or diagnose
+    gets the non-severe `would_be_unfit_unsold` instead."""
     from django.db.models import Min
 
     from apps.miners.models import MinerIdentity
 
+    node_ids = sorted(nodes)
+    live: dict[str, list[MinerStoragePool]] = {}
+    retired: set[tuple[str, str]] = set()
+    for p in MinerStoragePool.objects.filter(miner_node_id__in=node_ids).order_by("pool_id"):
+        if p.retired_at is None:
+            live.setdefault(p.miner_node_id.lower(), []).append(p)
+        else:
+            retired.add((p.miner_node_id.lower(), p.pool_id))
     rows = (
-        DiskProbeRun.objects.filter(state__in=VERDICTS, miner_node_id__in=sorted(nodes))
+        DiskProbeRun.objects.filter(state__in=VERDICTS, miner_node_id__in=node_ids)
         .order_by("miner_node_id", "-finished_at")
         .only("miner_node_id", "state", "failure_reason", "finished_at", "targets", "os_pool_id")
     )
-    by_node: dict[str, list[DiskProbeRun]] = {}
+    by_pool: dict[tuple[str, str], list[DiskProbeRun]] = {}
     for r in rows:
-        by_node.setdefault(r.miner_node_id.lower(), []).append(r)
+        key = (r.miner_node_id.lower(), r.os_pool_id)
+        if key not in retired:
+            by_pool.setdefault(key, []).append(r)
     first_attempt = {
-        n.lower(): at
-        for n, at in DiskProbeRun.objects.filter(miner_node_id__in=sorted(nodes))
+        (n.lower(), pool): at
+        for n, pool, at in DiskProbeRun.objects.filter(miner_node_id__in=node_ids)
         .order_by()
-        .values_list("miner_node_id")
+        .values_list("miner_node_id", "os_pool_id")
         .annotate(at=Min("scheduled_at"))
     }
     fleet_start = DiskProbeRun.objects.aggregate(at=Min("scheduled_at"))["at"]
@@ -987,81 +1098,144 @@ def _node_metrics(ms: metrics.MetricSet, nodes: set[str]) -> None:
     # registration, not from the fleet's first probe.
     registered = {
         n.lower(): at
-        for n, at in MinerIdentity.objects.filter(chain_node_id__in=sorted(nodes))
+        for n, at in MinerIdentity.objects.filter(chain_node_id__in=node_ids)
         .order_by()
         .values_list("chain_node_id")
         .annotate(at=Min("registered_at"))
     }
-    for nid in sorted(nodes):
-        runs = by_node.get(nid, [])
-        if not any(r.state == ProbeRunState.VERIFIED for r in runs):
-            starts = [t for t in (fleet_start, registered.get(nid)) if t is not None]
-            watch = first_attempt.get(nid) or (max(starts) if fleet_start else None)
-            if watch is not None:
-                ms.gauge(
-                    M_NODE_LAST_VERIFIED,
-                    watch.timestamp(),
-                    help_text=(
-                        "When the node's newest verified probe finished, else when the "
-                        "probe started watching it (unix s)."
-                    ),
-                    node=nid,
-                )
-        if not runs:
-            continue
-        failures = 0
-        for r in runs:
-            if r.state == ProbeRunState.VERIFIED:
-                break
-            if r.failure_reason in VALI_SIDE_FAILURES:
-                continue  # vali's own backlog says nothing about the miner
-            failures += 1
-        ms.gauge(
-            M_NODE_FAILURES,
-            failures,
-            help_text="Probe runs failed or timed out since the node's last verified one.",
-            node=nid,
-        )
-        verified = next((r for r in runs if r.state == ProbeRunState.VERIFIED), None)
-        if verified is not None and verified.finished_at is not None:
-            ms.gauge(
-                M_NODE_LAST_VERIFIED,
-                verified.finished_at.timestamp(),
-                help_text=(
-                    "When the node's newest verified probe finished, else when the "
-                    "probe started watching it (unix s)."
-                ),
-                node=nid,
+    for nid in node_ids:
+        pools = live.get(nid, [])
+        watched = {pool for (n, pool) in by_pool if n == nid}
+        watched |= {p.pool_id for p in pools if p.os_disks}
+        # `default` keeps its node-level clock: a node that starts reporting
+        # pools late does not restart its Stale watch.
+        reported = {p.pool_id: p.created_at for p in pools if p.pool_id != DEFAULT_POOL_ID}
+        rows_by_id = {p.pool_id: p for p in pools}
+        supported: bool | None = None
+        for pool_id in sorted(watched or {DEFAULT_POOL_ID}):
+            if pool_id != DEFAULT_POOL_ID and supported is None:
+                supported = routing.supported(nid)
+            sellable = _sellable(pool_id, rows_by_id.get(pool_id), bool(supported))
+            watch = first_attempt.get((nid, pool_id))
+            if watch is None and fleet_start is not None:
+                starts = (fleet_start, registered.get(nid), reported.get(pool_id))
+                watch = max(t for t in starts if t is not None)
+            _pool_metrics(
+                ms, nid, pool_id, by_pool.get((nid, pool_id), []), watch, sellable=sellable
             )
-            ms.gauge(
-                M_NODE_TIER,
-                1,
-                help_text="The OS tier the node's newest verified probe classifies (record only).",
-                node=nid,
-                pool=verified.os_pool_id,
-                tier=_os_target(verified).get("classified_tier") or DiskTier.UNKNOWN.value,
-            )
-        last = runs[0]
-        suspect_cache = (
-            last.state == ProbeRunState.FAILED and last.failure_reason == "suspect-cache"
+
+
+def _sellable(pool_id: str, row: MinerStoragePool | None, supported: bool) -> bool:
+    """The pool is one a VM's OS disk is sold on today, so C1 would act on
+    its verdict. `default`: no row (the node's data root, no storage
+    report), or an active one taking OS disks. Another pool: one A4b
+    routes OS disks to (`routing.choose_os_pool`) — the node's agent takes
+    `os_pool`, the pool takes OS disks, is reported active, not retired,
+    and of the class sold as an OS disk (`routing.sold_class_as_os_disk`:
+    declared or overridden nvme). Deliberately NOT the verdict-derived
+    half of `sold_as_os_disk_tier` (tier, health): a probe demoting a pool
+    must not turn it unsold, or its severe grade could never fire. And not
+    the report's age: a late heartbeat must not flip the series (anti-flap).
+    Anything else (draining, hdd/ssd, unroutable) is probed to explore or
+    diagnose only. A declared-ssd pool a probe verified nvme (which A4b does
+    route to) stays unsold here until the operator declares or overrides it
+    nvme: the operator's side decides what is sold. No gap while verdicts
+    are record-only (the effective tier is then the declared class).
+
+    TODO(C1): once verdicts change the tier, follow what routing actually
+    sells — a pool that holds or can receive OS disks — without letting an
+    unfit verdict make its own pool unsold (its severe grade must still
+    fire)."""
+    if row is None:
+        return pool_id == DEFAULT_POOL_ID
+    if row.retired_at is not None or not row.os_disks:
+        return False
+    if pool_id == DEFAULT_POOL_ID:
+        return row.reported_state in ("", "active")
+    return supported and row.reported_state == "active" and routing.sold_class_as_os_disk(row)
+
+
+def _pool_metrics(
+    ms: metrics.MetricSet,
+    nid: str,
+    pool_id: str,
+    runs: list[DiskProbeRun],
+    watch: datetime | None,
+    *,
+    sellable: bool,
+) -> None:
+    """One pool's gauges (`_node_metrics`); `runs` are its verdicts,
+    newest first. `would_be_severe` only for a `sellable` pool,
+    `would_be_unfit_unsold` only for another."""
+    labels = {"node": nid, "pool": pool_id}
+    last_verified_help = (
+        "When the newest verified probe of the node's pool finished, else when the "
+        "probe started watching it (unix s)."
+    )
+    verified = next((r for r in runs if r.state == ProbeRunState.VERIFIED), None)
+    if verified is None and watch is not None:
+        ms.gauge(M_NODE_LAST_VERIFIED, watch.timestamp(), help_text=last_verified_help, **labels)
+    if not runs:
+        return
+    failures = 0
+    for r in runs:
+        if r.state == ProbeRunState.VERIFIED:
+            break
+        if r.failure_reason in VALI_SIDE_FAILURES:
+            continue  # vali's own backlog says nothing about the miner
+        failures += 1
+    ms.gauge(
+        M_NODE_FAILURES,
+        failures,
+        help_text="Probe runs of the node's pool failed or timed out since its last verified one.",
+        **labels,
+    )
+    if verified is not None and verified.finished_at is not None:
+        ms.gauge(
+            M_NODE_LAST_VERIFIED,
+            verified.finished_at.timestamp(),
+            help_text=last_verified_help,
+            **labels,
         )
         ms.gauge(
-            M_NODE_SUSPECT_CACHE,
-            1 if suspect_cache else 0,
-            help_text="1 when the node's newest probe failed suspect-cache.",
-            node=nid,
+            M_NODE_TIER,
+            1,
+            help_text="The OS tier the newest verified probe of the node's pool classifies "
+            "(record only).",
+            **labels,
+            tier=_os_target(verified).get("classified_tier") or DiskTier.UNKNOWN.value,
         )
-        unfit = (
-            last.state == ProbeRunState.VERIFIED
-            and _os_target(last).get("classified_tier") == DiskTier.UNFIT.value
-        )
-        two_timeouts = len(runs) >= 2 and all(r.state == ProbeRunState.TIMEOUT for r in runs[:2])
+    last = runs[0]
+    suspect_cache = last.state == ProbeRunState.FAILED and last.failure_reason == "suspect-cache"
+    ms.gauge(
+        M_NODE_SUSPECT_CACHE,
+        1 if suspect_cache else 0,
+        help_text="1 when the newest probe of the node's pool failed suspect-cache.",
+        **labels,
+    )
+    unfit = (
+        last.state == ProbeRunState.VERIFIED
+        and _os_target(last).get("classified_tier") == DiskTier.UNFIT.value
+    )
+    if not sellable:
         ms.gauge(
-            M_NODE_SEVERE,
-            1 if (unfit or suspect_cache or two_timeouts) else 0,
+            M_NODE_UNFIT_UNSOLD,
+            1 if unfit else 0,
             help_text=(
-                "1 when C1 would grade the node severe: an unfit verdict, suspect-cache, "
-                "or 2 timeouts in a row (record only)."
+                "1 when the newest probe of a pool no OS disk is sold on (inactive, "
+                "draining, hdd-only or unroutable) classified it unfit. Info only: C1 "
+                "acts on sellable pools."
             ),
-            node=nid,
+            **labels,
         )
+        return
+    two_timeouts = len(runs) >= 2 and all(r.state == ProbeRunState.TIMEOUT for r in runs[:2])
+    ms.gauge(
+        M_NODE_SEVERE,
+        1 if (unfit or suspect_cache or two_timeouts) else 0,
+        help_text=(
+            "1 when C1 would grade the node's sellable pool severe: an unfit verdict, "
+            "suspect-cache, or 2 timeouts in a row (record only)."
+        ),
+        **labels,
+    )

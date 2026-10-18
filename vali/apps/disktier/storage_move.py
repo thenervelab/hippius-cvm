@@ -266,7 +266,8 @@ def request_move(
     if not _receipting(vm):
         raise MoveRefused(
             "move-no-receipts",
-            "the guest served no recent receipt: its move could not be verified",
+            "the guest served no recent receipt, so its move could not be verified; "
+            "after a boot, wait for the first periodic receipt (~5 min)",
         )
     source = source_pool(placement)
     if target_pool == source:

@@ -106,6 +106,24 @@
       loop: "{{ [miner_data_disk_root, miner_state_disk_root] }}"
       register: miner_pf_roots
 
+    - name: Read the block counts of the filesystem holding the data root
+      # Fundamental block size, blocks, free, available: the usable size
+      # excludes the root-reserved blocks, which `ansible_mounts` cannot
+      # show (#1641). The mount point always exists, the root may not yet.
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "10"
+          - stat
+          - -f
+          - -c
+          - "%S %b %f %a"
+          - "{{ (miner_data_disk_root | miner_mount_for(ansible_mounts)) or '/' }}"
+      register: miner_pf_data_statfs
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
     - name: Probe the NetBird management URL from the host
       # Any HTTP status = reachable (TLS verified, so a broken clock or an
       # intercepting proxy shows up here too); -1 = no answer.
@@ -349,6 +367,9 @@
       ansible.builtin.import_tasks: miner-tasks/unattended-upgrades.yml
     - name: Keep needrestart off the miner-agent and libvirt
       ansible.builtin.import_tasks: miner-tasks/needrestart.yml
+    - name: Install the host-inventory collector's tools
+      ansible.builtin.import_tasks: miner-tasks/host-inventory-tools.yml
+      tags: [miner_inventory]
 
 # ── 03 — Tenant CVM networking ──────────────────────────────────────
 - name: "03 — Tenant CVM networking bridge"

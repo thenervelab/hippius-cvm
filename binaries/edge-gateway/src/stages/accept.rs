@@ -80,6 +80,7 @@ fn mock_body(kind: MessageKind) -> Result<Vec<u8>, EdgeError> {
         | MessageKind::Heartbeat
         | MessageKind::GracefulExit
         | MessageKind::VmProgress
+        | MessageKind::HostInventory
         | MessageKind::HostAttestorBeacon
         | MessageKind::VmLiveAttestation => Value::Map(vec![
             (Value::Text("body".into()), Value::Bytes(vec![0xDD; 32])),

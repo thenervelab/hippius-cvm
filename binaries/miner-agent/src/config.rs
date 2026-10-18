@@ -70,6 +70,96 @@ pub struct Config {
     /// blackbox UKI.
     #[serde(default)]
     pub host_attestor: Option<HostAttestorSection>,
+    /// `[inventory]` — the §18.10 host-inventory poster: reads the
+    /// collector's `<section>.json` files, signs and posts them to the
+    /// Edge. Optional AND default-disabled: absent, or `enabled = false`,
+    /// spawns nothing.
+    #[serde(default)]
+    pub inventory: InventorySection,
+}
+
+/// `[inventory]` — the §18.10 host-inventory poster
+/// ([`crate::host_inventory::poster`]).
+///
+/// Ships disabled: vali and the Edge must accept the report first. The
+/// state (`sequence`, the digests sent, the cadence clocks) lives at
+/// `<storage.state_disk_root>/inventory-state.json`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventorySection {
+    /// Master switch. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where the collector leaves its sections. Default
+    /// `/run/hippius-miner/inventory`.
+    #[serde(default = "default_inventory_dir")]
+    pub dir: PathBuf,
+    /// A `full` report every this many seconds (plus jitter). Default
+    /// 86400 (24 h).
+    #[serde(default = "default_inventory_full_interval_secs")]
+    pub full_interval_secs: u64,
+    /// The `full` cadence's jitter, ± seconds. Default 3600; below
+    /// `full_interval_secs`.
+    #[serde(default = "default_inventory_full_jitter_secs")]
+    pub full_jitter_secs: u64,
+    /// A `counters` report every this many seconds. Default 21600 (6 h).
+    #[serde(default = "default_inventory_counters_interval_secs")]
+    pub counters_interval_secs: u64,
+    /// The least gap between two reports of any kind (the `change`
+    /// debounce). Default 300; never below 300, which keeps the agent
+    /// within vali's 12 reports per hour.
+    #[serde(default = "default_inventory_min_gap_secs")]
+    pub min_gap_secs: u64,
+    /// How often the sections are re-read. Default 60.
+    #[serde(default = "default_inventory_poll_secs")]
+    pub poll_secs: u64,
+}
+
+impl Default for InventorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_inventory_dir(),
+            full_interval_secs: default_inventory_full_interval_secs(),
+            full_jitter_secs: default_inventory_full_jitter_secs(),
+            counters_interval_secs: default_inventory_counters_interval_secs(),
+            min_gap_secs: default_inventory_min_gap_secs(),
+            poll_secs: default_inventory_poll_secs(),
+        }
+    }
+}
+
+/// The floor of `[inventory] min_gap_secs`: vali takes at most 12 reports
+/// per node and hour, counted at ARRIVAL. 300 s would leave no margin (a
+/// slow post, up to its 15 s timeout, then fast ones can land a 13th in
+/// vali's window), so the floor is 300 s plus a 20 s margin.
+pub const INVENTORY_MIN_GAP_FLOOR_SECS: u64 = 320;
+
+/// No `[inventory]` interval is above this (30 days).
+pub const INVENTORY_MAX_INTERVAL_SECS: u64 = 30 * 24 * 3600;
+
+fn default_inventory_dir() -> PathBuf {
+    PathBuf::from(crate::host_inventory::INVENTORY_DIR)
+}
+
+fn default_inventory_full_interval_secs() -> u64 {
+    24 * 3600
+}
+
+fn default_inventory_full_jitter_secs() -> u64 {
+    3600
+}
+
+fn default_inventory_counters_interval_secs() -> u64 {
+    6 * 3600
+}
+
+fn default_inventory_min_gap_secs() -> u64 {
+    INVENTORY_MIN_GAP_FLOOR_SECS
+}
+
+fn default_inventory_poll_secs() -> u64 {
+    60
 }
 
 /// `[host_attestor]` — the diskless blackbox host-attestor Infra CVM
@@ -677,6 +767,27 @@ impl Config {
                 require_absolute(ca, "lifecycle.ca_cert")?;
             }
         }
+        // `[inventory]`: checked whether enabled or not, so a bad value is
+        // caught before the day it is switched on.
+        let inv = &self.inventory;
+        require_absolute(&inv.dir, "inventory.dir")?;
+        let within = |s: u64| (1..=INVENTORY_MAX_INTERVAL_SECS).contains(&s);
+        if !within(inv.full_interval_secs) || inv.full_jitter_secs >= inv.full_interval_secs {
+            return Err(MinerAgentError::ConfigInvalid(
+                "inventory.full_interval_secs",
+            ));
+        }
+        if !within(inv.counters_interval_secs) {
+            return Err(MinerAgentError::ConfigInvalid(
+                "inventory.counters_interval_secs",
+            ));
+        }
+        if inv.min_gap_secs < INVENTORY_MIN_GAP_FLOOR_SECS || !within(inv.min_gap_secs) {
+            return Err(MinerAgentError::ConfigInvalid("inventory.min_gap_secs"));
+        }
+        if inv.poll_secs == 0 || inv.poll_secs > inv.min_gap_secs {
+            return Err(MinerAgentError::ConfigInvalid("inventory.poll_secs"));
+        }
         // `[host_attestor]` is optional + default-disabled (INERT). When
         // present the boot inputs are validated fail-fast at load —
         // absolute measured-artifact paths, a non-empty cmdline, and a
@@ -999,6 +1110,71 @@ bind_addr = "100.64.0.10:9700"
 cvm_cpu_budget = 8
 cvm_memory_mb_budget = 16384
 "#;
+
+    #[test]
+    fn inventory_defaults_off_with_the_design_cadence() {
+        let c = parse(VALID).unwrap();
+        let inv = &c.inventory;
+        assert!(!inv.enabled);
+        assert_eq!(inv.dir, PathBuf::from("/run/hippius-miner/inventory"));
+        assert_eq!(
+            (
+                inv.full_interval_secs,
+                inv.full_jitter_secs,
+                inv.counters_interval_secs,
+                inv.min_gap_secs,
+                inv.poll_secs
+            ),
+            (86400, 3600, 21600, 320, 60)
+        );
+    }
+
+    #[test]
+    fn inventory_overrides_and_their_refusals() {
+        let with = |table: &str| format!("{VALID}\n[inventory]\n{table}\n");
+        let c = parse(&with(
+            "enabled = true\ndir = \"/srv/inv\"\nfull_interval_secs = 7200\n\
+             full_jitter_secs = 600\ncounters_interval_secs = 1800\nmin_gap_secs = 600\n\
+             poll_secs = 30",
+        ))
+        .unwrap();
+        assert!(c.inventory.enabled);
+        assert_eq!(c.inventory.dir, PathBuf::from("/srv/inv"));
+        assert_eq!(c.inventory.min_gap_secs, 600);
+        for (table, field) in [
+            ("dir = \"relative/inv\"", "inventory.dir"),
+            ("full_jitter_secs = 86400", "inventory.full_interval_secs"),
+            ("full_interval_secs = 0", "inventory.full_interval_secs"),
+            (
+                "counters_interval_secs = 0",
+                "inventory.counters_interval_secs",
+            ),
+            // Past 30 days.
+            (
+                "full_interval_secs = 2592001",
+                "inventory.full_interval_secs",
+            ),
+            (
+                "counters_interval_secs = 2592001",
+                "inventory.counters_interval_secs",
+            ),
+            ("min_gap_secs = 2592001", "inventory.min_gap_secs"),
+            // Below vali's budget of 12 reports an hour.
+            ("min_gap_secs = 319", "inventory.min_gap_secs"),
+            ("poll_secs = 0", "inventory.poll_secs"),
+            ("poll_secs = 321", "inventory.poll_secs"),
+        ] {
+            match parse(&with(table)) {
+                Err(MinerAgentError::ConfigInvalid(f)) => assert_eq!(f, field, "{table}"),
+                other => panic!("{table}: {other:?}"),
+            }
+        }
+        // An unknown key fails loudly, like every other section.
+        assert!(matches!(
+            parse(&with("enabled = true\ncadence = 5")),
+            Err(MinerAgentError::ConfigParse { .. })
+        ));
+    }
 
     /// The checks `load` runs, storage refusals included (as errors, so
     /// the storage tests read them; `load` itself drops the section).

@@ -130,6 +130,14 @@ where
 /// A failure is logged + counted, not fatal — the guest's at-least-once
 /// buffer retries, and one wedged relay must not kill the session.
 async fn forward(peer: &GuestPeer, edge: &EdgeClient, frame: &GuestFrame, forwarded: &mut u64) {
+    if !frame.kind.guest_relayable() {
+        log_relay(
+            peer,
+            &format!("forward-{:?}", frame.kind),
+            "kind-not-relayable",
+        );
+        return;
+    }
     match edge.send_envelope(frame.kind, &frame.body).await {
         Ok(()) => {
             *forwarded += 1;
@@ -206,6 +214,67 @@ mod tests {
         // The dead 127.0.0.1:1 endpoint refuses — nothing forwards.
         assert_eq!(report.frames_forwarded, 0);
         assert_eq!(report.outcome, RelayOutcome::Closed);
+    }
+
+    /// `forward` itself: a host-plane kind never leaves the miner; each
+    /// allowlisted guest kind still reaches the Edge at its route.
+    #[tokio::test]
+    async fn forward_refuses_host_plane_kinds_and_relays_guest_kinds() {
+        let cancel = CancellationToken::new();
+        let relay_one = |kind: EnvelopeKind, endpoint: String| {
+            let cancel = cancel.clone();
+            async move {
+                let (mut writer, mut reader) = tokio::io::duplex(8192);
+                write_frame(&mut writer, &GuestFrame::new(kind, vec![5u8; 16]))
+                    .await
+                    .unwrap();
+                drop(writer);
+                relay_guest_frames(
+                    &mut reader,
+                    &peer(),
+                    &EdgeClient::insecure_for_tests(endpoint),
+                    MAX_VSOCK_FRAME,
+                    Duration::from_secs(5),
+                    &cancel,
+                )
+                .await
+            }
+        };
+        for kind in [
+            EnvelopeKind::GracefulExit,
+            EnvelopeKind::HostInventory,
+            EnvelopeKind::HostAttestorChallenge,
+            EnvelopeKind::HostAttestorEnroll,
+            EnvelopeKind::HostAttestorBeacon,
+        ] {
+            let (endpoint, seen) = crate::edge_client::test_http::serve(vec![
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+            ])
+            .await;
+            let report = relay_one(kind, endpoint).await;
+            assert_eq!(report.frames_read, 1, "{kind:?}");
+            assert_eq!(report.frames_forwarded, 0, "{kind:?}");
+            assert!(seen.lock().unwrap().is_empty(), "{kind:?} reached the Edge");
+        }
+        for kind in [
+            EnvelopeKind::KbsRequest,
+            EnvelopeKind::StoppedAck,
+            EnvelopeKind::ServedReceipt,
+            EnvelopeKind::ServedAggregate,
+            EnvelopeKind::VmLiveAttestation,
+        ] {
+            let (endpoint, seen) = crate::edge_client::test_http::serve(vec![
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+            ])
+            .await;
+            let report = relay_one(kind, endpoint).await;
+            assert_eq!(report.frames_forwarded, 1, "{kind:?}");
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                [format!("POST {}", kind.edge_route())],
+                "{kind:?}"
+            );
+        }
     }
 
     #[tokio::test]

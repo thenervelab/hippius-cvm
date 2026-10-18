@@ -24,6 +24,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from django.conf import settings
 
@@ -982,6 +983,129 @@ def verify_graceful_exit(*, envelope: bytes, verifying_key: bytes) -> HeartbeatB
     if not isinstance(body, dict):
         raise VerifierUnavailable("verifier accept carried no body object")
     return _heartbeat_body(body)
+
+
+# ── host inventory (§18.10) ──────────────────────────────────────────
+# Same data-bearing shell-out as the heartbeat, against
+# `verify-host-inventory`: the envelope on stdin, `--vk-hex` on argv, exit
+# 0 for any verdict. An accept carries the WHOLE decoded body (every
+# bound, charset and order already checked in Rust) and one SHA-256 per
+# section the report carries.
+
+# Closed `error_class` vocabulary — mirrors `error_class` in
+# `binaries/ticket-validator/src/host_inventory.rs`.
+HOST_INVENTORY_ERROR_CLASSES: frozenset[str] = frozenset(
+    {
+        "body_too_large",
+        "not_canonical_cbor",
+        "envelope_decode_failed",
+        "signature_invalid",
+        "body_decode_failed",
+        "wrong_schema_version",
+        "wrong_domain",
+        "miner_id_invalid",
+        "body_invalid",
+        # The verifier's own failure, not the miner's: `VerifierUnavailable`.
+        "internal",
+    }
+)
+
+# `PositiveBigIntegerField` is a signed bigint on Postgres.
+_I64_MAX = 2**63 - 1
+
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+@dataclass(frozen=True)
+class HostInventoryReport:
+    """A verified host inventory: the decoded body (owner-only — carries
+    serials, never log it) and its per-section digests."""
+
+    miner_id: str
+    timestamp_unix: int
+    sequence: int
+    body: dict[str, Any]
+    section_digests: dict[str, str]
+
+
+def verify_host_inventory(*, envelope: bytes, verifying_key: bytes) -> HostInventoryReport:
+    """Verify a `SignedHostInventory` envelope against the miner's
+    registered key. Raises `VerifierFailed` (miner-side reject; its
+    category is the error class) or `VerifierUnavailable`."""
+    bin_path = Path(settings.VALI_TICKET_VALIDATOR_BIN)
+    if not bin_path.is_file():
+        raise VerifierUnavailable(f"validator binary not found at {bin_path}")
+    if not envelope:
+        raise VerifierFailed(
+            message="empty host-inventory envelope", category="envelope_decode_failed"
+        )
+    timeout = float(settings.VALI_TICKET_VALIDATOR_TIMEOUT_S)
+    argv = [str(bin_path), "verify-host-inventory", "--vk-hex", verifying_key.hex()]
+    try:
+        completed = subprocess.run(  # noqa: S603 — argv list, no shell.
+            argv, input=envelope, capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        log.error("verify-host-inventory timed out after %.2fs", timeout)
+        raise VerifierUnavailable(f"verifier timed out after {timeout:.2f}s") from exc
+    except OSError as exc:
+        log.error("verify-host-inventory spawn failed: %s", exc)
+        raise VerifierUnavailable(f"verifier spawn failed: {exc}") from exc
+    if completed.returncode != 0:
+        log.error("verify-host-inventory non-zero exit: rc=%s", completed.returncode)
+        raise VerifierUnavailable(f"verifier exited with code {completed.returncode}")
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        log.error("verify-host-inventory non-JSON stdout")
+        raise VerifierUnavailable("verifier stdout is not JSON") from exc
+    if not isinstance(payload, dict) or "ok" not in payload:
+        raise VerifierUnavailable("verifier stdout missing 'ok' field")
+    if payload["ok"] is False:
+        error_class = payload.get("error_class")
+        if not isinstance(error_class, str) or error_class not in HOST_INVENTORY_ERROR_CLASSES:
+            raise VerifierUnavailable("verifier reject carried an unknown error_class")
+        detail = payload.get("detail")
+        log.info(
+            "host-inventory refused: class=%s detail=%s",
+            error_class,
+            detail if isinstance(detail, str) and detail.startswith("host-inventory-") else "-",
+        )
+        if error_class == "internal":
+            raise VerifierUnavailable("verifier failed internally")
+        raise VerifierFailed(message="host-inventory verification failed", category=error_class)
+    if payload["ok"] is not True:
+        raise VerifierUnavailable("verifier 'ok' field is not a boolean")
+    body = payload.get("body")
+    digests = payload.get("section_digests")
+    if not isinstance(body, dict) or not isinstance(digests, dict):
+        raise VerifierUnavailable("verifier accept carried no body / section_digests")
+    miner_id, ts, seq = body.get("miner_id"), body.get("timestamp_unix"), body.get("sequence")
+    if (
+        not isinstance(miner_id, str)
+        or type(ts) is not int
+        or type(seq) is not int
+        or not all(
+            isinstance(k, str)
+            and isinstance(v, str)
+            and len(v) == 64
+            and set(v) <= _SHA256_HEX
+            for k, v in digests.items()
+        )
+    ):
+        raise VerifierUnavailable("verifier accept carried a malformed body")
+    if not 0 <= seq <= _I64_MAX:
+        # A valid u64 the store cannot hold: the miner's to fix.
+        raise VerifierFailed(
+            message="host-inventory sequence out of range", category="body_invalid"
+        )
+    return HostInventoryReport(
+        miner_id=miner_id,
+        timestamp_unix=ts,
+        sequence=seq,
+        body=body,
+        section_digests=digests,
+    )
 
 
 # ── vm boot-progress ─────────────────────────────────────────────────

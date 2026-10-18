@@ -9,6 +9,7 @@ from .views import (
     HostAttestorDesiredView,
     HostAttestorReleaseView,
     MinerGracefulExitIngestView,
+    MinerHostInventoryIngestView,
     MinerVmProgressIngestView,
     TelemetryIngestView,
     TelemetryPullView,
@@ -25,6 +26,11 @@ urlpatterns = [
         "telemetry/graceful-exit",
         MinerGracefulExitIngestView.as_view(),
         name="telemetry_graceful_exit",
+    ),
+    path(
+        "telemetry/host-inventory",
+        MinerHostInventoryIngestView.as_view(),
+        name="telemetry_host_inventory",
     ),
     path(
         "telemetry/vm-progress",

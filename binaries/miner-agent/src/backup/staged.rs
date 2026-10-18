@@ -772,6 +772,9 @@ pub enum StageStart {
 
 struct Running {
     restore_id: String,
+    /// Where its record lives (`begin_stage` reads it back in the window
+    /// between `run_stage`'s `Staged` write and its leaving this map).
+    restore_root: std::path::PathBuf,
     cancel: CancellationToken,
     done: tokio::sync::watch::Receiver<bool>,
     progress: Arc<AtomicU64>,
@@ -982,12 +985,25 @@ impl RestoreManager {
         }
         restore::check_chain(&req.chain, Some(req.disk_bytes))?;
         let _ops = RESTORE_OPS.lock().await;
-        if let Some(r) = self.running_lock()?.get(&req.vm_id) {
-            return if r.restore_id == req.restore_id {
-                Ok(StageStart::Staging)
+        let running_root = match self.running_lock()?.get(&req.vm_id) {
+            Some(r) if r.restore_id != req.restore_id => {
+                return Err(MinerAgentError::Backup("restore-busy"))
+            }
+            Some(r) => Some(r.restore_root.clone()),
+            None => None,
+        };
+        if let Some(restore_root) = running_root {
+            // `run_stage` writes the `Staged` record a moment before it
+            // leaves the running map: in that window the record is the
+            // truth (a status read already says staged).
+            let staged = read_record(&restore_root).await.is_some_and(|rec| {
+                rec.restore_id == req.restore_id && rec.state == RestoreState::Staged
+            });
+            return Ok(if staged {
+                StageStart::Staged
             } else {
-                Err(MinerAgentError::Backup("restore-busy"))
-            };
+                StageStart::Staging
+            });
         }
         // A restore to a host this VM never ran on builds on the launch
         // pool; its pool record is written once the restore goes ahead.
@@ -1060,6 +1076,7 @@ impl RestoreManager {
             req.vm_id.clone(),
             Running {
                 restore_id: req.restore_id.clone(),
+                restore_root: paths.restore_root.clone(),
                 cancel: cancel.clone(),
                 done: done_rx,
                 progress: Arc::clone(&opts.progress),

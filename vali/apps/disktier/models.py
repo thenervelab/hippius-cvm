@@ -98,6 +98,9 @@ class MinerStoragePool(models.Model):
     #: `unavailable`) and its last refusal code, as reported.
     reported_state = models.CharField(max_length=12, blank=True, default="", db_default="")
     reported_error = models.CharField(max_length=48, blank=True, default="", db_default="")
+    #: Since when the node has reported the pool `unavailable` without a
+    #: break (off its filesystem, unmounted, …); null while it is not.
+    unavailable_since = models.DateTimeField(null=True, blank=True)
     earned_gb = models.PositiveIntegerField(null=True, blank=True)
 
     tier = models.CharField(
@@ -625,6 +628,15 @@ class MinerStorageConfig(models.Model):
     updated_by_family = models.CharField(max_length=64, blank=True, default="")
     updated_by_user = models.CharField(max_length=128, blank=True, default="")
     updated_at = models.DateTimeField(null=True, blank=True)
+    #: Why the current revision is not pushed, while it is held
+    #: (`pool-not-drained:<pool>`, `family-changed`, `chain-unavailable`);
+    #: blank once pushed. Read as `sync_status` `held:<reason>`.
+    held = models.CharField(max_length=96, blank=True, default="", db_default="")
+    #: Pools an operator force-removed (audited): `{pool_id: {at, principal,
+    #: family, user, reason, report}}`. Such a pool leaves the document
+    #: once the agent applied it `draining` and still reports it
+    #: `unavailable` and empty — it never reports a dead pool `draining`.
+    forced_pools = models.JSONField(default=dict, blank=True, db_default={})
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -655,7 +667,9 @@ class MinerStorageConfigAudit(models.Model):
     miner_node_id = models.CharField(max_length=64)
     revision = models.BigIntegerField()
     #: `put`, `pool-add`, `pool-update`, `pool-drain`, `disk-drain`,
-    #: `adopt`, `validate`, `pool-removed` (by vali once drained), `push`.
+    #: `adopt`, `validate`, `pool-removed` (by vali once drained), `push`,
+    #: `pool-force` (an operator's statement that a dead pool's disk is
+    #: gone: `doc` = `{pool, reason, report}`), `pool-force-drain`.
     action = models.CharField(max_length=24)
     principal = models.CharField(max_length=128, blank=True, default="")
     #: The acting family as sent (SS58) and as verified (account hex).
@@ -761,3 +775,158 @@ class VmStorageMove(models.Model):
     @property
     def move_id(self) -> str:
         return self.id.hex
+
+
+# ─── §18.10 host inventory (UNTRUSTED, owner-facing only) ────────────
+#
+# What a miner reports about its own machine: shown to the node's owner,
+# never read by tiers, placement, cordon, pay, strikes or billing
+# (`tests/test_host_inventory.py` pins who may import these).
+# Bodies carry serials: never log them, never list them in the admin.
+
+
+class HostInventorySectionName(models.TextChoices):
+    SYSTEM = "system", "system"
+    CPU = "cpu", "cpu"
+    MEMORY = "memory", "memory"
+    STORAGE = "storage", "storage"
+    NETWORK = "network", "network"
+    PCI = "pci", "pci"
+    SENSORS = "sensors", "sensors"
+    SOFTWARE = "software", "software"
+
+
+class HostInventoryState(models.Model):
+    """Per node: the replay floor and the hourly report budget."""
+
+    miner_node_id = models.CharField(max_length=64, primary_key=True)
+    #: The registry identity whose `sequence` the floor counts: the agent
+    #: persists its sequence per identity, so a node re-registered under a
+    #: new one starts a new floor.
+    miner_id = models.CharField(max_length=64, blank=True, default="")
+    #: None until a report is accepted.
+    last_sequence = models.PositiveBigIntegerField(null=True, blank=True)
+    #: The last accepted report's signed timestamp, and when vali got it.
+    last_reported_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    #: Reports verified in the current hour window (accepted or not).
+    window_started_at = models.DateTimeField()
+    window_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self) -> str:
+        return f"HostInventoryState {self.miner_node_id[:12]} seq={self.last_sequence}"
+
+
+class HostInventorySection(models.Model):
+    """The latest report of one section of one node, replaced as a whole.
+    A section absent from a report is unchanged, never removed."""
+
+    id = models.BigAutoField(primary_key=True)
+    miner_node_id = models.CharField(max_length=64)
+    section = models.CharField(max_length=16, choices=HostInventorySectionName.choices)
+    #: SHA-256 of the section's canonical CBOR (the Rust verifier's).
+    digest = models.CharField(max_length=64)
+    #: The section as the verifier decoded it (bounds and charsets checked
+    #: there). Owner-only: carries serials.
+    body = models.JSONField()
+    #: The section's own `status` (`ok`, `partial`, `timeout`, …).
+    status = models.CharField(max_length=16)
+    #: The signed timestamp and sequence of the report it came in.
+    reported_at = models.DateTimeField()
+    sequence = models.PositiveBigIntegerField()
+    received_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["miner_node_id", "section"], name="disktier_host_inventory_one_per_section"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"HostInventorySection {self.miner_node_id[:12]}/{self.section}"
+
+
+class HostInventoryChange(models.Model):
+    """A section whose content changed: when, and which of its top-level
+    fields. Reaped past `VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS`."""
+
+    id = models.BigAutoField(primary_key=True)
+    miner_node_id = models.CharField(max_length=64)
+    section = models.CharField(max_length=16, choices=HostInventorySectionName.choices)
+    at = models.DateTimeField()
+    #: The top-level field names whose value changed, sorted.
+    fields = models.JSONField(default=list)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["miner_node_id", "at"]),
+            models.Index(fields=["at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"HostInventoryChange {self.miner_node_id[:12]}/{self.section} {self.at:%Y-%m-%d}"
+
+
+class AdvisoryTransition(models.TextChoices):
+    OPENED = "opened", "opened"
+    ESCALATED = "escalated", "escalated"
+    DEESCALATED = "deescalated", "deescalated"
+    RESOLVED = "resolved", "resolved"
+
+
+class HostDiskAdvisory(models.Model):
+    """One host-reported disk health signal (§18.3/§18.5) of one node,
+    upserted from each host inventory's storage section. Absent from a
+    complete newer report ⇒ `resolved_at`. UNTRUSTED, owner-facing only."""
+
+    id = models.BigAutoField(primary_key=True)
+    miner_node_id = models.CharField(max_length=64)
+    #: `pool | dedicated_disk | controller | md | device | collector`.
+    subject_kind = models.CharField(max_length=16)
+    subject_ref = models.CharField(max_length=DISK_ID_MAX_LEN, blank=True, default="")
+    code = models.CharField(max_length=48)
+    severity = models.CharField(max_length=8)
+    count = models.PositiveBigIntegerField(default=0)
+    value = models.BigIntegerField(default=0)
+    first_seen = models.DateTimeField()
+    last_seen = models.DateTimeField()
+    #: Rebuilt from a fixed template by the collector; untrusted text.
+    sample = models.CharField(max_length=128, blank=True, default="")
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["miner_node_id", "subject_kind", "subject_ref", "code"],
+                name="disktier_host_advisory_unique",
+            ),
+        ]
+        indexes = [models.Index(fields=["resolved_at"])]
+
+    def __str__(self) -> str:
+        return f"HostDiskAdvisory {self.miner_node_id[:12]}/{self.subject_ref}/{self.code}"
+
+
+class HostDiskAdvisoryEvent(models.Model):
+    """An advisory's transition, appended on change only (the feed of the
+    backend's "new critical" email). Reaped past 180 d."""
+
+    id = models.BigAutoField(primary_key=True)
+    miner_node_id = models.CharField(max_length=64)
+    subject_kind = models.CharField(max_length=16)
+    subject_ref = models.CharField(max_length=DISK_ID_MAX_LEN, blank=True, default="")
+    code = models.CharField(max_length=48)
+    transition = models.CharField(max_length=12, choices=AdvisoryTransition.choices)
+    severity = models.CharField(max_length=8)
+    at = models.DateTimeField()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["miner_node_id", "at"]),
+            models.Index(fields=["at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"HostDiskAdvisoryEvent {self.miner_node_id[:12]}/{self.code} {self.transition}"

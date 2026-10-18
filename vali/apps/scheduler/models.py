@@ -422,6 +422,16 @@ class MinerCapacity(models.Model):
     # `approved_by` is the audit actor that approved it.
     approved_at = models.DateTimeField(null=True, blank=True, default=None)
     approved_by = models.CharField(max_length=128, blank=True, default="", db_default="")
+    # A REVOKED approval (`revoke_approval`): set with `approved_at` cleared,
+    # so the miner is pending again. Sticky: the automatic approval never
+    # approves a row that carries it; only an operator approval clears it.
+    revoked_at = models.DateTimeField(null=True, blank=True, default=None)
+    revoked_by = models.CharField(max_length=128, blank=True, default="", db_default="")
+    # Automatic approval soak (working state, written by the heartbeat
+    # ingest on PENDING rows only): when the current unbroken run of
+    # complete heartbeats (v3 capacity + v4 disk + free RAM, no gap past the
+    # liveness timeout) began. NULL = no such run in progress.
+    approval_soak_since = models.DateTimeField(null=True, blank=True, default=None)
     observed_epoch = models.BigIntegerField()
     data_epoch = models.BigIntegerField()
     refreshed_at = models.DateTimeField()

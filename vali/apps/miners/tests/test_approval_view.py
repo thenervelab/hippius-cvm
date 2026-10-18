@@ -129,3 +129,63 @@ def test_refusals_map_to_http(
     resp = admin_client.post(URL, _body(**body), format="json")
     assert resp.status_code == code, resp.json()
     assert resp.json()["category"] == category
+
+
+# ─── revoke ──────────────────────────────────────────────────────────
+
+
+def _revoke_body(**over: object) -> dict[str, object]:
+    body: dict[str, object] = {"revoke": True, "revoked_by": "backend:bob", "reason": "fraud"}
+    body.update(over)
+    return body
+
+
+def test_post_revoke_puts_the_miner_back_to_pending(admin_client: APIClient, settings) -> None:
+    settings.VALI_MINER_APPROVAL_REQUIRED = True
+    _identity()
+    _capacity(approved_at=timezone.now(), approved_by="grandfathered")
+    resp = admin_client.post(URL, _revoke_body(), format="json")
+    assert resp.status_code == 200, resp.content
+    assert resp.json()["revoked_by"] == "op:backend:bob"
+    row = MinerCapacity.objects.get()
+    assert row.approved_at is None and row.revoked_at is not None
+    readout = admin_client.get(URL).json()
+    assert readout["held_back"] is True
+    assert readout["revoked_by"] == "op:backend:bob"
+    assert readout["auto_approval_blocker"] == "revoked"
+    again = admin_client.post(URL, _revoke_body(), format="json")
+    assert again.status_code == 409
+    assert again.json()["category"] == "already-revoked"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _revoke_body(revoke=False),
+        _revoke_body(revoked_by=""),
+        _revoke_body(reason=""),
+        {"revoke": True},
+    ],
+)
+def test_post_revoke_rejects_a_malformed_body(admin_client: APIClient, body: dict) -> None:
+    _identity()
+    _capacity(approved_at=timezone.now(), approved_by="grandfathered")
+    resp = admin_client.post(URL, body, format="json")
+    assert resp.status_code == 400, resp.content
+    assert MinerCapacity.objects.get().approved_at is not None
+    assert not MinerCapacityAudit.objects.exists()
+
+
+def test_post_revoke_has_no_dry_run(admin_client: APIClient) -> None:
+    _identity()
+    _capacity(approved_at=timezone.now(), approved_by="grandfathered")
+    resp = admin_client.post(URL + "?dry_run=1", _revoke_body(), format="json")
+    assert resp.status_code == 400
+    assert MinerCapacity.objects.get().revoked_at is None
+
+
+def test_post_revoke_only_the_miner_admin(plain_client: APIClient) -> None:
+    _identity()
+    _capacity(approved_at=timezone.now(), approved_by="grandfathered")
+    assert plain_client.post(URL, _revoke_body(), format="json").status_code == 403
+    assert MinerCapacity.objects.get().revoked_at is None

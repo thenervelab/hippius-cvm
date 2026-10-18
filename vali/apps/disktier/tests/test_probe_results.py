@@ -225,6 +225,22 @@ def test_a_verdict_changes_no_pool_tier_or_health() -> None:
     assert MinerStoragePool.objects.filter(pk=pool.pk).values().get() == before
 
 
+def test_the_verdict_of_a_pool_probe_is_recorded_against_that_pool() -> None:
+    """A probe of `nvme0` (its OS disk on `nvme0`, A4b) records its verdict
+    on the run of that pool, and still writes nothing to the pool."""
+    pool = MinerStoragePool.objects.create(
+        miner_node_id=NODE, pool_id="nvme0", declared_class="ssd", os_disks=True
+    )
+    before = MinerStoragePool.objects.filter(pk=pool.pk).values().get()
+    run = _running(pool="nvme0")
+    assert _ingest(_receipt(result_for(run))) == "probe-accepted"
+    run.refresh_from_db()
+    assert run.state == ProbeRunState.VERIFIED and run.os_pool_id == "nvme0"
+    (target,) = run.targets
+    assert (target["pool_id"], target["classified_tier"]) == ("nvme0", "nvme")
+    assert MinerStoragePool.objects.filter(pk=pool.pk).values().get() == before
+
+
 def test_probe_off_only_counts(settings: Any) -> None:
     settings.VALI_DISK_PROBE_ENABLED = False
     settings.VALI_DISK_IO_INGEST = True

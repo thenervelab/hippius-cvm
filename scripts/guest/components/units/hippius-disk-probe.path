@@ -1,0 +1,18 @@
+# Hippius guest components release — starts the disk-tier probe the moment
+# vali's probe request appears (docs/design/disk-tier-verification.md §4.2).
+# The request is written by cloud-init's write_files from the probe VM's
+# userdata, and where cloud-init runs alongside early boot (the RHEL family)
+# the service's own ConditionPathExists alone can be evaluated before the
+# request exists. Watching from paths.target catches a request written at
+# any time; one already there when the watch starts (Ubuntu/Debian, where
+# cloud-init runs before sysinit) triggers at once. The probe waits out a
+# request still being written. Dormant in every other VM.
+[Unit]
+Description=Start the Hippius disk-tier probe when its request appears
+
+[Path]
+PathExists=/run/hippius/disk-probe/request.json
+Unit=hippius-disk-probe.service
+
+[Install]
+WantedBy=paths.target

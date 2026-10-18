@@ -1,0 +1,23 @@
+# Managed by Ansible (miner-tasks/host-inventory.yml). Do not edit by hand.
+[Unit]
+Description=Run the Hippius host inventory collector ({{ miner_inventory_mode }})
+
+[Timer]
+Unit=hippius-host-inventory@{{ miner_inventory_mode }}.service
+{% if miner_inventory_mode == 'full' %}
+OnBootSec=2min
+OnUnitActiveSec=24h
+RandomizedDelaySec=1h
+{% elif miner_inventory_mode == 'counters' %}
+OnBootSec=10min
+OnUnitActiveSec=6h
+{% else %}
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+{% endif %}
+# Monotonic timers: nothing to catch up after a downtime.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

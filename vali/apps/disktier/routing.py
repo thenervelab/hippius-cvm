@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from django.conf import settings
+from django.db.models import QuerySet
 from django.utils import timezone
 
 from .models import DeclaredClass, DiskHealth, MinerStoragePool
@@ -50,6 +51,17 @@ def free_gb(pool: MinerStoragePool) -> int | None:
     return max(free, 0)
 
 
+def sold_class_as_os_disk(pool: MinerStoragePool) -> bool:
+    """The operator-side half of `sold_as_os_disk_tier`, without anything a
+    probe verdict writes (`tier`, `health`): the pool is declared nvme, or
+    the operator overrode it to nvme; an override to anything else wins
+    over the declaration. What a pool is SOLD as, before any probe says
+    whether it lives up to it."""
+    if pool.operator_override:
+        return pool.operator_override == DiskTier.NVME
+    return pool.declared_class == DeclaredClass.NVME
+
+
 def sold_as_os_disk_tier(pool: MinerStoragePool) -> bool:
     """The pool is what every OS disk is sold as today (nvme): verified (or
     overridden) nvme, or not probed yet and declared nvme — the probes (G3)
@@ -62,6 +74,20 @@ def sold_as_os_disk_tier(pool: MinerStoragePool) -> bool:
     return nvme and pool.health in (DiskHealth.OK, DiskHealth.SUSPECT)
 
 
+def os_disk_pools(node_id: str) -> QuerySet[MinerStoragePool]:
+    """The node's pools an order may name as `os_pool`: active, recently
+    reported, not retired, taking OS disks (the agent admits the rest).
+    Whatever their tier or health: the probe (`apps.disktier.probe`)
+    measures exactly those; `choose_os_pool` narrows to the sold tier."""
+    return MinerStoragePool.objects.filter(
+        miner_node_id=node_id,
+        retired_at__isnull=True,
+        os_disks=True,
+        reported_state="active",
+        reported_at__gte=timezone.now() - REPORT_MAX_AGE,
+    )
+
+
 def choose_os_pool(node_id: str, need_gb: int) -> str | None:
     """The pool other than `default` to put a `need_gb` OS disk on: the
     node's active, recently reported, not retired, OS-disk pool of the sold
@@ -70,15 +96,8 @@ def choose_os_pool(node_id: str, need_gb: int) -> str | None:
     room."""
     if not supported(node_id):
         return None
-    candidates = MinerStoragePool.objects.filter(
-        miner_node_id=node_id,
-        retired_at__isnull=True,
-        os_disks=True,
-        reported_state="active",
-        reported_at__gte=timezone.now() - REPORT_MAX_AGE,
-    ).exclude(pool_id=DEFAULT_POOL_ID)
     best: tuple[int, str] | None = None
-    for pool in candidates:
+    for pool in os_disk_pools(node_id).exclude(pool_id=DEFAULT_POOL_ID):
         if not sold_as_os_disk_tier(pool):
             continue
         free = free_gb(pool)

@@ -247,6 +247,32 @@ miner_cosign:
   sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
   path: "/usr/local/libexec/hippius-miner/cosign"
 
+# ── Host inventory (§18.10) ─────────────────────────────────────────
+# The collector units (`hippius-host-inventory@{full,counters,kernel}`)
+# and their timers are always installed; the timers run, and the agent's
+# `[inventory] enabled` posts the report, only when this is true. OFF by
+# default: vali and the Edge must accept the report first.
+#
+# `--tags miner_inventory` applies the collector side alone: the tools
+# (play 02) and the units, starting or stopping the timers (play 05). It
+# does NOT re-render the agent config (that needs every fact play 05
+# derives), so the agent's `[inventory]` (the poster) changes only with a
+# full play-05 run — and takes effect only at the agent's next restart
+# (the SIGKILL swap, or an auto-update): the play never restarts the agent.
+miner_inventory_enabled: false
+
+# Local in-band IPMI (sensors' power supplies, the BMC firmware):
+# ipmitool is installed, and ipmi_devintf loaded (now and at boot, for
+# /dev/ipmi0), when this is true AND the host has a BMC (ipmi_si loaded,
+# /sys/class/ipmi or /dev/ipmi0), or always with
+# `miner_inventory_ipmitool_force: true`.
+miner_inventory_ipmitool: true
+miner_inventory_ipmitool_force: false
+
+# smartmontools brings its smartd daemon; it is left running (an operator
+# may rely on its alerts) unless this is true AND the inventory is on.
+miner_inventory_disable_smartd: false
+
 # ── miner-agent source (TEMPORARY — until a signed binary release) ────
 # Play 05 clones this and builds `hippius-miner-agent` from it, so it is
 # a CODE-DELIVERY path, not a documentation link: whatever is here is
@@ -328,11 +354,20 @@ edge_order_signing_pubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf
 # ratio 100..400, reserve_cpus >= 2 and reserve_memory_mb >= 8192 before
 # rendering, so a host_vars `host_cvm` cannot remove the reserve.
 #
-# DISK: `cvm_disk_gb_budget` = size of the filesystem holding
-# `miner_data_disk_root` (GiB, from `ansible_mounts`) − `reserve_disk_gb`.
-# Keep `reserve_disk_gb` = VALI_DISK_RESERVE_GB: vali computes the same
-# fs_total − reserve from the v4 heartbeat and takes the min of both, so a
-# larger reserve on either side simply wins. The reserve is the room the
+# DISK: `cvm_disk_gb_budget` = the USABLE size of the filesystem holding
+# `miner_data_disk_root` (GiB, from `stat -f`: its blocks minus the
+# root-reserved ones — ext4 keeps 5% no tenant can use, ~45 GiB on a 892 GiB disk;
+# `ansible_mounts` cannot tell them apart) −
+# `reserve_disk_gb`, − `reserve_disk_root_extra_gb` too when that
+# filesystem is `/` (#1641: a miner's root filesystem filled up, the image cache
+# (19 GiB), the per-VM staging (~8 GiB) and the OS living next to the
+# tenant disks).
+# Keep `reserve_disk_gb` = VALI_DISK_RESERVE_GB: vali computes its own
+# fs_total − reserve from the v4 heartbeat (root-reserved blocks included,
+# so higher) and takes the min of both: the lower budget derived here wins.
+# A run that LOWERS the installed budget stops until acknowledged
+# (`-e miner_disk_budget_lower_ack=true`, miner-tasks/disk-budget.yml): a
+# budget under what the host already commits strands relaunches. The reserve is the room the
 # agent needs on that filesystem beyond tenant disks — §25 migration
 # downloads, backup/restore staging, and (when the data root is the system
 # disk, the default) base-image staging + the image cache. The install play
@@ -349,6 +384,9 @@ host_cvm:
   reserve_cpus: 2
   reserve_memory_mb: 8192
   reserve_disk_gb: 100
+  # Added to the reserve when the data root is on `/` (the OS, the image
+  # cache and the base-image staging share it). 0 to opt out on purpose.
+  reserve_disk_root_extra_gb: 50
 
 # Capacity v2 — v3 heartbeat (budgets + SEV-ES ASID pool as down-only
 # clamps for vali). vali accepts v3 since the sha-0816d762378c pin.

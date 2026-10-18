@@ -3,7 +3,8 @@
 `disktier-probe` CronJob (suspended until the probe is turned on).
 
     manage.py vali_disk_probe [--no-push]
-    manage.py vali_disk_probe --request <node_id>   # queue an operator probe
+    manage.py vali_disk_probe --request <node_id> [--pool <pool_id>]
+        # queue an operator probe of the node's pool (default `default`)
 
 While `VALI_DISK_PROBE_ENABLED` is off the tick launches nothing and
 pushes nothing; a run left in flight by turning it off is still torn
@@ -33,13 +34,24 @@ class Command(BaseCommand):
             "--request",
             metavar="NODE_ID",
             default=None,
-            help="Queue an operator-requested probe of the node's OS pool (1 per 7 days).",
+            help="Queue an operator-requested probe of the node's pool (1 per 7 days).",
+        )
+        parser.add_argument(
+            "--pool",
+            metavar="POOL_ID",
+            default=None,
+            help=(
+                "With --request: the pool to probe (default `default`); its OS disk goes on "
+                "it. The 1-per-7-days limit is per node, whichever pool."
+            ),
         )
 
     def handle(self, *args: Any, **opts: Any) -> None:
         if opts["request"] is not None:
-            self._request(opts["request"])
+            self._request(opts["request"], opts["pool"] or probe.DEFAULT_POOL_ID)
             return
+        if opts["pool"] is not None:
+            raise CommandError("--pool only goes with --request")
         report = probe.tick()
         self.stdout.write(
             f"disk probe: enabled={report.enabled} due={report.due} launched={report.launched} "
@@ -65,15 +77,17 @@ class Command(BaseCommand):
         if not pushed:
             raise CommandError("disk probe: the Pushgateway refused or did not answer")
 
-    def _request(self, node_id: str) -> None:
+    def _request(self, node_id: str, pool_id: str) -> None:
         if not settings.VALI_DISK_PROBE_ENABLED:
             raise CommandError("VALI_DISK_PROBE_ENABLED is off: no probe is queued")
         nid = node_id.strip().lower()
         if not _NODE_ID_RE.fullmatch(nid):
             raise CommandError(f"{node_id!r} is not a 64-hex node id")
         try:
-            run = probe.request_manual(nid)
+            run = probe.request_manual(nid, pool_id=pool_id)
         except (ValueError, RuntimeError) as exc:
             raise CommandError(str(exc)) from exc
         # The run id only: the vm id and owner are the probe's identity.
-        self.stdout.write(f"disk probe: queued run {run.run_id} for node {nid[:12]}")
+        self.stdout.write(
+            f"disk probe: queued run {run.run_id} for node {nid[:12]} pool {run.os_pool_id}"
+        )

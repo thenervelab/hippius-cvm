@@ -1,8 +1,10 @@
 # Hippius guest components release — the disk-tier probe
 # (docs/design/disk-tier-verification.md §4.2). Dormant in every tenant
-# VM: it starts only when vali's probe userdata, KBS-released before
-# switch_root, left its request in /run. Never in health_mask: a unit
-# that does nothing must not count against an upgrade.
+# VM: it starts only once vali's probe request exists — written by
+# cloud-init (write_files) from the probe VM's userdata, after the early
+# boot. hippius-disk-probe.path starts it whenever the request appears;
+# the multi-user link below covers a request already present. Never in
+# health_mask: a unit that does nothing must not count against an upgrade.
 [Unit]
 Description=Hippius disk-tier probe (vali probe VMs only)
 ConditionPathExists=/run/hippius/disk-probe/request.json
@@ -11,10 +13,19 @@ RequiresMountsFor=/run/hippius/guest
 
 [Service]
 Type=exec
-ExecStart=/run/hippius/guest/bin/hippius-agent-disk-probe
+# `-`: however the probe ends, the unit is not failed, and with
+# RemainAfterExit it stays active — so the path unit (PathExists, still
+# true) never starts it again this boot. A probe that dies leaves no result
+# and vali times the run out; the binary itself refuses a second run once a
+# result exists. A request caught half-written is re-read for 30 s
+# (`Request::load_settled`).
+ExecStart=-/run/hippius/guest/bin/hippius-agent-disk-probe
+RemainAfterExit=yes
+# An OOM kill must not fail the unit either (the default `stop` would, and
+# the path unit would then start a second run this boot).
+OOMPolicy=continue
 # Started at once (Type=exec): the request's delay (up to 72 h) and the run
-# never hold boot. No restart: a probe that dies leaves no result, and vali
-# times the run out.
+# never hold boot. No restart.
 
 [Install]
 WantedBy=multi-user.target

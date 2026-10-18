@@ -1,0 +1,319 @@
+---
+# Wiring test for miner-tasks/host-inventory.yml and
+# host-inventory-tools.yml (§18 HW7): the real tasks files, on localhost,
+# into scratch directories. systemd, packages and kernel modules are never
+# touched (`miner_inventory_manage_systemd: false`,
+# `miner_inventory_manage_packages: false`); no host is contacted. The
+# rendered units are also checked by `systemd-analyze verify` when the
+# runner has it.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/host_inventory_wiring.yml
+
+- name: Host inventory wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+  vars:
+    miner_inventory_manage_systemd: false
+    miner_inventory_manage_packages: false
+    miner_inventory_file_owner: "{{ lookup('ansible.builtin.pipe', 'id -un') }}"
+    # Not the owner's name: a CI `runner` user has no `runner` group.
+    miner_inventory_file_group: "{{ lookup('ansible.builtin.pipe', 'id -gn') }}"
+    miner_inventory_templates: "{{ playbook_dir }}/../playbooks/miner-tasks/templates"
+  tasks:
+    - name: A scratch unit directory
+      ansible.builtin.tempfile:
+        state: directory
+      register: scratch
+
+    - name: The group default is off
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_enabled | bool)
+
+    - name: Render with the default (off)
+      vars:
+        miner_inventory_unit_dir: "{{ scratch.path }}"
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory.yml
+
+    - name: Off — the units are installed, the timers stopped and disabled
+      ansible.builtin.assert:
+        that:
+          - miner_inventory_timers | length == 3
+          - not (miner_inventory_timer_enabled | bool)
+          - miner_inventory_timer_state == 'stopped'
+          - miner_inventory_services_to_stop | length == 3
+
+    - name: Read the rendered units
+      ansible.builtin.slurp:
+        src: "{{ scratch.path }}/hippius-host-inventory@{{ item }}"
+      loop:
+        - full.service
+        - counters.service
+        - kernel.service
+        - full.timer
+        - counters.timer
+        - kernel.timer
+      register: rendered
+
+    - name: Index them by name
+      ansible.builtin.set_fact:
+        units: >-
+          {{ dict(rendered.results | map(attribute='item')
+                  | zip(rendered.results | map(attribute='content') | map('b64decode'))) }}
+
+    - name: Every service runs its mode in the shared sandbox
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('ExecStart=' ~ miner_agent.install_path ~ ' host-inventory-collect --mode ' ~ mode
+             ~ ' --out-dir /run/hippius-miner/inventory --config ' ~ miner_agent.config_path)
+            in units[mode ~ '.service']
+          - "'Type=oneshot' in units[mode ~ '.service']"
+          - "'User=root' in units[mode ~ '.service']"
+          - "'RuntimeDirectory=hippius-miner/inventory' in units[mode ~ '.service']"
+          - "'RuntimeDirectoryMode=0700' in units[mode ~ '.service']"
+          - "'RuntimeDirectoryPreserve=yes' in units[mode ~ '.service']"
+          - "'ProtectSystem=strict' in units[mode ~ '.service']"
+          - "'ProtectHome=true' in units[mode ~ '.service']"
+          - "'PrivateTmp=true' in units[mode ~ '.service']"
+          - "'NoNewPrivileges=true' in units[mode ~ '.service']"
+          - "'ProtectKernelTunables=true' in units[mode ~ '.service']"
+          - "'ProtectControlGroups=true' in units[mode ~ '.service']"
+          - "'DevicePolicy=closed' in units[mode ~ '.service']"
+          - "'DeviceAllow=block-sd rw' in units[mode ~ '.service']"
+          - "'DeviceAllow=block-blkext r' in units[mode ~ '.service']"
+          - "'DeviceAllow=char-nvme r' in units[mode ~ '.service']"
+          # smartctl mknod's /dev/megaraid_sas_ioctl_node itself.
+          - "'DeviceAllow=char-megaraid_sas_ioctl rwm' in units[mode ~ '.service']"
+          - "'DeviceAllow=char-ipmidev rw' in units[mode ~ '.service']"
+          - units[mode ~ '.service'] | regex_search('(?m)^DeviceAllow=/dev/') is none
+          - >-
+            'CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_MKNOD'
+            in units[mode ~ '.service']
+          # A private network namespace would hide every NIC: never set
+          # (the word is only in the comment that says why).
+          - units[mode ~ '.service'] | regex_search('(?m)^\s*PrivateNetwork\s*=') is none
+          - units[mode ~ '.service'] | regex_search('(?m)^\s*PrivateDevices\s*=') is none
+      loop: [full, counters, kernel]
+      loop_control:
+        loop_var: mode
+
+    - name: Full and counters are retried within the agent's 15 min deadline
+      ansible.builtin.assert:
+        that:
+          - "'TimeoutStartSec=15min' in units[mode ~ '.service']"
+          - "'Restart=on-failure' in units[mode ~ '.service']"
+          - "'RestartSec=300' in units[mode ~ '.service']"
+          - "'StartLimitIntervalSec=1h' in units[mode ~ '.service']"
+          - "'StartLimitBurst=3' in units[mode ~ '.service']"
+      loop: [full, counters]
+      loop_control:
+        loop_var: mode
+
+    - name: The kernel tail is short and never retried
+      ansible.builtin.assert:
+        that:
+          - "'TimeoutStartSec=2min' in units['kernel.service']"
+          - units['kernel.service'] | regex_search('(?m)^Restart=') is none
+          - units['kernel.service'] | regex_search('(?m)^StartLimit') is none
+
+    - name: The timers' schedules
+      ansible.builtin.assert:
+        that:
+          - "'Unit=hippius-host-inventory@full.service' in units['full.timer']"
+          - "'OnBootSec=2min' in units['full.timer']"
+          - "'OnUnitActiveSec=24h' in units['full.timer']"
+          - "'RandomizedDelaySec=1h' in units['full.timer']"
+          - "'Unit=hippius-host-inventory@counters.service' in units['counters.timer']"
+          - "'OnBootSec=10min' in units['counters.timer']"
+          - "'OnUnitActiveSec=6h' in units['counters.timer']"
+          - "'Unit=hippius-host-inventory@kernel.service' in units['kernel.timer']"
+          - "'OnBootSec=3min' in units['kernel.timer']"
+          - "'OnUnitActiveSec=5min' in units['kernel.timer']"
+          - "'Persistent=false' in units['full.timer']"
+          - "'Persistent=false' in units['counters.timer']"
+          - "'Persistent=false' in units['kernel.timer']"
+
+    - name: Render with the switch on
+      vars:
+        miner_inventory_unit_dir: "{{ scratch.path }}"
+        miner_inventory_enabled: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory.yml
+
+    - name: On — the timers are enabled and started, no service stopped
+      ansible.builtin.assert:
+        that:
+          - miner_inventory_timer_enabled | bool
+          - miner_inventory_timer_state == 'started'
+          - miner_inventory_services_to_stop | length == 0
+
+    # ── the agent config render: guarded when [inventory] is rendered ───
+    - name: Read the agent install tasks
+      ansible.builtin.set_fact:
+        install_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../playbooks/miner-tasks/miner-agent-install.yml') | from_yaml }}"
+
+    - name: The config render validates through the installed agent, only with the switch on
+      vars:
+        render: "{{ install_tasks | selectattr('name', 'equalto', 'Render the miner-agent config') | first }}"
+      ansible.builtin.assert:
+        that:
+          - "'validate' in render['ansible.builtin.template']"
+          - "'storage-check --config %s' in render['ansible.builtin.template'].validate"
+          - "'miner_inventory_enabled' in render['ansible.builtin.template'].validate"
+          - "'else omit' in render['ansible.builtin.template'].validate"
+
+    # ── systemd's own reading of the units ──────────────────────────────
+    - name: Is systemd-analyze here
+      ansible.builtin.shell: command -v systemd-analyze
+      register: analyze
+      changed_when: false
+      failed_when: false
+
+    - name: A scratch dir for the verify render
+      ansible.builtin.tempfile:
+        state: directory
+      register: verify_dir
+      when: analyze.rc == 0
+
+    - name: An existing config for the verify render
+      ansible.builtin.copy:
+        dest: "{{ verify_dir.path }}/config.toml"
+        content: ""
+        mode: "0600"
+      when: analyze.rc == 0
+
+    - name: Render the units with a stub binary
+      vars:
+        miner_inventory_unit_dir: "{{ verify_dir.path }}"
+        miner_agent:
+          install_path: /bin/true
+          config_path: "{{ verify_dir.path }}/config.toml"
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory.yml
+      when: analyze.rc == 0
+
+    - name: systemd-analyze verify accepts every unit
+      ansible.builtin.command:
+        argv: >-
+          {{ ['systemd-analyze', 'verify', '--man=no']
+             + (['full', 'counters', 'kernel'] | product(['service', 'timer'])
+                | map('join', '.')
+                | map('regex_replace', '^', verify_dir.path ~ '/hippius-host-inventory@')
+                | list) }}
+      register: verify
+      changed_when: false
+      when: analyze.rc == 0
+
+    - name: Nothing to say about them
+      ansible.builtin.assert:
+        that:
+          - verify.stderr | trim == ''
+        fail_msg: "{{ verify.stderr }}"
+      when: analyze.rc == 0
+
+    - name: No systemd-analyze on this runner
+      ansible.builtin.debug:
+        msg: systemd-analyze absent; the verify step is skipped
+      when: analyze.rc != 0
+
+    # ── the tools (play 02): planned, never applied ────────────────────
+    - name: A scratch dir standing in for the BMC probe paths
+      ansible.builtin.tempfile:
+        state: directory
+      register: bmc
+
+    - name: No BMC, default vars — no ipmitool, smartd left alone
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi_si", "{{ bmc.path }}/ipmi0"]
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: Nothing planned
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_bmc_present | bool)
+          - not (miner_inventory_install_ipmitool | bool)
+          - not (miner_inventory_stop_smartd | bool)
+
+    - name: No BMC, forced — ipmitool
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi_si"]
+        miner_inventory_ipmitool_force: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: Forced
+      ansible.builtin.assert:
+        that:
+          - miner_inventory_install_ipmitool | bool
+
+    - name: A BMC (ipmi_si loaded)
+      ansible.builtin.file:
+        path: "{{ bmc.path }}/ipmi_si"
+        state: directory
+        mode: "0755"
+
+    - name: A BMC — ipmitool and ipmi_devintf
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi_si", "{{ bmc.path }}/ipmi0"]
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: Planned
+      ansible.builtin.assert:
+        that:
+          - miner_inventory_bmc_present | bool
+          - miner_inventory_install_ipmitool | bool
+
+    - name: A BMC but IPMI switched off — none
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi_si"]
+        miner_inventory_ipmitool: false
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: Not planned
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_install_ipmitool | bool)
+
+    - name: smartd — the opt-in without the inventory
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi0"]
+        miner_inventory_enabled: false
+        miner_inventory_disable_smartd: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: smartd stays (inventory off)
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_stop_smartd | bool)
+
+    - name: smartd — the inventory without the opt-in
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi0"]
+        miner_inventory_enabled: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: smartd stays (no opt-in)
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_stop_smartd | bool)
+
+    - name: smartd — the inventory on AND the opt-in
+      vars:
+        miner_inventory_ipmi_probe_paths: ["{{ bmc.path }}/ipmi0"]
+        miner_inventory_enabled: true
+        miner_inventory_disable_smartd: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory-tools.yml
+
+    - name: smartd is stopped only then
+      ansible.builtin.assert:
+        that:
+          - miner_inventory_stop_smartd | bool
+
+    - name: Remove the scratch directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ [scratch.path, bmc.path] + ([verify_dir.path] if analyze.rc == 0 else []) }}"

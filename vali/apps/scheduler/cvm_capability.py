@@ -433,6 +433,10 @@ DEST_ACTIVATION_PREFIXES_NOT_START_CAPABILITY = (
     "migration/chain-",  # a backup-chain restore was refused
     "backup/",  # the backup-chain restore itself failed
     "vm-pool-record-",  # the arriving VM's pool record not written/read (A4)
+    # The arrival's pool refused before anything was written (A4b: its
+    # `place_arriving` admission, the agent error as is).
+    "cvm-pool-unavailable",
+    "cvm-insufficient-disk",
 )
 
 

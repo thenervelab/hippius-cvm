@@ -332,6 +332,10 @@ REST_FRAMEWORK = {
         # real miner sends ONE graceful-exit when leaving, so this is very
         # generous while still bounding the subprocess amplification.
         "graceful_exit": os.environ.get("VALI_THROTTLE_GRACEFUL_EXIT", "120/min"),
+        # Anon miner host-inventory ingress (Edge-relayed), keyed per
+        # peer-id: bounds the verifier subprocesses. The per-node hourly
+        # budget (`VALI_HOST_INVENTORY_MAX_PER_HOUR`) is the real cadence gate.
+        "host_inventory": os.environ.get("VALI_THROTTLE_HOST_INVENTORY", "30/min"),
         # Anon telemetry/heartbeat ingress (Edge-relayed, CBOR path is
         # token-exempt), keyed per peer-id (RA-N5). Each ingest shells out to
         # the Rust heartbeat verifier BEFORE any backpressure/quarantine, so
@@ -720,6 +724,16 @@ VALI_SCHEDULER_BOOT_WAIT_POLL_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_POLL_S", 15
 # Off (default) = today's behaviour: a new row is approved on sight, and
 # every row that existed before the switch was grandfathered approved.
 VALI_MINER_APPROVAL_REQUIRED = _env_bool("VALI_MINER_APPROVAL_REQUIRED", False)
+
+# Self-service onboarding: with approval required, also approve a pending
+# miner AUTOMATICALLY once its host-attestor is attested on its registered
+# CHIP_ID, it registered with an explicit snp_generation, and it has sent
+# complete (v3 capacity + v4 disk) heartbeats without a gap for
+# VALI_MINER_AUTO_APPROVE_SOAK_S (`apps.scheduler.approval.auto_approve_pending`,
+# run by `vali_scheduler_reeval`). Off (default) = operator approval only.
+# A revoked miner is never re-approved automatically.
+VALI_MINER_AUTO_APPROVE = _env_bool("VALI_MINER_AUTO_APPROVE", False)
+VALI_MINER_AUTO_APPROVE_SOAK_S = _env_int("VALI_MINER_AUTO_APPROVE_SOAK_S", 1800)
 
 # §23 admission bound — default per-miner VM-slot cap seeded into a
 # fresh `MinerCapacity` mirror row. v1 carries no detailed hardware
@@ -2378,10 +2392,15 @@ LOGGING = {
             "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
         },
     },
+    "filters": {
+        # Hardware serials and by-id names never reach a log line (§18.10.3).
+        "redact_serials": {"()": "vali.log_filters.SerialRedactionFilter"},
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "default",
+            "filters": ["redact_serials"],
         },
     },
     "loggers": {
@@ -2554,6 +2573,22 @@ VALI_DISK_IO_RETENTION_DAYS = _env_int("VALI_DISK_IO_RETENTION_DAYS", 30)
 VALI_DISK_HEALTH_RETENTION_DAYS = _env_int("VALI_DISK_HEALTH_RETENTION_DAYS", 180)
 VALI_DISK_GC_BATCH = _env_int("VALI_DISK_GC_BATCH", 5000)
 VALI_DISK_GC_MAX_BATCHES = _env_int("VALI_DISK_GC_MAX_BATCHES", 200)
+
+# §18.10 host inventory (UNTRUSTED, owner-facing only). The Edge-relayed
+# `POST /v1/telemetry/host-inventory` answers 404 while off.
+VALI_HOST_INVENTORY_INGEST = _env_bool("VALI_HOST_INVENTORY_INGEST", False)
+# Reports one node may send per hour (full 24 h, counters 6 h, change
+# debounced to 5 min): past it, 429.
+VALI_HOST_INVENTORY_MAX_PER_HOUR = _env_int("VALI_HOST_INVENTORY_MAX_PER_HOUR", 12)
+# Signed timestamp vs vali clock.
+VALI_HOST_INVENTORY_MAX_SKEW_S = _env_int("VALI_HOST_INVENTORY_MAX_SKEW_S", 300)
+# Section changes and disk-advisory transitions (§18.10 / §18.5).
+VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS = _env_int(
+    "VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS", 180
+)
+VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS = _env_int(
+    "VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS", 90
+)
 # What a probe verdict may change: `off` nothing, `record` events + audit
 # only, `enforce` tiers, health, cordons.
 VALI_DISK_TIER_CONSEQUENCES = os.environ.get("VALI_DISK_TIER_CONSEQUENCES", "off")

@@ -33,6 +33,9 @@
 //!   `SignedMinerHeartbeat` envelope on stdin; `--vk-hex`. Unlike every
 //!   other `verify-*` subcommand it is **data-bearing** — see the wire
 //!   contract note below and `mod heartbeat`.
+//! - `verify-host-inventory` — §18.10 host inventory signature + schema
+//!   validation, data-bearing like `verify-heartbeat` (the whole decoded
+//!   body + per-section digests). See `mod host_inventory`.
 //!
 //! ## Wire contract (`verify-*` subcommands)
 //!
@@ -84,6 +87,7 @@ mod heartbeat;
 mod host_attestor_cert;
 mod host_beacon;
 mod host_challenge_request;
+mod host_inventory;
 mod idempotency;
 mod live_attestation;
 mod miner_status;
@@ -276,6 +280,11 @@ enum Command {
     /// endpoint (replay + skew gate). Data-bearing — see
     /// `mod graceful_exit`.
     VerifyGracefulExit(graceful_exit::VerifyGracefulExitArgs),
+    /// Verify a §18.10 `SignedHostInventory` from stdin against the
+    /// miner's `--vk-hex` and echo the decoded body + per-section digests
+    /// for vali's host-inventory ingest. Data-bearing — see
+    /// `mod host_inventory`.
+    VerifyHostInventory(host_inventory::VerifyHostInventoryArgs),
     /// Verify a `SignedVmProgress` guest-boot milestone from stdin
     /// against the miner's `--vk-hex` and echo the decoded body
     /// (`vm_id`, `milestone`, `timestamp_unix`) for vali's boot-progress
@@ -392,6 +401,7 @@ fn main() -> ExitCode {
         Command::VerifyServedReceipt(args) => telemetry::run_served_receipt(args),
         Command::VerifyHeartbeat(args) => heartbeat::run(args),
         Command::VerifyGracefulExit(args) => graceful_exit::run(args),
+        Command::VerifyHostInventory(args) => host_inventory::run(args),
         Command::VerifyVmProgress(args) => vm_progress::run(args),
         Command::VerifyHostAttestorCert(args) => host_attestor_cert::run(args),
         Command::VerifyLiveAttestation(args) => live_attestation::run(args),

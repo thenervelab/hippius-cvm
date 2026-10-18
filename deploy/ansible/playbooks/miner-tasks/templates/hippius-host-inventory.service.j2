@@ -1,0 +1,91 @@
+# Managed by Ansible (miner-tasks/host-inventory.yml). Do not edit by hand.
+#
+# The §18.10 host-inventory collector, mode `{{ miner_inventory_mode }}`: a oneshot of the
+# agent binary, OUTSIDE the agent's sandbox (which shows no device and no
+# DMI table). It reads the host read-only and leaves one
+# `<section>.json` per section (or, in `kernel` mode, the journal state)
+# under /run/hippius-miner/inventory; the agent signs and posts them
+# (`[inventory] enabled`). All three modes share one run lock there.
+[Unit]
+Description=Hippius host inventory collector ({{ miner_inventory_mode }})
+After=local-fs.target
+{% if miner_inventory_mode == 'full' %}
+# A busy or out-of-time `full` run exits non-zero to be retried (the
+# agent's run deadline fits TimeoutStartSec below); three tries an hour.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+{% elif miner_inventory_mode == 'counters' %}
+# A busy `counters` run skips with exit 0 (its next tick is 6 h away);
+# only a real failure is retried, three tries an hour.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+{% endif %}
+
+[Service]
+Type=oneshot
+ExecStart={{ miner_agent.install_path }} host-inventory-collect --mode {{ miner_inventory_mode }} --out-dir /run/hippius-miner/inventory --config {{ miner_agent.config_path }}
+User=root
+Group=root
+{% if miner_inventory_mode == 'kernel' %}
+# The journal tail has its own 60 s deadline; a busy lock skips (exit 0).
+TimeoutStartSec=2min
+{% else %}
+# = the agent's UNIT_TIMEOUT (host_inventory::UNIT_TIMEOUT): its run
+# deadline is derived from it. Change both together.
+TimeoutStartSec=15min
+# Restart= on a Type=oneshot needs systemd >= 244: Ubuntu 22.04 ships
+# 249, 24.04 255, and the fleet's 26.04 a later one.
+Restart=on-failure
+RestartSec=300
+{% endif %}
+
+# The sections, the storage counters and the journal state live here;
+# kept across runs (three units share it), root-only (serials, by-id
+# names).
+RuntimeDirectory=hippius-miner/inventory
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+# Read-only on the host, writable only in its own directory (systemd
+# makes a RuntimeDirectory= writable under ProtectSystem=strict).
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# NO PrivateNetwork=: a private network namespace hides every NIC from
+# /sys/class/net and `ip` (the network section would list none). The
+# collector opens no socket beyond netlink/ioctl queries of the host's
+# own interfaces (`ip -o -4 addr`, `ethtool -i`).
+
+# Devices: only what SMART / NVMe / IPMI open. `closed` keeps the pseudo
+# devices (/dev/null, …).
+# - `sd` (SCSI/SATA disks): SG_IO for SMART. `rw`, not `r`: smartctl's
+#   SCSI/SAT passthrough opens the disk read-write. The canary must show
+#   that `r` is NOT enough before anyone tightens this.
+# - `blkext`: the block major of every NVMe namespace (there is no
+#   `block-nvme`), for the admin passthrough of `nvme smart-log`.
+# - `nvme` (char): the NVMe controllers.
+# - `megaraid_sas_ioctl`: `smartctl -d megaraid,N` talks to
+#   /dev/megaraid_sas_ioctl_node, which udev never creates: smartctl
+#   mknod's it itself (major from /proc/devices), hence `m` and
+#   CAP_MKNOD below. The device cgroup confines that mknod to this one
+#   char major; the alternative, an `ExecStartPre=+` creating the node,
+#   would run a privileged shell outside this sandbox on every start.
+# - `ipmidev`: the local BMC (/dev/ipmi0, `ipmitool`).
+DevicePolicy=closed
+DeviceAllow=block-sd rw
+DeviceAllow=block-blkext r
+DeviceAllow=char-nvme r
+DeviceAllow=char-megaraid_sas_ioctl rwm
+DeviceAllow=char-ipmidev rw
+# - CAP_SYS_RAWIO: SG_IO / the SMART passthrough;
+# - CAP_SYS_ADMIN: the NVMe admin passthrough ioctl and the MegaRAID
+#   firmware ioctl — broad, but neither works without it;
+# - CAP_DAC_READ_SEARCH: root-only files of other owners;
+# - CAP_MKNOD: smartctl's /dev/megaraid_sas_ioctl_node (above).
+# Without CAP_SYS_PTRACE, /proc/1/mountinfo is refused (PID 1 holds caps
+# outside this set); the collector falls back to /proc/self/mountinfo,
+# which lists the same host mounts in this unit's namespace.
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_MKNOD

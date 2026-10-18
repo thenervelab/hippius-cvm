@@ -37,7 +37,8 @@
       approval state, the anchor and the heartbeat's current figures. POST
       {cpus, memory_mb, disk_gb?, trust_class?, approved_by, reason}
       approves a PENDING miner and sets its anchor to min(declared,
-      measured), audited.
+      measured), audited. POST {revoke: true, revoked_by, reason} revokes:
+      back to pending, never approved automatically again.
       → 200 / 400 wire or invalid / 403 / 404 unknown miner or no capacity
         row yet / 409 already approved, not measured, or below committed.
 
@@ -56,7 +57,12 @@ from django.conf import settings
 from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    PolymorphicProxySerializer,
+    extend_schema,
+)
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.request import Request
@@ -80,6 +86,8 @@ from .permissions import IsMinerAdmin
 from .schemas import (
     MinerApprovalRequestSerializer,
     MinerApprovalResponseSerializer,
+    MinerApprovalRevokeRequestSerializer,
+    MinerApprovalRevokeResponseSerializer,
     MinerApprovalStatusSerializer,
     MinerGracefulExitResponseSerializer,
     MinerIdentitySerializer,
@@ -501,6 +509,7 @@ _APPROVAL_HTTP_STATUS = {
     "already-approved": status.HTTP_409_CONFLICT,
     "not-measured": status.HTTP_409_CONFLICT,
     "below-committed": status.HTTP_409_CONFLICT,
+    "already-revoked": status.HTTP_409_CONFLICT,
 }
 
 
@@ -546,12 +555,15 @@ class MinerApprovalView(APIView):
         return Response({"miner_id": miner_id, **readout}, status=status.HTTP_200_OK)
 
     @extend_schema(
-        summary="Approve a pending miner",
+        summary="Approve or revoke a miner",
         description=(
             "Miner-admin only. Approves a miner held back by "
             "VALI_MINER_APPROVAL_REQUIRED and sets its host-size anchor to "
             "min(declared, fresh heartbeat figure) per term, with an audit "
-            "row per field. `?dry_run=1` computes and writes nothing."
+            "row per field. `?dry_run=1` computes and writes nothing. "
+            "`{\"revoke\": true, \"revoked_by\", \"reason\"}` instead revokes the "
+            "approval: the miner is pending again and is never approved "
+            "automatically until an operator approves it."
         ),
         tags=["Miners"],
         parameters=[
@@ -560,9 +572,20 @@ class MinerApprovalView(APIView):
                 "dry_run", bool, OpenApiParameter.QUERY, description="Compute only."
             ),
         ],
-        request=MinerApprovalRequestSerializer,
+        request=PolymorphicProxySerializer(
+            component_name="MinerApprovalPostRequest",
+            serializers=[MinerApprovalRequestSerializer, MinerApprovalRevokeRequestSerializer],
+            resource_type_field_name=None,
+        ),
         responses={
-            200: MinerApprovalResponseSerializer,
+            200: PolymorphicProxySerializer(
+                component_name="MinerApprovalPostResponse",
+                serializers=[
+                    MinerApprovalResponseSerializer,
+                    MinerApprovalRevokeResponseSerializer,
+                ],
+                resource_type_field_name=None,
+            ),
             400: OpenApiResponse(ErrorSerializer, "Malformed body / value out of range."),
             403: OpenApiResponse(ErrorSerializer, "Not the miner-admin principal."),
             404: OpenApiResponse(
@@ -570,8 +593,8 @@ class MinerApprovalView(APIView):
             ),
             409: OpenApiResponse(
                 ErrorSerializer,
-                "Already approved, no fresh heartbeat figure, or the anchor is "
-                "below what vali already placed there.",
+                "Already approved, no fresh heartbeat figure, the anchor is "
+                "below what vali already placed there, or already revoked.",
             ),
         },
     )
@@ -581,6 +604,8 @@ class MinerApprovalView(APIView):
         node_id = _approval_node_id(miner_id)
         if node_id is None:
             return _error(status.HTTP_404_NOT_FOUND, "miner not found", "not-found")
+        if isinstance(request.data, dict) and "revoke" in request.data:
+            return self._revoke(request, miner_id, node_id)
         body = MinerApprovalRequestSerializer(data=request.data)
         if not body.is_valid():
             return _error(status.HTTP_400_BAD_REQUEST, str(body.errors), "wire")
@@ -610,6 +635,30 @@ class MinerApprovalView(APIView):
         return Response(
             {"miner_id": miner_id, **result.as_dict()}, status=status.HTTP_200_OK
         )
+
+
+    @staticmethod
+    def _revoke(request: Request, miner_id: str, node_id: str) -> Response:
+        from apps.scheduler import approval
+
+        body = MinerApprovalRevokeRequestSerializer(data=request.data)
+        if not body.is_valid():
+            return _error(status.HTTP_400_BAD_REQUEST, str(body.errors), "wire")
+        if str(request.query_params.get("dry_run", "")).lower() in ("1", "true"):
+            return _error(status.HTTP_400_BAD_REQUEST, "a revocation has no dry run", "wire")
+        data = body.validated_data
+        try:
+            revoked = approval.revoke_approval(
+                node_id, revoker=data["revoked_by"], reason=data["reason"]
+            )
+        except approval.ApprovalRefused as exc:
+            return _error(
+                _APPROVAL_HTTP_STATUS.get(exc.code, status.HTTP_409_CONFLICT),
+                exc.message,
+                exc.code,
+            )
+        log.warning("miner approval revoked: miner_id=%s by=%s", miner_id, revoked["revoked_by"])
+        return Response({"miner_id": miner_id, **revoked}, status=status.HTTP_200_OK)
 
 
 def _approval_node_id(miner_id: str) -> str | None:

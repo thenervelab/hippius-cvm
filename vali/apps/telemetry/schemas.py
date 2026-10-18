@@ -111,6 +111,18 @@ class GracefulExitResponseSerializer(serializers.Serializer):
     accepted = serializers.BooleanField()
 
 
+class HostInventoryResponseSerializer(serializers.Serializer):
+    """`POST /v1/telemetry/host-inventory` 200 body — the report was
+    verified and merged (the sections it carried replaced vali's)."""
+
+    accepted = serializers.BooleanField()
+    sequence = serializers.IntegerField()
+    sections = serializers.ListField(child=serializers.CharField())
+    changed = serializers.ListField(
+        child=serializers.CharField(), help_text="Sections whose content changed."
+    )
+
+
 class VmProgressResponseSerializer(serializers.Serializer):
     """`POST /v1/telemetry/vm-progress` 200 body — the guest-boot
     milestone was accepted (signature + identity + skew verified).

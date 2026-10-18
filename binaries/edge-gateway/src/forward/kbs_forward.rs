@@ -212,6 +212,11 @@ impl ReqwestForwardClient {
             .await
             .map_err(|_| ForwardError::Transport)?;
         let status = response.status().as_u16();
+        let retry_after_secs = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         // Hard-bound the upstream body: a hostile / buggy inner
         // endpoint cannot drive an unbounded allocation. `content-
         // length` is advisory — re-check the actual collected length.
@@ -230,6 +235,7 @@ impl ReqwestForwardClient {
         Ok(ForwardResponse {
             status,
             body: bytes.to_vec(),
+            retry_after_secs,
         })
     }
 }
@@ -420,6 +426,18 @@ impl ForwardClient for ReqwestForwardClient {
             .await
     }
 
+    /// Relay a `HostInventory` body to the vali host-inventory ingest,
+    /// stamping the connection's mTLS [`PeerId`] like
+    /// [`forward_vm_progress`](Self::forward_vm_progress).
+    async fn forward_host_inventory(
+        &self,
+        env: &ValidatedEnvelope,
+    ) -> Result<ForwardResponse, ForwardError> {
+        let url = join_url(&self.vali_base, vali_forward::HOST_INVENTORY_INGEST_PATH);
+        self.post_cbor(&url, env.body_bytes(), Some(env.peer()))
+            .await
+    }
+
     /// Relay a `HostAttestorChallenge` body to the vali nonce authority
     /// (PR-10). Like [`forward_heartbeat`](Self::forward_heartbeat) it
     /// stamps the connection's mTLS [`PeerId`] as the
@@ -470,6 +488,7 @@ impl ForwardClient for ReqwestForwardClient {
             return Ok(ForwardResponse {
                 status: kbs_resp.status,
                 body: Vec::new(),
+                retry_after_secs: None,
             });
         }
 

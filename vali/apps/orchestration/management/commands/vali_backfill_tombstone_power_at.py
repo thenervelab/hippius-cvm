@@ -4,7 +4,7 @@ before the tombstone stamped it.
 Migration `lifecycle.0017` turned every destroyed row `off` and gave it
 `power_state_at = updated_at`, the best date it had. For rows tombstoned by
 the old CAS that date is stale — the transition never bumped `updated_at`
-(seen in production: destroyed 09-27 03:02, read 09-25 15:47). A row whose
+(one production VM: destroyed 09-27 03:02, read 09-25 15:47). A row whose
 §24 job finished knows better: that job's `finished_at`.
 
 Touches only a destroyed, `off` row with a `done` DecommissionJob, and only

@@ -79,6 +79,12 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
     """Upsert `node_id`'s pools and dedicated disks from `report`."""
     with transaction.atomic():
         reported_pools = set()
+        before = {
+            p.pool_id: p.reported_error
+            for p in MinerStoragePool.objects.filter(
+                miner_node_id=node_id, reported_state="unavailable"
+            ).only("pool_id", "reported_error")
+        }
         for pool in report.pools:
             reported_pools.add(pool.pool_id)
             total = _known(pool.total_gb)
@@ -100,7 +106,23 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
             )
         MinerStoragePool.objects.filter(miner_node_id=node_id, retired_at__isnull=True).exclude(
             pool_id__in=reported_pools
-        ).update(retired_at=now)
+        ).update(retired_at=now, unavailable_since=None)
+        # How long a pool has been unavailable without a break (#1638).
+        pools = MinerStoragePool.objects.filter(miner_node_id=node_id, pool_id__in=reported_pools)
+        pools.filter(reported_state="unavailable", unavailable_since__isnull=True).update(
+            unavailable_since=now
+        )
+        # Another reason is another outage: its clock starts now.
+        changed = [
+            p.pool_id
+            for p in report.pools
+            if p.state == "unavailable" and p.pool_id in before and before[p.pool_id] != p.error
+        ]
+        if changed:
+            pools.filter(pool_id__in=changed).update(unavailable_since=now)
+        pools.exclude(reported_state="unavailable").exclude(unavailable_since=None).update(
+            unavailable_since=None
+        )
 
         # A disk first seen after the desired document named it takes the
         # document's state from the start (a `draining` declaration must

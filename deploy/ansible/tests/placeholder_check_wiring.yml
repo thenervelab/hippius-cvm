@@ -22,12 +22,15 @@
     ansible_processor_vcpus: 48
     ansible_memtotal_mb: 386000
     miner_data_fs_gb: 800
+    miner_data_disk_reserve_gb: 150
+    miner_cvm_disk_budget_gb: 650
     miner_data_fs_mount: /
   tasks:
-    # The published group_vars carry `<VALI_LIFECYCLE_URL>` on purpose
-    # (the next task proves it is refused); this one checks the template
-    # with that value filled in, as a deployer's host_vars would.
-    - name: The group_vars with the deployer's values carry no placeholder
+    # The lifecycle URL is set here the way a deployer's host_vars would,
+    # so this block also passes on the published tree, whose group_vars
+    # carry the placeholder. Block vars, not play vars: play vars rank
+    # below vars_files and would not override it.
+    - name: The fleet group_vars carry no placeholder
       vars:
         miner_vali_lifecycle_url: "https://vali.example:8446"
       block:

@@ -723,6 +723,13 @@ class LaunchSpec:
     # relaunch from the stamp the restage writes inside the wrapped
     # template ([`split_verbatim_userdata`]); never by a launch.
     userdata_verbatim: bool = False
+    # The pool the OS disk of a FIRST golden launch goes on, pinned instead
+    # of chosen (A4b): the disk-tier probe's pool under test
+    # (`apps.disktier.probe`), accepted from a disk-probe launch only
+    # (`launch_jobs._check_os_pool_pin`). `default` ⇒ the order names no
+    # pool. Empty (every other launch) ⇒ `_choose_os_pool`. Written into
+    # `spec_json` only when set, like `require_failover_peer`.
+    pinned_os_pool: str = ""
 
 
 @dataclass
@@ -990,8 +997,11 @@ _CHOOSE_OS_POOL = object()
 
 
 def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
-    """`apps.disktier.routing.choose_os_pool` for this launch; any failure
-    is `default` (logged), never a failed launch."""
+    """The spec's pinned pool (`None` for `default`), else
+    `apps.disktier.routing.choose_os_pool` for this launch; any failure of
+    the choice is `default` (logged), never a failed launch."""
+    if spec.pinned_os_pool:
+        return _pinned_os_pool(spec)
     try:
         return disk_routing.choose_os_pool(miner.chain_node_id or "", _os_disk_need_gb(spec))
     except Exception:
@@ -999,13 +1009,32 @@ def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
         return None
 
 
-def _retry_os_pool(out: LaunchOutcome) -> str | None:
+def _own_retry_pool(out: LaunchOutcome, dispatch_retries: int) -> None:
+    """A same-miner retry answered `already-launched` by the boot an
+    earlier attempt of THIS loop started: that disk is on the pool those
+    attempts named (a retry names the same one, `_retry_os_pool`), so the
+    placement records it. A first attempt answered so is an older boot's:
+    its pool is unknown, nothing is recorded."""
+    if answered_already_launched(out) and dispatch_retries and out.chosen_os_pool:
+        out.os_pool = out.chosen_os_pool
+
+
+def _pinned_os_pool(spec: LaunchSpec) -> str | None:
+    """The pool a pinned spec's order names: `None` for `default`."""
+    pool = spec.pinned_os_pool
+    return None if pool == disk_routing.DEFAULT_POOL_ID else pool
+
+
+def _retry_os_pool(spec: LaunchSpec, out: LaunchOutcome) -> str | None:
     """The pool a same-miner dispatch retry names: the first attempt's,
     unless the miner refused that pool (`insufficient-disk:<pool>` /
     `pool-unavailable:<pool>`, before it recorded anything) — then
-    `default`."""
+    `default`. A pinned spec (the disk probe) names its pin again, even
+    then: the probe measures that pool or nothing."""
     from apps.scheduler import cvm_capability
 
+    if spec.pinned_os_pool:
+        return _pinned_os_pool(spec)
     classifier = str((out.emit or {}).get("classifier") or "")
     if cvm_capability.is_pool_refusal(classifier):
         return None
@@ -1359,7 +1388,8 @@ def launch_on_miner(
     # (the agent keeps those on `default`). The preflight checks the same
     # pool the launch then uses.
     # A same-miner retry passes the pool its first attempt named
-    # (`os_pool`), so one VM never gets two choices.
+    # (`os_pool`), so one VM never gets two choices. A disk-probe launch
+    # pins its pool under test (`spec.pinned_os_pool`) instead of choosing.
     if require_existing_disks or spec.disk_mode != _DISK_MODE_GOLDEN_VERITY:
         os_pool = None
     elif os_pool is _CHOOSE_OS_POOL:
@@ -2836,7 +2866,8 @@ def _place_and_launch(
             )
             time.sleep(dispatch_retry_backoff_s())
             dispatched.extend(_candidate_of(spec, out))
-            out = launch_on_miner(spec, miner, os_pool=_retry_os_pool(out))
+            out = launch_on_miner(spec, miner, os_pool=_retry_os_pool(spec, out))
+        _own_retry_pool(out, dispatch_retries)
         if answered_already_launched(out):
             _await_the_attested_boot(
                 spec.vm_id, out, [*_earlier_dispatched_boots(spec.vm_id), *dispatched]

@@ -587,7 +587,7 @@ def test_decommission_still_destroys_the_domain_for_a_bound_vm(
 
 def _stranded(vm_id: str, *, host: str = "node-src") -> tuple:
     """A VM in `Decommissioning` behind a FAILED §24 job — the live shape
-    of vm-0001-722298ff & co."""
+    of a stranded production VM."""
     vm = make_vm(vm_id, state=VmState.DECOMMISSIONING, host=host)
     old = DecommissionJob.objects.create(
         job_id=f"old-{vm_id}",
