@@ -615,12 +615,18 @@ mod tests {
         // (`applies_incrementals_in_order_and_installs`).
         let f = fixture(vec![]);
         let root = f.dir.path();
+        // The live disk's promised (unwritten) tail is set far past the
+        // filesystem's free space, so the host ledger nets the free space
+        // to zero whatever else the machine frees or fills meanwhile. Sized
+        // to exactly the free space, any space freed between the
+        // measurement and the restore (a busy build box) let the chain fit.
+        // Sparse: allocates nothing.
         let free = super::super::capture::free_bytes(root).unwrap();
         let data = crate::lifecycle::data_disk::data_dir(root);
         std::fs::create_dir_all(&data).unwrap();
         std::fs::File::create(data.join("tenant-live.img"))
             .unwrap()
-            .set_len(free)
+            .set_len(free.saturating_add(1 << 40))
             .unwrap();
         let err = BackupChainRestorer::new(f.fetcher, Arc::new(SpaceLedger::host(root)))
             .with_headroom(0)

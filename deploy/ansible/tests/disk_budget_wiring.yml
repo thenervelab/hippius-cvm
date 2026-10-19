@@ -19,7 +19,7 @@
     ansible_mounts:
       - { mount: /, size_total: 957777477632, size_available: 4294967296 }
     miner_data_disk_root: /var/lib/hippius-miner
-    # A 892 GiB root filesystem: 44 GiB root-reserved, 4 GiB available
+    # A host like: 892 GiB, 44 GiB root-reserved, 4 GiB available
     # (`%S %b %f %a`): 848 GiB usable.
     miner_data_statfs_canned: "4096 233832448 12582912 1048576"
   tasks:

@@ -271,3 +271,182 @@ def test_redaction_is_linear_on_hostile_input() -> None:
     redact("ata-" * 16_384)
     redact("x" * 65_536 + "serial")
     assert time.monotonic() - started < 1.0
+
+
+# ─── the attested block (vali's attested sources, not the report) ────
+
+MEAS_A = "a1" * 48
+MEAS_B = "b2" * 48
+GENOA_CHIP = "c0" * 64
+
+
+def _miner(platform_id: str = GENOA_CHIP, snp_generation: str = "") -> Any:
+    from apps.miners.models import MinerIdentity
+
+    return MinerIdentity.objects.create(
+        miner_id="miner-1",
+        pubkey_hex="ab" * 32,
+        platform_id=platform_id,
+        chain_node_id=NODE,
+        snp_generation=snp_generation,
+    )
+
+
+def _attestor(**over: Any) -> Any:
+    from apps.telemetry.models import HostAttestor, HostAttestorStatus
+
+    fields = {
+        "chip_id": GENOA_CHIP,
+        "node_id": NODE,
+        "signer_pubkey": bytes(32),
+        "measurement": MEAS_A,
+        "tcb": 0x1B00000000000815,
+        "cert_expiry_at": timezone.now() + timedelta(days=30),
+        "status": HostAttestorStatus.ATTESTED.value,
+        "last_seen_at": timezone.now(),
+    }
+    fields.update(over)
+    return HostAttestor.objects.create(**fields)
+
+
+def _release(measurement: str = MEAS_A) -> None:
+    from apps.telemetry.models import HostAttestorRelease
+
+    HostAttestorRelease.objects.create(measurement=measurement, version="v1", is_active=True)
+
+
+def _attested(operator_client: APIClient) -> dict[str, Any]:
+    response = operator_client.get(_url("operator_hardware"), **HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert GENOA_CHIP not in response.content.decode(), "the CHIP_ID is never served"
+    return body["attested"]
+
+
+def test_an_attested_host(owned: dict[str, Any], operator_client: APIClient) -> None:
+    _miner()
+    _release()
+    _attestor()
+    a = _attested(operator_client)
+    assert a["attestor_status"] == "attested"
+    assert a["attestor_gate_reason"] is None
+    assert (a["snp_generation"], a["snp_generation_source"]) == ("genoa", "inferred")
+    assert a["chip_id_present"] is True
+    assert a["chip_matches_attestor"] is True
+    # Hex: a 64-bit bitfield past 2^53 would lose its low SVN bits as a number.
+    assert a["platform_tcb"] == {"current": None, "reported": "0x1b00000000000815"}
+    assert a["as_of"] is not None
+
+
+def test_a_pending_attestor_carries_no_tcb(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    from apps.telemetry.models import HostAttestorStatus
+
+    _miner(snp_generation="milan")
+    _release()
+    _attestor(status=HostAttestorStatus.PENDING.value)
+    a = _attested(operator_client)
+    assert (a["attestor_status"], a["attestor_gate_reason"]) == ("pending", "attestor-pending")
+    assert a["platform_tcb"] is None, "an unverified cert's TCB is not attested"
+    assert (a["snp_generation"], a["snp_generation_source"]) == ("milan", "registered")
+
+
+def test_no_attestor_and_no_chip(owned: dict[str, Any], operator_client: APIClient) -> None:
+    _miner(platform_id="onchain:" + NODE)
+    a = _attested(operator_client)
+    assert a == {
+        "snp_generation": None,
+        "snp_generation_source": None,
+        "chip_id_present": False,
+        "chip_matches_attestor": None,
+        "platform_tcb": None,
+        "attestor_status": "missing",
+        "attestor_gate_reason": "release-unpinned",
+        "as_of": None,
+    }
+
+
+def test_no_identity_at_all(owned: dict[str, Any], operator_client: APIClient) -> None:
+    a = _attested(operator_client)
+    assert (a["snp_generation"], a["chip_id_present"], a["attestor_status"]) == (
+        None,
+        False,
+        "missing",
+    )
+
+
+@pytest.mark.parametrize(
+    ("over", "reason"),
+    [
+        ({"last_seen_at": timezone.now() - timedelta(days=2)}, "attestor-stale"),
+        ({"status": "expired"}, "cert-expired"),
+        ({"measurement": MEAS_B}, "measurement-stale"),
+    ],
+)
+def test_a_stale_attestor(
+    owned: dict[str, Any], operator_client: APIClient, over: dict[str, Any], reason: str
+) -> None:
+    _miner()
+    _release()
+    _attestor(**over)
+    a = _attested(operator_client)
+    assert (a["attestor_status"], a["attestor_gate_reason"]) == ("stale", reason)
+    # Still KBS-certified unless its cert expired: the TCB stays attested.
+    assert (a["platform_tcb"] is None) == (reason == "cert-expired")
+
+
+def test_the_row_the_gate_judges_is_shown(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    from apps.telemetry.models import HostAttestorStatus
+
+    _miner()
+    _release()
+    # A re-key left a fresher pending row beside the covering one — and
+    # first in the table's order, so `.first()` would pick the wrong row.
+    _attestor(chip_id="a0" * 64, status=HostAttestorStatus.PENDING.value, tcb=1)
+    _attestor()
+    a = _attested(operator_client)
+    assert a["attestor_status"] == "attested"
+    assert a["platform_tcb"]["reported"] == "0x1b00000000000815"
+
+
+def test_no_release_pinned_judges_the_rest_of_the_row(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    from apps.telemetry.models import HostAttestor, HostAttestorStatus
+
+    _miner()
+    _attestor()
+    a = _attested(operator_client)
+    assert (a["attestor_status"], a["attestor_gate_reason"]) == ("attested", "release-unpinned")
+    # The gate's reason is unpinned whatever the row: a pending one too.
+    HostAttestor.objects.update(status=HostAttestorStatus.PENDING.value)
+    a = _attested(operator_client)
+    assert (a["attestor_status"], a["attestor_gate_reason"]) == ("pending", "release-unpinned")
+
+
+def test_an_attestor_of_another_chip_is_flagged(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    _miner()
+    _release()
+    _attestor(chip_id="e0" * 64)
+    assert _attested(operator_client)["chip_matches_attestor"] is False
+
+
+def test_every_gate_reason_has_a_status() -> None:
+    from apps.disktier.hardware_views import _ATTESTOR_STATUS
+    from apps.telemetry import release_service
+
+    assert set(release_service._REASON_RANK) | {None} == set(_ATTESTOR_STATUS)
+
+
+def test_no_attestor_with_a_release_pinned(
+    owned: dict[str, Any], operator_client: APIClient
+) -> None:
+    _miner()
+    _release()
+    a = _attested(operator_client)
+    assert (a["attestor_status"], a["attestor_gate_reason"]) == ("missing", "attestor-missing")

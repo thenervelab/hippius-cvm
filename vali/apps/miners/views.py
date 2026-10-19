@@ -42,6 +42,12 @@
       → 200 / 400 wire or invalid / 403 / 404 unknown miner or no capacity
         row yet / 409 already approved, not measured, or below committed.
 
+  GET /v1/admin/miner/<miner_id>/hardware[/history] | /disk-inventory
+      | /host-disk-advisories
+      Auth: ServiceToken, the miner-admin principal. Read-only support views
+      of the host inventory, serials and by-id names withheld
+      (`apps.miners.hardware_views`).
+
 The miner registry is the trust anchor for miner-signed telemetry; it
 is never derived from a miner's self-report (§13/§23).
 """

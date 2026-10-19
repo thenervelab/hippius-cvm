@@ -20,7 +20,7 @@
     miner_agent_miner_id: m-0123456789abcdef
     miner_identity_init: { stdout: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
     miner_platform_id: { stdout: "{{ 'ab' * 64 }}" }
-    miner_netbird_ip: 100.64.12.34
+    miner_netbird_ip: 100.65.187.90
     # Play 00's inputs for an EPYC 7543 (family 25, model 1 = Milan).
     ansible_architecture: x86_64
     ansible_distribution: Ubuntu
@@ -97,11 +97,11 @@
           {"miner_id": "m-0123456789abcdef",
           "node_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
           "platform_id": "{{ 'ab' * 64 }}",
-          "netbird_ip": "100.64.12.34", "snp_generation": "milan"}
+          "netbird_ip": "100.65.187.90", "snp_generation": "milan"}
         expected:
           miner_id: m-0123456789abcdef
           node_id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           platform_id: "{{ 'ab' * 64 }}"
-          netbird_ip: 100.64.12.34
+          netbird_ip: 100.65.187.90
           snp_generation: milan
         registration_json: "{{ miner_registration_json.msg | from_json }}"

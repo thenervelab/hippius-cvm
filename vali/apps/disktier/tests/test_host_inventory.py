@@ -118,8 +118,9 @@ def test_changes_are_reaped_past_their_retention() -> None:
 
 _APPS = Path(__file__).resolve().parents[2]
 #: The only modules that may name the host inventory: its own module and
-#: models, the retention sweep, the migration, the Edge-relayed ingest and
-#: the owner-scoped operator reads. Tiers, placement, cordon, pay, strikes and billing never do.
+#: models, the retention sweep, the migration, the Edge-relayed ingest, the
+#: owner-scoped operator reads and their serial-withheld miner-admin twin.
+#: Tiers, placement, cordon, pay, strikes and billing never do.
 _ALLOWED = {
     "disktier/host_inventory.py",
     "disktier/host_advisories.py",
@@ -127,6 +128,10 @@ _ALLOWED = {
     "disktier/gc.py",
     # The owner-scoped operator reads (serials stay behind the family check).
     "disktier/hardware_views.py",
+    # The miner-admin support reads of the same readouts, and the step that
+    # withholds their serials and by-id names: read-only, they decide nothing.
+    "disktier/withhold.py",
+    "miners/hardware_views.py",
     "telemetry/views.py",
     "telemetry/verifier.py",
     "telemetry/urls.py",

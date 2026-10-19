@@ -357,7 +357,7 @@ def ripestat_geo(ip: str) -> GeoRecord | None:
     asn, prefix = _ripestat_network_info(base, q)
     if asn is None:
         # network-info sometimes answers `asns: []` (seen live for an
-        # APNIC-routed hosting-provider range) — prefix-overview names the
+        # range registered in one region and routed in another) — prefix-overview names the
         # announcing AS and its holder in one call.
         asn, overview_prefix, holder = _ripestat_prefix_overview(base, q)
         prefix = prefix or overview_prefix
@@ -390,7 +390,7 @@ def _ripestat_data(url: str, *, label: str) -> dict[str, Any]:
 
 
 def _ripestat_network_info(base: str, q: str) -> tuple[int | None, str]:
-    """`network-info`: `{"asns": ["64500"], "prefix": "203.0.113.0/24"}`
+    """`network-info`: `{"asns": ["64500"], "prefix": "198.51.100.0/24"}`
     → `(asn, prefix)`. Never raises — the ASN is enrichment."""
     try:
         net = _ripestat_data(
@@ -405,8 +405,8 @@ def _ripestat_network_info(base: str, q: str) -> tuple[int | None, str]:
 
 
 def _ripestat_prefix_overview(base: str, q: str) -> tuple[int | None, str, str]:
-    """`prefix-overview`: `{"resource": "203.0.113.0/24", "asns": [{"asn":
-    64500, "holder": "EXAMPLE-AS Example Hosting"}], …}`. Never raises."""
+    """`prefix-overview`: `{"resource": "198.51.100.0/24", "asns": [{"asn":
+    64500, "holder": "EXAMPLE-AS"}], …}`. Never raises."""
     try:
         over = _ripestat_data(
             f"{base}/data/prefix-overview/data.json?resource={q}", label="ripestat:prefix-overview"
@@ -656,10 +656,9 @@ def assess(
     while a missing sample is a statement about the probe. The tenant
     egress contradiction is never arbitrated away. Two GeoIP sources that
     disagree ARE, when the RTT rules exactly one of them out (`_arbitrate`):
-    a hosting provider's range registered to its Canadian entity but routed
-    in Australia, so NetBird's GeoLite said CA while RIPEstat said AU — at
-    293 ms from a European vantage point,
-    where Canada is at most ~100 ms.
+    a provider's range registered in Canada but routed in Sydney, so
+    NetBird's GeoLite said CA while RIPEstat said AU — at 293 ms from a
+    vantage in northern France, where Canada is at most ~100 ms.
     """
     if peer is None:
         return Verdict(LocationVerdict.UNKNOWN, [R_NO_PEER])

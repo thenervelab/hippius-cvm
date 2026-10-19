@@ -816,6 +816,19 @@ def test_miner_approval_flag_is_one_shared_value_and_off() -> None:
     assert on["VALI_MINER_APPROVAL_REQUIRED"] == "true"
 
 
+@_needs_helm
+def test_host_inventory_ingest_is_one_shared_value_and_on() -> None:
+    """The Edge-relayed host-inventory route (web pod) reads one ConfigMap
+    key, never a per-pod override. On since §18 went live; unset renders
+    "false", the settings.py default (the route answers 404)."""
+    docs = _docs()
+    assert _configmap_data(docs)["VALI_HOST_INVENTORY_INGEST"] == "true"
+    for label, env in _env_by_workload(docs).items():
+        assert not any(k.startswith("VALI_HOST_INVENTORY_") for k in env), label
+    unset = _configmap_data(_docs("--set", "hostInventory=null"))
+    assert unset["VALI_HOST_INVENTORY_INGEST"] == "false"
+
+
 def _public_ingresses(docs: list[dict]) -> dict[str, dict]:
     return {
         d["metadata"]["name"]: d
@@ -854,7 +867,7 @@ def test_the_miner_approval_route_is_published_narrowly() -> None:
     ingress = _public_ingresses(_docs())["vali-public-api-regex"]
     assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/use-regex"] == "true"
     paths = _ingress_paths(ingress)
-    assert [p["path"] for p in paths] == ["/v1/admin/miner/[A-Za-z0-9._-]+/approval$"]
+    assert [p["path"] for p in paths][0] == "/v1/admin/miner/[A-Za-z0-9._-]+/approval$"
     assert all(p["pathType"] == "ImplementationSpecific" for p in paths)
     # What ingress-nginx serves: `location ~* "^<path>"`.
     served = re.compile("^" + paths[0]["path"], re.IGNORECASE)
@@ -876,12 +889,54 @@ def test_the_miner_approval_route_is_published_narrowly() -> None:
         assert not served.search(hidden), hidden
 
 
+_ADMIN_HARDWARE_REGEX = (
+    "/v1/admin/miner/[A-Za-z0-9._-]+/"
+    "(hardware|hardware/history|disk-inventory|host-disk-advisories)$"
+)
+
+
+@_needs_helm
+def test_the_miner_admin_hardware_routes_are_published_narrowly() -> None:
+    """The four read-only miner-admin hardware routes (#1697) are published
+    through one anchored regex on the regex Ingress — never the miner's
+    write routes, the bare miner, the list, or an extra segment."""
+    ingress = _public_ingresses(_docs())["vali-public-api-regex"]
+    paths = _ingress_paths(ingress)
+    assert [p["path"] for p in paths] == [
+        "/v1/admin/miner/[A-Za-z0-9._-]+/approval$",
+        _ADMIN_HARDWARE_REGEX,
+    ]
+    assert all(p["pathType"] == "ImplementationSpecific" for p in paths)
+    # What ingress-nginx serves: `location ~* "^<path>"`.
+    served = re.compile("^" + paths[1]["path"], re.IGNORECASE)
+    for miner in ("miner-b", "ab" * 32):
+        for leaf in ("hardware", "hardware/history", "disk-inventory", "host-disk-advisories"):
+            ok = f"/v1/admin/miner/{miner}/{leaf}"
+            assert served.search(ok), ok
+    for hidden in (
+        "/v1/admin/miner/miner-b/drain",
+        "/v1/admin/miner/miner-b/quarantine",
+        "/v1/admin/miner/miner-b/approval",
+        "/v1/admin/miner/miner-b",
+        "/v1/admin/miner/list",
+        "/v1/admin/miner/register",
+        "/v1/admin/miner/a/b/hardware",
+        "/v1/admin/miner/miner-b/hardware/x",
+        "/v1/admin/miner/miner-b/hardware/history/x",
+        "/v1/admin/miner/miner-b/disk-inventory/x",
+        "/v1/admin/miner/miner-b/hardware-x",
+        "/v1/admin/miner//hardware",
+    ):
+        assert not served.search(hidden), hidden
+
+
 @_needs_helm
 def test_no_vali_route_leaks_through_a_regex_prefix() -> None:
     """With `use-regex` on the host, ingress-nginx serves every Prefix path
     as `~* "^<path>"`: case-insensitive, no path-element boundary. No vali
     route may start with a published prefix without being AT or UNDER it,
-    and the regex paths may match no route but the approval one."""
+    and the regex paths may match no route but the approval one and the
+    four miner-admin hardware reads."""
     docs = _docs()
     ingresses = _public_ingresses(docs)
     prefixes = [p["path"] for p in _ingress_paths(ingresses["vali-public-api"])]
@@ -898,7 +953,13 @@ def test_no_vali_route_leaks_through_a_regex_prefix() -> None:
                     f"{route} would be published by the regex form of {prefix}"
                 )
     matched = sorted({r for r in routes for rx in regexes if rx.search(r)})
-    assert matched == ["/v1/admin/miner/miner-a/approval"], matched
+    assert matched == [
+        "/v1/admin/miner/miner-a/approval",
+        "/v1/admin/miner/miner-a/disk-inventory",
+        "/v1/admin/miner/miner-a/hardware",
+        "/v1/admin/miner/miner-a/hardware/history",
+        "/v1/admin/miner/miner-a/host-disk-advisories",
+    ], matched
 
 
 @_needs_helm

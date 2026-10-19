@@ -335,6 +335,20 @@ pub trait CommandRunner: Send + Sync {
         self.run(program, args)
     }
 
+    /// [`Self::run_bounded`], and the tool's exit code when it exited
+    /// non-zero (`None`: it exited 0, was killed, never ran — or the
+    /// runner does not know). For a log line saying how a tool failed;
+    /// never its output.
+    fn run_bounded_status(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        any_exit: bool,
+    ) -> (Result<String, CommandError>, Option<i32>) {
+        (self.run_bounded(program, args, timeout, any_exit), None)
+    }
+
     /// [`Self::run_bounded`] (exit 0 required) for a tool whose output
     /// can be longer than the stdout cap: at the cap the tool is stopped
     /// (its process group killed) and what was read is the answer, not a
@@ -399,6 +413,16 @@ impl CommandRunner for SystemRunner {
         exec(program, args, timeout, any_exit, false)
     }
 
+    fn run_bounded_status(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        any_exit: bool,
+    ) -> (Result<String, CommandError>, Option<i32>) {
+        exec_status(program, args, timeout, any_exit, false)
+    }
+
     fn run_capped(
         &self,
         program: &str,
@@ -420,11 +444,22 @@ fn exec(
     any_exit: bool,
     stop_at_cap: bool,
 ) -> Result<String, CommandError> {
+    exec_status(program, args, timeout, any_exit, stop_at_cap).0
+}
+
+/// [`exec`], and the tool's exit code when it exited non-zero.
+fn exec_status(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    any_exit: bool,
+    stop_at_cap: bool,
+) -> (Result<String, CommandError>, Option<i32>) {
     use std::os::unix::process::CommandExt;
     // Its own process group, so a timeout reaches the grandchildren
     // too: one of them holding stdout would otherwise keep the pipe
     // (and the reader) open past the deadline.
-    let mut child = std::process::Command::new(program)
+    let child = std::process::Command::new(program)
         .args(args)
         .env_clear()
         .env("PATH", TOOL_PATH)
@@ -433,11 +468,14 @@ fn exec(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => CommandError::NotFound,
-            _ => CommandError::Failed,
-        })?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Err(CommandError::NotFound), None)
+        }
+        Err(_) => return (Err(CommandError::Failed), None),
+    };
     let pgid = i32::try_from(child.id())
         .ok()
         .map(nix::unistd::Pid::from_raw);
@@ -512,10 +550,14 @@ fn exec(
     // die of SIGPIPE once the reader stops, before the loop above saw the
     // cap.
     if let (true, Ok((out, true))) = (stop_at_cap, &stdout) {
-        return Ok(String::from_utf8_lossy(out).into_owned());
+        return (Ok(String::from_utf8_lossy(out).into_owned()), None);
     }
     let stdout = stdout.map(|(kept, _)| kept);
-    match (exit, stdout) {
+    let code = match &exit {
+        Exit::Status(s) if !s.success() => s.code(),
+        _ => None,
+    };
+    let result = match (exit, stdout) {
         (Exit::Capped, Ok(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
         (Exit::Capped, Err(_)) => Err(CommandError::Failed),
         (Exit::TimedOut, _) => Err(CommandError::Timeout),
@@ -525,7 +567,8 @@ fn exec(
         }
         (Exit::Status(s), Err(_)) if s.success() || any_exit => Err(CommandError::Timeout),
         (Exit::Status(_), _) => Err(CommandError::Failed),
-    }
+    };
+    (result, code)
 }
 
 // ─── the oneshot ─────────────────────────────────────────────────────
@@ -555,6 +598,9 @@ pub fn collect(
 ) -> Result<(Sections, storage::Counters), NoProbeTime> {
     // Sensors and IPMI before storage: the SMART probe stays last.
     let sensors = collect_sensors(paths, runner);
+    for line in &sensors.notes {
+        eprintln!("{line}");
+    }
     if sensors.dropped > 0 {
         eprintln!(
             "hippius-miner-agent: host-inventory-collect: sensors: {} reading(s) dropped \
@@ -1048,12 +1094,25 @@ pub(crate) mod fixture {
 
     /// Canned tool output, keyed by `program arg arg…`; anything else is
     /// "not installed".
+    /// The exit code a command's canned failure reports, if any.
     #[derive(Default)]
-    pub(crate) struct Runner(pub(crate) BTreeMap<String, Result<String, CommandError>>);
+    pub(crate) struct Runner(
+        pub(crate) BTreeMap<String, Result<String, CommandError>>,
+        pub(crate) BTreeMap<String, i32>,
+    );
 
     impl Runner {
         pub(crate) fn with(mut self, cmd: &str, out: Result<&str, CommandError>) -> Self {
             self.0.insert(cmd.to_string(), out.map(str::to_string));
+            // A later answer replaces an earlier `exits`, code included.
+            self.1.remove(cmd);
+            self
+        }
+
+        /// `cmd` fails with exit code `code`.
+        pub(crate) fn exits(mut self, cmd: &str, code: i32) -> Self {
+            self.0.insert(cmd.to_string(), Err(CommandError::Failed));
+            self.1.insert(cmd.to_string(), code);
             self
         }
     }
@@ -1068,6 +1127,23 @@ pub(crate) mod fixture {
                 .get(&key)
                 .cloned()
                 .unwrap_or(Err(CommandError::NotFound))
+        }
+
+        fn run_bounded_status(
+            &self,
+            program: &str,
+            args: &[&str],
+            timeout: Duration,
+            any_exit: bool,
+        ) -> (Result<String, CommandError>, Option<i32>) {
+            let key = std::iter::once(program)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (
+                self.run_bounded(program, args, timeout, any_exit),
+                self.1.get(&key).copied(),
+            )
         }
     }
 }
@@ -1167,6 +1243,19 @@ mod tests {
         assert_eq!(
             r.run_bounded("sh", &script, Duration::from_secs(5), false),
             Err(CommandError::Failed)
+        );
+        // The exit code of a failure, for its log line; none on success.
+        assert_eq!(
+            r.run_bounded_status("sh", &script, Duration::from_secs(5), false),
+            (Err(CommandError::Failed), Some(72))
+        );
+        assert_eq!(
+            r.run_bounded_status("sh", &["-c", "echo ok"], Duration::from_secs(5), false),
+            (Ok("ok\n".to_string()), None)
+        );
+        assert_eq!(
+            r.run_bounded_status("hippius-no-such-tool", &[], Duration::from_secs(5), false),
+            (Err(CommandError::NotFound), None)
         );
         let started = std::time::Instant::now();
         assert_eq!(

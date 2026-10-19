@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:3497a54ef60bd37e8df2c9c372d1d766b850c5ddf2192841a01c9c7d59f174f9"
+  digest: "sha256:373d1d58a8034c99d1dfdb3e19968fdf25d0a3d7c537e237f3dfaa4e039f623f"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "3355f11bd2a8569252fe6a4d5b938720aed92767"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39078999741/attempts/1"
+    commitSha: "147ea6de3e5b570418049deaaf5a85da341de0c4"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39185688876/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -1069,6 +1069,14 @@ storageMove:
     enabled: "true"
     # A move held mid-pivot this long pages (the VM is down meanwhile).
     pivotUnknownAfterMinutes: 10
+# §18.10 host inventory ingest (`apps.disktier.host_inventory`): the
+# Edge-relayed, miner-signed `POST /v1/telemetry/host-inventory` (web pod,
+# the only reader of the flag). UNTRUSTED, shown to the node owner only;
+# nothing schedules or pays on it. "false" = the route answers 404 (the
+# agent's poster backs off). The budget / skew / retention knobs keep
+# their settings.py defaults (no chart key).
+hostInventory:
+  ingest: "true"
 # The disk-tier probe orchestrator (docs/design/disk-tier-verification.md
 # §4.4, R1; `vali_disk_probe`): RECORD ONLY. SUSPENDED, and
 # VALI_DISK_PROBE_ENABLED keeps its code default (off, no chart key), so the
@@ -1746,6 +1754,12 @@ publicApiIngress:
     # `/{id}/drain`, `/v1/admin/miner/{id}` and `/list` stay unpublished
     # (pinned by the chart test).
     - /v1/admin/miner/[A-Za-z0-9._-]+/approval$
+    # Miner-admin hardware reads (#1697, `apps.miners.hardware_views`):
+    # GET-only, `IsMinerAdmin` (same ONE principal), serials and by-id
+    # names withheld. Published for the console's support view. The
+    # alternation is anchored at `$`: no extra segment, and `/drain`,
+    # `/quarantine`, the bare miner and `/list` stay unpublished (chart test).
+    - /v1/admin/miner/[A-Za-z0-9._-]+/(hardware|hardware/history|disk-inventory|host-disk-advisories)$
   # The nginx controller that serves the Ingress above. Named here because
   # the vali CiliumNetworkPolicy is default-deny: it has to admit these
   # pods on the listen port explicitly, or the route exists and every

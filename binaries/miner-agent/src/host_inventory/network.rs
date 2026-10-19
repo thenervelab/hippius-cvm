@@ -445,7 +445,7 @@ fd00000000000000000000000000abcd 06 40 00 80   vnet3
         nic_tree(&h);
         let json = serde_json::to_string(&collect_network(&h.paths(), &runner())).unwrap();
         for leak in [
-            MAC, "aa:bb", "51.195", "192.168", "100.92", "2001", "fe80", "fd00", "virbr", "vnet",
+            MAC, "aa:bb", "198.51", "192.168", "100.92", "2001", "fe80", "fd00", "virbr", "vnet",
             "wt0", "\"lo\"", "docker",
         ] {
             assert!(!json.contains(leak), "{leak} in {json}");
@@ -551,7 +551,7 @@ fd00000000000000000000000000abcd 06 40 00 80   vnet3
         assert_eq!(by_name["eno3"].role, NicRole::Unused);
         assert_eq!(n.virtual_interfaces, 3, "bond0, br0, eno2.100");
         let json = serde_json::to_string(&n).unwrap();
-        for leak in ["bond0", "br0", "eno2.100", "51.195", "10.1.1"] {
+        for leak in ["bond0", "br0", "eno2.100", "198.51", "10.1.1"] {
             assert!(!json.contains(leak), "{leak} in {json}");
         }
     }
