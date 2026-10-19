@@ -318,6 +318,23 @@ dodge by failing launches) but never downgrades a tier on its own. Under
 `VALI_DISK_TIER_CONSEQUENCES=record` only events, metrics and audit rows are
 written; under `enforce` everything applies.
 
+**Hard rule: host-reported advisories never decide.** The host inventory's
+advisories (§18 of the plan: SMART/NVMe attributes, kernel journal lines,
+sensors, PSUs) are self-reported by the miner and vendor-dependent: an SSD's
+raw attribute 198 can read 1080 on a healthy drive. They **never** trigger a
+cordon, a tier demotion, a merit penalty or a slashing on their own, under
+any `VALI_DISK_TIER_CONSEQUENCES`. Only the attested probe (G1/G2/R1: a
+vali-owned probe CVM, its result inside the guest-signed receipt) moves a
+pool or disk through this state machine. At most, an advisory may schedule a
+probe early (like the passive `suspect` row above), and the probe decides.
+The guard: `vali/apps/disktier/tests/test_host_inventory.py::
+test_only_the_ingest_and_its_own_module_name_the_host_inventory` fails if
+any module other than the ingest, its models, the operator reads and the
+retention sweep names the host inventory or its advisories, so scheduling,
+cordon, rewards and billing code cannot read them. A future C1/§14 change
+that wants an advisory to *trigger a probe* goes through that allowlist,
+deliberately and reviewed.
+
 ### 5.2 Dedicated disk
 
 ```
@@ -621,6 +638,9 @@ Hard ordering rules:
   zero Active miners with an unknown OS pool.
 - Dedicated disks are refused at launch while the blessed guest release
   lacks G3 (`dedicated-needs-release`).
+- Host-reported advisories (§18) never cordon, demote, penalise or slash on
+  their own: only the attested probe does (§5.1 hard rule). C1, the
+  remediation engine (E3) and slashing (S-*) must keep it.
 
 ## 11. Open items
 

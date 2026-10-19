@@ -1,7 +1,7 @@
 """Can we place this flavor BEFORE we sell it?
 
-The headline case is `4xlarge` (32 vCPU / 128 GiB) against
-125 GB / 24-core hosts. It exceeds the hardware on BOTH
+The headline case is `4xlarge` on the real fleet: 32 vCPU / 128 GiB
+against 125 GB / 24-core hosts. It exceeds the hardware on BOTH
 dimensions, so no amount of waiting or decommissioning makes it
 placeable — and vali's own scheduler cannot see that, because capacity
 is counted in reference-flavor SLOTS and one placement costs one slot
@@ -31,7 +31,7 @@ from .factories import (
     observe_chain_epoch,
 )
 
-# A representative mid-size host.
+# The real fleet, as measured 2026-08-20.
 REAL_MINER_MEMORY_MB = 125_000
 REAL_MINER_CPUS = 24
 
@@ -63,7 +63,7 @@ def _pin_chain(monkeypatch, *seeds: int) -> None:
 
 @pytest.fixture
 def real_fleet(db, monkeypatch):  # noqa: ANN001, ANN201 — pytest fixture
-    """Three identical mid-size miners."""
+    """Three miners the size of the ones we actually run."""
     observe_chain_epoch(10)
     for seed in (1, 2, 3):
         _host(seed, memory_mb=REAL_MINER_MEMORY_MB, cpus=REAL_MINER_CPUS)
@@ -156,9 +156,10 @@ class TestItRefusesToGuess:
         assert result.hosts[0].shortfall == "no-trusted-anchor"
         assert result.hosts[0].size_unknown is True
         assert result.hosts[0].free_memory_mb is None
-        # …and unknown must NOT become `never`. An earlier version, facing
-        # miners whose `total_memory_mb` was None (no operator anchor
-        # seeded yet), answered `never` for the ENTIRE catalogue — it declared
+        # …and unknown must NOT become `never`. This is the LIVE bug: every
+        # miner on the real fleet has `total_memory_mb = None` (the
+        # operator anchor was never seeded), so the first version of this
+        # code answered `never` for the ENTIRE catalogue — it declared
         # every flavor permanently unsellable from missing data alone.
         # `never` has to be earned from knowledge.
         assert result.verdict == "not-now"
@@ -167,8 +168,8 @@ class TestItRefusesToGuess:
     def test_a_fleet_with_no_anchors_at_all_never_says_never(
         self, db, monkeypatch
     ) -> None:  # noqa: ANN001
-        """Three reachable miners, none with a hardware anchor. Nothing may
-        be `never`."""
+        """The live fleet, exactly as found on 2026-08-20: three reachable
+        miners, none with a hardware anchor. Nothing may be `never`."""
         observe_chain_epoch(10)
         for seed in (1, 2, 3):
             _host(seed, memory_mb=None, cpus=None)
@@ -271,7 +272,7 @@ def _locate(seed: int, country: str, verdict: str = "verified") -> None:
 
     MinerLocation.objects.create(
         miner=MinerIdentity.objects.get(chain_node_id=node_id(seed)),
-        connection_ip="146.10.20.30",
+        connection_ip="149.112.112.45",
         country_code=country,
         verdict=verdict,
         observed_at=timezone.now(),

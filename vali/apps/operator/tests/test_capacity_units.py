@@ -47,7 +47,7 @@ def _host(seed: int, country: str, *, cpus: int, memory_mb: int, slots: int = 32
     miner = make_dispatchable_identity(seed)
     MinerLocation.objects.create(
         miner=miner,
-        connection_ip=f"146.10.20.{seed}",
+        connection_ip=f"149.112.112.{seed}",
         country_code=country,
         latitude=48.8,
         longitude=2.3,
@@ -230,7 +230,7 @@ def test_regions_sum_the_per_flavor_headroom_and_free_vms(
 def test_fleet_headroom_is_the_v2_figure_when_v2_decides(
     fleet: None, operator_client: APIClient
 ) -> None:
-    """Node 2 (24 threads, 384 GB) at 2:1 takes 32 smalls under v2 (the
+    """miner-2 (24 threads, 384 GB) at 2:1 takes 32 smalls under v2 (the
     VM ceiling binds) where v1's arithmetic says 22 (vCPU at 1:1)."""
     body = operator_client.get(reverse("operator_fleet"), {"chain": "false"}).json()
     row = next(r for r in body["miners"] if r["node_id"] == node_id(2))

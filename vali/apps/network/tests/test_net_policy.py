@@ -92,7 +92,7 @@ def _miner(seed: int, country: str = "FR", ip: str = "") -> MinerIdentity:
     miner = make_dispatchable_identity(seed)
     MinerLocation.objects.create(
         miner=miner,
-        connection_ip=ip or f"192.0.2.{100 + seed}",
+        connection_ip=ip or f"149.112.112.{seed}",
         country_code=country,
         verdict=LocationVerdict.VERIFIED,
         observed_at=timezone.now(),

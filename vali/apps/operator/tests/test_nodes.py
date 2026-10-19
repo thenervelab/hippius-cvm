@@ -820,7 +820,7 @@ def test_location_is_serialised_from_the_probe_row(operator_client: APIClient) -
     miner = make_dispatchable_identity(1)
     row = MinerLocation.objects.create(
         miner=miner,
-        connection_ip="146.10.20.30",
+        connection_ip="149.112.112.45",
         country_code="FR",
         city="",
         latitude=48.8582,
@@ -837,7 +837,7 @@ def test_location_is_serialised_from_the_probe_row(operator_client: APIClient) -
         "country_code": "FR",
         "region": "FR",
         "city": "",
-        "connection_ip": "146.10.20.30",
+        "connection_ip": "149.112.112.45",
         "asn": 64500,
         "as_holder": "EXAMPLE-AS",
         "rtt_ms": 4.0,

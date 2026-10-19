@@ -50,10 +50,46 @@ const ATTR_REALLOCATED: u64 = 5;
 const ATTR_PENDING: u64 = 197;
 const ATTR_OFFLINE_UNCORRECTABLE: u64 = 198;
 const ATTR_UDMA_CRC: u64 = 199;
+const ATTR_PROGRAM_FAIL: u64 = 181;
+const ATTR_ERASE_FAIL: u64 = 182;
+/// The names 181 / 182 carry when they ARE program / erase failures (181
+/// is `Non4k_Aligned_Access` on a Crucial C300 / m4 / C400, and other
+/// vendors reuse both): only these are read.
+const PROGRAM_ERASE_FAIL_NAMES: [&str; 6] = [
+    "Program_Fail_Cnt_Total",
+    "Program_Fail_Count",
+    "Program_Fail_Blocks",
+    "Block_Program_Failures",
+    "Erase_Fail_Count",
+    "Erase_Fail_Count_Total",
+];
+/// Attributes only a solid-state disk reports: evidence of one when it
+/// reports no rotation rate. smartmontools' drivedb tags 177
+/// (Wear_Leveling_Count) and 233 (Media_Wearout_Indicator) SSD by default;
+/// 173 has no default name, and every drive family mapping it is flash.
+/// NOT 202 / 231: drivedb tags them HDD by default (Data_Address_Mark_Errs,
+/// Temperature_Celsius), and an old HDD carrying them must keep the HDD
+/// reading of its bad sectors. Hybrid SSHDs map none of these and report a
+/// real rotation rate, which wins before this.
+const SSD_ONLY_ATTRS: [u64; 3] = [173, 177, 233];
+/// The attributes whose normalised value an SSD is judged on.
+const NORMALISED_ATTRS: [u64; 5] = [
+    ATTR_REALLOCATED,
+    ATTR_PROGRAM_FAIL,
+    ATTR_ERASE_FAIL,
+    ATTR_PENDING,
+    ATTR_OFFLINE_UNCORRECTABLE,
+];
 
 /// The counters a "rising" check compares across runs.
 const C_REALLOCATED: &str = "reallocated";
 const C_UDMA_CRC: &str = "udma_crc";
+/// An SSD's raw 197 / 198 / 181 / 182, kept to tell a rise from a static
+/// vendor counter.
+const C_PENDING: &str = "pending";
+const C_OFFLINE: &str = "offline_uncorrectable";
+const C_PROGRAM_FAIL: &str = "program_fail";
+const C_ERASE_FAIL: &str = "erase_fail";
 const C_MEDIA_ERRORS: &str = "media_errors";
 
 /// One signal of one subject, before its times are stamped.
@@ -124,6 +160,66 @@ pub(crate) struct AtaReading {
     pub(crate) power_on_hours: Option<u64>,
     /// `rotation_rate`: 0 = solid state.
     pub(crate) rotation_rate: Option<u64>,
+    /// 181 / 182 raw: NAND program / erase failures (an SSD's).
+    /// Only when the attribute's name says so ([`PROGRAM_ERASE_FAIL_NAMES`]).
+    pub(crate) program_fail: Option<u64>,
+    pub(crate) erase_fail: Option<u64>,
+    /// Secondary evidence of a solid-state disk, for one that reports no
+    /// rotation rate: an SSD-only attribute ([`SSD_ONLY_ATTRS`]), or
+    /// `trim.supported` together with a named program / erase failure count.
+    /// TRIM alone is not: drive-managed SMR hard disks advertise it.
+    pub(crate) ssd_evidence: bool,
+    /// The vendor's own verdict on [`NORMALISED_ATTRS`], by id.
+    pub(crate) normalised: BTreeMap<u64, Normalised>,
+}
+
+/// An attribute's normalised value against its threshold, as smartctl
+/// reports them (`value`, `thresh`, `when_failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Normalised {
+    pub(crate) value: u64,
+    pub(crate) thresh: u64,
+    pub(crate) when_failed: WhenFailed,
+}
+
+/// smartctl's `when_failed`: `""`, `"now"` or `"past"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhenFailed {
+    Never,
+    Now,
+    Past,
+}
+
+impl Normalised {
+    /// Failing now: at or below a real threshold (a threshold of 0 means
+    /// "never fails"), or smartctl says `now`.
+    fn failing(&self) -> bool {
+        (self.thresh > 0 && self.value <= self.thresh) || self.when_failed == WhenFailed::Now
+    }
+}
+
+/// Whether a device is solid state: smartctl's `rotation_rate` (0 =
+/// "Solid State Device") when it reports one, else sysfs `rotational`,
+/// else smartctl's secondary evidence ([`AtaReading::ssd_evidence`]), else
+/// unknown. smartctl wins a disagreement: it reads the
+/// drive's own IDENTIFY (word 217), whereas sysfs `rotational` is
+/// whatever the driver in front of the drive says — a RAID virtual disk,
+/// a USB or SAS bridge default to 1. (An NVMe never reaches here: its
+/// health path is its own.)
+///
+/// A change of behaviour: a directly attached SATA disk with sysfs
+/// `rotational=0` and no smartctl rotation rate used to get the HDD
+/// reading of raw 197 / 198; it now gets the SSD one.
+pub(crate) fn solid_state(
+    rotation_rate: Option<u64>,
+    rotational_hint: Option<bool>,
+    ssd_evidence: bool,
+) -> Option<bool> {
+    match (rotation_rate, rotational_hint) {
+        (Some(rate), _) => Some(rate == 0),
+        (None, Some(rotational)) => Some(!rotational),
+        (None, None) => ssd_evidence.then_some(true),
+    }
 }
 
 /// An NVMe health log reading.
@@ -168,14 +264,42 @@ pub(crate) fn parse_smartctl(text: &str) -> Result<Smart<AtaReading>, Malformed>
         return Ok(Smart::Unavailable);
     }
     let v = Value::Object(map);
-    let attr = |id: u64| -> Option<u64> {
+    let entry = |id: u64| -> Option<&Value> {
         v.get("ata_smart_attributes")?
             .get("table")?
             .as_array()?
             .iter()
             .find(|a| a.get("id").and_then(Value::as_u64) == Some(id))
-            .and_then(|a| u64_at(a, &["raw", "value"]))
     };
+    let attr = |id: u64| entry(id).and_then(|a| u64_at(a, &["raw", "value"]));
+    // 181 / 182 only under a program / erase failure name.
+    let is_named = |id: u64| {
+        entry(id)
+            .and_then(|a| a.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|n| PROGRAM_ERASE_FAIL_NAMES.contains(&n))
+    };
+    let named_attr = |id: u64| attr(id).filter(|_| is_named(id));
+    let normalised = NORMALISED_ATTRS
+        .iter()
+        .filter(|id| ![ATTR_PROGRAM_FAIL, ATTR_ERASE_FAIL].contains(*id) || is_named(**id))
+        .filter_map(|id| {
+            let a = entry(*id)?;
+            let when_failed = match a.get("when_failed").and_then(Value::as_str) {
+                Some("now") => WhenFailed::Now,
+                Some("past") => WhenFailed::Past,
+                _ => WhenFailed::Never,
+            };
+            Some((
+                *id,
+                Normalised {
+                    value: u64_at(a, &["value"])?,
+                    thresh: u64_at(a, &["thresh"])?,
+                    when_failed,
+                },
+            ))
+        })
+        .collect();
     let r = AtaReading {
         passed: v
             .get("smart_status")
@@ -188,10 +312,23 @@ pub(crate) fn parse_smartctl(text: &str) -> Result<Smart<AtaReading>, Malformed>
         temperature_c: i64_at(&v, &["temperature", "current"]),
         power_on_hours: u64_at(&v, &["power_on_time", "hours"]),
         rotation_rate: u64_at(&v, &["rotation_rate"]),
+        program_fail: named_attr(ATTR_PROGRAM_FAIL),
+        erase_fail: named_attr(ATTR_ERASE_FAIL),
+        ssd_evidence: SSD_ONLY_ATTRS.iter().any(|id| entry(*id).is_some())
+            || (v
+                .get("trim")
+                .and_then(|t| t.get("supported"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                && (named_attr(ATTR_PROGRAM_FAIL).is_some()
+                    || named_attr(ATTR_ERASE_FAIL).is_some())),
+        normalised,
     };
     let rotation_rate = r.rotation_rate;
+    let ssd_evidence = r.ssd_evidence;
     if (AtaReading {
         rotation_rate,
+        ssd_evidence,
         ..AtaReading::default()
     }) == r
     {
@@ -363,6 +500,67 @@ pub(crate) fn ata_signals(
             "SMART overall-health self-assessment failed",
         ));
     }
+    let ssd = solid_state(r.rotation_rate, rotational_hint, r.ssd_evidence);
+    if ssd == Some(true) {
+        ssd_media_signals(r, prev, &mut out, &mut keep);
+    } else {
+        // A disk not known to be solid state: the raw counts are sectors.
+        hdd_media_signals(r, prev, &mut out, &mut keep);
+    }
+    if let Some(n) = r.udma_crc {
+        keep.insert(C_UDMA_CRC.into(), n);
+        if let Some(was) = rising(prev, C_UDMA_CRC, n) {
+            out.push(signal(
+                C::UdmaCrcErrors,
+                S::Warning,
+                n,
+                signed(n),
+                &format!("UDMA CRC errors rose from {was} to {n}"),
+            ));
+        }
+    }
+    if let Some(t) = r.temperature_c {
+        // Unknown: the SSD threshold (the higher one, fewer false alarms),
+        // as before — whereas the media counts of an unknown disk take the
+        // HDD reading (never miss a real bad sector).
+        let threshold = if ssd.unwrap_or(true) {
+            SSD_TEMP_WARN_C
+        } else {
+            HDD_TEMP_WARN_C
+        };
+        if t >= threshold {
+            out.push(signal(
+                C::TemperatureHigh,
+                S::Warning,
+                1,
+                t,
+                &format!("temperature {t} C, threshold {threshold} C"),
+            ));
+        }
+    }
+    if let Some(h) = r.power_on_hours {
+        out.push(signal(
+            C::PowerOnHours,
+            S::Info,
+            h,
+            signed(h),
+            &format!("powered on {h} hours"),
+        ));
+    }
+    (out, keep)
+}
+
+/// The raw 5 (reallocated, `rising` against the previous run), 197 and
+/// 198 counts of a disk with sectors (an HDD, or not known to be solid
+/// state): today's §18.3 reading.
+fn hdd_media_signals(
+    r: &AtaReading,
+    prev: Option<&CounterMap>,
+    out: &mut Vec<Signal>,
+    keep: &mut CounterMap,
+) {
+    use AdvisoryCode as C;
+    use Severity as S;
     if let Some(n) = r.reallocated {
         keep.insert(C_REALLOCATED.into(), n);
         if n > 0 {
@@ -394,48 +592,157 @@ pub(crate) fn ata_signals(
             &format!("{n} offline uncorrectable sectors"),
         ));
     }
-    if let Some(n) = r.udma_crc {
-        keep.insert(C_UDMA_CRC.into(), n);
-        if let Some(was) = rising(prev, C_UDMA_CRC, n) {
-            out.push(signal(
-                C::UdmaCrcErrors,
-                S::Warning,
-                n,
-                signed(n),
-                &format!("UDMA CRC errors rose from {was} to {n}"),
-            ));
+}
+
+/// `cur` becomes `s` unless it is already critical.
+fn worsen(cur: &mut Option<Severity>, s: Severity) {
+    if *cur != Some(Severity::Critical) {
+        *cur = Some(s);
+    }
+}
+
+/// The vendor's verdict on attribute `id`: failing now (critical), failed
+/// in the past (warning), else nothing.
+fn threshold_verdict(r: &AtaReading, id: u64) -> Option<(Severity, String)> {
+    let a = r.normalised.get(&id)?;
+    if a.failing() {
+        Some((
+            Severity::Critical,
+            format!(
+                "attribute {id} failing: normalised {} against threshold {}",
+                a.value, a.thresh
+            ),
+        ))
+    } else if a.when_failed == WhenFailed::Past {
+        Some((
+            Severity::Warning,
+            format!("attribute {id} failed in the past"),
+        ))
+    } else {
+        None
+    }
+}
+
+/// A solid-state ATA disk. Raw 197 / 198 are vendor-specific counters on
+/// many SSDs (an SK hynix HFS1T9G32FEH reports raw 198 = 1080 with its
+/// normalised value at 100 and nothing retired) but real error counts on
+/// others (Crucial / Micron client, ATP, with a threshold of 0): a static
+/// raw value says nothing, a RISE since the previous run warns, and the
+/// vendor's own verdict — the normalised value at or below a real
+/// threshold, or `when_failed` — is critical (`past`: a warning).
+/// Attribute 5 (reallocated / retired blocks) stays a count, as on an
+/// HDD: > 0 warns, rising is critical; so do NAND program (181) and erase
+/// (182) failures, read only under their own names, on the same
+/// `reallocated_sectors` (a failed program or erase retires the block); a
+/// threshold verdict on 5 / 181 / 182 is critical there. The wear
+/// indicators (e.g. 177 / 233) have no advisory code of an ATA disk's: not
+/// read.
+fn ssd_media_signals(
+    r: &AtaReading,
+    prev: Option<&CounterMap>,
+    out: &mut Vec<Signal>,
+    keep: &mut CounterMap,
+) {
+    use AdvisoryCode as C;
+    use Severity as S;
+    let mut severity: Option<Severity> = None;
+    let mut parts: Vec<String> = Vec::new();
+    let mut count = 0u64;
+    if let Some(n) = r.reallocated {
+        keep.insert(C_REALLOCATED.into(), n);
+        if n > 0 {
+            count = n;
+            match rising(prev, C_REALLOCATED, n) {
+                Some(was) => {
+                    worsen(&mut severity, S::Critical);
+                    parts.push(format!("reallocated {n} blocks, up from {was}"));
+                }
+                None => {
+                    worsen(&mut severity, S::Warning);
+                    parts.push(format!("reallocated {n} blocks"));
+                }
+            }
         }
     }
-    if let Some(t) = r.temperature_c {
-        let ssd = match r.rotation_rate {
-            Some(rate) => rate == 0,
-            None => rotational_hint != Some(true),
-        };
-        let threshold = if ssd {
-            SSD_TEMP_WARN_C
-        } else {
-            HDD_TEMP_WARN_C
-        };
-        if t >= threshold {
-            out.push(signal(
-                C::TemperatureHigh,
-                S::Warning,
-                1,
-                t,
-                &format!("temperature {t} C, threshold {threshold} C"),
-            ));
+    // Program / erase failures: > 0 warns, rising is critical (as 5).
+    let mut failures = 0u64;
+    for (key, raw, what) in [
+        (C_PROGRAM_FAIL, r.program_fail, "program"),
+        (C_ERASE_FAIL, r.erase_fail, "erase"),
+    ] {
+        let Some(n) = raw else { continue };
+        keep.insert(key.into(), n);
+        if n == 0 {
+            continue;
+        }
+        failures = failures.saturating_add(n);
+        match rising(prev, key, n) {
+            Some(was) => {
+                worsen(&mut severity, S::Critical);
+                parts.push(format!("{n} NAND {what} failures, up from {was}"));
+            }
+            None => {
+                worsen(&mut severity, S::Warning);
+                parts.push(format!("{n} NAND {what} failures"));
+            }
         }
     }
-    if let Some(h) = r.power_on_hours {
+    if count == 0 {
+        count = failures;
+    }
+    for id in [ATTR_REALLOCATED, ATTR_PROGRAM_FAIL, ATTR_ERASE_FAIL] {
+        if let Some((s, text)) = threshold_verdict(r, id) {
+            worsen(&mut severity, s);
+            parts.push(text);
+        }
+    }
+    if let Some(severity) = severity {
+        let count = count.max(1);
         out.push(signal(
-            C::PowerOnHours,
-            S::Info,
-            h,
-            signed(h),
-            &format!("powered on {h} hours"),
+            C::ReallocatedSectors,
+            severity,
+            count,
+            signed(count),
+            &parts.join("; "),
         ));
     }
-    (out, keep)
+    // 197 / 198: the vendor's verdict (critical), or a raw count that
+    // ROSE since the previous run (warning). A static raw value — a
+    // vendor counter — says nothing.
+    for (id, key, code, raw, what) in [
+        (
+            ATTR_PENDING,
+            C_PENDING,
+            C::PendingSectors,
+            r.pending,
+            "pending",
+        ),
+        (
+            ATTR_OFFLINE_UNCORRECTABLE,
+            C_OFFLINE,
+            C::OfflineUncorrectable,
+            r.offline_uncorrectable,
+            "offline uncorrectable",
+        ),
+    ] {
+        let mut severity: Option<Severity> = None;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(n) = raw {
+            keep.insert(key.into(), n);
+            if let Some(was) = rising(prev, key, n) {
+                worsen(&mut severity, S::Warning);
+                parts.push(format!("{what} count rose from {was} to {n}"));
+            }
+        }
+        if let Some((s, text)) = threshold_verdict(r, id) {
+            worsen(&mut severity, s);
+            parts.push(text);
+        }
+        if let Some(severity) = severity {
+            let n = raw.unwrap_or(0).max(1);
+            out.push(signal(code, severity, n, signed(n), &parts.join("; ")));
+        }
+    }
 }
 
 /// The §18.3 NVMe signals of a reading, and the counters to keep.

@@ -54,7 +54,7 @@ def _located(seed: int, country: str, verdict: str = LocationVerdict.VERIFIED) -
     miner = make_dispatchable_identity(seed)
     return MinerLocation.objects.create(
         miner=miner,
-        connection_ip=f"146.10.20.{seed}",
+        connection_ip=f"149.112.112.{seed}",
         country_code=country,
         latitude=48.8,
         longitude=2.3,
