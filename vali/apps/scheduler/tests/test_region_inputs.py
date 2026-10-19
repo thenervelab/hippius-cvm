@@ -32,7 +32,7 @@ def _locate(
 ) -> MinerLocation:
     return MinerLocation.objects.create(
         miner=miner,
-        connection_ip="146.10.20.30",
+        connection_ip="149.112.112.45",
         country_code=country,
         verdict=verdict,
         observed_at=timezone.now(),

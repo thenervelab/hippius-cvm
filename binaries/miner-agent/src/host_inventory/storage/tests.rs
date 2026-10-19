@@ -602,11 +602,11 @@ const SCAN_OPEN: &str = r#"{"smartctl":{"exit_status":0},"devices":[
 /// scan type; `-d scsi` lists the controller's disks, never opens an NVMe,
 /// and sends a direct SATA /dev/sdX one IDENTIFY).
 const SCAN_CMD: &str = "smartctl --scan-open -d scsi -j";
-/// The former scan, and what smartctl 7.5 answers it (a Dell PowerEdge host).
+/// The former scan, and what smartctl 7.5 answers it (a Dell PowerEdge).
 const OLD_SCAN_CMD: &str = "smartctl --scan-open -d megaraid -j";
 const OLD_SCAN_75: &str = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"svn_revision":"5714","exit_status":1,"messages":[{"string":"Invalid type 'megaraid', valid arguments are: by-id, ata, scsi, sat, nvme","severity":"error"}]}}"#;
 /// smartctl 7.5 (svn 5714) `--scan-open -d scsi -j` on the PERC H330 Mini
-/// of a Dell PowerEdge host: the virtual disk and the two SATA SSDs
+/// of a Dell PowerEdge, as captured on a real host: the virtual disk and the two SATA SSDs
 /// behind it, SAT-tunnelled.
 const SCAN_OPEN_75: &str = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"svn_revision":"5714","exit_status":0},"devices":[
   {"name":"/dev/sda","info_name":"/dev/sda","type":"scsi","protocol":"SCSI"},
@@ -2666,5 +2666,585 @@ fn sensors_and_ipmi_run_before_storage_and_the_probe_last() {
     assert_eq!(
         s.system.as_ref().and_then(|x| x.bmc_firmware.as_deref()),
         Some("7.10")
+    );
+}
+
+/// smartctl 7.5 `-j -H -A -l error -d sat+megaraid,N /dev/bus/0` of the two
+/// SK hynix HFS1T9G32FEH SATA SSDs behind a PERC H330, as one host
+/// reported them: 198 (flags 0x0010, VALUE 100, WORST 100, THRESH
+/// 0, raw `offline`), raw 0 on 5 / 181 / 182 / 199, raw `wear` on 233 and
+/// `nand_gib` on 241, about 22k power-on hours, health PASSED, solid
+/// state. The normalised values of the attributes other than 198 were
+/// not reported: 100 against the threshold below is assumed.
+fn hynix_ssd(offline: u64, wear: u64, nand_gib: u64, hours: u64) -> String {
+    hynix_ssd_198(offline, wear, nand_gib, hours, 100, 0, "")
+}
+
+fn hynix_ssd_198(
+    offline: u64,
+    wear: u64,
+    nand_gib: u64,
+    hours: u64,
+    value: u64,
+    thresh: u64,
+    when_failed: &str,
+) -> String {
+    ssd_json(
+        &hynix_lines(offline, wear, nand_gib, hours, value, thresh, when_failed),
+        hours,
+    )
+}
+
+/// The attribute table lines of [`hynix_ssd_198`].
+fn hynix_lines(
+    offline: u64,
+    wear: u64,
+    nand_gib: u64,
+    hours: u64,
+    value: u64,
+    thresh: u64,
+    when_failed: &str,
+) -> Vec<String> {
+    vec![
+        r#"{"id":5,"name":"Retired_Block_Count","value":100,"worst":100,"thresh":10,"when_failed":"","flags":{"value":51,"string":"PO--CK "},"raw":{"value":0,"string":"0"}}"#.to_string(),
+        format!(r#"{{"id":9,"name":"Power_On_Hours","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{hours},"string":"{hours}"}}}}"#),
+        r#"{"id":181,"name":"Program_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{"value":50,"string":"-O--CK "},"raw":{"value":0,"string":"0"}}"#.to_string(),
+        r#"{"id":182,"name":"Erase_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{"value":50,"string":"-O--CK "},"raw":{"value":0,"string":"0"}}"#.to_string(),
+        format!(r#"{{"id":198,"name":"Offline_Uncorrectable","value":{value},"worst":{value},"thresh":{thresh},"when_failed":"{when_failed}","flags":{{"value":16,"string":"----C- "}},"raw":{{"value":{offline},"string":"{offline}"}}}}"#),
+        r#"{"id":199,"name":"UDMA_CRC_Error_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{"value":50,"string":"-O--CK "},"raw":{"value":0,"string":"0"}}"#.to_string(),
+        format!(r#"{{"id":233,"name":"Media_Wearout_Indicator","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{wear},"string":"{wear}"}}}}"#),
+        format!(r#"{{"id":241,"name":"Total_LBAs_Written","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{nand_gib},"string":"{nand_gib}"}}}}"#),
+    ]
+}
+
+/// smartctl 7.5 JSON of a solid-state SATA disk behind the PERC with the
+/// attribute table `lines`.
+fn ssd_json(lines: &[String], hours: u64) -> String {
+    format!(
+        r#"{{"json_format_version":[1,0],
+  "smartctl":{{"version":[7,5],"svn_revision":"5714","exit_status":0}},
+  "device":{{"name":"/dev/bus/0","type":"sat+megaraid,0","protocol":"ATA"}},
+  "model_name":"SK hynix HFS1T9G32FEH","rotation_rate":0,
+  "smart_status":{{"passed":true}},
+  "ata_smart_attributes":{{"revision":16,"table":[
+    {}]}},
+  "power_on_time":{{"hours":{hours}}},
+  "temperature":{{"current":33}}}}"#,
+        lines.join(",\n    ")
+    )
+}
+
+#[test]
+fn an_ssd_s_raw_198_is_not_bad_sectors() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    // pd0 and pd1: raw 198 = 1080 / 248, normalised 100, threshold 0.
+    for (offline, wear, nand, hours) in [
+        (1080, 281_103, 256_452, 22_000),
+        (248, 110_396, 114_681, 22_100),
+    ] {
+        let r = ata(&hynix_ssd(offline, wear, nand, hours));
+        assert_eq!(r.offline_uncorrectable, Some(offline));
+        let (signals, keep) = health::ata_signals(&r, None, None);
+        assert_eq!(
+            sig(&signals),
+            [(C::PowerOnHours, S::Info, signed(hours))],
+            "{offline}"
+        );
+        assert_eq!(keep.get("reallocated"), Some(&0));
+    }
+    // Through the PERC passthrough: no critical at all on either disk.
+    let h = Host::new();
+    let v = perc_host(&h);
+    let runner = Runner::default()
+        .with(SCAN_CMD, Ok(SCAN_OPEN_75))
+        .with(SAT_PD0, Ok(&hynix_ssd(1080, 281_103, 256_452, 22_000)))
+        .with(SAT_PD1, Ok(&hynix_ssd(248, 110_396, 114_681, 22_100)))
+        .with(SMARTCTL_SDC, Ok(&healthy_ata()));
+    let s = collect(&h, &runner, &v);
+    assert_eq!(s.status, SectionStatus::Ok);
+    assert!(
+        s.advisories
+            .iter()
+            .all(|a| a.severity != Severity::Critical && a.code != C::OfflineUncorrectable),
+        "{:?}",
+        codes(&s)
+    );
+    assert!(adv(&s, "ctrl:PERC H330 Mini:pd0", C::PowerOnHours).is_some());
+}
+
+fn signed(v: u64) -> i64 {
+    i64::try_from(v).unwrap()
+}
+
+#[test]
+fn an_ssd_s_198_at_its_threshold_is_raised() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    let only = |text: &str, code: C| -> Vec<(C, S, i64)> {
+        sig(&health::ata_signals(&ata(text), None, None).0)
+            .into_iter()
+            .filter(|(c, ..)| *c == code)
+            .collect()
+    };
+    // At or below a real threshold: critical, carrying the raw count.
+    for value in [10, 3] {
+        assert_eq!(
+            only(
+                &hynix_ssd_198(1080, 1, 1, 1, value, 10, ""),
+                C::OfflineUncorrectable
+            ),
+            [(C::OfflineUncorrectable, S::Critical, 1080)]
+        );
+    }
+    // Above it, or a threshold of 0 (never fails): nothing.
+    assert!(only(
+        &hynix_ssd_198(1080, 1, 1, 1, 11, 10, ""),
+        C::OfflineUncorrectable
+    )
+    .is_empty());
+    assert!(only(
+        &hynix_ssd_198(1080, 1, 1, 1, 0, 0, ""),
+        C::OfflineUncorrectable
+    )
+    .is_empty());
+    // smartctl's own verdict: `now` critical, `past` a warning.
+    assert_eq!(
+        only(
+            &hynix_ssd_198(0, 1, 1, 1, 100, 0, "now"),
+            C::OfflineUncorrectable
+        ),
+        [(C::OfflineUncorrectable, S::Critical, 1)]
+    );
+    assert_eq!(
+        only(
+            &hynix_ssd_198(0, 1, 1, 1, 100, 0, "past"),
+            C::OfflineUncorrectable
+        ),
+        [(C::OfflineUncorrectable, S::Warning, 1)]
+    );
+    let r = ata(&hynix_ssd_198(1080, 1, 1, 1, 10, 10, ""));
+    let s = health::ata_signals(&r, None, None).0;
+    let a = s
+        .iter()
+        .find(|s| s.code == C::OfflineUncorrectable)
+        .unwrap();
+    assert_eq!(
+        a.sample.as_deref(),
+        Some("attribute 198 failing: normalised 10 against threshold 10")
+    );
+}
+
+#[test]
+fn an_hdd_s_raw_198_is_still_bad_sectors() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    // Spinning (smartctl), or unknown with no rotation rate and no hint:
+    // the raw counts are sectors, whatever the normalised value.
+    let r = ata(&smart_ata(true, 0, 0, 5, 0, 35, 7200));
+    assert!(
+        sig(&health::ata_signals(&r, Some(false), None).0).contains(&(
+            C::OfflineUncorrectable,
+            S::Critical,
+            5
+        ))
+    );
+    let unknown = health::AtaReading {
+        offline_uncorrectable: Some(5),
+        pending: Some(2),
+        ..health::AtaReading::default()
+    };
+    let s = sig(&health::ata_signals(&unknown, None, None).0);
+    assert!(s.contains(&(C::OfflineUncorrectable, S::Critical, 5)));
+    assert!(s.contains(&(C::PendingSectors, S::Critical, 2)));
+    // The same counts on a disk the sysfs hint says is solid state (no
+    // rotation rate from smartctl): not sectors.
+    assert!(health::ata_signals(&unknown, Some(false), None)
+        .0
+        .is_empty());
+}
+
+#[test]
+fn which_disk_is_solid_state() {
+    use health::solid_state;
+    // smartctl's rotation rate wins over sysfs (a RAID VD or a bridge
+    // says rotational whatever is behind it).
+    assert_eq!(solid_state(Some(0), Some(true), false), Some(true));
+    assert_eq!(solid_state(Some(7200), Some(false), true), Some(false));
+    assert_eq!(solid_state(Some(0), None, false), Some(true));
+    assert_eq!(solid_state(Some(5400), None, true), Some(false));
+    // No rotation rate: the sysfs hint.
+    assert_eq!(solid_state(None, Some(false), false), Some(true));
+    assert_eq!(solid_state(None, Some(true), true), Some(false));
+    // No rate, no hint: smartctl's secondary evidence (an SSD-only
+    // attribute, TRIM with a named program / erase count), else unknown.
+    assert_eq!(solid_state(None, None, true), Some(true));
+    assert_eq!(solid_state(None, None, false), None);
+    // End to end: rotation 0 with a rotational sysfs hint is an SSD (raw
+    // 198 ignored); rotation 7200 with a solid-state hint is an HDD.
+    let ssd = ata(&smart_ata(true, 0, 0, 9, 0, 35, 0));
+    assert!(health::ata_signals(&ssd, Some(true), None)
+        .0
+        .iter()
+        .all(|s| s.code != AdvisoryCode::OfflineUncorrectable));
+    let hdd = ata(&smart_ata(true, 0, 0, 9, 0, 35, 7200));
+    assert!(health::ata_signals(&hdd, Some(false), None)
+        .0
+        .iter()
+        .any(|s| s.code == AdvisoryCode::OfflineUncorrectable));
+}
+
+#[test]
+fn an_ssd_s_retired_blocks_and_program_erase_failures() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    let with = |realloc: u64, program: u64, erase: u64, realloc_value: u64| {
+        hynix_ssd(0, 1, 1, 1)
+            .replacen(
+                r#""value":100,"worst":100,"thresh":10,"when_failed":"","flags":{"value":51,"string":"PO--CK "},"raw":{"value":0,"string":"0"}"#,
+                &format!(
+                    r#""value":{realloc_value},"worst":{realloc_value},"thresh":10,"when_failed":"","flags":{{"value":51,"string":"PO--CK "}},"raw":{{"value":{realloc},"string":"{realloc}"}}"#
+                ),
+                1,
+            )
+            .replacen(
+                r#""name":"Program_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{"value":50,"string":"-O--CK "},"raw":{"value":0"#,
+                &format!(
+                    r#""name":"Program_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{program}"#
+                ),
+                1,
+            )
+            .replacen(
+                r#""name":"Erase_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{"value":50,"string":"-O--CK "},"raw":{"value":0"#,
+                &format!(
+                    r#""name":"Erase_Fail_Count","value":100,"worst":100,"thresh":0,"when_failed":"","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{erase}"#
+                ),
+                1,
+            )
+    };
+    let realloc = |text: &str, prev: Option<&BTreeMap<String, u64>>| {
+        health::ata_signals(&ata(text), None, prev)
+            .0
+            .into_iter()
+            .filter(|s| s.code == C::ReallocatedSectors)
+            .map(|s| (s.severity, s.value, s.sample.unwrap_or_default()))
+            .collect::<Vec<_>>()
+    };
+    // Retired blocks: a count, warning; rising, critical (as on an HDD).
+    assert_eq!(
+        realloc(&with(4, 0, 0, 100), None),
+        [(S::Warning, 4, "reallocated 4 blocks".to_string())]
+    );
+    let prev = BTreeMap::from([("reallocated".to_string(), 2)]);
+    assert_eq!(
+        realloc(&with(4, 0, 0, 100), Some(&prev)),
+        [(
+            S::Critical,
+            4,
+            "reallocated 4 blocks, up from 2".to_string()
+        )]
+    );
+    // A later warning never lowers a critical (rising, then P/E failures).
+    assert_eq!(
+        realloc(&with(4, 1, 0, 100), Some(&prev)),
+        [(
+            S::Critical,
+            4,
+            "reallocated 4 blocks, up from 2; 1 NAND program failures".to_string()
+        )]
+    );
+    // Program / erase failures: a warning on the same code.
+    assert_eq!(
+        realloc(&with(0, 2, 1, 100), None),
+        [(
+            S::Warning,
+            3,
+            "2 NAND program failures; 1 NAND erase failures".to_string()
+        )]
+    );
+    assert_eq!(
+        realloc(&with(4, 2, 1, 100), None),
+        [(
+            S::Warning,
+            4,
+            "reallocated 4 blocks; 2 NAND program failures; 1 NAND erase failures".to_string()
+        )]
+    );
+    // Attribute 5 at its threshold: critical, even with a raw of 0.
+    assert_eq!(
+        realloc(&with(0, 0, 0, 10), None),
+        [(
+            S::Critical,
+            1,
+            "attribute 5 failing: normalised 10 against threshold 10".to_string()
+        )]
+    );
+    assert!(realloc(&with(0, 0, 0, 100), None).is_empty());
+}
+
+/// `hynix_ssd` with attribute `id`'s line replaced by `line` (or added).
+fn ssd_with(id: u64, line: &str) -> String {
+    let mut lines = hynix_lines(0, 1, 1, 1, 100, 0, "");
+    let tag = format!(r#"{{"id":{id},"#);
+    match lines.iter_mut().find(|l| l.starts_with(&tag)) {
+        Some(l) => *l = line.to_string(),
+        None => lines.push(line.to_string()),
+    }
+    ssd_json(&lines, 1)
+}
+
+fn attr_line(id: u64, name: &str, value: u64, thresh: u64, when_failed: &str, raw: u64) -> String {
+    format!(
+        r#"{{"id":{id},"name":"{name}","value":{value},"worst":{value},"thresh":{thresh},"when_failed":"{when_failed}","flags":{{"value":50,"string":"-O--CK "}},"raw":{{"value":{raw},"string":"{raw}"}}}}"#
+    )
+}
+
+fn only(
+    text: &str,
+    prev: Option<&BTreeMap<String, u64>>,
+    code: AdvisoryCode,
+) -> Vec<(Severity, i64, String)> {
+    health::ata_signals(&ata(text), None, prev)
+        .0
+        .into_iter()
+        .filter(|s| s.code == code)
+        .map(|s| (s.severity, s.value, s.sample.unwrap_or_default()))
+        .collect()
+}
+
+#[test]
+fn an_ssd_s_197_198_warn_only_when_they_rise() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    // 198: a static 1080 across two runs says nothing; 1080 → 1100 warns.
+    let first = ata(&hynix_ssd(1080, 1, 1, 1));
+    let (signals, keep) = health::ata_signals(&first, None, None);
+    assert!(signals.iter().all(|s| s.code != C::OfflineUncorrectable));
+    assert_eq!(keep.get("offline_uncorrectable"), Some(&1080));
+    assert!(only(
+        &hynix_ssd(1080, 1, 1, 1),
+        Some(&keep),
+        C::OfflineUncorrectable
+    )
+    .is_empty());
+    assert_eq!(
+        only(
+            &hynix_ssd(1100, 1, 1, 1),
+            Some(&keep),
+            C::OfflineUncorrectable
+        ),
+        [(
+            S::Warning,
+            1100,
+            "offline uncorrectable count rose from 1080 to 1100".to_string()
+        )]
+    );
+    // 197, the same way; and a rise with a threshold verdict is critical.
+    let pending = |raw: u64, value: u64| {
+        ssd_with(
+            197,
+            &attr_line(197, "Current_Pending_ECC_Cnt", value, 10, "", raw),
+        )
+    };
+    let (_, keep) = health::ata_signals(&ata(&pending(7, 100)), None, None);
+    assert_eq!(keep.get("pending"), Some(&7));
+    assert!(only(&pending(7, 100), Some(&keep), C::PendingSectors).is_empty());
+    assert_eq!(
+        only(&pending(9, 100), Some(&keep), C::PendingSectors),
+        [(S::Warning, 9, "pending count rose from 7 to 9".to_string())]
+    );
+    assert_eq!(
+        only(&pending(9, 10), Some(&keep), C::PendingSectors),
+        [(
+            S::Critical,
+            9,
+            "pending count rose from 7 to 9; attribute 197 failing: normalised 10 against threshold 10"
+                .to_string()
+        )]
+    );
+    // No previous run: never a rise.
+    assert!(only(&pending(9, 100), None, C::PendingSectors).is_empty());
+}
+
+#[test]
+fn a_181_that_is_not_a_program_failure_is_not_read() {
+    use AdvisoryCode as C;
+    // Crucial C300 / m4 / C400: 181 is Non4k_Aligned_Access, a big raw
+    // value with nothing wrong — even "failing" against its threshold.
+    for line in [
+        attr_line(181, "Non4k_Aligned_Access", 100, 0, "", 123_456),
+        attr_line(181, "Non4k_Aligned_Access", 1, 50, "now", 123_456),
+    ] {
+        let text = ssd_with(181, &line);
+        let r = ata(&text);
+        assert_eq!(r.program_fail, None);
+        assert!(
+            only(&text, None, C::ReallocatedSectors).is_empty(),
+            "{line}"
+        );
+    }
+    // Under each program / erase failure name, it is read.
+    for (id, name) in [
+        (181, "Program_Fail_Cnt_Total"),
+        (181, "Program_Fail_Count"),
+        (181, "Program_Fail_Blocks"),
+        (181, "Block_Program_Failures"),
+        (182, "Erase_Fail_Count"),
+        (182, "Erase_Fail_Count_Total"),
+    ] {
+        let text = ssd_with(id, &attr_line(id, name, 100, 0, "", 2));
+        assert_eq!(
+            only(&text, None, C::ReallocatedSectors).len(),
+            1,
+            "{id} {name}"
+        );
+    }
+}
+
+#[test]
+fn program_erase_failures_rising_and_when_failed_on_5_181_182() {
+    use AdvisoryCode as C;
+    use Severity as S;
+    let erase = |raw: u64| ssd_with(182, &attr_line(182, "Erase_Fail_Count", 100, 0, "", raw));
+    let (_, keep) = health::ata_signals(&ata(&erase(2)), None, None);
+    assert_eq!(keep.get("erase_fail"), Some(&2));
+    assert_eq!(
+        only(&erase(2), Some(&keep), C::ReallocatedSectors),
+        [(S::Warning, 2, "2 NAND erase failures".to_string())]
+    );
+    assert_eq!(
+        only(&erase(5), Some(&keep), C::ReallocatedSectors),
+        [(
+            S::Critical,
+            5,
+            "5 NAND erase failures, up from 2".to_string()
+        )]
+    );
+    // `when_failed` on 5 / 181 / 182: now critical, past a warning.
+    for (id, name) in [
+        (5, "Retired_Block_Count"),
+        (181, "Program_Fail_Count"),
+        (182, "Erase_Fail_Count"),
+    ] {
+        for (when, severity) in [("now", S::Critical), ("past", S::Warning)] {
+            let text = ssd_with(id, &attr_line(id, name, 100, 0, when, 0));
+            let got = only(&text, None, C::ReallocatedSectors);
+            assert_eq!(got.len(), 1, "{id} {when}");
+            assert_eq!(got[0].0, severity, "{id} {when}");
+        }
+    }
+}
+
+#[test]
+fn no_rotation_rate_behind_the_controller_uses_ssd_evidence() {
+    use AdvisoryCode as C;
+    let no_rate = |text: &str| text.replace(r#""rotation_rate":0,"#, "");
+    // An SSD-only attribute (233) in the table: SSD rules (raw 198 silent).
+    let text = no_rate(&hynix_ssd(1080, 1, 1, 1));
+    let r = ata(&text);
+    assert_eq!((r.rotation_rate, r.ssd_evidence), (None, true));
+    assert!(only(&text, None, C::OfflineUncorrectable).is_empty());
+    // Without it, but `trim.supported` and a named program / erase failure
+    // count (the Hynix 181 / 182): SSD rules.
+    let without_233 = |offline: u64| {
+        let mut lines = hynix_lines(offline, 1, 1, 1, 100, 0, "");
+        lines.retain(|l| !l.starts_with(r#"{"id":233,"#));
+        no_rate(&ssd_json(&lines, 1))
+    };
+    let trim = without_233(1080).replacen(
+        r#""smart_status""#,
+        r#""trim":{"supported":true},"smart_status""#,
+        1,
+    );
+    let r = ata(&trim);
+    assert_eq!((r.rotation_rate, r.ssd_evidence), (None, true));
+    assert!(only(&trim, None, C::OfflineUncorrectable).is_empty());
+    // 173 / 177 alone are evidence too.
+    for (id, name) in [(173, "Wear_Leveling_Count"), (177, "Wear_Range_Delta")] {
+        let mut lines = hynix_lines(1080, 1, 1, 1, 100, 0, "");
+        lines.retain(|l| !l.starts_with(r#"{"id":233,"#));
+        lines.push(attr_line(id, name, 100, 0, "", 0));
+        let text = no_rate(&ssd_json(&lines, 1));
+        assert!(ata(&text).ssd_evidence, "{id}");
+        assert!(
+            only(&text, None, C::OfflineUncorrectable).is_empty(),
+            "{id}"
+        );
+    }
+    // TRIM alone is no evidence (a drive-managed SMR HDD advertises it):
+    // without 181 / 182, the HDD reading of raw 198.
+    let mut lines = hynix_lines(1080, 1, 1, 1, 100, 0, "");
+    lines.retain(|l| {
+        !l.starts_with(r#"{"id":233,"#)
+            && !l.starts_with(r#"{"id":181,"#)
+            && !l.starts_with(r#"{"id":182,"#)
+    });
+    let smr = no_rate(&ssd_json(&lines, 1)).replacen(
+        r#""smart_status""#,
+        r#""trim":{"supported":true},"smart_status""#,
+        1,
+    );
+    assert!(!ata(&smr).ssd_evidence);
+    assert_eq!(only(&smr, None, C::OfflineUncorrectable).len(), 1);
+    // TRIM with only one of them (182, an erase failure count): evidence.
+    let mut lines = hynix_lines(1080, 1, 1, 1, 100, 0, "");
+    lines.retain(|l| !l.starts_with(r#"{"id":233,"#) && !l.starts_with(r#"{"id":181,"#));
+    let erase_only = no_rate(&ssd_json(&lines, 1)).replacen(
+        r#""smart_status""#,
+        r#""trim":{"supported":true},"smart_status""#,
+        1,
+    );
+    assert!(ata(&erase_only).ssd_evidence);
+    // 202 / 231 alone are no evidence: smartmontools tags them HDD.
+    for (id, name) in [
+        (202, "Data_Address_Mark_Errs"),
+        (231, "Temperature_Celsius"),
+    ] {
+        let mut lines = hynix_lines(1080, 1, 1, 1, 100, 0, "");
+        lines.retain(|l| !l.starts_with(r#"{"id":233,"#));
+        lines.push(attr_line(id, name, 100, 0, "", 0));
+        let text = no_rate(&ssd_json(&lines, 1));
+        assert!(!ata(&text).ssd_evidence, "{id}");
+        assert_eq!(only(&text, None, C::OfflineUncorrectable).len(), 1, "{id}");
+    }
+    // `trim.supported: false` is no evidence.
+    let no_trim = without_233(1080).replacen(
+        r#""smart_status""#,
+        r#""trim":{"supported":false},"smart_status""#,
+        1,
+    );
+    assert!(!ata(&no_trim).ssd_evidence);
+    // Neither: unknown, the HDD reading of raw 198.
+    let bare = without_233(1080);
+    assert!(!ata(&bare).ssd_evidence);
+    assert_eq!(
+        only(&bare, None, C::OfflineUncorrectable),
+        [(
+            Severity::Critical,
+            1080,
+            "1080 offline uncorrectable sectors".to_string()
+        )]
+    );
+    // Through the PERC passthrough: no rotation rate, SSD attributes → no critical.
+    let h = Host::new();
+    let v = perc_host(&h);
+    let runner = Runner::default()
+        .with(SCAN_CMD, Ok(SCAN_OPEN_75))
+        .with(
+            SAT_PD0,
+            Ok(&no_rate(&hynix_ssd(1080, 281_103, 256_452, 22_000))),
+        )
+        .with(
+            SAT_PD1,
+            Ok(&no_rate(&hynix_ssd(248, 110_396, 114_681, 22_100))),
+        )
+        .with(SMARTCTL_SDC, Ok(&healthy_ata()));
+    let s = collect(&h, &runner, &v);
+    assert!(
+        s.advisories
+            .iter()
+            .all(|a| a.severity != Severity::Critical),
+        "{:?}",
+        codes(&s)
     );
 }

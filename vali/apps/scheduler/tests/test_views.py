@@ -625,7 +625,7 @@ def _locate_seed(seed: int, country: str) -> None:
 
     MinerLocation.objects.create(
         miner=MinerIdentity.objects.get(chain_node_id=node_id(seed)),
-        connection_ip="146.10.20.30",
+        connection_ip="149.112.112.45",
         country_code=country,
         verdict=LocationVerdict.VERIFIED,
         observed_at=timezone.now(),

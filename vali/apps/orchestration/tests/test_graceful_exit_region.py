@@ -36,7 +36,7 @@ pytestmark = pytest.mark.django_db
 def _locate(miner_id: str, country: str) -> None:
     MinerLocation.objects.create(
         miner=MinerIdentity.objects.get(miner_id=miner_id),
-        connection_ip="198.51.100.45",
+        connection_ip="149.112.112.45",
         country_code=country,
         verdict=LocationVerdict.VERIFIED,
         observed_at=timezone.now(),
