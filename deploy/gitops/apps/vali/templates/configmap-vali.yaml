@@ -406,6 +406,8 @@ data:
   {{- with (.Values.storageMove).minAgentVersion }}
   VALI_STORAGE_MOVE_MIN_AGENT_VERSION: {{ . | quote }}
   {{- end }}
+  # §18.10 host inventory ingest — see values.yaml `hostInventory.ingest`.
+  VALI_HOST_INVENTORY_INGEST: {{ (.Values.hostInventory).ingest | default "false" | toString | quote }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}
   # Synthetic monitor (apps.synthetic). The full-e2e golden bake_ids
   # (distro → Succeeded golden bake_id, JSON) + the Pushgateway URL result

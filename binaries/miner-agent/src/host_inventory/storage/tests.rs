@@ -598,6 +598,228 @@ const SCAN_OPEN: &str = r#"{"smartctl":{"exit_status":0},"devices":[
   {"name":"/dev/../etc/x","type":"megaraid,2"},
   {"name":"/dev/bus/0","type":"megaraid,1;rm"}]}"#;
 
+/// The scan: SCSI-class only (smartctl 7.5 refuses `-d megaraid` as a
+/// scan type; `-d scsi` lists the controller's disks, never opens an NVMe,
+/// and sends a direct SATA /dev/sdX one IDENTIFY).
+const SCAN_CMD: &str = "smartctl --scan-open -d scsi -j";
+/// The former scan, and what smartctl 7.5 answers it (a Dell PowerEdge host).
+const OLD_SCAN_CMD: &str = "smartctl --scan-open -d megaraid -j";
+const OLD_SCAN_75: &str = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"svn_revision":"5714","exit_status":1,"messages":[{"string":"Invalid type 'megaraid', valid arguments are: by-id, ata, scsi, sat, nvme","severity":"error"}]}}"#;
+/// smartctl 7.5 (svn 5714) `--scan-open -d scsi -j` on the PERC H330 Mini
+/// of a Dell PowerEdge host: the virtual disk and the two SATA SSDs
+/// behind it, SAT-tunnelled.
+const SCAN_OPEN_75: &str = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"svn_revision":"5714","exit_status":0},"devices":[
+  {"name":"/dev/sda","info_name":"/dev/sda","type":"scsi","protocol":"SCSI"},
+  {"name":"/dev/bus/0","info_name":"/dev/bus/0 [megaraid_disk_00] [SAT]","type":"sat+megaraid,0","protocol":"ATA"},
+  {"name":"/dev/bus/0","info_name":"/dev/bus/0 [megaraid_disk_01] [SAT]","type":"sat+megaraid,1","protocol":"ATA"}]}"#;
+/// The same host's plain `--scan-open -j`: `/dev/sda` with its open error.
+const PLAIN_SCAN_OPEN_75: &str = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"svn_revision":"5714","exit_status":0},"devices":[
+  {"name":"/dev/sda","info_name":"/dev/sda","type":"scsi","protocol":"SCSI","open_error":"DELL or MegaRaid controller, please try adding '-d megaraid,N'"},
+  {"name":"/dev/bus/0","info_name":"/dev/bus/0 [megaraid_disk_00] [SAT]","type":"sat+megaraid,0","protocol":"ATA"},
+  {"name":"/dev/bus/0","info_name":"/dev/bus/0 [megaraid_disk_01] [SAT]","type":"sat+megaraid,1","protocol":"ATA"}]}"#;
+/// The same scan without `-j`.
+const SCAN_OPEN_75_TEXT: &str = "/dev/sda -d scsi # /dev/sda, SCSI device
+/dev/bus/0 -d sat+megaraid,0 # /dev/bus/0 [megaraid_disk_00] [SAT], ATA device
+/dev/bus/0 -d sat+megaraid,1 # /dev/bus/0 [megaraid_disk_01] [SAT], ATA device
+";
+const SAT_PD0: &str = "smartctl -j -H -A -l error -n standby,0 -d sat+megaraid,0 /dev/bus/0";
+const SAT_PD1: &str = "smartctl -j -H -A -l error -n standby,0 -d sat+megaraid,1 /dev/bus/0";
+
+#[test]
+fn smartctl_7_5_sat_megaraid_disks_are_probed_behind_the_perc() {
+    let h = Host::new();
+    let v = perc_host(&h);
+    let runner = Runner::default()
+        // A regression to the former scan gets smartctl 7.5's refusal.
+        .with(OLD_SCAN_CMD, Ok(OLD_SCAN_75))
+        .with(SCAN_CMD, Ok(SCAN_OPEN_75))
+        .with(SAT_PD0, Ok(&smart_ata(true, 2, 0, 0, 0, 30, 0)))
+        .with(SAT_PD1, Ok(&healthy_ata()))
+        .with(SMARTCTL_SDC, Ok(&healthy_ata()));
+    let s = collect(&h, &runner, &v);
+    let pd0 = adv(
+        &s,
+        "ctrl:PERC H330 Mini:pd0",
+        AdvisoryCode::ReallocatedSectors,
+    )
+    .unwrap();
+    assert_eq!(
+        (pd0.subject_kind, pd0.value),
+        (AdvisorySubject::Controller, 2)
+    );
+    assert!(adv(&s, "ctrl:PERC H330 Mini:pd1", AdvisoryCode::PowerOnHours).is_some());
+    assert!(
+        s.advisories
+            .iter()
+            .all(|a| a.code != AdvisoryCode::SmartUnavailableBehindController),
+        "{:?}",
+        codes(&s)
+    );
+}
+
+/// Records every command line run, in order.
+struct Lines {
+    inner: Runner,
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+impl CommandRunner for Lines {
+    fn run(&self, program: &str, args: &[&str]) -> Result<String, CommandError> {
+        let line = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>();
+        self.log.lock().unwrap().push(line.join(" "));
+        self.inner.run(program, args)
+    }
+}
+
+#[test]
+fn the_scan_is_exactly_the_scsi_one_and_only_on_a_megaraid_host() {
+    let h = Host::new();
+    let v = perc_host(&h);
+    let runner = Lines {
+        inner: Runner::default()
+            .with(SCAN_CMD, Ok(SCAN_OPEN_75))
+            .with(SAT_PD0, Ok(&healthy_ata()))
+            .with(SAT_PD1, Ok(&healthy_ata()))
+            .with(SMARTCTL_SDC, Ok(&healthy_ata())),
+        log: std::sync::Mutex::new(Vec::new()),
+    };
+    collect(&h, &runner, &v);
+    let scans: Vec<String> = runner
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("--scan"))
+        .cloned()
+        .collect();
+    assert_eq!(scans, [SCAN_CMD]);
+    // No MegaRAID virtual disk: no scan at all.
+    let h = Host::new();
+    let v = nvme_md_host(&h);
+    let runner = Lines {
+        inner: healthy_runner(),
+        log: std::sync::Mutex::new(Vec::new()),
+    };
+    collect(&h, &runner, &v);
+    let log = runner.log.lock().unwrap();
+    assert!(!log.is_empty(), "the probe ran");
+    assert!(log.iter().all(|l| !l.contains("--scan")), "{log:?}");
+}
+
+#[test]
+fn a_scan_timeout_is_one_controller_timeout() {
+    let h = Host::new();
+    let v = perc_host(&h);
+    let runner = Runner::default()
+        .with(SCAN_CMD, Err(CommandError::Timeout))
+        .with(SAT_PD0, Ok(&healthy_ata()))
+        .with(SMARTCTL_SDC, Ok(&healthy_ata()));
+    let s = collect(&h, &runner, &v);
+    assert_eq!(s.status, SectionStatus::Timeout);
+    let timeouts: Vec<&str> = s
+        .advisories
+        .iter()
+        .filter(|a| a.code == AdvisoryCode::CollectorTimeout)
+        .map(|a| a.subject.as_str())
+        .collect();
+    assert_eq!(timeouts, ["ctrl:PERC H330 Mini:scan"]);
+    let t = adv(
+        &s,
+        "ctrl:PERC H330 Mini:scan",
+        AdvisoryCode::CollectorTimeout,
+    )
+    .unwrap();
+    assert_eq!(
+        (t.subject_kind, t.severity, t.sample.as_deref()),
+        (
+            AdvisorySubject::Controller,
+            Severity::Warning,
+            Some("smartctl --scan-open timed out after 60 s")
+        )
+    );
+    // No disk behind it was probed; each VD says so.
+    assert!(s.advisories.iter().all(|a| !a.subject.contains(":pd")));
+    for vd in ["0", "1"] {
+        assert!(adv(
+            &s,
+            &format!("ctrl:PERC H330 Mini:{vd}"),
+            AdvisoryCode::SmartUnavailableBehindController
+        )
+        .is_some());
+    }
+}
+
+#[test]
+fn the_scan_parser_reads_7_4_and_7_5_json_and_text() {
+    let e = |device: &str, n: u32, dtype: &str| health::ScanEntry {
+        device: device.into(),
+        n,
+        dtype: dtype.into(),
+    };
+    let sat = vec![
+        e("/dev/bus/0", 0, "sat+megaraid,0"),
+        e("/dev/bus/0", 1, "sat+megaraid,1"),
+    ];
+    assert_eq!(health::parse_scan(SCAN_OPEN_75).unwrap(), sat);
+    assert_eq!(health::parse_scan(PLAIN_SCAN_OPEN_75).unwrap(), sat);
+    assert_eq!(health::parse_scan(SCAN_OPEN_75_TEXT).unwrap(), sat);
+    // 7.4-shaped (`megaraid,N`), the unsafe entries dropped.
+    assert_eq!(
+        health::parse_scan(SCAN_OPEN).unwrap(),
+        vec![
+            e("/dev/bus/0", 0, "megaraid,0"),
+            e("/dev/bus/0", 1, "megaraid,1")
+        ]
+    );
+    assert_eq!(
+        health::parse_scan(
+            "/dev/bus/0 -d megaraid,3 # /dev/bus/0 [megaraid_disk_03], SCSI device\n"
+        )
+        .unwrap(),
+        vec![e("/dev/bus/0", 3, "megaraid,3")]
+    );
+    // The first type listed for a disk wins; no type outside the list.
+    let mixed = "/dev/bus/0 -d sat+megaraid,0\n/dev/bus/0 -d megaraid,0\n\
+                 /dev/sg1 -d cciss,0\n/dev/sdb -d sat\n/dev/bus/0 -d usbjmicron+megaraid,2\n\
+                 /dev/bus/0 -d sat+megaraid,1234\n";
+    assert_eq!(
+        health::parse_scan(mixed).unwrap(),
+        vec![e("/dev/bus/0", 0, "sat+megaraid,0")]
+    );
+    // An entry smartctl could not open is dropped, passthrough or not.
+    let open_error = r#"{"devices":[
+      {"name":"/dev/bus/0","type":"sat+megaraid,2","open_error":"open failed"},
+      {"name":"/dev/bus/0","type":"sat+megaraid,3"}]}"#;
+    assert_eq!(
+        health::parse_scan(open_error).unwrap(),
+        vec![e("/dev/bus/0", 3, "sat+megaraid,3")]
+    );
+    assert_eq!(
+        health::parse_scan("# /dev/bus/0 -d sat+megaraid,2 # open failed\n").unwrap_or_default(),
+        vec![]
+    );
+    // Only `/dev/bus/<digits>` or `/dev/sd[a-z]{1,4}`.
+    let paths = "/dev/sdb -d megaraid,4\n/dev/sdabcd -d megaraid,5\n/dev/sdabcde -d megaraid,6\n\
+                 /dev/sg1 -d megaraid,7\n/dev/bus/x -d megaraid,8\n/dev/bus/1234 -d megaraid,9\n\
+                 /dev/bus/12 -d megaraid,10\n/dev/sd1 -d megaraid,11\n/dev/nvme0 -d megaraid,12\n";
+    assert_eq!(
+        health::parse_scan(paths).unwrap(),
+        vec![
+            e("/dev/bus/12", 10, "megaraid,10"),
+            e("/dev/sdabcd", 5, "megaraid,5"),
+            e("/dev/sdb", 4, "megaraid,4"),
+        ]
+    );
+    // smartctl 7.5's answer to the former scan, and junk text, are malformed.
+    assert!(health::parse_scan(OLD_SCAN_75).is_err());
+    assert!(
+        health::parse_scan("Invalid type 'megaraid', valid arguments are: by-id, ata\n").is_err()
+    );
+    assert_eq!(health::parse_scan("").unwrap(), vec![]);
+}
+
 const PD0: &str = "smartctl -j -H -A -l error -n standby,0 -d megaraid,0 /dev/bus/0";
 const PD1: &str = "smartctl -j -H -A -l error -n standby,0 -d megaraid,1 /dev/bus/0";
 
@@ -607,7 +829,7 @@ fn perc_host_passthrough_and_behind_controller() {
     let v = perc_host(&h);
     let open_failed = r#"{"smartctl":{"exit_status":2,"messages":[{"string":"open failed"}]}}"#;
     let runner = Runner::default()
-        .with("smartctl --scan-open -d megaraid -j", Ok(SCAN_OPEN))
+        .with(SCAN_CMD, Ok(SCAN_OPEN))
         .with(PD0, Ok(&smart_ata(true, 3, 0, 0, 0, 30, 0)))
         .with(PD1, Ok(open_failed))
         .with(SMARTCTL_SDC, Ok(&smart_ata(true, 0, 0, 0, 0, 30, 0)));
@@ -666,7 +888,7 @@ fn perc_host_passthrough_and_behind_controller() {
 
     // Every passthrough working: no behind-controller advisory.
     let runner = Runner::default()
-        .with("smartctl --scan-open -d megaraid -j", Ok(SCAN_OPEN))
+        .with(SCAN_CMD, Ok(SCAN_OPEN))
         .with(PD0, Ok(&healthy_ata()))
         .with(PD1, Ok(&healthy_ata()))
         .with(SMARTCTL_SDC, Ok(&healthy_ata()));
@@ -680,7 +902,7 @@ fn perc_host_passthrough_and_behind_controller() {
     // The first passthrough timing out ends the passthrough: `megaraid,1`
     // is not run (the runner would answer it), every VD is unavailable.
     let runner = Runner::default()
-        .with("smartctl --scan-open -d megaraid -j", Ok(SCAN_OPEN))
+        .with(SCAN_CMD, Ok(SCAN_OPEN))
         .with(PD0, Err(CommandError::Timeout))
         .with(PD1, Ok(&healthy_ata()))
         .with(SMARTCTL_SDC, Ok(&healthy_ata()));

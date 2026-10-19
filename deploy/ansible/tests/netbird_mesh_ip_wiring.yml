@@ -17,9 +17,9 @@
       Daemon version: 0.71.3
       Management: Connected
       Signal: Connected
-      NetBird IP: 100.64.12.34/16
+      NetBird IP: 100.65.187.90/16
       Interface type: Kernel
-    iface_ok: '5: wt0    inet 100.64.12.34/16 brd 100.64.255.255 scope global wt0\       valid_lft forever preferred_lft forever'
+    iface_ok: '5: wt0    inet 100.65.187.90/16 brd 100.65.255.255 scope global wt0\       valid_lft forever preferred_lft forever'
     status_down: |
       Daemon version: 0.71.3
       Management: Disconnected
@@ -37,7 +37,7 @@
     - name: The detected address is the one recorded
       ansible.builtin.assert:
         that:
-          - miner_netbird_ip == '100.64.12.34'
+          - miner_netbird_ip == '100.65.187.90'
 
     - name: Each broken join is refused, never replaced by a fallback
       ansible.builtin.include_tasks: netbird_mesh_ip_refused.yml
@@ -49,7 +49,7 @@
         - { status: "{{ status_down }}", iface: "" }
         # status claims an address the interface does not carry.
         - { status: "{{ status_ok }}", iface: "" }
-        - { status: "{{ status_ok }}", iface: "5: wt0    inet 100.64.1.2/16 scope global wt0" }
+        - { status: "{{ status_ok }}", iface: "5: wt0    inet 100.65.1.2/16 scope global wt0" }
         # Not a CGNAT address.
         - { status: "NetBird IP: 10.0.0.5/24", iface: "5: wt0    inet 10.0.0.5/24 scope global wt0" }
       loop_control:

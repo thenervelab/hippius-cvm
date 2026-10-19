@@ -17,7 +17,7 @@
   vars:
     miner_agent_config_template: ../playbooks/miner-tasks/templates/miner-agent-config.toml.j2
     miner_agent_miner_id: m-0123456789abcdef
-    miner_netbird_ip: 100.64.12.34
+    miner_netbird_ip: 100.65.187.90
     snp_generation: genoa
     ansible_processor_vcpus: 48
     ansible_memtotal_mb: 386000

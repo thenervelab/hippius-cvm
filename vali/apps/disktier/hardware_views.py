@@ -8,8 +8,10 @@ proxied 1:1 by the backend).
     GET …/host-disk-advisories the disk health feed (§18.5), by subject
 
 UNTRUSTED: what the miner reports about its own machine. Every response
-says `"verified": false`; nothing here comes from attestation, and nothing
-that decides reads it. Serials and by-id names are the node owner's: they
+says `"verified": false`, and nothing that decides reads it. The one
+exception, kept apart in `hardware`'s `attested` block, comes from vali's
+ATTESTED sources only (the registered identity and the host attestor's
+KBS-certified row), never from the report. Serials and by-id names are the node owner's: they
 are served only here, under the same posture as the storage API
 (`_NodeStorageView`: operator principal + the acting family re-checked on
 chain), and never logged.
@@ -29,6 +31,8 @@ from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import serializers
 from rest_framework.request import Request
 from rest_framework.response import Response
+
+from apps.scheduler import reasons
 
 from .host_advisories import HISTORY_DAYS_MAX, advisories_readout
 from .host_inventory import section_status
@@ -77,10 +81,55 @@ class SectionSerializer(serializers.Serializer):
     )
 
 
+class PlatformTcbSerializer(serializers.Serializer):
+    current = serializers.CharField(
+        allow_null=True, help_text="Not tracked by vali yet (always null)."
+    )
+    reported = serializers.CharField(
+        help_text="The platform reported_tcb the KBS certified at enrollment, "
+        "as `0x` + 16 hex digits (a 64-bit bitfield: a JSON number would lose bits)."
+    )
+
+
+class AttestedSerializer(serializers.Serializer):
+    snp_generation = serializers.CharField(
+        allow_null=True, help_text="turin|genoa|milan, from the miner's registration."
+    )
+    snp_generation_source = serializers.CharField(
+        allow_null=True,
+        help_text="registered (operator-set) | inferred (from the CHIP_ID length: "
+        "a Milan host registered without its generation reads genoa).",
+    )
+    chip_id_present = serializers.BooleanField(
+        help_text="A real CHIP_ID is registered (the id itself is never served)."
+    )
+    chip_matches_attestor = serializers.BooleanField(
+        allow_null=True,
+        help_text="The attestor row shown certifies the registered CHIP_ID; null "
+        "without a registered chip or an attestor row.",
+    )
+    platform_tcb = PlatformTcbSerializer(
+        allow_null=True, help_text="Only from an attested host attestor."
+    )
+    attestor_status = serializers.CharField(help_text="attested|pending|missing|stale")
+    attestor_gate_reason = serializers.CharField(
+        allow_null=True,
+        help_text="The dispatchability gate's reason the node is not covered (null = "
+        "covered). With no host-attestor release pinned it is release-unpinned for "
+        "every node, while attestor_status still judges the row itself.",
+    )
+    as_of = serializers.DateTimeField(
+        allow_null=True, help_text="The attestor's last beacon, else its enrollment."
+    )
+
+
 class HardwareSerializer(serializers.Serializer):
     node_id = serializers.CharField()
     verified = serializers.BooleanField(help_text="Always false: host-reported.")
     reported_at = serializers.DateTimeField(allow_null=True)
+    attested = AttestedSerializer(
+        help_text="From vali's attested sources, NOT the host's report: shown apart."
+    )
     sections = serializers.DictField(child=SectionSerializer())
 
 
@@ -116,12 +165,117 @@ class DiskInventorySerializer(serializers.Serializer):
     cross_check = serializers.DictField()
 
 
+def _snp_generation(miner: Any) -> tuple[str | None, str | None]:
+    """(generation, source): the registered generation, else the one the
+    launch digest infers from the CHIP_ID length; `(None, None)` when
+    neither resolves."""
+    from apps.orchestration.services.launch_digest import (
+        SNP_GENERATION_VCPU,
+        _vcpu_type_for_platform,
+    )
+
+    if miner.snp_generation:
+        return str(miner.snp_generation), "registered"
+    try:
+        vcpu = _vcpu_type_for_platform(miner.platform_id, None)
+    except Exception:  # noqa: BLE001 — a placeholder / malformed id: unknown.
+        return None, None
+    generation = next((g for g, (v, _n) in SNP_GENERATION_VCPU.items() if v == vcpu), None)
+    return generation, ("inferred" if generation else None)
+
+
+#: The gate's reason for a row → what the dashboard shows.
+_ATTESTOR_STATUS = {
+    None: "attested",
+    reasons.REASON_ATTESTOR_PENDING: "pending",
+    reasons.REASON_ATTESTOR_STALE: "stale",
+    reasons.REASON_CERT_EXPIRED: "stale",
+    reasons.REASON_MEASUREMENT_STALE: "stale",
+}
+
+
+def attested_readout(node_id: str, *, now: datetime) -> dict[str, Any]:
+    """The node's ATTESTED facts: the registered identity and the host
+    attestor row the dispatchability gate judges (the one that got
+    furthest through it, `operator.fleet._attestors`' rule). Nothing from
+    the host's own report; never the CHIP_ID itself; the TCB only from an
+    attested (KBS-certified, on-chain-checked) row."""
+    from datetime import timedelta
+
+    from apps.miners.models import MinerIdentity, is_autoprovision_placeholder
+    from apps.operator.service import _attestor_sort_key
+    from apps.telemetry import release_service
+    from apps.telemetry.models import HostAttestor, HostAttestorStatus
+    from apps.telemetry.vm_liveness import chip_matches_platform
+
+    miner = MinerIdentity.objects.filter(chain_node_id__iexact=node_id).first()
+    desired = release_service._desired_measurement_set()
+    live_cutoff = now - timedelta(seconds=release_service._liveness_window_seconds())
+
+    def reason_of(row: HostAttestor) -> str | None:
+        # No release pinned: every node is `release-unpinned` for the gate,
+        # but that says nothing of this row; judge the rest of it.
+        rows_set = desired or {row.measurement}
+        return release_service._row_coverage_reason(
+            row, desired_set=rows_set, live_cutoff=live_cutoff
+        )
+
+    rank = release_service._REASON_RANK
+    best: tuple[tuple[int, Any], HostAttestor, str | None] | None = None
+    for row in HostAttestor.objects.filter(node_id__iexact=node_id):
+        reason = reason_of(row)
+        key = (-1 if reason is None else rank[reason], _attestor_sort_key(row))
+        if best is None or key < best[0]:
+            best = (key, row, reason)
+
+    chip_registered = bool(
+        miner is not None
+        and miner.platform_id
+        and not is_autoprovision_placeholder(miner.platform_id)
+    )
+    if best is None:
+        status, reason, tcb, as_of, chip_match = (
+            "missing",
+            reasons.REASON_ATTESTOR_MISSING,
+            None,
+            None,
+            None,
+        )
+    else:
+        _key, row, reason = best
+        status = _ATTESTOR_STATUS[reason]
+        tcb = (
+            {"current": None, "reported": f"0x{int(row.tcb) & (2**64 - 1):016x}"}
+            if row.status == HostAttestorStatus.ATTESTED
+            else None
+        )
+        as_of = row.last_seen_at or row.enrolled_at
+        chip_match = (
+            chip_matches_platform(chip_id_hex=row.chip_id, platform_id=miner.platform_id)
+            if chip_registered and miner is not None
+            else None
+        )
+    generation, source = _snp_generation(miner) if miner is not None else (None, None)
+    return {
+        "snp_generation": generation,
+        "snp_generation_source": source,
+        "chip_id_present": chip_registered,
+        "chip_matches_attestor": chip_match,
+        "platform_tcb": tcb,
+        "attestor_status": status,
+        # The gate itself: with no release pinned every node is unpinned.
+        "attestor_gate_reason": reason if desired else reasons.REASON_RELEASE_UNPINNED,
+        "as_of": as_of,
+    }
+
+
 def hardware_readout(node_id: str, *, now: datetime) -> dict[str, Any]:
     rows = {r.section: r for r in HostInventorySection.objects.filter(miner_node_id=node_id)}
     return {
         "node_id": node_id,
         "verified": False,
         "reported_at": max((r.reported_at for r in rows.values()), default=None),
+        "attested": attested_readout(node_id, now=now),
         "sections": {name: _section(rows.get(name), now) for name in SECTIONS},
     }
 
@@ -248,19 +402,29 @@ class OperatorHardwareHistoryView(_NodeStorageView):
         call = self._call(request, node_id)
         if isinstance(call, Response):
             return call
-        raw = request.query_params.get("limit", str(HISTORY_DEFAULT))
-        if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= HISTORY_MAX:
+        limit = history_limit(request)
+        if limit is None:
             return _error(400, f"limit is 1..{HISTORY_MAX}", "wire")
-        rows = HostInventoryChange.objects.filter(miner_node_id=call.node_id).order_by(
-            "-at", "-id"
-        )[: int(raw)]
-        return Response(
-            {
-                "node_id": call.node_id,
-                "verified": False,
-                "changes": [{"section": r.section, "at": r.at, "fields": r.fields} for r in rows],
-            }
-        )
+        return Response(hardware_history_readout(call.node_id, limit=limit))
+
+
+def history_limit(request: Request) -> int | None:
+    """The history `limit` query parameter (default 50), `None` if invalid."""
+    raw = request.query_params.get("limit", str(HISTORY_DEFAULT))
+    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= HISTORY_MAX:
+        return None
+    return int(raw)
+
+
+def hardware_history_readout(node_id: str, *, limit: int) -> dict[str, Any]:
+    rows = HostInventoryChange.objects.filter(miner_node_id=node_id).order_by("-at", "-id")[
+        :limit
+    ]
+    return {
+        "node_id": node_id,
+        "verified": False,
+        "changes": [{"section": r.section, "at": r.at, "fields": r.fields} for r in rows],
+    }
 
 
 class OperatorDiskInventoryView(_NodeStorageView):
@@ -343,17 +507,26 @@ class OperatorHostDiskAdvisoriesView(_NodeStorageView):
         call = self._call(request, node_id)
         if isinstance(call, Response):
             return call
-        include = request.query_params.get("include_resolved", "false").lower()
-        if include not in ("true", "false"):
-            return _error(400, "include_resolved is true or false", "wire")
-        raw = request.query_params.get("history_days", "0")
-        if not (raw.isascii() and raw.isdigit()) or int(raw) > HISTORY_DAYS_MAX:
-            return _error(400, f"history_days is 0..{HISTORY_DAYS_MAX}", "wire")
+        params = advisories_params(request)
+        if isinstance(params, str):
+            return _error(400, params, "wire")
+        include_resolved, history_days = params
         return Response(
             advisories_readout(
                 call.node_id,
-                include_resolved=include == "true",
-                history_days=int(raw),
+                include_resolved=include_resolved,
+                history_days=history_days,
                 now=timezone.now(),
             )
         )
+
+
+def advisories_params(request: Request) -> tuple[bool, int] | str:
+    """`(include_resolved, history_days)` from the query, or the 400 text."""
+    include = request.query_params.get("include_resolved", "false").lower()
+    if include not in ("true", "false"):
+        return "include_resolved is true or false"
+    raw = request.query_params.get("history_days", "0")
+    if not (raw.isascii() and raw.isdigit()) or int(raw) > HISTORY_DAYS_MAX:
+        return f"history_days is 0..{HISTORY_DAYS_MAX}"
+    return include == "true", int(raw)

@@ -810,17 +810,17 @@ def test_an_as_new_anchor_out_of_range_fails_if_pending() -> None:
     assert "anchor_as_new" in v["failed"]
 
 
-# ─── the as-new memory cap (a grandfathered host) ────────────────────
+# ─── the as-new memory cap (a grandfathered host) ─────────────────────
 
-M1_FREE, M1_COMMITTED, M1_DECLARED = 227_320, 73_728, 256_623
+GF_FREE, GF_COMMITTED, GF_DECLARED = 227_320, 73_728, 256_623
 
 
-def _m1(monkeypatch, **over: object) -> None:
-    """A busy host: 227 320 MiB free with 73 728 MiB of vali VMs on it,
+def _gf(monkeypatch, **over: object) -> None:
+    """A grandfathered host: 227 320 MiB free with 73 728 MiB of vali VMs,
     a 256 GB host — free + committed (301 048) overshoots it."""
     fields: dict[str, object] = dict(
-        reported_memory_available_mib=M1_FREE,
-        declared_memory_mb_budget=M1_DECLARED,
+        reported_memory_available_mib=GF_FREE,
+        declared_memory_mb_budget=GF_DECLARED,
         total_memory_mb=None,
     )
     fields.update(over)
@@ -829,54 +829,54 @@ def _m1(monkeypatch, **over: object) -> None:
     monkeypatch.setattr(
         approval,
         "_committed",
-        lambda nid: (3, M1_COMMITTED, 24) if nid == node_id(SEED) else real(nid),
+        lambda nid: (3, GF_COMMITTED, 24) if nid == node_id(SEED) else real(nid),
     )
 
 
 def test_as_new_memory_is_capped_at_the_heartbeat_budget(monkeypatch) -> None:
-    _m1(monkeypatch)
+    _gf(monkeypatch)
     term = _verdict()["anchor_as_new"]["terms"]["memory_mb"]
-    assert M1_FREE + M1_COMMITTED == 301_048
+    assert GF_FREE + GF_COMMITTED == 301_048
     assert term == {
-        "heartbeat": M1_FREE,
-        "committed_added": M1_COMMITTED,
+        "heartbeat": GF_FREE,
+        "committed_added": GF_COMMITTED,
         "placements": 3,
-        "cap": M1_DECLARED,
+        "cap": GF_DECLARED,
         "cap_source": approval.CAP_HEARTBEAT_BUDGET,
-        "result": M1_DECLARED,
+        "result": GF_DECLARED,
     }
 
 
 def test_as_new_memory_falls_back_to_the_row_anchor(monkeypatch) -> None:
     """A v3 heartbeat that could not read its budget (stored NULL)."""
-    _m1(monkeypatch, declared_memory_mb_budget=None, total_memory_mb=M1_DECLARED)
+    _gf(monkeypatch, declared_memory_mb_budget=None, total_memory_mb=GF_DECLARED)
     term = _verdict()["anchor_as_new"]["terms"]["memory_mb"]
     assert (term["cap"], term["cap_source"], term["result"]) == (
-        M1_DECLARED,
+        GF_DECLARED,
         approval.CAP_ROW_ANCHOR,
-        M1_DECLARED,
+        GF_DECLARED,
     )
 
 
 def test_a_stale_budget_is_not_the_cap(monkeypatch) -> None:
     """The cap follows the same freshness as the figures it caps; a stale
     v3 stamp also leaves no cpu figure, so the anchor is not measured."""
-    _m1(monkeypatch, declared_at=timezone.now() - timedelta(hours=1), total_memory_mb=M1_DECLARED)
+    _gf(monkeypatch, declared_at=timezone.now() - timedelta(hours=1), total_memory_mb=GF_DECLARED)
     v = _verdict()
     assert v["anchor_as_new"]["refusal"] == "not-measured"
     from apps.scheduler.approval import _host_memory_cap
 
-    assert _host_memory_cap(_row(), now=timezone.now()) == (M1_DECLARED, approval.CAP_ROW_ANCHOR)
+    assert _host_memory_cap(_row(), now=timezone.now()) == (GF_DECLARED, approval.CAP_ROW_ANCHOR)
 
 
 def test_as_new_memory_under_the_cap_is_left_alone(monkeypatch) -> None:
-    _m1(monkeypatch, declared_memory_mb_budget=400_000)
+    _gf(monkeypatch, declared_memory_mb_budget=400_000)
     term = _verdict()["anchor_as_new"]["terms"]["memory_mb"]
-    assert term["result"] == M1_FREE + M1_COMMITTED
+    assert term["result"] == GF_FREE + GF_COMMITTED
 
 
 def test_with_no_host_figure_the_sum_is_shown_uncapped(monkeypatch) -> None:
-    _m1(monkeypatch, declared_memory_mb_budget=None, total_memory_mb=None)
+    _gf(monkeypatch, declared_memory_mb_budget=None, total_memory_mb=None)
     term = _verdict()["anchor_as_new"]["terms"]["memory_mb"]
     assert (term["cap"], term["cap_source"], term["result"]) == (None, None, 301_048)
 
@@ -888,8 +888,8 @@ def test_the_real_pass_memory_anchor_never_exceeds_the_heartbeat_figure(
     """The real pass (no add-back) takes min(retained anchor, MemAvailable):
     never above what the host's kernel reports free, itself below its
     MemTotal, nor above an anchor the row already holds."""
-    _eligible(reported_memory_available_mib=M1_FREE, total_memory_mb=retained)
+    _eligible(reported_memory_available_mib=GF_FREE, total_memory_mb=retained)
     assert approval.auto_approve_pending().approved == (node_id(SEED),)
     got = _row().total_memory_mb
-    assert got == min(x for x in (retained, M1_FREE) if x is not None)
-    assert got <= M1_FREE
+    assert got == min(x for x in (retained, GF_FREE) if x is not None)
+    assert got <= GF_FREE

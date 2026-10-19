@@ -9,8 +9,9 @@
 //! error. Only typed fields are taken from a tool's JSON: the advisory
 //! `sample` is rebuilt from a fixed template, so no tool text (a serial,
 //! a firmware message) leaves the collector. Arbitrary `-d` types are
-//! never probed: only the `megaraid,N` devices the controller's own scan
-//! lists.
+//! never probed: only the MegaRAID passthrough entries (`megaraid,N`,
+//! `sat+megaraid,N`) the controller scan (`smartctl --scan-open -d scsi
+//! -j`) lists.
 //!
 //! A "rising" counter compares with the previous run's
 //! ([`super::counters::Counters`]): no previous run, no rising.
@@ -26,6 +27,11 @@ use super::counters::{CounterMap, Counters};
 
 /// How long one `smartctl` / `nvme` run may take.
 pub const SMART_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the controller scan (`smartctl --scan-open -d scsi -j`) may
+/// take: it opens and identifies every SCSI-class device of the host,
+/// one after another, so more than one disk's [`SMART_TIMEOUT`].
+pub const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the whole SMART probe of a run may take at most; the run's
 /// own deadline (`host_inventory::RUN_DEADLINE`) may leave it less. The
@@ -236,41 +242,99 @@ pub(crate) fn parse_smartctl_nvme(text: &str) -> Result<Smart<NvmeReading>, Malf
     }))
 }
 
-/// `smartctl --scan-open -j`: the `(device, N)` of every `megaraid,N`
-/// entry. Only a plain `/dev/…` path is kept (it is passed to smartctl).
-pub(crate) fn parse_scan(text: &str) -> Result<Vec<(String, u32)>, Malformed> {
-    let map = object(text)?;
-    let devices = map
-        .get("devices")
-        .and_then(Value::as_array)
-        .ok_or(Malformed)?;
-    let mut out: BTreeSet<(String, u32)> = BTreeSet::new();
-    for d in devices {
-        let (Some(name), Some(kind)) = (
-            d.get("name").and_then(Value::as_str),
-            d.get("type").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        let Some(n) = kind
-            .strip_prefix("megaraid,")
-            .filter(|n| !n.is_empty() && n.len() <= 3 && n.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let safe = name.strip_prefix("/dev/").is_some_and(|rest| {
-            !rest.is_empty()
-                && !rest.contains("..")
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'/')
-        });
-        if safe {
-            out.insert((name.to_string(), n));
+/// The `-d` types a controller scan entry may be probed with: MegaRAID
+/// passthrough, plain (`megaraid,N`: SAS/SCSI disks, and what the former
+/// `--scan-open -d megaraid` printed for every disk) or SAT-tunnelled
+/// (`sat+megaraid,N`: the SATA disks the scan lists behind a PERC H330
+/// with smartctl 7.5). A closed list: no other type a scan prints is
+/// ever passed to smartctl. (`cciss,N` / hpsa is not probed: those
+/// controllers stay `smart_unavailable_behind_controller`.)
+const PASSTHROUGH_TYPES: [&str; 2] = ["megaraid,", "sat+megaraid,"];
+
+/// One physical disk a controller scan lists: smartctl's device, the
+/// disk's number behind the controller, and the `-d` type to probe it with.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ScanEntry {
+    pub(crate) device: String,
+    pub(crate) n: u32,
+    pub(crate) dtype: String,
+}
+
+/// `/dev/bus/<digits>` (a MegaRAID host's passthrough node) or
+/// `/dev/sd[a-z]{1,4}`: the only device paths a scan entry is passed to
+/// smartctl with.
+fn scan_device_allowed(name: &str) -> bool {
+    if let Some(host) = name.strip_prefix("/dev/bus/") {
+        return !host.is_empty() && host.len() <= 3 && host.bytes().all(|b| b.is_ascii_digit());
+    }
+    name.strip_prefix("/dev/sd")
+        .is_some_and(|d| (1..=4).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+/// A scan entry's `(device, -d type)` if it is a passthrough
+/// ([`PASSTHROUGH_TYPES`]) on an allowed device path
+/// ([`scan_device_allowed`]; both are passed to smartctl), else `None`.
+fn scan_entry(name: &str, kind: &str) -> Option<ScanEntry> {
+    let n = PASSTHROUGH_TYPES
+        .iter()
+        .find_map(|prefix| kind.strip_prefix(prefix))?;
+    if n.is_empty() || n.len() > 3 || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = n.parse().ok().filter(|_| scan_device_allowed(name))?;
+    Some(ScanEntry {
+        device: name.to_string(),
+        n,
+        dtype: kind.to_string(),
+    })
+}
+
+/// `smartctl --scan-open [-d scsi] -j` (smartmontools 7.4 and 7.5), or its
+/// text form (`/dev/bus/0 -d sat+megaraid,0 # /dev/bus/0
+/// [megaraid_disk_00] [SAT], ATA device`): every controller passthrough
+/// entry, one per `(device, N)` (the first type listed wins). Other
+/// entries (`/dev/sda -d scsi`, a virtual disk) are dropped, and so is an
+/// entry smartctl could not open (`open_error` in JSON; a `#`-commented
+/// line in text). JSON without `devices`, or text with no entry line at
+/// all, is [`Malformed`] (smartctl 7.5 answers the old `-d megaraid` scan
+/// with an "Invalid type" message).
+pub(crate) fn parse_scan(text: &str) -> Result<Vec<ScanEntry>, Malformed> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if text.trim_start().starts_with('{') {
+        let map = object(text)?;
+        let devices = map
+            .get("devices")
+            .and_then(Value::as_array)
+            .ok_or(Malformed)?;
+        for d in devices.iter().filter(|d| d.get("open_error").is_none()) {
+            if let (Some(name), Some(kind)) = (
+                d.get("name").and_then(Value::as_str),
+                d.get("type").and_then(Value::as_str),
+            ) {
+                pairs.push((name.to_string(), kind.to_string()));
+            }
+        }
+    } else {
+        let mut lines = 0usize;
+        for line in text.lines() {
+            let entry = line.split('#').next().unwrap_or("");
+            let words: Vec<&str> = entry.split_whitespace().collect();
+            if let [name, "-d", kind] = words[..] {
+                lines += 1;
+                pairs.push((name.to_string(), kind.to_string()));
+            }
+        }
+        if lines == 0 && !text.trim().is_empty() {
+            return Err(Malformed);
         }
     }
-    Ok(out.into_iter().collect())
+    let mut out: BTreeMap<(String, u32), ScanEntry> = BTreeMap::new();
+    for (name, kind) in &pairs {
+        if let Some(e) = scan_entry(name, kind) {
+            out.entry((e.device.clone(), e.n)).or_insert(e);
+        }
+    }
+    Ok(out.into_values().collect())
 }
 
 /// Rising: above the previous run's value (none: not rising).
@@ -535,7 +599,13 @@ impl<'a> Probe<'a> {
     /// by the deadline (else the device is counted as skipped): a tool is
     /// never started that could outlive it.
     fn spend(&mut self, tools: u32) -> bool {
-        if self.clock.now() + SMART_TIMEOUT * tools > self.deadline {
+        self.spend_within(SMART_TIMEOUT * tools)
+    }
+
+    /// Whether a run of up to `timeout` still ends by the deadline (else
+    /// counted as skipped).
+    fn spend_within(&mut self, timeout: Duration) -> bool {
+        if self.clock.now() + timeout > self.deadline {
             self.skipped += 1;
             return false;
         }
@@ -550,12 +620,21 @@ impl<'a> Probe<'a> {
         args: &[&str],
         any_exit: bool,
     ) -> Result<String, CommandError> {
+        self.tool_within(program, args, any_exit, SMART_TIMEOUT)
+    }
+
+    /// [`Self::tool`] bounded by `timeout`.
+    fn tool_within(
+        &mut self,
+        program: &'static str,
+        args: &[&str],
+        any_exit: bool,
+        timeout: Duration,
+    ) -> Result<String, CommandError> {
         if self.missing.contains(program) {
             return Err(CommandError::NotFound);
         }
-        let r = self
-            .runner
-            .run_bounded(program, args, SMART_TIMEOUT, any_exit);
+        let r = self.runner.run_bounded(program, args, timeout, any_exit);
         self.tally.command(&r);
         if r == Err(CommandError::NotFound) {
             self.missing.insert(program);
@@ -725,17 +804,51 @@ impl<'a> Probe<'a> {
         if vds.is_empty() {
             return;
         }
-        let mut failed = !self.spend(1);
+        let mut failed = !self.spend_within(SCAN_TIMEOUT);
         let scan = if failed {
             Vec::new()
         } else {
-            // The controller's own devices only: `-d megaraid` scans
-            // MegaRAID, nothing else is opened.
-            match self.tool("smartctl", &["--scan-open", "-d", "megaraid", "-j"], true) {
+            // The SCSI-class scan: on a MegaRAID host only (this is only
+            // reached with a MegaRAID VD), it opens and IDENTIFYs every
+            // SCSI-class device — no `-n standby` guard exists for a scan:
+            // direct SATA disks are /dev/sdX too, so each gets one IDENTIFY
+            // (most answer it in standby without spinning up) — but never
+            // an NVMe (smartctl 7.5 refuses
+            // `-d megaraid` as a scan type; `-d scsi` still lists the
+            // controller's `sat+megaraid,N` / `megaraid,N` disks). Only
+            // those passthrough entries are probed (`parse_scan`).
+            match self.tool_within(
+                "smartctl",
+                &["--scan-open", "-d", "scsi", "-j"],
+                true,
+                SCAN_TIMEOUT,
+            ) {
                 Ok(text) => parse_scan(&text).unwrap_or_else(|Malformed| {
                     self.tally.failed();
                     Vec::new()
                 }),
+                Err(CommandError::Timeout) => {
+                    // One timeout per controller, not a silent "unavailable".
+                    let labels: BTreeSet<String> =
+                        vds.iter().map(|(label, _, _)| label.clone()).collect();
+                    for label in labels {
+                        self.push(
+                            AdvisorySubject::Controller,
+                            &ctrl_subject(&label, "scan"),
+                            signal(
+                                AdvisoryCode::CollectorTimeout,
+                                Severity::Warning,
+                                1,
+                                0,
+                                &format!(
+                                    "smartctl --scan-open timed out after {} s",
+                                    SCAN_TIMEOUT.as_secs()
+                                ),
+                            ),
+                        );
+                    }
+                    Vec::new()
+                }
                 Err(_) => Vec::new(),
             }
         };
@@ -745,7 +858,12 @@ impl<'a> Probe<'a> {
         // A passthrough that times out stalls the controller's firmware on
         // some hosts: the rest of its disks are not probed this run.
         let mut stalled = false;
-        for (dev, n) in &scan {
+        for ScanEntry {
+            device: dev,
+            n,
+            dtype,
+        } in &scan
+        {
             // The physical disk sits behind the controller of the VD on
             // the same SCSI host (`/dev/bus/<host>`), else the first.
             let host: Option<u32> = dev.strip_prefix("/dev/bus/").and_then(|h| h.parse().ok());
@@ -761,7 +879,6 @@ impl<'a> Probe<'a> {
                 self.carry(&subject);
                 continue;
             }
-            let d = format!("megaraid,{n}");
             let out = self.tool(
                 "smartctl",
                 &[
@@ -773,7 +890,7 @@ impl<'a> Probe<'a> {
                     "-n",
                     "standby,0",
                     "-d",
-                    &d,
+                    dtype,
                     dev,
                 ],
                 true,

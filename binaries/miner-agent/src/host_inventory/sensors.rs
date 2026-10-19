@@ -13,10 +13,12 @@
 //!
 //! No hwmon and no BMC is an `unavailable` section; an IPMI fault
 //! (`ipmitool` failing or timing out) makes it `partial` / `timeout`,
-//! never an error. A BMC power-supply name is never copied: it becomes
-//! `PSU<n>` from its first number.
+//! never an error, and is logged on stderr (the command, how it failed and
+//! its exit code; never its output), as is a missing `ipmitool` on a host
+//! with `/dev/ipmi0`. A BMC power-supply name is never copied: it becomes
+//! `PSU<n>` from its first number, else from the sensor's entity instance
+//! (`10.<n>`, entity 10 = power supply: an iDRAC names them all `Status`).
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use hippius_host_inventory::{
@@ -42,6 +44,8 @@ const DRIVE_CHIPS: [&str; 2] = ["nvme", "drivetemp"];
 pub struct SensorsReport {
     pub section: SensorsSection,
     pub dropped: u32,
+    /// Lines for stderr: how an `ipmitool` run failed (never its output).
+    pub notes: Vec<String>,
 }
 
 /// `<digits>` exactly.
@@ -194,10 +198,34 @@ fn walk(root: &std::path::Path) -> Walk {
     (temps, fans, dropped, any)
 }
 
+/// The supply number of an SDR row: the sensor name's first number
+/// (`PS2 Status`), else the instance of a power-supply entity (`10.2`; a
+/// Dell iDRAC names every supply's sensor `Status`). `None`: no supply
+/// (`PS Redundancy | 77h | ns | 7.1 | …` is the system board's).
+fn psu_number(name: &str, entity: &str) -> Option<String> {
+    let digits: String = name
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if !digits.is_empty() {
+        return number(&digits).then_some(digits);
+    }
+    let instance = entity.strip_prefix("10.")?;
+    number(instance).then(|| instance.to_string())
+}
+
 /// `ipmitool sdr type "Power Supply"` lines:
-/// `PS1 Status | C8h | ok | 10.1 | Presence detected`. The discrete
-/// status sensors (`… Status`) say what a supply's state is; when the BMC
-/// has none, every numbered sensor is read.
+/// `PS1 Status | C8h | ok | 10.1 | Presence detected` (an iDRAC:
+/// `Status | 85h | ok | 10.1 | Presence detected`). The discrete status
+/// sensors (`… Status`) say what a supply's state is and win over the
+/// rest (`PS Redundancy`); when the BMC has none, every numbered sensor
+/// is read.
+///
+/// `ns` (no reading) is `unknown`, whatever the text: an iDRAC's
+/// `Status | 86h | ns | 10.2 | Disabled` is a sensor the BMC does not
+/// scan, which says neither that the bay is empty nor that a supply in
+/// it failed — `absent` would claim the first, and only a reading may.
 pub(crate) fn parse_psus(output: &str) -> Vec<Psu> {
     let rows: Vec<Vec<&str>> = output
         .lines()
@@ -207,29 +235,18 @@ pub(crate) fn parse_psus(output: &str) -> Vec<Psu> {
     let has_status = rows
         .iter()
         .any(|c| c[0].to_ascii_lowercase().contains("status"));
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
+    let mut out: Vec<Psu> = Vec::new();
     for cols in &rows {
-        let [name, _id, status, _entity, reading] = cols.as_slice() else {
+        let [name, _id, status, entity, reading] = cols.as_slice() else {
             continue;
         };
         if has_status && !name.to_ascii_lowercase().contains("status") {
             continue;
         }
-        // `PSU<n>` from the sensor name's first number; a sensor with no
-        // number (`PS Redundancy`) is no supply.
-        let digits: String = name
-            .chars()
-            .skip_while(|c| !c.is_ascii_digit())
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if digits.is_empty() || digits.len() > 3 {
+        let Some(digits) = psu_number(name, entity) else {
             continue;
-        }
+        };
         let label = format!("PSU{digits}");
-        if !seen.insert(label.clone()) {
-            continue;
-        }
         let reading = reading.to_ascii_lowercase();
         let state = if ["failure", "ac lost", "predictive", "fault"]
             .iter()
@@ -246,9 +263,29 @@ pub(crate) fn parse_psus(output: &str) -> Vec<Psu> {
         } else {
             PsuState::Unknown
         };
-        out.push(Psu { label, state });
+        // Two status sensors of one supply (`PS1 Status` and an
+        // entity-numbered `Status | … | 10.1`): the worse state wins, never
+        // the first. Without status sensors the first numbered one stands:
+        // a reading (`220 Watts`) says nothing of the state, so its
+        // `unknown` must not override a `Presence detected`.
+        match out.iter_mut().find(|p| p.label == label) {
+            Some(p) if has_status && severity(state) > severity(p.state) => p.state = state,
+            Some(_) => {}
+            None => out.push(Psu { label, state }),
+        }
     }
     out
+}
+
+/// How bad a supply state is, to merge two sensors of one supply:
+/// failed > unknown > absent > ok.
+fn severity(state: PsuState) -> u8 {
+    match state {
+        PsuState::Ok => 0,
+        PsuState::Absent => 1,
+        PsuState::Unknown => 2,
+        PsuState::Failed => 3,
+    }
 }
 
 /// `ipmitool mc info`'s `Firmware Revision` value.
@@ -260,19 +297,52 @@ pub(crate) fn parse_firmware(output: &str) -> Option<String> {
     super::clean_text(value.as_bytes(), hippius_host_inventory::MAX_TEXT_LEN)
 }
 
+/// One in-band `ipmitool` run (the caller checked `/dev/ipmi0` exists, so
+/// a BMC is expected): a failure is noted for stderr
+/// ([`ipmi_failure_line`]) in `notes`. A missing tool is noted only when
+/// `note_missing` (the sensors section's run, once per collector run: the
+/// system section's `mc info` would say it again).
+fn ipmitool(
+    runner: &dyn CommandRunner,
+    args: &[&str],
+    notes: &mut Vec<String>,
+    note_missing: bool,
+) -> Result<String, CommandError> {
+    let (out, code) = runner.run_bounded_status("ipmitool", args, IPMI_TIMEOUT, false);
+    match &out {
+        Err(CommandError::NotFound) if !note_missing => {}
+        Err(e) => notes.push(ipmi_failure_line(args, *e, code)),
+        Ok(_) => {}
+    }
+    out
+}
+
+/// The log line of a failed `ipmitool <args>`: how it failed and its exit
+/// code. Never the tool's output (host text).
+pub(crate) fn ipmi_failure_line(args: &[&str], e: CommandError, code: Option<i32>) -> String {
+    let how = match e {
+        CommandError::NotFound => "not installed although /dev/ipmi0 exists".to_string(),
+        CommandError::Timeout => format!("timed out after {} s", IPMI_TIMEOUT.as_secs()),
+        CommandError::Failed => match code {
+            Some(c) => format!("failed (exit status {c})"),
+            None => "failed (no exit status: killed or not started)".to_string(),
+        },
+    };
+    format!(
+        "hippius-miner-agent: host-inventory-collect: ipmitool {}: {how}",
+        args.join(" ")
+    )
+}
+
 /// Collect the sensors section.
 pub fn collect_sensors(paths: &HostPaths, runner: &dyn CommandRunner) -> SensorsReport {
     let mut tally = Tally::default();
     let mut dropped = 0u32;
     let (mut temperatures, mut fans) = hwmon(paths, &mut tally, &mut dropped);
     let mut psus = Vec::new();
+    let mut notes = Vec::new();
     if paths.ipmi_device.exists() {
-        let sdr = runner.run_bounded(
-            "ipmitool",
-            &["sdr", "type", "Power Supply"],
-            IPMI_TIMEOUT,
-            false,
-        );
+        let sdr = ipmitool(runner, &["sdr", "type", "Power Supply"], &mut notes, true);
         match &sdr {
             Ok(out) => {
                 psus = parse_psus(out);
@@ -303,6 +373,7 @@ pub fn collect_sensors(paths: &HostPaths, runner: &dyn CommandRunner) -> Sensors
             psus,
         },
         dropped,
+        notes,
     }
 }
 
@@ -312,10 +383,25 @@ pub fn bmc_firmware(
     paths: &HostPaths,
     runner: &dyn CommandRunner,
 ) -> Result<Option<String>, CommandError> {
+    let mut notes = Vec::new();
+    let r = bmc_firmware_noted(paths, runner, &mut notes);
+    for line in notes {
+        eprintln!("{line}");
+    }
+    r
+}
+
+/// [`bmc_firmware`], its failure noted in `notes` (a missing `ipmitool` is
+/// not: the sensors section notes it once per run).
+pub(crate) fn bmc_firmware_noted(
+    paths: &HostPaths,
+    runner: &dyn CommandRunner,
+    notes: &mut Vec<String>,
+) -> Result<Option<String>, CommandError> {
     if !paths.ipmi_device.exists() {
         return Ok(None);
     }
-    match runner.run_bounded("ipmitool", &["mc", "info"], IPMI_TIMEOUT, false) {
+    match ipmitool(runner, &["mc", "info"], notes, false) {
         Ok(out) => Ok(parse_firmware(&out)),
         Err(CommandError::NotFound) => Ok(None),
         Err(e) => Err(e),
@@ -606,5 +692,196 @@ Manufacturer ID           : 674
         let r = collect_sensors(&h.paths(), &Runner::default());
         assert_eq!(r.section.status, SectionStatus::Unavailable);
         assert!(r.section.temperatures.is_empty());
+    }
+
+    /// A Dell PowerEdge iDRAC: every supply's sensor is named
+    /// `Status`, numbered only by its entity instance.
+    const IDRAC_SDR: &str = "\
+PS Redundancy    | 77h | ns  | 7.1 | No Reading
+Status           | 85h | ok  | 10.1 | Presence detected
+Status           | 86h | ns  | 10.2 | Disabled
+";
+    /// The same iDRAC's `ipmitool mc info` (spacing as it prints it).
+    const IDRAC_MC_INFO: &str = "\
+Device ID                 : 32
+Device Revision           : 1
+Firmware Revision         : 7.30
+IPMI Version              : 2.0
+Manufacturer ID           : 674
+Manufacturer Name         : DELL Inc
+Product ID                : 256 (0x0100)
+Product Name              : Unknown (0x100)
+Device Available          : yes
+Provides Device SDRs      : yes
+Additional Device Support :
+    Sensor Device
+    SDR Repository Device
+Aux Firmware Rev Info     :
+    0x00
+    0x1e
+";
+
+    #[test]
+    fn a_dell_idrac_s_supplies_and_firmware() {
+        let psus: Vec<(String, PsuState)> = parse_psus(IDRAC_SDR)
+            .into_iter()
+            .map(|p| (p.label, p.state))
+            .collect();
+        // `Status` lines win over `PS Redundancy`; `ns` (`Disabled`) is
+        // unknown, not absent.
+        assert_eq!(
+            psus,
+            vec![
+                ("PSU1".to_string(), PsuState::Ok),
+                ("PSU2".to_string(), PsuState::Unknown)
+            ]
+        );
+        // A name's own number still wins over the entity; an entity that
+        // is not a power supply numbers nothing.
+        let named = parse_psus(
+            "PS3 Status | C8h | ok | 10.1 | Presence detected\n\
+                                Status | 85h | ok | 7.4 | Presence detected\n",
+        );
+        assert_eq!(
+            named.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(),
+            ["PSU3"]
+        );
+
+        assert_eq!(parse_firmware(IDRAC_MC_INFO).as_deref(), Some("7.30"));
+        assert_eq!(
+            parse_firmware("Firmware Revision:7.30\n").as_deref(),
+            Some("7.30")
+        );
+        assert_eq!(
+            parse_firmware("Firmware Revision \t :   7.30  \n").as_deref(),
+            Some("7.30")
+        );
+
+        let h = Host::new();
+        h.write("dev/ipmi0", "");
+        let runner = Runner::default()
+            .with(SDR_CMD, Ok(IDRAC_SDR))
+            .with("ipmitool mc info", Ok(IDRAC_MC_INFO));
+        let r = collect_sensors(&h.paths(), &runner);
+        assert_eq!(r.section.status, SectionStatus::Ok);
+        assert_eq!(r.section.psus.len(), 2);
+        assert_eq!(bmc_firmware(&h.paths(), &runner), Ok(Some("7.30".into())));
+    }
+
+    #[test]
+    fn a_failing_ipmitool_is_partial_and_logged_with_its_exit_status() {
+        let h = Host::new();
+        hwmon_tree(&h);
+        h.write("dev/ipmi0", "");
+        let failing = Runner::default()
+            .exits(SDR_CMD, 1)
+            .exits("ipmitool mc info", 1);
+        // Through the collector: its notes carry the exit status (which
+        // only `run_bounded_status` knows), never the tool's output.
+        let r = collect_sensors(&h.paths(), &failing);
+        assert_eq!(r.section.status, SectionStatus::Partial);
+        assert!(r.section.psus.is_empty());
+        assert_eq!(
+            r.notes,
+            [
+                "hippius-miner-agent: host-inventory-collect: ipmitool sdr type Power Supply: \
+              failed (exit status 1)"
+            ]
+        );
+        let mut notes = Vec::new();
+        assert_eq!(
+            bmc_firmware_noted(&h.paths(), &failing, &mut notes),
+            Err(CommandError::Failed)
+        );
+        assert_eq!(
+            notes,
+            ["hippius-miner-agent: host-inventory-collect: ipmitool mc info: failed (exit status 1)"]
+        );
+        let timeout = Runner::default().with(SDR_CMD, Err(CommandError::Timeout));
+        assert_eq!(
+            collect_sensors(&h.paths(), &timeout).notes,
+            [
+                "hippius-miner-agent: host-inventory-collect: ipmitool sdr type Power Supply: \
+              timed out after 10 s"
+            ]
+        );
+        assert!(
+            ipmi_failure_line(&["mc", "info"], CommandError::Failed, None)
+                .ends_with("failed (no exit status: killed or not started)")
+        );
+        // A later `.with` replaces an `exits`, its code included.
+        let fixed = Runner::default()
+            .exits("ipmitool mc info", 1)
+            .with("ipmitool mc info", Err(CommandError::Failed));
+        assert_eq!(
+            fixed.run_bounded_status("ipmitool", &["mc", "info"], IPMI_TIMEOUT, false),
+            (Err(CommandError::Failed), None)
+        );
+    }
+
+    #[test]
+    fn a_missing_ipmitool_beside_dev_ipmi0_is_logged_once_per_run() {
+        let h = Host::new();
+        hwmon_tree(&h);
+        h.write("dev/ipmi0", "");
+        let none = Runner::default();
+        let r = collect_sensors(&h.paths(), &none);
+        assert_eq!(
+            r.section.status,
+            SectionStatus::Ok,
+            "a missing tool is no fault"
+        );
+        assert_eq!(
+            r.notes,
+            [
+                "hippius-miner-agent: host-inventory-collect: ipmitool sdr type Power Supply: \
+              not installed although /dev/ipmi0 exists"
+            ]
+        );
+        // The system section's `mc info` does not say it again.
+        let mut notes = Vec::new();
+        assert_eq!(bmc_firmware_noted(&h.paths(), &none, &mut notes), Ok(None));
+        assert!(notes.is_empty());
+        // No /dev/ipmi0: nothing run, nothing noted.
+        let h = Host::new();
+        hwmon_tree(&h);
+        assert!(collect_sensors(&h.paths(), &none).notes.is_empty());
+    }
+
+    #[test]
+    fn two_sensors_of_one_supply_keep_the_worse_state() {
+        let state = |sdr: &str| -> Vec<(String, PsuState)> {
+            parse_psus(sdr)
+                .into_iter()
+                .map(|p| (p.label, p.state))
+                .collect()
+        };
+        for sdr in [
+            "PS1 Status | C8h | ok | 10.1 | Presence detected\n\
+             Status     | 85h | ok | 10.1 | Presence detected, Failure detected\n",
+            "Status     | 85h | ok | 10.1 | Presence detected, Failure detected\n\
+             PS1 Status | C8h | ok | 10.1 | Presence detected\n",
+        ] {
+            assert_eq!(
+                state(sdr),
+                [("PSU1".to_string(), PsuState::Failed)],
+                "{sdr}"
+            );
+        }
+        // unknown beats absent beats ok.
+        assert_eq!(
+            state(
+                "PS1 Status | C8h | ok | 10.1 | Not Present\n\
+                 Status     | 85h | ns | 10.1 | Disabled\n"
+            ),
+            [("PSU1".to_string(), PsuState::Unknown)]
+        );
+        assert_eq!(
+            state(
+                "PS1 Status | C8h | ok | 10.1 | Presence detected\n\
+                 Status     | 85h | ok | 10.1 | Not Present\n"
+            ),
+            [("PSU1".to_string(), PsuState::Absent)]
+        );
     }
 }

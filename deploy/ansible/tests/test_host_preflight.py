@@ -306,10 +306,10 @@ class FailureTest(unittest.TestCase):
         self.assertFails("CPU_OFFLINE", {"smt_control": "forceoff"})
 
     def test_bios_smt_off_passes(self) -> None:
-        # A 24-core host with SMT disabled in the BIOS: control
+        # A real host's reading, SMT disabled in the BIOS: control
         # notsupported, active 0, online = possible = 0-23, nothing offline,
         # no nosmt / maxcpus on the cmdline. A healthy host: no fatal.
-        m1 = {
+        host = {
             "smt_control": "notsupported",
             "smt_active": "0",
             "cpus_online": "0-23",
@@ -317,12 +317,12 @@ class FailureTest(unittest.TestCase):
             "cpus_present": "0-23",
             "cpus_offline": "",
         }
-        result = run(m1)
+        result = run(host)
         self.assertEqual(result["failures"], [])
         self.assertNotIn("SMT_ON", codes(result, "warnings"))
-        self.assertEqual(run(dict(m1, smt_control="notimplemented"))["failures"], [])
+        self.assertEqual(run(dict(host, smt_control="notimplemented"))["failures"], [])
         # Empty hotplug slots (possible > present) are not offline CPUs.
-        self.assertEqual(run(dict(m1, cpus_possible="0-31"))["failures"], [])
+        self.assertEqual(run(dict(host, cpus_possible="0-31"))["failures"], [])
 
     def test_online_gap_is_fatal(self) -> None:
         # A present CPU missing from `online` (e.g. no per-CPU online file
@@ -404,11 +404,11 @@ class FailureTest(unittest.TestCase):
         self.assertFails("DATA_ROOT_TOO_SMALL", facts=dict(ok, data_fs_statfs=""))
 
     def test_usable_gib_and_reserve(self) -> None:
-        # 892 GiB, 44 GiB root-reserved, 4 GiB available ⇒ 848 usable.
+        # A host: 892 GiB, 44 GiB root-reserved, 4 GiB available ⇒ 848 usable.
         self.assertEqual(host_preflight.statfs_usable_gib(statfs(892, 4, reserved_gib=44)), 848)
         # What `ansible_mounts` would have said: the whole 892.
-        m1 = mnt("/", 892, 4)
-        self.assertEqual((m1["block_used"] + m1["block_available"]) * 4096 // GIB, 892)
+        host = mnt("/", 892, 4)
+        self.assertEqual((host["block_used"] + host["block_available"]) * 4096 // GIB, 892)
         for bad in ("", None, "4096 10 20 5", "a b c d", "4096 10 5"):
             self.assertEqual(host_preflight.statfs_usable_gib(bad), 0, bad)
         self.assertEqual(host_preflight.disk_reserve_gib("/", 100, 50), 150)

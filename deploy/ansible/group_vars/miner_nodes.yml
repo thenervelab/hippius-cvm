@@ -28,7 +28,7 @@
 # below, re-checked by play 00 against the apt candidate and by play 02
 # against what got installed).
 #
-#   25.10  libvirt 11.6 / QEMU 10.1 / kernel 6.17.
+#   25.10  libvirt 11.6 / QEMU 10.1 / kernel 6.17 — older hosts.
 #          End of life since 2026-07; do not provision new hosts on it.
 #   26.04  libvirt 12.0 / QEMU 10.2 / kernel 7.0 — validated on Genoa and
 #          Milan, including in-place upgrades from 24.04.
@@ -70,7 +70,7 @@ miner_preflight_min:
 
 # ── Pinned versions ─────────────────────────────────────────────────
 versions:
-  # NetBird agent — keep in lockstep with `group_vars/all.yml`. Pinned
+  # NetBird agent — matches the control plane (group_vars/all.yml). Pinned
   # via apt against the NetBird package repo.
   netbird: "0.71.3"
   # libvirt / qemu — the Ubuntu 26.04 distro versions (25.10 hosts run
@@ -184,7 +184,7 @@ libvirt:
   # Add the login user to the `libvirt` group for non-sudo `virsh`.
   user_can_access: true
   # The login user added to the `libvirt` group (operator override in
-  # host_vars if your provider image uses a different default account).
+  # host_vars if the provider's image uses a different default account).
   access_user: "ubuntu"
 
 # ── miner-agent install ─────────────────────────────────────────────
@@ -356,10 +356,10 @@ edge_order_signing_pubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf
 #
 # DISK: `cvm_disk_gb_budget` = the USABLE size of the filesystem holding
 # `miner_data_disk_root` (GiB, from `stat -f`: its blocks minus the
-# root-reserved ones — ext4 keeps 5% no tenant can use, ~45 GiB on a 892 GiB disk;
+# root-reserved ones — ext4 keeps 5% no tenant can use, 44.6 GiB on an 892 GiB root;
 # `ansible_mounts` cannot tell them apart) −
 # `reserve_disk_gb`, − `reserve_disk_root_extra_gb` too when that
-# filesystem is `/` (#1641: a miner's root filesystem filled up, the image cache
+# filesystem is `/` (#1641: a host's root filesystem filled up, the image cache
 # (19 GiB), the per-VM staging (~8 GiB) and the OS living next to the
 # tenant disks).
 # Keep `reserve_disk_gb` = VALI_DISK_RESERVE_GB: vali computes its own

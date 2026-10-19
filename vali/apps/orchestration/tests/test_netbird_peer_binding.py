@@ -694,12 +694,12 @@ def test_a_re_enrolled_guest_moves_the_displayed_address() -> None:
     re-enrolled with new peers and addresses, and the rows kept the dead
     ones — the one-shot served-receipt resolve never runs again."""
     vm = make_vm("vm-moved")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.171.93")
-    peers = [_peer("p-new", "hippius-tenant-vm-moved", "100.64.108.2")]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.71.93")
+    peers = [_peer("p-new", "hippius-tenant-vm-moved", "100.65.8.2")]
 
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 1
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.108.2"
+    assert vm.netbird_ip == "100.65.8.2"
     again = netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     assert again == 0, "idempotent"
 
@@ -707,14 +707,14 @@ def test_a_re_enrolled_guest_moves_the_displayed_address() -> None:
 def test_a_bound_peer_wins_over_a_name_claim() -> None:
     vm = make_vm("vm-bound")
     _key(vm, "k1", peer_id="p-own")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.100.1")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.0.1")
     peers = [
-        _peer("p-own", "whatever-the-guest-sent", "100.64.100.2"),
-        _peer("p-squat", "hippius-tenant-vm-bound", "100.64.100.3"),
+        _peer("p-own", "whatever-the-guest-sent", "100.65.0.2"),
+        _peer("p-squat", "hippius-tenant-vm-bound", "100.65.0.3"),
     ]
     netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.100.2"
+    assert vm.netbird_ip == "100.65.0.2"
 
 
 @pytest.fixture
@@ -735,32 +735,30 @@ def _absent_since(vm: Vm, ago: timedelta) -> None:
 def test_a_peer_record_gone_clears_an_active_vms_address_and_reads_lost(_fresh_cache) -> None:
     """NetBird may hand a deleted peer's address to another peer."""
     gone = make_vm("vm-gone")
-    Vm.objects.filter(pk=gone.pk).update(netbird_ip="100.64.101.1")
+    Vm.objects.filter(pk=gone.pk).update(netbird_ip="100.65.1.1")
     dead = make_vm("vm-dead")
-    Vm.objects.filter(pk=dead.pk).update(
-        state=VmState.DESTROYED, host="", netbird_ip="100.64.102.2"
-    )
-    peers = [_peer("p-x", "someone-else", "100.64.102.9")]
+    Vm.objects.filter(pk=dead.pk).update(state=VmState.DESTROYED, host="", netbird_ip="100.65.2.2")
+    peers = [_peer("p-x", "someone-else", "100.65.2.9")]
 
     # The first miss only records it: one listing may just be incomplete.
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
     gone.refresh_from_db()
-    assert gone.netbird_ip == "100.64.101.1"
+    assert gone.netbird_ip == "100.65.1.1"
     _absent_since(gone, netbird_binding.ABSENCE_CONFIRM)
 
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 1
     gone.refresh_from_db()
     dead.refresh_from_db()
     assert (gone.netbird_ip, gone.netbird_status) == ("", "lost")
-    assert dead.netbird_ip == "100.64.102.2"
+    assert dead.netbird_ip == "100.65.2.2"
 
 
 def test_a_peer_seen_again_resets_the_absence(_fresh_cache) -> None:
     vm = make_vm("vm-blip")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.3")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.3")
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
     netbird_binding.refresh_overlay_ips(
-        [_peer("p-b", "hippius-tenant-vm-blip", "100.64.101.3")], netbird_binding.overlay_snapshot()
+        [_peer("p-b", "hippius-tenant-vm-blip", "100.65.1.3")], netbird_binding.overlay_snapshot()
     )
     assert cache.get(netbird_binding._absent_key(vm.pk)) is None
 
@@ -773,31 +771,31 @@ def test_no_clear_when_the_binding_could_not_be_read(
     vm = make_vm("vm-unreadable")
     _key(vm, "k-first", peer_id="p-old")
     _key(vm, "k-relaunch", persistent=False)
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.4")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.4")
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
 
     def _down():
         raise effects.EffectUnavailable("audit log down")
 
     monkeypatch.setattr(effects, "list_netbird_setup_key_enrolments", _down)
-    peers = [_peer("p-new", "hippius-tenant-vm-unreadable", "100.64.101.5")]
+    peers = [_peer("p-new", "hippius-tenant-vm-unreadable", "100.65.1.5")]
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.101.4"
+    assert vm.netbird_ip == "100.65.1.4"
 
 
 def test_it_comes_back_ok_when_the_guest_re_enrols() -> None:
     vm = make_vm("vm-back")
     Vm.objects.filter(pk=vm.pk).update(netbird_ip="", netbird_status="lost")
-    peers = [_peer("p-new", "hippius-tenant-vm-back", "100.64.101.9")]
+    peers = [_peer("p-new", "hippius-tenant-vm-back", "100.65.1.9")]
     netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     vm.refresh_from_db()
-    assert (vm.netbird_ip, vm.netbird_status) == ("100.64.101.9", "ok")
+    assert (vm.netbird_ip, vm.netbird_status) == ("100.65.1.9", "ok")
 
 
 def test_an_empty_listing_clears_nothing() -> None:
     vm = make_vm("vm-empty")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.2")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.2")
     assert netbird_binding.refresh_overlay_ips([], netbird_binding.overlay_snapshot()) == 0
 
 
@@ -807,48 +805,48 @@ def test_a_migrating_vm_keeps_its_address_so_the_25_check_stays_armed(_fresh_cac
     vm = make_vm("vm-moving")
     Vm.objects.filter(pk=vm.pk).update(
         state=VmState.MIGRATING, migration_dest="node-dst", new_generation=6,
-        netbird_ip="100.64.106.6",
+        netbird_ip="100.65.6.6",
     )
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
-    peers = [_peer("p-x", "someone-else", "100.64.102.9")]
+    peers = [_peer("p-x", "someone-else", "100.65.2.9")]
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.106.6"
+    assert vm.netbird_ip == "100.65.6.6"
 
 
 def test_a_fence_landing_after_the_snapshot_wins(_fresh_cache) -> None:
     """active → migrating between the snapshot and the CAS: not cleared."""
     vm = make_vm("vm-fenced")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.106.7")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.6.7")
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
     snapshot = netbird_binding.overlay_snapshot()
     Vm.objects.filter(pk=vm.pk).update(
         state=VmState.MIGRATING, migration_dest="node-dst", new_generation=6
     )
-    peers = [_peer("p-x", "someone-else", "100.64.102.9")]
+    peers = [_peer("p-x", "someone-else", "100.65.2.9")]
     assert netbird_binding.refresh_overlay_ips(peers, snapshot) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.106.7"
+    assert vm.netbird_ip == "100.65.6.7"
 
 
 def test_a_value_written_after_the_snapshot_is_not_overwritten() -> None:
     """A served receipt that resolved a newer peer after the snapshot wins
     over the (older) listing the refresh resolves against."""
     vm = make_vm("vm-race")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.108.1")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.8.1")
     snapshot = netbird_binding.overlay_snapshot()
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.108.3")
-    peers = [_peer("p-old", "hippius-tenant-vm-race", "100.64.108.2")]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.8.3")
+    peers = [_peer("p-old", "hippius-tenant-vm-race", "100.65.8.2")]
 
     assert netbird_binding.refresh_overlay_ips(peers, snapshot) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.108.3"
+    assert vm.netbird_ip == "100.65.8.3"
 
 
 def test_a_disconnected_peer_keeps_its_address() -> None:
     vm = make_vm("vm-off")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.103.3")
-    peers = [_peer("p-off", "hippius-tenant-vm-off", "100.64.103.3", connected=False)]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.3.3")
+    peers = [_peer("p-off", "hippius-tenant-vm-off", "100.65.3.3", connected=False)]
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
 
 
@@ -860,37 +858,37 @@ def test_a_re_enrolment_under_an_open_key_is_bound_then_followed(
     vm = make_vm("vm-rekey")
     _key(vm, "k-first", peer_id="p-old")
     _key(vm, "k-relaunch", persistent=False)
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.104.4", netbird_peer_id="p-old")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.4.4", netbird_peer_id="p-old")
     monkeypatch.setattr(
         effects, "list_netbird_setup_key_enrolments", lambda: {"k-relaunch": "p-new"}
     )
     peers = [
-        _peer("p-old", "hippius-tenant-vm-rekey", "100.64.104.4", connected=False),
-        _peer("p-new", "hippius-tenant-vm-rekey", "100.64.104.5"),
+        _peer("p-old", "hippius-tenant-vm-rekey", "100.65.4.4", connected=False),
+        _peer("p-new", "hippius-tenant-vm-rekey", "100.65.4.5"),
     ]
     netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.104.5"
+    assert vm.netbird_ip == "100.65.4.5"
 
 
 def test_a_lost_vm_seen_connected_again_is_ok() -> None:
     vm = make_vm("vm-lost")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.105.5", netbird_status="lost")
-    peers = [_peer("p-back", "hippius-tenant-vm-lost", "100.64.105.6")]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.5.5", netbird_status="lost")
+    peers = [_peer("p-back", "hippius-tenant-vm-lost", "100.65.5.6")]
     netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     vm.refresh_from_db()
-    assert (vm.netbird_ip, vm.netbird_status) == ("100.64.105.6", "ok")
+    assert (vm.netbird_ip, vm.netbird_status) == ("100.65.5.6", "ok")
 
 
 def test_a_pending_vm_is_the_verifiers() -> None:
     """The §25 verifier owns `pending` rows, even when the peer resolves."""
     vm = make_vm("vm-checking")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.107.7", netbird_status="pending")
-    peers = [_peer("p-moved", "hippius-tenant-vm-checking", "100.64.107.8")]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.7.7", netbird_status="pending")
+    peers = [_peer("p-moved", "hippius-tenant-vm-checking", "100.65.7.8")]
 
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.107.7"
+    assert vm.netbird_ip == "100.65.7.7"
 
 
 def test_a_pass_indexes_the_listing_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -898,7 +896,7 @@ def test_a_pass_indexes_the_listing_once(monkeypatch: pytest.MonkeyPatch) -> Non
     indexed once per pass, not scanned once per VM."""
     for n in range(20):
         make_vm(f"vm-{n}")
-    peers = [_peer(f"p-{n}", f"hippius-tenant-vm-{n}", f"100.64.109.{n}") for n in range(20)]
+    peers = [_peer(f"p-{n}", f"hippius-tenant-vm-{n}", f"100.65.9.{n}") for n in range(20)]
     peers += [_peer(f"x-{n}", f"other-{n}", f"100.98.0.{n}") for n in range(200)]
     built: list[int] = []
     real_of = effects.PeerIndex.of
@@ -910,7 +908,7 @@ def test_a_pass_indexes_the_listing_once(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(effects.PeerIndex, "of", staticmethod(_of))
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 20
     assert built == [220]
-    assert Vm.objects.get(vm_id="vm-7").netbird_ip == "100.64.109.7"
+    assert Vm.objects.get(vm_id="vm-7").netbird_ip == "100.65.9.7"
 
 
 @pytest.mark.parametrize(
@@ -919,9 +917,9 @@ def test_a_pass_indexes_the_listing_once(monkeypatch: pytest.MonkeyPatch) -> Non
 )
 def test_the_index_resolves_exactly_as_the_listing(peer_ids, owners) -> None:
     peers = [
-        _peer("p-a", "hippius-tenant-vm-i", "100.64.110.1", connected=False),
-        _peer("p-b", "hippius-tenant-vm-i", "100.64.110.2"),
-        _peer("p-c", "unrelated", "100.64.110.3"),
+        _peer("p-a", "hippius-tenant-vm-i", "100.65.10.1", connected=False),
+        _peer("p-b", "hippius-tenant-vm-i", "100.65.10.2"),
+        _peer("p-c", "unrelated", "100.65.10.3"),
     ]
     kw = {"peer_ids": peer_ids, "bound_owners": owners}
     assert effects.tenant_peer_from_listing(
@@ -935,19 +933,19 @@ def test_a_stale_absence_for_another_address_never_shortcuts_the_confirmation(
 ) -> None:
     """A marker left from an earlier address (the VM moved since) restarts."""
     vm = make_vm("vm-stale-mark")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.6")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.6")
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.7")
-    peers = [_peer("p-x", "someone-else", "100.64.102.9")]
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.7")
+    peers = [_peer("p-x", "someone-else", "100.65.2.9")]
     assert netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot()) == 0
     vm.refresh_from_db()
-    assert vm.netbird_ip == "100.64.101.7"
+    assert vm.netbird_ip == "100.65.1.7"
 
 
 def test_a_pending_pass_drops_the_absence(_fresh_cache) -> None:
     vm = make_vm("vm-pend-mark")
-    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.64.101.8", netbird_status="pending")
+    Vm.objects.filter(pk=vm.pk).update(netbird_ip="100.65.1.8", netbird_status="pending")
     _absent_since(vm, netbird_binding.ABSENCE_CONFIRM)
-    peers = [_peer("p-x", "x", "100.64.102.9")]
+    peers = [_peer("p-x", "x", "100.65.2.9")]
     netbird_binding.refresh_overlay_ips(peers, netbird_binding.overlay_snapshot())
     assert cache.get(netbird_binding._absent_key(vm.pk)) is None
