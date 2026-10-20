@@ -242,12 +242,14 @@ host identity**, **Register on chain**, **Declare to the validator** and
 
 From your Ansible checkout (`deploy/ansible`):
 
-0. On the host, install the release `hippius-miner-agent`
-   ([`onboarding-a-miner.md`](./onboarding-a-miner.md#prebuilt-binary),
-   "Prebuilt binary"). Play 05 does not build the agent: it refuses to
-   run without the binary (`MINER_AGENT_BINARY_MISSING`). The
-   host-attestor files and the CA certificates need nothing from you:
-   the play downloads and verifies them
+0. Nothing to install on the host by hand. Play 05 installs the release
+   `hippius-miner-agent` itself, verified exactly as an auto-update is
+   (`SHA256SUMS`, the build-provenance attestation, `--version`; see
+   [`onboarding-a-miner.md`](./onboarding-a-miner.md#prebuilt-binary),
+   "Prebuilt binary", which also keeps the manual install as a fallback).
+   The host must reach `api.github.com` and `github.com` over HTTPS. The
+   host-attestor files and the CA certificates need nothing from you
+   either: the play downloads and verifies them
    ([`deploy/ansible/README.md`](../../deploy/ansible/README.md#host-attestor)).
 1. Save the generated file as `host_vars/<hostname>.yml`:
    - Fill the connection details and the disks, by
@@ -445,7 +447,7 @@ alone with `--tags preflight --check` after each fix.
 | `DATA_DISK_BUSY` | A disk listed as a data disk has a partition table, a filesystem, or backs a system mount. | List only blank disks as data disks. Never list a system disk. |
 | `PINNED_FILE_MISMATCH` | A CA certificate or host-attestor file (in the checkout or downloaded) doesn't hash to its pin. | Restore the checkout file from the repository (or delete it so the play downloads the pinned one) and rerun. Never edit the pin. |
 | `NETBIRD_SETUP_KEY_MISSING` | The setup-key file isn't on your workstation. | Save the key from the dashboard to the path the message gives. |
-| `MINER_AGENT_BINARY_MISSING` (play 05) | `/usr/local/bin/hippius-miner-agent` is missing, or its `--version` does not report `versions.miner_agent`. | Install the release binary as the message says (`onboarding-a-miner.md`, "Prebuilt binary"), then re-run. |
+| `MINER_AGENT_INSTALL_FAILED` (play 05) | The agent binary was missing or foreign, and the play could not install a verified release: no network to GitHub, no release old enough yet, a refused checksum or attestation (the message gives the updater's reason), or a release whose `--version` is newer than your checkout's `versions.miner_agent`. Nothing was installed. | Fix what the message says (allow outbound HTTPS, or update your checkout), then re-run. Or install the binary by hand (`onboarding-a-miner.md`, "Prebuilt binary") and re-run. |
 | `PLACEHOLDER_VALUE` (play 05) | A variable is still a `<…>` placeholder (the message names the config key or the variable). | Set it in host_vars (the dashboard's generated file carries the fleet values), then re-run. |
 | `VAULT_CREDENTIALS_SET`, `K3S_PRESENT` | The host or its variables look like a control-plane node. | A miner host carries neither; use a clean machine and the generated host_vars. |
 

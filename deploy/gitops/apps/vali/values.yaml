@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:13be95509e5c64c6f21abbaaf7e91ca11b10b35a581c5d92ec7b432bfa70f5a4"
+  digest: "sha256:eac63cede15f2b6f87861652a4d56f2fea6ca45ea2c910a24482c6c61543845c"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "455b82a6d3e7509eaf0a9efc39e36fde5ba30140"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39435738380/attempts/1"
+    commitSha: "404bce539a15b47674861bd382d71d081bc5c611"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39444414996/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,

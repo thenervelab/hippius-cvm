@@ -116,7 +116,9 @@ _CHILD_CASES = {
         storage(0xD1, has_quality=False, uptime_permille=None),
         storage_requirement.CHILD_NO_QUALITY,
     ),
-    "zero weight": (storage(0xD1, node_weight=0), storage_requirement.CHILD_ZERO_WEIGHT),
+    # The Arion filter has no per-child weight floor: a fresh, Active child
+    # with a quality record counts even at weight 0.
+    "zero weight still counts": (storage(0xD1, node_weight=0), None),
 }
 
 
@@ -142,7 +144,7 @@ def test_freshness_is_inclusive_at_stale_child_buckets() -> None:
 
 
 def test_one_good_node_among_bad_ones_is_enough(settings) -> None:
-    fam = family(FAMILY_A, (1,), storage(0xC1), storage(0xD1, node_weight=0), storage(0xD3))
+    fam = family(FAMILY_A, (1,), storage(0xC1), storage(0xD1, has_quality=False), storage(0xD3))
     (verdict,) = storage_requirement.judge(snapshot(fam))
     assert (verdict.counted, verdict.healthy) == (1, True)
     settings.VALI_COMPUTE_STORAGE_MIN_NODES = 2
@@ -180,35 +182,134 @@ def test_healthy_storage_keeps_the_family(on: None) -> None:
     assert storage_requirement.denied_node_ids() == {}
 
 
-def test_a_family_that_loses_its_storage_keeps_its_rights_for_the_grace(on: None) -> None:
-    t0 = timezone.now()
-    storage_requirement.refresh(snapshot(family(FAMILY_A, (1,), storage(0xD1))), now=t0)
-    lost = snapshot(family(FAMILY_A, (1,), storage(0xD1, node_weight=0)))
-    storage_requirement.refresh(lost, now=t0 + timedelta(hours=1))
+LOST = snapshot(family(FAMILY_A, (1,), storage(0xD1, last_bucket=0)))
+HEALTHY = snapshot(family(FAMILY_A, (1,), storage(0xD1)))
+DEBOUNCE = timedelta(seconds=7200)
+GRACE = timedelta(seconds=259200)
+
+
+def _readout(nid: str = node_id(1), **kw: Any) -> dict | None:
+    by_node = storage_requirement.node_requirements(**kw)
+    return storage_requirement.OFF_READOUT if by_node is None else by_node.get(nid)
+
+
+def test_a_family_that_loses_its_storage_lapses_after_the_debounce(on: None) -> None:
+    t0 = timezone.now() - timedelta(days=10)
+    storage_requirement.refresh(HEALTHY, now=t0)
+    t1 = t0 + timedelta(hours=1)  # first read without storage
+    storage_requirement.refresh(LOST, now=t1)
     row = FamilyStorageState.objects.get(family=FAMILY_A)
-    assert row.has_storage is False and row.last_healthy_at == t0
-    grace_end = t0 + timedelta(seconds=259200)
-    assert storage_requirement.denied_node_ids(now=grace_end) == {}
-    assert storage_requirement.denied_node_ids(now=grace_end + timedelta(seconds=1)) == {
+    assert (row.unhealthy_since, row.lapsed_since, row.last_healthy_at) == (t1, None, t0)
+    # Inside the debounce: not lapsed, still allowed.
+    assert _readout(now=t1) == {
+        "state": "ok",
+        "family_storage_children": 0,
+        "lapsed_since": None,
+        "grace_until": None,
+    }
+    storage_requirement.refresh(LOST, now=t1 + DEBOUNCE - timedelta(seconds=1))
+    assert FamilyStorageState.objects.get(family=FAMILY_A).lapsed_since is None
+    # The run outlasts the debounce: lapsed since its FIRST read, the grace
+    # counted from there.
+    storage_requirement.refresh(LOST, now=t1 + DEBOUNCE)
+    row = FamilyStorageState.objects.get(family=FAMILY_A)
+    assert row.lapsed_since == t1
+    grace_until = t1 + GRACE
+    assert _readout(now=t1 + DEBOUNCE) == {
+        "state": "grace",
+        "family_storage_children": 0,
+        "lapsed_since": t1.isoformat(),
+        "grace_until": grace_until.isoformat(),
+    }
+    assert storage_requirement.denied_node_ids(now=grace_until) == {}
+    assert storage_requirement.denied_node_ids(now=grace_until + timedelta(seconds=1)) == {
         node_id(1): "no-storage"
     }
-    # Storage back: rights back, grace clock reset.
+    # Lapsed: the deadline stays readable (the mail says when it was).
+    assert _readout(now=grace_until + timedelta(seconds=1)) == {
+        "state": "lapsed",
+        "family_storage_children": 0,
+        "lapsed_since": t1.isoformat(),
+        "grace_until": grace_until.isoformat(),
+    }
+    # Storage back: rights back, clock cleared.
+    storage_requirement.refresh(HEALTHY, now=grace_until + timedelta(hours=1))
+    row = FamilyStorageState.objects.get(family=FAMILY_A)
+    assert (row.unhealthy_since, row.lapsed_since) == (None, None)
+    assert _readout(now=grace_until + timedelta(hours=2))["state"] == "ok"
+
+
+def test_a_gap_shorter_than_the_debounce_never_lapses(on: None) -> None:
+    """An Arion migration / re-key: storage gone for under 2 h."""
+    t0 = timezone.now() - timedelta(days=1)
+    storage_requirement.refresh(HEALTHY, now=t0)
+    storage_requirement.refresh(LOST, now=t0 + timedelta(minutes=5))
+    storage_requirement.refresh(LOST, now=t0 + timedelta(hours=1, minutes=55))
+    storage_requirement.refresh(HEALTHY, now=t0 + timedelta(hours=2, minutes=5))
+    storage_requirement.refresh(LOST, now=t0 + timedelta(hours=3))
+    row = FamilyStorageState.objects.get(family=FAMILY_A)
+    # A new run starts from scratch.
+    assert row.unhealthy_since == t0 + timedelta(hours=3) and row.lapsed_since is None
+
+
+def test_the_debounce_is_configurable(on: None, settings) -> None:
+    settings.VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S = 0
+    t0 = timezone.now()
+    storage_requirement.refresh(HEALTHY, now=t0 - timedelta(minutes=5))
+    storage_requirement.refresh(LOST, now=t0)
+    assert FamilyStorageState.objects.get(family=FAMILY_A).lapsed_since == t0
+
+
+def test_the_clock_survives_a_restart(on: None) -> None:
+    """It is stored, not held in memory: a fresh read of the row (as a new
+    process would) gives the same readout."""
+    t0 = timezone.now() - timedelta(days=1)
+    storage_requirement.refresh(HEALTHY, now=t0)
+    storage_requirement.refresh(LOST, now=t0 + timedelta(minutes=1))
+    storage_requirement.refresh(LOST, now=t0 + timedelta(hours=3))
+    row = FamilyStorageState.objects.get(family=FAMILY_A)
+    assert row.lapsed_since == t0 + timedelta(minutes=1)
+    assert _readout(now=t0 + timedelta(hours=4))["lapsed_since"] == row.lapsed_since.isoformat()
+
+
+def test_a_new_family_without_storage_lapses_at_once_without_grace(on: None) -> None:
+    t0 = timezone.now()
+    storage_requirement.refresh(snapshot(family(FAMILY_A, (1,))), now=t0)
+    assert _readout(now=t0) == {
+        "state": "lapsed",
+        "family_storage_children": 0,
+        "lapsed_since": t0.isoformat(),
+        "grace_until": None,
+    }
+    # Still never healthy: the lapse keeps its first date.
+    storage_requirement.refresh(snapshot(family(FAMILY_A, (1,))), now=t0 + timedelta(hours=5))
+    assert _readout()["lapsed_since"] == t0.isoformat()
+
+
+def test_readout_states_exempt_off_and_unknown(on: None, settings) -> None:
     storage_requirement.refresh(
-        snapshot(family(FAMILY_A, (1,), storage(0xD1))), now=grace_end + timedelta(hours=1)
+        snapshot(family(FAMILY_A, (1,), storage(0xD1)), family(FAMILY_B, (2,)))
     )
-    assert storage_requirement.denied_node_ids(now=grace_end + timedelta(hours=2)) == {}
-
-
-def test_the_grace_counts_from_the_last_healthy_read(on: None) -> None:
-    t0 = timezone.now() - timedelta(days=10)
-    healthy = snapshot(family(FAMILY_A, (1,), storage(0xD1)))
-    storage_requirement.refresh(healthy, now=t0)
-    t1 = t0 + timedelta(days=5)
-    storage_requirement.refresh(healthy, now=t1)
-    storage_requirement.refresh(snapshot(family(FAMILY_A, (1,))), now=t1 + timedelta(minutes=5))
-    assert FamilyStorageState.objects.get(family=FAMILY_A).last_healthy_at == t1
-    # 72 h after t1 — long past t0 + 72 h — it is still in grace.
-    assert storage_requirement.denied_node_ids(now=t1 + timedelta(hours=71)) == {}
+    assert _readout() == {
+        "state": "ok",
+        "family_storage_children": 1,
+        "lapsed_since": None,
+        "grace_until": None,
+    }
+    settings.VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES = [storage_requirement.ss58_encode(FAMILY_B)]
+    assert _readout(node_id(2))["state"] == "exempt"
+    assert _readout(node_id(9)) is None  # not a compute node vali read
+    settings.VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES = ["typo"]
+    assert _readout(node_id(2)) == storage_requirement.OFF_READOUT
+    settings.VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES = []
+    settings.VALI_COMPUTE_REQUIRES_STORAGE = False
+    assert storage_requirement.node_requirements() is None
+    assert _readout(node_id(2)) == {
+        "state": "off",
+        "family_storage_children": None,
+        "lapsed_since": None,
+        "grace_until": None,
+    }
 
 
 def test_a_failed_read_keeps_the_last_decision(on: None, monkeypatch) -> None:
@@ -295,7 +396,7 @@ def test_a_cut_node_is_cordoned_and_never_placed_on(on: None) -> None:
     )
     assert decide_placement(**kw, cordoned=service.cordoned_node_ids()) == node_id(2)
     FamilyStorageState.objects.filter(family=FAMILY_B).update(
-        has_storage=False, last_healthy_at=None
+        has_storage=False, last_healthy_at=None, lapsed_since=timezone.now()
     )
     with pytest.raises(PlacementError) as exc:
         decide_placement(**kw, cordoned=service.cordoned_node_ids())
@@ -367,6 +468,33 @@ def test_operator_nodes_says_no_storage(on: None, authed_client) -> None:
         "no-storage",
     )
     assert rows[node_id(2)]["schedulable_reason"] != "no-storage"
+    # The lapse fields the backend mails the operator from.
+    assert rows[node_id(1)]["storage_requirement"]["state"] == "lapsed"
+    assert rows[node_id(1)]["storage_requirement"]["family_storage_children"] == 0
+    assert rows[node_id(1)]["storage_requirement"]["lapsed_since"] is not None
+    assert rows[node_id(2)]["storage_requirement"] == {
+        "state": "ok",
+        "family_storage_children": 1,
+        "lapsed_since": None,
+        "grace_until": None,
+    }
+
+
+def test_operator_nodes_reads_off_while_the_requirement_is_off(authed_client) -> None:
+    from django.urls import reverse
+
+    from .factories import make_dispatchable_identity
+
+    make_dispatchable_identity(1)
+    resp = authed_client.get(reverse("operator_nodes"), {"node_id": [node_id(1)]})
+    assert resp.json()["nodes"][0]["storage_requirement"] == storage_requirement.OFF_READOUT
+
+
+def test_operator_nodes_serializer_documents_the_field() -> None:
+    from apps.operator.schemas import OperatorNodeSerializer
+
+    field = OperatorNodeSerializer().fields["storage_requirement"]
+    assert set(field.fields) == set(storage_requirement.OFF_READOUT)
 
 
 # ─── the chain read boundary ─────────────────────────────────────────
@@ -493,20 +621,21 @@ def test_evaluate_reports_every_family_and_writes_nothing(on: None, monkeypatch,
     from django.test.utils import CaptureQueriesContext
 
     t0 = timezone.now() - timedelta(hours=10)
-    # A lost its storage 10 h ago (in grace); B never had any; C is healthy;
-    # D is exempt.
+    # A lost its storage 10 h ago (lapsed after the debounce, in grace); B
+    # never had any; C is healthy; D is exempt.
     fam_c, fam_d = h(0xC9), h(0xD9)
     FamilyStorageState.objects.create(
         family=FAMILY_A,
         compute_node_ids=[node_id(1)],
         has_storage=False,
-        last_healthy_at=t0,
+        last_healthy_at=t0 - timedelta(minutes=5),
+        unhealthy_since=t0,
         first_seen_at=t0,
         refreshed_at=t0,
     )
     settings.VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES = [storage_requirement.ss58_encode(fam_d)]
     snap = snapshot(
-        family(FAMILY_A, (1,), storage(0xD1, node_weight=0)),
+        family(FAMILY_A, (1,), storage(0xD1, last_bucket=0)),
         family(FAMILY_B, (2,), storage(0xC2, FAMILY_B)),
         family(fam_c, (3,), storage(0xE1, fam_c)),
         family(fam_d, (4,)),
@@ -527,18 +656,21 @@ def test_evaluate_reports_every_family_and_writes_nothing(on: None, monkeypatch,
     assert list(FamilyStorageState.objects.values()) == before
     report = json.loads(out.getvalue())
     by = {f["family"]: f for f in report["families"]}
-    assert (by[FAMILY_A]["decision"], by[FAMILY_A]["tracked"]) == ("grace", True)
-    assert by[FAMILY_A]["grace_until"] is not None
-    assert by[FAMILY_A]["children"] == [
-        {"child": h(0xD1), "counted": False, "reason": "zero-weight"}
-    ]
-    assert (by[FAMILY_B]["decision"], by[FAMILY_B]["allowed"]) == ("no-storage", False)
+    a = by[FAMILY_A]
+    assert (a["state"], a["tracked"], a["family_storage_children"]) == ("grace", True, 0)
+    # What the next refresh would record: lapsed since the first read without
+    # storage, the debounce being over — computed, never written.
+    assert a["lapsed_since"] == t0.isoformat()
+    assert a["grace_until"] == (t0 + GRACE).isoformat()
+    assert a["children"] == [{"child": h(0xD1), "counted": False, "reason": "stale"}]
+    assert (by[FAMILY_B]["state"], by[FAMILY_B]["allowed"]) == ("lapsed", False)
     assert by[FAMILY_B]["children"][0]["reason"] == "compute-child"
-    assert (by[fam_c]["decision"], by[fam_c]["storage_counted"]) == ("storage-ok", 1)
-    assert by[fam_d]["decision"] == "exempt"
+    assert (by[fam_c]["state"], by[fam_c]["family_storage_children"]) == ("ok", 1)
+    assert by[fam_d]["state"] == "exempt"
     assert by[fam_d]["family_ss58"] == storage_requirement.ss58_encode(fam_d)
     text = human.getvalue()
-    assert "decision=no-storage" in text and "[compute-child]" in text
+    assert "state=lapsed" in text and "[compute-child]" in text
+    assert f"lapsed_since={t0.isoformat()}" in text
     assert "4 compute family(ies), 1 cut; requirement on=True; nothing written" in text
 
 
@@ -561,7 +693,7 @@ def test_evaluate_fails_loudly_on_a_failed_read(monkeypatch) -> None:
 def test_a_new_family_is_judged_without_grace(monkeypatch) -> None:
     _evaluated(monkeypatch, snapshot(family(FAMILY_A, (1,))))
     (fam,) = storage_requirement.evaluate()["families"]
-    assert (fam["tracked"], fam["decision"], fam["grace_until"]) == (False, "no-storage", None)
+    assert (fam["tracked"], fam["state"], fam["grace_until"]) == (False, "lapsed", None)
 
 
 def test_snapshot_dataclass_is_frozen() -> None:

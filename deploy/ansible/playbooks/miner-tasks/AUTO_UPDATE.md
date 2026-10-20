@@ -54,6 +54,32 @@ unhealthy → same SIGKILL swap back to .bak, .update-failed-<tag>, exit 1
 
 Logs: `journalctl -t hippius-miner-update`.
 
+## First install (play 05)
+
+Play 05 installs the binary with the same script:
+`hippius-miner-update --install` (`miner-agent-binary.yml`), when
+`/usr/local/bin/hippius-miner-agent` is missing or its `--version` does
+not report `versions.miner_agent`. One trust model for both:
+
+- the same selection (step 3), except that the binary in place is not
+  trusted for anti-downgrade: only a recorded `installed-release` sets a
+  floor, and that tag itself may be installed again;
+- the same three checks (step 6), with the same pinned cosign, installed
+  just before;
+- then `installed-release = <tag>` and an atomic install (in that
+  order: a run cut short leaves the binary still foreign, which the next
+  play 05 run installs again). Nothing else:
+  no `.bak`, no `update-in-progress`, no swap, no health check, and the
+  agent is never signalled, started or stopped (a process still running
+  an earlier binary keeps it; play 05 says so).
+
+The opt-outs (`.no-auto-update`, `AUTO_UPDATE_DISABLED`) do not apply:
+they stop updates, not the first install. No eligible release, an update
+run holding the lock, or a cut-short update (`update-in-progress`) is an
+error: the play stops with `[MINER_AGENT_INSTALL_FAILED]` and installs
+nothing. A binary already reporting `versions.miner_agent` is never
+reinstalled by the play: from then on only the timer moves it.
+
 ## Why SIGKILL, never stop/restart
 
 A graceful stop of `hippius-miner-agent` destroys **every** domain on the
@@ -244,6 +270,7 @@ Set `miner_auto_update_min_release_age_h` back to the default afterwards.
 | `templates/hippius-miner-update.service.j2` | oneshot unit |
 | `templates/hippius-miner-update.timer.j2` | timer |
 | `templates/auto-update.env.j2` | `/etc/hippius-miner/auto-update.env` |
+| `miner-agent-binary.yml` | the first install (`--install`), from play 05 |
 | `../../../../.github/workflows/miner-agent-release.yml` | builds, attests, publishes |
 | `../../../../scripts/release/build-miner-agent.sh` | the build + smoke both release jobs run |
 | `../../../../scripts/dev/miner-update-test.sh` | updater tests (mocked GitHub, cosign, systemd) |

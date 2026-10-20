@@ -55,49 +55,85 @@
     group: root
     mode: "0755"
 
-- name: Check the installed miner-agent version
-  ansible.builtin.command:
-    argv:
-      - "{{ miner_agent.install_path }}"
-      - "--version"
-  register: miner_agent_version_check
-  failed_when: false
-  changed_when: false
-  check_mode: false
+# ── Auto-update tooling (GitHub Releases) ───────────────────────────
+# Installed before the binary, whose first install goes through the same
+# updater. A systemd timer (its units are rendered at the end) runs
+# /usr/local/bin/hippius-miner-update, which installs the latest release
+# of miner_auto_update_release_repo once it is old enough and verified (sha256, cosign build-provenance attestation, the
+# binary's --version), swaps the agent with SIGKILL — never stop/restart —
+# and rolls back on a missing heartbeat. The files are always installed;
+# the timer only runs when miner_auto_update_enabled is true (the
+# group_vars default). See miner-tasks/AUTO_UPDATE.md. Tagged
+# `miner_auto_update` so the switch can be applied alone
+# (`--tags miner_auto_update`) without re-running the agent install.
+- name: Ensure the cosign directory exists
+  tags: [miner_auto_update]
+  ansible.builtin.file:
+    path: "{{ miner_cosign.path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
-- name: Set whether the miner-agent binary needs (re)building
-  ansible.builtin.set_fact:
-    miner_agent_build_needed: >-
-      {{ miner_agent_version_check.rc != 0
-         or versions.miner_agent not in (miner_agent_version_check.stdout | default('')) }}
+- name: Install cosign (pinned version + digest) for the release attestation
+  tags: [miner_auto_update]
+  ansible.builtin.import_tasks: pinned-file.yml
+  vars:
+    pinned:
+      name: cosign
+      dest: "{{ miner_cosign.path }}"
+      sha256: "{{ miner_cosign.sha256 }}"
+      url: "https://github.com/sigstore/cosign/releases/download/{{ miner_cosign.version }}/cosign-linux-amd64"
+      mode: "0755"
 
-# The supported install is the release binary (onboarding-a-miner.md §1
-# "Prebuilt binary"); auto-update keeps it current. Building on the host
-# is an explicit opt-in: by default a missing or foreign binary stops the
-# play here instead of cloning a repository the operator may not be able
-# to read, or code nobody pinned, and building it on a confidential host.
-- name: Refuse to build the miner-agent from source unless asked to
-  ansible.builtin.assert:
-    that:
-      - not (miner_agent_build_needed | bool) or (miner_agent_build_from_source | bool)
-    fail_msg: >-
-      [MINER_AGENT_BINARY_MISSING] {{ miner_agent.install_path }} is missing or
-      does not report version {{ versions.miner_agent }} (`--version` said:
-      {{ miner_agent_version_check.stdout | default('', true) or 'nothing' }}).
-      Install the release binary on the host first:
-      download hippius-miner-agent-x86_64-linux-gnu and SHA256SUMS from
-      https://github.com/{{ miner_auto_update_release_repo }}/releases/latest,
-      `sha256sum -c SHA256SUMS`, then
-      `sudo install -m 0755 -o root -g root hippius-miner-agent-x86_64-linux-gnu
-      {{ miner_agent.install_path }}` (docs/operator/onboarding-a-miner.md,
-      "Prebuilt binary"), and re-run. To build from
-      `miner_agent_source_repo` on this host instead, set
-      `miner_agent_build_from_source: true` in host_vars.
+- name: Install the miner-agent auto-update script
+  tags: [miner_auto_update]
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/miner-tasks/files/hippius-miner-update.sh"
+    dest: /usr/local/bin/hippius-miner-update
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the auto-update env file
+  tags: [miner_auto_update]
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/miner-tasks/templates/auto-update.env.j2"
+    dest: /etc/hippius-miner/auto-update.env
+    owner: root
+    group: root
+    mode: "0644"
 
 # ── Binary install ──────────────────────────────────────────────────
-# Opt-in source build on the host (`miner_agent_build_from_source`); the
-# default path is the signed release binary, installed before the play.
-# Tracked alongside the §MA phase-2 roadmap.
+# The supported install is the release binary, verified and installed by
+# the play itself (miner-agent-binary.yml); auto-update keeps it current.
+# A binary already reporting versions.miner_agent is left untouched.
+- name: Install the miner-agent release binary unless it is in place
+  ansible.builtin.import_tasks: miner-agent-binary.yml
+  vars:
+    miner_agent_updater: /usr/local/bin/hippius-miner-update
+    miner_agent_updater_src: "{{ playbook_dir }}/miner-tasks/files/hippius-miner-update.sh"
+
+# Everything below runs the binary (init-identity, platform-id, the config
+# check), which --check has not installed. (The source build's --check is
+# left as it was.)
+- name: Stop previewing play 05 here when the release would be installed (--check)
+  ansible.builtin.meta: end_host
+  when:
+    - ansible_check_mode
+    - miner_agent_install_needed | bool
+    - not (miner_agent_build_from_source | bool)
+
+- name: Set whether the miner-agent is built from source on this host
+  ansible.builtin.set_fact:
+    miner_agent_source_build: "{{ (miner_agent_install_needed | bool) and (miner_agent_build_from_source | bool) }}"
+
+# ── Source build (opt-in) ───────────────────────────────────────────
+# Opt-in source build on the host (`miner_agent_build_from_source`),
+# instead of the release binary above, never by default: it clones a
+# repository the operator may not be able to read, or code nobody pinned,
+# and builds it on a confidential host. Tracked alongside the §MA phase-2
+# roadmap.
 # Building from source needs a build environment, and the playbook used
 # to install only the Rust half of it. Each of these was found by running
 # the play on a host that did not already have it, and each stopped the
@@ -122,7 +158,7 @@
       - libssl-dev
     state: present
     update_cache: true
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 # A published tree cannot ship a default that only WE can clone, and the
 # placeholder must fail loudly rather than produce a confusing git error
@@ -137,11 +173,11 @@
       `miner_agent_build_from_source: true` play 05 builds the miner-agent
       from source, so it needs a git URL it can actually clone. Set
       `miner_agent_source_repo` to the repository you build the agent
-      from, or drop `miner_agent_build_from_source` and install the
-      release binary at /usr/local/bin/hippius-miner-agent.
+      from, or drop `miner_agent_build_from_source` and let the play
+      install the verified release binary.
   vars:
     miner_agent_source_repo_resolved: "{{ miner_agent_source_repo | default('') }}"
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 - name: Install the Rust toolchain (TEMPORARY — until a binary release)
   ansible.builtin.shell:
@@ -151,7 +187,7 @@
         | sh -s -- -y --profile minimal
     executable: /bin/bash
     creates: /root/.cargo/bin/cargo
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 - name: Clone the hippius-compute repo (TEMPORARY — source build)
   ansible.builtin.git:
@@ -176,7 +212,7 @@
     version: "{{ miner_agent_source_ref | default('main') }}"
     depth: 1
     force: true
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 - name: Build the miner-agent binary (TEMPORARY — source build)
   # No `creates:` guard — the `when` already gates this. A `creates:`
@@ -202,7 +238,7 @@
       cd /opt/hippius-compute
       cargo build --release --locked -p hippius-miner-agent --features snp
     executable: /bin/bash
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 - name: Install the miner-agent binary
   ansible.builtin.copy:
@@ -212,7 +248,7 @@
     owner: root
     group: root
     mode: "0755"
-  when: miner_agent_build_needed | bool
+  when: miner_agent_source_build | bool
 
 # ── Host attestor components ────────────────────────────────────────
 # Rendered into [host_attestor] from `snp_generation` (derived from the
@@ -696,55 +732,11 @@
       `systemctl kill --signal=SIGKILL {{ miner_agent.systemd_unit_name }}`
       (Restart= brings it back and it re-adopts the running CVMs). Do not
       use systemctl restart/stop. See miner-tasks/AUTO_UPDATE.md.
-  when: miner_agent_build_needed | bool
+  when: miner_agent_install_needed | bool
 
-# ── Auto-update (GitHub Releases) ──────────────────────────────────
-# A systemd timer runs /usr/local/bin/hippius-miner-update, which installs
-# the latest release of miner_auto_update_release_repo once it is old
-# enough and verified (sha256, cosign build-provenance attestation, the
-# binary's --version), swaps the agent with SIGKILL — never stop/restart —
-# and rolls back on a missing heartbeat. The files are always installed;
-# the timer only runs when miner_auto_update_enabled is true (the
-# group_vars default). See miner-tasks/AUTO_UPDATE.md. Tagged
-# `miner_auto_update` so the switch can be applied alone
-# (`--tags miner_auto_update`) without re-running the agent install.
-- name: Ensure the cosign directory exists
-  tags: [miner_auto_update]
-  ansible.builtin.file:
-    path: "{{ miner_cosign.path | dirname }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Install cosign (pinned version + digest) for the release attestation
-  tags: [miner_auto_update]
-  ansible.builtin.get_url:
-    url: "https://github.com/sigstore/cosign/releases/download/{{ miner_cosign.version }}/cosign-linux-amd64"
-    dest: "{{ miner_cosign.path }}"
-    checksum: "sha256:{{ miner_cosign.sha256 }}"
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Install the miner-agent auto-update script
-  tags: [miner_auto_update]
-  ansible.builtin.copy:
-    src: "{{ playbook_dir }}/miner-tasks/files/hippius-miner-update.sh"
-    dest: /usr/local/bin/hippius-miner-update
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Render the auto-update env file
-  tags: [miner_auto_update]
-  ansible.builtin.template:
-    src: "{{ playbook_dir }}/miner-tasks/templates/auto-update.env.j2"
-    dest: /etc/hippius-miner/auto-update.env
-    owner: root
-    group: root
-    mode: "0644"
-
+# ── Auto-update timer ───────────────────────────────────────────────
+# The updater, cosign and the env file are installed before the binary
+# (above); these are its units. Tagged `miner_auto_update`.
 - name: Render the auto-update systemd service + timer units
   tags: [miner_auto_update]
   ansible.builtin.template:

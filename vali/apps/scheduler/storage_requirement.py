@@ -10,9 +10,9 @@ them are untouched — the same "no new work" posture as a cordon.
 ## Healthy
 
 An Arion child of the family counts when it passes the filters the Arion
-pallet applies to a child before counting it toward its family's paid weight
-(`compute_family_weight_from_nodes`, thebrain `pallets/arion-pallet`), plus a
-positive validator weight of its own — read on chain:
+pallet itself applies to a child before counting it toward its family's paid
+weight (`compute_family_weight_from_nodes`, thebrain `pallets/arion-pallet`)
+— aligned with the on-chain design, read on chain:
 
 1. `Arion.ChildRegistrations[child]` exists, names THIS family, and is
    `Active` (an `Unbonding` child has its deposit on the way out);
@@ -22,28 +22,39 @@ positive validator weight of its own — read on chain:
 3. its validator-reported weight is FRESH — `NodeWeightLastBucket` within
    `StaleChildBuckets` (the runtime constant, read from metadata) of
    `CurrentWeightBucket`;
-4. the validator has a `NodeQuality` on record for it;
-5. its `NodeWeightByChild` is above zero.
+4. the validator has a `NodeQuality` on record for it (the pallet skips a
+   child without one).
 
 Every input is written by the Arion weight authority or the registration
 extrinsics, never by the miner itself: a miner cannot claim storage it does
-not serve. (The pallet pays per family, from an aggregate; a per-child
-positive weight is the closest per-node signal of "this node is serving".)
-What it cannot prove is physical separation: one machine registered under a
-second account and node id passes condition 2 — it still has to earn its own
-fresh, non-zero validator weight. (A storage node with no shards yet can be healthy: requiring
-stored bytes would refuse every new storage node; the weight already folds
-bytes, bandwidth and uptime in.)
+not serve. What it cannot prove is physical separation: one machine
+registered under a second account and node id passes condition 2 — it still
+has to be reported, fresh, by the validator. (A storage node with no shards
+yet can be healthy: requiring stored bytes would refuse every new one.)
 
-## Grace
+## Lapse and grace
 
-A family that LOSES its storage keeps its rights for
-`VALI_COMPUTE_STORAGE_GRACE_S` (72 h) counted from the last read that found
-it healthy; a family never seen with storage is cut at once. The clock is
-`FamilyStorageState.last_healthy_at`, kept by [`refresh`] — which only runs
-while the requirement is on, so a family that lost its storage before the
-switch was turned on gets no grace. Run `vali_storage_requirement --evaluate`
-before turning it on.
+Per family, `FamilyStorageState` keeps the clock [`advance`] moves on every
+read, and survives a restart:
+
+- `unhealthy_since`: the first read of the current run without healthy
+  storage;
+- `lapsed_since`: set to `unhealthy_since` once that run has lasted
+  `VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S` (2 h) — a short gap (an Arion
+  migration, a re-key) never lapses; cleared, with `unhealthy_since`, by the
+  next healthy read.
+
+The rights end at `grace_until = lapsed_since + VALI_COMPUTE_STORAGE_GRACE_S`
+(72 h). A family never seen with storage lapses at its first read, with no
+debounce and no grace: it is cut at once. The clock only runs while the
+requirement is on, so a family that lost its storage before the switch was
+turned on starts its debounce at the flip. Run `vali_storage_requirement
+--evaluate` before turning it on.
+
+Per compute node, [`node_requirements`] is the readout `/v1/operator/nodes`
+serves: `state` (`ok` | `grace` | `lapsed` | `exempt` | `off`),
+`family_storage_children` (the healthy count), `lapsed_since`,
+`grace_until` — what the backend needs to warn an operator before the cut.
 
 ## Exemptions
 
@@ -92,13 +103,13 @@ CHILD_NOT_ACTIVE = "not-active"
 CHILD_COMPUTE = "compute-child"
 CHILD_STALE = "stale"
 CHILD_NO_QUALITY = "no-quality"
-CHILD_ZERO_WEIGHT = "zero-weight"
 
-#: Decisions.
-DECISION_STORAGE_OK = "storage-ok"
-DECISION_EXEMPT = "exempt"
-DECISION_GRACE = "grace"
-DECISION_NO_STORAGE = "no-storage"
+#: A family's (and its compute nodes') storage state.
+STATE_OK = "ok"
+STATE_GRACE = "grace"
+STATE_LAPSED = "lapsed"
+STATE_EXEMPT = "exempt"
+STATE_OFF = "off"
 
 _HEX64 = frozenset("0123456789abcdef")
 
@@ -112,6 +123,10 @@ def required() -> bool:
 
 def grace_s() -> int:
     return int(getattr(settings, "VALI_COMPUTE_STORAGE_GRACE_S", 259200))
+
+
+def debounce_s() -> int:
+    return int(getattr(settings, "VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S", 7200))
 
 
 def min_nodes() -> int:
@@ -346,8 +361,6 @@ def judge_child(
         return CHILD_STALE
     if not child.has_quality:
         return CHILD_NO_QUALITY
-    if child.node_weight <= 0:
-        return CHILD_ZERO_WEIGHT
     return None
 
 
@@ -374,11 +387,39 @@ def judge(snapshot: StorageSnapshot) -> list[FamilyVerdict]:
 
 
 @dataclass(frozen=True)
+class Clock:
+    """A family's lapse clock (module docstring, "Lapse and grace")."""
+
+    last_healthy_at: datetime | None
+    unhealthy_since: datetime | None
+    lapsed_since: datetime | None
+
+
+def advance(prev: Clock | None, *, healthy: bool, now: datetime) -> Clock:
+    """The clock after a read at `now` that found the family `healthy` or
+    not; `prev` is `None` for a family read for the first time."""
+    if healthy:
+        return Clock(now, None, None)
+    if prev is None:
+        # First read, no storage: a new family lapses at once.
+        return Clock(None, now, now)
+    if prev.last_healthy_at is None:
+        since = prev.lapsed_since or prev.unhealthy_since or now
+        return Clock(None, prev.unhealthy_since or since, since)
+    unhealthy_since = prev.unhealthy_since or now
+    lapsed_since = prev.lapsed_since
+    if lapsed_since is None and now - unhealthy_since >= timedelta(seconds=debounce_s()):
+        lapsed_since = unhealthy_since
+    return Clock(prev.last_healthy_at, unhealthy_since, lapsed_since)
+
+
+@dataclass(frozen=True)
 class Decision:
     allowed: bool
-    #: `storage-ok` | `exempt` | `grace` | `no-storage`.
-    why: str
-    #: When a family in grace is cut (`None` outside grace).
+    #: `ok` | `grace` | `lapsed` | `exempt`.
+    state: str
+    lapsed_since: datetime | None = None
+    #: `lapsed_since + grace`; `None` for a family that never had storage.
     grace_until: datetime | None = None
 
 
@@ -386,19 +427,27 @@ def decide(
     *,
     family: str,
     has_storage: bool,
-    last_healthy_at: datetime | None,
+    clock: Clock,
     exempt: frozenset[str],
     now: datetime,
 ) -> Decision:
     if has_storage:
-        return Decision(True, DECISION_STORAGE_OK)
+        return Decision(True, STATE_OK)
     if family in exempt:
-        return Decision(True, DECISION_EXEMPT)
-    if last_healthy_at is not None:
-        until = last_healthy_at + timedelta(seconds=grace_s())
-        if now <= until:
-            return Decision(True, DECISION_GRACE, until)
-    return Decision(False, DECISION_NO_STORAGE)
+        return Decision(True, STATE_EXEMPT, clock.lapsed_since)
+    if clock.last_healthy_at is None:
+        return Decision(False, STATE_LAPSED, clock.lapsed_since)
+    if clock.lapsed_since is None:
+        # Inside the debounce: not lapsed (yet).
+        return Decision(True, STATE_OK)
+    until = clock.lapsed_since + timedelta(seconds=grace_s())
+    if now <= until:
+        return Decision(True, STATE_GRACE, clock.lapsed_since, until)
+    return Decision(False, STATE_LAPSED, clock.lapsed_since, until)
+
+
+def _clock(row: FamilyStorageState) -> Clock:
+    return Clock(row.last_healthy_at, row.unhealthy_since, row.lapsed_since)
 
 
 # ─── the cached state and the gate ───────────────────────────────────
@@ -425,23 +474,22 @@ def refresh(snapshot: StorageSnapshot | None = None, *, now: datetime | None = N
                 "refreshed_at": now,
                 "block_hash": snapshot.block_hash,
             }
+            clock = advance(_clock(row) if row else None, healthy=healthy, now=now)
+            fields.update(
+                last_healthy_at=clock.last_healthy_at,
+                unhealthy_since=clock.unhealthy_since,
+                lapsed_since=clock.lapsed_since,
+            )
             if row is None:
-                FamilyStorageState.objects.create(
-                    family=v.family,
-                    first_seen_at=now,
-                    last_healthy_at=now if healthy else None,
-                    **fields,
-                )
+                FamilyStorageState.objects.create(family=v.family, first_seen_at=now, **fields)
                 continue
-            if healthy:
-                fields["last_healthy_at"] = now
-            elif row.has_storage:
+            if clock.lapsed_since is not None and row.lapsed_since is None:
                 log.warning(
-                    "storage requirement: family %s LOST its storage (%d healthy node(s)); "
+                    "storage requirement: family %s LAPSED (no healthy storage since %s); "
                     "grace until %s",
                     v.family[:16],
-                    v.counted,
-                    (row.last_healthy_at or now) + timedelta(seconds=grace_s()),
+                    clock.lapsed_since.isoformat(),
+                    (clock.lapsed_since + timedelta(seconds=grace_s())).isoformat(),
                 )
             FamilyStorageState.objects.filter(pk=row.pk).update(**fields)
         if existing:
@@ -466,13 +514,61 @@ def denied_node_ids(*, now: datetime | None = None) -> dict[str, str]:
         decision = decide(
             family=row.family,
             has_storage=row.has_storage,
-            last_healthy_at=row.last_healthy_at,
+            clock=_clock(row),
             exempt=exempt,
             now=now,
         )
         if not decision.allowed:
             for node_id in row.compute_node_ids:
                 out[str(node_id).lower()] = REASON_NO_STORAGE
+    return out
+
+
+def _iso(at: datetime | None) -> str | None:
+    return at.isoformat() if at else None
+
+
+#: The per-node readout while the requirement is off (or inert).
+OFF_READOUT: dict[str, Any] = {
+    "state": STATE_OFF,
+    "family_storage_children": None,
+    "lapsed_since": None,
+    "grace_until": None,
+}
+
+
+def node_requirements(*, now: datetime | None = None) -> dict[str, dict[str, Any]] | None:
+    """`{compute node_id: readout}` — the per-node `storage_requirement`
+    `/v1/operator/nodes` serves: `{state, family_storage_children,
+    lapsed_since, grace_until}`. `None` while the requirement is off (or
+    inert on a bad exemption list): every node then reads [`OFF_READOUT`].
+    A node absent from the map is not a compute node vali has read on
+    chain: the caller serves `null` for it."""
+    if not required():
+        return None
+    try:
+        exempt = exempt_families()
+    except ExemptionInvalid as exc:
+        _log_inert(str(exc))
+        return None
+    now = now or timezone.now()
+    out: dict[str, dict[str, Any]] = {}
+    for row in FamilyStorageState.objects.all():
+        decision = decide(
+            family=row.family,
+            has_storage=row.has_storage,
+            clock=_clock(row),
+            exempt=exempt,
+            now=now,
+        )
+        readout = {
+            "state": decision.state,
+            "family_storage_children": row.storage_counted,
+            "lapsed_since": _iso(decision.lapsed_since),
+            "grace_until": _iso(decision.grace_until),
+        }
+        for node_id in row.compute_node_ids:
+            out[str(node_id).lower()] = readout
     return out
 
 
@@ -588,11 +684,12 @@ def evaluate(snapshot: StorageSnapshot | None = None, *, now: datetime | None = 
     for v in judge(snapshot):
         row = rows.get(v.family)
         healthy = v.healthy
-        last_healthy = now if healthy else (row.last_healthy_at if row else None)
+        # The clock as the next refresh would move it — computed, not stored.
+        clock = advance(_clock(row) if row else None, healthy=healthy, now=now)
         decision = decide(
             family=v.family,
             has_storage=healthy,
-            last_healthy_at=last_healthy,
+            clock=clock,
             exempt=exempt,
             now=now,
         )
@@ -601,15 +698,16 @@ def evaluate(snapshot: StorageSnapshot | None = None, *, now: datetime | None = 
                 "family": v.family,
                 "family_ss58": ss58_encode(v.family),
                 "compute_node_ids": list(v.compute_node_ids),
-                "storage_counted": v.counted,
+                "family_storage_children": v.counted,
                 "storage_required": min_nodes(),
                 "healthy": healthy,
                 "children": [c.as_dict() for c in v.children],
                 "tracked": row is not None,
-                "last_healthy_at": last_healthy.isoformat() if last_healthy else None,
-                "decision": decision.why,
+                "state": decision.state,
                 "allowed": decision.allowed,
-                "grace_until": decision.grace_until.isoformat() if decision.grace_until else None,
+                "unhealthy_since": _iso(clock.unhealthy_since),
+                "lapsed_since": _iso(decision.lapsed_since),
+                "grace_until": _iso(decision.grace_until),
             }
         )
     return {
@@ -620,6 +718,7 @@ def evaluate(snapshot: StorageSnapshot | None = None, *, now: datetime | None = 
         "current_weight_bucket": snapshot.current_weight_bucket,
         "stale_child_buckets": snapshot.stale_child_buckets,
         "grace_s": grace_s(),
+        "lapse_debounce_s": debounce_s(),
         "last_refresh_at": last_refresh.isoformat() if last_refresh else None,
         "families": families,
     }

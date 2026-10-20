@@ -129,6 +129,35 @@ class OperatorLocationSerializer(serializers.Serializer):
     observed_at = serializers.DateTimeField(help_text="When this evidence was last collected.")
 
 
+class OperatorStorageRequirementSerializer(serializers.Serializer):
+    """The node's family against "compute requires storage"
+    (`apps.scheduler.storage_requirement`)."""
+
+    state = serializers.ChoiceField(
+        choices=["ok", "grace", "lapsed", "exempt", "off"],
+        help_text=(
+            "`ok`: healthy storage (or a gap still inside the lapse debounce); "
+            "`grace`: lapsed, rights kept until `grace_until`; `lapsed`: cut — no new "
+            "VM, no reward; `exempt`: never cut; `off`: the requirement is not enforced."
+        ),
+    )
+    family_storage_children = serializers.IntegerField(
+        allow_null=True,
+        help_text="The family's healthy Arion storage nodes at the last read (null when off).",
+    )
+    lapsed_since = serializers.DateTimeField(
+        allow_null=True,
+        help_text="The first read without healthy storage of the run that lapsed.",
+    )
+    grace_until = serializers.DateTimeField(
+        allow_null=True,
+        help_text=(
+            "`lapsed_since + VALI_COMPUTE_STORAGE_GRACE_S`: when the rights end. Null "
+            "when not lapsed, and for a family that never had storage (no grace)."
+        ),
+    )
+
+
 class OperatorNodeSerializer(serializers.Serializer):
     """One node's status row."""
 
@@ -187,6 +216,15 @@ class OperatorNodeSerializer(serializers.Serializer):
         help_text=(
             "The DETECTED location (`vali_geo_probe`) — `null` before the first probe "
             "cycle. Optional during the rollout."
+        ),
+    )
+    storage_requirement = OperatorStorageRequirementSerializer(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "Compute requires storage, for the node's family. `null` while enforced "
+            "for a node vali has not read as an Active compute node on chain. "
+            "Optional during the rollout."
         ),
     )
 
