@@ -1,0 +1,105 @@
+---
+# Place ONE public, sha256-pinned file on the miner — tasks file included
+# by mtls-cert-mount.yml (the Edge + KBS CA certificates) and
+# miner-agent-install.yml (the host-attestor boot components), and by
+# tests/pinned_file_wiring.yml against local files.
+#
+# Nothing here is a secret: public CA certificates and measured boot
+# artefacts whose integrity is the pin itself. Where the bytes come from
+# does not matter, only that they hash to `pinned.sha256`:
+#   1. `pinned.local_src` on the controller, when set and present (a file
+#      in this checkout's miner-tasks/files/, or an operator override);
+#   2. otherwise `pinned.url` (the public asset store), fetched ON THE
+#      MINER by get_url, which verifies the checksum before installing.
+# Either way the file that ends up on disk is re-hashed and refused on a
+# mismatch, so a wrong local copy fails as loudly as a wrong download.
+#
+# Input `pinned`: {name, dest, sha256, url, local_src (optional), mode,
+# owner/group (default root; the test harness passes its own user)}.
+
+- name: "Check for a local copy of {{ pinned.name }} on the controller"
+  ansible.builtin.stat:
+    path: "{{ pinned.local_src | expanduser }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: miner_pinned_local
+  when: pinned.local_src | default('') | length > 0
+
+# Before anything reaches the miner: a wrong local copy is never installed.
+- name: "Refuse a local copy of {{ pinned.name }} that is not the pinned file"
+  ansible.builtin.assert:
+    that:
+      - miner_pinned_local.stat.checksum == pinned.sha256
+    fail_msg: >-
+      [PINNED_FILE_MISMATCH] {{ pinned.local_src }} ({{ pinned.name }}) is
+      sha256 {{ miner_pinned_local.stat.checksum }}, pinned {{ pinned.sha256 }}.
+      Restore it from the repository (or delete it to download the pinned
+      file); never edit the pin to match a file.
+    quiet: true
+  when: miner_pinned_local.stat.exists | default(false)
+
+- name: "Install {{ pinned.name }} from the local copy"
+  ansible.builtin.copy:
+    src: "{{ pinned.local_src | expanduser }}"
+    dest: "{{ pinned.dest }}"
+    owner: "{{ pinned.owner | default('root') }}"
+    group: "{{ pinned.group | default('root') }}"
+    mode: "{{ pinned.mode | default('0644') }}"
+  register: miner_pinned_install
+  when: miner_pinned_local.stat.exists | default(false)
+
+- name: "Download {{ pinned.name }} from the public asset store"
+  when: not (miner_pinned_local.stat.exists | default(false))
+  block:
+    - name: "Download {{ pinned.name }} from the public asset store, verified by digest"
+      ansible.builtin.get_url:
+        url: "{{ pinned.url }}"
+        dest: "{{ pinned.dest }}"
+        checksum: "sha256:{{ pinned.sha256 }}"
+        owner: "{{ pinned.owner | default('root') }}"
+        group: "{{ pinned.group | default('root') }}"
+        mode: "{{ pinned.mode | default('0644') }}"
+      register: miner_pinned_download
+      # Under --check on a fresh host the destination directory does not
+      # exist yet (its `file` task only previewed), so get_url cannot even
+      # stage: a preview, not a failure.
+      ignore_errors: "{{ ansible_check_mode }}"
+  rescue:
+    - name: "Say why {{ pinned.name }} could not be placed"
+      ansible.builtin.fail:
+        msg: >-
+          [{{ 'PINNED_FILE_MISMATCH' if 'checksum' in (miner_pinned_download.msg | default('')) else 'PINNED_FILE_UNAVAILABLE' }}]
+          {{ pinned.name }}: {{ pinned.url }} —
+          {{ miner_pinned_download.msg | default('download failed') }}.
+          The file is pinned by sha256 in group_vars; check the host can
+          reach the public asset store over HTTPS, and that your checkout
+          is current (an old checkout can name a file the store no longer
+          serves).
+
+# The end state, not the action: get_url skips a download whose dest
+# already hashes right, and `copy` never compares content to a pin.
+- name: "Re-hash {{ pinned.name }} on disk"
+  ansible.builtin.stat:
+    path: "{{ pinned.dest }}"
+    checksum_algorithm: sha256
+  register: miner_pinned_stat
+
+- name: "Refuse {{ pinned.name }} unless it is the pinned file"
+  ansible.builtin.assert:
+    that:
+      - miner_pinned_stat.stat.exists
+      - miner_pinned_stat.stat.checksum == pinned.sha256
+    fail_msg: >-
+      [PINNED_FILE_MISMATCH] {{ pinned.dest }} ({{ pinned.name }}) is
+      {{ 'missing' if not miner_pinned_stat.stat.exists else 'sha256 ' ~ miner_pinned_stat.stat.checksum }},
+      pinned {{ pinned.sha256 }}. Source:
+      {{ pinned.local_src if (miner_pinned_local.stat.exists | default(false)) else pinned.url }}.
+      Remove the wrong copy and re-run; never edit the pin to match a file.
+    quiet: true
+  # Under --check nothing is written: judge only a file that stays as is.
+  when: >-
+    not ansible_check_mode
+    or (miner_pinned_stat.stat.exists
+        and not (miner_pinned_install.changed | default(false))
+        and not (miner_pinned_download.changed | default(false)))

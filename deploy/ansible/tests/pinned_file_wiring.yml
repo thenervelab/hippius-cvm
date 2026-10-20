@@ -1,0 +1,103 @@
+---
+# Wiring test for miner-tasks/pinned-file.yml: the real tasks file on
+# localhost, against files in a scratch directory and a file:// "asset
+# store" — no host and no network. Checks a local copy is installed, a
+# download is used when there is no local copy, a file already in place
+# is kept, and a wrong file from either source is refused.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/pinned_file_wiring.yml
+
+- name: Pinned public file wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/pinned-file-wiring"
+    me: "{{ lookup('env', 'USER') | default('root', true) }}"
+  tasks:
+    - name: Fresh scratch tree
+      ansible.builtin.file:
+        path: "{{ scratch }}/{{ item }}"
+        state: "{{ 'absent' if item == '' else 'directory' }}"
+      loop: ["", "store", "local", "dest"]
+
+    - name: The asset store and a local copy
+      ansible.builtin.copy:
+        dest: "{{ scratch }}/{{ item.path }}"
+        content: "{{ item.content }}"
+        mode: "0644"
+      loop:
+        - { path: store/good.crt, content: "public cert\n" }
+        - { path: store/bad.crt, content: "tampered\n" }
+        - { path: local/good.crt, content: "public cert\n" }
+        - { path: local/bad.crt, content: "tampered\n" }
+
+    - name: Pin the good bytes
+      ansible.builtin.set_fact:
+        good_sha: "{{ 'public cert\n' | hash('sha256') }}"
+
+    - name: A local copy is installed and verified
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: local, dest: "{{ scratch }}/dest/a.crt", sha256: "{{ good_sha }}",
+                  url: "file://{{ scratch }}/store/bad.crt", local_src: "{{ scratch }}/local/good.crt",
+                  owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: Without a local copy the store is used
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: download, dest: "{{ scratch }}/dest/b.crt", sha256: "{{ good_sha }}",
+                  url: "file://{{ scratch }}/store/good.crt", local_src: "{{ scratch }}/local/absent.crt",
+                  owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: A file already in place that hashes right is kept (the store is never read)
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: kept, dest: "{{ scratch }}/dest/b.crt", sha256: "{{ good_sha }}",
+                  url: "file://{{ scratch }}/store/does-not-exist.crt",
+                  owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: An empty local_src right after a local-copy include still downloads
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: no-local, dest: "{{ scratch }}/dest/e.crt", sha256: "{{ good_sha }}",
+                  url: "file://{{ scratch }}/store/good.crt", local_src: "",
+                  owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: A missing store object fails with its own code
+      block:
+        - name: Fetch an object the store does not have
+          ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+          vars:
+            pinned: { name: absent, dest: "{{ scratch }}/dest/f.crt", sha256: "{{ good_sha }}",
+                      url: "file://{{ scratch }}/store/absent.crt",
+                      owner: "{{ me }}", group: "{{ me }}" }
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: a missing object was accepted
+      rescue:
+        - name: Named PINNED_FILE_UNAVAILABLE
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is search('PINNED_FILE_UNAVAILABLE')
+
+    - name: Both installed files are the pinned bytes
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/dest/a.crt') == 'public cert'
+          - lookup('file', scratch ~ '/dest/b.crt') == 'public cert'
+          - lookup('file', scratch ~ '/dest/e.crt') == 'public cert'
+
+    - name: A wrong file is refused, from either source
+      ansible.builtin.include_tasks: pinned_file_refused.yml
+      loop:
+        - { name: bad-local, dest: "{{ scratch }}/dest/c.crt", sha256: "{{ good_sha }}",
+            url: "file://{{ scratch }}/store/good.crt", local_src: "{{ scratch }}/local/bad.crt",
+            owner: "{{ me }}", group: "{{ me }}" }
+        - { name: bad-download, dest: "{{ scratch }}/dest/d.crt", sha256: "{{ good_sha }}",
+            url: "file://{{ scratch }}/store/bad.crt",
+            owner: "{{ me }}", group: "{{ me }}" }
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"

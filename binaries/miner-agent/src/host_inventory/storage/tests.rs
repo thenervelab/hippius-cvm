@@ -2670,8 +2670,8 @@ fn sensors_and_ipmi_run_before_storage_and_the_probe_last() {
 }
 
 /// smartctl 7.5 `-j -H -A -l error -d sat+megaraid,N /dev/bus/0` of the two
-/// SK hynix HFS1T9G32FEH SATA SSDs behind a PERC H330, as one host
-/// reported them: 198 (flags 0x0010, VALUE 100, WORST 100, THRESH
+/// SK hynix HFS1T9G32FEH SATA SSDs behind a Dell PERC H330 host. From
+/// that host: 198 (flags 0x0010, VALUE 100, WORST 100, THRESH
 /// 0, raw `offline`), raw 0 on 5 / 181 / 182 / 199, raw `wear` on 233 and
 /// `nand_gib` on 241, about 22k power-on hours, health PASSED, solid
 /// state. The normalised values of the attributes other than 198 were
@@ -2738,7 +2738,7 @@ fn ssd_json(lines: &[String], hours: u64) -> String {
 fn an_ssd_s_raw_198_is_not_bad_sectors() {
     use AdvisoryCode as C;
     use Severity as S;
-    // pd0 and pd1: raw 198 = 1080 / 248, normalised 100, threshold 0.
+    // A Dell PERC H330 host, pd0 and pd1: raw 198 = 1080 / 248, normalised 100, threshold 0.
     for (offline, wear, nand, hours) in [
         (1080, 281_103, 256_452, 22_000),
         (248, 110_396, 114_681, 22_100),

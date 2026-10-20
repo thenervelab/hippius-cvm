@@ -28,7 +28,7 @@ def _peers(now, **over):
     p = {
         "name": "miner-a-host",
         "ip": "100.64.0.1",
-        "connection_ip": "146.10.20.30",
+        "connection_ip": "149.112.112.45",
         "country_code": "FR",
         "connected": True,
         "last_seen": seen,
@@ -39,7 +39,7 @@ def _peers(now, **over):
 
 @pytest.fixture(autouse=True)
 def _geo_settings(settings):
-    settings.VALI_GEO_VANTAGE_NAME = "cp-1"
+    settings.VALI_GEO_VANTAGE_NAME = "vantage-1"
     settings.VALI_GEO_VANTAGE_LAT = 50.63
     settings.VALI_GEO_VANTAGE_LON = 3.07
     settings.VALI_GEO_SLACK_KM = 300.0
@@ -80,12 +80,12 @@ def test_once_writes_a_verified_row_from_the_three_sources(stubs) -> None:
     row = MinerLocation.objects.get(miner=miner)
     assert row.verdict == LocationVerdict.VERIFIED
     assert row.country_code == "FR" and row.region == "FR"
-    assert row.connection_ip == "146.10.20.30"
+    assert row.connection_ip == "149.112.112.45"
     assert row.asn == 64500 and row.as_holder == "EXAMPLE-AS"
     assert row.rtt_ms == pytest.approx(4.2)
-    assert row.rtt_vantage == "cp-1"
+    assert row.rtt_vantage == "vantage-1"
     assert row.verdict_reasons == []
-    assert row.evidence_json["peer"]["connection_ip"] == "146.10.20.30"
+    assert row.evidence_json["peer"]["connection_ip"] == "149.112.112.45"
     assert row.netbird_last_seen_at is not None
 
 
@@ -107,7 +107,7 @@ def test_geoip_is_cached_while_the_ip_is_unchanged_and_fresh(stubs) -> None:
     assert stubs["calls"]["geo"] == 1  # second cycle reused the row
     assert stubs["calls"]["rtt"] == 2  # RTT is re-measured every cycle
     # a changed egress IP forces a fresh lookup
-    stubs["peers"] = _peers(stubs["now"] + timedelta(minutes=20), connection_ip="146.10.20.31")
+    stubs["peers"] = _peers(stubs["now"] + timedelta(minutes=20), connection_ip="149.112.113.64")
     cmd.probe_once(stubs["now"] + timedelta(minutes=20))
     assert stubs["calls"]["geo"] == 2
 
@@ -163,7 +163,7 @@ def test_one_miner_raising_does_not_starve_the_rest(stubs, monkeypatch) -> None:
     report = cmd.probe_once(stubs["now"])
     assert report.probed == 2
     assert MinerLocation.objects.get(miner=ok).verdict == LocationVerdict.VERIFIED
-    assert not MinerLocation.objects.filter(miner_id="miner-01").exists()
+    assert not MinerLocation.objects.filter(miner_id="miner-1").exists()
 
 
 def test_a_miner_without_a_netbird_ip_is_written_unknown(stubs) -> None:
@@ -278,11 +278,11 @@ MELBOURNE = geo.GeoRecord(
 
 
 def test_rtt_arbitration_stores_the_arbitrated_country_verified(stubs) -> None:
-    """NetBird CA, RIPEstat Melbourne, 293 ms from the
-    vantage ⇒ stored AU, verified, the arbitration visible."""
+    """NetBird CA, RIPEstat Melbourne, 293 ms from
+    the vantage ⇒ stored AU, verified, the arbitration visible."""
     miner = make_dispatchable_identity(1)
     stubs["geo"] = MELBOURNE
-    stubs["peers"] = _peers(stubs["now"], connection_ip="49.10.20.1", country_code="CA")
+    stubs["peers"] = _peers(stubs["now"], connection_ip="9.9.9.9", country_code="CA")
     stubs["rtt"] = 293.0
     cmd.probe_once(stubs["now"])
     row = MinerLocation.objects.get(miner=miner)

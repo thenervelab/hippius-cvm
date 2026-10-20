@@ -26,16 +26,21 @@
 # and the Edge admits it on the on-chain registry. The ONLY mTLS file
 # the miner needs is the Edge's PUBLIC server CA (so the agent can
 # verify the Edge it connects to) — the playbook provisions it from
-# `files/edge-ca.crt`. Onboarding is then: register the node_id
-# on-chain (`deploy/register-miner/`) + start the agent. No `scp`.
+# `files/edge-ca.crt` in this checkout, or downloads it from the public
+# asset store when the checkout has none, and refuses any file that is
+# not the pinned one (`miner_edge_ca` in group_vars). Onboarding is then:
+# register the node_id on-chain + start the agent. No `scp`.
 - name: "[onchain] Install the Edge server CA cert (public — not a secret)"
   when: miner_edge_auth | default('onchain') != 'ca'
-  ansible.builtin.copy:
-    src: edge-ca.crt
-    dest: "{{ mtls.cert_dir }}/ca.crt"
-    owner: root
-    group: root
-    mode: "0444"
+  ansible.builtin.include_tasks: pinned-file.yml
+  vars:
+    pinned:
+      name: Edge server CA
+      dest: "{{ mtls.cert_dir }}/ca.crt"
+      sha256: "{{ miner_edge_ca.sha256 }}"
+      url: "{{ miner_edge_ca.url }}"
+      local_src: "{{ playbook_dir }}/miner-tasks/files/edge-ca.crt"
+      mode: "0444"
 
 - name: "[onchain] Confirm the self-sign mTLS posture"
   when: miner_edge_auth | default('onchain') != 'ca'
@@ -151,13 +156,20 @@
 # silent hole: the template omits `[kbs].ca_cert` too, so the agent falls
 # back to the webpki roots, which is exactly right for a public cert.
 
-- name: Copy the KBS serving CA onto the miner
-  ansible.builtin.copy:
-    src: "{{ miner_kbs_ca_cert_src | expanduser }}"
-    dest: "{{ miner_kbs_ca_cert_file }}"
-    owner: root
-    group: root
-    mode: "0644"
+# Same rule as the Edge CA: a public certificate, pinned. Taken from
+# `miner_kbs_ca_cert_src` on the controller when that file exists (this
+# checkout's files/kbs-ca.crt by default), else downloaded from the public
+# asset store; refused unless it hashes to `miner_kbs_ca.sha256`.
+- name: Install the KBS serving CA on the miner
+  ansible.builtin.include_tasks: pinned-file.yml
+  vars:
+    pinned:
+      name: KBS serving CA
+      dest: "{{ miner_kbs_ca_cert_file }}"
+      sha256: "{{ miner_kbs_ca.sha256 }}"
+      url: "{{ miner_kbs_ca.url }}"
+      local_src: "{{ miner_kbs_ca_cert_src | default('') }}"
+      mode: "0644"
   when: miner_kbs_ca_cert_file | default('') | length > 0
 
 - name: Refuse a KBS CA that is not a certificate

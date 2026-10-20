@@ -1,0 +1,56 @@
+---
+# --check half of the pinned-file wiring test (run WITH --check): a
+# fresh host (destination directory not created yet) and a host whose pin
+# moved (old file in place) must preview, not fail; an unchanged correct
+# file is still judged.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/pinned_file_check_mode.yml --check
+
+- name: Pinned public file under --check
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/pinned-file-check"
+    me: "{{ lookup('env', 'USER') | default('root', true) }}"
+    old_sha: "{{ 'old cert\n' | hash('sha256') }}"
+    new_sha: "{{ 'new cert\n' | hash('sha256') }}"
+  tasks:
+    - name: This file only means something under --check
+      ansible.builtin.assert:
+        that: ansible_check_mode
+
+    - name: Fresh scratch tree (written for real)
+      check_mode: false
+      ansible.builtin.file:
+        path: "{{ scratch }}/{{ item }}"
+        state: "{{ 'absent' if item == '' else 'directory' }}"
+      loop: ["", "store", "host"]
+
+    - name: A store and a host holding the OLD file (written for real)
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ scratch }}/{{ item.path }}"
+        content: "{{ item.content }}"
+        mode: "0644"
+      loop:
+        - { path: store/new.crt, content: "new cert\n" }
+        - { path: host/ca.crt, content: "old cert\n" }
+
+    - name: Fresh host — the destination directory does not exist yet
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: fresh, dest: "{{ scratch }}/not-created-yet/ca.crt", sha256: "{{ new_sha }}",
+                  url: "file://{{ scratch }}/store/new.crt", owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: The pin moved — the old file would be replaced
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+      vars:
+        pinned: { name: moved, dest: "{{ scratch }}/host/ca.crt", sha256: "{{ new_sha }}",
+                  url: "file://{{ scratch }}/store/new.crt", owner: "{{ me }}", group: "{{ me }}" }
+
+    - name: The old file is untouched (nothing written under --check)
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/host/ca.crt') == 'old cert'
