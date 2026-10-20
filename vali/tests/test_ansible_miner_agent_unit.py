@@ -120,20 +120,41 @@ def test_storage_pools_are_bind_mounted_durably_under_the_pools_root() -> None:
 
 
 def test_the_play_builds_from_source_only_when_asked() -> None:
-    """A missing or foreign binary stops play 05 with the release install
-    steps (fail-closed) unless the host opts in to the source build: the
-    published group_vars cannot clone a repository only we can read."""
+    """A missing or foreign binary is replaced by the verified release
+    (`hippius-miner-update --install`, miner-agent-binary.yml) unless the
+    host opts in to the source build: the published group_vars cannot
+    clone a repository only we can read, and the release install never
+    runs on a source-build host."""
     group_vars = yaml.safe_load((REPO / "deploy/ansible/group_vars/miner_nodes.yml").read_text())
     assert group_vars["miner_agent_build_from_source"] is False
     tasks = yaml.safe_load(TASKS.read_text())
     names = [t.get("name") for t in tasks]
-    gate = "Refuse to build the miner-agent from source unless asked to"
-    (task,) = [t for t in tasks if t.get("name") == gate]
-    assert task["ansible.builtin.assert"]["that"] == [
-        "not (miner_agent_build_needed | bool) or (miner_agent_build_from_source | bool)"
+    binary = "Install the miner-agent release binary unless it is in place"
+    (task,) = [t for t in tasks if t.get("name") == binary]
+    assert task["ansible.builtin.import_tasks"] == "miner-agent-binary.yml"
+    (gate,) = [
+        t
+        for t in tasks
+        if t.get("name") == "Set whether the miner-agent is built from source on this host"
     ]
-    builds = [i for i, t in enumerate(tasks) if t.get("when") == "miner_agent_build_needed | bool"]
-    assert builds and names.index(gate) < min(builds)
+    assert gate["ansible.builtin.set_fact"]["miner_agent_source_build"] == (
+        "{{ (miner_agent_install_needed | bool) and (miner_agent_build_from_source | bool) }}"
+    )
+    builds = [i for i, t in enumerate(tasks) if t.get("when") == "miner_agent_source_build | bool"]
+    assert len(builds) == 6 and names.index(binary) < names.index(gate["name"]) < min(builds)
+
+    release = yaml.safe_load((TASKS.parent / "miner-agent-binary.yml").read_text())
+    (install,) = [
+        t
+        for t in release
+        if t.get("name") == "Install the miner-agent release, verified as an auto-update is"
+    ]
+    assert install["ansible.builtin.command"]["argv"] == ["{{ miner_agent_updater }}", "--install"]
+    assert install["when"] == [
+        "miner_agent_install_needed | bool",
+        "not (miner_agent_build_from_source | bool)",
+        "not ansible_check_mode",
+    ]
 
 
 def test_placeholders_are_refused_before_the_config_is_rendered() -> None:
@@ -146,9 +167,9 @@ def test_placeholders_are_refused_before_the_config_is_rendered() -> None:
 
 
 def test_the_play_expects_the_crate_version_the_releases_report() -> None:
-    """Play 05 refuses a binary whose `--version` lacks `versions.miner_agent`
-    (no silent rebuild any more), so a crate bump without the group_vars one
-    would stop every re-run on an up-to-date host."""
+    """Play 05 reinstalls a binary whose `--version` lacks
+    `versions.miner_agent`, and refuses a release that still lacks it, so a
+    crate bump without the group_vars one would stop every re-run."""
     group_vars = yaml.safe_load((REPO / "deploy/ansible/group_vars/miner_nodes.yml").read_text())
     cargo = (REPO / "binaries/miner-agent/Cargo.toml").read_text()
     (crate_version,) = [

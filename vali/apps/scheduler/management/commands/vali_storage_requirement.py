@@ -4,9 +4,9 @@
 
 Reads the chain NOW (`read-storage-families`) and prints, for every compute
 family: its compute nodes, its Arion storage children and why each did or did
-not count, whether the family is healthy, its grace, and the decision the
-requirement takes (`storage-ok`, `exempt`, `grace`, `no-storage`) — whether or
-not `VALI_COMPUTE_REQUIRES_STORAGE` is on. It writes nothing; a family vali
+not count, whether the family is healthy, and the state the requirement gives
+it (`ok`, `exempt`, `grace`, `lapsed`) with `lapsed_since` / `grace_until` —
+whether or not `VALI_COMPUTE_REQUIRES_STORAGE` is on. It writes nothing; a family vali
 has no recorded state for is judged as new (no grace), as the first refresh
 after turning the requirement on would. Run it before turning it on, and copy
 any family to exempt from the `family_ss58` column into
@@ -45,12 +45,14 @@ class Command(BaseCommand):
             uncounted = ",".join(
                 f"{c['child'][:8]}[{c['reason']}]" for c in f["children"] if not c["counted"]
             )
-            grace = f" grace_until={f['grace_until']}" if f["grace_until"] else ""
+            lapse = "".join(
+                f" {k}={f[k]}" for k in ("unhealthy_since", "lapsed_since", "grace_until") if f[k]
+            )
             self.stdout.write(
                 f"{f['family_ss58']} compute={len(f['compute_node_ids'])} "
-                f"storage={f['storage_counted']}/{f['storage_required']} "
+                f"storage={f['family_storage_children']}/{f['storage_required']} "
                 f"healthy={f['healthy']} tracked={f['tracked']} "
-                f"decision={f['decision']}{grace}"
+                f"state={f['state']}{lapse}"
                 + (f" not-counted={uncounted}" if uncounted else "")
             )
         cut = sum(1 for f in report["families"] if not f["allowed"])

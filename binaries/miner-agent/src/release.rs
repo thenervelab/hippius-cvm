@@ -6,8 +6,8 @@
 //! source build, the container image — carries [`DEV_RELEASE`].
 //!
 //! `--version` prints `hippius-miner-agent <crate version> (<tag>)`. The
-//! crate version stays in the line on purpose: play 05 skips its source
-//! build only while `--version` contains `versions.miner_agent`. The
+//! crate version stays in the line on purpose: play 05 keeps the installed
+//! binary only while `--version` contains `versions.miner_agent`. The
 //! auto-updater reads the parenthesised tag and refuses a downloaded
 //! binary whose tag is not the release it was published under.
 

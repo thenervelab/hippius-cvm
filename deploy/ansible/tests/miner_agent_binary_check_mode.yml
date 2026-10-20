@@ -1,0 +1,70 @@
+---
+# --check half of the miner-agent binary wiring test (run WITH --check): a
+# fresh host previews the release install without calling the updater or
+# writing anything, and an agent already in place is still judged in
+# place.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/miner_agent_binary_check_mode.yml --check
+
+- name: miner-agent binary under --check
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-check"
+    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent" }
+    miner_agent_updater: "{{ scratch }}/hippius-miner-update"
+    miner_agent_build_from_source: false
+    miner_auto_update_release_repo: "example/release-repo"
+    versions: { miner_agent: "0.0.1" }
+  tasks:
+    - name: This file only means something under --check
+      ansible.builtin.assert:
+        that: ansible_check_mode
+
+    - name: Fresh scratch tree (written for real)
+      check_mode: false
+      ansible.builtin.file:
+        path: "{{ scratch }}"
+        state: "{{ item }}"
+      loop: [absent, directory]
+
+    - name: A stub updater that records any call (written for real)
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ miner_agent_updater }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          echo "$*" >>"{{ scratch }}/calls"
+          printf '#!/bin/sh\necho "hippius-miner-agent 0.0.1 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}"
+          chmod 0755 "{{ miner_agent.install_path }}"
+          echo v2025.01.09
+
+    - name: Fresh host — no agent binary
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+
+    - name: Previewed, not run — no updater call, no binary
+      ansible.builtin.assert:
+        that:
+          - miner_agent_install_needed | bool
+          - miner_agent_release_install is skipped
+          - not (scratch ~ '/calls') is file
+          - not (miner_agent.install_path is file)
+
+    - name: An agent already at versions.miner_agent (written for real)
+      check_mode: false
+      ansible.builtin.copy:
+        dest: "{{ miner_agent.install_path }}"
+        mode: "0755"
+        content: "#!/bin/sh\necho 'hippius-miner-agent 0.0.1 (v2025.01.08)'\n"
+
+    - name: Agent in place
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+
+    - name: Judged in place under --check too — nothing to install
+      ansible.builtin.assert:
+        that:
+          - not (miner_agent_install_needed | bool)
+          - not (scratch ~ '/calls') is file

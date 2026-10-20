@@ -1,0 +1,136 @@
+---
+# Wiring test for miner-tasks/miner-agent-binary.yml: the real tasks file
+# on localhost, with the agent binary in a scratch directory and a stub in
+# place of hippius-miner-update (whose own selection and verification
+# scripts/dev/miner-update-test.sh covers). Checks that a binary at the
+# expected version is left alone, that a missing or foreign one is
+# installed through `--install`, that a failed install or a release at
+# another version stops the play, and that the source-build opt-in never
+# calls the updater, and that an updater other than the checkout's is
+# never run.
+#
+# Run (from deploy/ansible):
+#   ansible-playbook -i localhost, -c local tests/miner_agent_binary_wiring.yml
+
+- name: miner-agent binary wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-wiring"
+    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent" }
+    miner_agent_updater: "{{ scratch }}/hippius-miner-update"
+    miner_agent_updater_src: "{{ miner_agent_updater }}"
+    miner_agent_build_from_source: false
+    miner_auto_update_release_repo: "example/release-repo"
+    versions: { miner_agent: "0.0.1" }
+  tasks:
+    - name: Fresh scratch tree
+      ansible.builtin.file:
+        path: "{{ scratch }}"
+        state: "{{ item }}"
+      loop: [absent, directory]
+
+    # The stub does what `--install` does on success (installs a binary,
+    # prints its tag) or on a refusal (stderr, exit 1), as told by
+    # scratch/outcome, and records every call.
+    - name: A stub updater
+      ansible.builtin.copy:
+        dest: "{{ miner_agent_updater }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          echo "$*" >>"{{ scratch }}/calls"
+          case "$(cat "{{ scratch }}/outcome")" in
+            ok) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.1 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}" ;;
+            other-version) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.2 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}" ;;
+            *) echo "[hippius-miner-update] ERROR: build-provenance attestation of v2025.01.09 does not verify; refusing" >&2; exit 1 ;;
+          esac
+          chmod 0755 "{{ miner_agent.install_path }}"
+          echo v2025.01.09
+
+    - name: Another updater than the checkout's
+      ansible.builtin.copy: { dest: "{{ scratch }}/other-updater", content: "#!/bin/sh\necho an older updater\n", mode: "0755" }
+
+    - name: The updater installs successfully
+      ansible.builtin.copy: { dest: "{{ scratch }}/outcome", content: "ok\n", mode: "0644" }
+
+    # ── Already at the expected version: nothing happens ──
+    - name: An agent already at versions.miner_agent
+      ansible.builtin.copy:
+        dest: "{{ miner_agent.install_path }}"
+        mode: "0755"
+        content: "#!/bin/sh\necho 'hippius-miner-agent 0.0.1 (v2025.01.08)'\n"
+
+    - name: Run the binary tasks (agent in place)
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+
+    - name: In place => no install, the updater never called, the binary untouched
+      ansible.builtin.assert:
+        that:
+          - not (miner_agent_install_needed | bool)
+          - not (scratch ~ '/calls') is file
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('v2025.01.08')
+
+    # ── Missing: installed through --install ──
+    - name: No agent binary (a fresh host)
+      ansible.builtin.file: { path: "{{ miner_agent.install_path }}", state: absent }
+
+    - name: Run the binary tasks (fresh host)
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+
+    - name: Fresh host => the release installed by `hippius-miner-update --install`
+      ansible.builtin.assert:
+        that:
+          - miner_agent_install_needed | bool
+          - miner_agent_release_install is changed
+          - lookup('file', scratch ~ '/calls') == '--install'
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('v2025.01.09')
+
+    # ── Foreign: replaced through --install ──
+    - name: A foreign binary
+      ansible.builtin.copy:
+        dest: "{{ miner_agent.install_path }}"
+        mode: "0755"
+        content: "#!/bin/sh\necho 'something-else 9.9'\n"
+
+    - name: Run the binary tasks (foreign binary)
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+
+    - name: Foreign binary => replaced by the verified release
+      ansible.builtin.assert:
+        that:
+          - miner_agent_install_needed | bool
+          - lookup('file', scratch ~ '/calls').splitlines() | length == 2
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('hippius-miner-agent 0.0.1 \(v2025.01.09\)')
+
+    # ── Refusals stop the play ──
+    - name: Refusals
+      ansible.builtin.include_tasks: miner_agent_binary_refused.yml
+      loop:
+        - { name: updater-refuses, outcome: refuse, says: 'did not install a verified release.*does not verify', calls_after: 3 }
+        - { name: release-at-another-version, outcome: other-version, says: 'is older than the release', calls_after: 4 }
+        - { name: not-the-checkout-updater, outcome: ok, says: 'not the updater of this checkout', calls_after: 4,
+            updater_src: "{{ scratch }}/other-updater" }
+        - { name: updater-missing, outcome: ok, says: 'is missing, so', calls_after: 4,
+            updater: "{{ scratch }}/no-such-updater" }
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    # ── Source build opt-in: the updater is not used ──
+    - name: No agent binary, source build asked for
+      ansible.builtin.file: { path: "{{ miner_agent.install_path }}", state: absent }
+
+    - name: Run the binary tasks (source build)
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_build_from_source: true
+
+    - name: Source build => install needed, left to the build, the updater not called
+      ansible.builtin.assert:
+        that:
+          - miner_agent_install_needed | bool
+          - miner_agent_release_install is skipped
+          - lookup('file', scratch ~ '/calls').splitlines() | length == 4
+          - not (miner_agent.install_path is file)

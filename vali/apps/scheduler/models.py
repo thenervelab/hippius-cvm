@@ -458,8 +458,13 @@ class FamilyStorageState(models.Model):
       `has_storage` = at least the required number.
     - `storage_detail`: every Arion child of the family and why it did or
       did not count (operator readout only).
-    - `last_healthy_at`: the last read that found it with storage — the
-      grace clock. NULL = never seen with storage: no grace.
+    - `last_healthy_at`: the last read that found it with storage. NULL =
+      never seen with storage: no grace.
+    - `unhealthy_since`: the first read of the current run without healthy
+      storage (NULL while healthy).
+    - `lapsed_since`: `unhealthy_since`, once that run outlasted the lapse
+      debounce — the start of the grace (`grace_until = lapsed_since +
+      grace`). NULL while healthy or debouncing.
     """
 
     family = models.CharField(max_length=64, primary_key=True)
@@ -468,6 +473,8 @@ class FamilyStorageState(models.Model):
     has_storage = models.BooleanField(default=False)
     storage_detail = models.JSONField(default=list)
     last_healthy_at = models.DateTimeField(null=True, blank=True, default=None)
+    unhealthy_since = models.DateTimeField(null=True, blank=True, default=None)
+    lapsed_since = models.DateTimeField(null=True, blank=True, default=None)
     first_seen_at = models.DateTimeField()
     refreshed_at = models.DateTimeField()
     block_hash = models.CharField(max_length=66, blank=True, default="")

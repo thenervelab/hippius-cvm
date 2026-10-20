@@ -1,0 +1,29 @@
+---
+# One refusal case for miner_agent_binary_wiring.yml: the stub updater
+# answers `case.outcome`; the tasks file must fail with
+# MINER_AGENT_INSTALL_FAILED and a message matching `case.says`.
+- name: An install that must not pass
+  block:
+    - name: The stub's answer
+      ansible.builtin.copy: { dest: "{{ scratch }}/outcome", content: "{{ case.outcome }}\n", mode: "0644" }
+    - name: No agent binary
+      ansible.builtin.file: { path: "{{ miner_agent.install_path }}", state: absent }
+    - name: Run the binary tasks
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_updater: "{{ case.updater | default(scratch ~ '/hippius-miner-update') }}"
+        miner_agent_updater_src: "{{ case.updater_src | default(scratch ~ '/hippius-miner-update') }}"
+    - name: Not reached
+      ansible.builtin.fail:
+        msg: "an install that must fail passed: {{ case.name }}"
+  rescue:
+    - name: Refused with MINER_AGENT_INSTALL_FAILED
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_task.name != 'Not reached'
+          - ansible_failed_result.msg is search('MINER_AGENT_INSTALL_FAILED')
+          - ansible_failed_result.msg is search(case.says)
+          - (lookup('file', scratch ~ '/calls').splitlines() | length) == case.calls_after
+  always:
+    - name: The updater answers ok again
+      ansible.builtin.copy: { dest: "{{ scratch }}/outcome", content: "ok\n", mode: "0644" }

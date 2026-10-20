@@ -255,6 +255,7 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
     attestor_gate = scheduler_service.attestor_gate(now=now)
     failed_over = scheduler_service.failover_quarantined_miner_ids()
     no_storage = storage_requirement.denied_node_ids(now=now)
+    storage_by_node = storage_requirement.node_requirements(now=now)
     attestors = _best_attestor_by_node(wanted)
     # `vm_family=""` → the global view (the family set only drives
     # anti-affinity, which is per-launch, not a capacity property).
@@ -299,6 +300,11 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                 "refusal_count_30d": sum(breakdown.values()),
                 "refusal_breakdown_30d": breakdown,
                 "location": _serialize_location(_location_of(miner)),
+                "storage_requirement": (
+                    storage_requirement.OFF_READOUT
+                    if storage_by_node is None
+                    else storage_by_node.get(nid)
+                ),
             }
         )
     return rows

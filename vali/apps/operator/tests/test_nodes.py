@@ -40,6 +40,7 @@ ROW_KEYS = {
     "refusal_count_30d",
     "refusal_breakdown_30d",
     "location",
+    "storage_requirement",
 }
 
 #: A stored reason the scheduler's §13 re-eval writes — a real refusal.
@@ -234,6 +235,13 @@ def test_full_row_for_a_healthy_node(operator_client: APIClient) -> None:
         "refusal_count_30d": 1,
         "refusal_breakdown_30d": {"heartbeat-stale": 1},
         "location": None,
+        # Compute requires storage is off by default.
+        "storage_requirement": {
+            "state": "off",
+            "family_storage_children": None,
+            "lapsed_since": None,
+            "grace_until": None,
+        },
     }
 
 

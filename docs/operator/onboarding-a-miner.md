@@ -109,7 +109,7 @@ a `host_vars/<YOUR_HOST>.yml`. The eight plays, in order:
 | 02 | libvirt + qemu install | `libvirt-daemon-system`, `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `virtinst`; enables `libvirtd`. Distro versions, deliberately unpinned. **Also stages the TENANT OVMF** (`miner_tenant_ovmf_*`) and refuses to continue unless the file on disk matches the pinned digest — see below. |
 | 03 | Tenant CVM networking bridge | Enables libvirt's `default` NAT network for tenant virtio-net. |
 | 04 | NetBird agent | Installs and joins the mesh with your setup key; asserts the assigned address is inside `100.64.0.0/10`. |
-| 05 | miner-agent install + identity self-gen | Requires an installed `hippius-miner-agent` reporting `versions.miner_agent` — the release binary (refuses to build it unless `miner_agent_build_from_source: true`), refuses any `<…>` placeholder left in the variables, renders `/etc/hippius-miner/config.toml`, runs `init-identity`, reads the AMD CHIP_ID, prints the registration block, installs the systemd unit **without starting it**. |
+| 05 | miner-agent install + identity self-gen | Installs the release `hippius-miner-agent`, verified like an auto-update, unless one reporting `versions.miner_agent` is already in place (or builds it with `miner_agent_build_from_source: true`), refuses any `<…>` placeholder left in the variables, renders `/etc/hippius-miner/config.toml`, runs `init-identity`, reads the AMD CHIP_ID, prints the registration block, installs the systemd unit **without starting it**. |
 | 06 | mTLS cert mount point | Creates `/var/lib/hippius-miner/mtls` (0700) and installs the Edge **server** CA so the agent can verify the Edge. In permissionless mode nothing else is placed here. |
 | 07 | Host firewall | UFW default-deny inbound; allow `22/tcp`, `51820/udp`, and all traffic on `wt0`. |
 
@@ -118,9 +118,8 @@ a `host_vars/<YOUR_HOST>.yml`. The eight plays, in order:
 > `cvm-launch-digest/feature-disabled`. The release binary is; if you
 > build the binary yourself, do not omit it.
 
-> **Play 05 does not build the agent by default.** Install the release
-> binary first ([Prebuilt binary](#prebuilt-binary)); without it the play
-> stops with `[MINER_AGENT_BINARY_MISSING]` and the install steps. Set
+> **Play 05 installs the release binary itself.** Nothing to do on the
+> host ([Prebuilt binary](#prebuilt-binary)). Set
 > `miner_agent_build_from_source: true` in host_vars to have play 05
 > clone `miner_agent_source_repo` and build on the host instead.
 
@@ -135,6 +134,37 @@ commit with `--features snp`, with `SHA256SUMS`, `BUILD-INFO.txt`
 `hippius-miner-agent-x86_64-linux-gnu.sigstore.json`. It links glibc ≥ 2.39 and
 `libcrypto.so.3`, both present on Ubuntu 26.04.
 
+When `/usr/local/bin/hippius-miner-agent` is missing, or its `--version`
+does not report `versions.miner_agent` (`group_vars/miner_nodes.yml`),
+play 05 installs the release with `hippius-miner-update --install`: the
+auto-updater's own code, with the same choice of release and the same
+checks ([4b. Auto-update](#4b-auto-update)):
+
+- the newest complete release that has been out for
+  `miner_auto_update_min_release_age_h` (24 h), never one that failed its
+  health check on this host, never older than a recorded
+  `/var/lib/hippius-miner/installed-release`;
+- the binary matches `SHA256SUMS`, its build-provenance attestation
+  verifies with cosign for the release workflow of
+  `thenervelab/hippius-cvm` at that exact tag, and its `--version` names
+  the tag.
+
+It needs outbound HTTPS to `api.github.com` and `github.com`. A binary
+already reporting `versions.miner_agent` is left as it is, so re-running
+the play on a running miner changes nothing; a foreign one is replaced,
+by that verified download only. The agent is never started, stopped or
+signalled. If the release cannot be installed, the play stops with
+`[MINER_AGENT_INSTALL_FAILED]` and the updater's reason
+(`journalctl -t hippius-miner-update` has the whole run); the binary is
+replaced only once every check has passed, and a re-run tries again.
+`--check` previews the install and ends play 05 there for that host: the
+rest of play 05 runs the binary. Once installed,
+[auto-update](#4b-auto-update) keeps it current.
+
+**By hand (fallback).** To install the binary yourself (to pick the
+release, or when the play's install keeps failing), put it in place
+before play 05; the play then leaves it alone:
+
 ```sh
 TAG=<release tag>
 base=https://github.com/thenervelab/hippius-cvm/releases/download/$TAG
@@ -146,15 +176,9 @@ sudo install -m 0755 -o root -g root hippius-miner-agent-x86_64-linux-gnu \
 /usr/local/bin/hippius-miner-agent --version
 ```
 
-Install it **before** running play 05. The play accepts the binary when
-`hippius-miner-agent --version` prints `versions.miner_agent`
-(`group_vars/miner_nodes.yml`); otherwise it stops with
-`[MINER_AGENT_BINARY_MISSING]`, or, with
-`miner_agent_build_from_source: true`, rebuilds and overwrites the
-binary. A checksum only proves the download matches the release;
-releases from the tag workflow also carry a build-provenance attestation,
-checked in [Verifying a release by hand](#verifying-a-release-by-hand).
-Once installed, [auto-update](#4b-auto-update) keeps it current.
+A checksum only proves the download matches the release; check its
+build-provenance attestation too, as in
+[Verifying a release by hand](#verifying-a-release-by-hand).
 
 ### Variables you must supply
 
@@ -1142,19 +1166,36 @@ compute nodes take no new VM (`schedulable_reason: no-storage` in
 `/v1/operator/nodes`) and earn no reward weight. The VMs already on them
 keep running.
 
-A storage node counts when the Arion pallet itself would pay it:
+A storage node counts when it passes the Arion pallet's own filter for a
+family's paid weight:
 
 - it is an Arion child registered under the same family, and Active;
 - it is not one of the family's compute children, nor registered with one
   of its compute node ids (a compute machine is not its own storage);
 - the Arion validator reported its weight within the runtime's
-  `StaleChildBuckets`, has a quality record for it, and its weight is
-  above zero.
+  `StaleChildBuckets`, and has a quality record for it.
 
-A family that loses its storage keeps its rights for
-`VALI_COMPUTE_STORAGE_GRACE_S` (72 h). A family that never had any is cut
-at once. `VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES` (SS58, comma-separated)
-lists families that are never cut.
+When a family loses its storage, vali first waits out
+`VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S` (2 h), which absorbs an Arion
+migration or a re-key. If there is still no storage after that, the family
+has lapsed since its first read without storage, and keeps its rights until
+`grace_until = lapsed_since + VALI_COMPUTE_STORAGE_GRACE_S` (72 h). A family
+that never had storage is cut at once. `VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES`
+(SS58, comma-separated) lists families that are never cut.
+
+`/v1/operator/nodes` carries this per node, so the backend can warn the
+operator before the cut:
+
+```json
+"storage_requirement": {
+  "state": "ok | grace | lapsed | exempt | off",
+  "family_storage_children": 1,
+  "lapsed_since": "2026-10-20T08:00:00+00:00",
+  "grace_until": "2026-10-23T08:00:00+00:00"
+}
+```
+
+The field is `null` for a node vali has not read as an Active compute node.
 
 Before turning it on, see what it would decide (read-only):
 
@@ -1163,9 +1204,8 @@ python manage.py vali_storage_requirement --evaluate [--json]
 ```
 
 This prints one line per compute family: its storage count, why each Arion
-child did or did not count, its grace and the decision (`storage-ok`,
-`exempt`, `grace` or `no-storage`). Copy a family from its `family_ss58`
-column to exempt it.
+child did or did not count, and its state with `lapsed_since` and
+`grace_until`. Copy a family from its `family_ss58` column to exempt it.
 
 ---
 

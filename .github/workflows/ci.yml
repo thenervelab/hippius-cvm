@@ -134,8 +134,9 @@ jobs:
       # output (set_fact/debug/assert only), play 05's registration JSON
       # after play 00 and its placeholder refusal, the pinned public-file
       # placement (CA certs, host-attestor files) against a file:// store
-      # in a scratch dir, plus the play's syntax.
-      - name: ansible miner play (preflight, NetBird mesh IP, registration JSON, placeholders, pinned files, disk budget, host inventory units)
+      # in a scratch dir, play 05's miner-agent binary install against a
+      # stub updater, plus the play's syntax.
+      - name: ansible miner play (preflight, NetBird mesh IP, registration JSON, placeholders, pinned files, agent binary, disk budget, host inventory units)
         working-directory: deploy/ansible
         env:
           ANSIBLE_STDOUT_CALLBACK: default
@@ -153,6 +154,8 @@ jobs:
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/netbird_mesh_ip_check_mode.yml --check
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/pinned_file_wiring.yml
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/pinned_file_check_mode.yml --check
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/miner_agent_binary_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/miner_agent_binary_check_mode.yml --check
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/disk_budget_wiring.yml
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/host_inventory_wiring.yml
       # Miner-agent auto-update: the updater against a mocked GitHub API,

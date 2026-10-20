@@ -738,8 +738,8 @@ VALI_MINER_AUTO_APPROVE_SOAK_S = _env_int("VALI_MINER_AUTO_APPROVE_SOAK_S", 1800
 # Compute requires storage (`apps.scheduler.storage_requirement`): a compute
 # family must also run at least VALI_COMPUTE_STORAGE_MIN_NODES healthy Arion
 # storage node(s) — an Arion child of the same family, other than its compute
-# children, that the Arion pallet itself would pay (Active, weight reported
-# within StaleChildBuckets, quality on record, weight > 0). Otherwise its
+# children, that passes the Arion pallet's own filter (Active, weight reported
+# within StaleChildBuckets, quality on record). Otherwise its
 # compute nodes take no new VM and earn no reward weight. A family that LOSES
 # its storage keeps its rights for VALI_COMPUTE_STORAGE_GRACE_S; one that never
 # had any is cut at once. Off (default) = no change. The SS58 families in
@@ -747,6 +747,10 @@ VALI_MINER_AUTO_APPROVE_SOAK_S = _env_int("VALI_MINER_AUTO_APPROVE_SOAK_S", 1800
 # most every VALI_COMPUTE_STORAGE_REFRESH_S by `vali_scheduler_reeval`.
 VALI_COMPUTE_REQUIRES_STORAGE = _env_bool("VALI_COMPUTE_REQUIRES_STORAGE", False)
 VALI_COMPUTE_STORAGE_GRACE_S = _env_int("VALI_COMPUTE_STORAGE_GRACE_S", 259200)
+# How long a family must stay without healthy storage before it LAPSES (the
+# grace starts then, from the first read without storage): absorbs an Arion
+# migration or re-key. A family never seen with storage lapses at once.
+VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S = _env_int("VALI_COMPUTE_STORAGE_LAPSE_DEBOUNCE_S", 7200)
 VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES = _env_list("VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES", default=[])
 VALI_COMPUTE_STORAGE_MIN_NODES = _env_int("VALI_COMPUTE_STORAGE_MIN_NODES", 1)
 VALI_COMPUTE_STORAGE_REFRESH_S = _env_int("VALI_COMPUTE_STORAGE_REFRESH_S", 300)
