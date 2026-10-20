@@ -329,8 +329,8 @@ Registration is a raw extrinsic.
 **You need a registered, funded `family` account.** The extrinsic is
 `ComputeScoring::register_child(family, child, node_id, node_sig)` and
 it requires `ensure_signed(origin) == family` and
-`is_registered_family(family)`. This is the one prerequisite you cannot
-generate yourself — see below.
+`is_registered_family(family)`. You register it yourself, as an Arion
+storage miner — see below.
 
 ### What makes an account a family
 
@@ -339,7 +339,24 @@ On mainnet `is_registered_family(family)` is
 must own a registered node in `pallet_registration` — i.e. it is already
 a storage-miner (arion) family. Any such account you control qualifies;
 there is no separate "register a compute family" extrinsic. A brand-new
-account cannot be a family until it registers a node there first. The
+account cannot be a family until it registers a node there first: an
+Arion storage miner, registered from the providers dashboard
+(provider.hippius.com):
+
+1. the dashboard builds the `register_node_with_coldkey` challenge for
+   the storage node;
+2. you run `hippius-miner-agent sign-coldkey-registration` on the
+   storage host, which signs it with the Arion node key (`keypair.bin`),
+   offline;
+3. you paste its JSON output back into the dashboard;
+4. the dashboard submits `register_node_with_coldkey`, signed by the
+   owner account from your wallet.
+
+The owner (the future family) must be your Bittensor subnet 75
+**hotkey**, registered on the subnet as a **miner** UID; the chain
+refuses any other account. The command and its checks are described in
+[the external miner guide](external-miner-guide.md#signing-the-storage-registration-on-the-storage-host).
+Hippius never registers a family on an operator's behalf. The
 account must also hold at least the existential deposit, or the
 extrinsic fails on funding before it fails on anything else.
 
@@ -1117,6 +1134,39 @@ revoked: the automatic approval never takes it again, only an operator
 approval does. Revoking a pending miner keeps it out of the automatic
 approval for good.
 
+### Compute also requires storage
+
+When vali runs with `VALI_COMPUTE_REQUIRES_STORAGE=true`, a compute family
+must also run at least one healthy Arion storage node. Otherwise its
+compute nodes take no new VM (`schedulable_reason: no-storage` in
+`/v1/operator/nodes`) and earn no reward weight. The VMs already on them
+keep running.
+
+A storage node counts when the Arion pallet itself would pay it:
+
+- it is an Arion child registered under the same family, and Active;
+- it is not one of the family's compute children, nor registered with one
+  of its compute node ids (a compute machine is not its own storage);
+- the Arion validator reported its weight within the runtime's
+  `StaleChildBuckets`, has a quality record for it, and its weight is
+  above zero.
+
+A family that loses its storage keeps its rights for
+`VALI_COMPUTE_STORAGE_GRACE_S` (72 h). A family that never had any is cut
+at once. `VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES` (SS58, comma-separated)
+lists families that are never cut.
+
+Before turning it on, see what it would decide (read-only):
+
+```sh
+python manage.py vali_storage_requirement --evaluate [--json]
+```
+
+This prints one line per compute family: its storage count, why each Arion
+child did or did not count, its grace and the decision (`storage-ok`,
+`exempt`, `grace` or `no-storage`). Copy a family from its `family_ss58`
+column to exempt it.
+
 ---
 
 ## What you cannot self-supply
@@ -1127,8 +1177,6 @@ someone else's, you must be given them:
 
 | Item | Why |
 |---|---|
-| A registered, funded **family account** on chain | `register_child` fails with `FamilyNotRegistered` without one, and any deposit (none while lockup is off) is reserved on it |
-| A **`pallet_proxy` delegation** from that family to your child account | `register_child` gates on `ProxyVerifier::can_register_child`; without it the extrinsic fails `ProxyVerificationFailed` — *after* you have already produced the `node_sig`. `NonTransfer` with `delay = 0` is enough (the check does not filter on proxy type), and it can be removed once the registration is in a block, since nothing reads the gate afterwards |
 | A **NetBird setup key** bound to the miner group, on the fleet's NetBird instance | A key from a different NetBird instance fails to log in |
 | The **Edge server CA** certificate | The agent verifies the Edge's server certificate against it |
 | `edge_order_signing_pubkey` | Every lifecycle order is `verify_strict`ed against it; a wrong key means every order is rejected |
@@ -1136,6 +1184,11 @@ someone else's, you must be given them:
 | A **vali miner-admin token** | Only for the §6 call above |
 | The **host-attestor components** (`ovmf.fd`, `linux.bin`, `initrd.bin`) | Pinned by sha256 in `miner_host_attestor` (group_vars) and not published at a public URL; stage them into `/var/lib/hippius-miner/host-attestor/` before play 05, or it refuses to render `[host_attestor]`. Without an attested host attestor a host receives no tenant VM |
 | The host-size **anchor** (§6b) | Set by the fleet operator from hardware they know, never from your report — it caps what vali will ask of your host |
+
+Not on this list, because you sign them yourself: the family account
+(your Arion storage-miner coldkey, §3) and the `pallet_proxy` delegation
+from it to your child account, which `register_child` requires (§3, "The
+proxy step").
 
 Note that none of these lets the fleet operator read your tenants' data,
 and none of them is a certificate authority over your identity. They are

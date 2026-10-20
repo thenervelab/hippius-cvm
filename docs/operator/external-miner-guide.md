@@ -120,7 +120,9 @@ They are routing and mesh membership.
 ### Step 1: Wallet and accounts
 
 1. Install a wallet extension and create (or import) your **family**
-   account. Create one fresh **child** account per host you plan to run.
+   account. A new family must be your Bittensor subnet 75 miner
+   **hotkey** (see step 2). Create one fresh **child** account per host
+   you plan to run.
 2. In the providers dashboard, open **Accounts** → **Link an account**.
    Pick the family account, role **Compute family**, and sign the
    one-time message. Signing moves no funds.
@@ -135,16 +137,85 @@ already registered on chain (`Registration.OwnerToNode`). There is
 nothing to register: go straight to adding compute nodes from the
 dashboard (step 3).
 
-**New operator without an Arion storage node:** first register an Arion
-storage miner. It needs a Bittensor miner UID on the subnet, and
-registration goes through the Arion tooling: see the public
+**New operator without an Arion storage node:** first set up an Arion
+storage miner (see the public
 [storage miner overview](https://docs.hippius.com/earn/storage-miner) and
-[Arion miner setup](https://docs.hippius.com/earn/arion/running-blockchain-node)
-(coldkey registration, then the miner). Then add your compute nodes from
-the dashboard.
+[Arion miner setup](https://docs.hippius.com/earn/arion/running-blockchain-node)),
+then register your family from the dashboard:
 
-Registering a family any other way is an exception handled by support,
-not a path to plan for.
+1. **The family account is your subnet 75 hotkey.** The account that
+   signs the registration (the owner, which becomes your family) must be
+   your Bittensor subnet 75 **hotkey**, registered on the subnet as a
+   **miner** UID. The chain refuses any other account. Link that hotkey
+   in the dashboard (step 1).
+2. **The dashboard builds the challenge.** In the providers dashboard
+   (provider.hippius.com), registering your storage node shows a
+   registration challenge (hex) for that node and that account.
+3. **You sign it on the storage host** with
+   `hippius-miner-agent sign-coldkey-registration` (below).
+4. **You paste the JSON** it prints back into the dashboard.
+5. **The dashboard submits `register_node_with_coldkey`**, signed by the
+   owner account from your wallet. Once it lands, the account is a
+   family: add compute nodes (step 3).
+
+#### Signing the storage registration (on the storage host)
+
+The Arion node key has to sign two messages: the coldkey registration
+challenge the dashboard builds, and the storage child's authorisation.
+`hippius-miner-agent sign-coldkey-registration` signs both, on the
+storage host, offline:
+
+```sh
+hippius-miner-agent sign-coldkey-registration \
+  --keypair /var/lib/hippius/miner/data/miner/keypair.bin \
+  --challenge 0x<CHALLENGE_HEX> \
+  --family 0x<FAMILY_HEX> --child 0x<CHILD_HEX> --nonce <NONCE>
+```
+
+- Use the release binary compute hosts run
+  (`hippius-miner-agent-x86_64-linux-gnu`). It needs glibc 2.39 or later,
+  OpenSSL 3's `libcrypto.so.3` and `libgcc_s.so.1`: Ubuntu 24.04+ or
+  Debian 13+. No agent, no config, no SEV hardware: this subcommand only
+  reads the key file. On an older storage host, use the container below.
+- `--keypair` is the Arion node's `keypair.bin` (32 raw bytes, the
+  default path above). The file is only read: never written, copied or
+  re-permissioned, and the secret is never printed. Any other size is
+  refused, including the hex `identity.key` of a compute host.
+- `--challenge` is the hex the dashboard shows. It is refused unless it
+  is exactly 200 bytes, carries the `HIPPIUS::REGISTER::v1` domain,
+  names **this** node's peer id, and is for Hippius mainnet
+  (`--allow-any-genesis` lifts the last check, for test chains only).
+- `--family`, `--child` and `--nonce` add the storage child's
+  authorisation. Give all three or none. The dashboard shows the nonce
+  the chain expects.
+
+**Older storage hosts (for example Ubuntu 22.04).** Run the same binary
+in an `ubuntu:24.04` container, with no network and the key file mounted
+read-only:
+
+```sh
+docker run --rm --network none --read-only \
+  -v "$PWD/hippius-miner-agent-x86_64-linux-gnu:/hippius-miner-agent:ro" \
+  -v /var/lib/hippius/miner/data/miner/keypair.bin:/k:ro \
+  ubuntu:24.04 \
+  /hippius-miner-agent sign-coldkey-registration --keypair /k \
+    --challenge 0x<CHALLENGE_HEX> \
+    --family 0x<FAMILY_HEX> --child 0x<CHILD_HEX> --nonce <NONCE>
+```
+
+Run it from the directory holding the downloaded binary, as a user who
+can read `keypair.bin`. The stock `ubuntu:24.04` image already ships
+glibc 2.39 and OpenSSL 3.
+
+It prints one JSON object to paste back into the dashboard:
+`public_key`, `node_id_hex`, `node_id` (the `12D3KooW…` peer id),
+`signature`, `account`, `expires_at`, and, with the three Arion flags, an
+`arion` object with `family`, `child`, `node_id`, `nonce` and
+`node_sig`. All of it is public. The command never contacts the network
+or the chain; the dashboard submits the extrinsics.
+
+There is no other path: Hippius never registers a family for you. You
+sign every registration yourself, from your own wallet.
 
 Linking a self-custody account in the dashboard (step 1) gives you
 access to the wizard automatically.

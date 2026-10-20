@@ -242,7 +242,7 @@ pub fn fetch_registry(rpc_url: &str, pallet: &str) -> Result<RegistrySnapshot, R
 
     // Discover the registered set from `NodeIdToChild`.
     let registry_prefix = storage_map_prefix(pallet, "NodeIdToChild");
-    let registry_keys = get_keys_paged(url, &registry_prefix)?;
+    let registry_keys = get_keys_paged(url, &registry_prefix, None)?;
 
     let epoch_scale = current_epoch.to_le_bytes();
 
@@ -477,7 +477,7 @@ pub fn fetch_pending_prices(
     // Enumerate `PendingPriceChange` — sparse (a row exists only while a
     // change is announced-and-pending; `apply_price_change` removes it).
     let prefix = storage_map_prefix(pallet, "PendingPriceChange");
-    let keys = get_keys_paged(url, &prefix)?;
+    let keys = get_keys_paged(url, &prefix, None)?;
 
     let mut changes = Vec::with_capacity(keys.len());
     for key in &keys {
@@ -640,24 +640,12 @@ pub fn fetch_node_family(
 /// `NodeIdToChild` and `ChildRegistrations` as `Blake2_128Concat` maps of
 /// `pallet`, under the storage prefix the keys are derived from.
 fn require_family_maps(metadata_blob: &[u8], pallet: &str) -> Result<(), RegistryError> {
-    let absent = |what: String| RegistryError::new(category::PALLET_ABSENT, what);
-    let storage = metadata::pallet_storage(metadata_blob, pallet)?
-        .ok_or_else(|| absent(format!("pallet `{pallet}` has no storage in the runtime")))?;
-    if storage.prefix != pallet {
-        return Err(absent(format!(
-            "pallet `{pallet}` stores under prefix `{}`",
-            storage.prefix
-        )));
-    }
-    for name in ["NodeIdToChild", "ChildRegistrations"] {
-        let entry = storage.entries.iter().find(|e| e.name == name);
-        if entry.and_then(|e| e.map_hashers.as_deref()) != Some(&[metadata::BLAKE2_128_CONCAT]) {
-            return Err(absent(format!(
-                "`{pallet}.{name}` is not a Blake2_128Concat map in the runtime"
-            )));
-        }
-    }
-    Ok(())
+    require_maps(
+        metadata_blob,
+        pallet,
+        &["NodeIdToChild", "ChildRegistrations"],
+        &[],
+    )
 }
 
 /// `NodeIdToChild` key: `StorageMap<Blake2_128Concat, [u8; 32], AccountId>`.
@@ -704,6 +692,310 @@ fn decode_child_registration_head(bytes: &[u8]) -> Result<ChildRegistrationHead,
         family,
         node_id,
         status,
+    })
+}
+
+// ─── compute families and their storage (the storage requirement) ───
+
+/// A validator-reported `NodeQuality` of an Arion child
+/// (`NodeQualityByChild`): `shard_data_bytes: u128 ++ bandwidth_bytes: u128
+/// ++ uptime_permille: u16 ++ strikes: u32 ++ integrity_fails: u32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeQualityRead {
+    pub shard_data_bytes: u128,
+    pub bandwidth_bytes: u128,
+    pub uptime_permille: u16,
+    pub strikes: u32,
+    pub integrity_fails: u32,
+}
+
+/// One child of a family's Arion `FamilyChildren` list and what the chain
+/// says about it — the inputs of the pallet's own payout eligibility
+/// (`compute_family_weight_from_nodes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageChildRead {
+    pub child: [u8; 32],
+    /// `Arion.ChildRegistrations[child]`; `None` when absent.
+    pub registration: Option<ChildRegistrationHead>,
+    /// `Arion.NodeWeightByChild[child]` (`0` when absent).
+    pub node_weight: u16,
+    /// `Arion.NodeWeightLastBucket[child]` (`0` when absent).
+    pub last_bucket: u32,
+    /// `Arion.NodeQualityByChild[child]`.
+    pub quality: Option<NodeQualityRead>,
+}
+
+/// A compute node of a family: its node id and its compute child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeNodeRead {
+    pub node_id: [u8; 32],
+    pub child: [u8; 32],
+}
+
+/// One compute family: its Active compute nodes and every child its Arion
+/// `FamilyChildren` lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyStorageRead {
+    pub family: [u8; 32],
+    pub compute: Vec<ComputeNodeRead>,
+    pub storage: Vec<StorageChildRead>,
+}
+
+/// Every compute family and its Arion storage children, all read at one
+/// finalized block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFamiliesRead {
+    pub block_hash: String,
+    /// `Arion.CurrentWeightBucket`.
+    pub current_weight_bucket: u32,
+    /// The Arion pallet constant `StaleChildBuckets`: a child whose weight
+    /// is older than this many buckets is not paid by the pallet.
+    pub stale_child_buckets: u32,
+    pub families: Vec<FamilyStorageRead>,
+}
+
+/// Read every Active compute node (`compute_pallet.NodeIdToChild` →
+/// `ChildRegistrations`), grouped by family, and for each family the Arion
+/// children it lists (`arion_pallet.FamilyChildren` → `ChildRegistrations`,
+/// `NodeWeightByChild`, `NodeWeightLastBucket`, `NodeQualityByChild`), plus
+/// `CurrentWeightBucket` and the `StaleChildBuckets` constant — every read
+/// pinned to the finalized head. The runtime metadata at that block must
+/// name every map read (a fossil is refused) and the constant.
+///
+/// Facts only: what counts as a healthy storage node is the caller's to
+/// decide. Blocking, fail-closed on every transport / decode error, never
+/// echoes the RPC URL.
+pub fn fetch_storage_families(
+    rpc_url: &str,
+    compute_pallet: &str,
+    arion_pallet: &str,
+) -> Result<StorageFamiliesRead, RegistryError> {
+    let url = rpc_url.trim();
+    if url.is_empty() {
+        return Err(RegistryError::new(
+            category::RPC_REQUEST,
+            "RPC URL is empty".to_string(),
+        ));
+    }
+    let at = get_finalized_head(url)?;
+    let metadata = get_metadata_at(url, &at)?;
+    require_maps(
+        &metadata,
+        compute_pallet,
+        &["NodeIdToChild", "ChildRegistrations"],
+        &[],
+    )?;
+    require_maps(
+        &metadata,
+        arion_pallet,
+        &[
+            "FamilyChildren",
+            "ChildRegistrations",
+            "NodeWeightByChild",
+            "NodeWeightLastBucket",
+            "NodeQualityByChild",
+        ],
+        &["CurrentWeightBucket"],
+    )?;
+    let stale_child_buckets =
+        match metadata::pallet_constant(&metadata, arion_pallet, "StaleChildBuckets")? {
+            Some(bytes) => scale_u32(&bytes)?,
+            None => {
+                return Err(RegistryError::new(
+                    category::PALLET_ABSENT,
+                    format!("`{arion_pallet}` has no StaleChildBuckets constant in the runtime"),
+                ))
+            }
+        };
+    let current_weight_bucket = match get_storage_at(
+        url,
+        &storage_value_key(arion_pallet, "CurrentWeightBucket"),
+        &at,
+    )? {
+        Some(bytes) => scale_u32(&bytes)?,
+        None => 0,
+    };
+
+    // Active compute nodes, grouped by family.
+    let prefix = storage_map_prefix(compute_pallet, "NodeIdToChild");
+    let mut by_family: std::collections::BTreeMap<[u8; 32], Vec<ComputeNodeRead>> =
+        std::collections::BTreeMap::new();
+    for key in get_keys_paged(url, &prefix, Some(&at))? {
+        if key.len() != prefix.len() + 16 + 32 {
+            return Err(RegistryError::new(
+                category::RPC_RESPONSE,
+                format!("unexpected NodeIdToChild key length {}", key.len()),
+            ));
+        }
+        let mut node_id = [0u8; 32];
+        node_id.copy_from_slice(&key[key.len() - 32..]);
+        let Some(raw_child) = get_storage_at(url, &key, &at)? else {
+            continue;
+        };
+        let child = decode_account_id(&raw_child)?;
+        let Some(raw_reg) = get_storage_at(
+            url,
+            &storage_map_key(compute_pallet, "ChildRegistrations", &child),
+            &at,
+        )?
+        else {
+            continue;
+        };
+        let reg = decode_child_registration_head(&raw_reg)?;
+        // The two indexes must agree, and only an Active compute node is
+        // one the gate acts on.
+        if reg.node_id != node_id || reg.status != ChildStatus::Active {
+            continue;
+        }
+        by_family
+            .entry(reg.family)
+            .or_default()
+            .push(ComputeNodeRead { node_id, child });
+    }
+
+    let mut families = Vec::with_capacity(by_family.len());
+    for (family, mut compute) in by_family {
+        compute.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let children = match get_storage_at(
+            url,
+            &storage_map_key(arion_pallet, "FamilyChildren", &family),
+            &at,
+        )? {
+            Some(bytes) => decode_account_list(&bytes)?,
+            None => Vec::new(),
+        };
+        let mut storage = Vec::with_capacity(children.len());
+        for child in children {
+            let registration = match get_storage_at(
+                url,
+                &storage_map_key(arion_pallet, "ChildRegistrations", &child),
+                &at,
+            )? {
+                Some(bytes) => Some(decode_child_registration_head(&bytes)?),
+                None => None,
+            };
+            let node_weight = match get_storage_at(
+                url,
+                &storage_map_key(arion_pallet, "NodeWeightByChild", &child),
+                &at,
+            )? {
+                Some(bytes) => scale_u16(&bytes)?,
+                None => 0,
+            };
+            let last_bucket = match get_storage_at(
+                url,
+                &storage_map_key(arion_pallet, "NodeWeightLastBucket", &child),
+                &at,
+            )? {
+                Some(bytes) => scale_u32(&bytes)?,
+                None => 0,
+            };
+            let quality = match get_storage_at(
+                url,
+                &storage_map_key(arion_pallet, "NodeQualityByChild", &child),
+                &at,
+            )? {
+                Some(bytes) => Some(decode_node_quality(&bytes)?),
+                None => None,
+            };
+            storage.push(StorageChildRead {
+                child,
+                registration,
+                node_weight,
+                last_bucket,
+                quality,
+            });
+        }
+        families.push(FamilyStorageRead {
+            family,
+            compute,
+            storage,
+        });
+    }
+    Ok(StorageFamiliesRead {
+        block_hash: at,
+        current_weight_bucket,
+        stale_child_buckets,
+        families,
+    })
+}
+
+/// The runtime metadata must list each of `maps` as a `Blake2_128Concat`
+/// map and each of `values` as a plain value of `pallet`, under the
+/// storage prefix the keys are derived from.
+fn require_maps(
+    metadata_blob: &[u8],
+    pallet: &str,
+    maps: &[&str],
+    values: &[&str],
+) -> Result<(), RegistryError> {
+    let absent = |what: String| RegistryError::new(category::PALLET_ABSENT, what);
+    let storage = metadata::pallet_storage(metadata_blob, pallet)?
+        .ok_or_else(|| absent(format!("pallet `{pallet}` has no storage in the runtime")))?;
+    if storage.prefix != pallet {
+        return Err(absent(format!(
+            "pallet `{pallet}` stores under prefix `{}`",
+            storage.prefix
+        )));
+    }
+    for name in maps {
+        let entry = storage.entries.iter().find(|e| e.name == *name);
+        if entry.and_then(|e| e.map_hashers.as_deref()) != Some(&[metadata::BLAKE2_128_CONCAT]) {
+            return Err(absent(format!(
+                "`{pallet}.{name}` is not a Blake2_128Concat map in the runtime"
+            )));
+        }
+    }
+    for name in values {
+        let entry = storage.entries.iter().find(|e| e.name == *name);
+        if !matches!(entry, Some(e) if e.map_hashers.is_none()) {
+            return Err(absent(format!(
+                "`{pallet}.{name}` is not a plain value in the runtime"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A `BoundedVec<AccountId32, _>`: `Compact(len) ++ len × 32 bytes`, and
+/// nothing after it.
+fn decode_account_list(bytes: &[u8]) -> Result<Vec<[u8; 32]>, RegistryError> {
+    let mut input = bytes;
+    let list = <Vec<[u8; 32]> as codec::Decode>::decode(&mut input)
+        .map_err(|e| RegistryError::new(category::SCALE_DECODE, format!("account list: {e}")))?;
+    if !input.is_empty() {
+        return Err(RegistryError::new(
+            category::SCALE_DECODE,
+            format!("account list has {} trailing bytes", input.len()),
+        ));
+    }
+    Ok(list)
+}
+
+/// A `NodeQuality`: exactly `16 + 16 + 2 + 4 + 4` bytes.
+fn decode_node_quality(bytes: &[u8]) -> Result<NodeQualityRead, RegistryError> {
+    if bytes.len() != 42 {
+        return Err(RegistryError::new(
+            category::SCALE_DECODE,
+            format!("NodeQuality is {} bytes, want 42", bytes.len()),
+        ));
+    }
+    let u128_at = |i: usize| {
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&bytes[i..i + 16]);
+        u128::from_le_bytes(b)
+    };
+    let u32_at = |i: usize| {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&bytes[i..i + 4]);
+        u32::from_le_bytes(b)
+    };
+    Ok(NodeQualityRead {
+        shard_data_bytes: u128_at(0),
+        bandwidth_bytes: u128_at(16),
+        uptime_permille: u16::from_le_bytes([bytes[32], bytes[33]]),
+        strikes: u32_at(34),
+        integrity_fails: u32_at(38),
     })
 }
 
@@ -1025,6 +1317,30 @@ fn scale_u128(bytes: &[u8]) -> Result<u128, RegistryError> {
         .map_err(|e| RegistryError::new(category::SCALE_DECODE, format!("u128: {e}")))
 }
 
+/// A `u32` value: exactly 4 bytes (an encoded value never carries more).
+fn scale_u32(bytes: &[u8]) -> Result<u32, RegistryError> {
+    <[u8; 4]>::try_from(bytes)
+        .map(u32::from_le_bytes)
+        .map_err(|_| {
+            RegistryError::new(
+                category::SCALE_DECODE,
+                format!("u32 is {} bytes", bytes.len()),
+            )
+        })
+}
+
+/// A `u16` value: exactly 2 bytes.
+fn scale_u16(bytes: &[u8]) -> Result<u16, RegistryError> {
+    <[u8; 2]>::try_from(bytes)
+        .map(u16::from_le_bytes)
+        .map_err(|_| {
+            RegistryError::new(
+                category::SCALE_DECODE,
+                format!("u16 is {} bytes", bytes.len()),
+            )
+        })
+}
+
 // ─── JSON-RPC client ─────────────────────────────────────────────────
 
 /// `0x`-prefixed hex → bytes. A bare (un-prefixed) string is also
@@ -1184,15 +1500,23 @@ fn get_storage_at(url: &str, key: &[u8], at: &str) -> Result<Option<Vec<u8>>, Re
     Ok(Some(decode_hex(hex_str)?))
 }
 
-/// `state_getKeysPaged(prefix, …)` — every storage key under
-/// `prefix`, fetched page by page.
-fn get_keys_paged(url: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RegistryError> {
+/// `state_getKeysPaged(prefix, …[, at])` — every storage key under
+/// `prefix`, fetched page by page, at block `at` when given (else the
+/// best block).
+fn get_keys_paged(
+    url: &str,
+    prefix: &[u8],
+    at: Option<&str>,
+) -> Result<Vec<Vec<u8>>, RegistryError> {
     let prefix_hex = format!("0x{}", hex::encode(prefix));
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut start_key: Option<String> = None;
 
     loop {
-        let params = serde_json::json!([prefix_hex, KEYS_PAGE_SIZE, start_key]);
+        let params = match at {
+            Some(at) => serde_json::json!([prefix_hex, KEYS_PAGE_SIZE, start_key, at]),
+            None => serde_json::json!([prefix_hex, KEYS_PAGE_SIZE, start_key]),
+        };
         let result = rpc_call(url, "state_getKeysPaged", params)?;
         let page = result.as_array().ok_or_else(|| {
             RegistryError::new(
@@ -1227,6 +1551,7 @@ fn get_keys_paged(url: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RegistryErro
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use codec::Encode;
 
     // ── Storage-key derivation conformance (the frozen contract the
     //    reader + the pallet must byte-match) ──────────────────────────
@@ -1976,5 +2301,221 @@ mod tests {
     fn fetch_node_family_refuses_an_empty_url() {
         let err = fetch_node_family("  ", "ComputeScoring", &[0u8; 32]).unwrap_err();
         assert_eq!(err.category, category::RPC_REQUEST);
+    }
+
+    // ── compute families and their Arion storage ──────────────────────
+
+    fn hexed(bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!(format!("0x{}", hex::encode(bytes)))
+    }
+
+    /// A `ChildRegistration` as mainnet stores it (`BlockNumber = u64`).
+    fn reg(family: [u8; 32], node: [u8; 32], status: u8) -> Vec<u8> {
+        let mut out = family.to_vec();
+        out.extend_from_slice(&node);
+        out.push(status);
+        out.extend_from_slice(&[0u8; 16 + 8]);
+        out
+    }
+
+    fn quality(bytes: u128, uptime: u16) -> Vec<u8> {
+        let mut out = bytes.to_le_bytes().to_vec();
+        out.extend_from_slice(&7u128.to_le_bytes());
+        out.extend_from_slice(&uptime.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out
+    }
+
+    /// Family A `[0xa1]`: compute nodes `[0x01]` (child `[0xc1]`, Active)
+    /// and `[0x02]` (child `[0xc2]`, Unbonding — not a compute node of the
+    /// gate); Arion children `[0xd1]` (fully reported) and `[0xd2]` (no
+    /// registration, nothing reported). Family B `[0xb1]`: compute node
+    /// `[0x03]` (child `[0xc3]`), no Arion children. A node whose forward
+    /// and reverse index disagree (`[0x04]`) is skipped.
+    fn storage_chain(meta: Vec<u8>) -> String {
+        use std::collections::HashMap;
+        let (fa, fb) = ([0xa1u8; 32], [0xb1u8; 32]);
+        let mut kv: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let compute = |node: u8, child: u8, family: [u8; 32], status: u8, reg_node: u8| {
+            vec![
+                (
+                    storage_map_key("ComputeScoring", "NodeIdToChild", &[node; 32]),
+                    vec![child; 32],
+                ),
+                (
+                    storage_map_key("ComputeScoring", "ChildRegistrations", &[child; 32]),
+                    reg(family, [reg_node; 32], status),
+                ),
+            ]
+        };
+        kv.extend(compute(0x01, 0xc1, fa, 0, 0x01));
+        kv.extend(compute(0x02, 0xc2, fa, 1, 0x02));
+        kv.extend(compute(0x03, 0xc3, fb, 0, 0x03));
+        kv.extend(compute(0x04, 0xc4, fb, 0, 0x99));
+        let mut children = codec::Compact(2u32).encode();
+        children.extend_from_slice(&[0xd1u8; 32]);
+        children.extend_from_slice(&[0xd2u8; 32]);
+        kv.insert(storage_map_key("Arion", "FamilyChildren", &fa), children);
+        kv.insert(
+            storage_map_key("Arion", "ChildRegistrations", &[0xd1u8; 32]),
+            reg(fa, [0xe1u8; 32], 0),
+        );
+        kv.insert(
+            storage_map_key("Arion", "NodeWeightByChild", &[0xd1u8; 32]),
+            900u16.to_le_bytes().to_vec(),
+        );
+        kv.insert(
+            storage_map_key("Arion", "NodeWeightLastBucket", &[0xd1u8; 32]),
+            40u32.to_le_bytes().to_vec(),
+        );
+        kv.insert(
+            storage_map_key("Arion", "NodeQualityByChild", &[0xd1u8; 32]),
+            quality(1 << 40, 990),
+        );
+        kv.insert(
+            storage_value_key("Arion", "CurrentWeightBucket"),
+            42u32.to_le_bytes().to_vec(),
+        );
+        let prefix = storage_map_prefix("ComputeScoring", "NodeIdToChild");
+        rpc_stub(move |method, params| match method {
+            "chain_getFinalizedHead" => serde_json::json!(HEAD),
+            "state_getMetadata" => {
+                assert_eq!(params[0], HEAD);
+                hexed(&meta)
+            }
+            "state_getKeysPaged" => {
+                assert_eq!(params[3], HEAD, "keys are listed at the finalized head");
+                assert_eq!(params[0], hexed(&prefix));
+                let mut keys: Vec<_> = kv
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .map(|k| hexed(k))
+                    .collect();
+                if !params[2].is_null() {
+                    keys.clear(); // one page
+                }
+                serde_json::json!(keys)
+            }
+            "state_getStorage" => {
+                assert_eq!(params[1], HEAD, "storage is read at the finalized head");
+                let key = decode_hex(params[0].as_str().unwrap()).unwrap();
+                kv.get(&key).map_or(serde_json::Value::Null, |v| hexed(v))
+            }
+            other => panic!("unexpected RPC {other}"),
+        })
+    }
+
+    #[test]
+    fn fetch_storage_families_reads_every_compute_family_and_its_arion_children() {
+        let read = fetch_storage_families(
+            &storage_chain(metadata::tests::with_arion(14, 4, None)),
+            "ComputeScoring",
+            "Arion",
+        )
+        .unwrap();
+        assert_eq!(read.block_hash, HEAD);
+        assert_eq!(read.stale_child_buckets, 4);
+        assert_eq!(read.current_weight_bucket, 42);
+        let families: Vec<_> = read.families.iter().map(|f| f.family).collect();
+        assert_eq!(families, [[0xa1u8; 32], [0xb1u8; 32]]);
+        let a = &read.families[0];
+        // The Unbonding compute child is not a compute node of the gate.
+        assert_eq!(
+            a.compute,
+            [ComputeNodeRead {
+                node_id: [0x01; 32],
+                child: [0xc1; 32]
+            }]
+        );
+        assert_eq!(a.storage.len(), 2);
+        let d1 = &a.storage[0];
+        assert_eq!(d1.child, [0xd1u8; 32]);
+        let r = d1.registration.as_ref().unwrap();
+        assert_eq!(
+            (r.family, r.node_id, r.status),
+            ([0xa1; 32], [0xe1; 32], ChildStatus::Active)
+        );
+        assert_eq!((d1.node_weight, d1.last_bucket), (900, 40));
+        let q = d1.quality.as_ref().unwrap();
+        assert_eq!((q.shard_data_bytes, q.bandwidth_bytes), (1 << 40, 7));
+        assert_eq!(
+            (q.uptime_permille, q.strikes, q.integrity_fails),
+            (990, 1, 2)
+        );
+        let d2 = &a.storage[1];
+        assert_eq!(
+            (
+                d2.registration.is_none(),
+                d2.node_weight,
+                d2.last_bucket,
+                d2.quality.is_none()
+            ),
+            (true, 0, 0, true)
+        );
+        // Family B: one compute node (the mismatched index is skipped), no storage.
+        let b = &read.families[1];
+        assert_eq!(b.compute.len(), 1);
+        assert_eq!(b.compute[0].node_id, [0x03; 32]);
+        assert!(b.storage.is_empty());
+    }
+
+    #[test]
+    fn fetch_storage_families_refuses_a_fossil_or_a_missing_constant() {
+        for drop in [
+            "FamilyChildren",
+            "ChildRegistrations",
+            "NodeWeightByChild",
+            "NodeWeightLastBucket",
+            "NodeQualityByChild",
+            "CurrentWeightBucket",
+            "StaleChildBuckets",
+        ] {
+            let err = fetch_storage_families(
+                &storage_chain(metadata::tests::with_arion(14, 4, Some(drop))),
+                "ComputeScoring",
+                "Arion",
+            )
+            .unwrap_err();
+            assert_eq!(err.category, category::PALLET_ABSENT, "{drop}");
+        }
+        // The compute pallet's maps are required too.
+        let err = fetch_storage_families(
+            &storage_chain(metadata::tests::with_arion(14, 4, None)),
+            "Gone",
+            "Arion",
+        )
+        .unwrap_err();
+        assert_eq!(err.category, category::PALLET_ABSENT);
+    }
+
+    #[test]
+    fn storage_family_decoders_fail_closed() {
+        assert_eq!(
+            decode_account_list(&[0x08, 1, 2]).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+        let mut trailing = codec::Compact(1u32).encode();
+        trailing.extend_from_slice(&[9u8; 33]);
+        assert_eq!(
+            decode_account_list(&trailing).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+        assert!(decode_account_list(&codec::Compact(0u32).encode())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decode_node_quality(&[0u8; 41]).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+        assert_eq!(
+            scale_u32(&[0u8; 5]).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+        assert_eq!(
+            scale_u16(&[0u8; 1]).unwrap_err().category,
+            category::SCALE_DECODE
+        );
+        assert_eq!(scale_u32(&7u32.to_le_bytes()).unwrap(), 7);
     }
 }

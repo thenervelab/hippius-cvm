@@ -1280,11 +1280,16 @@ def cordoned_node_ids() -> dict[str, str]:
 
     A miner PENDING APPROVAL (`apps.scheduler.approval`, only while
     `VALI_MINER_APPROVAL_REQUIRED` is on) is folded in with the reason
-    `pending approval`: it is the same "no new work" hold. An operator
-    cordon's own reason wins when a miner is both."""
+    `pending approval`: it is the same "no new work" hold. So is a compute
+    node whose family runs no healthy Arion storage
+    (`apps.scheduler.storage_requirement`, only while
+    `VALI_COMPUTE_REQUIRES_STORAGE` is on), with the reason `no-storage`.
+    An operator cordon's own reason wins when a miner is several."""
     from .approval import pending_approval_node_ids
+    from .storage_requirement import denied_node_ids
 
     cordoned = pending_approval_node_ids()
+    cordoned.update(denied_node_ids())
     cordoned.update(
         (nid.lower(), reason)
         for nid, reason in MinerCapacity.objects.filter(cordoned_at__isnull=False).values_list(
@@ -1488,15 +1493,18 @@ def capacity_views(
 def hard_gated_node_ids(rows: Iterable[MinerCapacity] | None = None) -> frozenset[str]:
     """Mirror rows `decide_placement` would hard-refuse whatever their free
     capacity: not on-chain `active`, epoch-stale, observed CVM-incapable,
-    zombie-quarantined, operator-cordoned or pending approval. Read from the mirror
+    zombie-quarantined, operator-cordoned, pending approval or cut for want
+    of storage. Read from the mirror
     (refreshed on every chain read) so a capacity readout needs no chain
     round-trip of its own; a
     readout zeroes these hosts' FREE figures instead of advertising room
     placement would never use."""
     from .approval import held_back
     from .cvm_capability import INCAPABLE
+    from .storage_requirement import denied_node_ids
 
     lag = max_epoch_lag()
+    no_storage = denied_node_ids()
     capability = cvm_capability_by_node()
     zombies = {z.lower() for z in zombie_quarantined_node_ids()}
     out: set[str] = set()
@@ -1508,6 +1516,7 @@ def hard_gated_node_ids(rows: Iterable[MinerCapacity] | None = None) -> frozense
             or capability.get(nid) == INCAPABLE
             or nid.lower() in zombies
             or held_back(row)
+            or nid.lower() in no_storage
         ):
             out.add(nid)
     return frozenset(out)

@@ -22,6 +22,9 @@
 //! - `read-node-family` — which family runs a compute node
 //!   (`NodeIdToChild` → `ChildRegistrations`, finalized head), for vali's
 //!   operator config API. Reads no stdin. See `mod node_family`.
+//! - `read-storage-families` — every compute family and the Arion storage
+//!   children it lists (finalized head), for vali's storage requirement.
+//!   Reads no stdin. See `mod storage_families`.
 //! - `idempotency-record` / `idempotency-recall` — §14 retry-dedup
 //!   over `kbs_core::persist::FileIdempotencyStore`, for the PR-G5
 //!   vali §24/§25 orchestrator. Read no stdin. See `mod idempotency`.
@@ -93,6 +96,7 @@ mod live_attestation;
 mod miner_status;
 mod node_family;
 mod pending_prices;
+mod storage_families;
 mod telemetry;
 mod vm_progress;
 
@@ -260,6 +264,10 @@ enum Command {
     /// config API. Reads no stdin; the RPC endpoint comes from the
     /// `THEBRAIN_RPC_URL` env var.
     ReadNodeFamily(node_family::ReadNodeFamilyArgs),
+    /// Read every compute family and the Arion storage children it lists
+    /// (at the finalized head) for vali's storage requirement. Reads no
+    /// stdin; the RPC endpoint comes from the `THEBRAIN_RPC_URL` env var.
+    ReadStorageFamilies(storage_families::ReadStorageFamiliesArgs),
     /// Record a §14 idempotency key (PR-G5 orchestration retry-dedup).
     /// Store dir from the `IDEMPOTENCY_DIR` env var.
     IdempotencyRecord(idempotency::IdempotencyRecordArgs),
@@ -395,6 +403,7 @@ fn main() -> ExitCode {
         Command::ReadMinerStatus(args) => miner_status::run(args),
         Command::ReadPendingPrices(args) => pending_prices::run(args),
         Command::ReadNodeFamily(args) => node_family::run(args),
+        Command::ReadStorageFamilies(args) => storage_families::run(args),
         Command::IdempotencyRecord(args) => idempotency::run_record(args),
         Command::IdempotencyRecall(args) => idempotency::run_recall(args),
         Command::VerifyEdgeTelemetry(args) => telemetry::run_edge_telemetry(args),

@@ -159,3 +159,83 @@ fn version_prints_the_crate_version_and_the_embedded_release_tag() {
         )
     );
 }
+
+/// The 200-byte `HIPPIUS::REGISTER::v1` challenge for the Ed25519 seed
+/// `0x11 × 32` on mainnet (account `0x44 × 32`, block 1000, expiry 1100).
+const REGISTER_CHALLENGE_SEED_11: &str = "0x484950504955533a3a52454749535445523a3a763100000028a6b54823f786c5dd8520ef7bdb0ee2639173815bfbb7719bcf58ef9eb5e1f944444444444444444444444444444444444444444444444444444444444444447576f054116b1dff9bf2538c8980809de003d3b8e049f925b50bc28ccf75e1345555555555555555555555555555555555555555555555555555555555555555e80300000000000066666666666666666666666666666666666666666666666666666666666666664c04000000000000";
+
+#[test]
+fn sign_coldkey_registration_signs_from_a_raw_keypair_and_leaves_it_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let keypair = dir.path().join("keypair.bin");
+    std::fs::write(&keypair, [0x11u8; 32]).unwrap();
+    std::fs::set_permissions(&keypair, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let before = std::fs::metadata(&keypair).unwrap();
+
+    let family = format!("0x{}", "aa".repeat(32));
+    let child = format!("0x{}", "bb".repeat(32));
+    let out = Command::new(bin())
+        .args(["sign-coldkey-registration", "--keypair"])
+        .arg(&keypair)
+        .args(["--challenge", REGISTER_CHALLENGE_SEED_11])
+        .args(["--family", &family, "--child", &child, "--nonce", "3"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["node_id"],
+        "12D3KooWPqT2nMDSiXUSx5D7fasaxhxKigVhcqfkKqrLghCq9jxz"
+    );
+    assert_eq!(json["account"], format!("0x{}", "44".repeat(32)));
+    assert_eq!(json["expires_at"], 1100);
+    assert_eq!(json["arion"]["nonce"], 3);
+    assert_eq!(json["arion"]["node_id"], json["public_key"]);
+    // The seed never reaches stdout or stderr.
+    let seed_hex = "11".repeat(32);
+    assert!(!stdout.contains(&seed_hex));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&seed_hex));
+
+    // Read-only: bytes, mode and mtime unchanged.
+    let after = std::fs::metadata(&keypair).unwrap();
+    assert_eq!(std::fs::read(&keypair).unwrap(), [0x11u8; 32]);
+    assert_eq!(after.permissions().mode(), before.permissions().mode());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn sign_coldkey_registration_refuses_partial_arion_args_and_bad_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let keypair = dir.path().join("keypair.bin");
+    std::fs::write(&keypair, [0x11u8; 32]).unwrap();
+    let family = format!("0x{}", "aa".repeat(32));
+    let run = |extra: &[&str]| {
+        Command::new(bin())
+            .args(["sign-coldkey-registration", "--keypair"])
+            .arg(&keypair)
+            .args(["--challenge", REGISTER_CHALLENGE_SEED_11])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--family", &family]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("registration-arg/arion-args-all-or-none")
+    );
+
+    // A hex identity.key is not an Arion keypair.
+    std::fs::write(&keypair, "11".repeat(32)).unwrap();
+    let out = run(&[]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("identity-parse/keypair-len"));
+}

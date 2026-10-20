@@ -36,6 +36,7 @@ from django.db.models import Max
 
 from apps.orchestration.services import flavors
 
+from . import storage_requirement
 from .models import MinerCapacity, Placement, PlacementStatus, UsageAccrual
 
 log = logging.getLogger("apps.scheduler.scoring")
@@ -92,6 +93,10 @@ def compute_epoch_weights() -> dict[str, int]:
     attestor keeps earning 0, a real-usage miner with a dead attestor drops
     to 0.
 
+    Storage withhold: a compute node whose family runs no healthy Arion
+    storage node (`apps.scheduler.storage_requirement`, behind
+    `VALI_COMPUTE_REQUIRES_STORAGE`) is dropped the same way.
+
     Zombie withhold: a miner that is zombie-quarantined when the weights
     are computed (still relaying frames from a VM whose §24 crypto-erase
     already ran — `apps.lifecycle.zombie`) is DROPPED from this epoch's
@@ -101,6 +106,10 @@ def compute_epoch_weights() -> dict[str, int]:
     source = str(getattr(settings, "VALI_EPOCH_WEIGHT_SOURCE", "snapshot"))
     base = _usage_weights() if source == "usage" else _snapshot_weights()
     base = withhold_zombie_quarantined(base)
+    # Compute requires storage: a family running no healthy Arion storage
+    # node earns nothing on its compute nodes (`storage_requirement`;
+    # unchanged while VALI_COMPUTE_REQUIRES_STORAGE is off).
+    base = storage_requirement.withhold_weights(base)
     # DEFAULT-OFF ⇒ return the base weights UNCHANGED (byte-identical to the
     # pre-PR-11 behaviour). The multiplier only applies once an operator
     # arms `VALI_REWARD_REQUIRE_ATTESTOR` at PR-13.

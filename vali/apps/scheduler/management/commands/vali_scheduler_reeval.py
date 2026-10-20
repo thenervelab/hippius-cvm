@@ -44,6 +44,10 @@ Then the automatic miner approval (`auto_approval`,
 is approved (`actor = auto:attested-soak`); one summary line per cycle with
 pending miners. Off, it does nothing.
 
+Then the storage requirement's chain read (`storage_requirement.refresh_if_due`):
+with `VALI_COMPUTE_REQUIRES_STORAGE` on, every compute family's Arion storage
+is re-read at most every `VALI_COMPUTE_STORAGE_REFRESH_S`. Off, nothing.
+
 And the storage-config sync state of every node with a desired storage
 document (`storage_config_survey`, job `vali-storage-config`):
 `hippius_storage_config_sync{node_id,state}`, one-hot over `in_sync`,
@@ -60,7 +64,7 @@ from typing import TYPE_CHECKING, Any
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from apps.scheduler import service
+from apps.scheduler import service, storage_requirement
 from apps.scheduler.chain import ChainReadUnavailable
 
 if TYPE_CHECKING:
@@ -343,6 +347,7 @@ class Command(BaseCommand):
             except Exception:  # noqa: BLE001 — daemon loop must survive.
                 log.exception("reeval cycle raised — continuing")
             auto_approval()
+            storage_requirement.refresh_if_due()
             disk_survey()
             host_health_survey()
             storage_config_survey()

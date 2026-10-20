@@ -50,6 +50,7 @@ from django.utils import timezone
 from apps.miners import geo
 from apps.miners.models import LocationVerdict, MinerIdentity, MinerLocation
 from apps.scheduler import service as scheduler_service
+from apps.scheduler import storage_requirement
 from apps.scheduler.models import (
     MinerCapacity,
     Placement,
@@ -59,6 +60,7 @@ from apps.scheduler.models import (
 from apps.scheduler.reasons import (
     LAUNCH_REFUSAL_OUTCOMES,
     NON_NODE_DRAIN_REASONS,
+    REASON_NO_STORAGE,
     public_refusal_reason,
 )
 from apps.telemetry.models import HostAttestor, HostAttestorStatus
@@ -252,6 +254,7 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
 
     attestor_gate = scheduler_service.attestor_gate(now=now)
     failed_over = scheduler_service.failover_quarantined_miner_ids()
+    no_storage = storage_requirement.denied_node_ids(now=now)
     attestors = _best_attestor_by_node(wanted)
     # `vm_family=""` → the global view (the family set only drives
     # anti-affinity, which is per-launch, not a capacity property).
@@ -268,6 +271,12 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
         verdict = scheduler_service.dispatchability(
             miner, now=now, attestor=attestor_gate, failover_quarantined=failed_over
         )
+        schedulable, reason = verdict.dispatchable, verdict.reason
+        # A dispatchable node whose family runs no healthy Arion storage
+        # takes no new VM either (`storage_requirement`): named, so the
+        # dashboard can tell the family why.
+        if schedulable and nid in no_storage:
+            schedulable, reason = False, REASON_NO_STORAGE
         load = load_by_node.get(nid, 0)
         total = capacity_by_node.get(nid)
         breakdown = breakdown_by_node.get(nid, {})
@@ -278,8 +287,8 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                 "status": miner.status,
                 "last_seen_at": _iso(miner.last_seen_at),
                 "attestor": _serialize_attestor(attestors.get(nid)),
-                "schedulable": verdict.dispatchable,
-                "schedulable_reason": verdict.reason,
+                "schedulable": schedulable,
+                "schedulable_reason": reason,
                 # Active placements (pending + bound) — vali's own ledger of
                 # what it put on this host; never the miner's claim.
                 "hosted_vm_count": load,

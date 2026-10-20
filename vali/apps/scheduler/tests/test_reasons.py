@@ -30,6 +30,8 @@ SCHEDULING_GATES = {
     "cert-expired",
     "measurement-stale",
     "attestor-stale",
+    # The family runs no healthy Arion storage node (storage requirement).
+    "no-storage",
 }
 
 

@@ -61,6 +61,11 @@ rand_core = { version = "0.6", features = ["std", "getrandom"] }
 # Secret-wiping: `Zeroizing` for the seed buffer + the on-disk hex.
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
+# `blake2_256` of the libp2p peer id, checked against the
+# `RegisterChallenge::node_id_hash` before `sign-coldkey-registration`
+# signs. Same version + default features `hippius-onchain-registry`
+# already pulls — no new lockfile entry.
+blake2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 # Operator config (TOML). Parser only — no date / sptr features.
