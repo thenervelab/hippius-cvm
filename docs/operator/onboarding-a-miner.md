@@ -222,9 +222,9 @@ copied from an example:
 | `miner_vali_lifecycle_url` | the lifecycle relay address |
 | `edge_order_signing_pubkey` | 64-hex Ed25519 key; the agent `verify_strict`s **every** lifecycle order against it |
 | `image.s3_endpoint` / `image.s3_bucket` | where published UKIs live |
-| `edge_ca_cert_file` | path on YOUR workstation to the CA that signed the Edge's **server** certificate; defaults to `~/.config/hippius/edge-ca.crt` and is copied to the host by `mtls-cert-mount.yml` |
 | `miner_tenant_ovmf_url` / `_sha256` | the firmware every tenant CVM boots. **Not** the distro `ovmf` package — this exact image is folded into the SNP launch measurement, and the validator recomputes against the copy it pins. A different build measures differently, so the KBS refuses every release on your host. Fetched and digest-verified by play 02; a host without it answers every launch `tenant-preflight/ovmf-missing`. |
-| `miner_kbs_ca_cert_file` / `_src` | CA the agent trusts when dialling the KBS to relay a guest's §21 release. The KBS serves a private certificate by default (internal service on the mesh, not a public ACME endpoint). Leave empty only for a publicly-trusted KBS certificate. |
+| `miner_kbs_ca_cert_file` / `_src` | CA the agent trusts when dialling the KBS to relay a guest's §21 release. The KBS serves a private certificate by default (internal service on the mesh, not a public ACME endpoint). Leave `_file` empty only for a publicly-trusted KBS certificate. `_src` defaults to the checkout's `miner-tasks/files/kbs-ca.crt`; without it the play downloads `miner_kbs_ca.url`. Either way it must hash to `miner_kbs_ca.sha256`. |
+| `miner_edge_ca` / `miner_kbs_ca` / `miner_host_attestor.*_url` | public URL + sha256 pin of each file the play places without building it: the two CA certificates and the host-attestor kernel, initrd and OVMF (`miner-tasks/pinned-file.yml`). A file already on the host that hashes right is kept. |
 | `miner_agent_source_repo` | with `miner_agent_build_from_source: true` only: the git repository play 05 clones and **builds the agent from**. A code-delivery path, not a link — whatever is here is what runs on your confidential host. The play refuses to run on an unfilled placeholder. |
 
 Play 05 refuses any of these still set to a `<…>` placeholder

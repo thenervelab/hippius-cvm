@@ -243,10 +243,14 @@ host's CPUID signature, so the measurement differs per generation.
 `snp_generation` in host_vars selects the entry rendered into
 `[host_attestor]`.
 
-The components are not published at a public URL. Stage them into
+Play 05 fetches the components into
 `/var/lib/hippius-miner/host-attestor/{ovmf.fd,linux.bin,initrd.bin}`
-before play 05 (it refuses to render the section on a missing or
-different file). A measurement for a NEW generation must be computed
+from the public asset store (`miner_host_attestor.*_url`), verifies each
+against its sha256 pin, keeps a file already there that hashes right, and
+refuses to render the section on a missing or different file
+(`miner-tasks/pinned-file.yml`). The Edge and KBS CA certificates follow
+the same rule (`miner_edge_ca`, `miner_kbs_ca`; committed in
+`miner-tasks/files/`). A measurement for a NEW generation must be computed
 over exactly those files and admitted before a host of that generation
 can enroll:
 
@@ -255,8 +259,8 @@ hippius-launch-digest --ovmf ovmf.fd --kernel linux.bin --initrd initrd.bin \
     --cmdline cmdline.txt --vcpus 1 --vcpu-type EpycMilan   # EpycGenoa | EpycTurin
 ```
 
-It reproduces the existing Genoa/Turin entries byte for byte — check
-that first. Admission = a §22 pin with class `host_attestor` plus an
+It reproduces the three pinned entries (Genoa `107e7a10…`, Turin
+`ce4d2921…`, Milan `51d83b4c…`) byte for byte — check that first. Admission = a §22 pin with class `host_attestor` plus an
 active `HostAttestorRelease` row in vali.
 
 ### Enabling SEV-SNP on a Dell (racadm)

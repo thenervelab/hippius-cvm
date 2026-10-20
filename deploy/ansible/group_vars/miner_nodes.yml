@@ -135,10 +135,40 @@ miner_kbs_endpoint: "https://kbs.hippius.network"
 # default deployment does not, because the KBS is an internal service on the
 # mesh rather than a public ACME endpoint.
 #
-# Path on the MINER. `mtls-cert-mount.yml` copies it there from
-# `miner_kbs_ca_cert_src` on your workstation.
+# Path on the MINER. `mtls-cert-mount.yml` places it there (pinned:
+# `miner_kbs_ca` below).
 miner_kbs_ca_cert_file: "/etc/hippius-miner/kbs-ca.pem"
-miner_kbs_ca_cert_src: "~/.config/hippius/kbs-ca.crt"
+# Taken from here on the controller when the file exists, else downloaded
+# from `miner_kbs_ca.url`; either way refused unless it hashes to
+# `miner_kbs_ca.sha256` (miner-tasks/pinned-file.yml).
+miner_kbs_ca_cert_src: "{{ playbook_dir }}/miner-tasks/files/kbs-ca.crt"
+
+# ── Public, pinned miner assets ──────────────────────────────────────
+#
+# Everything an operator needs that is not built on the host: two public
+# CA certificates and the host-attestor boot components. None is a
+# secret — integrity is the sha256 pin below, which this reviewed file
+# carries. The play takes a file from this checkout when present
+# (miner-tasks/files/), else downloads it from the public asset store, and
+# refuses any byte that does not hash to the pin
+# (miner-tasks/pinned-file.yml). An operator stages nothing by hand.
+miner_public_assets_url: "https://s3.hippius.com/hippius-compute-images/miner-assets"
+
+# The Edge gateway's server CA (`CN=hippius-compute-edge-bootstrap-ca`),
+# installed as [edge]/[lifecycle] ca_cert. Also committed as
+# miner-tasks/files/edge-ca.crt.
+miner_edge_ca:
+  url: "{{ miner_public_assets_url }}/edge-ca-540cd92f.crt"
+  sha256: "540cd92f8778a6c27b51c3180003816ef00436d3bbbb313c1b516b7b8ce8ccca"
+
+# The KBS serving certificate bundle (`CN=kbs.hippius.network`: the
+# self-signed serving leaf + its CA), installed as [kbs] ca_cert. Also
+# committed as miner-tasks/files/kbs-ca.crt. The pin covers the leaf too:
+# re-issuing the KBS serving certificate means a new file, a new pin here,
+# a new object in the store, and a play run across the fleet.
+miner_kbs_ca:
+  url: "{{ miner_public_assets_url }}/kbs-ca-c1605eb1.crt"
+  sha256: "c1605eb1090f798c4fb5a08bfd313d741162facc59e39d57262c72281000028d"
 
 # ── Tenant OVMF — the firmware every tenant CVM boots ────────────────
 #
@@ -519,14 +549,20 @@ netbird_setup_key_file: "netbird-miner-setupkey"
 # HostAttestorRelease row in vali before a host of that generation can
 # enroll. `snp_generation` (host_vars) selects the entry.
 #
-# The components are staged by the operator into `dir` (they are not
-# published at a public URL); play 05 refuses to render the section
-# unless all three files are on disk with exactly these digests.
+# Play 05 fetches the three components into `dir` from the URLs below
+# (a file already there that hashes right is kept) and refuses to render
+# the section unless all three are on disk with exactly these digests.
+# The OVMF is the tenant OVMF, byte for byte. The three measurements
+# below were recomputed from exactly these files + `cmdline` with
+# `hippius-launch-digest --vcpus 1`.
 miner_host_attestor:
   dir: "/var/lib/hippius-miner/host-attestor"
   ovmf_sha256: "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c"
+  ovmf_url: "{{ miner_tenant_ovmf_url }}"
   kernel_sha256: "6a6419fde155bc1be12f9d2555ad18876cdff111d80c2887c6aa2c5d6cb250ac"
+  kernel_url: "{{ miner_public_assets_url }}/host-attestor/linux-6a6419fd.bin"
   initrd_sha256: "9b3fe08cbc9f6f0d5dd6ad733269840f6e2723cf4a9b9c24b4e1b4a0b2e8839d"
+  initrd_url: "{{ miner_public_assets_url }}/host-attestor/initrd-9b3fe08c.bin"
   cmdline: "quiet panic=0 console=ttyS0 hippius.chain_genesis=6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e hippius.pallet_instance=c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
   measurements:
     genoa: "107e7a10a5f783b8920a7fccbdcbfc41f9511dd32211b72c8ffa4d8fdd803da6ba276b5419f000a51f44b7337f03fbd3"

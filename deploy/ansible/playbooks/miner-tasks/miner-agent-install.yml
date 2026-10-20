@@ -220,10 +220,12 @@
 # same invocation when host_vars does not set it). A
 # miner without it would render no attestor, never attest, and — with
 # vali's host-attestor gate enforced — never receive a VM, so it is
-# required. The files are staged by the operator (see
-# `miner_host_attestor` in group_vars); a missing or different file is a
-# hard stop here, because the agent would otherwise retry the launch
-# forever against a digest mismatch and the host would never attest.
+# required. The three boot components are fetched from the public asset
+# store and verified against their sha256 pins (`miner_host_attestor` in
+# group_vars); a file already in place that hashes right is kept. A
+# missing or different file is a hard stop here, because the agent would
+# otherwise retry the launch forever against a digest mismatch and the
+# host would never attest.
 - name: Assert snp_generation names a known host-attestor measurement
   ansible.builtin.assert:
     that:
@@ -235,32 +237,32 @@
       EPYC generation: 7003=milan, 9004=genoa, 9005=turin); got
       {{ snp_generation | default('(unset)') }}.
 
-- name: Stat the staged host-attestor components
-  ansible.builtin.stat:
-    path: "{{ miner_host_attestor.dir }}/{{ item.file }}"
-    checksum_algorithm: sha256
-  loop:
-    - { file: ovmf.fd, sha256: "{{ miner_host_attestor.ovmf_sha256 }}" }
-    - { file: linux.bin, sha256: "{{ miner_host_attestor.kernel_sha256 }}" }
-    - { file: initrd.bin, sha256: "{{ miner_host_attestor.initrd_sha256 }}" }
-  loop_control:
-    label: "{{ item.file }}"
-  register: miner_ha_files
-  when: snp_generation is defined
+- name: Create the host-attestor directory
+  ansible.builtin.file:
+    path: "{{ miner_host_attestor.dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
-- name: Refuse host-attestor components that are missing or not the pinned ones
-  ansible.builtin.assert:
-    that:
-      - item.stat.exists
-      - item.stat.checksum == item.item.sha256
-    fail_msg: >-
-      {{ miner_host_attestor.dir }}/{{ item.item.file }} is missing or does
-      not match its pinned sha256 ({{ item.item.sha256 }}). Stage the
-      host-attestor components before this play.
-  loop: "{{ miner_ha_files.results }}"
+- name: Fetch and verify the host-attestor boot components
+  ansible.builtin.include_tasks: pinned-file.yml
+  loop:
+    - name: host-attestor OVMF
+      dest: "{{ miner_host_attestor.dir }}/ovmf.fd"
+      sha256: "{{ miner_host_attestor.ovmf_sha256 }}"
+      url: "{{ miner_host_attestor.ovmf_url }}"
+    - name: host-attestor kernel
+      dest: "{{ miner_host_attestor.dir }}/linux.bin"
+      sha256: "{{ miner_host_attestor.kernel_sha256 }}"
+      url: "{{ miner_host_attestor.kernel_url }}"
+    - name: host-attestor initrd
+      dest: "{{ miner_host_attestor.dir }}/initrd.bin"
+      sha256: "{{ miner_host_attestor.initrd_sha256 }}"
+      url: "{{ miner_host_attestor.initrd_url }}"
   loop_control:
-    label: "{{ item.item.file }}"
-  when: snp_generation is defined
+    loop_var: pinned
+    label: "{{ pinned.name }}"
 
 # ── Config ──────────────────────────────────────────────────────────
 - name: Assert the CVM budget inputs before deriving the budget

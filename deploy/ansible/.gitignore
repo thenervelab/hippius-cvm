@@ -36,3 +36,8 @@ host_vars/*.yml
 host_vars/*.yaml
 !host_vars/*.example.yml
 !host_vars/*.example.yaml
+
+# Public certificates the play pins by sha256 (group_vars `miner_edge_ca`,
+# `miner_kbs_ca`). Certificates only — never a key.
+!playbooks/miner-tasks/files/edge-ca.crt
+!playbooks/miner-tasks/files/kbs-ca.crt

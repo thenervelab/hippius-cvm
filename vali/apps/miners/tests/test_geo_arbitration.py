@@ -12,9 +12,9 @@ from apps.miners.models import LocationVerdict
 from apps.orchestration.effects import EffectError, EffectUnavailable
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
-#: A control-plane vantage in northern France (Lille).
-VANTAGE = geo.Vantage(name="cp-1", latitude=50.63, longitude=3.07)
-#: A RIPEstat maxmind-geo-lite answer placing 49.10.20.1 in Melbourne.
+#: A vantage in northern France.
+GRA = geo.Vantage(name="vantage-fr", latitude=50.63, longitude=3.07)
+#: A canned maxmind-geo-lite answer: Melbourne.
 MELBOURNE = geo.GeoRecord(
     country_code="AU", city="Melbourne", latitude=-37.8136, longitude=144.9631, asn=64500
 )
@@ -23,9 +23,9 @@ ASHBURN = geo.GeoRecord(country_code="US", city="Ashburn", latitude=39.04, longi
 
 def _peer(**over):
     base = {
-        "name": "miner-e",
+        "name": "miner-a",
         "ip": "100.64.10.5",
-        "connection_ip": "49.10.20.1",
+        "connection_ip": "9.9.9.9",
         "country_code": "CA",
         "connected": True,
         "last_seen": (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z"),
@@ -40,7 +40,7 @@ def _assess(**over):
         geo=MELBOURNE,
         rtt_ms=293.0,
         guest_egress_ips=[],
-        vantage=VANTAGE,
+        vantage=GRA,
         now=NOW,
         km_per_ms=100.0,
         slack_km=300.0,
@@ -50,14 +50,14 @@ def _assess(**over):
     return geo.assess(**kwargs)
 
 
-# ─── the motivating case ────────────────────────────────────────────────────
+# ─── the live case ────────────────────────────────────────────────────
 
 
-def test_netbird_ca_vs_ripestat_melbourne_at_293ms_verifies_au() -> None:
-    """NetBird's GeoLite says CA (the range is registered to a Canadian
-    entity), RIPEstat says Melbourne. Canada is at most ~8 500 km from the
-    vantage; 293 ms needs >= 10 520 km under bound (b). Only Melbourne
-    fits => verified AU, and the arbitration shows."""
+def test_netbird_ca_vs_ripestat_sydney_at_293ms_verifies_au() -> None:
+    """NetBird's GeoLite says CA (the range is
+    registered in Canada), RIPEstat says Melbourne. Canada is at most
+    ~8 000 km from the vantage; 293 ms needs >= 10 520 km under bound (b).
+    Only Melbourne fits => verified AU, and the arbitration shows."""
     v = _assess()
     assert v.verdict == LocationVerdict.VERIFIED
     assert v.reasons == [geo.R_RTT_ARBITRATED]
@@ -121,7 +121,7 @@ def test_no_usable_rtt_cannot_arbitrate(rtt) -> None:
 
 
 def test_a_guest_egress_mismatch_still_wins_over_arbitration() -> None:
-    v = _assess(guest_egress_ips=["49.10.20.1", "203.0.113.50"])
+    v = _assess(guest_egress_ips=["9.9.9.9", "203.0.113.50"])
     assert v.verdict == LocationVerdict.MISMATCH
     assert v.reasons == [geo.R_SOURCE_DISAGREE, geo.R_GUEST_MISMATCH]
     assert v.country_code == ""
@@ -177,7 +177,7 @@ def test_ripestat_candidate_is_judged_on_its_coordinates_not_its_country() -> No
     """At 480 ms Melbourne's own budget (~448 ms) is blown, although the far
     edge of Australia's disc would still admit it. The coordinate check is
     the one used => RIPEstat inconsistent, Canada inconsistent => mismatch."""
-    lo, hi = geo.country_distance_range_km("AU", VANTAGE)
+    lo, hi = geo.country_distance_range_km("AU", GRA)
     b = geo._RttBounds(rtt=480.0, km_per_ms=100.0, slack_km=300.0, path_factor=2.5, extra_ms=30.0)
     assert b.admits_range(lo, hi)  # the disc alone would have let it through
     assert _assess(rtt_ms=480.0).verdict == LocationVerdict.MISMATCH
@@ -215,10 +215,10 @@ def test_admits_range_agrees_with_the_point_check() -> None:
 
 
 def test_country_range() -> None:
-    assert geo.country_distance_range_km("ZZ", VANTAGE) is None
-    lo, hi = geo.country_distance_range_km("ca", VANTAGE)
+    assert geo.country_distance_range_km("ZZ", GRA) is None
+    lo, hi = geo.country_distance_range_km("ca", GRA)
     assert 0 <= lo < hi < 10_520  # Canada can never answer in 293 ms from the vantage
-    lo, _ = geo.country_distance_range_km("FR", VANTAGE)
+    lo, _ = geo.country_distance_range_km("FR", GRA)
     assert lo == 0.0  # the vantage is inside France's disc
 
 
@@ -342,20 +342,20 @@ EXTREME_POINTS: dict[str, list[tuple[float, float]]] = {
 
 #: Cities NOT used in the derivation.
 KNOWN_CITIES: list[tuple[str, float, float]] = [
-    ("AU", -37.81, 144.96),  # Melbourne
+    ("AU", -33.87, 151.21),  # Sydney
     ("AU", -31.95, 115.86),  # Perth
     ("AU", -42.88, 147.33),  # Hobart
-    ("CA", 45.50, -73.57),  # Montreal
+    ("CA", 45.31, -73.87),  # Beauharnois
     ("CA", 43.65, -79.38),  # Toronto
     ("CA", 49.28, -123.12),  # Vancouver
     ("US", 39.04, -77.49),  # Ashburn
     ("US", 37.39, -121.96),  # Santa Clara
     ("US", 21.31, -157.86),  # Honolulu
     ("US", 61.22, -149.90),  # Anchorage
-    ("FR", 51.03, 2.38),  # Dunkirk
+    ("FR", 50.63, 3.07),  # Lille
     ("FR", 48.86, 2.35),  # Paris
-    ("FR", 47.75, 7.34),  # Mulhouse
-    ("FR", 50.63, 3.06),  # Lille
+    ("FR", 48.58, 7.75),  # Strasbourg
+    ("FR", 50.69, 3.17),  # Roubaix
     ("DE", 50.11, 8.68),  # Frankfurt
     ("DE", 52.52, 13.40),  # Berlin
     ("GB", 51.51, -0.13),  # London
@@ -385,8 +385,8 @@ def test_every_extreme_point_lies_inside_its_country_disc() -> None:
 def test_known_cities_fall_inside_their_country_range(cc, lat, lon) -> None:
     c_lat, c_lon, radius = geo.COUNTRY_DISCS[cc]
     assert geo.haversine_km(c_lat, c_lon, lat, lon) <= radius
-    lo, hi = geo.country_distance_range_km(cc, VANTAGE)
-    assert lo <= geo.haversine_km(VANTAGE.latitude, VANTAGE.longitude, lat, lon) <= hi
+    lo, hi = geo.country_distance_range_km(cc, GRA)
+    assert lo <= geo.haversine_km(GRA.latitude, GRA.longitude, lat, lon) <= hi
 
 
 def test_the_table_covers_where_miners_realistically_are() -> None:
@@ -404,17 +404,17 @@ def test_the_table_covers_where_miners_realistically_are() -> None:
 
 # ─── RIPEstat ASN fallback ────────────────────────────────────────────
 
-#: Shaped like real RIPEstat answers (2026-09-26), with documentation values.
+#: Shaped like RIPEstat's live answers (2026-09-26); IP, prefixes and AS are neutral.
 _GEOLITE = {
     "data": {
         "located_resources": [
             {
-                "resource": "49.10.20.1/32",
+                "resource": "9.9.9.9/32",
                 "locations": [
                     {
                         "country": "AU",
                         "city": "Melbourne",
-                        "resources": ["49.10.16.0/20"],
+                        "resources": ["9.9.0.0/20"],
                         "latitude": -37.8136,
                         "longitude": 144.9631,
                         "covered_percentage": 100.0,
@@ -426,7 +426,7 @@ _GEOLITE = {
 }
 _PREFIX_OVERVIEW = {
     "data": {
-        "resource": "49.10.0.0/16",
+        "resource": "9.9.0.0/17",
         "announced": True,
         "asns": [{"asn": 64500, "holder": "EXAMPLE-AS Example"}],
     }
@@ -457,12 +457,12 @@ def test_network_info_without_asn_falls_back_to_prefix_overview(ripestat) -> Non
     answers, calls = ripestat
     answers["network-info"] = {"data": {"asns": [], "prefix": ""}}
     answers["prefix-overview"] = _PREFIX_OVERVIEW
-    rec = geo.ripestat_geo("49.10.20.1")
+    rec = geo.ripestat_geo("9.9.9.9")
     assert rec is not None
     assert (rec.country_code, rec.city) == ("AU", "Melbourne")
     assert rec.asn == 64500
     assert rec.as_holder == "EXAMPLE-AS Example"
-    assert rec.as_prefix == "49.10.0.0/16"
+    assert rec.as_prefix == "9.9.0.0/17"
     assert calls == ["maxmind-geo-lite", "network-info", "prefix-overview"]
 
 
@@ -470,17 +470,17 @@ def test_a_failed_network_info_also_falls_back(ripestat) -> None:
     answers, _ = ripestat
     answers["network-info"] = EffectError("ripestat:asn: HTTP 500")
     answers["prefix-overview"] = _PREFIX_OVERVIEW
-    rec = geo.ripestat_geo("49.10.20.1")
+    rec = geo.ripestat_geo("9.9.9.9")
     assert rec is not None and rec.asn == 64500 and rec.as_holder == "EXAMPLE-AS Example"
 
 
 def test_network_info_with_an_asn_uses_as_overview_for_the_holder(ripestat) -> None:
     answers, calls = ripestat
-    answers["network-info"] = {"data": {"asns": ["64500"], "prefix": "49.10.0.0/16"}}
+    answers["network-info"] = {"data": {"asns": ["64500"], "prefix": "9.9.0.0/17"}}
     answers["as-overview"] = {"data": {"holder": "EXAMPLE-AS Example"}}
-    rec = geo.ripestat_geo("49.10.20.1")
+    rec = geo.ripestat_geo("9.9.9.9")
     assert rec is not None
-    assert (rec.asn, rec.as_prefix, rec.as_holder) == (64500, "49.10.0.0/16", "EXAMPLE-AS Example")
+    assert (rec.asn, rec.as_prefix, rec.as_holder) == (64500, "9.9.0.0/17", "EXAMPLE-AS Example")
     assert "prefix-overview" not in calls
 
 
@@ -488,7 +488,7 @@ def test_every_asn_source_failing_keeps_the_location(ripestat) -> None:
     answers, _ = ripestat
     answers["network-info"] = {"data": {"asns": ["not-a-number"]}}
     answers["prefix-overview"] = EffectUnavailable("ripestat:prefix-overview: timeout")
-    rec = geo.ripestat_geo("49.10.20.1")
+    rec = geo.ripestat_geo("9.9.9.9")
     assert rec is not None and rec.country_code == "AU"
     assert rec.asn is None and rec.as_holder == ""
 
@@ -496,7 +496,7 @@ def test_every_asn_source_failing_keeps_the_location(ripestat) -> None:
 def test_a_malformed_prefix_overview_degrades_to_no_asn(ripestat) -> None:
     answers, _ = ripestat
     answers["network-info"] = {"data": {"asns": []}}
-    answers["prefix-overview"] = {"data": {"resource": "49.10.0.0/16", "asns": ["64500"]}}
-    rec = geo.ripestat_geo("49.10.20.1")
+    answers["prefix-overview"] = {"data": {"resource": "9.9.0.0/17", "asns": ["64500"]}}
+    rec = geo.ripestat_geo("9.9.9.9")
     assert rec is not None and rec.asn is None and rec.as_holder == ""
-    assert rec.as_prefix == "49.10.0.0/16"
+    assert rec.as_prefix == "9.9.0.0/17"

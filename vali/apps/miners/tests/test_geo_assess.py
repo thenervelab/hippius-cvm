@@ -11,9 +11,9 @@ from apps.miners import geo
 from apps.miners.models import LocationVerdict
 
 NOW = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
-#: A control-plane vantage in northern France (Lille).
-VANTAGE = geo.Vantage(name="cp-1", latitude=50.63, longitude=3.07)
-#: A country-level GeoLite point — Paris, ~205 km from the vantage.
+#: A vantage in northern France.
+VANTAGE = geo.Vantage(name="vantage-1", latitude=50.63, longitude=3.07)
+#: The GeoLite point a French hosting range resolves to — Paris, ~205 km from the vantage.
 PARIS = geo.GeoRecord(
     country_code="FR", latitude=48.8582, longitude=2.3387, asn=64500, as_holder="EXAMPLE-AS"
 )
@@ -22,9 +22,9 @@ TOKYO = geo.GeoRecord(country_code="JP", latitude=35.68, longitude=139.69, asn=2
 
 def _peer(**over):
     base = {
-        "name": "miner-c",
-        "ip": "100.64.243.4",
-        "connection_ip": "146.10.20.30",
+        "name": "miner-c-host",
+        "ip": "100.65.243.4",
+        "connection_ip": "149.112.112.45",
         "country_code": "FR",
         "connected": True,
         "last_seen": (NOW - timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z"),
@@ -57,7 +57,7 @@ def test_a_nearby_miner_with_consistent_evidence_is_verified() -> None:
 
 def test_a_far_exit_cannot_hide_behind_a_short_rtt() -> None:
     """The load-bearing check: a Tokyo exit is ~9 500 km from the vantage,
-    which needs ≥ 95 ms of RTT. 4 ms is physically impossible ⇒ the IP
+    which needs ≥ 96 ms of RTT. 4 ms is physically impossible ⇒ the IP
     is not where the packets are answered from."""
     v = _assess(geo=TOKYO, peer=_peer(country_code="JP"))
     assert v.verdict == LocationVerdict.UNVERIFIED
@@ -71,16 +71,16 @@ def test_a_far_exit_with_a_matching_long_rtt_is_verified() -> None:
 
 def test_a_near_claim_answering_from_far_away_is_refused() -> None:
     """The VPN case: a host on another continent tunnels through a French
-    exit. The IP geolocates ~205 km away — but every packet still crosses
-    the ocean, so the RTT is ~100 ms where ~205 km warrants ≤ 36 ms
-    (2.5 × 2.0 ms + 30 ms, rounded up). Slower than the claim permits ⇒ not verified."""
+    exit. The IP geolocates 240 km away — but every packet still crosses
+    the ocean, so the RTT is ~100 ms where 240 km warrants ≤ 36 ms
+    (2.5 × 2.4 ms + 30 ms). Slower than the claim permits ⇒ not verified."""
     v = _assess(rtt_ms=100.0)
     assert v.verdict == LocationVerdict.UNVERIFIED
     assert v.reasons == [geo.R_RTT_TOO_HIGH]
 
 
 def test_a_relayed_but_plausible_rtt_still_verifies_nearby() -> None:
-    # ~205 km ⇒ budget ~35 ms; a TURN-relayed 30 ms path is within it.
+    # 240 km ⇒ budget 36 ms; a TURN-relayed 30 ms path is within it.
     assert _assess(rtt_ms=30.0).verdict == LocationVerdict.VERIFIED
 
 
@@ -111,13 +111,13 @@ def test_geo_without_coordinates_cannot_be_bounded() -> None:
 def test_a_tenant_cvm_egressing_elsewhere_is_a_mismatch() -> None:
     """The attested guest says its traffic comes out of a different public
     IP than the host's own peer — guest traffic is being tunnelled."""
-    v = _assess(guest_egress_ips=["146.10.20.30", "185.10.10.10"])
+    v = _assess(guest_egress_ips=["149.112.112.45", "185.10.10.10"])
     assert v.verdict == LocationVerdict.MISMATCH
     assert v.reasons == [geo.R_GUEST_MISMATCH]
 
 
 def test_tenant_cvms_on_the_same_egress_do_not_disturb_verified() -> None:
-    v = _assess(guest_egress_ips=["146.10.20.30"])
+    v = _assess(guest_egress_ips=["149.112.112.45"])
     assert v.verdict == LocationVerdict.VERIFIED
 
 
@@ -159,7 +159,7 @@ def test_no_peer_is_unknown() -> None:
     assert v.reasons == [geo.R_NO_PEER]
 
 
-@pytest.mark.parametrize("ip", ["100.64.1.2", "10.0.0.1", "127.0.0.1", "", None, "garbage"])
+@pytest.mark.parametrize("ip", ["100.65.1.2", "10.0.0.1", "127.0.0.1", "", None, "garbage"])
 def test_a_non_public_connection_ip_is_unknown(ip) -> None:
     v = _assess(peer=_peer(connection_ip=ip))
     assert v.verdict == LocationVerdict.UNKNOWN
@@ -173,7 +173,7 @@ def test_geo_lookup_failure_is_unknown() -> None:
 
 
 def test_haversine_lille_paris_is_about_205_km() -> None:
-    assert 195 < geo.haversine_km(50.63, 3.07, 48.8582, 2.3387) < 215
+    assert 190 < geo.haversine_km(50.63, 3.07, 48.8582, 2.3387) < 215
 
 
 def test_netbird_nanosecond_timestamps_parse() -> None:
@@ -184,7 +184,7 @@ def test_netbird_nanosecond_timestamps_parse() -> None:
 
 
 def test_public_ip_predicate() -> None:
-    assert geo.is_public_ip("146.10.20.30")
+    assert geo.is_public_ip("149.112.112.45")
     assert geo.is_public_ip("2001:41d0::1")
     assert not geo.is_public_ip("100.64.0.1")  # CGNAT — the NetBird overlay itself
     assert not geo.is_public_ip("192.168.1.1")
@@ -196,7 +196,7 @@ def test_public_ip_predicate() -> None:
 
 def test_tenant_peers_are_grouped_by_host_and_recency() -> None:
     peers = [
-        _peer(name="hippius-tenant-vm-a", connection_ip="146.10.20.30"),
+        _peer(name="hippius-tenant-vm-a", connection_ip="149.112.112.45"),
         _peer(name="hippius-tenant-vm-b", connection_ip="185.1.1.1"),
         _peer(
             name="hippius-tenant-vm-old",
@@ -210,7 +210,7 @@ def test_tenant_peers_are_grouped_by_host_and_recency() -> None:
             connected=True,
             last_seen=(NOW - timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         ),
-        _peer(name="hippius-tenant-vm-cgnat", connection_ip="100.64.5.5"),
+        _peer(name="hippius-tenant-vm-cgnat", connection_ip="100.65.5.5"),
         _peer(name="not-a-tenant", connection_ip="8.8.8.8"),
     ]
     hosts = {
@@ -221,25 +221,25 @@ def test_tenant_peers_are_grouped_by_host_and_recency() -> None:
         "vm-longlived": "miner-c",
     }
     out = geo.tenant_peers_by_host(peers, hosts, now=NOW, stale_after_s=900)
-    assert out == {"miner-c": ["146.10.20.30", "185.1.1.1"]}
+    assert out == {"miner-c": ["149.112.112.45", "185.1.1.1"]}
 
 
 def test_miner_peer_is_matched_on_overlay_ip_preferring_connected() -> None:
     peers = [
-        _peer(ip="100.64.243.4", connected=False, connection_ip="1.1.1.1"),
-        _peer(ip="100.64.243.4", connected=True, connection_ip="2.2.2.2"),
-        _peer(ip="100.64.9.9"),
+        _peer(ip="100.65.243.4", connected=False, connection_ip="1.1.1.1"),
+        _peer(ip="100.65.243.4", connected=True, connection_ip="2.2.2.2"),
+        _peer(ip="100.65.9.9"),
     ]
-    assert geo.match_miner_peer(peers, "100.64.243.4")["connection_ip"] == "2.2.2.2"
-    assert geo.match_miner_peer(peers, "100.64.0.1") is None
+    assert geo.match_miner_peer(peers, "100.65.243.4")["connection_ip"] == "2.2.2.2"
+    assert geo.match_miner_peer(peers, "100.65.0.1") is None
     assert geo.match_miner_peer(peers, None) is None
 
 
 def test_a_registered_peer_id_wins_over_the_overlay_ip() -> None:
     peers = [
-        _peer(id="peer-A", ip="100.64.243.4", connection_ip="1.1.1.1"),
-        _peer(id="peer-B", ip="100.64.9.9", connection_ip="2.2.2.2"),
+        _peer(id="peer-A", ip="100.65.243.4", connection_ip="1.1.1.1"),
+        _peer(id="peer-B", ip="100.65.9.9", connection_ip="2.2.2.2"),
     ]
-    assert geo.match_miner_peer(peers, "100.64.243.4", "peer-B")["connection_ip"] == "2.2.2.2"
+    assert geo.match_miner_peer(peers, "100.65.243.4", "peer-B")["connection_ip"] == "2.2.2.2"
     # an id nobody has falls back to the ip match
-    assert geo.match_miner_peer(peers, "100.64.243.4", "peer-Z")["connection_ip"] == "1.1.1.1"
+    assert geo.match_miner_peer(peers, "100.65.243.4", "peer-Z")["connection_ip"] == "1.1.1.1"

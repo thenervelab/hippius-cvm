@@ -39,13 +39,18 @@
     miner_placeholder_config_hits: >-
       {{ miner_placeholder_config_lines | select('search', miner_placeholder_re) | map('trim') | list }}
     # Play inputs that do not reach config.toml (they are consumed by the
-    # NetBird join, the firmware fetch, the KBS CA copy and the updater).
+    # NetBird join, the firmware fetch, the pinned public files and the
+    # updater).
     miner_placeholder_inputs:
       network.netbird_management_url: "{{ network.netbird_management_url | default('') }}"
       network.netbird_group: "{{ network.netbird_group | default('') }}"
       miner_tenant_ovmf_url: "{{ miner_tenant_ovmf_url | default('') }}"
       miner_tenant_ovmf_sha256: "{{ miner_tenant_ovmf_sha256 | default('') }}"
       miner_kbs_ca_cert_src: "{{ miner_kbs_ca_cert_src | default('') }}"
+      miner_edge_ca.url: "{{ miner_edge_ca.url | default('') }}"
+      miner_kbs_ca.url: "{{ miner_kbs_ca.url | default('') }}"
+      miner_host_attestor.kernel_url: "{{ miner_host_attestor.kernel_url | default('') }}"
+      miner_host_attestor.initrd_url: "{{ miner_host_attestor.initrd_url | default('') }}"
       miner_auto_update_release_repo: "{{ miner_auto_update_release_repo | default('') }}"
     miner_placeholder_input_hits: >-
       {{ miner_placeholder_inputs | dict2items

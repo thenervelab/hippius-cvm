@@ -59,7 +59,7 @@ def _launch_body(state: str, **over: object) -> dict[str, object]:
         "tenant_id": "tenant-1",
         "flavor": "small",
         "state": state,
-        "miner_id": "miner-b" if state != "queued" else None,
+        "miner_id": "miner-2" if state != "queued" else None,
         "placement_id": None,
         "reason": None,
         "result": {"ok": True} if state == "succeeded" else None,
@@ -147,7 +147,7 @@ def test_launch_happy_path_polls_to_succeeded() -> None:
         final = c.wait_for_launch(job.job_id, interval=0, timeout=5)
 
     assert final.is_succeeded
-    assert final.miner_id == "miner-b"
+    assert final.miner_id == "miner-2"
     assert final.result == {"ok": True}
 
     # Auth + Host headers are sent on the launch POST.
@@ -627,7 +627,7 @@ def test_provision_vm_on_progress_emits_phases_in_order() -> None:
     assert [s.phase for s in steps] == _HAPPY_PHASES
     # PLACED carries the miner it landed on; SUCCEEDED is terminal.
     placed = next(s for s in steps if s.phase is ProvisionPhase.PLACED)
-    assert placed.miner_id == "miner-b"
+    assert placed.miner_id == "miner-2"
     assert steps[-1].terminal
     # pct is a monotonic non-decreasing estimate up to 100.
     pcts = [s.pct for s in steps]
@@ -1571,7 +1571,7 @@ def _regions_body() -> dict:
         ],
         "unlocated_miners": 1,
         "require_verified": True,
-        "vantage": {"name": "cp-1-eu", "latitude": 52.37, "longitude": 4.9},
+        "vantage": {"name": "vantage-fr", "latitude": 50.63, "longitude": 3.07},
         "generated_at": "2026-09-21T00:00:00Z",
     }
 
@@ -1661,7 +1661,7 @@ def test_regions_report() -> None:
     assert Region.from_dict({"region": "IT", "miners_dispatchable": 2}).placeable is False
     assert report.unlocated_miners == 1
     assert report.require_verified is True
-    assert report.vantage["name"] == "cp-1-eu"
+    assert report.vantage["name"] == "vantage-fr"
     # The default asks the validator's own rule: no parameter on the wire.
     assert responses.calls[0].request.method == "GET"
     assert "verified_only" not in responses.calls[0].request.url

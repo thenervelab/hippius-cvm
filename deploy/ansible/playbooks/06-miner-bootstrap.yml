@@ -19,7 +19,7 @@
 # (`site.yml` / 00-05): it is intentionally NOT wired into `site.yml`.
 # Run it explicitly, scoped to one host:
 #   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
-#     --limit <miner-hostname>
+#     --limit <miner-host>
 #
 # INVARIANTS (asserted at preflight, see the README "Miner node
 # bootstrap" section):
@@ -220,7 +220,7 @@
         fail_msg: >-
           [NVME_LAYOUT] {{ item.item }} is not a block device on this host — the
           host_vars NVMe layout is wrong. Re-check `lsblk` BEFORE
-          running anything (the §K2 near-miss lesson).
+          running anything (the §K2 control-plane near-miss lesson).
       loop: "{{ miner_nvme_stat.results }}"
       loop_control:
         label: "{{ item.item }}"
@@ -230,7 +230,7 @@
       # data disks (tenant LUKS volumes are MA-3+). It fails closed on:
       #   - a partition table — a partitioned "data" device is almost
       #     always a mis-targeted system disk (/, /boot, swap); the
-      #     §K2 near-miss lesson;
+      #     §K2 control-plane near-miss lesson;
       #   - any whole-disk filesystem / RAID signature OTHER than
       #     crypto_LUKS or a data-only `linux_raid_member`.
       # An empty (raw, fresh box) device passes; so does crypto_LUKS —
@@ -245,7 +245,7 @@
       # promises: on any host where play 04 had run, re-running this
       # bootstrap failed closed forever. The safety property is
       # unchanged — a member of an array carrying /, /boot, /boot/efi
-      # or swap is still refused, which is the control-plane near-miss this
+      # or swap is still refused, which is the §K2 control-plane near-miss this
       # assertion exists for. An UNMOUNTED raid member is refused too:
       # an unassembled array is unidentifiable, so it fails closed.
       ansible.builtin.shell:

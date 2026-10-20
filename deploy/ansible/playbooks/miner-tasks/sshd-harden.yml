@@ -3,12 +3,13 @@
 # Tasks file imported by 06-miner-bootstrap.yml play "08".
 #
 # Play 07 leaves 22/tcp open to the Internet on the assumption that auth
-# is key-only. Provider images do not always make it so: some ship
-# `50-cloud-init.conf` with `PasswordAuthentication yes`, which sorts
-# before Ubuntu's `60-cloudimg-settings.conf` and therefore wins (sshd
-# keeps the first value it reads), and some also set
-# `PermitRootLogin yes` in sshd_config. A public miner with password
-# auth on sees thousands of failed password attempts a day.
+# is key-only. The provider images do not make it so: two providers
+# ship `50-cloud-init.conf` with `PasswordAuthentication
+# yes`, which sorts before Ubuntu's `60-cloudimg-settings.conf` and
+# therefore wins (sshd keeps the first value it reads). One provider's
+# image also sets `PermitRootLogin yes` in sshd_config. Measured on
+# 2026-10-01: four of five miners accepted passwords, with 1.5k-10k
+# failed password attempts a day each.
 #
 # The drop-in is named 00-* so it sorts first and wins over both.
 # PermitRootLogin stays `prohibit-password` rather than `no`: some

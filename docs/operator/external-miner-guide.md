@@ -98,8 +98,8 @@ SMT **may stay on**. The rule is about how CPUs are taken offline:
 | Item | How you get it |
 |---|---|
 | NetBird setup key (mesh membership) | Shown **once** by the dashboard when you prepare a host. Save it to a file on your workstation; it is never committed and never copied to the host. |
-| Gateway server CA, gateway endpoint, order-signing public key, mesh management URL, tenant firmware URL + digest | Fleet values shipped in the Ansible checkout (`deploy/ansible/group_vars/miner_nodes.yml`, `miner-tasks/files/edge-ca.crt`). Don't edit them. |
-| KBS CA certificate and the host-attestor boot components | Provided by Hippius on request if they aren't in your checkout. Stage them as described in [`deploy/ansible/README.md`](../../deploy/ansible/README.md#host-attestor). The play refuses files whose digest isn't the pinned one. |
+| Gateway endpoint, order-signing public key, mesh management URL, tenant firmware URL + digest | Fleet values shipped in the Ansible checkout (`deploy/ansible/group_vars/miner_nodes.yml`). Don't edit them. |
+| Gateway (Edge) server CA, KBS serving certificate, host-attestor boot components (kernel, initrd, OVMF) | **Nothing to do.** The play takes them from the checkout (`miner-tasks/files/`) or downloads them from the public asset store, and refuses any file whose sha256 isn't the one pinned in `group_vars/miner_nodes.yml` (`miner_edge_ca`, `miner_kbs_ca`, `miner_host_attestor`). They are public certificates and measured boot files, not secrets. |
 
 None of these lets anyone read your tenants' data or act as your node.
 They are routing and mesh membership.
@@ -173,11 +173,11 @@ From your Ansible checkout (`deploy/ansible`):
 
 0. On the host, install the release `hippius-miner-agent`
    ([`onboarding-a-miner.md`](./onboarding-a-miner.md#prebuilt-binary),
-   "Prebuilt binary") and stage the host-attestor files
+   "Prebuilt binary"). Play 05 does not build the agent: it refuses to
+   run without the binary (`MINER_AGENT_BINARY_MISSING`). The
+   host-attestor files and the CA certificates need nothing from you:
+   the play downloads and verifies them
    ([`deploy/ansible/README.md`](../../deploy/ansible/README.md#host-attestor)).
-   Play 05 does not build the agent: it refuses to run without the
-   binary (`MINER_AGENT_BINARY_MISSING`) or with attestor files that do
-   not match their pinned digests.
 1. Save the generated file as `host_vars/<hostname>.yml`:
    - Fill the connection details and the disks, by
      `/dev/disk/by-id/...`, never `/dev/nvmeXn1`.
@@ -372,6 +372,7 @@ alone with `--tags preflight --check` after each fix.
 | `NETBIRD_DISCONNECTED` (warning) | NetBird is installed but not connected. | Expected before play 04, which (re)joins. Otherwise check `netbird status`. |
 | `NVME_LAYOUT` | A disk listed in host_vars isn't a block device. | Fix the `/dev/disk/by-id/` names in host_vars (`lsblk`). |
 | `DATA_DISK_BUSY` | A disk listed as a data disk has a partition table, a filesystem, or backs a system mount. | List only blank disks as data disks. Never list a system disk. |
+| `PINNED_FILE_MISMATCH` | A CA certificate or host-attestor file (in the checkout or downloaded) doesn't hash to its pin. | Restore the checkout file from the repository (or delete it so the play downloads the pinned one) and rerun. Never edit the pin. |
 | `NETBIRD_SETUP_KEY_MISSING` | The setup-key file isn't on your workstation. | Save the key from the dashboard to the path the message gives. |
 | `MINER_AGENT_BINARY_MISSING` (play 05) | `/usr/local/bin/hippius-miner-agent` is missing, or its `--version` does not report `versions.miner_agent`. | Install the release binary as the message says (`onboarding-a-miner.md`, "Prebuilt binary"), then re-run. |
 | `PLACEHOLDER_VALUE` (play 05) | A variable is still a `<…>` placeholder (the message names the config key or the variable). | Set it in host_vars (the dashboard's generated file carries the fleet values), then re-run. |
@@ -408,10 +409,10 @@ node shows one of these as its **Schedulable** reason:
 
 | Reason | Meaning | Fix |
 |---|---|---|
-| `attestor-missing` | The validator has never heard from this host's attestor. | Check `journalctl -u hippius-miner-agent \| grep -i attestor` for a launch failure. Check that the three components are staged with the pinned digests and that `snp_generation` is right. |
+| `attestor-missing` | The validator has never heard from this host's attestor. | Check `journalctl -u hippius-miner-agent \| grep -i attestor` for a launch failure. Check that the three components are in `/var/lib/hippius-miner/host-attestor/` (the play places them; rerun it if not) and that `snp_generation` is right. |
 | `attestor-pending` | Enrolled, not attested yet. | Normal for a few minutes after the first start. If it persists, the measurement probably doesn't match your generation: check `snp_generation`. |
 | `cert-expired` | Its enrolment certificate lapsed and no fresh one has arrived. | Check the agent journal for attestor errors and that the mesh is up. If it persists, contact support. |
-| `measurement-stale` | Attested, but on an attestor release the network no longer accepts. | Stage the current host-attestor components and rerun the play. |
+| `measurement-stale` | Attested, but on an attestor release the network no longer accepts. | Update your checkout and rerun the play: it fetches the current host-attestor components. |
 | `attestor-stale` | Attested, but no recent beacon. | Check the domain is running (`virsh list` shows `hippius-infra-host-attestor`) and the agent is up. |
 | `release-unpinned` | The network has no active attestor release. | Not about your host. Wait, or ask Hippius. |
 

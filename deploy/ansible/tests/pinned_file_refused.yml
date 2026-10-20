@@ -1,0 +1,18 @@
+---
+# One refusal case for pinned_file_wiring.yml: `case` is the `pinned`
+# input; the tasks file must fail and never leave a wrong file trusted.
+- name: Place a wrong file
+  vars:
+    pinned: "{{ case }}"
+  block:
+    - name: Run the pinned-file tasks
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/pinned-file.yml
+    - name: Not reached
+      ansible.builtin.fail:
+        msg: "a wrong file was accepted: {{ case.name }}"
+  rescue:
+    - name: Refused by the download checksum or by the on-disk re-hash
+      ansible.builtin.assert:
+        that:
+          - not ((case.dest ~ '') is file) or (lookup('file', case.dest) == 'public cert')
+          - ansible_failed_task.name is search('Refuse .*(unless it is|that is not) the pinned file|Say why .* could not be placed')
