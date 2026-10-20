@@ -448,6 +448,37 @@ class MinerCapacity(models.Model):
         return f"MinerCapacity {self.miner_node_id} ({self.status})"
 
 
+class FamilyStorageState(models.Model):
+    """One compute family's storage, as of the last successful chain read
+    (`apps.scheduler.storage_requirement.refresh`).
+
+    - `compute_node_ids`: the family's Active compute nodes (64-hex list) —
+      the nodes the storage gate acts on.
+    - `storage_counted`: its healthy Arion storage nodes at that read;
+      `has_storage` = at least the required number.
+    - `storage_detail`: every Arion child of the family and why it did or
+      did not count (operator readout only).
+    - `last_healthy_at`: the last read that found it with storage — the
+      grace clock. NULL = never seen with storage: no grace.
+    """
+
+    family = models.CharField(max_length=64, primary_key=True)
+    compute_node_ids = models.JSONField(default=list)
+    storage_counted = models.PositiveIntegerField(default=0)
+    has_storage = models.BooleanField(default=False)
+    storage_detail = models.JSONField(default=list)
+    last_healthy_at = models.DateTimeField(null=True, blank=True, default=None)
+    first_seen_at = models.DateTimeField()
+    refreshed_at = models.DateTimeField()
+    block_hash = models.CharField(max_length=66, blank=True, default="")
+
+    class Meta:
+        ordering = ["family"]
+
+    def __str__(self) -> str:
+        return f"FamilyStorageState {self.family[:12]} storage={self.storage_counted}"
+
+
 class MinerCapacityAudit(models.Model):
     """One change to one capacity-policy field of one `MinerCapacity`.
 

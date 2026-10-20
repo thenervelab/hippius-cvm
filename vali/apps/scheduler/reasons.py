@@ -82,6 +82,9 @@ REASON_MEASUREMENT_STALE = "measurement-stale"
 #: An `attested` row on a desired measurement whose last beacon is outside
 #: the liveness window (or that never beaconed).
 REASON_ATTESTOR_STALE = "attestor-stale"
+#: The node's family runs no healthy Arion storage node
+#: (`apps.scheduler.storage_requirement`): no new work, no reward.
+REASON_NO_STORAGE = "no-storage"
 
 # ─── launch-time refusals (`launch._fail_placement`) ────────────────────
 #
@@ -119,6 +122,7 @@ SCHEDULABLE_REASONS: frozenset[str] = frozenset(
         REASON_CERT_EXPIRED,
         REASON_MEASUREMENT_STALE,
         REASON_ATTESTOR_STALE,
+        REASON_NO_STORAGE,
     }
 )
 

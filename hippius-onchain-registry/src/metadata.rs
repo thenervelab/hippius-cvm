@@ -223,12 +223,16 @@ fn utf8(bytes: &[u8]) -> Result<String, RegistryError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| malformed("non-UTF-8 name"))
 }
 
-/// The storage section of `pallet` in `metadata` (v14 / v15): `Ok(None)`
-/// when the runtime has no such pallet or it has no storage.
-pub fn pallet_storage(
-    metadata: &[u8],
-    pallet: &str,
-) -> Result<Option<PalletStorage>, RegistryError> {
+/// One pallet as the runtime metadata lists it: its storage section (if
+/// any) and its constants (`name`, SCALE-encoded value).
+struct PalletEntry {
+    storage: Option<PalletStorage>,
+    constants: Vec<(String, Vec<u8>)>,
+}
+
+/// Walk `metadata` (v14 / v15) to the pallet named `pallet`: `Ok(None)`
+/// when the runtime has no such pallet.
+fn pallet_entry(metadata: &[u8], pallet: &str) -> Result<Option<PalletEntry>, RegistryError> {
     let mut cur = Cursor { bytes: metadata };
     if cur.take(4)? != b"meta" {
         return Err(RegistryError::new(
@@ -254,25 +258,55 @@ pub fn pallet_storage(
         };
         cur.option_compact()?; // calls
         cur.option_compact()?; // event
+        let mine = name == pallet.as_bytes();
+        let mut constants = Vec::new();
         for _ in 0..cur.len()? {
-            cur.string()?; // name
+            let const_name = cur.string()?;
             cur.compact()?; // ty
-            cur.bytes_vec()?; // value
+            let value = cur.bytes_vec()?;
             cur.strings()?; // docs
+            if mine {
+                constants.push((utf8(const_name)?, value.to_vec()));
+            }
         }
         cur.option_compact()?; // error
         cur.u8()?; // index
         if version == 15 {
             cur.strings()?; // docs
         }
-        if name == pallet.as_bytes() {
+        if mine {
             if found.is_some() {
                 return Err(malformed("pallet listed twice"));
             }
-            found = Some(storage);
+            found = Some(PalletEntry { storage, constants });
         }
     }
-    Ok(found.flatten())
+    Ok(found)
+}
+
+/// The storage section of `pallet` in `metadata` (v14 / v15): `Ok(None)`
+/// when the runtime has no such pallet or it has no storage.
+pub fn pallet_storage(
+    metadata: &[u8],
+    pallet: &str,
+) -> Result<Option<PalletStorage>, RegistryError> {
+    Ok(pallet_entry(metadata, pallet)?.and_then(|p| p.storage))
+}
+
+/// The SCALE-encoded value of `pallet`'s constant `name` (a
+/// `#[pallet::constant]`): `Ok(None)` when the runtime has no such pallet
+/// or the pallet no such constant.
+pub fn pallet_constant(
+    metadata: &[u8],
+    pallet: &str,
+    name: &str,
+) -> Result<Option<Vec<u8>>, RegistryError> {
+    Ok(pallet_entry(metadata, pallet)?.and_then(|p| {
+        p.constants
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value)
+    }))
 }
 
 #[cfg(test)]
@@ -373,6 +407,15 @@ pub(crate) mod tests {
     }
 
     fn pallet(version: u8, name: &str, storage: Option<(&str, Vec<Vec<u8>>)>) -> Vec<u8> {
+        pallet_with(version, name, storage, &[("Max", vec![4u8])])
+    }
+
+    fn pallet_with(
+        version: u8,
+        name: &str,
+        storage: Option<(&str, Vec<Vec<u8>>)>,
+        constants: &[(&str, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut out = s(name);
         match storage {
             None => out.push(0),
@@ -384,9 +427,12 @@ pub(crate) mod tests {
         }
         out.extend([vec![1], c(1)].concat()); // calls
         out.push(0); // event
-        out.extend(vec_of(&[
-            [s("Max"), c(0), vec![4u8].encode(), docs(&[])].concat()
-        ]));
+        out.extend(vec_of(
+            &constants
+                .iter()
+                .map(|(n, v)| [s(n), c(0), v.encode(), docs(&[])].concat())
+                .collect::<Vec<_>>(),
+        ));
         out.extend([vec![1], c(2)].concat()); // error
         out.push(7); // index
         if version == 15 {
@@ -428,6 +474,52 @@ pub(crate) mod tests {
                     )),
                 ),
                 pallet(version, "Balances", None),
+            ],
+        )
+    }
+
+    /// `live` plus an `Arion` pallet with every map the storage read uses,
+    /// `CurrentWeightBucket`, and `StaleChildBuckets = stale` — or, with
+    /// `drop`, one of those (map, value or constant) missing.
+    pub(crate) fn with_arion(version: u8, stale: u32, drop: Option<&str>) -> Vec<u8> {
+        let maps = [
+            "FamilyChildren",
+            "ChildRegistrations",
+            "NodeWeightByChild",
+            "NodeWeightLastBucket",
+            "NodeQualityByChild",
+        ];
+        let mut entries: Vec<Vec<u8>> = maps
+            .iter()
+            .filter(|m| Some(**m) != drop)
+            .map(|m| entry(m, Some(&[BLAKE2_128_CONCAT])))
+            .collect();
+        if drop != Some("CurrentWeightBucket") {
+            entries.push(entry("CurrentWeightBucket", None));
+        }
+        let constants: Vec<(&str, Vec<u8>)> = if drop == Some("StaleChildBuckets") {
+            vec![("MaxChildrenPerFamily", 8u32.to_le_bytes().to_vec())]
+        } else {
+            vec![
+                ("MaxChildrenPerFamily", 8u32.to_le_bytes().to_vec()),
+                ("StaleChildBuckets", stale.to_le_bytes().to_vec()),
+            ]
+        };
+        metadata(
+            version,
+            &[
+                pallet(
+                    version,
+                    "ComputeScoring",
+                    Some((
+                        "ComputeScoring",
+                        vec![
+                            entry("ChildRegistrations", Some(&[BLAKE2_128_CONCAT])),
+                            entry("NodeIdToChild", Some(&[BLAKE2_128_CONCAT])),
+                        ],
+                    )),
+                ),
+                pallet_with(version, "Arion", Some(("Arion", entries)), &constants),
             ],
         )
     }
@@ -526,6 +618,27 @@ pub(crate) mod tests {
             );
             assert_eq!(pallet_storage(&live(version), "Balances").unwrap(), None);
             assert_eq!(pallet_storage(&live(version), "Nope").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn reads_a_pallets_constant() {
+        for version in [14, 15] {
+            let meta = live(version);
+            assert_eq!(
+                pallet_constant(&meta, "ComputeScoring", "Max").unwrap(),
+                Some(vec![4])
+            );
+            assert_eq!(
+                pallet_constant(&meta, "ComputeScoring", "Min").unwrap(),
+                None
+            );
+            // A pallet with no storage still lists its constants.
+            assert_eq!(
+                pallet_constant(&meta, "Balances", "Max").unwrap(),
+                Some(vec![4])
+            );
+            assert_eq!(pallet_constant(&meta, "Nope", "Max").unwrap(), None);
         }
     }
 

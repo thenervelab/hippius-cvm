@@ -63,7 +63,7 @@ from apps.network.models import PublicIP, PublicIpState
 from apps.orchestration.effects import EffectError
 from apps.orchestration.services import flavors
 from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
-from apps.scheduler import capacity_config, chain, cvm_capability, scoring
+from apps.scheduler import capacity_config, chain, cvm_capability, scoring, storage_requirement
 from apps.scheduler import service as scheduler_service
 from apps.scheduler.approval import held_back
 from apps.scheduler.capacity import DISK_GATE_OFF, DISK_UNKNOWN, HostBudget
@@ -74,6 +74,7 @@ from apps.scheduler.models import (
     UsageAccrual,
 )
 from apps.scheduler.placement import MINER_ACTIVE
+from apps.scheduler.reasons import REASON_NO_STORAGE
 from apps.telemetry import guest_resources, release_service
 from apps.telemetry.models import HostAttestor, HostAttestorRelease
 
@@ -748,6 +749,7 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
     backups = _backups_by_miner(now - BACKUP_WINDOW)
     backup_attention = _backup_attention(now)
     zombies = _zombies_by_node(now)
+    no_storage = storage_requirement.denied_node_ids(now=now)
     shortfalls = guest_resources.flagged(now)
     disk_health = _disk_health_by_node(now)
     public_ips = dict(
@@ -797,6 +799,7 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
                     backup_attention,
                 ),
                 zombie=zombies.get(nid),
+                no_storage=nid in no_storage,
                 disk_health=disk_health.get(nid),
                 public_ips=public_ips,
                 shortfalls=shortfalls,
@@ -908,6 +911,7 @@ def _row(
     view: scheduler_service.CapacityView | None = None,
     budget: HostBudget | None = None,
     disk_health: dict[str, Any] | None = None,
+    no_storage: bool = False,
 ) -> dict[str, Any]:
     last_seen = miner.last_seen_at if miner is not None else None
     location: MinerLocation | None = _location_of(miner) if miner is not None else None
@@ -1077,6 +1081,7 @@ def _row(
         capacity_visible=mirror is None
         or mirror.miner_node_id == (chain_view.node_id if chain_view is not None else nid),
         cordoned=mirror is not None and held_back(mirror),
+        no_storage=no_storage,
     )
 
     return {
@@ -1138,6 +1143,7 @@ def _placement_verdict(
     cap: dict[str, Any] | None,
     capacity_visible: bool = True,
     cordoned: bool = False,
+    no_storage: bool = False,
 ) -> tuple[bool, str | None]:
     """Could `decide_placement` choose this node right now? Its hard gates
     in its own order (`apps.scheduler.placement`); the first one failed is
@@ -1162,6 +1168,10 @@ def _placement_verdict(
         return False, "cvm-incapable"
     if cap is None or not capacity_visible:
         return False, "no-capacity-record"
+    # The storage requirement rides the cordon gate too, but is named: the
+    # backend dashboard tells the family to add a storage node.
+    if no_storage:
+        return False, REASON_NO_STORAGE
     # Gate (h), the operator cordon (or a pending approval, which rides the
     # same gate): no new placement, so not schedulable.
     # Reported as the existing `full` ("takes nothing now") rather than a

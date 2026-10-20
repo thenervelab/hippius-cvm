@@ -38,6 +38,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod backup;
+pub mod coldkey_registration;
 pub mod config;
 pub mod edge_client;
 pub mod error;

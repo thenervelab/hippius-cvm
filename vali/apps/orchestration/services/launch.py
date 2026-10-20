@@ -3091,6 +3091,12 @@ def _refuse_cordoned_miner(miner: MinerIdentity) -> None:
     from apps.scheduler import service as sched
 
     reason = sched.miner_cordon_reason(miner.miner_id)
+    if reason == "no-storage":
+        raise LaunchConfigError(
+            f"miner {miner.miner_id!r} takes no new VM: its family runs no healthy "
+            "Arion storage node (add one, or list the family in "
+            "VALI_COMPUTE_STORAGE_EXEMPT_FAMILIES)"
+        )
     if reason is not None:
         raise LaunchConfigError(
             f"miner {miner.miner_id!r} is cordoned ({reason or 'no reason given'}) — "

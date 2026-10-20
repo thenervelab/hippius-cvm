@@ -62,8 +62,9 @@ pub enum MinerAgentError {
     #[error("identity-cert/{0}")]
     IdentityCert(&'static str),
 
-    /// A `sign-registration` CLI argument was malformed (a family /
-    /// child AccountId that was not 32 bytes of hex).
+    /// A `sign-registration` / `sign-coldkey-registration` argument was
+    /// malformed or refused (a family / child AccountId that was not 32
+    /// bytes of hex, or a register challenge that failed a check).
     #[error("registration-arg/{0}")]
     RegistrationArg(&'static str),
 

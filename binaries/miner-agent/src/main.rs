@@ -9,6 +9,9 @@
 //! - `launch-test` — manually provision + launch one tenant SEV-SNP
 //!   CVM via libvirt (or, with `--digest-only`, just compute the
 //!   pre-flight launch digest — MA-3);
+//! - `sign-coldkey-registration` — offline, on a storage host: sign an
+//!   Arion node's `register_node_with_coldkey` challenge (and its
+//!   `register_child` message) with Arion's `keypair.bin`;
 //! - `serve` — the long-running daemon (MA-4 + MA-5 + MA-6): the
 //!   AF_VSOCK guest relay, the signed-order HTTP server, and the §K
 //!   signed-heartbeat subsystem, with an ordered graceful shutdown.
@@ -32,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use hippius_image_provenance::store::HippiusS3ImageStore;
+use hippius_miner_agent::coldkey_registration;
 use hippius_miner_agent::config::EdgeCliFlags;
 use hippius_miner_agent::heartbeat::{CapacityDeclarer, DiskDeclarer, StatvfsDiskSource};
 use hippius_miner_agent::orders::{IdempotencyStore, OrderState, OrderVerifier, OrdersServer};
@@ -151,6 +155,36 @@ enum Command {
         /// registration; bump on re-registration after a cooldown).
         #[arg(long, default_value_t = 0)]
         nonce: u64,
+    },
+    /// Sign an Arion storage node's on-chain onboarding, offline, on
+    /// the operator's STORAGE host. Reads Arion's `keypair.bin` (32 raw
+    /// Ed25519 seed bytes) and signs the 200-byte `HIPPIUS::REGISTER::v1`
+    /// challenge the provider dashboard built for
+    /// `register_node_with_coldkey` — refused unless it names THIS
+    /// node and (by default) mainnet. With `--family --child --nonce`
+    /// it also signs the `ARION_NODE_REG_V1` message for the Arion
+    /// pallet's `register_child`. One JSON object on stdout. Never
+    /// touches the network, the chain, or the key file.
+    SignColdkeyRegistration {
+        /// Arion node keypair (32 raw bytes). Only read.
+        #[arg(long, default_value = "/var/lib/hippius/miner/data/miner/keypair.bin")]
+        keypair: PathBuf,
+        /// SCALE `RegisterChallenge` from the dashboard, `0x`-hex (200
+        /// bytes).
+        #[arg(long)]
+        challenge: String,
+        /// Family account for Arion `register_child`, `0x`-hex.
+        #[arg(long)]
+        family: Option<String>,
+        /// Storage child account for Arion `register_child`, `0x`-hex.
+        #[arg(long)]
+        child: Option<String>,
+        /// Arion `NodeIdNonce` for this node id.
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Sign a challenge for a chain other than Hippius mainnet.
+        #[arg(long)]
+        allow_any_genesis: bool,
     },
     /// Print this host's SEV-SNP CPU-unique CHIP_ID (the 64-byte AMD
     /// platform identifier) as lowercase hex. This is the `platform_id`
@@ -408,6 +442,21 @@ fn run() -> Result<()> {
             child,
             nonce,
         } => cmd_sign_registration(&key_path, &pub_path, &family, &child, nonce),
+        Command::SignColdkeyRegistration {
+            keypair,
+            challenge,
+            family,
+            child,
+            nonce,
+            allow_any_genesis,
+        } => cmd_sign_coldkey_registration(
+            &keypair,
+            &challenge,
+            family.as_deref(),
+            child.as_deref(),
+            nonce,
+            allow_any_genesis,
+        ),
         Command::PlatformId => cmd_platform_id(),
         Command::RequestGracefulExit {
             config,
@@ -855,6 +904,28 @@ fn cmd_sign_registration(
         hex::encode(sig.to_bytes()),
         nonce
     );
+    Ok(())
+}
+
+/// `sign-coldkey-registration` — sign an Arion node's coldkey
+/// registration challenge (+ optionally its `register_child` message).
+fn cmd_sign_coldkey_registration(
+    keypair: &Path,
+    challenge: &str,
+    family: Option<&str>,
+    child: Option<&str>,
+    nonce: Option<u64>,
+    allow_any_genesis: bool,
+) -> Result<()> {
+    // Argument checks first: a malformed command never opens the key.
+    let arion = coldkey_registration::arion_args(family, child, nonce)?;
+    let key = coldkey_registration::load_arion_keypair(keypair)?;
+    let out =
+        coldkey_registration::sign_coldkey_registration(&key, challenge, arion, allow_any_genesis)?;
+    // Only public values: keys, peer id, signatures, echoed inputs.
+    let json =
+        serde_json::to_string(&out).map_err(|_| MinerAgentError::RegistrationArg("output-json"))?;
+    println!("{json}");
     Ok(())
 }
 
