@@ -17,6 +17,10 @@
       - qemu-utils              # qemu-img and friends
       - ovmf                    # UEFI firmware — required for CVMs
       - virtinst                # virt-install / domain provisioning
+      # The `default` network's DHCP/DNS. Only a Recommends of
+      # libvirt-daemon-system: on a host that skips recommends, every
+      # `virsh net-start default` fails, and with it every tenant NIC.
+      - dnsmasq-base
     state: present
     update_cache: true
     cache_valid_time: 3600

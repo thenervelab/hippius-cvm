@@ -31,6 +31,7 @@ from typing import Any
 
 from django.conf import settings
 
+from apps.miners import launch_errors
 from apps.orchestration import order_dispatch
 from apps.orchestration.effects import EffectError, EffectUnavailable
 
@@ -213,11 +214,18 @@ class PreflightRejected(EffectError):
 
     `classifier` is that class (`insufficient-resources`, …) — the miner's
     closed vocabulary, used only to classify vali's OWN reaction (never
-    persisted or trusted as a statement about another miner)."""
+    persisted or trusted as a statement about another miner). `status` is
+    the answer's HTTP status and `reason` the miner's finer code
+    (`DispatchResult.reason`), both only ever recorded through
+    `apps.miners.launch_errors`."""
 
-    def __init__(self, message: str, *, classifier: str) -> None:
+    def __init__(
+        self, message: str, *, classifier: str, status: int = 0, reason: str = ""
+    ) -> None:
         super().__init__(message)
         self.classifier = classifier
+        self.status = status
+        self.reason = reason
 
 
 def dispatch_preflight(
@@ -291,8 +299,10 @@ def dispatch_preflight(
     if not result.ok:
         raise PreflightRejected(
             f"preflight-dispatch: miner-rejected status={result.status} "
-            f"classifier={result.classifier!r}",
+            f"classifier={launch_errors.printable(result.classifier, 120)!r}",
             classifier=result.classifier,
+            status=result.status,
+            reason=result.reason,
         )
 
     return _parse_preflight_response(result.classifier)

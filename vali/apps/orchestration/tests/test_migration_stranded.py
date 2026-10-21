@@ -888,7 +888,9 @@ def test_dispatch_migrate_activate_passes_settle_by_to_the_payload(
     assert built[0]["settle_by_unix"] == 1_790_000_000
     # A4b: the dest's pool reaches the body (`effects._arrival_os_pool`).
     assert built[0]["os_pool"] is None
-    monkeypatch.setattr(effects, "_arrival_os_pool", lambda miner_id, cmdline: "nvme0")
+    monkeypatch.setattr(
+        effects, "_arrival_os_pool", lambda miner_id, cmdline, tier="nvme": "nvme0"
+    )
     fx.real["dispatch_migrate_activate"](
         vm,
         dest_node_id="node-dst",

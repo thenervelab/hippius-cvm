@@ -135,14 +135,17 @@ jobs:
       # after play 00 and its placeholder refusal, the pinned public-file
       # placement (CA certs, host-attestor files) against a file:// store
       # in a scratch dir, play 05's miner-agent binary install against a
-      # stub updater, plus the play's syntax.
-      - name: ansible miner play (preflight, NetBird mesh IP, registration JSON, placeholders, pinned files, agent binary, disk budget, host inventory units)
+      # stub updater, play 09's tenant-launch preflight (verdict filter,
+      # then its probe script against stub virsh / systemd tools), plus
+      # the play's syntax.
+      - name: ansible miner play (preflight, NetBird mesh IP, registration JSON, placeholders, pinned files, agent binary, disk budget, host inventory units, launch preflight)
         working-directory: deploy/ansible
         env:
           ANSIBLE_STDOUT_CALLBACK: default
           ANSIBLE_FILTER_PLUGINS: playbooks/filter_plugins
         run: |
           python3 tests/test_host_preflight.py
+          python3 tests/test_launch_preflight.py
           python3 -m venv /tmp/ansible-venv
           /tmp/ansible-venv/bin/pip install -q 'ansible-core>=2.16,<2.22'
           /tmp/ansible-venv/bin/ansible-galaxy collection install -r requirements.yml
@@ -158,13 +161,15 @@ jobs:
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/miner_agent_binary_check_mode.yml --check
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/disk_budget_wiring.yml
           /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/host_inventory_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/launch_preflight_wiring.yml
+          /tmp/ansible-venv/bin/ansible-playbook -i localhost, -c local tests/launch_preflight_check_mode.yml --check
       # Miner-agent auto-update: the updater against a mocked GitHub API,
       # cosign, systemd and journald. Its systemctl mock fails any
       # stop/restart (a graceful stop destroys every domain on a miner).
       - name: miner-agent auto-update
         run: |
           sudo apt-get install -y -q shellcheck
-          shellcheck -S warning deploy/ansible/playbooks/miner-tasks/files/hippius-miner-update.sh scripts/dev/miner-update-test.sh scripts/release/build-miner-agent.sh
+          shellcheck -S warning deploy/ansible/playbooks/miner-tasks/files/hippius-miner-update.sh deploy/ansible/playbooks/miner-tasks/files/launch-preflight-probe.sh scripts/dev/miner-update-test.sh scripts/release/build-miner-agent.sh
           bash scripts/dev/miner-update-test.sh
       # Multi-OS bake dispatch: shellcheck the bake script + diff the
       # per-distro `--print-plan` decisions against the committed golden
@@ -788,6 +793,9 @@ jobs:
       - name: cargo audit (RustSec advisory gate)
         # Reads .cargo/audit.toml for the documented `ignore` allow-list.
         run: cargo audit
+      - name: webpki-roots 1.x floor (keeps the RUSTSEC-2026-0381 ignore sound)
+        # The ignore covers only the 0.26.11 shim over 1.x (#1721).
+        run: scripts/ci/check-webpki-roots-floor.sh
       - name: No QUIC stack compiled in (attack-surface gate)
         # quinn sits in Cargo.lock through a weak reqwest feature without
         # being built; this reads the resolved build graph (#1592).

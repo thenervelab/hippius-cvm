@@ -678,6 +678,51 @@ def _reject_disk_full_dest(vm: Vm, dest_node_id: str) -> None:
         )
 
 
+def _reject_disk_tier_dest(vm: Vm, dest_node_id: str) -> None:
+    """Refuse an EXPLICIT destination with no OS pool at the VM's sold
+    disk tier, under `VALI_SCHEDULER_DISK_TIER_GATE=enforce` (record: logged
+    and allowed; off: nothing) — gate (n) of `decide_placement`, which the
+    API / CLI bypass by naming the destination."""
+    from apps.disktier import os_tier
+    from apps.miners.models import MinerIdentity
+    from apps.scheduler import service as sched
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES, Placement
+
+    mode = os_tier.gate_mode()
+    if mode == os_tier.GATE_OFF:
+        return
+    chain_node_id = (
+        MinerIdentity.objects.filter(miner_id=dest_node_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+        or ""
+    )
+    if not chain_node_id:
+        return  # nothing vali knows of the host — the miner's own gate decides
+    row = (
+        Placement.objects.filter(vm=vm, status__in=ACTIVE_PLACEMENT_STATES)
+        .values_list("resource_class", "data_disk_gb")
+        .first()
+    )
+    need_gb = sched.placement_disk_gb(row[0], row[1]) if row is not None else 0
+    tier = os_tier.launch_tier(vm.vm_id)
+    reason = os_tier.refusal(chain_node_id, tier, need_gb)
+    if not reason:
+        return
+    if mode == os_tier.GATE_RECORD:
+        log.info(
+            "disk-tier gate would refuse destination %s for vm=%s: %s",
+            dest_node_id,
+            vm.vm_id,
+            reason,
+        )
+        return
+    raise StartError(
+        f"destination {dest_node_id!r} holds no OS disk at the vm's tier {tier} ({reason})",
+        os_tier.CATEGORY_NO_MINER_AT_TIER,
+    )
+
+
 def start_migration(
     *,
     vm: Vm,
@@ -798,6 +843,7 @@ def start_migration(
     _reject_cdn_colocated_dest(vm, dest_node_id)
     _reject_group_colocated_dest(vm, dest_node_id)
     _reject_disk_full_dest(vm, dest_node_id)
+    _reject_disk_tier_dest(vm, dest_node_id)
     # §24/§25 GAP-3 — the EOL nonce is NOT (re-)minted for a migration.
     # For a COLD migration the source guest signs its `stopped{}` ack from
     # its ALREADY-BAKED, MEASURED cmdline (`hippius.eol_nonce`), which
@@ -1599,6 +1645,8 @@ def enroll_departing_miner_migrations(
                 max_family_per_node=sched.cdn_family_cap(placement.vm_family),
                 **sched.cdn_edge_arguments(placement.vm_family, vm.vm_id),
                 **sched.group_arguments(vm.vm_id),
+                # Gate (n) — an OS pool at the VM's disk tier.
+                **sched.disk_tier_arguments(placement.resource_class, vm_id=vm.vm_id),
                 # No gate (m): a `require_failover_peer` VM leaving a
                 # departing miner moves in-region even without a peer, rather
                 # than staying stranded (logged below; its policy then reads

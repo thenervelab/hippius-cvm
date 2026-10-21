@@ -1,0 +1,67 @@
+---
+# --check half of the launch-preflight wiring test (run WITH --check): a
+# broken host is previewed, never refused, and the real probe script runs
+# its read-only half only — no scratch file, no smoke domain.
+#
+# Run (from deploy/ansible):
+#   ANSIBLE_FILTER_PLUGINS=playbooks/filter_plugins \
+#     ansible-playbook -i localhost, -c local tests/launch_preflight_check_mode.yml --check
+
+- name: Tenant-launch preflight under --check
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+    - launch_preflight_stubs.yml
+  tasks:
+    - name: This file only means something under --check
+      ansible.builtin.assert:
+        that: ansible_check_mode
+
+    - name: A broken host is previewed, not refused
+      vars:
+        miner_launch_probe_canned: "{{ good_probe | replace('nwfilter_clean_traffic=1', 'nwfilter_clean_traffic=0') }}"
+      block:
+        - name: Run the launch preflight on the broken host
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+
+    - name: The finding is there, the run went on
+      ansible.builtin.assert:
+        that:
+          - miner_lpf.summary.failures == ['LIBVIRT_NWFILTER_MISSING']
+
+    - name: Stage the scratch tree and the stub host tools
+      ansible.builtin.import_tasks: launch_preflight_stage.yml
+
+    - name: The real probe script under --check
+      environment:
+        PATH: "{{ scratch }}/bin:{{ lookup('env', 'PATH') }}"
+        FAKE_DIR: "{{ scratch }}"
+      vars:
+        miner_launch_probe_script: "{{ playbook_dir }}/../playbooks/miner-tasks/files/launch-preflight-probe.sh"
+        miner_data_disk_root: "{{ scratch }}/data"
+        miner_state_disk_root: "{{ scratch }}/data"
+        miner_agent:
+          state_dir: "{{ scratch }}/data"
+          systemd_unit_name: hippius-miner-agent
+          config_path: "{{ scratch }}/config.toml"
+      block:
+        - name: Run the launch preflight with the real probe
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+
+    - name: Only the read-only half ran
+      ansible.builtin.assert:
+        that:
+          - miner_lpf.summary.result == 'pass'
+          - miner_lpf.summary.smoke == 'skipped'
+          - "'config_data_root=' ~ scratch ~ '/data' in miner_launch_probe.stdout"
+          - "'sandbox_' not in miner_launch_probe.stdout"
+          - "'odirect_' not in miner_launch_probe.stdout"
+
+    - name: Remove the scratch tree
+      check_mode: false
+      ansible.builtin.file:
+        path: "{{ scratch }}"
+        state: absent

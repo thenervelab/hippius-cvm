@@ -379,6 +379,35 @@ pub struct MinerForwardResponse {
     pub status: u16,
     /// The miner's response body — relayed to vali verbatim.
     pub body: Vec<u8>,
+    /// The miner's [`REASON_HEADER`] — the failing step's static code
+    /// (`libvirt-driver/define`) — when it sent a well-formed one
+    /// ([`reason_from_headers`]). Relayed to vali as the same header.
+    pub reason: Option<String>,
+}
+
+/// Response header in which the miner-agent names the step that failed an
+/// order. Relayed to vali, which records it for the operator dashboard.
+pub const REASON_HEADER: &str = "x-hippius-reason";
+
+/// Longest [`REASON_HEADER`] relayed (the miner-agent's own bound).
+const MAX_REASON_LEN: usize = 128;
+
+/// The miner's [`REASON_HEADER`] if it is a code — `[a-z0-9][a-z0-9._:/-]*`,
+/// at most [`MAX_REASON_LEN`] bytes — and `None` otherwise. The value is
+/// miner-controlled: anything else is dropped, never reshaped, so the Edge
+/// relays nothing a code could not be.
+pub fn reason_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(REASON_HEADER)?.to_str().ok()?;
+    let bytes = value.as_bytes();
+    let ok = !bytes.is_empty()
+        && bytes.len() <= MAX_REASON_LEN
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')
+        });
+    ok.then(|| value.to_string())
 }
 
 /// Sign a CBOR `OrderBody` and POST `SignedOrder { body, sig }` to the
@@ -578,6 +607,7 @@ impl MinerForward for ReqwestMinerForward {
             .map_err(|_| MinerForwardError::Transport)?;
 
         let status = response.status().as_u16();
+        let reason = reason_from_headers(response.headers());
         // `content-length` is advisory — when present we can reject up
         // front; when absent (chunked / streaming peer) we MUST still
         // bound allocation, by reading chunks one at a time and
@@ -603,7 +633,11 @@ impl MinerForward for ReqwestMinerForward {
             body.extend_from_slice(&chunk);
         }
 
-        Ok(MinerForwardResponse { status, body })
+        Ok(MinerForwardResponse {
+            status,
+            body,
+            reason,
+        })
     }
 
     async fn forward_migration_status(
@@ -708,7 +742,11 @@ impl ReqwestMinerForward {
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(MinerForwardResponse { status, body })
+        Ok(MinerForwardResponse {
+            status,
+            body,
+            reason: None,
+        })
     }
 }
 
@@ -759,8 +797,18 @@ mod mock {
     impl MockMinerForward {
         /// A mock that returns `status` + `body` for every call.
         pub fn with_response(status: u16, body: Vec<u8>) -> Self {
+            Self::with_reason(status, body, None)
+        }
+
+        /// [`with_response`](Self::with_response), plus the miner's
+        /// [`REASON_HEADER`](super::REASON_HEADER) code.
+        pub fn with_reason(status: u16, body: Vec<u8>, reason: Option<String>) -> Self {
             Self {
-                outcome: Mutex::new(Ok(MinerForwardResponse { status, body })),
+                outcome: Mutex::new(Ok(MinerForwardResponse {
+                    status,
+                    body,
+                    reason,
+                })),
                 calls: Mutex::new(Vec::new()),
                 status_calls: Mutex::new(Vec::new()),
             }
@@ -1266,5 +1314,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MinerForwardError::Encode));
+    }
+
+    #[test]
+    fn only_a_well_formed_reason_code_is_kept() {
+        let with = |v: &str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                REASON_HEADER,
+                reqwest::header::HeaderValue::from_str(v).unwrap(),
+            );
+            reason_from_headers(&h)
+        };
+        assert_eq!(
+            with("libvirt-driver/define").as_deref(),
+            Some("libvirt-driver/define")
+        );
+        assert_eq!(
+            with("insufficient-disk:nvme0").as_deref(),
+            Some("insufficient-disk:nvme0")
+        );
+        let long = "a".repeat(MAX_REASON_LEN + 1);
+        for bad in ["", "Upper", "a b", "-x", "/var/lib/x", long.as_str()] {
+            assert_eq!(with(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            reason_from_headers(&reqwest::header::HeaderMap::new()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miner_reason_header_is_read_off_the_order_response() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::io::Write;
+
+        let app = axum::Router::new().route(
+            "/v1/miner/order/launch",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(REASON_HEADER, "libvirt-driver/define")],
+                    "dispatch-failed",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(hex::encode([42u8; 32]).as_bytes()).unwrap();
+        f.flush().unwrap();
+        let signer = OrderSigner::load(f.path(), None).unwrap();
+        let resp = ReqwestMinerForward::new()
+            .unwrap()
+            .forward_signed_order(&signer, addr, OrderKind::Launch, b"body")
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 500);
+        assert_eq!(resp.body, b"dispatch-failed");
+        assert_eq!(resp.reason.as_deref(), Some("libvirt-driver/define"));
     }
 }

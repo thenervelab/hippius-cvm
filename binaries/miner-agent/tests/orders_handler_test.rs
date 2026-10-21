@@ -401,6 +401,11 @@ fn signed_wire<T: Serialize>(
 
 /// Minimal HTTP/1.1 `POST` — returns `(status, body)`.
 async fn post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
+    parse_response(&post_raw(addr, path, body).await)
+}
+
+/// [`post`], returning the raw response bytes (status line + headers).
+async fn post_raw(addr: SocketAddr, path: &str, body: &[u8]) -> Vec<u8> {
     let fut = async {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let header = format!(
@@ -416,11 +421,9 @@ async fn post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
         stream.read_to_end(&mut resp).await.unwrap();
         resp
     };
-    parse_response(
-        &tokio::time::timeout(Duration::from_secs(10), fut)
-            .await
-            .expect("HTTP POST timed out"),
-    )
+    tokio::time::timeout(Duration::from_secs(10), fut)
+        .await
+        .expect("HTTP POST timed out")
 }
 
 /// Minimal HTTP/1.1 `GET` — returns `(status, body)`.
@@ -477,6 +480,40 @@ async fn a_signed_launch_order_is_dispatched_to_the_lifecycle() {
     let listed = lifecycle.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0.as_str(), "tenant-l1");
+}
+
+#[tokio::test]
+async fn a_refused_launch_names_the_failing_step_in_the_reason_header() {
+    let (addr, sk, _lifecycle) = spawn_server().await;
+    let mut order = launch_payload("tenant-reason-1");
+    order.cpu_count = 0;
+    let wire = signed_wire(&sk, "ord-reason-1", OrderKind::Launch, order);
+    let raw = post_raw(addr, "/v1/miner/order/launch", &wire).await;
+    let (status, body) = parse_response(&raw);
+    // The body class vali branches on is unchanged…
+    assert_eq!((status, body.as_str()), (422, "launch-input"));
+    // …and the header carries the step's own static code.
+    let head = String::from_utf8_lossy(&raw);
+    let head = head.split("\r\n\r\n").next().unwrap_or("");
+    let reason = head
+        .lines()
+        .find_map(|l| l.strip_prefix("x-hippius-reason: "))
+        .unwrap_or_else(|| panic!("no reason header in {head:?}"));
+    assert!(reason.starts_with("cvm-launch-input/"), "{reason}");
+}
+
+#[tokio::test]
+async fn an_accepted_launch_sends_no_reason_header() {
+    let (addr, sk, _lifecycle) = spawn_server().await;
+    let wire = signed_wire(
+        &sk,
+        "ord-reason-2",
+        OrderKind::Launch,
+        launch_payload("tenant-reason-2"),
+    );
+    let raw = post_raw(addr, "/v1/miner/order/launch", &wire).await;
+    assert_eq!(parse_response(&raw).0, 200);
+    assert!(!String::from_utf8_lossy(&raw).contains("x-hippius-reason"));
 }
 
 #[tokio::test]

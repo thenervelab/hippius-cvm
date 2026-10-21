@@ -176,6 +176,32 @@ class LaunchIntentSerializer(serializers.Serializer):
             "`GET /v1/operator/regions`."
         ),
     )
+    os_disk_tier = serializers.ChoiceField(
+        choices=["", "nvme", "ssd", "hdd"],
+        required=False,
+        default="",
+        help_text=(
+            "The OS disk's tier, a MINIMUM: the disk may land on a faster pool. "
+            "Absent or `\"\"` = `nvme`. Off the enum ⇒ 400 `disk-tier-invalid`; a "
+            "tier this validator does not sell (`VALI_SELLABLE_OS_TIERS`, nvme only by "
+            "default; `hdd` up to `VALI_HDD_OS_MAX_FLAVOR`) ⇒ 409 "
+            "`disk-tier-not-offered`. A launch no miner can take at the tier fails "
+            "with `no-miner-at-tier`. Fixed for the VM's life: every later placement "
+            "keeps it. Not measured."
+        ),
+    )
+    dedicated_disks = serializers.JSONField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "Reserved for whole physical disks passed to the VM (not sold yet): any "
+            "value but null ⇒ 409 `dedicated-disks-not-offered`."
+        ),
+    )
+    pinned_ack = serializers.BooleanField(
+        required=False,
+        help_text="Reserved, with `dedicated_disks`. Ignored.",
+    )
     max_price_per_unit = serializers.IntegerField(
         required=False,
         allow_null=True,

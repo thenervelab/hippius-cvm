@@ -32,6 +32,7 @@ from django.conf import settings
 from django.db import transaction
 
 from apps.disktier import ingest as disktier_ingest
+from apps.disktier import os_tier
 from apps.telemetry import service as telemetry
 from apps.telemetry import verifier
 from apps.telemetry.models import (
@@ -604,6 +605,12 @@ def _accrue_one(
 
         deg = min(max(fields.observed_degradation_bps, 0), _BPS_FULL)
         unit_seconds = units * billable * (_BPS_FULL - deg) // _BPS_FULL
+        # The VM's sold OS-disk tier (decision Q7), from vali's own binding;
+        # 10000 bps, so nothing changes, while `VALI_DISK_TIER_UNIT_FACTOR`
+        # is off.
+        factor_bps = os_tier.unit_factor_bps(binding.os_disk_tier)
+        if factor_bps != _BPS_FULL:
+            unit_seconds = unit_seconds * factor_bps // _BPS_FULL
 
         wm.last_period_end = max(wm.last_period_end, fields.period_end)
         wm.save(update_fields=[*seq_fields, "last_period_end"])

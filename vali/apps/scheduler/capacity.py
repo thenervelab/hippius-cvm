@@ -450,6 +450,19 @@ class BudgetInputs:
     committed_vms: int
 
 
+#: Where a host's v2 budget comes from (`HostBudget.source`):
+#: `trusted` — an `operator` row sized from its operator anchor;
+#: `declared+earned` — an `earned` row: what it has PROVEN (floor first),
+#: clamped by a hardware figure it declared (fresh) or an anchor;
+#: `earned` — an `earned` row with NO hardware figure at all: sized by
+#: proof alone (the floor for a new miner);
+#: `unknown` — vali cannot size it (an `operator` row with no anchor).
+SOURCE_TRUSTED = "trusted"
+SOURCE_DECLARED_EARNED = "declared+earned"
+SOURCE_EARNED = "earned"
+SOURCE_UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class HostBudget:
     """One host's v2 budget and what is free in it, in real units.
@@ -479,6 +492,9 @@ class HostBudget:
     #: budget, not applied — is exactly the pre-disk behaviour.
     disk: DiskBudget = field(default_factory=lambda: DISK_UNKNOWN)
     disk_gate: str = "off"
+    #: `SOURCE_*` — what the budget rests on. Informative only: nothing
+    #: decides on it (admission reads the numbers).
+    source: str = SOURCE_UNKNOWN
 
 
 _UNKNOWN = HostBudget(
@@ -573,7 +589,22 @@ def host_budget(inp: BudgetInputs) -> HostBudget:
         per_vm_overhead_mb=inp.per_vm_overhead_mb,
         over_claim=over_claim,
         binding=(vcpu_bind, mem_bind, vm_bind),
+        source=_source(inp, anchored=anchored, earned=earned),
     )
+
+
+def _source(inp: BudgetInputs, *, anchored: bool, earned: bool) -> str:
+    """`HostBudget.source` of a host [`host_budget`] could size."""
+    if not earned:
+        return SOURCE_TRUSTED
+    declared = (
+        inp.declared_cpu_budget,
+        inp.declared_memory_mb_budget,
+        inp.declared_asid_capacity,
+    )
+    if anchored or any(v is not None for v in declared):
+        return SOURCE_DECLARED_EARNED
+    return SOURCE_EARNED
 
 
 def fits(b: HostBudget, *, cpu_count: int, memory_mb: int, disk_gb: int = 0) -> bool:

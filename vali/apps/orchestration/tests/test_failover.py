@@ -349,6 +349,33 @@ def test_a_destination_without_disk_room_is_refused(world: _World, monkeypatch) 
     restore._validate_other_dest(vm, "node-dst", source="node-src")
 
 
+def test_a_destination_without_the_vms_disk_tier_is_refused(world: _World, monkeypatch) -> None:
+    """Gate (n) on the restore / failover destination: enforced, a host with
+    no OS pool at the tier the VM was sold at is not one."""
+    from django.test import override_settings
+
+    from apps.disktier.models import MinerStoragePool
+
+    monkeypatch.setattr(restore, "_validate_other_dest", _REAL_VALIDATE)
+    vm = _golden_vm()
+    MinerIdentity.objects.filter(miner_id="node-dst").update(chain_node_id="d" * 64)
+    monkeypatch.setattr(sched, "launch_region_for_vm", lambda vm_id: "FR")
+    monkeypatch.setattr(sched, "region_by_node", lambda **kw: {"d" * 64: "FR"})
+    monkeypatch.setattr(sched, "dispatchability", lambda m, **kw: sched.Dispatchability(True, None))
+    monkeypatch.setattr(
+        sched,
+        "host_resources_by_node",
+        lambda: {"d" * 64: sched.HostResources(64 * 1024, 8, 10**6, 64)},
+    )
+    MinerStoragePool.objects.create(
+        miner_node_id="d" * 64, pool_id="default", declared_class="hdd", os_disks=True
+    )
+    with override_settings(VALI_SCHEDULER_DISK_TIER_GATE="enforce"):
+        with pytest.raises(restore.RestoreError, match="tier nvme"):
+            restore._validate_other_dest(vm, "node-dst", source="node-src")
+    restore._validate_other_dest(vm, "node-dst", source="node-src")
+
+
 # ── the fence and the activation ─────────────────────────────────────
 
 

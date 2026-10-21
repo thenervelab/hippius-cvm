@@ -49,6 +49,17 @@
 # they stop updates, not the first install. No eligible release = exit 1.
 # Messages also go to stderr; stdout is the installed tag.
 #
+# `--tag <tag>` (play 05's `miner_agent_version`, one-shot) installs exactly
+# that release instead of selecting one: read from the releases/tags/<tag>
+# endpoint, with the same three checks, no soak, never a tag marked failed,
+# never below the installed release (the same tag as installed-release may
+# be installed again). With --install it is the first install above.
+# Without, it is an update: the same preflight, SIGKILL swap, health check
+# and rollback as a timer run, and nothing at all when the binary already
+# reports <tag>. The opt-outs of step 1 do not apply to an explicit tag;
+# auto-update.env is not touched. Messages also go to stderr; stdout is the
+# tag.
+#
 # Release tags are `vYYYY.MM.DD` or `vYYYY.MM.DD.N` (N = 1..999, a second
 # release the same day). They compare as the integer tuple
 # (YYYY, MM, DD, N), with N = 0 when absent: v2026.10.08 < v2026.10.08.1
@@ -70,6 +81,8 @@ STATE_DIR="${MINER_STATE_DIR:-/var/lib/hippius-miner}"
 MINER_CONFIG="${MINER_CONFIG:-/etc/hippius-miner/config.toml}"
 RELEASE_REPO="${RELEASE_REPO:-thenervelab/hippius-cvm}"
 RELEASES_API="${RELEASES_API:-https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=20}"
+# One release by tag (`--tag`): <RELEASE_TAG_API>/<tag>.
+RELEASE_TAG_API="${RELEASE_TAG_API:-https://api.github.com/repos/${RELEASE_REPO}/releases/tags}"
 ASSET_NAME="${ASSET_NAME:-hippius-miner-agent-x86_64-linux-gnu}"
 MIN_RELEASE_AGE_H="${MIN_RELEASE_AGE_H:-24}"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-300}"
@@ -78,8 +91,11 @@ POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 COSIGN_BIN="${COSIGN_BIN:-/usr/local/libexec/hippius-miner/cosign}"
 CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
 AUTO_UPDATE_DISABLED="${AUTO_UPDATE_DISABLED:-false}"
-# true for `--install` (set by main).
+# Set by main: true for `--install`; the release asked for with `--tag`;
+# true for any argument (an operator run: messages also on stderr).
 INSTALL_MODE=false
+PIN_TAG=""
+INTERACTIVE=false
 export TUF_ROOT="${TUF_ROOT:-${STATE_DIR}/sigstore-tuf}"
 
 # Not configurable: the attestation must come from GitHub Actions, from the
@@ -103,11 +119,12 @@ BACKUP_PATH="${BINARY_PATH}.bak"
 LOG_TAG="hippius-miner-update"
 
 # Fallbacks go to stderr: stdout of some functions is captured (a PID).
-# With --install every message also goes to stderr, where play 05 shows it.
+# With --install or --tag every message also goes to stderr, where play 05
+# shows it.
 emit() { # <priority> <message>
-    if [ "$INSTALL_MODE" = true ]; then printf '[%s] %s\n' "$LOG_TAG" "$2" >&2; fi
+    if [ "$INTERACTIVE" = true ]; then printf '[%s] %s\n' "$LOG_TAG" "$2" >&2; fi
     printf '%s\n' "$2" | systemd-cat -t "$LOG_TAG" -p "$1" 2>/dev/null \
-        || [ "$INSTALL_MODE" = true ] || printf '[%s] %s\n' "$LOG_TAG" "$2" >&2
+        || [ "$INTERACTIVE" = true ] || printf '[%s] %s\n' "$LOG_TAG" "$2" >&2
 }
 log() { emit info "$*"; }
 warn() { emit warning "WARNING: $*"; }
@@ -399,16 +416,26 @@ resume_interrupted() {
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    case "$*" in
-        "") ;;
-        --install) INSTALL_MODE=true ;;
-        *) die "usage: hippius-miner-update [--install]" ;;
-    esac
-    if [ "$INSTALL_MODE" = false ] && [ -f "$NO_UPDATE_FLAG" ]; then
+    local usage="usage: hippius-miner-update [--install] [--tag vYYYY.MM.DD[.N]]"
+    # Any argument = an operator run (the timer passes none).
+    [ $# -eq 0 ] || INTERACTIVE=true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --install) INSTALL_MODE=true; shift ;;
+            --tag)
+                [ $# -ge 2 ] && [ -z "$PIN_TAG" ] || die "$usage"
+                valid_tag "$2" || die "--tag '$2' is not vYYYY.MM.DD[.N]; refusing"
+                PIN_TAG="$2"
+                shift 2 ;;
+            *) die "$usage" ;;
+        esac
+    done
+    # The opt-outs stop the timer's runs, not an operator's.
+    if [ "$INTERACTIVE" = false ] && [ -f "$NO_UPDATE_FLAG" ]; then
         log "auto-update disabled ($NO_UPDATE_FLAG present)"
         exit 0
     fi
-    if [ "$INSTALL_MODE" = false ] && [ "$AUTO_UPDATE_DISABLED" = true ]; then
+    if [ "$INTERACTIVE" = false ] && [ "$AUTO_UPDATE_DISABLED" = true ]; then
         log "auto-update disabled (AUTO_UPDATE_DISABLED=true in $ENV_FILE)"
         exit 0
     fi
@@ -424,14 +451,16 @@ main() {
     mkdir -p "$STATE_DIR"
     exec 9>"${STATE_DIR}/.update.lock"
     if ! flock -n 9; then
-        [ "$INSTALL_MODE" = false ] || die "an update run holds ${STATE_DIR}/.update.lock; nothing installed, try again once it is done"
+        [ "$INTERACTIVE" = false ] || die "an update run holds ${STATE_DIR}/.update.lock; nothing installed, try again once it is done"
         log "another update run holds the lock; exiting"
         exit 0
     fi
     rm -f -- "$KILLED_FLAG"
 
-    if [ "$INSTALL_MODE" = true ] && [ -f "$TXN_FILE" ]; then
-        die "an update to $(head -n1 "$TXN_FILE") was cut short ($TXN_FILE); run hippius-miner-update without --install to finish or roll it back first"
+    # An operator run does not resume a cut-short swap (that run would end
+    # there, without doing what was asked): the timer's next run does.
+    if [ "$INTERACTIVE" = true ] && [ -f "$TXN_FILE" ]; then
+        die "an update to $(head -n1 "$TXN_FILE") was cut short ($TXN_FILE); run hippius-miner-update without arguments to finish or roll it back first"
     fi
     if [ -f "$TXN_FILE" ]; then
         local stuck
@@ -442,6 +471,16 @@ main() {
 
     [ "$INSTALL_MODE" = true ] || [ -x "$BINARY_PATH" ] || die "installed binary not found at $BINARY_PATH"
     [ -x "$COSIGN_BIN" ] || die "cosign not found at $COSIGN_BIN; cannot verify a release, refusing to update"
+    if [ -n "$PIN_TAG" ] && [ "$INSTALL_MODE" = false ] && [ "$(binary_tag "$BINARY_PATH")" = "$PIN_TAG" ]; then
+        local recorded=""
+        [ -f "$INSTALLED_FILE" ] && recorded="$(head -n1 "$INSTALLED_FILE" | tr -d '[:space:]')"
+        if valid_tag "$recorded" && [ "$(tag_cmp "$PIN_TAG" "$recorded")" = -1 ]; then
+            die "requested release $PIN_TAG is older than the recorded $recorded; downgrade refused"
+        fi
+        log "$BINARY_PATH already runs $PIN_TAG; nothing to do"
+        printf '%s\n' "$PIN_TAG"
+        exit 0
+    fi
 
     local tmp
     tmp="$(mktemp -d "${STATE_DIR}/.update.XXXXXX")"
@@ -457,9 +496,11 @@ main() {
         curl -fsSL --proto "=https" --proto-redir "=https" --connect-timeout 20 \
             --retry 2 --max-time "$t" --retry-max-time "$t" "$@" -o "$out" "$url"
     }
-    fetch 30 "$tmp/release.json" "$RELEASES_API" \
+    local api="$RELEASES_API"
+    [ -z "$PIN_TAG" ] || api="${RELEASE_TAG_API}/${PIN_TAG}"
+    fetch 30 "$tmp/release.json" "$api" \
         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
-        || die "cannot fetch $RELEASES_API"
+        || die "cannot fetch $api"
 
     # A first install does not trust the binary in place (it is missing or
     # foreign): only the recorded tag sets a floor, and that tag itself may
@@ -501,7 +542,7 @@ def say(level, msg):
 data = json.load(open(sys.argv[1]))
 releases = data if isinstance(data, list) else [data]
 asset, tag_re, installed, min_age_h, state_dir = sys.argv[2], re.compile(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6]
-first_install = sys.argv[7] == "true"
+first_install, pin = sys.argv[7] == "true", sys.argv[8]
 need = (asset, "SHA256SUMS", asset + ".sigstore.json")
 
 def key(m):
@@ -530,6 +571,17 @@ for rel in releases:
     cands.append((key(m), tag, ready, [assets[n].get("browser_download_url") or "" for n in need]))
 
 cands.sort(reverse=True)
+# --tag: that release or nothing. No soak; the floor and the failed marker
+# are checked by the caller.
+if pin:
+    for k, tag, ready, urls in cands:
+        if tag == pin:
+            print(tag)
+            for u in urls:
+                print(u)
+            sys.exit(0)
+    say("warn", f"release {pin} is not a complete published release of this repository")
+    sys.exit(0)
 if not cands:
     say("info", "no complete release yet; nothing to do")
     sys.exit(0)
@@ -556,8 +608,8 @@ for k, tag, ready, urls in cands:
         print(u)
     sys.exit(0)
 say("info", "no eligible release; nothing to do")
-' "$tmp/release.json" "$ASSET_NAME" "$TAG_RE" "$installed" "$MIN_RELEASE_AGE_H" "$STATE_DIR" "$INSTALL_MODE" 2>"$tmp/select.log")" \
-        || die "cannot parse the release metadata from $RELEASES_API: $(tail -n 1 "$tmp/select.log")"
+' "$tmp/release.json" "$ASSET_NAME" "$TAG_RE" "$installed" "$MIN_RELEASE_AGE_H" "$STATE_DIR" "$INSTALL_MODE" "$PIN_TAG" 2>"$tmp/select.log")" \
+        || die "cannot parse the release metadata from $api: $(tail -n 1 "$tmp/select.log")"
     local line
     while read -r line; do
         case "$line" in
@@ -573,18 +625,24 @@ say("info", "no eligible release; nothing to do")
     mapfile -t f <<<"$fields"
     tag="${f[0]:-}" url_bin="${f[1]:-}" url_sums="${f[2]:-}" url_bundle="${f[3]:-}"
     if [ -z "$tag" ]; then
+        [ -z "$PIN_TAG" ] || die "release $PIN_TAG cannot be installed (see the lines above); nothing installed"
         [ "$INSTALL_MODE" = false ] || die "no eligible release of $RELEASE_REPO to install (see the lines above); nothing installed"
         exit 0
     fi
 
     # Re-checked here, independently of the selection above.
     valid_tag "$tag" || die "selected release tag '$tag' is not vYYYY.MM.DD[.N]; refusing"
-    [ ! -f "${STATE_DIR}/.update-failed-${tag}" ] || die "selected release $tag is marked failed; refusing"
+    [ ! -f "${STATE_DIR}/.update-failed-${tag}" ] || die "selected release $tag is marked failed; refusing (remove ${STATE_DIR}/.update-failed-${tag} to retry it)"
+    [ -z "$PIN_TAG" ] || [ "$tag" = "$PIN_TAG" ] || die "selected release $tag is not the requested $PIN_TAG; refusing"
     if [ "$INSTALL_MODE" = true ]; then
         if [ -n "$installed" ]; then
             [ "$(tag_cmp "$tag" "$installed")" != -1 ] || die "selected release $tag is older than the recorded $installed; refusing"
         fi
         log "first install: release $tag"
+    elif [ -n "$PIN_TAG" ] && [ -n "$installed" ]; then
+        # Not the binary's own tag (checked above): equal = installed-release.
+        [ "$(tag_cmp "$tag" "$installed")" != -1 ] || die "requested release $tag is older than installed $installed; downgrade refused"
+        log "requested release $tag (installed $installed)"
     elif [ -n "$installed" ]; then
         [ "$(tag_cmp "$tag" "$installed")" = 1 ] || die "selected release $tag is not newer than installed $installed; refusing"
         log "release $tag is newer than installed $installed"
@@ -691,6 +749,7 @@ say("info", "no eligible release; nothing to do")
 
     commit_release "$tag"
     log "updated to $tag: $SERVICE_NAME pid $pid healthy, heartbeat delivered"
+    [ -z "$PIN_TAG" ] || printf '%s\n' "$tag"
 }
 
 # Sourced by the tests for the tag helpers; executed for real otherwise.

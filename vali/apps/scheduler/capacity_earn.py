@@ -21,6 +21,33 @@ is what it has PROVEN, never what it claims:
   verdict comes from a tenant image without the telemetry agent or root
   inside the guest stopping it, which is no evidence against the host.
 
+## Self-service hardware ceiling (`VALI_CAPACITY_DECLARED_CEILING`)
+
+A miner nobody anchored still has a size: its own heartbeat-declared #668
+budgets (`hardware_ceiling`). With the flag on, that ceiling BOUNDS growth
+— a held proof never lifts a ceiling past what the miner says its machine
+has, and a dimension it declares nothing for does not grow — but it never
+grants anything: only held proof does. Lying high gains nothing beyond what
+the miner then proves under load; lying low only throttles itself. The
+same flag adds one penalty and the strike record:
+
+- `GUEST_RESOURCE_SHORT`: VMs on the host whose guests ATTEST less than
+  their flavor (`telemetry.guest_resources`, PSP-signed figures the miner
+  relays but cannot change), from at least
+  `VALI_CAPACITY_SHORTFALL_MIN_OWNERS` (≥ 2) distinct tenants, cost the
+  host the `START_FAILED` decrease, once per tenant SET. Root inside a
+  guest can forge its own figures, hence the corroboration: one tenant
+  cannot shrink a rival alone, extra VMs of the same tenants add nothing,
+  and even a Sybil campaign (a new tenant account per halving) stops at
+  the floor — never exclusion. This is the backstop for CPU overcommit /
+  RAM ballooning behind an inflated declaration.
+- A charged event (with an incident) that has nothing left to lower
+  writes a `strike` audit row instead of nothing.
+
+Staking / slashing is out of scope here: a strike is the hook a future
+stake-weighted penalty would read (`MinerCapacityAudit`, `field=strike`
+plus every `event:*` actor).
+
 Every change goes through `capacity_admin.apply_capacity_change`, so it
 is audited (`actor = tick:earn` / `event:<kind>`). `operator` rows are
 never touched.
@@ -54,6 +81,7 @@ and the proof is simply empty.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from dataclasses import dataclass
@@ -82,8 +110,9 @@ PREFLIGHT_INSUFFICIENT = "preflight-insufficient"
 START_FAILED = "start-failed"
 CVM_INCAPABLE = "cvm-incapable"
 DISK_INSUFFICIENT = "disk-insufficient"
+GUEST_RESOURCE_SHORT = "guest-resource-short"
 EVENTS: frozenset[str] = frozenset(
-    {PREFLIGHT_INSUFFICIENT, START_FAILED, CVM_INCAPABLE, DISK_INSUFFICIENT}
+    {PREFLIGHT_INSUFFICIENT, START_FAILED, CVM_INCAPABLE, DISK_INSUFFICIENT, GUEST_RESOURCE_SHORT}
 )
 
 PROOF_OFF = "off"
@@ -257,6 +286,60 @@ def earned_ceiling(row: MinerCapacity) -> dict[str, int]:
     }
 
 
+def hardware_ceiling(row: MinerCapacity) -> dict[str, int | None]:
+    """The host's self-service HARDWARE CEILING per dimension: the most
+    conservative of every hardware figure vali has for it, `None` where it
+    has none.
+
+    - vcpus:     the declared `cvm_cpu_budget`; the anchor's
+                 `(total_cpus − reserve) × ratio`;
+    - memory_mb: the declared `cvm_memory_mb_budget`; the anchor's
+                 `total_memory_mb − reserve`;
+    - vms:       the declared SEV-ES ASID capacity less the reserve.
+
+    Declared figures count whether fresh or not — the miner's last word
+    is its claim until it says otherwise, and a ceiling only ever bounds
+    growth. (The §18 hardware report is deliberately NOT a term: it is
+    owner-facing only and nothing that decides may read it — pinned by
+    the disktier isolation test.)"""
+    from .service import _host_reserve_cpus, _host_reserve_memory_mb
+
+    vcpus: list[int] = []
+    mem: list[int] = []
+    vms: list[int] = []
+    if row.declared_cpu_budget is not None:
+        vcpus.append(row.declared_cpu_budget)
+    if row.declared_memory_mb_budget is not None:
+        mem.append(row.declared_memory_mb_budget)
+    if row.declared_asid_capacity is not None:
+        vms.append(max(0, row.declared_asid_capacity - capacity_config.asid_reserve()))
+    if row.total_cpus is not None and row.total_memory_mb is not None:
+        ratio = (
+            row.cpu_ratio if row.cpu_ratio is not None else capacity_config.cpu_overcommit_default()
+        )
+        vcpus.append(int(max(0, row.total_cpus - _host_reserve_cpus()) * ratio))
+        mem.append(max(0, row.total_memory_mb - _host_reserve_memory_mb()))
+    return {
+        "vms": min(vms) if vms else None,
+        "vcpus": min(vcpus) if vcpus else None,
+        "memory_mb": min(mem) if mem else None,
+    }
+
+
+def _bounded_by_ceiling(
+    target: dict[str, int], current: dict[str, int], ceiling: dict[str, int | None]
+) -> dict[str, int]:
+    """`target` with growth stopped at the hardware ceiling. Never below
+    `current`: lowering a ceiling is the penalties' job, and the budget
+    already takes the fresh declaration as a down-only term. No ceiling
+    signal for a dimension ⇒ it does not grow."""
+    out: dict[str, int] = {}
+    for d in _DIMS:
+        cap = ceiling[d]
+        out[d] = min(target[d], current[d] if cap is None else max(current[d], cap))
+    return out
+
+
 def _held(node_id: str) -> Sample:
     """What the host is actually RUNNING: its BOUND placements. Pending
     ones are excluded — the launch that was just refused is one of them."""
@@ -328,7 +411,7 @@ def _record_event(node_id: str, kind: str, *, incident: str, now: datetime) -> b
             # behaviour — no penalty beyond the truth.
             held = _held(node_id)
             new = {d: min(current[d], getattr(held, d)) for d in _DIMS}
-        else:  # START_FAILED — multiplicative decrease, floored.
+        else:  # START_FAILED / GUEST_RESOURCE_SHORT — multiplicative decrease, floored.
             factor = capacity_config.earn_penalty_factor()
             new = {
                 d: min(current[d], max(floors[d], math.ceil(current[d] * float(factor))))
@@ -343,6 +426,17 @@ def _record_event(node_id: str, kind: str, *, incident: str, now: datetime) -> b
             changes[f"candidate_{d}"] = 0
         changes["candidate_since"] = None
         if not capacity_admin.audited(capacity_admin.diff(row, changes)):
+            if (
+                capacity_config.declared_ceiling_enabled()
+                and incident
+                and kind != PREFLIGHT_INSUFFICIENT
+            ):
+                # Nothing left to lower — the fault still goes on record,
+                # once per incident (an incident-less event, e.g. the tick's
+                # incapable reset, would strike every pass). A preflight
+                # refusal is honest behaviour, never a strike.
+                capacity_admin.record_strike(row, actor=actor, reason=reason)
+                log.warning("capacity strike on %s by %s (at the floor)", node_id, kind)
             return False
         changes["earned_last_reason"] = kind
         changes["earned_last_change_at"] = now
@@ -403,6 +497,64 @@ def _cut_disk_ceiling(row: MinerCapacity, *, actor: str, reason: str, now: datet
     return True
 
 
+#: A finding that the guest ran a STALE launch (`guest_resources`), not one
+#: that it was given less than its flavor: evidence of something, but not
+#: of missing hardware.
+_SUPERSEDED_REASON = "superseded-launch"
+
+
+def shortfall_owners_by_node(now: datetime) -> dict[str, frozenset[str]]:
+    """`{node_id: tenants}` — per host, the distinct tenants whose VMs have
+    a fresh guest-resource SHORTFALL there (inside the flag window of
+    `telemetry.guest_resources`). Keyed on the node id vali credited the
+    VERIFIED attestation to — never a miner field. Superseded-launch
+    findings are not shortfalls; a VM vali has no tenant for (no `Vm` row,
+    blank `tenant_id`) counts for nobody, so it cannot corroborate."""
+    from apps.lifecycle.models import Vm
+    from apps.telemetry.guest_resources import flag_window_s
+    from apps.telemetry.models import GuestResourceShortfall
+
+    since = now - timedelta(seconds=flag_window_s())
+    rows = list(
+        GuestResourceShortfall.objects.filter(last_seen_at__gte=since)
+        .exclude(reason=_SUPERSEDED_REASON)
+        .values_list("node_id_hex", "vm_id")
+    )
+    if not rows:
+        return {}
+    owner_of = dict(
+        Vm.objects.filter(vm_id__in={vm for _, vm in rows})
+        .exclude(tenant_id="")
+        .values_list("vm_id", "tenant_id")
+    )
+    out: dict[str, set[str]] = {}
+    for node, vm in rows:
+        if vm in owner_of:
+            out.setdefault(node.lower(), set()).add(owner_of[vm])
+    return {node: frozenset(owners) for node, owners in out.items()}
+
+
+def shortfall_incident(
+    node_id: str, *, now: datetime, owners_by_node: dict[str, frozenset[str]] | None = None
+) -> str:
+    """The `GUEST_RESOURCE_SHORT` incident to charge `node_id` now, or `""`.
+
+    Charged only once the host's fresh shortfalls span
+    `shortfall_min_owners` distinct tenants ([`shortfall_owners_by_node`]).
+    The incident is that SET of tenants (hashed — tenant ids stay out of
+    the audit): an unchanged set is charged once however many VMs it
+    holds, so one tenant forging shortfalls on VM after VM gains nothing
+    once corroborated; each further halving needs a tenant set never
+    charged before. `owners_by_node` lets the tick compute the fleet once."""
+    if owners_by_node is None:
+        owners_by_node = shortfall_owners_by_node(now)
+    owners = owners_by_node.get(node_id.lower(), frozenset())
+    if len(owners) < capacity_config.shortfall_min_owners():
+        return ""
+    digest = hashlib.sha256("\n".join(sorted(owners)).encode()).hexdigest()[:16]
+    return f"tenants={len(owners)} set={digest}"
+
+
 # ─── the tick (growth) ──────────────────────────────────────────────
 
 
@@ -413,6 +565,7 @@ class EarnReport:
     grown: int = 0
     held: int = 0
     reset_incapable: int = 0
+    shortfall_penalties: int = 0
 
 
 def _grow(current: dict[str, int], proven: Sample) -> dict[str, int]:
@@ -451,12 +604,18 @@ def tick(*, now: datetime | None = None, sampler: Any = None) -> EarnReport:
             "miner_node_id", flat=True
         )
     )
-    grown = held = reset = 0
+    ceiling_on = capacity_config.declared_ceiling_enabled()
+    short_owners = shortfall_owners_by_node(now) if ceiling_on else {}
+    grown = held = reset = short = 0
     proof_available = False
     for nid in rows:
         if capability.get(nid) == INCAPABLE:
             reset += int(record_event(nid, CVM_INCAPABLE, now=now))
             continue
+        if ceiling_on:
+            incident = shortfall_incident(nid, now=now, owners_by_node=short_owners)
+            if incident:
+                short += int(record_event(nid, GUEST_RESOURCE_SHORT, incident=incident, now=now))
         sample = sample_of(nid, now)
         if sample is None:
             continue
@@ -504,6 +663,8 @@ def tick(*, now: datetime | None = None, sampler: Any = None) -> EarnReport:
                     changes["proven_at"] = now
                 current = earned_ceiling(row)
                 target = _grow(current, proven)
+                if ceiling_on:
+                    target = _bounded_by_ceiling(target, current, hardware_ceiling(row))
                 if target != current:
                     grown += 1
                     changes.update(
@@ -532,4 +693,5 @@ def tick(*, now: datetime | None = None, sampler: Any = None) -> EarnReport:
         grown=grown,
         held=held,
         reset_incapable=reset,
+        shortfall_penalties=short,
     )

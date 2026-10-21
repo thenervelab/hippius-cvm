@@ -483,3 +483,168 @@ class TestTheOfferedMaximum:
 
         with pytest.raises(ImproperlyConfigured, match="not a flavor"):
             feasibility.assess("small")
+
+
+# ─── ?os_disk_tier= — the question for a VM sold at a tier ───────────
+
+
+#: Every key of one answer before tiers existed: a caller that names no
+#: tier must get exactly these, value for value.
+_PRE_TIER_KEYS = {
+    "flavor",
+    "verdict",
+    "placeable_now",
+    "fits_any_host",
+    "headroom",
+    "cpu_count",
+    "memory_mb",
+    "data_disk_size_gb",
+    "reason",
+    "scheduler_error",
+    "hosts",
+    "disk_checked",
+    "region",
+    # Not a tier key: added later (self-service capacity), present whatever
+    # the tier question.
+    "capacity_source",
+}
+
+
+class TestOsDiskTier:
+    def test_no_tier_is_the_answer_before_tiers(
+        self, real_fleet, authed_client
+    ) -> None:  # noqa: ANN001
+        from django.urls import reverse
+
+        url = reverse("scheduler_feasibility")
+        plain = authed_client.get(url, {"flavor": "small"}).json()
+        assert set(plain["flavors"][0]) == _PRE_TIER_KEYS
+        assert authed_client.get(url, {"flavor": "small", "os_disk_tier": ""}).json() == plain
+        board = authed_client.get(url).json()["flavors"]
+        assert all(set(f) == _PRE_TIER_KEYS for f in board)
+
+    def test_the_tier_is_echoed_and_nvme_answers_as_before(
+        self, real_fleet, authed_client
+    ) -> None:  # noqa: ANN001
+        from django.urls import reverse
+
+        url = reverse("scheduler_feasibility")
+        plain = authed_client.get(url, {"flavor": "small"}).json()["flavors"][0]
+        nvme = authed_client.get(url, {"flavor": "small", "os_disk_tier": "nvme"}).json()
+        assert nvme["flavors"][0] == {**plain, "os_disk_tier": "nvme"}
+
+    def test_a_tier_off_the_enum_is_400(self, real_fleet, authed_client) -> None:  # noqa: ANN001
+        from django.urls import reverse
+
+        resp = authed_client.get(reverse("scheduler_feasibility"), {"os_disk_tier": "sata"})
+        assert (resp.status_code, resp.json()["category"]) == (400, "disk-tier-invalid")
+
+    def test_a_tier_not_sold_is_never(self, real_fleet) -> None:  # noqa: ANN001
+        result = feasibility.assess("small", os_disk_tier="ssd")
+        assert (result.verdict, result.reason) == ("never", "disk-tier-not-offered")
+        assert result.os_disk_tier == "ssd"
+        with override_settings(
+            VALI_SELLABLE_OS_TIERS=["nvme", "hdd"], VALI_SCHEDULER_DISK_TIER_GATE="enforce"
+        ):
+            result = feasibility.assess("xlarge", os_disk_tier="hdd")
+            assert (result.verdict, result.reason) == ("never", "disk-tier-not-offered")
+            assert "large" in result.scheduler_error
+        # The flavor's own refusal comes first.
+        with override_settings(VALI_SCHEDULER_MAX_FLAVOR="small"):
+            result = feasibility.assess("medium", os_disk_tier="ssd")
+            assert result.reason == "flavor-not-offered"
+
+    @override_settings(
+        VALI_SELLABLE_OS_TIERS=["nvme", "ssd"], VALI_SCHEDULER_DISK_TIER_GATE="enforce"
+    )
+    def test_enforced_no_host_with_a_pool_at_the_tier_is_never(
+        self, real_fleet
+    ) -> None:  # noqa: ANN001
+        from apps.disktier.models import MinerStoragePool
+
+        for seed in (1, 2, 3):
+            MinerStoragePool.objects.create(
+                miner_node_id=node_id(seed), pool_id="default", declared_class="hdd"
+            )
+        result = feasibility.assess("small", os_disk_tier="ssd")
+        assert (result.verdict, result.reason) == ("never", "no-miner-at-tier")
+        # One host at the tier: placeable.
+        MinerStoragePool.objects.filter(miner_node_id=node_id(2)).update(declared_class="ssd")
+        result = feasibility.assess("small", os_disk_tier="ssd")
+        assert result.verdict == "yes", result
+        # nvme asked, no nvme pool anywhere: the scheduler's gate would
+        # place nothing either.
+        assert feasibility.assess("small", os_disk_tier="nvme").reason == "no-miner-at-tier"
+
+    @override_settings(
+        VALI_SELLABLE_OS_TIERS=["nvme", "ssd"],
+        VALI_SCHEDULER_DISK_TIER_GATE="enforce",
+        VALI_POOL_ROUTING_MIN_AGENT_VERSION="*",
+    )
+    @pytest.mark.parametrize(
+        "state", [dict(available_gb=0), dict(reported_at=None), dict(health="degraded")]
+    )
+    def test_a_pool_at_the_tier_full_or_unreported_for_now_is_not_never(
+        self, real_fleet, state
+    ) -> None:  # noqa: ANN001
+        from apps.disktier.models import MinerStoragePool
+
+        for seed in (1, 2, 3):
+            MinerStoragePool.objects.create(
+                miner_node_id=node_id(seed), pool_id="default", declared_class="hdd"
+            )
+        fields = dict(
+            declared_class="ssd",
+            os_disks=True,
+            reported_state="active",
+            reported_at=timezone.now(),
+            available_gb=1000,
+        )
+        fields.update(state)
+        MinerStoragePool.objects.create(miner_node_id=node_id(1), pool_id="ssd0", **fields)
+        result = feasibility.assess("small", os_disk_tier="ssd")
+        assert (result.verdict, result.reason) == ("not-now", "no-miner-at-tier")
+
+    @override_settings(VALI_SCHEDULER_DISK_TIER_GATE="record")
+    def test_recorded_the_gate_never_unsells(self, real_fleet) -> None:  # noqa: ANN001
+        from apps.disktier.models import MinerStoragePool
+
+        for seed in (1, 2, 3):
+            MinerStoragePool.objects.create(
+                miner_node_id=node_id(seed), pool_id="default", declared_class="hdd"
+            )
+        assert feasibility.assess("small", os_disk_tier="nvme").verdict == "yes"
+
+    def test_the_board_answers_at_the_tier(self, real_fleet) -> None:  # noqa: ANN001
+        board = feasibility.assess_catalogue(os_disk_tier="ssd")
+        assert {r.os_disk_tier for r in board} == {"ssd"}
+        assert {r.reason for r in board} == {"disk-tier-not-offered"}
+
+    @override_settings(VALI_SCHEDULER_DISK_TIER_GATE="enforce")
+    def test_a_fleet_without_pool_rows_is_nvme(self, real_fleet) -> None:  # noqa: ANN001
+        """Pre-v7 miners report no pools: their single pool is nvme."""
+        assert feasibility.assess("small", os_disk_tier="nvme").verdict == "yes"
+
+    @override_settings(
+        VALI_SELLABLE_OS_TIERS=["nvme", "ssd"], VALI_SCHEDULER_DISK_TIER_GATE="enforce"
+    )
+    def test_a_pool_taking_no_os_disk_holds_no_tier(self, real_fleet) -> None:  # noqa: ANN001
+        from apps.disktier.models import MinerStoragePool
+
+        for seed in (1, 2, 3):
+            MinerStoragePool.objects.create(
+                miner_node_id=node_id(seed),
+                pool_id="default",
+                declared_class="ssd",
+                os_disks=False,
+            )
+        result = feasibility.assess("small", os_disk_tier="ssd")
+        assert (result.verdict, result.reason) == ("never", "no-miner-at-tier")
+
+    def test_the_board_endpoint_echoes_the_tier(
+        self, real_fleet, authed_client
+    ) -> None:  # noqa: ANN001
+        from django.urls import reverse
+
+        board = authed_client.get(reverse("scheduler_feasibility"), {"os_disk_tier": "ssd"})
+        assert {f["os_disk_tier"] for f in board.json()["flavors"]} == {"ssd"}

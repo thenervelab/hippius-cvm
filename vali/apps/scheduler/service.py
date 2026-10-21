@@ -71,7 +71,13 @@ from .models import (
     PlacementFailureSource,
     PlacementStatus,
 )
-from .placement import MINER_ACTIVE, ResourceFit, SelectionWeights, log_disk_would_reject
+from .placement import (
+    MINER_ACTIVE,
+    DiskTierFit,
+    ResourceFit,
+    SelectionWeights,
+    log_disk_would_reject,
+)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -267,10 +273,15 @@ def recent_failures_by_node() -> dict[str, int]:
     disabled (`max_recent_failures() == 0`) — skip the query entirely."""
     if max_recent_failures() <= 0:
         return {}
+    from apps.orchestration.services.launch import NO_OS_POOL_AT_TIER
+
     cutoff = timezone.now() - timedelta(seconds=failure_window_s())
     out: dict[str, int] = {}
     for row in (
         Placement.objects.filter(status=PlacementStatus.FAILED.value, failed_at__gte=cutoff)
+        # vali's own tier refusal at dispatch (gate (n)) says nothing about
+        # the miner: it never counts against it.
+        .exclude(reason=NO_OS_POOL_AT_TIER)
         .values("miner_node_id")
         .annotate(n=Count("id"))
     ):
@@ -1035,11 +1046,15 @@ def placement_arguments(
     vm_id: str = "",
     power_policy_stop: bool = False,
     require_failover_peer: bool = False,
+    os_disk_tier: str = "",
 ) -> dict[str, Any]:
     """Every [`decide_placement`] argument EXCEPT `snapshot`, assembled
     from settings + the DB exactly as a real launch assembles them.
 
     `require_failover_peer` adds gate (m): only a host with a failover peer.
+
+    `os_disk_tier` is gate (n)'s tier (`""` ⇒ the VM's launch's, nvme
+    without one), while the gate is not `off`.
 
     `power_policy_stop` adds gate (l): only miners whose agent supports
     the guest-poweroff policy (an `on_guest_poweroff=stop` launch).
@@ -1112,6 +1127,42 @@ def placement_arguments(
         # Gate (m) — a `require_failover_peer` VM only where a failover can
         # ever find a destination.
         **failover_peer_arguments(require_failover_peer, vm_id),
+        # Gate (n) — an OS pool at the VM's disk tier.
+        **disk_tier_arguments(flavor, vm_id=vm_id, os_disk_tier=os_disk_tier),
+    }
+
+
+def disk_tier_arguments(
+    flavor: str, *, vm_id: str = "", os_disk_tier: str = ""
+) -> dict[str, Any]:
+    """Gate (n)'s [`decide_placement`] argument: per dispatchable node, why
+    it holds no OS disk of `flavor` (its data disk: `vm_id`'s launch's when
+    it has one) at the tier (`os_disk_tier`, else `vm_id`'s launch's, else
+    nvme). `{}` (no query) while `VALI_SCHEDULER_DISK_TIER_GATE` is `off`."""
+    from apps.disktier import os_tier
+
+    mode = os_tier.gate_mode()
+    if mode == os_tier.GATE_OFF:
+        return {}
+    from apps.orchestration.services import launch_record
+
+    tier = os_disk_tier or os_tier.launch_tier(vm_id)
+    # The VM's own disk once it has one (a resize keeps its launch disk),
+    # as the pool choice sizes it; else the flavor's.
+    carried = launch_record.vm_data_disk_gb(vm_id) if vm_id else 0
+    need_gb = placement_disk_gb(flavor, carried or None) if flavor else 0
+    # A legacy LUKS disk always lands on `default` (only a golden launch
+    # names a pool); a VM with no launch yet is asked about as golden.
+    golden = "golden_verity_overlay"
+    legacy = bool(vm_id) and _launch_spec(vm_id).get("disk_mode", golden) != golden
+    return {
+        "disk_tier_fit": DiskTierFit(
+            mode=mode,
+            tier=tier,
+            refusal_by_node=os_tier.refusals(
+                dispatchable_node_ids(), tier, need_gb, default_only=legacy
+            ),
+        )
     }
 
 

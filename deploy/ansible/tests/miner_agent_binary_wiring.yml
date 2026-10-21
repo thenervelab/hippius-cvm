@@ -7,7 +7,10 @@
 # installed through `--install`, that a failed install or a release at
 # another version stops the play, and that the source-build opt-in never
 # calls the updater, and that an updater other than the checkout's is
-# never run.
+# never run. Then `miner_agent_version`: the exact tag through `--install
+# --tag` (fresh host, or an agent that is not running) or `--tag` (the
+# updater's swap of a running agent; `systemctl` is a stub here), nothing
+# when the binary already reports it, and the refusals.
 #
 # Run (from deploy/ansible):
 #   ansible-playbook -i localhost, -c local tests/miner_agent_binary_wiring.yml
@@ -16,9 +19,11 @@
   hosts: localhost
   gather_facts: false
   become: false
+  environment:
+    PATH: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-wiring/bin:{{ lookup('env', 'PATH') }}"
   vars:
     scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-wiring"
-    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent" }
+    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent", systemd_unit_name: hippius-miner-agent }
     miner_agent_updater: "{{ scratch }}/hippius-miner-update"
     miner_agent_updater_src: "{{ miner_agent_updater }}"
     miner_agent_build_from_source: false
@@ -31,6 +36,15 @@
         state: "{{ item }}"
       loop: [absent, directory]
 
+    - name: A bin directory first on PATH
+      ansible.builtin.file: { path: "{{ scratch }}/bin", state: directory, mode: "0755" }
+
+    - name: A stub systemctl answering scratch/active-state
+      ansible.builtin.copy:
+        dest: "{{ scratch }}/bin/systemctl"
+        mode: "0755"
+        content: "#!/bin/sh\ncat '{{ scratch }}/active-state' 2>/dev/null || echo inactive\n"
+
     # The stub does what `--install` does on success (installs a binary,
     # prints its tag) or on a refusal (stderr, exit 1), as told by
     # scratch/outcome, and records every call.
@@ -41,13 +55,18 @@
         content: |
           #!/bin/sh
           echo "$*" >>"{{ scratch }}/calls"
+          tag=v2025.01.09
+          [ "$1" = --tag ] && tag="$2"
+          [ "$2" = --tag ] && tag="$3"
           case "$(cat "{{ scratch }}/outcome")" in
-            ok) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.1 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}" ;;
+            ok) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.1 (%s)"\n' "$tag" >"{{ miner_agent.install_path }}" ;;
+            older-crate) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.0 (%s)"\n' "$tag" >"{{ miner_agent.install_path }}" ;;
+            wrong-tag) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.1 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}" ;;
             other-version) printf '#!/bin/sh\necho "hippius-miner-agent 0.0.2 (v2025.01.09)"\n' >"{{ miner_agent.install_path }}" ;;
             *) echo "[hippius-miner-update] ERROR: build-provenance attestation of v2025.01.09 does not verify; refusing" >&2; exit 1 ;;
           esac
           chmod 0755 "{{ miner_agent.install_path }}"
-          echo v2025.01.09
+          echo "$tag"
 
     - name: Another updater than the checkout's
       ansible.builtin.copy: { dest: "{{ scratch }}/other-updater", content: "#!/bin/sh\necho an older updater\n", mode: "0755" }
@@ -134,3 +153,88 @@
           - miner_agent_release_install is skipped
           - lookup('file', scratch ~ '/calls').splitlines() | length == 4
           - not (miner_agent.install_path is file)
+
+    # ── miner_agent_version: an exact release ──
+    - name: Fresh host, miner_agent_version set
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.10
+
+    - name: Fresh host => `--install --tag <tag>`
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/calls').splitlines()[-1] == '--install --tag v2025.01.10'
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('[(]v2025.01.10[)]')
+
+    - name: The same tag again
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.10
+
+    - name: Binary already reports the tag => no call
+      ansible.builtin.assert:
+        that:
+          - not (miner_agent_install_needed | bool)
+          - not (miner_agent_pin_needed | bool)
+          - lookup('file', scratch ~ '/calls').splitlines() | length == 5
+
+    - name: Another tag, agent not running
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.11
+
+    - name: Agent not running => `--install --tag` (nothing to signal)
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/calls').splitlines()[-1] == '--install --tag v2025.01.11'
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('[(]v2025.01.11[)]')
+
+    - name: The agent is running
+      ansible.builtin.copy: { dest: "{{ scratch }}/active-state", content: "active\n", mode: "0644" }
+
+    - name: Another tag, agent running
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.12.1
+
+    - name: Agent running => `--tag` alone (the updater's SIGKILL swap)
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/calls').splitlines()[-1] == '--tag v2025.01.12.1'
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('[(]v2025.01.12.1[)]')
+
+    - name: miner_agent_version refusals
+      ansible.builtin.include_tasks: miner_agent_binary_refused.yml
+      loop:
+        - { name: malformed-tag, outcome: ok, version: v2025.1.13, keep_binary: true, code: MINER_AGENT_VERSION_INVALID,
+            says: 'must be a release', calls_after: 7 }
+        - { name: tag-dot-zero, outcome: ok, version: v2025.01.13.0, keep_binary: true, code: MINER_AGENT_VERSION_INVALID,
+            says: 'must be a release', calls_after: 7 }
+        - { name: tag-with-source-build, outcome: ok, version: v2025.01.13, source_build: true, keep_binary: true,
+            code: MINER_AGENT_VERSION_INVALID, says: 'miner_agent_build_from_source', calls_after: 7 }
+        - { name: updater-refuses-the-tag, outcome: refuse, version: v2025.01.13, keep_binary: true,
+            says: 'did not install a verified release', calls_after: 8 }
+        - { name: installed-but-not-that-tag, outcome: wrong-tag, version: v2025.01.13, keep_binary: true,
+            says: 'not 0.0.1 [(]v2025.01.13[)]', calls_after: 9 }
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: The refused upgrades went through the swap (`--tag`, agent running)
+      ansible.builtin.assert:
+        that:
+          - lookup('file', scratch ~ '/calls').splitlines()[-2:] == ['--tag v2025.01.13', '--tag v2025.01.13']
+
+    - name: An exact release built from an older crate version
+      ansible.builtin.copy: { dest: "{{ scratch }}/outcome", content: "older-crate\n", mode: "0644" }
+
+    - name: Pin a release whose crate version is not the checkout's
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.14
+
+    - name: Judged by its tag, accepted
+      ansible.builtin.assert:
+        that:
+          - miner_agent_release_install is changed
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('0.0.0 [(]v2025.01.14[)]')

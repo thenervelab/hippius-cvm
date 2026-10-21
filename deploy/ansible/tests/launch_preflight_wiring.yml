@@ -1,0 +1,123 @@
+---
+# Wiring test for miner-tasks/launch-preflight.yml (play 09): the real
+# tasks file on localhost, no connection to any host. First against canned
+# probe output (set_fact/debug/assert only), then running the real probe
+# script against stub virsh / systemctl / systemd-run / runuser / dd in a
+# scratch dir — the only change to this machine, removed at the end. The
+# verdict itself is unit-tested in test_launch_preflight.py.
+#
+# Run (from deploy/ansible):
+#   ANSIBLE_FILTER_PLUGINS=playbooks/filter_plugins \
+#     ansible-playbook -i localhost, -c local tests/launch_preflight_wiring.yml
+
+- name: Tenant-launch preflight wiring
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/miner_nodes.yml
+    - launch_preflight_stubs.yml
+  tasks:
+    - name: This file is the run without --check
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+
+    - name: A healthy host passes
+      vars:
+        miner_launch_probe_canned: "{{ good_probe }}"
+      block:
+        - name: Run the launch preflight
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+
+    - name: The verdict is a pass
+      ansible.builtin.assert:
+        that:
+          - miner_lpf.summary.result == 'pass'
+          - miner_lpf.summary.smoke == 'ok'
+
+    - name: A broken host is refused with every code at once
+      vars:
+        miner_launch_probe_canned: >-
+          {{ good_probe
+             | replace('net_active=1', 'net_active=0')
+             | replace('/var/lib/hippius-miner||', '/var/lib/hippius-miner|/var/lib|drwx------ root:root')
+             | replace('odirect_0=/var/lib/hippius-miner|ok', 'odirect_0=/var/lib/hippius-miner|fail:Invalid argument') }}
+      block:
+        - name: Run the launch preflight on the broken host
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+        - name: Not reached
+          ansible.builtin.fail:
+            msg: the launch preflight accepted a host with an inactive default network
+      rescue:
+        - name: The refusal names every problem, with its fix
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_task.name == 'Refuse a host that cannot start a tenant domain'
+              - "'FAIL [LIBVIRT_DEFAULT_NET_INACTIVE]' in (ansible_failed_result.msg | join(' '))"
+              - "'FAIL [QEMU_CANNOT_TRAVERSE_DATA_ROOT]' in (ansible_failed_result.msg | join(' '))"
+              - "'chmod o+x /var/lib' in (ansible_failed_result.msg | join(' '))"
+              - "'FAIL [DATA_ROOT_NO_ODIRECT]' in (ansible_failed_result.msg | join(' '))"
+
+    - name: Stage the scratch tree and the stub host tools
+      ansible.builtin.import_tasks: launch_preflight_stage.yml
+
+    - name: The real probe script, with the write probes and the smoke domain
+      environment:
+        PATH: "{{ scratch }}/bin:{{ lookup('env', 'PATH') }}"
+        FAKE_DIR: "{{ scratch }}"
+      vars:
+        miner_launch_probe_script: "{{ playbook_dir }}/../playbooks/miner-tasks/files/launch-preflight-probe.sh"
+        miner_data_disk_root: "{{ scratch }}/data"
+        miner_state_disk_root: "{{ scratch }}/data"
+        miner_agent:
+          state_dir: "{{ scratch }}/data"
+          systemd_unit_name: hippius-miner-agent
+          config_path: "{{ scratch }}/config.toml"
+      block:
+        - name: Run the launch preflight with the real probe
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+
+    - name: Every probe ran, passed, and left nothing behind
+      ansible.builtin.find:
+        paths: "{{ scratch }}/data"
+        hidden: true
+        file_type: any
+      register: leftovers
+
+    - name: Check the real-probe verdict
+      ansible.builtin.assert:
+        that:
+          - miner_lpf.summary.result == 'pass'
+          - miner_lpf.summary.smoke == 'ok'
+          - "'sandbox_0=' ~ scratch ~ '/data|ok' in miner_launch_probe.stdout"
+          - "'odirect_0=' ~ scratch ~ '/data|ok' in miner_launch_probe.stdout"
+          - leftovers.matched == 0
+
+    - name: With the smoke test switched off, only the smoke is skipped
+      environment:
+        PATH: "{{ scratch }}/bin:{{ lookup('env', 'PATH') }}"
+        FAKE_DIR: "{{ scratch }}"
+      vars:
+        miner_launch_probe_script: "{{ playbook_dir }}/../playbooks/miner-tasks/files/launch-preflight-probe.sh"
+        miner_launch_smoke_enabled: false
+        miner_data_disk_root: "{{ scratch }}/data"
+        miner_state_disk_root: "{{ scratch }}/data"
+        miner_agent:
+          state_dir: "{{ scratch }}/data"
+          systemd_unit_name: hippius-miner-agent
+          config_path: "{{ scratch }}/config.toml"
+      block:
+        - name: Run the launch preflight without the smoke domain
+          ansible.builtin.import_tasks: ../playbooks/miner-tasks/launch-preflight.yml
+
+    - name: Smoke skipped, O_DIRECT still probed
+      ansible.builtin.assert:
+        that:
+          - miner_lpf.summary.smoke == 'skipped'
+          - "'odirect_0=' in miner_launch_probe.stdout"
+
+    - name: Remove the scratch tree
+      ansible.builtin.file:
+        path: "{{ scratch }}"
+        state: absent

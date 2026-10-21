@@ -148,7 +148,9 @@ def test_accrues_to_the_current_chain_epoch_not_the_baked_epoch(monkeypatch) -> 
     assert a.epoch == 7
 
 
-def _binding(*, resource_class="small", node_id_hex=NODE, lease_id="lease-1") -> None:
+def _binding(
+    *, resource_class="small", node_id_hex=NODE, lease_id="lease-1", os_disk_tier="nvme"
+) -> None:
     from apps.scheduler.models import VmBillingBinding
 
     VmBillingBinding.objects.create(
@@ -156,7 +158,39 @@ def _binding(*, resource_class="small", node_id_hex=NODE, lease_id="lease-1") ->
         node_id_hex=node_id_hex,
         resource_class=resource_class,
         lease_id=lease_id,
+        os_disk_tier=os_disk_tier,
     )
+
+
+@pytest.mark.parametrize(
+    ("tier", "factor_on", "unit_seconds"),
+    [
+        # Off (the default): every tier accrues as today.
+        ("nvme", False, 100 * 60),
+        ("ssd", False, 100 * 60),
+        ("hdd", False, 100 * 60),
+        # On: the VM's sold tier scales its miner's units (decision Q7).
+        ("nvme", True, 100 * 60),
+        ("ssd", True, 100 * 60 * 8000 // 10000),
+        ("hdd", True, 100 * 60 * 6000 // 10000),
+    ],
+)
+def test_the_sold_disk_tier_scales_units_only_under_the_flag(
+    monkeypatch, settings, tier, factor_on, unit_seconds
+) -> None:
+    settings.VALI_DISK_TIER_UNIT_FACTOR = factor_on
+    _binding(os_disk_tier=tier)
+    _envelope()
+    _patch_units(monkeypatch, 100)
+    _patch_verify(monkeypatch, fixed=_fields(period_start=1000, period_end=1060))
+
+    assert usage.accrue_usage_once().accrued == 1
+    a = UsageAccrual.objects.get()
+    assert (a.billable_seconds, a.unit_seconds) == (60, unit_seconds)
+
+
+def test_the_disk_tier_factor_is_off_by_default(settings) -> None:
+    assert settings.VALI_DISK_TIER_UNIT_FACTOR is False
 
 
 def test_rejects_a_receipt_whose_resource_class_mismatches_the_binding(monkeypatch) -> None:

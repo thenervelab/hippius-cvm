@@ -48,6 +48,7 @@ from django.utils import timezone
 
 from apps.cdn import identity as cdn_identity
 from apps.disktier import routing as disk_routing
+from apps.miners import launch_errors
 from apps.miners.models import MinerIdentity
 from apps.network import net_policy
 from apps.orchestration import effects, kbs_admin, order_dispatch, power_policy
@@ -730,6 +731,11 @@ class LaunchSpec:
     # pool. Empty (every other launch) ⇒ `_choose_os_pool`. Written into
     # `spec_json` only when set, like `require_failover_peer`.
     pinned_os_pool: str = ""
+    # The OS-disk tier the VM is sold at, a minimum (`apps.disktier.os_tier`):
+    # `""` = nvme, and the only value intake writes into `spec_json` is
+    # another one. Drives placement (gate (n), the pool choice) and the
+    # billing binding; never measured.
+    os_disk_tier: str = ""
 
 
 @dataclass
@@ -1003,10 +1009,43 @@ def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
     if spec.pinned_os_pool:
         return _pinned_os_pool(spec)
     try:
-        return disk_routing.choose_os_pool(miner.chain_node_id or "", _os_disk_need_gb(spec))
+        return disk_routing.choose_os_pool(
+            miner.chain_node_id or "", _os_disk_need_gb(spec), _os_disk_tier(spec)
+        )
     except Exception:
         log.exception("launch: vm_id=%s os pool choice failed — using default", spec.vm_id)
         return None
+
+
+#: `launch_on_miner`'s outcome when gate (n) refuses the disk's landing
+#: on `default` at dispatch.
+NO_OS_POOL_AT_TIER = "no-os-pool-at-tier"
+
+
+def _default_pool_refusal(miner: MinerIdentity, spec: LaunchSpec) -> str:
+    """Why the spec's OS disk may not land on the miner's `default` pool
+    (`""` when it may): only while `VALI_SCHEDULER_DISK_TIER_GATE` is
+    `enforce`, when `default` does not hold the VM's tier."""
+    from apps.disktier import os_tier
+    from apps.disktier.tiers import satisfies
+
+    if os_tier.gate_mode() != os_tier.GATE_ENFORCE:
+        return ""
+    tier = _os_disk_tier(spec)
+    own = disk_routing.default_pool_tier(miner.chain_node_id or "")
+    if own is not None and satisfies(own, tier):
+        return ""
+    return (
+        f"the miner's default pool ({own or 'no OS disks'}) does not hold an OS disk at "
+        f"{tier}, and no other pool of it can take this one"
+    )
+
+
+def _os_disk_tier(spec: LaunchSpec) -> str:
+    """The tier the spec's VM is sold at (`""` ⇒ nvme)."""
+    from apps.disktier import os_tier
+
+    return os_tier.spec_tier({"os_disk_tier": getattr(spec, "os_disk_tier", "")})
 
 
 def _own_retry_pool(out: LaunchOutcome, dispatch_retries: int) -> None:
@@ -1390,10 +1429,30 @@ def launch_on_miner(
     # A same-miner retry passes the pool its first attempt named
     # (`os_pool`), so one VM never gets two choices. A disk-probe launch
     # pins its pool under test (`spec.pinned_os_pool`) instead of choosing.
+    first_attempt = os_pool is _CHOOSE_OS_POOL
     if require_existing_disks or spec.disk_mode != _DISK_MODE_GOLDEN_VERITY:
         os_pool = None
     elif os_pool is _CHOOSE_OS_POOL:
         os_pool = _choose_os_pool(miner, spec)
+    # Gate (n) enforced: a first disk that would land on `default` while
+    # `default` does not hold the VM's tier (no other pool had room, or the
+    # miner refused the one named) is not dispatched. A first attempt here
+    # touched nothing, so it re-places; a same-miner retry cannot (the KBS
+    # holds the VM on this host), so it stops.
+    if not require_existing_disks and os_pool is None and not spec.pinned_os_pool:
+        why = _default_pool_refusal(miner, spec)
+        if why:
+            if first_attempt:
+                return LaunchOutcome(
+                    disposition=RETRIABLE,
+                    emit={"ok": False, "outcome": NO_OS_POOL_AT_TIER, "error": why},
+                    exit_code=EXIT_CONFIG_ERROR,
+                )
+            # Only a retry after the KBS register reaches here: say so, or the
+            # abandoned-launch reap would leave its KEK live.
+            out = _terminal(NO_OS_POOL_AT_TIER, why, EXIT_CONFIG_ERROR)
+            out.registered = True
+            return out
     # The CDN role (`apps.cdn.identity`): a CDN node's launch carries the
     # role in its ticket, cmdline and pin class. Refused before any row,
     # secret or pin exists when it must not run, or would boot anything but
@@ -1716,7 +1775,11 @@ def launch_on_miner(
     #        measured cmdline as `hippius.node_id`); resource_class is the
     #        flavor tier. Non-fatal (best-effort, same as the source).
     _persist_billing_binding(
-        spec.vm_id, miner.chain_node_id, spec.flavor, spec.lease_id
+        spec.vm_id,
+        miner.chain_node_id,
+        spec.flavor,
+        spec.lease_id,
+        os_disk_tier=_os_disk_tier(spec),
     )
 
     # ── 3. allowed_userdata_digest_hex ──────────────────────────────
@@ -1772,11 +1835,12 @@ def launch_on_miner(
     # bake SHAs so the miner's content-addressed cache (#823) HITs on a
     # same-distro relaunch. kernel/initrd are staged identically.
     _preflight_artifacts = _select_preflight_artifacts(spec)
+    preflight_order_id = preflight_svc.fresh_order_id()
     try:
         preflight_result = preflight_svc.dispatch_preflight(
             miner_id=miner.miner_id,
             netbird_ip=str(miner.netbird_ip),
-            order_id=preflight_svc.fresh_order_id(),
+            order_id=preflight_order_id,
             vm_id=spec.vm_id,
             ovmf_path=spec.ovmf_path,
             cmdline=augmented_cmdline,
@@ -1802,13 +1866,24 @@ def launch_on_miner(
             _record_capacity_event(
                 miner, "preflight-insufficient", incident=f"vm={spec.vm_id}"
             )
+        failure_emit: dict[str, Any] = {
+            "ok": False,
+            "outcome": "preflight-failure",
+            "error": str(exc),
+        }
+        if isinstance(exc, preflight_svc.PreflightRejected):
+            failure_emit["miner_error"] = _record_launch_error(
+                miner,
+                spec.vm_id,
+                stage=launch_errors.STAGE_PREFLIGHT,
+                http_status=exc.status,
+                classifier=exc.classifier,
+                reason=exc.reason,
+                order_id=preflight_order_id,
+            )
         return LaunchOutcome(
             disposition=RETRIABLE,
-            emit={
-                "ok": False,
-                "outcome": "preflight-failure",
-                "error": str(exc),
-            },
+            emit=failure_emit,
             exit_code=EXIT_PREFLIGHT_FAILURE,
         )
 
@@ -2243,7 +2318,8 @@ def launch_on_miner(
         "ok": result.ok,
         "outcome": "miner-accepted" if result.ok else "miner-rejected",
         "status": result.status,
-        "classifier": result.classifier,
+        # Miner bytes: printable and bounded (a static class is unchanged).
+        "classifier": launch_errors.printable(result.classifier),
         "miner_id": miner.miner_id,
         "target_addr": (
             f"{miner.netbird_ip}:{order_dispatch.DEFAULT_MINER_ORDERS_PORT}"
@@ -2387,6 +2463,22 @@ def launch_on_miner(
     _record_cvm_start_evidence(
         miner, accepted=result.ok, classifier=result.classifier
     )
+    # What the miner's operator sees (`GET /v1/operator/nodes`). Recording
+    # only — the ledger feeds nothing the scheduler reads.
+    # A 409 `order-in-flight` is this same order still running there — vali
+    # re-asking, not a refusal.
+    if result.ok:
+        launch_errors.record_ok(miner)
+    elif not (result.status == 409 and result.classifier == "order-in-flight"):
+        emit["miner_error"] = _record_launch_error(
+            miner,
+            spec.vm_id,
+            stage=launch_errors.STAGE_LAUNCH,
+            http_status=result.status,
+            classifier=result.classifier,
+            reason=result.reason,
+            order_id=order_id,
+        )
     if not result.ok and _launch_refusal_is_disk(result.status, result.classifier):
         # 507 `insufficient-disk` AFTER the KBS register (the budget
         # reservation or the statvfs check at disk-file create). A capacity
@@ -2427,6 +2519,40 @@ def launch_on_miner(
         os_pool=os_pool if result.ok and result.classifier != _ALREADY_LAUNCHED else None,
         chosen_os_pool=os_pool,
     )
+
+
+def _record_launch_error(
+    miner: MinerIdentity,
+    vm_id: str,
+    *,
+    stage: str,
+    http_status: int,
+    classifier: str,
+    reason: str,
+    order_id: str,
+) -> dict[str, Any]:
+    """Record a failed preflight/launch answer in the miner's launch-error
+    ledger and log it. Returns the sanitized entry, for the LaunchJob's
+    `result_json` — the raw miner bytes go nowhere."""
+    entry = launch_errors.failure_entry(
+        stage=stage,
+        http_status=http_status,
+        classifier=classifier,
+        reason=reason,
+        order_id=order_id,
+    )
+    launch_errors.record_failure(miner, entry)
+    log.warning(
+        "launch: miner=%s vm_id=%s %s refused status=%d class=%s code=%s order_id=%s",
+        miner.miner_id,
+        vm_id,
+        stage,
+        entry["http_status"],
+        entry["class"],
+        entry["code"],
+        entry["order_id"],
+    )
+    return entry
 
 
 def _record_cvm_start_evidence(
@@ -2616,7 +2742,7 @@ class LaunchResult:
     placement_id: str | None = None
     cose_ticket: bytes | None = None
     emit: dict[str, Any] = field(default_factory=dict)
-    attempts: list[dict[str, str]] = field(default_factory=list)
+    attempts: list[dict[str, Any]] = field(default_factory=list)
     # True iff the launch got PAST the §24 KBS `register-vm` on some miner
     # (`LaunchOutcome.registered`). Only meaningful when `ok` is False: it
     # says the vm_id is now permanently bound at the KBS to a host it may
@@ -2759,6 +2885,7 @@ def _place_and_launch(
                         == power_policy.STOP
                     ),
                     require_failover_peer=getattr(spec, "require_failover_peer", False),
+                    os_disk_tier=_os_disk_tier(spec),
                 ),
             )
         except PlacementError as exc:
@@ -2884,6 +3011,11 @@ def _place_and_launch(
                 "miner_node_id": node_id,
                 "miner_id": miner.miner_id,
                 "disposition": out.disposition,
+                **(
+                    {"miner_error": out.emit["miner_error"]}
+                    if "miner_error" in out.emit
+                    else {}
+                ),
                 **(
                     {"dispatch_retries": str(dispatch_retries)}
                     if dispatch_retries
@@ -3263,7 +3395,12 @@ def _persist_telemetry_source(vm_id: str, vk: bytes) -> None:
 
 
 def _persist_billing_binding(
-    vm_id: str, node_id_hex: str, resource_class: str, lease_id: str
+    vm_id: str,
+    node_id_hex: str,
+    resource_class: str,
+    lease_id: str,
+    *,
+    os_disk_tier: str = "nvme",
 ) -> None:
     """§23 — record the authoritative billing identity vali provisioned for
     `vm_id` (the miner `node_id`, `resource_class`, `lease_id`). The usage
@@ -3293,6 +3430,7 @@ def _persist_billing_binding(
             "node_id_hex": node_id_hex,
             "resource_class": resource_class,
             "lease_id": lease_id,
+            "os_disk_tier": os_disk_tier,
         },
     )
     billing.record_assignment(
@@ -4128,9 +4266,10 @@ def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
 
 def _record_os_pool(placement: Any, pool_id: str) -> None:
     """A4b: the placement's OS disk is on `pool_id` (a placement without
-    a row is on `default`). Sized as the placement commits it; the tier is
-    the one every OS disk is sold at today (no tier choice yet)."""
-    from apps.disktier.models import OS_SLOT, DiskKind, DiskTier, PlacementDisk
+    a row is on `default`). Sized as the placement commits it, at the tier
+    its VM was sold at."""
+    from apps.disktier import os_tier
+    from apps.disktier.models import OS_SLOT, DiskKind, PlacementDisk
     from apps.scheduler.service import placement_disk_gb
 
     PlacementDisk.objects.get_or_create(
@@ -4140,7 +4279,7 @@ def _record_os_pool(placement: Any, pool_id: str) -> None:
             "kind": DiskKind.POOL,
             "pool_id": pool_id,
             "size_gb": placement_disk_gb(placement.resource_class, placement.data_disk_gb),
-            "required_tier": DiskTier.NVME,
+            "required_tier": os_tier.launch_tier(placement.vm.vm_id),
         },
     )
 

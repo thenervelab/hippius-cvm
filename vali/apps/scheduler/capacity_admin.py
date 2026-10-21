@@ -78,6 +78,11 @@ WORKING_FIELDS: frozenset[str] = frozenset(
 #: The audit `field` of an operator note — records a decision, changes
 #: no column.
 NOTE_FIELD = "note"
+#: The audit `field` of a strike — a vali-attributed fault charged to a
+#: miner whose ceiling had nothing left to lower (already at the floor).
+#: Changes no column; keeps the fault on the record and the event's
+#: incident idempotent (`capacity_earn.record_event`).
+STRIKE_FIELD = "strike"
 
 
 @dataclass(frozen=True)
@@ -204,4 +209,21 @@ def record_note(node_id: str, *, actor: str, reason: str) -> MinerCapacityAudit:
         raise ValueError("a note needs an actor and a reason")
     return MinerCapacityAudit.objects.create(
         miner_node_id=node_id, actor=actor, field=NOTE_FIELD, before=None, after=None, reason=reason
+    )
+
+
+def record_strike(row: MinerCapacity, *, actor: str, reason: str) -> MinerCapacityAudit:
+    """A strike on `row` (see `STRIKE_FIELD`). Same locking contract as
+    [`apply_capacity_change`]: `row` held under `select_for_update()`."""
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("record_strike needs a locked row inside transaction.atomic()")
+    if not actor or not reason:
+        raise ValueError("a strike needs an actor and a reason")
+    return MinerCapacityAudit.objects.create(
+        miner_node_id=row.miner_node_id,
+        actor=actor,
+        field=STRIKE_FIELD,
+        before=None,
+        after=None,
+        reason=reason,
     )

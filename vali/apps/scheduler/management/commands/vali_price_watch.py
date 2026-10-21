@@ -238,6 +238,7 @@ class Command(BaseCommand):
                 max_family_per_node=service.cdn_family_cap(family),
                 **service.cdn_edge_arguments(family, intent.vm_id),
                 **service.group_arguments(intent.vm_id),
+                **service.disk_tier_arguments(resource_class, vm_id=intent.vm_id),
                 **service.failover_peer_arguments(
                     service.launch_requires_failover_peer(intent.vm_id), intent.vm_id
                 ),

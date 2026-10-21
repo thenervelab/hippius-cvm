@@ -35,6 +35,7 @@ ROW_KEYS = {
     "capacity",
     "failover_capable",
     "node_ids",
+    "os_disk_tiers",
 }
 BODY_KEYS = {"regions", "unlocated_miners", "require_verified", "vantage", "generated_at"}
 
@@ -113,6 +114,12 @@ def test_shape_of_a_region_row(operator_client: APIClient) -> None:
         "capacity": row["capacity"],
         "failover_capable": False,
         "node_ids": [node_id(1)],
+        # A pre-v7 miner (no pool rows) holds every tier; nvme alone is sold.
+        "os_disk_tiers": {
+            "nvme": {"placeable": True, "hosts": 1},
+            "ssd": {"placeable": False, "hosts": 1},
+            "hdd": {"placeable": False, "hosts": 1},
+        },
     }
     assert _legacy(row["capacity"]) == {"total_units": 6, "committed_units": 2, "free_units": 4}
 
@@ -299,3 +306,83 @@ def test_a_cordoned_or_quarantined_peer_breaks_the_pair(operator_client: APIClie
     MinerCapacity.objects.filter(miner_node_id=node_id(2)).update(cordoned_at=None)
     MinerIdentity.objects.filter(chain_node_id=node_id(2)).update(status="quarantined")
     assert _failover_capable(operator_client) == {"FR": False}
+
+
+# ── os_disk_tiers ───────────────────────────────────────────────────
+
+
+def _default_pool(seed: int, declared: str) -> None:
+    from apps.disktier.models import MinerStoragePool
+
+    MinerStoragePool.objects.create(
+        miner_node_id=node_id(seed), pool_id="default", declared_class=declared, os_disks=True
+    )
+
+
+def test_os_disk_tiers_count_the_hosts_with_an_os_pool_at_each_tier(
+    operator_client: APIClient, settings
+) -> None:
+    for seed, declared in ((1, "nvme"), (2, "ssd"), (3, "hdd")):
+        _located(seed, "FR")
+        _capacity(seed)
+        _default_pool(seed, declared)
+    _located(4, "DE")
+    _capacity(4)
+    tiers = {r["region"]: r["os_disk_tiers"] for r in operator_client.get(URL).json()["regions"]}
+    # Gate off: placement checks no tier, so nvme is placeable on any miner;
+    # ssd / hdd are not sold.
+    assert tiers["FR"] == {
+        "nvme": {"placeable": True, "hosts": 1},
+        "ssd": {"placeable": False, "hosts": 2},
+        "hdd": {"placeable": False, "hosts": 3},
+    }
+    settings.VALI_SCHEDULER_DISK_TIER_GATE = "enforce"
+    settings.VALI_SELLABLE_OS_TIERS = ["nvme", "hdd"]
+    tiers = {r["region"]: r["os_disk_tiers"] for r in operator_client.get(URL).json()["regions"]}
+    assert tiers["FR"] == {
+        "nvme": {"placeable": True, "hosts": 1},
+        "ssd": {"placeable": False, "hosts": 2},
+        "hdd": {"placeable": True, "hosts": 3},
+    }
+    # DE's miner reports no pools: a pre-v7 single pool, nvme.
+    assert tiers["DE"]["hdd"] == {"placeable": True, "hosts": 1}
+
+
+def test_enforced_a_tier_no_host_holds_is_not_placeable(
+    operator_client: APIClient, settings
+) -> None:
+    settings.VALI_SCHEDULER_DISK_TIER_GATE = "enforce"
+    _located(1, "FR")
+    _capacity(1)
+    _default_pool(1, "ssd")
+    tiers = operator_client.get(URL).json()["regions"][0]["os_disk_tiers"]
+    assert tiers["nvme"] == {"placeable": False, "hosts": 0}
+
+
+def test_gate_off_nvme_is_placeable_where_no_pool_says_nvme(operator_client: APIClient) -> None:
+    """Off, placement checks no tier: `hosts` reports the pools, `placeable`
+    what a launch does."""
+    _located(1, "FR")
+    _capacity(1)
+    _default_pool(1, "ssd")
+    tiers = operator_client.get(URL).json()["regions"][0]["os_disk_tiers"]
+    assert tiers["nvme"] == {"placeable": True, "hosts": 0}
+
+
+def test_a_gated_miner_offers_no_tier(operator_client: APIClient, settings) -> None:
+    settings.VALI_SCHEDULER_DISK_TIER_GATE = "enforce"
+    _located(1, "FR")
+    _capacity(1)
+    _located(2, "FR")
+    MinerCapacity.objects.create(
+        miner_node_id=node_id(2),
+        status="active",
+        capacity_slots=6,
+        observed_epoch=10,
+        data_epoch=10,
+        refreshed_at=timezone.now(),
+    )
+    MinerCapacity.objects.filter(miner_node_id=node_id(1)).update(status="quarantined")
+    row = operator_client.get(URL).json()["regions"][0]
+    assert row["miners_dispatchable"] == 2, "both counted; the quarantined one offers nothing"
+    assert row["os_disk_tiers"]["nvme"] == {"placeable": True, "hosts": 1}

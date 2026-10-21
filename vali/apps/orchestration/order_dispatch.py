@@ -115,11 +115,17 @@ class DispatchResult:
       on 4xx — opaque to vali, surfaced verbatim so the orchestrator
       can branch on the exact failure mode (``bad-signature``,
       ``order-id-collision``, ``replay``, …).
+    - ``reason`` is the finer static code an agent that sends one puts in
+      the ``x-hippius-reason`` response header (``libvirt-driver/define``),
+      relayed by the Edge; ``""`` otherwise. Miner-controlled and
+      UNSANITIZED here — only ever recorded through
+      ``apps.miners.launch_errors``, never branched on.
     """
 
     ok: bool
     status: int
     classifier: str
+    reason: str = ""
 
 
 def _required_setting(name: str) -> str:
@@ -291,10 +297,11 @@ def _post_to_edge(
     kind: str,
     edge_url: str,
     timeout_s: float,
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, str]:
     """One HTTP POST to the Edge inner listener. Returns
-    ``(status, response_body)``. Raises ``OrderDispatchUnavailable`` on
-    a transport failure — the URL never reaches the exception text.
+    ``(status, response_body, reason_header)``. Raises
+    ``OrderDispatchUnavailable`` on a transport failure — the URL never
+    reaches the exception text.
     """
     # Build the Request inside the try/except so even
     # `http.client.InvalidURL` / `ValueError` raised by `Request.__init__`
@@ -313,11 +320,11 @@ def _post_to_edge(
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=timeout_s) as resp:  # noqa: S310
-            return resp.status, resp.read()
+            return resp.status, resp.read(), _reason_header(resp.headers)
     except urllib.error.HTTPError as exc:
         # The Edge / miner answered with a non-2xx — read the body for
         # the classifier and return; never raise on an HTTP response.
-        return exc.code, exc.read()
+        return exc.code, exc.read(), _reason_header(exc.headers)
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         # Transport failure — Edge unreachable, DNS, connect refused,
         # timeout. The error text is a STATIC classifier; the original
@@ -338,6 +345,17 @@ def _post_to_edge(
         # not derived from request input, so `Misconfigured` is the
         # right class.
         raise OrderDispatchMisconfigured("VALI_EDGE_ORDER_URL is malformed") from exc
+
+
+#: The miner's finer reason code, relayed by the Edge (see `DispatchResult`).
+REASON_HEADER = "x-hippius-reason"
+#: Longer than any code; the cap only bounds what a miner can hand vali.
+_MAX_REASON_HEADER = 256
+
+
+def _reason_header(headers: Any) -> str:
+    value = headers.get(REASON_HEADER) if headers is not None else None
+    return value.strip()[:_MAX_REASON_HEADER] if isinstance(value, str) else ""
 
 
 def dispatch_order(
@@ -387,7 +405,7 @@ def dispatch_order(
     target_addr = f"{netbird_ip}:{DEFAULT_MINER_ORDERS_PORT}"
     timeout = float(timeout_s if timeout_s is not None else DEFAULT_DISPATCH_TIMEOUT_S)
 
-    status, resp_body = _post_to_edge(
+    status, resp_body, reason = _post_to_edge(
         body_bytes=body_bytes,
         target_addr=target_addr,
         kind=kind,
@@ -405,7 +423,7 @@ def dispatch_order(
         status,
         ok,
     )
-    return DispatchResult(ok=ok, status=status, classifier=classifier)
+    return DispatchResult(ok=ok, status=status, classifier=classifier, reason=reason)
 
 
 #: Upstream statuses that say "the outcome is UNKNOWN", not "refused": the

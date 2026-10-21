@@ -269,6 +269,37 @@ def earn_decay_after_s() -> int:
     return _int("VALI_CAPACITY_EARN_DECAY_AFTER_S", 14 * 86400, minimum=3600)
 
 
+def declared_ceiling_enabled() -> bool:
+    """`VALI_CAPACITY_DECLARED_CEILING` — self-service sizing of an
+    `earned` miner nobody anchored (default False: everything as before).
+
+    On, three things change, all on `earned` rows only:
+
+    - growth is bounded by the host's HARDWARE CEILING
+      (`capacity_earn.hardware_ceiling`: the heartbeat-declared budgets,
+      the anchor when there is one): a held proof never raises a ceiling
+      past what the miner says its machine has, and a dimension with no
+      ceiling signal does not grow at all. The ceiling never GRANTS
+      anything — only held proof does (`VALI_CAPACITY_EARN_PROOF`);
+    - guest-attested resource shortfalls corroborated by
+      `VALI_CAPACITY_SHORTFALL_MIN_OWNERS` distinct tenants lower the
+      earned ceiling (`capacity_earn.GUEST_RESOURCE_SHORT`);
+    - a charged event that moves nothing (the ceiling is already at the
+      floor) still lands a `strike` audit row, and the fleet's
+      `no-hardware-anchor` alert fires only where vali has no hardware
+      figure at all (`capacity_source` `unknown` or `earned`)."""
+    name = "VALI_CAPACITY_DECLARED_CEILING"
+    return parse_flag(name, getattr(settings, name, False))
+
+
+def shortfall_min_owners() -> int:
+    """`VALI_CAPACITY_SHORTFALL_MIN_OWNERS` — distinct tenants whose VMs on
+    one host must attest less than their flavor before it costs the host
+    earned capacity. Root inside a guest can forge its own figures, so one
+    tenant alone must not be able to shrink a miner (hence the minimum 2)."""
+    return _int("VALI_CAPACITY_SHORTFALL_MIN_OWNERS", 2, minimum=2)
+
+
 def validate_all() -> None:
     """Read every knob once; the first malformed one raises."""
     for getter in (
@@ -297,6 +328,8 @@ def validate_all() -> None:
         earn_penalty_factor,
         earned_inflight_max,
         earn_decay_after_s,
+        declared_ceiling_enabled,
+        shortfall_min_owners,
     ):
         getter()
     from .capacity_earn import proof_source

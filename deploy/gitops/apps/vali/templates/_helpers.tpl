@@ -243,3 +243,43 @@ of points of an earlier boot (VALI_RESTORE_ROLLBACK_ENABLED), and
   value: {{ .Values.vmBackup.failoverCrossGenVmIds | default "" | quote }}
 {{- end }}
 {{- end }}
+
+{{/*
+`vali.netLaunchSpecEnv` — the guest NIC spec on launch, relaunch and §25
+orders (`net_policy.launch_net_spec`). A named template because THREE
+processes build those orders and must agree: the web pod (power
+start/reboot, guest-upgrade recover, `vali_create_vm`), launch-tick
+(`launch_vm`) and orchestration-tick (reboot-recovery, resize, guest
+upgrade, userdata restage, §25 activation). One that dispatched without
+the spec while the others carry it would launch an uncapped,
+unfiltered NIC on a miner that is meant to have one.
+`VALI_NET_LAUNCH_SPEC` always renders ("false" = the code default);
+`_MINERS`, `_ISOLATE` and the `netLaunchSpec.caps` overrides
+(VALI_NET_CAP_*) only when it is "true".
+*/}}
+{{- define "vali.netLaunchSpecEnv" -}}
+{{- $spec := .Values.netLaunchSpec | default dict }}
+{{- $enabled := toString ($spec.enabled | default "false") -}}
+- name: VALI_NET_LAUNCH_SPEC
+  value: {{ $enabled | quote }}
+{{- if eq $enabled "true" }}
+- name: VALI_NET_LAUNCH_SPEC_MINERS
+  value: {{ $spec.miners | default "" | quote }}
+- name: VALI_NET_LAUNCH_ISOLATE
+{{- /* hasKey, not `| default`: a bool false would read as unset. */}}
+  value: {{ ternary (toString $spec.isolate) "true" (hasKey $spec "isolate") | quote }}
+{{- $caps := $spec.caps | default dict }}
+{{- with $caps.byFlavor }}
+- name: VALI_NET_CAP_MBPS_BY_FLAVOR
+  value: {{ . | quote }}
+{{- end }}
+{{- with $caps.defaultMbps }}
+- name: VALI_NET_CAP_DEFAULT_MBPS
+  value: {{ toString . | quote }}
+{{- end }}
+{{- with $caps.publicIpMbps }}
+- name: VALI_NET_CAP_PUBLIC_IP_MBPS
+  value: {{ toString . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}

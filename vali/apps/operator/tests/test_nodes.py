@@ -41,6 +41,9 @@ ROW_KEYS = {
     "refusal_breakdown_30d",
     "location",
     "storage_requirement",
+    "last_launch_error",
+    "launch_fail_streak",
+    "recent_launch_errors",
 }
 
 #: A stored reason the scheduler's §13 re-eval writes — a real refusal.
@@ -242,6 +245,9 @@ def test_full_row_for_a_healthy_node(operator_client: APIClient) -> None:
             "lapsed_since": None,
             "grace_until": None,
         },
+        "last_launch_error": None,
+        "launch_fail_streak": 0,
+        "recent_launch_errors": [],
     }
 
 
@@ -853,3 +859,96 @@ def test_location_is_serialised_from_the_probe_row(operator_client: APIClient) -
         "verdict_reasons": ["peer-stale"],
         "observed_at": row.observed_at.isoformat(),
     }
+
+
+# ─── launch errors (`apps.miners.launch_errors`) ─────────────────────
+
+
+def _launch_failure(miner, *, code: str = "", cls: str = "dispatch-failed", order_id: str = ""):
+    from apps.miners import launch_errors
+
+    launch_errors.record_failure(
+        miner,
+        launch_errors.failure_entry(
+            stage=launch_errors.STAGE_LAUNCH,
+            http_status=500,
+            classifier=cls,
+            reason=code,
+            order_id=order_id,
+        ),
+    )
+
+
+def test_launch_errors_are_served_newest_first(operator_client: APIClient) -> None:
+    miner = make_dispatchable_identity(1)
+    _launch_failure(miner, code="libvirt-driver/define", order_id="ord-a-1")
+    _launch_failure(miner, code="tenant-preflight/ovmf-missing", order_id="ord-a-2")
+
+    row = _get(operator_client, node_id(1)).json()["nodes"][0]
+
+    assert row["launch_fail_streak"] == 2
+    assert [e["code"] for e in row["recent_launch_errors"]] == [
+        "tenant-preflight/ovmf-missing",
+        "libvirt-driver/define",
+    ]
+    last = row["last_launch_error"]
+    assert last == row["recent_launch_errors"][0]
+    assert set(last) == {"code", "class", "http_status", "stage", "order_id", "at"}
+    assert last["class"] == "dispatch-failed"
+    assert last["http_status"] == 500
+    assert last["stage"] == "launch"
+    assert last["order_id"] == "ord-a-2"
+
+
+def test_a_success_resets_the_streak_and_keeps_the_history(operator_client: APIClient) -> None:
+    from apps.miners import launch_errors
+
+    miner = make_dispatchable_identity(1)
+    _launch_failure(miner, code="libvirt-driver/create")
+    launch_errors.record_ok(miner)
+
+    row = _get(operator_client, node_id(1)).json()["nodes"][0]
+
+    assert row["launch_fail_streak"] == 0
+    assert row["last_launch_error"]["code"] == "libvirt-driver/create"
+
+
+def test_launch_errors_are_per_node(operator_client: APIClient) -> None:
+    _launch_failure(make_dispatchable_identity(1), code="libvirt-driver/define")
+    make_dispatchable_identity(2)
+
+    rows = {r["node_id"]: r for r in _get(operator_client, node_id(1), node_id(2)).json()["nodes"]}
+
+    assert rows[node_id(1)]["launch_fail_streak"] == 1
+    assert rows[node_id(2)]["last_launch_error"] is None
+    assert rows[node_id(2)]["recent_launch_errors"] == []
+
+
+def test_launch_errors_cost_no_extra_query(operator_client: APIClient) -> None:
+    """The ledger rides the identity query (`select_related`), however many
+    nodes carry one."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    _launch_failure(make_dispatchable_identity(1), code="libvirt-driver/define")
+    with CaptureQueriesContext(connection) as one:
+        _get(operator_client, node_id(1))
+    for seed in range(2, 6):
+        _launch_failure(make_dispatchable_identity(seed), code="libvirt-driver/define")
+    with CaptureQueriesContext(connection) as five:
+        body = _get(operator_client, *(node_id(s) for s in range(1, 6))).json()
+    assert all(r["launch_fail_streak"] == 1 for r in body["nodes"])
+    assert len(five) == len(one), (len(one), len(five))
+
+
+def test_schema_publishes_the_launch_error_shape() -> None:
+    from drf_spectacular.generators import SchemaGenerator
+
+    comps = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+    node = comps["OperatorNode"]
+    for key in ("last_launch_error", "launch_fail_streak", "recent_launch_errors"):
+        assert key in node["properties"]
+        assert key not in node.get("required", [])  # optional during the rollout
+    err = comps["OperatorLaunchError"]
+    assert set(err["properties"]) == {"code", "class", "http_status", "stage", "order_id", "at"}
+    assert set(_enum(comps, err["properties"]["stage"])) == {"preflight", "launch"}
