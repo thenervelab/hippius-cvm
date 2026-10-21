@@ -19,6 +19,7 @@ from apps.scheduler.models import (
     CapacityTrustClass,
     MinerCapacity,
     MinerCapacityAudit,
+    Placement,
     PlacementStatus,
 )
 
@@ -463,6 +464,23 @@ def test_live_attestation_proof_counts_distinct_guests_alive_the_whole_hold() ->
     assert sample is not None and sample.vms == 2
     m, c = service._committed_resources("small")
     assert (sample.vcpus, sample.memory_mb) == (2 * c, 2 * m)
+
+
+@override_settings(
+    VALI_CAPACITY_EARN_PROOF="live-attestation",
+    VALI_CAPACITY_EARN_HOLD_S=HOLD,
+    VALI_SYNTHETIC_TENANT_ID="synthetic-monitor",
+)
+def test_our_own_vms_are_never_proof_of_fill() -> None:
+    """Claim: a miner earns no capacity for hosting OUR VMs (synthetic
+    probes, canaries, load tests: the reward-excluded owners), exactly as
+    it earns no pay for them."""
+    now = _proof_setup(2)
+    Placement.objects.filter(vm__vm_id="vm-small-bound-1").update(owner="synthetic-monitor")
+    _alive("vm-small-bound-0", report="a1", now=now)
+    _alive("vm-small-bound-1", report="a2", now=now)
+    sample = capacity_earn.proven_concurrency(NODE, now=timezone.now())
+    assert sample is not None and sample.vms == 1
 
 
 @override_settings(VALI_CAPACITY_EARN_PROOF="live-attestation", VALI_CAPACITY_EARN_HOLD_S=HOLD)

@@ -153,6 +153,35 @@ class VerdictTest(unittest.TestCase):
         )
 
 
+class GoldenPathsVerdictTest(unittest.TestCase):
+    def test_umask_closing_qemu_out(self) -> None:
+        self.assertEqual(codes(judge(unit_umask="0077")), ["AGENT_UMASK_BLOCKS_QEMU"])
+        self.assertEqual(codes(judge(unit_umask="0027")), ["AGENT_UMASK_BLOCKS_QEMU"])
+        self.assertEqual(codes(judge(unit_umask="0022")), [])
+        self.assertEqual(codes(judge(unit_umask="")), [])
+
+    def test_a_symlink_above_the_agent_tree_only_warns(self) -> None:
+        verdict = judge(symlink_0="/srv/vms|/srv|/mnt/nvme/srv")
+        self.assertEqual(codes(verdict), [])
+        self.assertEqual([w["code"] for w in verdict["warnings"]], ["STORAGE_PATH_SYMLINK"])
+
+    def test_a_symlink_on_the_way_is_refused_with_the_bind_mount(self) -> None:
+        verdict = judge(symlink_0="/var/lib/hippius-miner/staging|/var/lib/hippius-miner/staging|/srv/big/staging")
+        self.assertEqual(codes(verdict), ["STORAGE_PATH_SYMLINK"])
+        self.assertIn("/srv/big/staging /var/lib/hippius-miner/staging none bind 0 0", verdict["failures"][0]["fix"])
+        self.assertEqual(codes(judge(symlink_0="/var/lib/hippius-miner||")), [])
+
+    def test_apparmor_denials_are_coded_by_dir(self) -> None:
+        verdict = judge(
+            smoke="fail",
+            smoke_err="Could not open '/x/rootfs.img': Permission denied",
+            apparmor_denied_0="STAGING|/srv/big/staging/.s/rootfs.img|r|libvirt-0000",
+            apparmor_denied_1="WEIRD|/etc/x|r|libvirt-0000",
+        )
+        self.assertEqual(codes(verdict), ["LAUNCH_SMOKE_FAILED", "APPARMOR_DENIED_STAGING", "APPARMOR_DENIED_OTHER"])
+        self.assertIn("/srv/big/staging/.s/rootfs.img", verdict["failures"][1]["detail"])
+
+
 class NetworkClashTest(unittest.TestCase):
     ROUTES = (
         "default via 203.0.113.1 dev eno1 proto static\n"
@@ -196,6 +225,7 @@ case "$1" in
   nwfilter-dumpxml) [ "${FAKE_NWFILTER:-1}" = 1 ] ;;
   create)
     cp "$2" "$FAKE_DIR/created.xml"
+    [ -z "${FAKE_MODES:-}" ] || stat -c '%a %n' "$(dirname "$2")" >>"$FAKE_DIR/modes"
     if [ -n "${FAKE_CREATE_ERR:-}" ]; then echo "$FAKE_CREATE_ERR" >&2; exit 1; fi
     if [ -n "${FAKE_CREATE_LATE:-}" ]; then
       # libvirtd finishes the create after the client gave up.
@@ -220,6 +250,7 @@ case "$1" in
     case "$4" in
       ProtectSystem) echo strict ;;
       ReadWritePaths) echo "$FAKE_RW" ;;
+      UMask) echo "${FAKE_UMASK:-0022}" ;;
       *) echo "" ;;
     esac ;;
 esac
@@ -260,6 +291,16 @@ case " $* " in *" iflag=direct "*) echo "dd: IO error: Invalid input" >&2; exit 
 """,
     "id": "#!/bin/bash\necho 64055\n",
     "chown": "#!/bin/bash\nexit 0\n",
+    # The kernel log: with $FAKE_DENIED set, a DENIED line for the smoke
+    # domain's own profile, and always one for an unrelated profile.
+    "journalctl": r"""#!/bin/bash
+echo "$*" >>"$FAKE_DIR/journalctl-calls"
+echo 'audit: type=1400 apparmor="DENIED" operation="open" profile="libvirt-00000000-0000-0000-0000-000000000000" name="/elsewhere/x.raw" requested_mask="r"'
+if [ -n "${FAKE_DENIED:-}" ]; then
+  uuid=$(sed -nE 's/.*<uuid>(.*)<\/uuid>.*/\1/p' "$FAKE_DIR/created.xml")
+  echo "audit: type=1400 apparmor=\"DENIED\" operation=\"open\" profile=\"libvirt-$uuid\" name=\"$FAKE_DENIED\" pid=1 comm=\"qemu-system-x86\" requested_mask=\"r\" denied_mask=\"r\""
+fi
+""",
 }
 
 
@@ -334,7 +375,92 @@ class ProbeTest(unittest.TestCase):
         return lpf.parse_probe(out.stdout)
 
     def leftovers(self) -> list:
-        return sorted(p.name for p in self.data.iterdir())
+        """Every scratch file or dir the probe could have left anywhere
+        under the data root (the agent subdirs and the staging dir too)."""
+        return sorted(
+            str(p.relative_to(self.data)) for p in self.data.rglob("*") if "hippius-preflight" in p.name
+        )
+
+    def golden_layout(self) -> None:
+        """The agent's subdirs, a host kernel and the tenant OVMF."""
+        for sub in ("staging", "overlay", "state", "data"):
+            (self.data / sub).mkdir()
+        self.kernel = self.data.parent / "vmlinuz-host"
+        self.kernel.write_bytes(b"MZ kernel")
+        self.ovmf = self.data / "ovmf.fd"
+        self.ovmf.write_bytes(b"ovmf")
+
+    def test_the_smoke_domain_opens_what_a_golden_tenant_opens(self) -> None:
+        self.golden_layout()
+        probe = self.run_probe(
+            "--write", "--smoke", "--host-kernel", str(self.kernel), "--ovmf", str(self.ovmf)
+        )
+        self.assertEqual(probe["smoke"], "ok")
+        self.assertEqual(probe["smoke_kernel"], "ok")
+        self.assertEqual(codes(lpf.miner_launch_preflight(probe, FACTS)), [])
+        xml = (self.fake / "created.xml").read_text()
+        stage = f"{self.data}/staging/.hippius-preflight-smoke."
+        self.assertIn(f"<kernel>{stage}", xml)
+        self.assertIn(f"<initrd>{stage}", xml)
+        self.assertIn(f"<loader type='rom'>{self.ovmf}</loader>", xml)
+        for sub, disk in (("overlay", "overlay"), ("state", "state"), ("data", "data")):
+            self.assertIn(f"<source file='{self.data}/{sub}/.hippius-preflight-smoke-", xml)
+            self.assertIn(f"-{disk}.raw'/>", xml)
+        # The rootfs data + hash disks are read-only, like a tenant's.
+        for name, dev in (("rootfs.img", "vdb"), ("rootfs.verity", "vdc")):
+            block = xml.split(f"/{name}'/>")[1].split("</disk>")[0]
+            self.assertIn(f"<target dev='{dev}'", block)
+            self.assertIn("<readonly/>", block)
+        self.assertIn("<uuid>", xml)
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse((self.fake / "journalctl-calls").exists())
+
+    def test_a_symlinked_staging_dir_is_refused(self) -> None:
+        self.golden_layout()
+        (self.data / "staging").rmdir()
+        elsewhere = self.data.parent / "big-disk-staging"
+        elsewhere.mkdir()
+        os.chmod(elsewhere, 0o755)
+        (self.data / "staging").symlink_to(elsewhere)
+        probe = self.run_probe("--write", "--smoke", "--host-kernel", str(self.kernel))
+        # Inside the agent's tree: refused.
+        verdict = lpf.miner_launch_preflight(probe, {**FACTS, "state_dir": str(self.data)})
+        self.assertEqual(codes(verdict), ["STORAGE_PATH_SYMLINK"])
+        self.assertIn(f"{self.data}/staging is a symlink (to {elsewhere})", verdict["failures"][0]["detail"])
+        # Above it (libvirt canonicalises): a warning only.
+        outside = lpf.miner_launch_preflight(probe, FACTS)
+        self.assertEqual(codes(outside), [])
+        self.assertEqual([w["code"] for w in outside["warnings"]], ["STORAGE_PATH_SYMLINK"])
+        self.assertEqual(sorted(p.name for p in elsewhere.iterdir()), [])
+
+    def test_the_smoke_uses_the_agent_umask_and_old_vm_dirs_are_walked(self) -> None:
+        self.golden_layout()
+        old_vm = self.data / "staging" / "tenant-a"
+        old_vm.mkdir()
+        os.chmod(old_vm, 0o700)
+        probe = self.run_probe(
+            "--write", "--smoke", "--host-kernel", str(self.kernel),
+            FAKE_UMASK="0077", FAKE_BLOCKED=str(old_vm), FAKE_MODES="1",
+        )
+        verdict = lpf.miner_launch_preflight(probe, FACTS)
+        self.assertEqual(codes(verdict), ["QEMU_CANNOT_TRAVERSE_DATA_ROOT", "AGENT_UMASK_BLOCKS_QEMU"])
+        self.assertIn(f"cannot enter {old_vm} (drwx------", verdict["failures"][0]["detail"])
+        # The smoke's staging dir got the agent's 0700, not a friendlier mode.
+        self.assertIn("700 ", (self.fake / "modes").read_text())
+
+    def test_an_apparmor_denial_is_named_with_its_dir(self) -> None:
+        self.golden_layout()
+        probe = self.run_probe(
+            "--write", "--smoke", "--host-kernel", str(self.kernel),
+            FAKE_CREATE_ERR="error: Failed to start domain: Could not open '/x/rootfs.img': Permission denied",
+            FAKE_DENIED="/srv/big/staging/.hippius-preflight-smoke.abc/rootfs.img",
+        )
+        verdict = lpf.miner_launch_preflight(probe, FACTS)
+        self.assertEqual(codes(verdict), ["LAUNCH_SMOKE_FAILED", "APPARMOR_DENIED_STAGING"])
+        # Only this smoke domain's profile, only since the smoke started.
+        self.assertNotIn("apparmor_denied_1", probe)
+        self.assertIn("--since @", (self.fake / "journalctl-calls").read_text())
+        self.assertEqual(self.leftovers(), [])
 
     def test_read_only_probe_on_a_healthy_host(self) -> None:
         probe = self.run_probe()

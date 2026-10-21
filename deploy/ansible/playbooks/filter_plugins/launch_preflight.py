@@ -15,8 +15,12 @@ judges, after libvirt and the agent are installed (play 09):
   `cache='none'`, which QEMU opens with `O_DIRECT`;
 - the agent's systemd sandbox (`ProtectSystem=strict` + `ReadWritePaths`)
   can write both roots the agent's config names;
-- a paused, transient, non-SNP smoke domain with a raw `cache='none'`
-  disk under the data root and a NIC on `default` starts.
+- no symlink on the way to anything QEMU opens: the per-domain AppArmor
+  profile allows the given path, the kernel checks the resolved one;
+- a paused, transient, non-SNP smoke domain laid out like a golden
+  tenant (kernel, initrd, read-only rootfs + dm-verity disks in a staging
+  dir, overlay / state / data disks, the tenant OVMF, a NIC on `default`)
+  starts; if it does not, the AppArmor denials of its window are named.
 
 The play runs one probe (files/launch-preflight-probe.sh, `key=value`
 lines) and hands it here:
@@ -133,6 +137,9 @@ class _Report:
 
     def fail(self, code: str, detail: str, fix: str) -> None:
         self.failures.append({"code": code, "detail": detail, "fix": fix})
+
+    def warn(self, code: str, detail: str, fix: str) -> None:
+        self.warnings.append({"code": code, "detail": detail, "fix": fix})
 
 
 def _indexed(probe: dict[str, str], prefix: str, fields: int) -> list[list[str]]:
@@ -281,11 +288,81 @@ def _check_odirect(probe: dict[str, str], report: _Report) -> None:
             )
 
 
+def _check_symlinks(probe: dict[str, str], facts: dict[str, Any], report: _Report) -> None:
+    """A symlink inside the agent's fixed layout fails; one above it warns.
+
+    libvirt >= 12 canonicalises the paths it writes into the per-domain
+    AppArmor profile, so a link is not by itself a denial there; but the
+    agent's own checks (the pools root, the staging reclaim, which never
+    follows a link) assume its tree has none, and older or patched libvirt
+    builds do not canonicalise.
+    """
+    state_dir = str(facts.get("state_dir", "/var/lib/hippius-miner")).rstrip("/")
+    for path, link, target in _indexed(probe, "symlink", 3):
+        if not link:
+            continue
+        inside = _covered(link, [state_dir])
+        (report.fail if inside else report.warn)(
+            "STORAGE_PATH_SYMLINK",
+            f"{link} is a symlink (to {target or '?'}) on the way to {path}"
+            + (f": the agent's tree under {state_dir} must not contain links" if inside
+               else ": libvirt follows it, but a launch denied by AppArmor would point here"),
+            f"Replace the symlink with a bind mount at {link} (an /etc/fstab line "
+            f"`{target or '<target>'} {link} none bind 0 0`, then `mount {link}`), or point the "
+            "play's variables at the real path, then rerun the play.",
+        )
+
+
+def _check_umask(probe: dict[str, str], facts: dict[str, Any], report: _Report) -> None:
+    umask = probe.get("unit_umask", "")
+    unit = facts.get("unit_name", "hippius-miner-agent")
+    try:
+        bits = int(umask, 8)
+    except ValueError:
+        return
+    if bits & 0o001:
+        report.fail(
+            "AGENT_UMASK_BLOCKS_QEMU",
+            f"{unit}.service runs with UMask={umask}: every per-VM dir it creates (staging, "
+            "overlay, state, data) is closed to QEMU's user, so every launch fails "
+            "`disk-open-permission`",
+            "Rerun the play: the unit sets UMask=0022. Remove any drop-in or DefaultUMask= "
+            "(/etc/systemd/system.conf) that overrides it, then restart the agent the "
+            f"supported way (`systemctl kill --signal=SIGKILL {unit}`). Per-VM dirs a failed "
+            "launch left behind: `chmod o+x` them (QEMU_CANNOT_TRAVERSE_DATA_ROOT names them).",
+        )
+
+
+# What the smoke's files are, as the probe labels a denied path.
+_APPARMOR_DIRS = {
+    "STAGING": "the per-VM staging dir (kernel, initrd, rootfs + dm-verity disks)",
+    "OVERLAY": "the overlay disk dir",
+    "STATE": "the state disk dir",
+    "DATA": "the data disk dir",
+    "OVMF": "the tenant OVMF",
+    "OTHER": "a file outside the storage dirs",
+}
+
+
+def _check_apparmor(probe: dict[str, str], report: _Report) -> None:
+    for label, path, mask, profile in _indexed(probe, "apparmor_denied", 4):
+        label = label if label in _APPARMOR_DIRS else "OTHER"
+        report.fail(
+            f"APPARMOR_DENIED_{label}",
+            f"AppArmor ({profile or '?'}) denied `{mask or '?'}` on {path or '?'}, "
+            f"{_APPARMOR_DIRS[label]}, while the smoke domain started",
+            "That path is not the one libvirt was given: look for a symlink on the way "
+            "(STORAGE_PATH_SYMLINK) and use a bind mount at the configured path instead. "
+            "`aa-status` lists the profiles; `journalctl -k | grep 'apparmor=\"DENIED\"'` "
+            "shows every denial. Do not disable AppArmor for libvirt.",
+        )
+
+
 _SMOKE_HINTS: tuple[tuple[str, str], ...] = (
     ("clean-traffic", "LIBVIRT_NWFILTER_MISSING"),
     ("network 'default' is not active", "LIBVIRT_DEFAULT_NET_INACTIVE"),
     ("Network not found", "LIBVIRT_DEFAULT_NET_INACTIVE"),
-    ("Permission denied", "QEMU_CANNOT_OPEN_DATA_ROOT"),
+    ("Permission denied", "QEMU_CANNOT_OPEN_DATA_ROOT or an AppArmor denial"),
     ("Invalid argument", "DATA_ROOT_NO_ODIRECT"),
 )
 
@@ -297,8 +374,9 @@ def _check_smoke(probe: dict[str, str], report: _Report) -> None:
     hint = next((code for marker, code in _SMOKE_HINTS if marker in err), "")
     report.fail(
         "LAUNCH_SMOKE_FAILED",
-        f"a paused smoke domain (raw cache='none' disk under the data root, NIC on `default`) "
-        f"did not start: {err}" + (f" (looks like {hint})" if hint else ""),
+        "a paused smoke domain laid out like a golden tenant (kernel, initrd and read-only "
+        "rootfs disks in a staging dir, overlay/state/data disks, the tenant OVMF, a NIC on "
+        f"`default`) did not start: {err}" + (f" (looks like {hint})" if hint else ""),
         "Fix the cause libvirt names (the codes above usually say which); "
         "`journalctl -u libvirtd` and /var/log/libvirt/qemu/hippius-preflight-smoke-*.log have the rest. "
         "Skip only this test with `-e miner_launch_smoke_enabled=false`.",
@@ -326,15 +404,19 @@ def miner_launch_preflight(probe: Any, facts: dict[str, Any]) -> dict[str, Any]:
             )
         _check_network(probe, report)
         _check_traversal(probe, report)
+        _check_symlinks(probe, facts, report)
+        _check_umask(probe, facts, report)
         _check_sandbox(probe, facts, report)
         _check_odirect(probe, report)
         _check_smoke(probe, report)
+        _check_apparmor(probe, report)
 
     summary = {
         "result": "fail" if report.failures else "pass",
         "qemu_user": probe.get("qemu_user", ""),
         "default_net": "active" if probe.get("net_active") == "1" else "inactive",
         "smoke": probe.get("smoke", "skipped"),
+        "smoke_kernel": probe.get("smoke_kernel", ""),
         "failures": sorted({f["code"] for f in report.failures}),
         "warnings": sorted({w["code"] for w in report.warnings}),
     }

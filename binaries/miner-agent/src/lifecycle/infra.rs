@@ -227,6 +227,7 @@ impl InfraDomainConfig {
             // cmdline/vcpus are folded in); carry the real one for parity.
             cid: self.cid,
             net: None,
+            dhcp: None,
         })
     }
 

@@ -286,7 +286,7 @@ impl IfaceTuner for VirshTuner {
 }
 
 /// `xx:xx:xx:xx:xx:xx`, lower-case hex.
-fn is_mac(mac: &str) -> bool {
+pub(crate) fn is_mac(mac: &str) -> bool {
     let parts: Vec<&str> = mac.split(':').collect();
     parts.len() == 6
         && parts.iter().all(|p| {

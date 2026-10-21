@@ -24,6 +24,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::cvm_handle::{DomainUuid, VmId};
+use super::dhcp_reservation::DhcpReservation;
 use super::libvirt_driver::DomainId;
 use crate::error::{MinerAgentError, Result};
 use crate::netpolicy::caps::Rate;
@@ -149,6 +150,11 @@ pub struct QemuConfig {
     /// today's NIC: an auto-named `vnet*` tap, no cap, no filter. Not a
     /// measured launch input.
     pub net: Option<NetSpec>,
+    /// The NIC's static DHCP reservation ([`super::dhcp_reservation`]),
+    /// made at launch for every [`Self::net`] NIC: its MAC is pinned on
+    /// the interface and its address in the filter, so the filter learns
+    /// nothing. Ignored without [`Self::net`]. Not a measured input.
+    pub dhcp: Option<DhcpReservation>,
 }
 
 impl QemuConfig {
@@ -422,9 +428,12 @@ impl QemuConfig {
     ///   at most 65535, so the name fits `IFNAMSIZ`; a CID re-allocated
     ///   after a collision renames the tap with it.
     /// - `clean-traffic` drops frames whose MAC, IP or ARP is not the
-    ///   guest's own; the IP is learned from the DHCP lease, trusting
-    ///   only the `default` network's DHCP server on `virbr0` (the same
-    ///   address the host rules assume). It also drops IPv6.
+    ///   guest's own. It also drops IPv6. With [`Self::dhcp`] (every
+    ///   launch) the MAC and the IP are the reservation's, pinned: the
+    ///   guest's two DHCP exchanges (initramfs, then OS, with different
+    ///   client ids) both get that address, and the filter learns
+    ///   nothing. Without it the IP is learned from the first DHCP lease,
+    ///   trusting only the `default` network's DHCP server on `virbr0`.
     /// - `<bandwidth>` caps both directions at `cap_mbps` from the first
     ///   packet; the host's `net-policy` re-applies its own cap later.
     /// - `<port isolated='yes'/>` stops L2 traffic between guests. It
@@ -457,20 +466,33 @@ impl QemuConfig {
         } else {
             ""
         };
+        let (mac, filter_params) = match &self.dhcp {
+            Some(r) => (
+                format!("<mac address='{}'/>\n      ", r.mac),
+                format!("<parameter name='IP' value='{}'/>\n      ", r.ip),
+            ),
+            None => (
+                String::new(),
+                format!(
+                    "<parameter name='CTRL_IP_LEARNING' value='dhcp'/>\n        \
+                     <parameter name='DHCPSERVER' value='{}'/>\n      ",
+                    crate::netpolicy::render::GUEST_BRIDGE_ADDR,
+                ),
+            ),
+        };
         format!(
             "<interface type='network'>\n      \
+             {mac}\
              <source network='default'/>\n      \
              <target dev='{TENANT_TAP_PREFIX}{cid}'/>\n      \
              <model type='virtio'/>\n      \
              {bandwidth}\
              {isolated}\
              <filterref filter='clean-traffic'>\n        \
-             <parameter name='CTRL_IP_LEARNING' value='dhcp'/>\n        \
-             <parameter name='DHCPSERVER' value='{dhcp_server}'/>\n      \
+             {filter_params}\
              </filterref>\n    \
              </interface>\n    ",
             cid = self.cid,
-            dhcp_server = crate::netpolicy::render::GUEST_BRIDGE_ADDR,
         )
     }
 }
@@ -638,6 +660,7 @@ mod tests {
             golden: false,
             cid: 7,
             net: None,
+            dhcp: None,
         }
     }
 

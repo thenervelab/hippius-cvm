@@ -32,8 +32,8 @@ image:
     # Fulcio SAN on the signature — workflow AND the git ref it ran on.
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/edge-image.yml@refs/heads/main"
     # `githubWorkflowSha` on the signing cert — the exact source commit.
-    commitSha: "ae55adc306ec3f25e7458754cafce0aeca95a241"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39054678063/attempts/1"
+    commitSha: "3b1b8382e3dcb002b2991a9cbf953b74bb3a48e2"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39608778886/attempts/3"
     # false ⇒ built from a ref other than refs/heads/main, i.e. from a
     # tree that is NOT in this repo's history.
     mergedSource: true

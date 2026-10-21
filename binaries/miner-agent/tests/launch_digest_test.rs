@@ -72,6 +72,7 @@ fn kat_config() -> QemuConfig {
         // device is not a measured launch input.
         cid: MIN_GUEST_CID,
         net: None,
+        dhcp: None,
     }
 }
 

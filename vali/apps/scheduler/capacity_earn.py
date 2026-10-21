@@ -185,12 +185,16 @@ def _live_attested(node_id: str, *, now: datetime) -> Sample:
         pinned_measurements,
     )
 
+    from .scoring import _excluded_owners
     from .service import _committed_resources
 
+    # Our own VMs (synthetic probes, disk probes, canaries, rehearsals —
+    # the reward-excluded owners) are never proof of fill: a miner earns
+    # neither pay nor capacity for hosting them.
     classes = dict(
-        Placement.objects.filter(
-            miner_node_id=node_id, status=PlacementStatus.BOUND.value
-        ).values_list("vm__vm_id", "resource_class")
+        Placement.objects.filter(miner_node_id=node_id, status=PlacementStatus.BOUND.value)
+        .exclude(owner__in=_excluded_owners())
+        .values_list("vm__vm_id", "resource_class")
     )
     if not classes:
         return Sample()
@@ -430,11 +434,15 @@ def _record_event(node_id: str, kind: str, *, incident: str, now: datetime) -> b
                 capacity_config.declared_ceiling_enabled()
                 and incident
                 and kind != PREFLIGHT_INSUFFICIENT
+                and row.cvm_last_ok_at is not None
             ):
                 # Nothing left to lower — the fault still goes on record,
                 # once per incident (an incident-less event, e.g. the tick's
                 # incapable reset, would strike every pass). A preflight
-                # refusal is honest behaviour, never a strike.
+                # refusal is honest behaviour, never a strike. Probation: a
+                # host that has never started a CVM is still onboarding —
+                # its failures are setup, not misbehaviour, so no strike
+                # before its first successful start.
                 capacity_admin.record_strike(row, actor=actor, reason=reason)
                 log.warning("capacity strike on %s by %s (at the floor)", node_id, kind)
             return False

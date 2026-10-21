@@ -1206,6 +1206,20 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
         ),
     }
 
+    // DHCP reservations of `net` NICs: after the backfill (a VM without a
+    // pool record is then really gone), before orders are served. Not
+    // fatal: a launch re-checks its own reservation, and the next start
+    // retries the rest.
+    match lifecycle.reconcile_dhcp_reservations().await {
+        Ok(done) if done == Default::default() => {}
+        Ok(done) => {
+            eprintln!("hippius-miner-agent: serve — DHCP reservations reconciled: {done:?}")
+        }
+        Err(err) => {
+            eprintln!("hippius-miner-agent: serve — DHCP reservations not reconciled: {err}")
+        }
+    }
+
     // Load the persisted net policy again before orders are served (the
     // boot unit loaded the last ruleset file; this re-renders it for the
     // current uplink and taps). A failure is not fatal: the previous
@@ -1855,6 +1869,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
             // CID is a fine placeholder for the `--digest-only` path.
             cid: MIN_GUEST_CID,
             net: None,
+            dhcp: None,
         };
         let digest = compute_launch_digest(&config)?;
         // stdout: the digest is the §F allowlist measurement — pipe it

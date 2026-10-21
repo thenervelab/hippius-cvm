@@ -225,7 +225,7 @@ fn list(dir: &Path) -> std::io::Result<Vec<String>> {
     }
 }
 
-fn write_durable(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_durable(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if !dir.is_dir() {
         std::fs::create_dir_all(dir)?;

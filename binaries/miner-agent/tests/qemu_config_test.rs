@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use hippius_miner_agent::lifecycle::dhcp_reservation::DhcpReservation;
 use hippius_miner_agent::orders::NetSpec;
 use hippius_miner_agent::snp_config::{install_for_tests, SnpCpuConfig};
 use hippius_miner_agent::{DomainUuid, QemuConfig, VmId};
@@ -127,6 +128,7 @@ fn kat_config() -> QemuConfig {
         golden: false,
         cid: 5,
         net: None,
+        dhcp: None,
     }
 }
 
@@ -210,6 +212,55 @@ fn domain_xml_with_net_matches_known_answer() {
          EXPECTED_NET_INTERFACE"
     );
     assert!(EXPECTED_XML.contains(LEGACY_INTERFACE));
+}
+
+/// [`EXPECTED_NET_INTERFACE`] with the launch's DHCP reservation: the
+/// MAC is pinned and the filter's IP is the reserved one, not learned.
+const EXPECTED_RESERVED_INTERFACE: &str = "\
+    <interface type='network'>
+      <mac address='02:68:76:12:34:56'/>
+      <source network='default'/>
+      <target dev='hvt5'/>
+      <model type='virtio'/>
+      <bandwidth>
+        <inbound average='30517' peak='30517' burst='305'/>
+        <outbound average='30517' peak='30517' burst='305'/>
+      </bandwidth>
+      <port isolated='yes'/>
+      <filterref filter='clean-traffic'>
+        <parameter name='IP' value='192.168.122.57'/>
+      </filterref>
+    </interface>
+";
+
+fn reservation() -> DhcpReservation {
+    DhcpReservation {
+        mac: "02:68:76:12:34:56".to_string(),
+        ip: "192.168.122.57".parse().unwrap(),
+    }
+}
+
+#[test]
+fn domain_xml_with_a_dhcp_reservation_matches_known_answer() {
+    let mut cfg = kat_config();
+    cfg.net = Some(NetSpec {
+        cap_mbps: Some(250),
+        isolate: true,
+    });
+    cfg.dhcp = Some(reservation());
+    assert_eq!(
+        cfg.to_libvirt_xml(),
+        EXPECTED_XML.replace(LEGACY_INTERFACE, EXPECTED_RESERVED_INTERFACE),
+        "the reserved <interface> changed — if intentional, re-pin \
+         EXPECTED_RESERVED_INTERFACE"
+    );
+}
+
+#[test]
+fn a_dhcp_reservation_without_a_net_spec_changes_nothing() {
+    let mut cfg = kat_config();
+    cfg.dhcp = Some(reservation());
+    assert_eq!(cfg.to_libvirt_xml(), EXPECTED_XML);
 }
 
 #[test]

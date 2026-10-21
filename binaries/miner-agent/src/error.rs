@@ -464,4 +464,11 @@ pub enum MinerAgentError {
     /// `read`, `parse`, `encode`.
     #[error("power-policy-store/{0}")]
     PowerPolicyStore(&'static str),
+
+    /// The static DHCP reservation of a tenant NIC launched with a `net`
+    /// spec ([`crate::lifecycle::dhcp_reservation`]). Sub-classifiers:
+    /// `ip-range-exhausted` (no free address in the network's DHCP
+    /// range), `dhcp-reservation-failed` (libvirt or the record store).
+    #[error("net/{0}")]
+    NetReservation(&'static str),
 }

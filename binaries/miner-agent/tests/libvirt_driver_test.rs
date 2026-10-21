@@ -88,3 +88,31 @@ async fn define_rejects_xml_without_a_name() {
     assert!(driver.define_domain("<domain></domain>").await.is_err());
     assert_eq!(driver.defined_count().unwrap(), 0);
 }
+
+#[test]
+fn net_update_args_add_and_delete_a_dhcp_host_live_and_persistent() {
+    use hippius_miner_agent::lifecycle::libvirt_driver::{net_update_args, DhcpHostOp};
+    let host = "<host mac='02:68:76:12:34:56' ip='192.168.122.57'/>";
+    assert_eq!(
+        net_update_args("default", DhcpHostOp::Add, 1, host),
+        [
+            "net-update",
+            "default",
+            "add-last",
+            "ip-dhcp-host",
+            host,
+            "--parent-index",
+            "1",
+            "--live",
+            "--config"
+        ]
+    );
+    assert_eq!(
+        net_update_args("default", DhcpHostOp::Modify, 0, host)[2],
+        "modify"
+    );
+    assert_eq!(
+        net_update_args("default", DhcpHostOp::Delete, 0, host)[2],
+        "delete"
+    );
+}

@@ -503,6 +503,7 @@ mod tests {
             golden: false,
             cid: 3,
             net: None,
+            dhcp: None,
         }
     }
 

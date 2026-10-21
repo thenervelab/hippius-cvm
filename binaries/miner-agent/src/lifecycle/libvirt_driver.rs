@@ -220,6 +220,75 @@ pub trait LibvirtDriver: Send + Sync {
     async fn blockjob_abort(&self, _id: &DomainId, _disk: &str) -> Result<()> {
         Err(MinerAgentError::LibvirtDriver("blockjob-abort"))
     }
+
+    // ── network DHCP reservations ([`super::dhcp_reservation`]) ─────
+    // Defaults refuse: only the drivers that model a network have them.
+
+    /// The network's definition (`virsh net-dumpxml`).
+    async fn network_xml(&self, _network: &str) -> Result<String> {
+        Err(MinerAgentError::LibvirtDriver("net-dumpxml"))
+    }
+
+    /// The network's active leases, as the `virsh net-dhcp-leases` table.
+    async fn network_dhcp_leases(&self, _network: &str) -> Result<String> {
+        Err(MinerAgentError::LibvirtDriver("net-dhcp-leases"))
+    }
+
+    /// Add, replace or delete one static `<host/>` in the `<dhcp>` of the
+    /// network's `<ip>` number `parent_index`, live and in the persistent
+    /// definition (`virsh net-update … ip-dhcp-host … --parent-index
+    /// --live --config`).
+    async fn network_update_dhcp_host(
+        &self,
+        _network: &str,
+        _op: DhcpHostOp,
+        _parent_index: usize,
+        _host_xml: &str,
+    ) -> Result<()> {
+        Err(MinerAgentError::LibvirtDriver("net-update"))
+    }
+}
+
+/// A `virsh net-update … ip-dhcp-host` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhcpHostOp {
+    /// `add-last`: libvirt refuses an entry whose MAC or IP is already there.
+    Add,
+    /// `modify`: replace the entry matching the MAC (with the same one, it
+    /// re-saves the definition and reloads dnsmasq).
+    Modify,
+    /// `delete`: the entry matching the MAC.
+    Delete,
+}
+
+impl DhcpHostOp {
+    fn command(self) -> &'static str {
+        match self {
+            DhcpHostOp::Add => "add-last",
+            DhcpHostOp::Modify => "modify",
+            DhcpHostOp::Delete => "delete",
+        }
+    }
+}
+
+/// The argv after `--connect <uri>` of a `virsh net-update`.
+pub fn net_update_args(
+    network: &str,
+    op: DhcpHostOp,
+    parent_index: usize,
+    host_xml: &str,
+) -> Vec<String> {
+    vec![
+        "net-update".into(),
+        network.into(),
+        op.command().into(),
+        "ip-dhcp-host".into(),
+        host_xml.into(),
+        "--parent-index".into(),
+        parent_index.to_string(),
+        "--live".into(),
+        "--config".into(),
+    ]
 }
 
 /// A block job's progress.
@@ -608,6 +677,30 @@ impl LibvirtDriver for VirshDriver {
             .arg("--abort");
         run_virsh(cmd, "blockjob-abort").await.map(|_| ())
     }
+
+    async fn network_xml(&self, network: &str) -> Result<String> {
+        let mut cmd = self.virsh();
+        cmd.arg("net-dumpxml").arg(network);
+        run_virsh(cmd, "net-dumpxml").await
+    }
+
+    async fn network_dhcp_leases(&self, network: &str) -> Result<String> {
+        let mut cmd = self.virsh();
+        cmd.arg("net-dhcp-leases").arg(network);
+        run_virsh(cmd, "net-dhcp-leases").await
+    }
+
+    async fn network_update_dhcp_host(
+        &self,
+        network: &str,
+        op: DhcpHostOp,
+        parent_index: usize,
+        host_xml: &str,
+    ) -> Result<()> {
+        let mut cmd = self.virsh();
+        cmd.args(net_update_args(network, op, parent_index, host_xml));
+        run_virsh(cmd, "net-update").await.map(|_| ())
+    }
 }
 
 /// In-memory test double — no `virsh`, no libvirt, deterministic.
@@ -656,6 +749,43 @@ pub struct MockLibvirtDriver {
     late_job: Mutex<Option<(usize, std::path::PathBuf)>>,
     /// How many of the next `domain_xml` calls fail (a stressed libvirtd).
     domain_xml_failures: AtomicUsize,
+    /// The `default` network's DHCP service.
+    net: Mutex<MockNetwork>,
+}
+
+/// A [`MockLibvirtDriver`] network: its DHCP range, static hosts and
+/// leases (`(mac, ip)`).
+#[derive(Debug)]
+struct MockNetwork {
+    range: (std::net::Ipv4Addr, std::net::Ipv4Addr),
+    hosts: Vec<(String, std::net::Ipv4Addr)>,
+    leases: Vec<(String, std::net::Ipv4Addr)>,
+    fail_updates: bool,
+    /// The next update changes the live entries, then answers an error
+    /// (libvirt saving or reloading dnsmasq failed after the change).
+    fail_after_next_update: bool,
+    /// The next `add-last` races a client: this MAC leases the address.
+    lease_on_next_add: Option<String>,
+    /// Every update applied, in order.
+    log: Vec<DhcpHostOp>,
+}
+
+impl Default for MockNetwork {
+    /// libvirt's stock `default` network.
+    fn default() -> Self {
+        Self {
+            range: (
+                std::net::Ipv4Addr::new(192, 168, 122, 2),
+                std::net::Ipv4Addr::new(192, 168, 122, 254),
+            ),
+            hosts: Vec::new(),
+            leases: Vec::new(),
+            fail_updates: false,
+            fail_after_next_update: false,
+            lease_on_next_add: None,
+            log: Vec::new(),
+        }
+    }
 }
 
 /// A [`MockLibvirtDriver`] block copy.
@@ -684,6 +814,7 @@ impl MockLibvirtDriver {
             pivot_times_out: std::sync::atomic::AtomicBool::new(false),
             late_job: Mutex::new(None),
             domain_xml_failures: AtomicUsize::new(0),
+            net: Mutex::new(MockNetwork::default()),
         }
     }
 
@@ -706,6 +837,7 @@ impl MockLibvirtDriver {
             pivot_times_out: std::sync::atomic::AtomicBool::new(false),
             late_job: Mutex::new(None),
             domain_xml_failures: AtomicUsize::new(0),
+            net: Mutex::new(MockNetwork::default()),
         }
     }
 
@@ -834,6 +966,72 @@ impl MockLibvirtDriver {
     /// The next `blockjob --abort` fails (a job libvirt is pivoting).
     pub fn fail_next_abort(&self) {
         self.fail_abort.store(true, Ordering::Relaxed);
+    }
+
+    /// The network's static DHCP hosts, `(mac, ip)`, in order.
+    pub fn dhcp_hosts(&self) -> Vec<(String, std::net::Ipv4Addr)> {
+        self.net.lock().map(|n| n.hosts.clone()).unwrap_or_default()
+    }
+
+    /// Add a static DHCP host out-of-band (an operator's own entry).
+    pub fn seed_dhcp_host(&self, mac: &str, ip: std::net::Ipv4Addr) {
+        if let Ok(mut n) = self.net.lock() {
+            n.hosts.push((mac.to_string(), ip));
+        }
+    }
+
+    /// Drop every static DHCP host (the network was redefined).
+    pub fn clear_dhcp_hosts(&self) {
+        if let Ok(mut n) = self.net.lock() {
+            n.hosts.clear();
+        }
+    }
+
+    /// An active lease, as dnsmasq would report it.
+    pub fn seed_dhcp_lease(&self, mac: &str, ip: std::net::Ipv4Addr) {
+        if let Ok(mut n) = self.net.lock() {
+            n.leases.push((mac.to_string(), ip));
+        }
+    }
+
+    /// Every lease expires.
+    pub fn clear_dhcp_leases(&self) {
+        if let Ok(mut n) = self.net.lock() {
+            n.leases.clear();
+        }
+    }
+
+    /// The network's dynamic DHCP range.
+    pub fn set_dhcp_range(&self, start: std::net::Ipv4Addr, end: std::net::Ipv4Addr) {
+        if let Ok(mut n) = self.net.lock() {
+            n.range = (start, end);
+        }
+    }
+
+    /// The next `net-update` lands, then answers an error.
+    pub fn fail_after_next_net_update(&self) {
+        if let Ok(mut n) = self.net.lock() {
+            n.fail_after_next_update = true;
+        }
+    }
+
+    /// The next `add-last` races a client: `mac` leases that address.
+    pub fn lease_on_next_add(&self, mac: &str) {
+        if let Ok(mut n) = self.net.lock() {
+            n.lease_on_next_add = Some(mac.to_string());
+        }
+    }
+
+    /// Every `net-update` applied so far.
+    pub fn net_update_log(&self) -> Vec<DhcpHostOp> {
+        self.net.lock().map(|n| n.log.clone()).unwrap_or_default()
+    }
+
+    /// Whether `net-update` fails from now on.
+    pub fn fail_net_updates(&self, fail: bool) {
+        if let Ok(mut n) = self.net.lock() {
+            n.fail_updates = fail;
+        }
     }
 
     pub fn force_all_to_state(&self, state: DomainState) -> Result<()> {
@@ -1148,6 +1346,91 @@ impl LibvirtDriver for MockLibvirtDriver {
             .lock()
             .map_err(|_| MinerAgentError::LockPoisoned)?
             .remove(id);
+        Ok(())
+    }
+
+    async fn network_xml(&self, network: &str) -> Result<String> {
+        let n = self.net.lock().map_err(|_| MinerAgentError::LockPoisoned)?;
+        if network != "default" {
+            return Err(MinerAgentError::LibvirtDriver("net-dumpxml"));
+        }
+        let hosts: String = n
+            .hosts
+            .iter()
+            .map(|(mac, ip)| format!("      <host mac='{mac}' ip='{ip}'/>\n"))
+            .collect();
+        Ok(format!(
+            "<network>\n  <name>default</name>\n  \
+             <ip address='192.168.122.1' netmask='255.255.255.0'>\n    <dhcp>\n      \
+             <range start='{}' end='{}'/>\n{hosts}    </dhcp>\n  </ip>\n</network>\n",
+            n.range.0, n.range.1,
+        ))
+    }
+
+    async fn network_dhcp_leases(&self, network: &str) -> Result<String> {
+        let n = self.net.lock().map_err(|_| MinerAgentError::LockPoisoned)?;
+        if network != "default" {
+            return Err(MinerAgentError::LibvirtDriver("net-dhcp-leases"));
+        }
+        let mut table = String::from(
+            " Expiry Time           MAC address         Protocol   IP address           \
+             Hostname   Client ID or DUID\n---------------------------------------------\n",
+        );
+        for (mac, ip) in &n.leases {
+            table.push_str(&format!(
+                " 2026-10-21 10:00:00   {mac}   ipv4       {ip}/24   -          01:{mac}\n"
+            ));
+        }
+        Ok(table)
+    }
+
+    async fn network_update_dhcp_host(
+        &self,
+        network: &str,
+        op: DhcpHostOp,
+        parent_index: usize,
+        host_xml: &str,
+    ) -> Result<()> {
+        let mut n = self.net.lock().map_err(|_| MinerAgentError::LockPoisoned)?;
+        if parent_index != 0 {
+            return Err(MinerAgentError::LibvirtDriver("net-update"));
+        }
+        let fields = super::adopt::tag_attrs(host_xml, "host").and_then(|a| {
+            let mac = super::adopt::attr(&a, "mac")?;
+            let ip = super::adopt::attr(&a, "ip")?.parse().ok()?;
+            Some((mac, ip))
+        });
+        let (Some((mac, ip)), false, "default") = (fields, n.fail_updates, network) else {
+            return Err(MinerAgentError::LibvirtDriver("net-update"));
+        };
+        let refused = Err(MinerAgentError::LibvirtDriver("net-update"));
+        match op {
+            // libvirt refuses a duplicate MAC or IP.
+            DhcpHostOp::Add if n.hosts.iter().any(|(m, i)| *m == mac || *i == ip) => {
+                return refused;
+            }
+            DhcpHostOp::Add => {
+                if let Some(racer) = n.lease_on_next_add.take() {
+                    n.leases.push((racer, ip));
+                }
+                n.hosts.push((mac, ip));
+            }
+            DhcpHostOp::Modify => match n.hosts.iter_mut().find(|(m, _)| *m == mac) {
+                Some(entry) => entry.1 = ip,
+                None => return refused,
+            },
+            DhcpHostOp::Delete => {
+                let before = n.hosts.len();
+                n.hosts.retain(|(m, _)| *m != mac);
+                if n.hosts.len() == before {
+                    return refused;
+                }
+            }
+        }
+        if std::mem::take(&mut n.fail_after_next_update) {
+            return refused;
+        }
+        n.log.push(op);
         Ok(())
     }
 }

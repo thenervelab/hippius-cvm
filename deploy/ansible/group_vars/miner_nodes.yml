@@ -218,11 +218,13 @@ libvirt:
   access_user: "ubuntu"
 
 # ── Tenant-launch preflight (play 09) ───────────────────────────────
-# Play 09 starts a paused, transient, non-SNP smoke domain (64 MiB, a
-# 16 MiB raw disk under miner_data_disk_root, a NIC on `default`) and
-# destroys it, to prove a tenant `virsh start` can open its disks and
-# attach its NIC. Running tenants are not touched. `false` skips only
-# the smoke domain; every other check still runs.
+# Play 09 starts a paused, transient, non-SNP smoke domain laid out like
+# a golden tenant (64 MiB; a copy of the host kernel + a dummy initrd and
+# read-only rootfs/verity disks in a staging dir; 16 MiB overlay, state
+# and data disks in the agent's dirs; the tenant OVMF; a NIC on
+# `default`) and destroys it, to prove a tenant `virsh start` can open
+# every file and attach its NIC. Running tenants are not touched. `false`
+# skips only the smoke domain; every other check still runs.
 miner_launch_smoke_enabled: true
 # Seconds `virsh create` may take before the smoke test gives up.
 miner_launch_smoke_timeout_s: 60

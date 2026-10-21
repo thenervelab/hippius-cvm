@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "0c08bfd4b64c9cd64760eb9ebb99cb6e165d3fb4"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39608816926/attempts/1"
+    commitSha: "131ba96b78bbb60962ee77f6f19fc499d631411f"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39640253333/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -174,8 +174,11 @@ scheduler:
   # at all (`capacity_source` unknown | earned).
   # Both OFF: an unanchored earned miner stays at the floor (∩ its declared
   # budget), exactly as before. Operator-anchored miners are never touched.
-  capacityEarnProof: "off"
-  capacityDeclaredCeiling: "false"
+  # ON 2026-10-21 (self-service capacity, design approved): the KBS runs
+  # keepalive_binding = "record" (release-bound live attestations), so the
+  # proof is real; growth is bounded by each miner's declaration.
+  capacityEarnProof: "live-attestation"
+  capacityDeclaredCeiling: "true"
   capacityShortfallMinOwners: "2"
 
 # Customer-held disk keys (H6a, VALI_CUSTOMER_KEYS_ENABLED). Gates only NEW
