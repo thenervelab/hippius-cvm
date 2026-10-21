@@ -63,10 +63,24 @@ from apps.network.models import PublicIP, PublicIpState
 from apps.orchestration.effects import EffectError
 from apps.orchestration.services import flavors
 from apps.orchestration.services.launch_digest import _vcpu_type_for_platform
-from apps.scheduler import capacity_config, chain, cvm_capability, scoring, storage_requirement
+from apps.scheduler import (
+    capacity_config,
+    capacity_earn,
+    chain,
+    cvm_capability,
+    scoring,
+    storage_requirement,
+)
 from apps.scheduler import service as scheduler_service
 from apps.scheduler.approval import held_back
-from apps.scheduler.capacity import DISK_GATE_OFF, DISK_UNKNOWN, HostBudget
+from apps.scheduler.capacity import (
+    DISK_GATE_OFF,
+    DISK_UNKNOWN,
+    SOURCE_EARNED,
+    SOURCE_TRUSTED,
+    SOURCE_UNKNOWN,
+    HostBudget,
+)
 from apps.scheduler.models import (
     ACTIVE_PLACEMENT_STATES,
     MinerCapacity,
@@ -260,6 +274,32 @@ def _v2_budget(budget: HostBudget | None) -> dict[str, Any] | None:
         "free_memory_mb": budget.free_memory_mb,
         "free_vms": budget.free_vms,
         "binding": list(budget.binding),
+    }
+
+
+def _capacity_source(
+    view: scheduler_service.CapacityView | None, result: Any, budget: HostBudget | None
+) -> str:
+    """What the ACTIVE admission model sizes this host from
+    (`capacity.SOURCE_*`). Under v2, the budget's own source; under v1 the
+    trusted anchor or nothing — v1 sizes an unanchored host by its flat
+    `capacity_slots`, which says nothing about the hardware."""
+    if view is not None and view.model == "v2":
+        if budget is None or not budget.known:
+            return SOURCE_UNKNOWN
+        return budget.source
+    return SOURCE_TRUSTED if result is not None and result.dynamic else SOURCE_UNKNOWN
+
+
+def _earned_row(mirror: MinerCapacity) -> dict[str, Any]:
+    """The earned ceiling (floor-resolved), the hardware ceiling that bounds
+    its growth under `VALI_CAPACITY_DECLARED_CEILING`, and the last change."""
+    return {
+        **capacity_earn.earned_ceiling(mirror),
+        "hardware_ceiling": capacity_earn.hardware_ceiling(mirror),
+        "declared_at": _iso(mirror.declared_at),
+        "last_reason": mirror.earned_last_reason or None,
+        "last_change_at": _iso(mirror.earned_last_change_at),
     }
 
 
@@ -650,6 +690,19 @@ def _disk_health_by_node(now: datetime) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _no_hardware_anchor(cap: dict[str, Any]) -> bool:
+    """The `no-hardware-anchor` alert. Historically "no operator anchor"
+    (`dynamic` false). With `VALI_CAPACITY_DECLARED_CEILING` on, an
+    unanchored `earned` host sized from its proof + declaration is not a
+    problem any more (`capacity_source = declared+earned` says so), so
+    the alert keeps its code but fires only where vali has NO hardware
+    figure: it cannot size the host (`unknown`), or sizes it from proof
+    alone with nothing declared (`earned`)."""
+    if capacity_config.declared_ceiling_enabled():
+        return cap["capacity_source"] in (SOURCE_UNKNOWN, SOURCE_EARNED)
+    return cap["dynamic"] is False
+
+
 def _alerts(row: dict[str, Any], *, now: datetime) -> list[str]:
     """Closed vocabulary of conditions an operator should look at."""
     alerts: list[str] = []
@@ -672,7 +725,7 @@ def _alerts(row: dict[str, Any], *, now: datetime) -> list[str]:
             # EXPIRED one is news.
             if attestor["cert_expiry_at_dt"] <= now:
                 alerts.append("attestor-cert-expired")
-        if row["capacity"] is not None and row["capacity"]["dynamic"] is False:
+        if row["capacity"] is not None and _no_hardware_anchor(row["capacity"]):
             alerts.append("no-hardware-anchor")
     if row["cvm_start"]["verdict"] in (cvm_capability.DEGRADED, cvm_capability.INCAPABLE):
         alerts.append(f"cvm-{row['cvm_start']['verdict']}")
@@ -984,6 +1037,9 @@ def _row(
                 else None
             ),
             "trust_class": mirror.trust_class,
+            # `trusted` | `declared+earned` | `earned` | `unknown` (`_capacity_source`).
+            "capacity_source": _capacity_source(view, result, budget),
+            "earned": _earned_row(mirror),
             "cpu_ratio": str(mirror.cpu_ratio) if mirror.cpu_ratio is not None else None,
             # Capacity v2 budget, ALWAYS shown (also while v1 decides) — the
             # shadow run is judged by comparing it with the v1 figures above.

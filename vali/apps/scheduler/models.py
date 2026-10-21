@@ -1055,6 +1055,10 @@ class VmBillingBinding(models.Model):
     node_id_hex = models.CharField(max_length=64)
     resource_class = models.CharField(max_length=128)
     lease_id = models.CharField(max_length=256, blank=True, default="")
+    #: The OS-disk tier the VM was sold at (`apps.disktier.os_tier`) —
+    #: what its miner's units are scaled by under
+    #: `VALI_DISK_TIER_UNIT_FACTOR`. Never read off a receipt.
+    os_disk_tier = models.CharField(max_length=8, default="nvme", db_default="nvme")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

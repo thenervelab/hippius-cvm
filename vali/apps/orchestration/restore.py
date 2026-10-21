@@ -226,6 +226,7 @@ def _validate_other_dest(
         service._reject_cordoned_dest(dest_node_id)
         service._reject_cdn_colocated_dest(vm, dest_node_id)
         service._reject_group_colocated_dest(vm, dest_node_id)
+        service._reject_disk_tier_dest(vm, dest_node_id)
     except service.StartError as exc:
         raise refuse(exc.message) from exc
     # The VM's region (`region`, as `operator_region` resolved it, else

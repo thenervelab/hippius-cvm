@@ -56,6 +56,32 @@ pub struct OrderRejection {
     /// A JSON body replacing `class` on the wire (`storage-config`
     /// refusals name the pool or disk at fault).
     pub json: Option<String>,
+    /// The failing step's own code — the [`MinerAgentError`] `Display`
+    /// (`libvirt-driver/define`, `tenant-preflight/ovmf-missing`), sent
+    /// as the [`REASON_HEADER`] response header. `class` stays the body
+    /// vali branches on; this only tells the operator WHICH step failed.
+    pub reason: Option<String>,
+}
+
+/// Response header carrying [`OrderRejection::reason`]. The Edge relays
+/// it to vali, which records it per miner for the operator dashboard.
+pub const REASON_HEADER: &str = "x-hippius-reason";
+
+/// Longest [`OrderRejection::reason`] sent. vali keeps the same bound.
+const MAX_REASON_LEN: usize = 128;
+
+/// `true` for a code vali will record: `[a-z0-9][a-z0-9._:/-]*`, at most
+/// [`MAX_REASON_LEN`] bytes. Anything else is not sent at all.
+fn is_reason_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_REASON_LEN
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')
+        })
 }
 
 impl OrderRejection {
@@ -65,6 +91,7 @@ impl OrderRejection {
             status,
             class,
             json: None,
+            reason: None,
         }
     }
 
@@ -74,13 +101,24 @@ impl OrderRejection {
             status,
             class,
             json: Some(json),
+            reason: None,
         }
+    }
+
+    /// Attach `err`'s `Display` as the [`reason`](Self::reason). Every
+    /// variant's `Display` is a static classifier (see
+    /// [`MinerAgentError`]); one that does not pass the code charset is
+    /// dropped rather than reshaped.
+    pub fn with_reason(mut self, err: &MinerAgentError) -> Self {
+        let code = err.to_string();
+        self.reason = is_reason_code(&code).then_some(code);
+        self
     }
 }
 
 impl IntoResponse for OrderRejection {
     fn into_response(self) -> Response {
-        match self.json {
+        let mut response = match self.json {
             Some(json) => (
                 self.status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -88,7 +126,14 @@ impl IntoResponse for OrderRejection {
             )
                 .into_response(),
             None => (self.status, self.class).into_response(),
+        };
+        if let Some(value) = self
+            .reason
+            .and_then(|r| axum::http::HeaderValue::from_str(&r).ok())
+        {
+            response.headers_mut().insert(REASON_HEADER, value);
         }
+        response
     }
 }
 
@@ -105,6 +150,10 @@ impl IntoResponse for OrderRejection {
 /// already-classified arms (`insufficient-resources`,
 /// `vsock-cid-exhausted`, `launch-input`, `not-yet-wired`) carry the
 /// detail in `class` already; they do not double-log.
+///
+/// Every arm also carries the error's `Display` as the
+/// [`REASON_HEADER`] header ([`OrderRejection::with_reason`]): the body
+/// class is unchanged, so vali's handling is too.
 pub fn reject_dispatch(err: &MinerAgentError, vm_id: &str) -> OrderRejection {
     reject_dispatch_with_log(err, vm_id, |line| eprintln!("{line}"))
 }
@@ -114,6 +163,15 @@ pub fn reject_dispatch(err: &MinerAgentError, vm_id: &str) -> OrderRejection {
 /// without grabbing the process stderr file descriptor. Production
 /// passes `eprintln!`; tests pass a `Vec`-pushing closure.
 fn reject_dispatch_with_log<L: FnOnce(String)>(
+    err: &MinerAgentError,
+    vm_id: &str,
+    log_detail: L,
+) -> OrderRejection {
+    reject_class(err, vm_id, log_detail).with_reason(err)
+}
+
+/// The status + body class of [`reject_dispatch`], one arm per error.
+fn reject_class<L: FnOnce(String)>(
     err: &MinerAgentError,
     vm_id: &str,
     log_detail: L,
@@ -1858,5 +1916,91 @@ mod tests {
         // `default` keeps the historical class vali recognises.
         let rej = reject_dispatch(&MinerAgentError::InsufficientDisk, "tenant-1");
         assert_eq!(rej.class, "insufficient-disk");
+    }
+
+    #[test]
+    fn every_rejection_names_its_step_and_keeps_its_class() {
+        let cases = [
+            (
+                MinerAgentError::LibvirtDriver("define"),
+                "dispatch-failed",
+                "libvirt-driver/define",
+            ),
+            (
+                MinerAgentError::Preflight("ovmf-missing"),
+                "dispatch-failed",
+                "tenant-preflight/ovmf-missing",
+            ),
+            (
+                MinerAgentError::LaunchFailed("timeout"),
+                "dispatch-failed",
+                "cvm-launch-failed/timeout",
+            ),
+            (
+                MinerAgentError::LaunchInput("cpu-count-zero"),
+                "launch-input",
+                "cvm-launch-input/cpu-count-zero",
+            ),
+            (
+                MinerAgentError::InsufficientResources,
+                "insufficient-resources",
+                "cvm-insufficient-resources",
+            ),
+            (
+                MinerAgentError::TicketDelivery("connect-timeout"),
+                "ticket-delivery-failed",
+                "ticket-delivery/connect-timeout",
+            ),
+            (
+                MinerAgentError::RelaunchDisksMissing("overlay", "nvme0".to_string()),
+                "relaunch-disks-missing",
+                "relaunch-disks-missing/overlay-missing:nvme0",
+            ),
+        ];
+        for (err, class, reason) in cases {
+            let rej = reject_dispatch_with_log(&err, "tenant-1", |_| {});
+            assert_eq!(rej.class, class, "{err}");
+            assert_eq!(rej.reason.as_deref(), Some(reason), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_display_outside_the_code_charset_is_not_sent() {
+        let rej = reject_dispatch_with_log(
+            &MinerAgentError::ConfigParse { line: 3, col: 4 },
+            "tenant-1",
+            |_| {},
+        );
+        assert_eq!(rej.class, "dispatch-failed");
+        assert_eq!(rej.reason, None);
+    }
+
+    #[test]
+    fn reason_codes_are_a_closed_charset() {
+        for ok in [
+            "libvirt-driver/define",
+            "insufficient-disk:nvme0",
+            "a.b_c-d/e:f",
+        ] {
+            assert!(is_reason_code(ok), "{ok}");
+        }
+        let long = "a".repeat(MAX_REASON_LEN + 1);
+        for bad in ["", "-x", "Upper", "a b", "a\nb", "a\r", "é", long.as_str()] {
+            assert!(!is_reason_code(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_reason_rides_a_header_and_the_body_stays_the_class() {
+        let resp = reject_dispatch_with_log(&MinerAgentError::LibvirtDriver("create"), "t", |_| {})
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers().get(REASON_HEADER).unwrap(),
+            "libvirt-driver/create"
+        );
+        // A rejection built without an error carries no header at all.
+        let plain = OrderRejection::new(StatusCode::BAD_REQUEST, "order-stale").into_response();
+        assert!(plain.headers().get(REASON_HEADER).is_none());
     }
 }

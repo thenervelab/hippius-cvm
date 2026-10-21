@@ -14,6 +14,10 @@
 #   06 mTLS mount point  create the dir; the operator pushes the certs
 #   07 host firewall     UFW default-deny INPUT + narrow public surface
 #   08 host sshd         key-only auth (drop-in), `systemctl reload ssh`
+#   09 launch preflight  can this host START a tenant domain? network,
+#                        QEMU access + O_DIRECT on the disk roots, agent
+#                        sandbox, a paused smoke domain; codes + fixes.
+#                        With play 03 alone: `--tags launch_preflight`
 #
 # This playbook is a SEPARATE trust profile from the cc-node playbooks
 # (`site.yml` / 00-05): it is intentionally NOT wired into `site.yml`.
@@ -375,6 +379,12 @@
 - name: "03 — Tenant CVM networking bridge"
   hosts: miner_nodes
   become: true
+  # Also under `--tags launch_preflight`: it is the fix for that play's
+  # network codes (define, start, autostart; refuse a subnet clash).
+  tags: [launch_preflight]
+  # virsh's `Active:` / `Autostart:` labels are matched: never localised.
+  environment:
+    LC_ALL: C
   tasks:
     - name: Enable the libvirt default network
       ansible.builtin.import_tasks: miner-tasks/networking-bridge.yml
@@ -427,3 +437,18 @@
       ansible.builtin.systemd_service:
         name: ssh
         state: reloaded
+
+# ── 09 — Tenant-launch preflight ────────────────────────────────────
+# The host-attestor proves SNP works here, but it has no disk and no NIC:
+# this proves the rest of a tenant `virsh start` before the first order
+# does. Last, so a refusal leaves the host otherwise fully bootstrapped;
+# a failure lists every code at once (docs/operator/external-miner-guide.md).
+- name: "09 — Tenant-launch preflight"
+  hosts: miner_nodes
+  become: true
+  tags: [launch_preflight]
+  tasks:
+    - name: Check this host can start a tenant domain
+      ansible.builtin.import_tasks: miner-tasks/launch-preflight.yml
+      vars:
+        miner_launch_probe_script: "{{ playbook_dir }}/miner-tasks/files/launch-preflight-probe.sh"

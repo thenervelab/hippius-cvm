@@ -1,0 +1,66 @@
+---
+# Tenant-launch preflight: can this host START a tenant domain? Tasks file
+# imported by 06-miner-bootstrap.yml play "09", and by
+# tests/launch_preflight_wiring.yml with canned probe output.
+#
+# The host-attestor has no disk and no NIC, so a host can run it and still
+# fail every tenant launch at `virsh start` (`dispatch-failed`,
+# `libvirt-driver/create`). The probe (files/launch-preflight-probe.sh)
+# looks at what a tenant domain adds — the `default` network and its
+# nwfilter, QEMU's access to the disk roots, O_DIRECT there, the agent's
+# sandbox — and starts a paused smoke domain; the verdict is
+# filter_plugins/launch_preflight.py (tests/test_launch_preflight.py).
+#
+# Inputs: `miner_launch_probe_script` (the probe's path on the controller),
+# or `miner_launch_probe_canned` (its output, for the wiring test).
+#
+# Under --check only the read-only half runs, and findings are printed,
+# never fatal. Without --check the probe creates scratch files and the
+# smoke domain, and removes them before it exits.
+# `miner_launch_smoke_enabled: false` skips the smoke domain only.
+
+- name: Probe what a tenant launch needs from this host
+  ansible.builtin.script:
+    cmd: >-
+      {{ miner_launch_probe_script }}
+      --data-root {{ miner_data_disk_root | quote }}
+      --state-root {{ miner_state_disk_root | quote }}
+      --staging-root {{ (miner_agent.state_dir ~ '/staging') | quote }}
+      --unit {{ miner_agent.systemd_unit_name | quote }}
+      --config {{ miner_agent.config_path | quote }}
+      {{ '' if ansible_check_mode else '--write' }}
+      {{ '--smoke' if (miner_launch_smoke_enabled | bool) and not ansible_check_mode else '' }}
+      --smoke-timeout {{ miner_launch_smoke_timeout_s | int }}
+    executable: /bin/bash
+  register: miner_launch_probe
+  changed_when: false
+  # The read-only half previews under --check; the script itself drops
+  # its write probes there (no --write / --smoke above).
+  check_mode: false
+  when: miner_launch_probe_canned is not defined
+
+- name: Judge the tenant-launch preflight
+  ansible.builtin.set_fact:
+    miner_lpf: >-
+      {{ (miner_launch_probe_canned | default(miner_launch_probe.stdout | default('')))
+         | miner_launch_preflight({'unit_name': miner_agent.systemd_unit_name}) }}
+
+- name: Report the tenant-launch preflight verdict
+  # One machine-readable line for the operator dashboard / backend.
+  ansible.builtin.debug:
+    msg: "HIPPIUS_LAUNCH_PREFLIGHT {{ miner_lpf.summary | to_json }}"
+
+- name: Preview the tenant-launch refusals (--check)
+  ansible.builtin.debug:
+    msg: "{{ miner_lpf.failures | map('miner_preflight_line', 'WOULD FAIL') | list }}"
+  when:
+    - ansible_check_mode
+    - miner_lpf.failures | length > 0
+
+- name: Refuse a host that cannot start a tenant domain
+  ansible.builtin.assert:
+    that:
+      - miner_lpf.failures | length == 0
+    fail_msg: "{{ miner_lpf.failures | map('miner_preflight_line', 'FAIL') | list }}"
+    quiet: true
+  when: not ansible_check_mode

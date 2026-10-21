@@ -1,12 +1,12 @@
 {
   "measurement_kind": "snp_launch_digest_v1",
-  "measurement_hex": "7e6e1def0f5e34fd3a5c77bc3a7f90b153c030100d1e37b8f0d600a935bb8599bfd24e4688be69d4a2aebe8c0af01e69",
+  "measurement_hex": "214e195345a9c6873b2fd8e6022b65b77ca803d0a35850c7cd2aca268d90e9c77d45b88bbc73d3ce94de791c2b36349f",
   "components": {
     "kernel_sha256": "6a6419fde155bc1be12f9d2555ad18876cdff111d80c2887c6aa2c5d6cb250ac",
-    "initrd_sha256": "51b02b28cec0800a8f2192447c20c303bd7d7e44ec6dcf19cc0e9004d235eda4",
-    "cmdline_sha256": "6a239755003c14cfb0df6497d91e25d083ade28a1b7706297b4840c21fb5a4e9",
+    "initrd_sha256": "e26466f5d8c6e4846e9fc8c8bb00c3fa0a704d6011376fa8fdee63ac0ed78778",
+    "cmdline_sha256": "63199ec0b112f219c14beeae52f380ca4d122a7103673c98f6dd976c6803e99a",
     "ovmf_sha256": "162aa41b6a036ca24676abaf56f10a92ee67aa381a79e19fe2ce4c336692dc3c",
-    "rootfs_verity_root": "d88c17fd606e4baf12f9ed5f031f0653624fd3a003ca6f151ff2fda5ccd9697c",
+    "rootfs_verity_root": "93c8a0c048fd8b10501e4fc8637e208b96e88c3ce98ea73f06f4a2f019cf48bd",
     "snp_launch_config": {
       "vcpus": 1,
       "vcpu_type": "EpycGenoa",
@@ -14,6 +14,6 @@
     }
   },
   "uki_basename": "tenant-0.0.1-tenant.uki.signed",
-  "uki_size_bytes": 38742592,
+  "uki_size_bytes": 38748736,
   "note": "measurement_kind=snp_launch_digest_v1 is the real AMD SEV-SNP launch digest. It is only a PRODUCTION trust anchor once the packer/kbs-uki/idblock/ placeholder (all-zero, DO-NOT-TRUST-IN-PROD) is replaced with a real signed launch policy and the OVMF in packer/kbs-uki/ovmf/ovmf.lock is pinned to a verified release."
 }

@@ -285,6 +285,18 @@ class HostFitSerializer(serializers.Serializer):
             "unknown data denied)."
         ),
     )
+    capacity_source = serializers.ChoiceField(
+        choices=["trusted", "declared+earned", "earned", "unknown"],
+        required=False,
+        help_text=(
+            "What this host's answer rests on: `trusted` — the operator hardware "
+            "anchor; `declared+earned` — a self-service (`earned`) host, sized by "
+            "the capacity it has PROVEN under load (a floor to start), clamped by "
+            "the budget it declares; `earned` — the same with no hardware figure "
+            "at all (proof alone); `unknown` — vali cannot size it "
+            "(`size_unknown`)."
+        ),
+    )
 
 
 class FeasibilitySerializer(serializers.Serializer):
@@ -330,7 +342,11 @@ class FeasibilitySerializer(serializers.Serializer):
             "`region-unknown` (no miner has a detected location yet — the "
             "probe has not run; retry), `no-miner-in-region` (the fleet is "
             "located and none of it is there — `never`), `region-unverified` "
-            "(miners detected there but none verified; retry)."
+            "(miners detected there but none verified; retry). With "
+            "`?os_disk_tier=`: `disk-tier-not-offered` (the tier is not sold for "
+            "this flavor — `never`), `no-miner-at-tier` (tier gate enforced: no host "
+            "has an OS pool at the tier — `never`; with pools but no room, the "
+            "scheduler's own `not-now`)."
         ),
     )
     scheduler_error = serializers.CharField(allow_blank=True)
@@ -351,6 +367,22 @@ class FeasibilitySerializer(serializers.Serializer):
         )
     )
     hosts = HostFitSerializer(many=True)
+    os_disk_tier = serializers.ChoiceField(
+        choices=["nvme", "ssd", "hdd"],
+        required=False,
+        help_text="The `?os_disk_tier=` asked for. Absent when none was.",
+    )
+    capacity_source = serializers.ChoiceField(
+        choices=["", "trusted", "declared+earned", "earned"],
+        required=False,
+        help_text=(
+            "The weakest `capacity_source` among the hosts counted in `headroom` "
+            "(`earned` < `declared+earned` < `trusted`): anything but `trusted` "
+            "means at least one is a self-service host sized from proof (and its "
+            "own declaration) rather than a trusted anchor; empty when nothing "
+            "fits."
+        ),
+    )
 
 
 class FeasibilityListSerializer(serializers.Serializer):

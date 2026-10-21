@@ -600,11 +600,13 @@ def _env_by_workload(docs: list[dict]) -> dict[str, dict[str, str]]:
 @_needs_helm
 def test_net_policy_push_reaches_only_the_orchestration_tick() -> None:
     """The push runs in the orchestration tick; no other pod gets the
-    net-policy switches, and the egress feed / launch-spec flags stay
-    unset everywhere (their settings.py defaults are off)."""
+    net-policy switches, and the egress feed flags stay unset everywhere
+    (their settings.py defaults are off). The launch spec is pinned per
+    workload in apps/network/tests/test_net_launch_spec_chart.py."""
     docs = _docs()
-    egress = {"VALI_EGRESS_FEED_ENABLED", "VALI_NET_LAUNCH_SPEC", "VALI_EGRESS_VMS"}
+    egress = {"VALI_EGRESS_FEED_ENABLED", "VALI_EGRESS_VMS"}
     assert not egress & set(_configmap_data(docs))
+    assert "VALI_NET_LAUNCH_SPEC" not in _configmap_data(docs)
     for label, env in _env_by_workload(docs).items():
         assert not egress & set(env), label
         if label != "Deployment/vali-orchestration-tick":

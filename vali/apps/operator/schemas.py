@@ -158,6 +158,45 @@ class OperatorStorageRequirementSerializer(serializers.Serializer):
     )
 
 
+class OperatorLaunchErrorSerializer(serializers.Serializer):
+    """One failed launch attempt on the node, as vali observed the node's
+    answer (`apps.miners.launch_errors`)."""
+
+    code = serializers.CharField(
+        help_text=(
+            "The finest reason known, a static code matching `[a-z0-9][a-z0-9._:/-]*` "
+            "(max 128): the agent's own reason (`libvirt-driver/define`, "
+            "`tenant-preflight/ovmf-missing`, `cvm-launch-failed/timeout`, …) when it "
+            "sends one, else `class`. vali's own codes: `miner-unreachable` (the Edge "
+            "could not reach the node, or timed out waiting on it), `unclassified` (an "
+            "answer with no code), `invalid` (the node sent something that is not a code)."
+        ),
+    )
+    class_ = serializers.CharField(
+        allow_null=True,
+        help_text=(
+            "The coarse class in the answer's body (`dispatch-failed`, "
+            "`insufficient-resources`, `launch-input`, …) — what vali acted on. `null` "
+            "for an answer with no body."
+        ),
+    )
+    http_status = serializers.IntegerField(help_text="Status of the answer (502/504: the Edge).")
+    stage = serializers.ChoiceField(
+        choices=["preflight", "launch"],
+        help_text="`preflight`: artifact staging + measurement; `launch`: the domain start.",
+    )
+    order_id = serializers.CharField(
+        allow_null=True, help_text="The refused order, as the node logged it."
+    )
+    at = serializers.DateTimeField(help_text="When vali received the answer.")
+
+    def get_fields(self) -> dict[str, serializers.Field]:
+        # `class` is a Python keyword: declared as `class_`, published as `class`.
+        fields = super().get_fields()
+        fields["class"] = fields.pop("class_")
+        return fields
+
+
 class OperatorNodeSerializer(serializers.Serializer):
     """One node's status row."""
 
@@ -227,6 +266,30 @@ class OperatorNodeSerializer(serializers.Serializer):
             "Optional during the rollout."
         ),
     )
+    last_launch_error = OperatorLaunchErrorSerializer(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "The node's most recent failed launch attempt (= `recent_launch_errors[0]`), "
+            "or `null` if none was ever recorded. Kept after a later success: compare "
+            "`at` with `launch_fail_streak`. Observability only — it never changes "
+            "placement. Optional during the rollout."
+        ),
+    )
+    launch_fail_streak = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        help_text=(
+            "Failed launch attempts on the node since the last launch it accepted "
+            "(every attempt counts, a retry on the same node included); `0` after an "
+            "accepted launch. Optional during the rollout: a consumer defaults it to `0`."
+        ),
+    )
+    recent_launch_errors = OperatorLaunchErrorSerializer(
+        many=True,
+        required=False,
+        help_text="The node's last failed launch attempts, newest first (max 5).",
+    )
 
 
 class OperatorRegionCapacitySerializer(serializers.Serializer):
@@ -267,6 +330,21 @@ class OperatorRegionCapacitySerializer(serializers.Serializer):
     )
 
 
+class OperatorRegionTierSerializer(serializers.Serializer):
+    placeable = serializers.BooleanField(
+        help_text="The tier is sold (`launch` would not answer `disk-tier-not-offered`) "
+        "and, with the tier gate enforced, `hosts` > 0; otherwise a dispatchable miner "
+        "is counted here (placement does not check the tier)."
+    )
+    hosts = serializers.IntegerField(
+        min_value=0,
+        help_text="Dispatchable, offering miners of the region with an OS pool at the "
+        "tier (a minimum: an nvme pool counts for ssd and hdd), room or not, as of now: "
+        "a pool unreported, inactive or degraded for now does not count (feasibility "
+        "then answers `not-now`, not `never`).",
+    )
+
+
 class OperatorRegionSerializer(serializers.Serializer):
     region = serializers.CharField(
         help_text=(
@@ -298,6 +376,11 @@ class OperatorRegionSerializer(serializers.Serializer):
     )
     node_ids = serializers.ListField(
         child=serializers.CharField(), help_text="On-chain node_ids of the counted miners."
+    )
+    os_disk_tiers = serializers.DictField(
+        child=OperatorRegionTierSerializer(),
+        help_text="Per OS-disk tier (`nvme`, `ssd`, `hdd`): whether a VM sold at it can "
+        "be placed in the region, and on how many hosts.",
     )
 
 
@@ -490,6 +573,28 @@ class FleetCapacitySerializer(serializers.Serializer):
     )
     trust_class = serializers.CharField(
         required=False, help_text="`operator` (anchored) or `earned` (proof-based)."
+    )
+    capacity_source = serializers.ChoiceField(
+        choices=["trusted", "declared+earned", "earned", "unknown"],
+        required=False,
+        help_text=(
+            "What the ACTIVE admission model sizes this host from: `trusted` — the "
+            "operator anchor; `declared+earned` — an `earned` host, sized by what it "
+            "has proven (floor first) clamped by a hardware figure it declared; "
+            "`earned` — the same with no hardware figure (proof alone); `unknown` — "
+            "vali cannot size it. With VALI_CAPACITY_DECLARED_CEILING on, "
+            "`no-hardware-anchor` fires for `earned` and `unknown` only."
+        ),
+    )
+    earned = serializers.DictField(
+        required=False,
+        help_text=(
+            "`{vms, vcpus, memory_mb}` the earned ceiling (floor-resolved; binds only "
+            "`earned` hosts), `hardware_ceiling` `{vms, vcpus, memory_mb}` (null per "
+            "dimension = no figure) — the most conservative self-reported / anchor "
+            "figure, which bounds growth under VALI_CAPACITY_DECLARED_CEILING and "
+            "never grants capacity — `declared_at`, `last_reason`, `last_change_at`."
+        ),
     )
     cpu_ratio = serializers.CharField(
         allow_null=True,

@@ -217,6 +217,16 @@ libvirt:
   # host_vars if the provider's image uses a different default account).
   access_user: "ubuntu"
 
+# ── Tenant-launch preflight (play 09) ───────────────────────────────
+# Play 09 starts a paused, transient, non-SNP smoke domain (64 MiB, a
+# 16 MiB raw disk under miner_data_disk_root, a NIC on `default`) and
+# destroys it, to prove a tenant `virsh start` can open its disks and
+# attach its NIC. Running tenants are not touched. `false` skips only
+# the smoke domain; every other check still runs.
+miner_launch_smoke_enabled: true
+# Seconds `virsh create` may take before the smoke test gives up.
+miner_launch_smoke_timeout_s: 60
+
 # ── miner-agent install ─────────────────────────────────────────────
 miner_agent:
   install_path: "/usr/local/bin/hippius-miner-agent"
@@ -269,6 +279,18 @@ miner_auto_update_randomized_delay: "6h"
 # How long the relaunched agent has to deliver a heartbeat before the
 # updater puts the previous binary back.
 miner_auto_update_health_timeout_s: 300
+
+# An exact miner-agent release for THIS run, one-shot, on the command line:
+#   ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+#       --limit <host> -e miner_agent_version=<tag>
+# Play 05 installs that tag (`hippius-miner-update --tag`): the same
+# sha256 / attestation / --version checks, no soak, never below the
+# installed release, never a tag marked failed. On a running agent it is
+# the updater's SIGKILL swap (domains survive, rolled back if unhealthy);
+# otherwise a plain install. Auto-update and its soak are unchanged. Not
+# set here: left in host_vars it would fail every run once the timer
+# moves past it.
+# miner_agent_version: "vYYYY.MM.DD"
 
 # cosign, which verifies the attestation. Pinned binary + digest
 # (https://github.com/sigstore/cosign/releases, cosign_checksums.txt).

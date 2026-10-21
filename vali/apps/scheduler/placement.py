@@ -125,6 +125,8 @@ MINERS_BOOTING = "miners-booting"
 ANTI_AFFINITY_UNSATISFIABLE = "placement-anti-affinity-unsatisfiable"
 #: Gate (m) emptied the set: no host has a failover peer.
 NO_FAILOVER_CAPABLE_HOST = "no-failover-capable-host"
+#: Gate (n) emptied the set: no host has an OS pool at the VM's tier.
+NO_MINER_AT_TIER = "no-miner-at-tier"
 
 # The two `cvm_capability` verdicts this module acts on. Re-declared as
 # plain literals rather than imported so this module stays free of the
@@ -166,6 +168,18 @@ class ResourceFit:
     disk_mode: str = "off"
     disk_gb: int = 0
     disk_refusal_by_node: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DiskTierFit:
+    """Gate (n), the OS-disk tier (`VALI_SCHEDULER_DISK_TIER_GATE`, see
+    `apps.disktier.os_tier`): `record` admits but logs a CHOSEN node
+    `enforce` would have refused; `enforce` refuses. The map holds, per
+    node, why it has no OS pool at `tier` (a node absent from it has one)."""
+
+    mode: str
+    tier: str
+    refusal_by_node: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -366,6 +380,7 @@ def decide_placement(
     group_occupied: frozenset[str] | None = None,
     power_policy_capable: frozenset[str] | None = None,
     failover_capable: frozenset[str] | None = None,
+    disk_tier_fit: DiskTierFit | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -507,6 +522,9 @@ def decide_placement(
                          peer (`service.failover_capable_node_ids`), passed
                          only for a VM launched `require_failover_peer`.
                          HARD, no fallback. `None` ⇒ no gate.
+    - `disk_tier_fit`    gate (n): the nodes with no OS pool at the VM's
+                         OS-disk tier ([`DiskTierFit`]). Enforced: HARD, no
+                         fallback. `None` ⇒ no gate.
 
     Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
     candidate that passed all the others (retry shortly);
@@ -514,7 +532,8 @@ def decide_placement(
     every one of them (the fleet is reachable, just not there);
     `placement-anti-affinity-unsatisfiable` when gate (k) removed every host
     that passed all the others; `no-miner-supports-power-policy` likewise
-    for gate (l), `no-failover-capable-host` for gate (m); otherwise
+    for gate (l), `no-failover-capable-host` for gate (m), `no-miner-at-tier`
+    for gate (n); otherwise
     `no-eligible-miner`.
     """
     weights = weights or SelectionWeights()
@@ -569,6 +588,13 @@ def decide_placement(
     failover_skipped = 0
     zombie_skipped = 0
     disk_skipped = 0
+    tier_seen = 0
+    tier_skipped = 0
+    # Gate (n)'s refusals while it is enforced, and the tier they are at.
+    tier_refusals: Mapping[str, str] | None = None
+    tier = ""
+    if disk_tier_fit is not None and disk_tier_fit.mode == "enforce":
+        tier_refusals, tier = disk_tier_fit.refusal_by_node, disk_tier_fit.tier
     booting = booting_by_node or {}
     # Gate (g)'s removals, `{node_id: booting count}` — logged, and named
     # in the `miners-booting` error.
@@ -693,6 +719,12 @@ def decide_placement(
         ):
             disk_skipped += 1
             continue
+        # (n) the OS-disk tier — a host with no OS pool at the VM's tier.
+        if tier_refusals is not None:
+            tier_seen += 1
+            if tier_refusals.get(miner.node_id, ""):
+                tier_skipped += 1
+                continue
         # (a) admission bounded by proven capacity.
         capacity = capacity_by_node.get(miner.node_id)
         load = load_by_node.get(miner.node_id, 0)
@@ -851,6 +883,12 @@ def decide_placement(
                 "candidate(s) have none",
                 NO_FAILOVER_CAPABLE_HOST,
             )
+        if tier_seen and tier_skipped == tier_seen:
+            raise PlacementError(
+                f"no dispatchable miner has an OS pool at disk tier {tier!r} with room "
+                f"({tier_skipped} candidate(s) removed by the disk-tier gate)",
+                NO_MINER_AT_TIER,
+            )
         region_note = (
             f" (constrained to region {region!r}: {region_skipped} of "
             f"{region_seen} reachable candidate(s) removed by the region gate)"
@@ -980,7 +1018,29 @@ def decide_placement(
     eligible.sort(key=lambda c: (-scores[c.node_id], c.node_id))
     _log_shadow(resource_fit, shadow, chosen=eligible[0].node_id)
     _log_disk_record(resource_fit, chosen=eligible[0].node_id)
+    _log_tier_record(disk_tier_fit, chosen=eligible[0].node_id)
     return eligible[0].node_id
+
+
+def _log_tier_record(fit: DiskTierFit | None, *, chosen: str) -> None:
+    """Gate (n) `record`: the chosen node is one `enforce` would have
+    refused — log it (stable event name) and admit anyway."""
+    if fit is None or fit.mode != "record":
+        return
+    reason = fit.refusal_by_node.get(chosen, "")
+    if reason:
+        log.warning(
+            "%s",
+            json.dumps(
+                {
+                    "event": "disk_tier_gate_would_reject",
+                    "node_id": chosen,
+                    "os_disk_tier": fit.tier,
+                    "reason": reason,
+                },
+                sort_keys=True,
+            ),
+        )
 
 
 def _log_disk_record(resource_fit: ResourceFit | None, *, chosen: str) -> None:

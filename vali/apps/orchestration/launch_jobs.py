@@ -23,6 +23,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from apps.disktier import os_tier
 from apps.disktier.storage_doc import is_valid_pool_id
 from apps.identity import scoping
 from apps.orchestration import power_policy, webhook
@@ -266,6 +267,30 @@ def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
             # there would be silently ignored.
             raise LaunchIntentError("os_pool needs a golden launch", "bad-field")
         spec["pinned_os_pool"] = pin
+
+    # The OS-disk tier (a minimum; absent ⇒ nvme): 400 off the enum, 409
+    # when not sold (`os_tier.not_offered`). Written only when not nvme,
+    # like the three above.
+    try:
+        tier = os_tier.parse(intent.get("os_disk_tier"))
+    except ValueError as exc:
+        raise LaunchIntentError(str(exc), os_tier.CATEGORY_INVALID) from exc
+    why = os_tier.not_offered(tier, spec["flavor"])
+    if why:
+        raise LaunchIntentError(why, os_tier.CATEGORY_NOT_OFFERED)
+    if tier != os_tier.DEFAULT_TIER:
+        spec["os_disk_tier"] = tier
+
+    # Dedicated disks (design §10.20) are reserved, not sold yet: any value
+    # but null is refused 409 so a caller can wire the field now.
+    # `pinned_ack` goes with it, a boolean, and is not kept.
+    if intent.get("dedicated_disks") is not None:
+        raise LaunchIntentError(
+            "dedicated_disks is not offered on this validator", CATEGORY_DEDICATED_NOT_OFFERED
+        )
+    ack = intent.get("pinned_ack")
+    if ack is not None and not isinstance(ack, bool):
+        raise LaunchIntentError("pinned_ack must be a boolean", "bad-field")
 
     # Tenant price ceiling — optional positive int (USD/unit ×1e6) or None
     # (no ceiling ⇒ the VM is never migrated on a miner price change).
@@ -601,6 +626,8 @@ def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> DiskP
 
 #: The category of an `os_pool` in a launch that is not the disk probe's.
 CATEGORY_OS_POOL_RESERVED = "os-pool-reserved"
+#: A launch naming `dedicated_disks` before they are sold (409).
+CATEGORY_DEDICATED_NOT_OFFERED = "dedicated-disks-not-offered"
 #: The intent key the disk-tier probe pins its pool under test with.
 _OS_POOL_KEY = "os_pool"
 
@@ -1011,6 +1038,54 @@ def start_launch(
             customer_keys.check_new_launch(intent, binding)
         except customer_keys.CustomerKeysError as exc:
             raise LaunchIntentError(str(exc), "bad-field") from exc
+    # Every pure check of the body BEFORE the first write below (the golden
+    # overlay KEK, the userdata): a refusal after those would strand Vault
+    # material under a vm_id that never gets a `Vm` row, where §24 never
+    # looks.
+    spec_json = _build_spec_json(intent)
+    prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", ""))
+    if not prefix:
+        raise LaunchIntentError("VALI_VAULT_KV_PREFIX is not configured", "internal")
+    # NetBird template is a pure check — fail fast at POST (the worker
+    # applies the same rule).
+    nb_err = launch.check_netbird_userdata(
+        userdata,
+        enable=spec_json["enable_netbird"],
+        hostname_template=spec_json["netbird_hostname_template"],
+        vm_id=spec_json["vm_id"],
+    )
+    if nb_err is None:
+        nb_err = launch.check_netbird_hostname(
+            enable=spec_json["enable_netbird"],
+            hostname_template=spec_json["netbird_hostname_template"],
+            vm_id=spec_json["vm_id"],
+        )
+    if nb_err is not None:
+        raise LaunchIntentError(nb_err, "bad-field")
+    # The KEK path every launch ends on: a prefix that makes it too long, or
+    # that the `<mount>/data/` strip below would rewrite, is refused before
+    # the KEK is provisioned there.
+    mount = str(getattr(settings, "VALI_VAULT_KV_MOUNT", "secret"))
+    canonical_kek_path = f"{prefix}/{spec_json['vm_id']}/luks-kek"
+    if len(canonical_kek_path) > _MAX_VAULT_PATH or canonical_kek_path.startswith(
+        f"{mount}/data/"
+    ):
+        raise LaunchIntentError(
+            f"the canonical kek path {canonical_kek_path!r} is unusable "
+            "(VALI_VAULT_KV_PREFIX)",
+            "internal",
+        )
+    # An in-flight launch of this vm_id, refused before the writes (the
+    # insert below re-checks it under the partial unique index).
+    if (
+        LaunchJob.objects.filter(vm_id=spec_json["vm_id"])
+        .exclude(state__in=(LaunchJobState.SUCCEEDED.value, LaunchJobState.FAILED.value))
+        .exists()
+    ):
+        raise LaunchIntentError(
+            f"vm {spec_json['vm_id']!r} already has an in-flight launch job", "conflict"
+        )
+
     if not customer_keys.releases_kek(binding):
         # M2 (`customer`): Hippius holds NO disk KEK — nothing is generated
         # (no Transit datakey), wrapped or staged. The job still records the
@@ -1058,13 +1133,6 @@ def start_launch(
     if len(kek_vault_path) > _MAX_VAULT_PATH:
         raise LaunchIntentError("kek_vault_path too long", "bad-field")
 
-    spec_json = _build_spec_json(intent)
-
-    mount = str(getattr(settings, "VALI_VAULT_KV_MOUNT", "secret"))
-    prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", ""))
-    if not prefix:
-        raise LaunchIntentError("VALI_VAULT_KV_PREFIX is not configured", "internal")
-
     # The KEK MUST already be staged at the canonical
     # `{prefix}/{vm_id}/luks-kek` — the exact path the KBS releases from
     # (it derives lifecycle-key by swapping that final segment). Requiring
@@ -1075,30 +1143,12 @@ def start_launch(
     # vm's namespace (no cross-tenant key confusion). The operator/bake
     # convention already stages here (`--kek-vault-path …/luks-kek`).
     vm_id = spec_json["vm_id"]
-    canonical_kek_path = f"{prefix}/{vm_id}/luks-kek"
     if kek_vault_path != canonical_kek_path:
         raise LaunchIntentError(
             f"kek_vault_path must be exactly {canonical_kek_path!r} "
             "(the canonical luks-kek path the KBS releases from)",
             "bad-field",
         )
-
-    # NetBird template is a pure check — fail fast at POST (the worker
-    # applies the same rule).
-    nb_err = launch.check_netbird_userdata(
-        userdata,
-        enable=spec_json["enable_netbird"],
-        hostname_template=spec_json["netbird_hostname_template"],
-        vm_id=spec_json["vm_id"],
-    )
-    if nb_err is None:
-        nb_err = launch.check_netbird_hostname(
-            enable=spec_json["enable_netbird"],
-            hostname_template=spec_json["netbird_hostname_template"],
-            vm_id=spec_json["vm_id"],
-        )
-    if nb_err is not None:
-        raise LaunchIntentError(nb_err, "bad-field")
 
     # §20: stage the userdata to a transport path BEFORE the row exists,
     # so the plaintext never touches the DB — and Transit-WRAPPED (under

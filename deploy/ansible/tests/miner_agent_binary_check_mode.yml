@@ -1,8 +1,9 @@
 ---
 # --check half of the miner-agent binary wiring test (run WITH --check): a
 # fresh host previews the release install without calling the updater or
-# writing anything, and an agent already in place is still judged in
-# place.
+# writing anything, an agent already in place is still judged in place,
+# and `miner_agent_version` on a running agent previews the swap
+# (`--tag`) without calling anything.
 #
 # Run (from deploy/ansible):
 #   ansible-playbook -i localhost, -c local tests/miner_agent_binary_check_mode.yml --check
@@ -11,9 +12,11 @@
   hosts: localhost
   gather_facts: false
   become: false
+  environment:
+    PATH: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-check/bin:{{ lookup('env', 'PATH') }}"
   vars:
     scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/miner-agent-binary-check"
-    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent" }
+    miner_agent: { install_path: "{{ scratch }}/hippius-miner-agent", systemd_unit_name: hippius-miner-agent }
     miner_agent_updater: "{{ scratch }}/hippius-miner-update"
     miner_agent_build_from_source: false
     miner_auto_update_release_repo: "example/release-repo"
@@ -29,6 +32,14 @@
         path: "{{ scratch }}"
         state: "{{ item }}"
       loop: [absent, directory]
+
+    - name: A stub systemctl saying the agent runs (written for real)
+      check_mode: false
+      block:
+        - name: Its directory
+          ansible.builtin.file: { path: "{{ scratch }}/bin", state: directory, mode: "0755" }
+        - name: The stub
+          ansible.builtin.copy: { dest: "{{ scratch }}/bin/systemctl", content: "#!/bin/sh\necho active\n", mode: "0755" }
 
     - name: A stub updater that records any call (written for real)
       check_mode: false
@@ -68,3 +79,17 @@
         that:
           - not (miner_agent_install_needed | bool)
           - not (scratch ~ '/calls') is file
+
+    - name: miner_agent_version on a running agent
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/miner-agent-binary.yml
+      vars:
+        miner_agent_version: v2025.01.10
+
+    - name: The swap is previewed (`--tag`), nothing called, the binary untouched
+      ansible.builtin.assert:
+        that:
+          - miner_agent_pin_needed | bool
+          - miner_agent_updater_args == ['--tag', 'v2025.01.10']
+          - miner_agent_release_install is skipped
+          - not (scratch ~ '/calls') is file
+          - lookup('pipe', miner_agent.install_path ~ ' --version') is search('[(]v2025.01.08[)]')

@@ -149,12 +149,19 @@ def test_the_play_builds_from_source_only_when_asked() -> None:
         for t in release
         if t.get("name") == "Install the miner-agent release, verified as an auto-update is"
     ]
-    assert install["ansible.builtin.command"]["argv"] == ["{{ miner_agent_updater }}", "--install"]
-    assert install["when"] == [
-        "miner_agent_install_needed | bool",
-        "not (miner_agent_build_from_source | bool)",
-        "not ansible_check_mode",
-    ]
+    assert install["ansible.builtin.command"]["argv"] == (
+        "{{ [miner_agent_updater] + miner_agent_updater_args }}"
+    )
+    assert install["when"] == ["miner_agent_release_runs | bool", "not ansible_check_mode"]
+    (choose,) = [t for t in release if t.get("name") == "Choose the updater run"]
+    facts = choose["ansible.builtin.set_fact"]
+    # A missing or foreign binary goes to the release only without the
+    # source build; an explicit `miner_agent_version` always does.
+    assert "not (miner_agent_build_from_source | bool)" in facts["miner_agent_release_runs"]
+    assert "(miner_agent_pin_needed | bool)" in facts["miner_agent_release_runs"]
+    # Only a running agent is swapped (`--tag` alone); otherwise `--install`.
+    assert "== 'active'" in facts["miner_agent_updater_args"]
+    assert "['--install']" in facts["miner_agent_updater_args"]
 
 
 def test_placeholders_are_refused_before_the_config_is_rendered() -> None:

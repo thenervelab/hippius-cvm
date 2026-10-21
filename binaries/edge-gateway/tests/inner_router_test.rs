@@ -581,6 +581,52 @@ async fn forwarder_transport_failure_returns_502() {
     assert_eq!(mock.calls().len(), 1);
 }
 
+/// The miner's `x-hippius-reason` (the failing step's static code) rides
+/// back to vali as the same header; the body class is unchanged.
+#[tokio::test]
+async fn the_miner_reason_code_is_relayed_as_a_header() {
+    let forward: Arc<dyn MinerForward> = Arc::new(MockMinerForward::with_reason(
+        500,
+        b"dispatch-failed".to_vec(),
+        Some("libvirt-driver/define".to_string()),
+    ));
+    let router = build_inner_router(InnerRouterState::new(test_signer(), forward));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/edge/order")
+        .header("content-type", "application/cbor")
+        .header(TARGET_ADDR_HEADER, "100.100.100.100:9700")
+        .header(ORDER_KIND_HEADER, "launch")
+        .body(Body::from(launch_order_body()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 500);
+    assert_eq!(
+        response.headers().get("x-hippius-reason").unwrap(),
+        "libvirt-driver/define"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"dispatch-failed");
+}
+
+#[tokio::test]
+async fn no_reason_header_without_a_miner_reason() {
+    let forward: Arc<dyn MinerForward> = Arc::new(MockMinerForward::with_response(
+        400,
+        b"bad-signature".to_vec(),
+    ));
+    let router = build_inner_router(InnerRouterState::new(test_signer(), forward));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/edge/order")
+        .header(TARGET_ADDR_HEADER, "100.100.100.100:9700")
+        .header(ORDER_KIND_HEADER, "launch")
+        .body(Body::from(launch_order_body()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert!(response.headers().get("x-hippius-reason").is_none());
+}
+
 #[tokio::test]
 async fn miner_4xx_classifier_is_relayed_to_vali_verbatim() {
     // The miner-agent's `OrderVerifier::verify` returns 400 with body

@@ -12,6 +12,9 @@ already keeps and NEVER from a miner's self-report:
                          cannot disagree
 - capacity / load        `scheduler.service.decision_inputs` — the
                          effective admission slots + active placements
+- launch errors          `miners.MinerLaunchErrors` — the node's own
+                         answers to the launch orders vali sent it, as
+                         sanitized static codes (`miners.launch_errors`)
 - recent refusals        FAILED `Placement` rows that are a judgement
                          about the node, selected by PROVENANCE
                          (`Placement.failure_source`, stamped by the
@@ -47,8 +50,13 @@ from django.db.models import Count, F, Q, QuerySet, Window
 from django.db.models.functions import Lower, RowNumber
 from django.utils import timezone
 
-from apps.miners import geo
-from apps.miners.models import LocationVerdict, MinerIdentity, MinerLocation
+from apps.miners import geo, launch_errors
+from apps.miners.models import (
+    LocationVerdict,
+    MinerIdentity,
+    MinerLaunchErrors,
+    MinerLocation,
+)
 from apps.scheduler import service as scheduler_service
 from apps.scheduler import storage_requirement
 from apps.scheduler.models import (
@@ -138,6 +146,13 @@ def _location_of(miner: MinerIdentity) -> MinerLocation | None:
     try:
         return miner.location
     except MinerLocation.DoesNotExist:
+        return None
+
+
+def _launch_errors_of(miner: MinerIdentity) -> MinerLaunchErrors | None:
+    try:
+        return miner.launch_errors
+    except MinerLaunchErrors.DoesNotExist:
         return None
 
 
@@ -245,7 +260,7 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
 
     now = timezone.now()
     identities = list(
-        MinerIdentity.objects.select_related("location")
+        MinerIdentity.objects.select_related("location", "launch_errors")
         .annotate(nid=Lower("chain_node_id"))
         .filter(nid__in=wanted)
     )
@@ -305,6 +320,7 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                     if storage_by_node is None
                     else storage_by_node.get(nid)
                 ),
+                **launch_errors.readout(_launch_errors_of(miner)),
             }
         )
     return rows
@@ -323,6 +339,31 @@ def _empty_region_capacity(model: str) -> dict[str, Any]:
         "free_vms": None,
         "free_by_flavor": {},
     }
+
+
+def _add_os_disk_tiers(
+    by_region: dict[str, dict[str, Any]], offering: dict[str, list[str]]
+) -> None:
+    """Each region's `os_disk_tiers`: per tier, how many of its offering
+    miners have an OS pool at it (`os_tier.refusals`, room aside), and
+    whether a VM sold at it can be placed there — sold, and with the tier
+    gate enforced a host at it; otherwise any offering miner (placement
+    does not check the tier)."""
+    from apps.disktier import os_tier
+    from apps.disktier.tiers import SELLABLE_TIERS
+
+    nodes = [nid for nids in offering.values() for nid in nids]
+    enforced = os_tier.gate_mode() == os_tier.GATE_ENFORCE
+    for tier in SELLABLE_TIERS:
+        refused = os_tier.refusals(nodes, tier, 0) if nodes else {}
+        sold = not os_tier.tier_not_offered(tier)
+        for region, row in by_region.items():
+            mine = offering.get(region, [])
+            hosts = sum(1 for nid in mine if nid not in refused)
+            row.setdefault("os_disk_tiers", {})[str(tier)] = {
+                "placeable": sold and (hosts > 0 if enforced else bool(mine)),
+                "hosts": hosts,
+            }
 
 
 def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]:
@@ -370,6 +411,8 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
     )
 
     by_region: dict[str, dict[str, Any]] = {}
+    # Per region, the counted, dispatchable miners that offer (not gated).
+    offering: dict[str, list[str]] = {}
     for loc in located:
         nid = str(loc.miner.chain_node_id).lower()
         region = loc.region
@@ -396,6 +439,8 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
         if nid not in dispatchable:
             continue
         row["miners_dispatchable"] += 1
+        if nid not in gated:
+            offering.setdefault(region, []).append(nid)
         view = views.get(nid)
         if view is not None:
             row["hosted_vm_count"] += view.placements
@@ -421,6 +466,7 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
             row["capacity"] = cap
     for row in by_region.values():
         row["node_ids"].sort()
+    _add_os_disk_tiers(by_region, offering)
     vantage = geo.vantage_from_settings()
     return {
         "regions": [by_region[k] for k in sorted(by_region)],

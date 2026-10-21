@@ -276,10 +276,13 @@ From your Ansible checkout (`deploy/ansible`):
    ```sh
    ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --limit <hostname>
    ```
-   Plays 00-08 cover: preflight, SNP kernel command line (may reboot),
+   Plays 00-09 cover: preflight, SNP kernel command line (may reboot),
    libvirt/QEMU plus the tenant firmware, the VM network, NetBird join,
-   the miner agent and identity, the gateway CA, the firewall, and SSH
-   hardening (key-only).
+   the miner agent and identity, the gateway CA, the firewall, SSH
+   hardening (key-only), and a last tenant-launch preflight. That one
+   prints a `HIPPIUS_LAUNCH_PREFLIGHT {...}` line and refuses a host that
+   could not start a tenant VM
+   ([Launch preflight codes](#launch-preflight-codes-play-09)).
 5. Play 04 reads this host's mesh address from `netbird status` after the
    join, and the agent's order server binds to it. Check that the
    `bind_ip=` it prints matches `netbird status`. Without a mesh address
@@ -447,9 +450,51 @@ alone with `--tags preflight --check` after each fix.
 | `DATA_DISK_BUSY` | A disk listed as a data disk has a partition table, a filesystem, or backs a system mount. | List only blank disks as data disks. Never list a system disk. |
 | `PINNED_FILE_MISMATCH` | A CA certificate or host-attestor file (in the checkout or downloaded) doesn't hash to its pin. | Restore the checkout file from the repository (or delete it so the play downloads the pinned one) and rerun. Never edit the pin. |
 | `NETBIRD_SETUP_KEY_MISSING` | The setup-key file isn't on your workstation. | Save the key from the dashboard to the path the message gives. |
-| `MINER_AGENT_INSTALL_FAILED` (play 05) | The agent binary was missing or foreign, and the play could not install a verified release: no network to GitHub, no release old enough yet, a refused checksum or attestation (the message gives the updater's reason), or a release whose `--version` is newer than your checkout's `versions.miner_agent`. Nothing was installed. | Fix what the message says (allow outbound HTTPS, or update your checkout), then re-run. Or install the binary by hand (`onboarding-a-miner.md`, "Prebuilt binary") and re-run. |
+| `MINER_AGENT_VERSION_INVALID` (play 05) | `miner_agent_version` is not `vYYYY.MM.DD[.N]`, or is combined with `miner_agent_build_from_source: true`. | Pass a release tag from the releases page, without the source build. |
+| `MINER_AGENT_INSTALL_FAILED` (play 05) | The agent binary was missing or foreign (or `miner_agent_version` asked for another release), and the play could not install a verified release: a tag older than the installed release, marked failed, or without a complete release; no network to GitHub, no release old enough yet, a refused checksum or attestation (the message gives the updater's reason), or a release whose `--version` is newer than your checkout's `versions.miner_agent`. Nothing is installed unless every check passed; a swapped agent that does not come back healthy is put back on its previous binary. | Fix what the message says (allow outbound HTTPS, or update your checkout), then re-run. Or install the binary by hand (`onboarding-a-miner.md`, "Prebuilt binary") and re-run. |
 | `PLACEHOLDER_VALUE` (play 05) | A variable is still a `<…>` placeholder (the message names the config key or the variable). | Set it in host_vars (the dashboard's generated file carries the fleet values), then re-run. |
 | `VAULT_CREDENTIALS_SET`, `K3S_PRESENT` | The host or its variables look like a control-plane node. | A miner host carries neither; use a clean machine and the generated host_vars. |
+
+### Launch preflight codes (play 09)
+
+The host attestor has no disk and no network card, so a host can run it
+and still fail every tenant launch at `virsh start` (`dispatch-failed`,
+class `libvirt-driver/create`). Play 09 checks what a tenant VM adds,
+after libvirt and the agent are installed, and reports every failure at
+once in the same `FAIL [CODE] ... -- fix: ...` form. Its last check
+starts a small smoke VM: paused, transient, not SNP, 64 MiB, a 16 MiB raw
+disk under `miner_data_disk_root` opened the way tenant disks are
+(`cache='none'`), and a network card on `default` with the tenant
+filter. It is destroyed straight away, and so are its scratch files.
+Running tenant VMs are not touched. Set `miner_launch_smoke_enabled:
+false` to skip only the smoke VM.
+
+Rerun it alone after a fix, together with play 03, which repairs the
+network:
+
+```sh
+ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+    --limit <hostname> --tags launch_preflight
+```
+
+With `--check` it runs only the read-only checks (no scratch file, no
+smoke VM) and prints `WOULD FAIL [CODE]` lines without stopping.
+
+| Code | Meaning | Fix |
+|---|---|---|
+| `LIBVIRT_NOT_INSTALLED` | `virsh` is missing, so nothing could be checked. | Run the whole play: play 02 installs libvirt. |
+| `LIBVIRT_DEFAULT_NET_INACTIVE` | The libvirt `default` network is missing or not running. Every tenant network card attaches to it. | `virsh net-start default && virsh net-autostart default`, or rerun with `--tags launch_preflight` (play 03 defines, starts and autostarts it). |
+| `LIBVIRT_DEFAULT_NET_NO_AUTOSTART` | `default` runs but won't come back after a reboot. | `virsh net-autostart default`, or rerun with `--tags launch_preflight`. |
+| `LIBVIRT_DEFAULT_NET_SUBNET_CLASH` (play 03) | `default` (192.168.122.0/24) overlaps a route or address the host already has: another hypervisor, a container bridge, a VPN. Nothing was started. | Renumber the other interface. The agent needs `default` on exactly 192.168.122.1/24. |
+| `LIBVIRT_DEFAULT_NET_START_FAILED` (play 03) | `virsh net-start default` failed (the message has libvirt's error). | Usually `dnsmasq-base` missing (play 02 installs it), another DNS/DHCP server bound to every address (`ss -lunp 'sport = :67 or sport = :53'`), or the firewall backend (`journalctl -u libvirtd`). |
+| `LIBVIRT_DEFAULT_NET_WRONG_SUBNET` | `default` isn't on `virbr0` with 192.168.122.1/24. The agent's guest firewall and DHCP filter assume exactly that. | Redefine `default` as the stock libvirt network. If the range is taken, renumber the other interface instead. |
+| `LIBVIRT_NWFILTER_MISSING` | libvirt has no `clean-traffic` filter, which tenant network cards reference. | `apt install --reinstall libvirt-daemon-config-nwfilter`, then `systemctl restart libvirtd` (running VMs keep running). |
+| `QEMU_USER_UNKNOWN` | `user =` in `/etc/libvirt/qemu.conf` names an account that doesn't exist. | Restore the packaged default (commented out, meaning `libvirt-qemu`), restart libvirtd. |
+| `QEMU_CANNOT_TRAVERSE_DATA_ROOT` | QEMU's user (`libvirt-qemu`) can't enter a directory on the way to a storage root. libvirt hands it each disk file, never the parent directories. The message names the directory and its mode. | `chmod o+x <dir>`, or `setfacl -m u:libvirt-qemu:x <dir>`. The play doesn't change directories it didn't create. |
+| `QEMU_CANNOT_OPEN_DATA_ROOT` | root can do direct I/O on a file there, QEMU's user can't, on a file it owns. Also given as a likely cause when the smoke VM fails with `Permission denied`. | Look for an ACL, a mount option (NFS root-squash) or a security module denial: `getfacl`, `findmnt`, `journalctl -k \| grep -i denied`. |
+| `DATA_ROOT_NO_ODIRECT` | The filesystem under a storage root refuses `O_DIRECT`. Tenant disks are `cache='none'`, which QEMU opens with `O_DIRECT`. | Put the storage roots on ext4, xfs or btrfs: not tmpfs, overlayfs, or a network or FUSE filesystem without direct I/O. |
+| `AGENT_SANDBOX_CANNOT_WRITE` | The agent's systemd sandbox (`ProtectSystem=strict`) can't write a storage root that its installed config names. Either the root is missing from the unit's `ReadWritePaths`, or a file couldn't be created there under the unit's own sandbox properties, drop-ins included. Also given when the unit isn't installed. | Set `miner_data_disk_root` / `miner_state_disk_root` in host_vars and rerun the play: it renders both the config and the unit. Don't edit `config.toml` by hand. Check that the root is a writable mount (`findmnt`) and look for drop-ins under `/etc/systemd/system/hippius-miner-agent.service.d/`. |
+| `LAUNCH_SMOKE_FAILED` | The smoke VM didn't start. The message has libvirt's error, and usually `(looks like <CODE>)`. | Fix what libvirt names. `journalctl -u libvirtd` and `/var/log/libvirt/qemu/hippius-preflight-smoke-*.log` have the rest. |
 
 ### Heartbeats
 
@@ -510,6 +555,10 @@ Common classes:
 - `refused kbs-transport`: the KBS CA is missing.
 - `*-disk/mkdir`: a data root outside the agent's writable paths. Set it
   in host_vars and rerun the play.
+- `libvirt-driver/create`: `virsh start` failed. Run
+  `--tags launch_preflight` ([Launch preflight codes](#launch-preflight-codes-play-09)).
+  It checks the `default` network, QEMU's access to the disk roots, and
+  `O_DIRECT`, then starts a smoke VM.
 - `507 insufficient-disk`: the disk budget is exhausted. This is a
   capacity event, not a fault.
 
@@ -614,7 +663,21 @@ cat /var/lib/hippius-miner/installed-release
 - Durably: set `miner_auto_update_enabled: false` in host_vars and run the
   play with `--tags miner_auto_update`.
 
-Then upgrade by hand as described in
+**An exact release, now** (to take a release before its 24-hour soak, or
+to upgrade a host where auto-update is off):
+
+```sh
+ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --limit <host> -e miner_agent_version=<tag>
+```
+
+Same checks as auto-update, no soak, never an older release than the one
+the host runs. A running agent is swapped the way auto-update does it
+(SIGKILL, systemd relaunches it, your VMs keep running; rolled back if no
+heartbeat follows). Auto-update itself is not changed. Use `-e` only, not
+host_vars. Details:
+[An exact release](./onboarding-a-miner.md#an-exact-release-miner_agent_version).
+
+Or upgrade by hand as described in
 [`miner-tasks/AUTO_UPDATE.md`](../../deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md).
 To verify a release yourself, follow
 [Verifying a release by hand](./onboarding-a-miner.md#verifying-a-release-by-hand).

@@ -57,6 +57,7 @@ MINER_CONFIG=$SB/config.toml
 COSIGN_BIN=$SB/bin/cosign
 CGROUP_ROOT=$SB/cgroup
 RELEASES_API=https://api.github.test/releases/latest
+RELEASE_TAG_API=https://api.github.test/releases/tags
 HEALTH_TIMEOUT_S=3
 RELAUNCH_TIMEOUT_S=3
 POLL_INTERVAL_S=0
@@ -171,13 +172,16 @@ run_update() {
 
 # The first install (play 05): stdout (the installed tag) and stderr (what
 # play 05 shows) each kept apart from the journal.
-run_install() {
+run_args() {
     set +e
-    env -i PATH="$SB/bin:/usr/bin:/bin" HIPPIUS_MINER_UPDATE_ENV="$SB/env" bash "$UPDATER" --install >"$SB/stdout" 2>"$SB/stderr"
+    env -i PATH="$SB/bin:/usr/bin:/bin" HIPPIUS_MINER_UPDATE_ENV="$SB/env" bash "$UPDATER" "$@" >"$SB/stdout" 2>"$SB/stderr"
     RC=$?
     set -e
     cat "$SB/stderr" "$SB/journal" >"$SB/out" 2>/dev/null || true
 }
+run_install() { run_args --install; }
+# A release served by tag (`--tag`): <tag> <published hours ago>.
+write_tag_release() { release_json "$1" "$(iso_hours_ago "$2")" >"$SB/remote/$1"; }
 # Without the agent binary at all (a fresh host).
 no_agent() { rm -f -- "$SB/hippius-miner-agent"; }
 no_systemctl() { ! grep -q '^systemctl' "$SB/calls"; }
@@ -609,6 +613,77 @@ check "install: an update run holding the lock => exit 1, not a silent success" 
 
 setup "" v2025.01.09 48; no_agent; set +e; env -i PATH="$SB/bin:/usr/bin:/bin" HIPPIUS_MINER_UPDATE_ENV="$SB/env" bash "$UPDATER" --instal >"$SB/out" 2>&1; RC=$?; set -e
 check "install: an unknown argument is refused" bash -c "[ $RC = 1 ] && ! grep -q curl '$SB/calls'"
+
+# ── An explicit release (--tag, play 05's miner_agent_version) ──────────────
+# The served binary is the second setup argument; the release object is
+# served at <RELEASE_TAG_API>/<tag>.
+setup "" v2025.01.10 1; no_agent; write_tag_release v2025.01.10 1; run_args --install --tag v2025.01.10
+check "tag install: exactly that release, inside the soak, verified" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.10)' && [ \"\$(cat '$SB/stdout')\" = v2025.01.10 ] && [ \"\$(cat '$SB/state/installed-release')\" = v2025.01.10 ]"
+check "tag install: read from the tag endpoint, cosign pinned to that tag" \
+    bash -c "grep -q 'curl https://api.github.test/releases/tags/v2025.01.10$' '$SB/calls' && grep -qx 'https://github.com/thenervelab/hippius-cvm/.github/workflows/miner-agent-release.yml@refs/tags/v2025.01.10' '$SB/cosign-args'"
+check "tag install: no systemctl" no_systemctl
+check "tag install: auto-update.env untouched" bash -c "! grep -q MIN_RELEASE_AGE_H '$SB/env'"
+
+setup "" v2025.01.10 48; no_agent; run_args --install --tag v2025.1.10
+check "tag: a malformed tag is refused before any network" bash -c "[ $RC = 1 ] && grep -q 'is not vYYYY.MM.DD' '$SB/stderr' && ! grep -q curl '$SB/calls'"
+setup "" v2025.01.10 48; no_agent; run_args --install --tag v2025.01.10.0
+check "tag: .0 is not a release tag" bash -c "[ $RC = 1 ] && ! grep -q curl '$SB/calls'"
+setup "" v2025.01.10 48; no_agent; run_args --install --tag
+check "tag: --tag without a value is refused" test "$RC" = 1
+
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; echo v2025.01.11 >"$SB/state/installed-release"; run_args --install --tag v2025.01.10
+check "tag install: below the recorded floor is refused, nothing installed" \
+    bash -c "[ $RC = 1 ] && grep -q 'older than the recorded v2025.01.11' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ] && ! grep -q 'curl .*/hippius-miner-agent-x86_64-linux-gnu$' '$SB/calls'"
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; echo v2025.01.10 >"$SB/state/installed-release"; run_args --install --tag v2025.01.10
+check "tag install: the recorded tag itself is allowed" bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.10)'"
+
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; sed -i '/sigstore.json"}/d' "$SB/remote/v2025.01.10"; run_args --install --tag v2025.01.10
+check "tag install: an incomplete release is refused" \
+    bash -c "[ $RC = 1 ] && grep -q 'is incomplete' '$SB/stderr' && grep -q 'v2025.01.10 cannot be installed' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+setup "" v2025.01.10 48; no_agent; run_args --install --tag v2025.01.10
+check "tag install: a tag with no release (404) is refused" bash -c "[ $RC = 1 ] && grep -q 'cannot fetch' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; touch "$SB/state/.update-failed-v2025.01.10"; run_args --install --tag v2025.01.10
+check "tag install: a tag marked failed here is refused" bash -c "[ $RC = 1 ] && grep -q 'is marked failed' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; touch "$SB/cosign-fail"; run_args --install --tag v2025.01.10
+check "tag install: attestation refused => nothing installed" bash -c "[ $RC = 1 ] && grep -q 'does not verify' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+setup "" v2025.01.10 48; no_agent; write_tag_release v2025.01.10 48; echo "0000000000000000000000000000000000000000000000000000000000000000  hippius-miner-agent-x86_64-linux-gnu" >"$SB/remote/SHA256SUMS"; run_args --install --tag v2025.01.10
+check "tag install: bad sha => nothing installed" bash -c "[ $RC = 1 ] && grep -q 'sha256 mismatch' '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+setup "" v2025.01.11 48; no_agent; write_tag_release v2025.01.10 48; run_args --install --tag v2025.01.10
+check "tag install: a binary naming another tag is refused" bash -c "[ $RC = 1 ] && grep -q \"reports release 'v2025.01.11', expected 'v2025.01.10'\" '$SB/stderr' && [ ! -e '$SB/hippius-miner-agent' ]"
+
+# --tag on a running agent: the update path, SIGKILL swap, never stop/restart.
+setup v2025.01.08 v2025.01.10 1; write_tag_release v2025.01.10 1; touch "$SB/state/.no-auto-update"; echo AUTO_UPDATE_DISABLED=true >>"$SB/env"; run_args --tag v2025.01.10
+check "tag upgrade: swapped to that release inside the soak, despite the opt-outs" \
+    bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.10)' && [ \"\$(cat '$SB/state/installed-release')\" = v2025.01.10 ] && [ \"\$(cat '$SB/stdout')\" = v2025.01.10 ]"
+check "tag upgrade: exactly one SIGKILL, never stop/restart, previous binary in .bak" \
+    bash -c "[ \$(wc -l <'$SB/kills') = 1 ] && [ ! -e '$SB/forbidden' ] && '$SB/hippius-miner-agent.bak' --version | grep -qF '(v2025.01.08)'"
+check "tag upgrade: messages on stderr" grep -q '^\[hippius-miner-update\] updated to v2025.01.10' "$SB/stderr"
+
+setup v2025.01.10 v2025.01.10 48; run_args --tag v2025.01.10
+check "tag upgrade: already running that tag => nothing, no network" \
+    bash -c "[ $RC = 0 ] && ! grep -q curl '$SB/calls' && [ ! -e '$SB/kills' ] && [ \"\$(cat '$SB/stdout')\" = v2025.01.10 ]"
+
+setup v2025.01.10 v2025.01.10 48; echo v2025.01.11 >"$SB/state/installed-release"; run_args --tag v2025.01.10
+check "tag upgrade: running that tag but below the recorded floor => refused" \
+    bash -c "[ $RC = 1 ] && grep -q 'older than the recorded v2025.01.11' '$SB/stderr' && [ ! -e '$SB/kills' ]"
+
+setup v2025.01.09 v2025.01.10 48; write_tag_release v2025.01.10 48; fake_agent "$SB/hippius-miner-agent.bak" v2025.01.08
+echo v2025.01.09 >"$SB/state/update-in-progress"; run_args --tag v2025.01.10
+check "tag upgrade: a cut-short swap is left to the timer, nothing done" \
+    bash -c "[ $RC = 1 ] && grep -q 'was cut short' '$SB/stderr' && [ ! -e '$SB/kills' ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)' && ! grep -q curl '$SB/calls'"
+
+setup v2025.01.11 v2025.01.10 48; write_tag_release v2025.01.10 48; run_args --tag v2025.01.10
+check "tag upgrade: below the installed release => downgrade refused, agent untouched" \
+    bash -c "[ $RC = 1 ] && grep -q 'downgrade refused' '$SB/stderr' && [ ! -e '$SB/kills' ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.11)'"
+
+setup v2025.01.08 v2025.01.10 48; write_tag_release v2025.01.10 48; echo v2025.01.10 >"$SB/bad-tag"; run_args --tag v2025.01.10
+check "tag upgrade: unhealthy => rolled back by SIGKILL, marked failed, exit 1" \
+    bash -c "[ $RC = 1 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)' && [ -f '$SB/state/.update-failed-v2025.01.10' ] && [ ! -e '$SB/forbidden' ]"
+
+setup v2025.01.08 v2025.01.10 48; write_tag_release v2025.01.10 48; echo inactive >"$SB/sysd/state"; echo 0 >"$SB/sysd/pid"; run_args --tag v2025.01.10
+check "tag upgrade: a stopped agent is refused (play 05 uses --install for it)" \
+    bash -c "[ $RC = 1 ] && [ ! -e '$SB/kills' ] && ! grep -q 'systemctl start' '$SB/calls' && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)'"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

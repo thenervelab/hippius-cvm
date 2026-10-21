@@ -63,7 +63,7 @@ from apps.orchestration import order_dispatch
 from apps.scheduler import usage
 from apps.scheduler.models import Placement, PlacementStatus, ReceiptWatermark
 
-from . import routing
+from . import os_tier, routing
 from .models import (
     OS_SLOT,
     TERMINAL_MOVE_STATES,
@@ -74,7 +74,6 @@ from .models import (
     VmStorageMove,
 )
 from .storage_config import agent_version, version_at_least
-from .tiers import DiskTier
 
 log = logging.getLogger("apps.disktier.storage_move")
 
@@ -192,9 +191,9 @@ def os_disk_gb(placement: Placement) -> int:
     return int(placement_disk_gb(placement.resource_class, placement.data_disk_gb))
 
 
-def _check_target(node_id: str, pool_id: str, need_gb: int) -> None:
-    """The target takes the disk: the same rules as a first launch's pool
-    (`routing.choose_os_pool`), `default` included."""
+def _check_target(node_id: str, pool_id: str, need_gb: int, tier: str) -> None:
+    """The target takes the disk sold at `tier`: the same rules as a first
+    launch's pool (`routing.choose_os_pool`), `default` included."""
     pool = MinerStoragePool.objects.filter(
         miner_node_id=node_id, pool_id=pool_id, retired_at__isnull=True
     ).first()
@@ -209,8 +208,8 @@ def _check_target(node_id: str, pool_id: str, need_gb: int) -> None:
         raise MoveRefused(
             "move-pool-not-active", f"pool {pool_id!r} is not an active, reported OS-disk pool"
         )
-    if not routing.sold_as_os_disk_tier(pool):
-        raise MoveRefused("move-pool-tier", f"pool {pool_id!r} is not of the OS disk tier")
+    if not routing.serves_os_disk_tier(pool, tier):
+        raise MoveRefused("move-pool-tier", f"pool {pool_id!r} does not hold OS disks at {tier}")
     free = routing.free_gb(pool)
     if free is None or free < need_gb:
         raise MoveRefused(
@@ -272,7 +271,7 @@ def request_move(
     source = source_pool(placement)
     if target_pool == source:
         raise MoveRefused("move-same-pool", f"the disk is already on {source!r}")
-    _check_target(node_id, target_pool, os_disk_gb(placement))
+    _check_target(node_id, target_pool, os_disk_gb(placement), os_tier.launch_tier(vm.vm_id))
 
     with transaction.atomic():
         locked = Vm.objects.select_for_update().get(pk=vm.pk)
@@ -788,7 +787,7 @@ def _record_os_pool(move: VmStorageMove, pool_id: str) -> bool:
             "kind": DiskKind.POOL,
             "pool_id": pool_id,
             "size_gb": os_disk_gb(placement),
-            "required_tier": DiskTier.NVME,
+            "required_tier": os_tier.launch_tier(move.vm.vm_id),
         },
     )
     return True

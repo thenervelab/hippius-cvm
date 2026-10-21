@@ -18,14 +18,44 @@
 # here: the release moves, the attested identity does not. A foreign
 # binary in place is replaced only by that verified download.
 #
-# The agent is never signalled, started or stopped: a process still running
-# an earlier binary keeps it until the operator swaps it (the OPERATOR
-# ACTION at the end of play 05). With `miner_agent_build_from_source: true`
-# the binary is left to the source build in miner-agent-install.yml.
+# `miner_agent_version: <tag>` (one-shot, `-e miner_agent_version=<tag>`)
+# asks for exactly that release instead, with the same checks and no soak
+# (`--tag <tag>`). It is installed when the binary is missing or foreign,
+# and also when the binary in place reports another tag: through
+# `--install --tag` when the agent is not running (nothing to signal), or
+# through the updater's own swap when it is (`--tag`: atomic install,
+# SIGKILL, systemd relaunches the agent, which re-adopts the running CVMs;
+# health-checked, rolled back on failure; never stop/restart). The updater
+# refuses a tag below the installed release and a tag marked failed. The
+# auto-update soak and auto-update.env are not touched.
 #
-# Input: `miner_agent_updater` (the installed hippius-miner-update) and
-# `miner_agent_updater_src` (this checkout's copy, on the controller).
+# Without `miner_agent_version` the agent is never signalled, started or
+# stopped: a process still running an earlier binary keeps it until the
+# operator swaps it (the OPERATOR ACTION at the end of play 05). With
+# `miner_agent_build_from_source: true` the binary is left to the source
+# build in miner-agent-install.yml.
+#
+# Input: `miner_agent_updater` (the installed hippius-miner-update),
+# `miner_agent_updater_src` (this checkout's copy, on the controller),
+# `miner_agent_version` (optional).
 # Output: `miner_agent_install_needed`.
+
+- name: Refuse a malformed miner_agent_version, or one with the source build
+  # The updater's own tag grammar (its TAG_RE): vYYYY.MM.DD or
+  # vYYYY.MM.DD.N, N = 1..999.
+  ansible.builtin.assert:
+    that:
+      - miner_agent_version_pin is match('^v[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][1-9][0-9]{0,2})?$')
+      - not (miner_agent_build_from_source | bool)
+    fail_msg: >-
+      [MINER_AGENT_VERSION_INVALID] miner_agent_version must be a release
+      tag vYYYY.MM.DD or vYYYY.MM.DD.N (got
+      {{ miner_agent_version_pin | to_json }}), and cannot be combined with
+      `miner_agent_build_from_source: true`.
+    quiet: true
+  vars:
+    miner_agent_version_pin: "{{ miner_agent_version | default('', true) | string }}"
+  when: miner_agent_version | default('', true) | string | length > 0
 
 - name: Check the installed miner-agent version
   ansible.builtin.command:
@@ -38,10 +68,45 @@
   check_mode: false
 
 - name: Set whether the miner-agent binary needs (re)installing
+  vars:
+    _pin: "{{ miner_agent_version | default('', true) | string }}"
+    # `hippius-miner-agent <crate version> (<tag>)`
+    _stdout: "{{ miner_agent_version_check.stdout | default('') | trim }}"
+    _running_tag: >-
+      {{ (_stdout.split('(') | last).split(')') | first if _stdout.endswith(')') else '' }}
   ansible.builtin.set_fact:
+    miner_agent_pin: "{{ _pin }}"
     miner_agent_install_needed: >-
       {{ miner_agent_version_check.rc != 0
          or versions.miner_agent not in (miner_agent_version_check.stdout | default('')) }}
+    miner_agent_pin_needed: >-
+      {{ _pin | length > 0
+         and miner_agent_version_check.rc == 0
+         and versions.miner_agent in (miner_agent_version_check.stdout | default(''))
+         and _running_tag != _pin }}
+
+- name: Read whether the miner-agent is running (for miner_agent_version)
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=ActiveState, --value, "{{ miner_agent.systemd_unit_name }}"]
+  register: miner_agent_active_state
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: miner_agent_pin_needed | bool
+
+# --install: the binary is missing or foreign, or the agent is not running
+# (nothing to swap). --tag alone: the updater's SIGKILL swap of a running
+# agent.
+- name: Choose the updater run
+  ansible.builtin.set_fact:
+    miner_agent_release_runs: >-
+      {{ ((miner_agent_install_needed | bool) and not (miner_agent_build_from_source | bool))
+         or (miner_agent_pin_needed | bool) }}
+    miner_agent_updater_args: >-
+      {{ ([] if (miner_agent_pin_needed | bool)
+                 and (miner_agent_active_state.stdout | default('') | trim) == 'active'
+             else ['--install'])
+         + (['--tag', miner_agent_pin] if miner_agent_pin | length > 0 else []) }}
 
 # An older updater ignores `--install` and would run a normal update,
 # which swaps a running agent: run only this checkout's (it is installed
@@ -55,8 +120,7 @@
   become: false
   register: miner_agent_updater_src_stat
   when: &release_install_runs
-    - miner_agent_install_needed | bool
-    - not (miner_agent_build_from_source | bool)
+    - miner_agent_release_runs | bool
     - not ansible_check_mode
 
 - name: Hash the updater on the host
@@ -81,9 +145,7 @@
 
 - name: Install the miner-agent release, verified as an auto-update is
   ansible.builtin.command:
-    argv:
-      - "{{ miner_agent_updater }}"
-      - "--install"
+    argv: "{{ [miner_agent_updater] + miner_agent_updater_args }}"
   register: miner_agent_release_install
   failed_when: false
   changed_when: miner_agent_release_install.rc == 0
@@ -92,23 +154,24 @@
 - name: Stop on a release that could not be installed
   ansible.builtin.fail:
     msg: >-
-      [MINER_AGENT_INSTALL_FAILED] {{ miner_agent.install_path }} is missing
-      or does not report version {{ versions.miner_agent }} (`--version`
-      said: {{ miner_agent_version_check.stdout | default('', true) or 'nothing' }}),
-      and `{{ miner_agent_updater }} --install` did not install a verified
-      release of {{ miner_auto_update_release_repo }} (exit
-      {{ miner_agent_release_install.rc }}):
+      [MINER_AGENT_INSTALL_FAILED] `{{ ([miner_agent_updater] + miner_agent_updater_args) | join(' ') }}`
+      did not install a verified release of {{ miner_auto_update_release_repo }}
+      (exit {{ miner_agent_release_install.rc }}; `--version` said before:
+      {{ miner_agent_version_check.stdout | default('', true) or 'nothing' }}):
       {{ (miner_agent_release_install.stderr_lines | default([]))[-4:] | join(' | ') }}.
-      The updater replaces the binary only once every check has passed.
-      The host must reach api.github.com and github.com over HTTPS;
-      `journalctl -t hippius-miner-update` has the whole run. To install by hand instead, follow
-      docs/operator/onboarding-a-miner.md, "Prebuilt binary", and re-run.
+      The updater replaces the binary only once every check has passed, and
+      puts the previous one back if a swapped agent does not come back
+      healthy. The host must reach api.github.com and github.com over
+      HTTPS; `journalctl -t hippius-miner-update` has the whole run. To
+      install by hand instead, follow docs/operator/onboarding-a-miner.md,
+      "Prebuilt binary", and re-run.
   when:
     - miner_agent_release_install.rc is defined
     - miner_agent_release_install.rc != 0
 
 # The release carries its crate version in `--version`; one that does not
-# match `versions.miner_agent` would be reinstalled on every run.
+# match `versions.miner_agent` would be reinstalled on every run. An exact
+# release (`miner_agent_version`) must report its tag instead.
 - name: Check the version of the installed release
   ansible.builtin.command:
     argv:
@@ -119,17 +182,23 @@
   changed_when: false
   when: miner_agent_release_install is changed
 
-- name: Refuse a release that does not report versions.miner_agent
+- name: Refuse a release that does not report versions.miner_agent (or the asked tag)
   ansible.builtin.assert:
     that:
       - miner_agent_release_version.rc == 0
-      - versions.miner_agent in miner_agent_release_version.stdout
+      # An exact release is judged by its tag (it may predate the
+      # checkout's crate version); otherwise by versions.miner_agent.
+      - >-
+        ('(' ~ miner_agent_pin ~ ')') in miner_agent_release_version.stdout
+        if miner_agent_pin | length > 0
+        else versions.miner_agent in miner_agent_release_version.stdout
     fail_msg: >-
       [MINER_AGENT_INSTALL_FAILED] release
       {{ miner_agent_release_install.stdout | trim }} is installed at
       {{ miner_agent.install_path }} but `--version` says
       "{{ miner_agent_release_version.stdout | default('') | trim }}", not
-      {{ versions.miner_agent }}. Your checkout's `versions.miner_agent`
+      {{ versions.miner_agent }}{{ (' (' ~ miner_agent_pin ~ ')') if miner_agent_pin | length > 0 else '' }}.
+      If the crate version differs, your checkout's `versions.miner_agent`
       (group_vars/miner_nodes.yml) is older than the release: update the
       checkout and re-run.
     quiet: true
@@ -140,17 +209,22 @@
     msg: >-
       Installed miner-agent release {{ miner_agent_release_install.stdout | trim }}
       at {{ miner_agent.install_path }} (sha256, build-provenance attestation
-      and --version verified).
+      and --version verified){{ '; the running agent was swapped to it (SIGKILL, relaunched, heartbeat delivered)'
+      if '--install' not in miner_agent_updater_args else '' }}.
   when: miner_agent_release_install is changed
 
 - name: Preview the miner-agent release install (--check)
   ansible.builtin.debug:
     msg: >-
-      {{ miner_agent.install_path }} is missing or does not report
-      {{ versions.miner_agent }}: a real run installs the newest eligible,
-      verified release of {{ miner_auto_update_release_repo }} here. Under
-      --check nothing is downloaded.
+      {{ miner_agent.install_path }}
+      {{ ('reports another release than ' ~ miner_agent_pin) if (miner_agent_pin_needed | bool)
+         else ('is missing or does not report ' ~ versions.miner_agent) }}:
+      a real run runs `hippius-miner-update {{ miner_agent_updater_args | join(' ') }}`,
+      installing {{ ('release ' ~ miner_agent_pin) if miner_agent_pin | length > 0
+                    else 'the newest eligible release' }} of
+      {{ miner_auto_update_release_repo }}, verified{{ ', and swaps the running agent to it (SIGKILL)'
+      if '--install' not in miner_agent_updater_args else '' }}. Under --check
+      nothing is downloaded.
   when:
-    - miner_agent_install_needed | bool
-    - not (miner_agent_build_from_source | bool)
+    - miner_agent_release_runs | bool
     - ansible_check_mode

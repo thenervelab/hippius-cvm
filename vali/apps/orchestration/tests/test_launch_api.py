@@ -1266,6 +1266,114 @@ def test_a_refused_golden_launch_writes_nothing_to_vault(
     assert LaunchJob.objects.count() == 0
 
 
+@pytest.mark.parametrize(
+    ("overrides", "status", "category"),
+    [
+        # E1's os_disk_tier / dedicated_disks / pinned_ack.
+        (dict(os_disk_tier="sata"), 400, "disk-tier-invalid"),
+        (dict(os_disk_tier="ssd"), 409, "disk-tier-not-offered"),
+        (dict(dedicated_disks={"tier": "hdd", "count": 1}), 409, "dedicated-disks-not-offered"),
+        (dict(pinned_ack="yes"), 400, "bad-field"),
+        # Every other pure body check of `_build_spec_json`.
+        (dict(vm_id="Bad/Id"), 400, "bad-field"),
+        (dict(region="France"), 400, "bad-field"),
+        (dict(placement_group="Not A Group"), 400, "bad-field"),
+        (dict(on_guest_poweroff="halt"), 400, "bad-field"),
+        (dict(require_failover_peer="yes"), 400, "bad-field"),
+        (dict(max_price_per_unit=-1), 400, "bad-field"),
+        (dict(expiry_seconds=10), 400, "bad-field"),
+        (dict(enable_netbird="yes"), 400, "bad-field"),
+        (dict(verity_root_hash_hex=""), 400, "bad-field"),
+        (dict(s3_bucket=""), 400, "wire"),
+        (dict(cmdline=""), 400, "wire"),
+        # The NetBird template checks.
+        (dict(userdata="#cloud-config\n"), 400, "bad-field"),
+        (dict(netbird_hostname_template="{vm_id}" * 40), 400, "bad-field"),
+    ],
+)
+def test_a_refused_body_stages_nothing(
+    root_client, monkeypatch, overrides, status, category
+) -> None:
+    """Every refusal of the body comes BEFORE the first write: the golden
+    overlay KEK (Transit key + KV entry) and the staged userdata. A refusal
+    after them would strand Vault material under a vm_id with no `Vm` row,
+    where §24 never looks."""
+    touched: list[str] = []
+
+    def spy(name: str):
+        def fail(*_a: object, **_k: object) -> None:
+            touched.append(name)
+            raise AssertionError(f"{name} reached for a refused launch")
+
+        return fail
+
+    monkeypatch.setattr(launch_jobs, "_provision_golden_overlay_kek", spy("provision"))
+    for fn in ("put_kv", "ensure_transit_key", "transit_datakey_wrapped", "transit_encrypt"):
+        monkeypatch.setattr(vault_kv, fn, spy(fn))
+    monkeypatch.setattr(launch, "stage_userdata_intake_copy", spy("stage-userdata"))
+    body = _golden_intent(**{"vm_id": "vm-refused", **overrides})
+    body.pop("kek_vault_path")
+    resp = root_client.post(LAUNCH_URL, body, format="json")
+    assert (resp.status_code, resp.json()["category"]) == (status, category), resp.content
+    assert touched == []
+    assert LaunchJob.objects.count() == 0
+
+
+@pytest.mark.parametrize(
+    ("kek_path", "legacy"),
+    [("secret/elsewhere/luks-kek", False), ("x" * 600, False), (None, True)],
+)
+def test_a_refused_kek_path_stages_nothing(root_client, monkeypatch, kek_path, legacy) -> None:
+    """The KEK-path refusals come after the golden provisioning, and are
+    reached only without it: a path the caller supplied (wrong, too long),
+    or none on a legacy launch (which never provisions)."""
+    touched: list[str] = []
+
+    def fail(*_a: object, **_k: object) -> None:
+        touched.append("write")
+        raise AssertionError("Vault touched for a refused launch")
+
+    monkeypatch.setattr(launch_jobs, "_provision_golden_overlay_kek", fail)
+    monkeypatch.setattr(vault_kv, "put_kv", fail)
+    monkeypatch.setattr(launch, "stage_userdata_intake_copy", fail)
+    body = _intent(vm_id="vm-kek") if legacy else _golden_intent(vm_id="vm-kek")
+    if kek_path is None:
+        body.pop("kek_vault_path")
+    else:
+        body["kek_vault_path"] = kek_path
+    resp = root_client.post(LAUNCH_URL, body, format="json")
+    assert resp.status_code == 400, resp.content
+    assert touched == []
+    assert LaunchJob.objects.count() == 0
+
+
+def test_an_in_flight_launch_or_an_unusable_prefix_stages_nothing(
+    root_client, stub_vault_put, stub_golden_transit, monkeypatch, settings
+) -> None:
+    body = _golden_intent(vm_id="vm-twice")
+    body.pop("kek_vault_path")
+    assert root_client.post(LAUNCH_URL, body, format="json").status_code == 202
+    stub_vault_put.clear()
+    stub_golden_transit["datakey"].clear()
+    resp = root_client.post(LAUNCH_URL, body, format="json")
+    assert (resp.status_code, resp.json()["category"]) == (409, "conflict")
+    assert (stub_vault_put, stub_golden_transit["datakey"]) == ([], [])
+    settings.VALI_VAULT_KV_PREFIX = "p" * 500
+    resp = root_client.post(LAUNCH_URL, {**body, "vm_id": "vm-long"}, format="json")
+    assert resp.status_code == 503, resp.content
+    assert (stub_vault_put, stub_golden_transit["datakey"]) == ([], [])
+
+
+def test_a_valid_golden_body_still_provisions_its_kek(
+    root_client, stub_vault_put, stub_golden_transit
+) -> None:
+    """The control for the test above: the same body, valid, reaches it."""
+    body = _golden_intent(vm_id="vm-refused")
+    body.pop("kek_vault_path")
+    assert root_client.post(LAUNCH_URL, body, format="json").status_code == 202
+    assert stub_golden_transit["datakey"] == ["kek-vm-refused"]
+
+
 def test_the_cap_is_validated_when_the_app_loads(settings) -> None:
     from django.apps import apps
     from django.core.exceptions import ImproperlyConfigured

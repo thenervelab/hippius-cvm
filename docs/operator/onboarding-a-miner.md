@@ -100,18 +100,20 @@ ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --limit <YOUR
 ```
 
 Add your host to the `miner_nodes` group in `inventory.yml` and give it
-a `host_vars/<YOUR_HOST>.yml`. The eight plays, in order:
+a `host_vars/<YOUR_HOST>.yml`. The plays, in order:
 
 | # | Play | What it does |
 |---|---|---|
 | 00 | Miner preflight | Read-only fail-closed asserts (§0 above). Also asserts that no Vault address/token is defined for a miner and that k3s is absent — a miner is not a control-plane node. |
 | 01 | SEV-SNP kernel cmdline | Edits `/etc/default/grub`, `update-grub`, reboots **only if the line changed**, re-asserts `sev_snp == Y`. |
-| 02 | libvirt + qemu install | `libvirt-daemon-system`, `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `virtinst`; enables `libvirtd`. Distro versions, deliberately unpinned. **Also stages the TENANT OVMF** (`miner_tenant_ovmf_*`) and refuses to continue unless the file on disk matches the pinned digest — see below. |
-| 03 | Tenant CVM networking bridge | Enables libvirt's `default` NAT network for tenant virtio-net. |
+| 02 | libvirt + qemu install | `libvirt-daemon-system`, `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `virtinst`, `dnsmasq-base` (the `default` network's DHCP; only a Recommends of libvirt); enables `libvirtd`. Distro versions, deliberately unpinned. **Also stages the TENANT OVMF** (`miner_tenant_ovmf_*`) and refuses to continue unless the file on disk matches the pinned digest — see below. |
+| 03 | Tenant CVM networking bridge | Defines, starts and autostarts libvirt's `default` NAT network for tenant virtio-net. Refuses to start it over a route the host already has (`LIBVIRT_DEFAULT_NET_SUBNET_CLASH`) and reports a failed start (`LIBVIRT_DEFAULT_NET_START_FAILED`). |
 | 04 | NetBird agent | Installs and joins the mesh with your setup key; asserts the assigned address is inside `100.64.0.0/10`. |
 | 05 | miner-agent install + identity self-gen | Installs the release `hippius-miner-agent`, verified like an auto-update, unless one reporting `versions.miner_agent` is already in place (or builds it with `miner_agent_build_from_source: true`), refuses any `<…>` placeholder left in the variables, renders `/etc/hippius-miner/config.toml`, runs `init-identity`, reads the AMD CHIP_ID, prints the registration block, installs the systemd unit **without starting it**. |
 | 06 | mTLS cert mount point | Creates `/var/lib/hippius-miner/mtls` (0700) and installs the Edge **server** CA so the agent can verify the Edge. In permissionless mode nothing else is placed here. |
 | 07 | Host firewall | UFW default-deny inbound; allow `22/tcp`, `51820/udp`, and all traffic on `wt0`. |
+| 08 | Host sshd | Key-only authentication (a drop-in), then `systemctl reload ssh`. |
+| 09 | Tenant-launch preflight | Can this host **start a tenant VM**? The host attestor proves SNP, but it has no disk and no network card. Checks the `default` network and its `clean-traffic` filter, QEMU's access to the storage roots, `O_DIRECT` there, and the agent's sandbox. Then starts and destroys a paused, transient, non-SNP smoke VM with a `cache='none'` disk under the data root and a network card on `default`. Reports every failure at once with a code ([external-miner-guide.md](./external-miner-guide.md#launch-preflight-codes-play-09)). Alone, with play 03: `--tags launch_preflight`. `miner_launch_smoke_enabled: false` skips only the smoke VM. |
 
 > **`--features snp` is load-bearing.** The agent must be built with it
 > or every launch order fail-closes with
@@ -161,9 +163,13 @@ replaced only once every check has passed, and a re-run tries again.
 rest of play 05 runs the binary. Once installed,
 [auto-update](#4b-auto-update) keeps it current.
 
-**By hand (fallback).** To install the binary yourself (to pick the
-release, or when the play's install keeps failing), put it in place
-before play 05; the play then leaves it alone:
+To install an exact release instead of the newest eligible one, add
+`-e miner_agent_version=<tag>` to the play
+([An exact release](#an-exact-release-miner_agent_version)).
+
+**By hand (fallback).** To install the binary yourself (when the play's
+install keeps failing), put it in place before play 05; the play then
+leaves it alone:
 
 ```sh
 TAG=<release tag>
@@ -557,6 +563,46 @@ systemctl list-timers hippius-miner-update.timer
 the play with `--tags miner_auto_update`; that stops and disables the
 timer and leaves the agent running. Then upgrade by hand with the swap in
 `deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md`.
+
+### An exact release (`miner_agent_version`)
+
+Install or upgrade to an exact release with the play, one shot,
+without waiting for the 24-hour soak:
+
+```sh
+ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml --limit <host> -e miner_agent_version=<tag>
+```
+
+`<tag>` is a release tag (`vYYYY.MM.DD` or `vYYYY.MM.DD.N`). Play 05 runs
+`hippius-miner-update --tag <tag>`, with the same checks as auto-update
+(`SHA256SUMS`, the build-provenance attestation of the release workflow
+at `refs/tags/<tag>`, `--version` naming the tag) and no soak. It refuses
+a malformed tag, a release that is missing or incomplete, a tag that
+failed its health check on this host
+(`/var/lib/hippius-miner/.update-failed-<tag>`), and a tag older than the
+release the host already runs (the same tag as `installed-release` is
+allowed). It does nothing if the agent already reports that tag. The
+release is judged by its tag, so it may be older than your checkout's
+`versions.miner_agent`.
+
+- Agent missing, or installed but not running: an atomic install,
+  nothing signalled.
+- Agent running: the auto-updater's own swap. It installs the new binary
+  atomically, then `systemctl kill --signal=SIGKILL hippius-miner-agent`.
+  systemd relaunches the agent and it re-adopts the running VMs (QEMU runs
+  outside the agent's cgroup). If no heartbeat follows within 5 minutes,
+  the previous binary is swapped back the same way and the tag is marked
+  failed. Never `systemctl stop`/`restart`: a graceful stop destroys every
+  VM. The swap needs `[host] skip_shutdown_teardown = true` in
+  `/etc/hippius-miner/config.toml` (the play renders it).
+
+It applies even when auto-update is turned off, and changes nothing about
+auto-update: the timer, its 24-hour soak and `auto-update.env` stay as
+they are. Pass it with `-e` only. Left in `host_vars`, it would make every
+later run fail once the timer has moved past that tag. A refusal stops
+the play with `[MINER_AGENT_INSTALL_FAILED]` (or
+`[MINER_AGENT_VERSION_INVALID]` for the tag itself) and the updater's
+reason.
 
 ### Verifying a release by hand
 

@@ -52,6 +52,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
+from apps.disktier import os_tier
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
 from apps.orchestration.services import flavors
@@ -232,6 +233,8 @@ class SchedulerPlaceView(APIView):
                 max_family_per_node=service.cdn_family_cap(vm_family),
                 **service.cdn_edge_arguments(vm_family, vm_id),
                 **service.group_arguments(vm_id),
+                # Gate (n) — an OS pool at the VM's disk tier.
+                **service.disk_tier_arguments(resource_class, vm_id=vm_id),
                 # Gate (m) — a `require_failover_peer` VM keeps it.
                 **service.failover_peer_arguments(
                     service.launch_requires_failover_peer(vm_id), vm_id
@@ -575,10 +578,26 @@ class SchedulerFeasibilityView(APIView):
                 required=False,
                 type=str,
             ),
+            OpenApiParameter(
+                name="os_disk_tier",
+                description=(
+                    "Optional OS-disk tier (`nvme` / `ssd` / `hdd`, a minimum): the "
+                    "answer for a VM sold at it, echoed as `os_disk_tier`. Adds "
+                    "`disk-tier-not-offered` (`never`: the tier is not sold for this "
+                    "flavor) and, with the tier gate enforced, `no-miner-at-tier` "
+                    "(`never`: no host has an OS pool at it) to `reason`. Omitted: the "
+                    "answer without the key, as before. 400 `disk-tier-invalid` off the "
+                    "enum."
+                ),
+                required=False,
+                type=str,
+            ),
         ],
         responses={
             200: FeasibilityListSerializer,
-            400: OpenApiResponse(ErrorSerializer, "Unknown flavor / malformed region."),
+            400: OpenApiResponse(
+                ErrorSerializer, "Unknown flavor / malformed region / os_disk_tier."
+            ),
         },
     )
     def get(self, request: Request) -> Response:
@@ -596,16 +615,26 @@ class SchedulerFeasibilityView(APIView):
                 "invalid",
             )
 
+        raw_tier = (request.query_params.get("os_disk_tier") or "").strip()
+        try:
+            tier = os_tier.parse(raw_tier) if raw_tier else None
+        except ValueError as exc:
+            return _error(status.HTTP_400_BAD_REQUEST, str(exc), os_tier.CATEGORY_INVALID)
+
         try:
             if flavor:
                 results = [
                     feasibility.assess(
-                        flavor, tenant_id=tenant_id, user_id=user_id, region=region
+                        flavor,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        region=region,
+                        os_disk_tier=tier,
                     )
                 ]
             else:
                 results = feasibility.assess_catalogue(
-                    tenant_id=tenant_id, user_id=user_id, region=region
+                    tenant_id=tenant_id, user_id=user_id, region=region, os_disk_tier=tier
                 )
         except flavors.UnknownFlavor as exc:
             # A flavor that does not exist is a CALLER error, not "cannot
@@ -614,9 +643,18 @@ class SchedulerFeasibilityView(APIView):
             return _error(status.HTTP_400_BAD_REQUEST, str(exc), "invalid")
 
         return Response(
-            {"flavors": [asdict(r) for r in results]},
+            {"flavors": [_feasibility_body(r) for r in results]},
             status=status.HTTP_200_OK,
         )
+
+
+def _feasibility_body(result: feasibility.Feasibility) -> dict[str, Any]:
+    """One answer on the wire: without `os_disk_tier` when none was asked,
+    so a caller that names no tier gets the answer as before tiers."""
+    body = asdict(result)
+    if body["os_disk_tier"] is None:
+        del body["os_disk_tier"]
+    return body
 
 
 class EpochWeightsView(APIView):
@@ -1033,6 +1071,7 @@ def _replace(
             max_family_per_node=service.cdn_family_cap(failed.vm_family),
             **service.cdn_edge_arguments(failed.vm_family, vm.vm_id),
             **service.group_arguments(vm.vm_id),
+            **service.disk_tier_arguments(failed.resource_class, vm_id=vm.vm_id),
             **service.failover_peer_arguments(
                 service.launch_requires_failover_peer(vm.vm_id), vm.vm_id
             ),

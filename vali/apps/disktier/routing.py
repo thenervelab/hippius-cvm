@@ -23,7 +23,7 @@ from django.utils import timezone
 
 from .models import DeclaredClass, DiskHealth, MinerStoragePool
 from .storage_config import agent_version, version_at_least
-from .tiers import DiskTier
+from .tiers import SELLABLE_TIERS, DiskTier, rank, satisfies
 
 DEFAULT_POOL_ID = "default"
 #: A pool report older than this is not routed to: the node may have
@@ -62,16 +62,30 @@ def sold_class_as_os_disk(pool: MinerStoragePool) -> bool:
     return pool.declared_class == DeclaredClass.NVME
 
 
-def sold_as_os_disk_tier(pool: MinerStoragePool) -> bool:
-    """The pool is what every OS disk is sold as today (nvme): verified (or
-    overridden) nvme, or not probed yet and declared nvme — the probes (G3)
-    demote a pool that is not. Healthy (`ok`, or only `suspect` pending a
-    probe): a probe that fell below the floor (`degraded`) or worse is out."""
+def os_disk_tier_of(pool: MinerStoragePool) -> str | None:
+    """The tier the pool holds OS disks at: its verified (or overridden)
+    tier, or, not probed yet, its declared class — the probes (G3) demote a
+    pool that is not what it says. `None` when it holds none: `unfit`, no
+    class, or unhealthy (a probe that fell below the floor, `degraded`, or
+    worse; only `suspect` pending a probe stays in)."""
+    if pool.health not in (DiskHealth.OK, DiskHealth.SUSPECT):
+        return None
     tier = pool.effective_tier
-    nvme = tier == DiskTier.NVME or (
-        tier == DiskTier.UNKNOWN and pool.declared_class == DeclaredClass.NVME
-    )
-    return nvme and pool.health in (DiskHealth.OK, DiskHealth.SUSPECT)
+    if tier == DiskTier.UNKNOWN:
+        tier = pool.declared_class
+    return tier if tier in SELLABLE_TIERS else None
+
+
+def serves_os_disk_tier(pool: MinerStoragePool, tier: str) -> bool:
+    """The pool may hold an OS disk sold at `tier` (a minimum): its own tier
+    is at least that. So an hdd pool holds only the OS disks sold hdd."""
+    own = os_disk_tier_of(pool)
+    return own is not None and satisfies(own, tier)
+
+
+def sold_as_os_disk_tier(pool: MinerStoragePool) -> bool:
+    """The pool is what every OS disk is sold as by default (nvme)."""
+    return serves_os_disk_tier(pool, DiskTier.NVME)
 
 
 def os_disk_pools(node_id: str) -> QuerySet[MinerStoragePool]:
@@ -88,22 +102,44 @@ def os_disk_pools(node_id: str) -> QuerySet[MinerStoragePool]:
     )
 
 
-def choose_os_pool(node_id: str, need_gb: int) -> str | None:
-    """The pool other than `default` to put a `need_gb` OS disk on: the
-    node's active, recently reported, not retired, OS-disk pool of the sold
-    tier with room for it and the most free, ties by id. `None` (⇒
-    `default`) when the agent does not take `os_pool`, or no such pool has
-    room."""
+def default_pool_tier(node_id: str) -> str | None:
+    """The tier `default` holds OS disks at: its row's (`os_disk_tier_of`;
+    not one taking OS disks ⇒ `None`), or nvme for a node that reports no
+    such row — a pre-v7 agent's single pool, sold nvme as every OS disk
+    always was."""
+    pool = MinerStoragePool.objects.filter(
+        miner_node_id=node_id, pool_id=DEFAULT_POOL_ID, retired_at__isnull=True
+    ).first()
+    if pool is None:
+        return DiskTier.NVME
+    return os_disk_tier_of(pool) if pool.os_disks else None
+
+
+def choose_os_pool(node_id: str, need_gb: int, tier: str = DiskTier.NVME) -> str | None:
+    """The pool other than `default` to put a `need_gb` OS disk sold at
+    `tier` on: of the node's active, recently reported, not retired,
+    OS-disk pools that hold `tier` and have room for it, the one of the
+    lowest such tier, then the most free, ties by id. `None` (⇒ `default`)
+    when the agent does not take `os_pool`, when no such pool has room, or
+    when `default` holds `tier` at a lower tier than any of them (its room
+    is the data-disk gate's). For nvme every candidate is of one tier: the
+    pool other than `default` with the most free, as ever."""
     if not supported(node_id):
         return None
-    best: tuple[int, str] | None = None
+    best: tuple[int, int, str] | None = None
     for pool in os_disk_pools(node_id).exclude(pool_id=DEFAULT_POOL_ID):
-        if not sold_as_os_disk_tier(pool):
+        if not serves_os_disk_tier(pool, tier):
             continue
         free = free_gb(pool)
         if free is None or free < need_gb:
             continue
-        key = (-free, pool.pool_id)
+        key = (rank(os_disk_tier_of(pool) or ""), -free, pool.pool_id)
         if best is None or key < best:
             best = key
-    return best[1] if best is not None else None
+    if best is None:
+        return None
+    if tier != DiskTier.NVME:
+        own = default_pool_tier(node_id)
+        if own is not None and satisfies(own, tier) and rank(own) < best[0]:
+            return None
+    return best[2]

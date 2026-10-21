@@ -546,3 +546,66 @@ def test_migrate_activate_payload_carries_settle_by_only_when_set() -> None:
     )
     assert carried["settle_by_unix"] == 1_790_000_000
     assert {k: v for k, v in carried.items() if k != "settle_by_unix"} == absent
+
+
+@override_settings(
+    VALI_EDGE_ORDER_URL="http://edge-gateway:8444",
+    VALI_TICKET_VALIDATOR_BIN="/usr/local/bin/hippius-ticket-validator",
+)
+@pytest.mark.parametrize(
+    ("headers", "want"),
+    [
+        ({"x-hippius-reason": "libvirt-driver/define"}, "libvirt-driver/define"),
+        ({"X-Hippius-Reason": " tenant-preflight/ovmf-missing "}, "tenant-preflight/ovmf-missing"),
+        ({}, ""),
+        ({"x-hippius-reason": "a" * 1000}, "a" * 256),
+    ],
+)
+def test_dispatch_carries_the_relayed_reason_header(headers: dict, want: str) -> None:
+    """The Edge relays the agent's `x-hippius-reason`: surfaced bounded,
+    never interpreted (`launch_errors` sanitizes it)."""
+    from email.message import Message
+
+    hdrs = Message()
+    for k, v in headers.items():
+        hdrs[k] = v
+    http_err = urllib.error.HTTPError(
+        url="http://edge-gateway:8444/v1/edge/order",
+        code=500,
+        msg="Internal Server Error",
+        hdrs=hdrs,  # type: ignore[arg-type]
+        fp=io.BytesIO(b"dispatch-failed"),
+    )
+    with (
+        patch.object(order_dispatch.subprocess, "run", return_value=_completed(b"cbor")),
+        patch.object(order_dispatch.urllib.request, "urlopen", side_effect=http_err),
+    ):
+        result = order_dispatch.dispatch_order(
+            miner_id="miner-1",
+            netbird_ip="100.64.0.10",
+            order_id="ord-2",
+            kind="launch",
+            payload_json=b"{}",
+        )
+    assert (result.status, result.classifier, result.reason) == (500, "dispatch-failed", want)
+
+
+@override_settings(
+    VALI_EDGE_ORDER_URL="http://edge-gateway:8444",
+    VALI_TICKET_VALIDATOR_BIN="/usr/local/bin/hippius-ticket-validator",
+)
+def test_a_reply_without_headers_has_no_reason() -> None:
+    with (
+        patch.object(order_dispatch.subprocess, "run", return_value=_completed(b"cbor")),
+        patch.object(
+            order_dispatch.urllib.request, "urlopen", return_value=_resp(200, b"launched")
+        ),
+    ):
+        result = order_dispatch.dispatch_order(
+            miner_id="miner-1",
+            netbird_ip="100.64.0.10",
+            order_id="ord-3",
+            kind="launch",
+            payload_json=b"{}",
+        )
+    assert (result.ok, result.reason) == (True, "")

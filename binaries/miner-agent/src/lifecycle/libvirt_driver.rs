@@ -292,17 +292,87 @@ async fn run_virsh(mut cmd: Command, op: &'static str) -> Result<String> {
 /// cannot create the tap because an orphan QEMU on that CID still holds
 /// it. libvirt creates the tap before it starts QEMU, so the second form
 /// comes first. Both make the lifecycle burn the CID and retry on a
-/// fresh one (and so a fresh tap name). Only these closed-vocabulary
+/// fresh one (and so a fresh tap name).
+///
+/// Every other failure is `LibvirtDriver("create")`, or one of the
+/// `create:<cause>` sub-classifiers of [`START_FAILURE_CAUSES`] when its
+/// stderr carries that cause's marker — so the operator learns WHY the
+/// domain did not start (`x-hippius-reason`). Only these closed-vocabulary
 /// markers are matched; the stderr itself is never surfaced.
 fn classify_start_failure(stderr: &str) -> MinerAgentError {
     let cid_bound = stderr.contains("set guest cid") && stderr.contains("Address already in use");
     let tap_taken = stderr.contains(super::qemu_config::TENANT_TAP_PREFIX)
         && (stderr.contains("Device or resource busy") || stderr.contains("already exists"));
     if cid_bound || tap_taken {
-        MinerAgentError::VsockCid("cid-in-use")
-    } else {
-        MinerAgentError::LibvirtDriver("create")
+        return MinerAgentError::VsockCid("cid-in-use");
     }
+    let cause = START_FAILURE_CAUSES
+        .iter()
+        .find(|(_, matches)| matches(stderr))
+        .map_or("create", |(code, _)| *code);
+    MinerAgentError::LibvirtDriver(cause)
+}
+
+/// A `virsh start` stderr predicate.
+type StartMarker = fn(&str) -> bool;
+
+/// The causes of a failed `virsh start` an operator can act on, first
+/// match wins: the sub-classifier and the stderr marker that names it.
+/// The SEV ones come before the generic file/permission ones, since a
+/// SEV failure can also read `Permission denied` (`/dev/sev`).
+const START_FAILURE_CAUSES: &[(&str, StartMarker)] = &[
+    // `sev_common_kvm_init: failed to initialize ret=-16` (EBUSY): the
+    // SEV firmware refused — the wedged ASID-recycle state.
+    ("create:sev-busy", |e| has_sev(e) && e.contains("ret=-16")),
+    // ret=-28 (ENOSPC): no free SEV ASID.
+    ("create:sev-asid-exhausted", |e| {
+        has_sev(e) && e.contains("ret=-28")
+    }),
+    ("create:sev-device-permission", |e| {
+        e.contains("/dev/sev") && e.contains("Permission denied")
+    }),
+    ("create:sev-unavailable", |e| {
+        e.contains("/dev/sev") && e.contains("No such file or directory")
+            || has_sev(e) && (e.contains("not supported") || e.contains("not available"))
+    }),
+    ("create:sev-init", has_sev),
+    ("create:kvm-unavailable", |e| {
+        e.contains("/dev/kvm") || e.contains("KVM is not available")
+    }),
+    // `network 'default' is not active` — the play's
+    // LIBVIRT_DEFAULT_NET_INACTIVE.
+    ("create:network-inactive", |e| {
+        e.contains("network '") && e.contains("is not active") || e.contains("Network not found")
+    }),
+    ("create:nwfilter-missing", |e| {
+        e.contains("referenced filter") && e.contains("is missing")
+    }),
+    // QEMU could not open a disk image: unreadable by the qemu user (the
+    // play's QEMU_CANNOT_TRAVERSE_DATA_ROOT), O_DIRECT refused by the
+    // filesystem (DATA_ROOT_NO_ODIRECT), or not there.
+    ("create:disk-open-permission", |e| {
+        e.contains("Could not open") && e.contains("Permission denied")
+    }),
+    ("create:disk-open-invalid", |e| {
+        e.contains("Could not open") && e.contains("Invalid argument")
+    }),
+    ("create:disk-missing", |e| {
+        e.contains("Could not open") && e.contains("No such file or directory")
+    }),
+    ("create:permission-denied", |e| {
+        e.contains("Permission denied")
+    }),
+    ("create:out-of-memory", |e| {
+        e.contains("Cannot allocate memory")
+    }),
+    ("create:qemu-exited", |e| {
+        e.contains("qemu unexpectedly closed the monitor")
+    }),
+];
+
+/// The stderr names QEMU's SEV(-SNP) setup.
+fn has_sev(stderr: &str) -> bool {
+    stderr.contains("sev_") || stderr.contains("SEV")
 }
 
 /// Production driver — shells out to `virsh`.
@@ -1179,7 +1249,7 @@ mod tests {
         for stderr in [
             "error: Failed to start domain 'hippius-tenant-a'\nerror: Unable to create tap \
              device vnet3: Device or resource busy",
-            "error: referenced filter 'clean-traffic' is missing",
+            "error: something nobody foresaw",
             "",
         ] {
             assert_eq!(
@@ -1188,6 +1258,98 @@ mod tests {
                 "{stderr}"
             );
         }
+    }
+
+    #[test]
+    fn a_start_failure_names_its_cause() {
+        let start = "error: Failed to start domain 'hippius-tenant-a'\nerror: ";
+        for (tail, code) in [
+            (
+                "internal error: qemu unexpectedly closed the monitor: \
+                 sev_common_kvm_init: failed to initialize ret=-16 fw_error=0 ''",
+                "create:sev-busy",
+            ),
+            (
+                "internal error: process exited while connecting to monitor: \
+                 sev_kvm_init: failed to initialize ret=-28 fw_error=0 ''",
+                "create:sev-asid-exhausted",
+            ),
+            (
+                "internal error: qemu: sev_snp_launch_start: Failed to open /dev/sev: \
+                 Permission denied",
+                "create:sev-device-permission",
+            ),
+            (
+                "internal error: SEV: guest firmware hashes not supported",
+                "create:sev-unavailable",
+            ),
+            (
+                "internal error: sev_snp_launch_update: SNP_LAUNCH_UPDATE ret=-5",
+                "create:sev-init",
+            ),
+            (
+                "Could not access KVM kernel module: No such file or directory\n\
+                 failed to initialize kvm: /dev/kvm",
+                "create:kvm-unavailable",
+            ),
+            (
+                "Requested operation is not valid: network 'default' is not active",
+                "create:network-inactive",
+            ),
+            (
+                "Network not found: no network with matching name 'default'",
+                "create:network-inactive",
+            ),
+            (
+                "referenced filter 'clean-traffic' is missing",
+                "create:nwfilter-missing",
+            ),
+            (
+                "internal error: qemu unexpectedly closed the monitor: \
+                 Could not open '/var/lib/hippius-miner/data/x.img': Permission denied",
+                "create:disk-open-permission",
+            ),
+            (
+                "internal error: qemu unexpectedly closed the monitor: \
+                 Could not open '/var/lib/hippius-miner/rootfs.img': Invalid argument",
+                "create:disk-open-invalid",
+            ),
+            (
+                "Cannot access storage file '/x': No such file or directory\n\
+                 Could not open '/x': No such file or directory",
+                "create:disk-missing",
+            ),
+            (
+                "internal error: cannot set ownership: Permission denied",
+                "create:permission-denied",
+            ),
+            (
+                "internal error: qemu unexpectedly closed the monitor: \
+                 cannot set up guest memory 'pc.ram': Cannot allocate memory",
+                "create:out-of-memory",
+            ),
+            (
+                "internal error: qemu unexpectedly closed the monitor: something else",
+                "create:qemu-exited",
+            ),
+        ] {
+            let stderr = format!("{start}{tail}");
+            assert_eq!(
+                classify_start_failure(&stderr).to_string(),
+                format!("libvirt-driver/{code}"),
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cid_conflict_still_wins_over_every_cause() {
+        let stderr = "error: Failed to start domain 'x'\nerror: qemu unexpectedly closed the \
+                      monitor: failed to set guest cid: Address already in use";
+        assert_eq!(
+            classify_start_failure(stderr).to_string(),
+            MinerAgentError::VsockCid("cid-in-use").to_string()
+        );
     }
 
     #[test]

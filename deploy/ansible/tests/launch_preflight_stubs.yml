@@ -1,0 +1,68 @@
+---
+# Shared vars of the launch-preflight wiring tests: a canned probe output
+# of a healthy host, and stub host tools for running the real probe
+# script on any machine (no libvirt, no root). Behaviour knobs are
+# environment variables; state lives in $FAKE_DIR.
+scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/launch-preflight-wiring"
+
+good_probe: |
+  virsh=1
+  qemu_user=libvirt-qemu
+  qemu_user_ok=1
+  net_defined=1
+  net_active=1
+  net_autostart=1
+  net_xml=<network><name>default</name><bridge name='virbr0'/><ip address='192.168.122.1' netmask='255.255.255.0'/></network>
+  nwfilter_clean_traffic=1
+  traverse_0=/var/lib/hippius-miner||
+  unit_present=1
+  unit_protect_system=strict
+  unit_rw_paths=/var/lib/hippius-miner
+  config_data_root=/var/lib/hippius-miner
+  config_state_root=/var/lib/hippius-miner
+  sandbox_0=/var/lib/hippius-miner|ok
+  odirect_0=/var/lib/hippius-miner|ok
+  smoke=ok
+
+stubs:
+  virsh: |
+    #!/bin/bash
+    shift 2
+    case "$1" in
+      net-info) printf 'Active:         yes\nAutostart:      yes\n' ;;
+      net-dumpxml) echo "<network><bridge name='virbr0'/><ip address='192.168.122.1' prefix='24'/></network>" ;;
+      nwfilter-dumpxml) exit 0 ;;
+      create) touch "$FAKE_DIR/running" ;;
+      domstate) [ -e "$FAKE_DIR/running" ] || exit 1; echo paused ;;
+      domiflist) echo " vnet9   network   default   virtio   52:54:00:00:00:01" ;;
+      destroy) rm -f "$FAKE_DIR/running" ;;
+    esac
+  systemctl: |
+    #!/bin/bash
+    case "$1:$4" in
+      cat:*) exit 0 ;;
+      show:ProtectSystem) echo strict ;;
+      show:ReadWritePaths) echo "$FAKE_DIR/data" ;;
+      *) echo "" ;;
+    esac
+  systemd-run: |
+    #!/bin/bash
+    while [ "$#" -gt 0 ]; do
+      case "$1" in -p) shift 2 ;; --*) shift ;; *) break ;; esac
+    done
+    exec "$@"
+  runuser: |
+    #!/bin/bash
+    shift 3
+    exec "$@"
+  # Ubuntu 26.04's uutils dd (its `iflag=direct` read fails anywhere):
+  # the probe's O_DIRECT check is Python, real I/O in the scratch dir.
+  dd: |
+    #!/bin/bash
+    case " $* " in *" iflag=direct "*) echo "dd: IO error: Invalid input" >&2; exit 1 ;; esac
+  id: |
+    #!/bin/bash
+    echo 64055
+  chown: |
+    #!/bin/bash
+    exit 0

@@ -8,6 +8,7 @@
 # public NIC. `libvirt-daemon-system` ships the `default` network
 # definition; this task makes sure it is defined, autostarted, and
 # running. Every step is guarded — a second run is a zero-diff no-op.
+# virsh output is matched below, so play 03 runs it with LC_ALL=C.
 
 - name: Query the libvirt default network state
   ansible.builtin.command:
@@ -49,6 +50,44 @@
   register: miner_net_state
   changed_when: false
   check_mode: false
+  # Under --check the define above was only previewed: still absent.
+  failed_when: miner_net_state.rc != 0 and not ansible_check_mode
+
+# A `virsh net-start` onto a range another interface already routes
+# either fails with a bare libvirt error or, worse, shadows that route.
+# Judged only while the network is down: once it runs, its own virbr0
+# route is the overlap.
+- name: Read the default network and the host's routes and addresses
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - [virsh, net-dumpxml, default]
+    - [ip, -4, route, show]
+    - [ip, -o, -4, addr, show]
+  register: miner_net_layout
+  changed_when: false
+  check_mode: false
+  failed_when: miner_net_layout.rc != 0 and not ansible_check_mode
+  when: not (miner_net_state.stdout is search('Active:\s+yes'))
+
+- name: Refuse to start the default network over an existing route
+  ansible.builtin.assert:
+    that:
+      - miner_net_clash | length == 0
+    fail_msg: >-
+      [LIBVIRT_DEFAULT_NET_SUBNET_CLASH] the libvirt `default` network
+      ({{ miner_net_info.ip }}/{{ miner_net_info.prefix }} on {{ miner_net_info.bridge }})
+      overlaps what this host already routes: {{ miner_net_clash | join(', ') }}.
+      The miner-agent needs `default` on exactly 192.168.122.1/24 (virbr0),
+      so renumber the other interface (another hypervisor, a container
+      bridge, a VPN), then rerun. Nothing was started.
+  vars:
+    miner_net_info: "{{ miner_net_layout.results[0].stdout | miner_libvirt_net_info }}"
+    miner_net_clash: >-
+      {{ miner_net_layout.results[1].stdout
+         | miner_libvirt_net_clash(miner_net_layout.results[2].stdout, miner_net_info.ip,
+                                   miner_net_info.prefix, miner_net_info.bridge) }}
+  when: not (miner_net_state.stdout is search('Active:\s+yes'))
 
 - name: Enable autostart for the default network
   ansible.builtin.command:
@@ -61,7 +100,21 @@
 - name: Start the default network
   ansible.builtin.command:
     cmd: virsh net-start default
+  register: miner_net_start
   changed_when: true
+  failed_when: false
   when:
     - libvirt.default_network_enabled | default(true)
     - not (miner_net_state.stdout is search('Active:\s+yes'))
+
+- name: Refuse a default network that did not start
+  ansible.builtin.assert:
+    that:
+      - miner_net_start.rc == 0
+    fail_msg: >-
+      [LIBVIRT_DEFAULT_NET_START_FAILED] `virsh net-start default` failed:
+      {{ miner_net_start.stderr | default('') | trim }}. Usual causes:
+      dnsmasq-base not installed, another DNS/DHCP server bound to all
+      addresses (check `ss -lunp 'sport = :67 or sport = :53'`), or a
+      broken firewall backend (`journalctl -u libvirtd`).
+  when: miner_net_start is not skipped

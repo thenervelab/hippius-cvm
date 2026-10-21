@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:eac63cede15f2b6f87861652a4d56f2fea6ca45ea2c910a24482c6c61543845c"
+  digest: "sha256:b0b6d2a078c06a08d0193bdc4482dc30451b5d08d0f131953f9c28833df59fda"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "404bce539a15b47674861bd382d71d081bc5c611"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39444414996/attempts/1"
+    commitSha: "0c08bfd4b64c9cd64760eb9ebb99cb6e165d3fb4"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39608816926/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -161,6 +161,22 @@ scheduler:
   resourceAdmission: "true"
   cpuOvercommit: "1.0"
   perVmOverheadMb: "256"
+  # Earned capacity for self-service (`earned`) miners (`capacity_earn`).
+  # capacityEarnProof: which proof lets an earned ceiling GROW past the
+  # floor (4 VMs / 8 vCPU / 32 GiB): "off" (default — nothing grows) or
+  # "live-attestation" (release-bound KBS keepalives held 30 min at >= 80 %
+  # fill ⇒ ×1.5). capacityDeclaredCeiling "true": that growth stops at the
+  # miner's heartbeat-declared hardware (a dimension it declares nothing for
+  # does not grow), corroborated guest-attested resource shortfalls
+  # (capacityShortfallMinOwners distinct tenants) halve the earned ceiling,
+  # an at-floor fault lands a `strike` audit row, and the fleet's
+  # `no-hardware-anchor` alert fires only where vali has no hardware figure
+  # at all (`capacity_source` unknown | earned).
+  # Both OFF: an unanchored earned miner stays at the floor (∩ its declared
+  # budget), exactly as before. Operator-anchored miners are never touched.
+  capacityEarnProof: "off"
+  capacityDeclaredCeiling: "false"
+  capacityShortfallMinOwners: "2"
 
 # Customer-held disk keys (H6a, VALI_CUSTOMER_KEYS_ENABLED). Gates only NEW
 # launches with key_mode=split|customer (also golden-only, off a bake marked
@@ -554,6 +570,33 @@ vmBackup:
     # Secret vali/vali-backup-s3 (object-scoped key, bucket hippius-vm-backup).
     enabled: true
     secretName: vali-backup-s3
+
+# Guest NIC spec on launch, relaunch and §25 orders (`net`:
+# apps.network.net_policy.launch_net_spec — the bandwidth cap, a
+# deterministic tap name, libvirt's `clean-traffic` filter and, with
+# `isolate`, an isolated bridge port). Rendered by `vali.netLaunchSpecEnv`
+# into EVERY process that builds such an order: the web pod (power
+# start/reboot, guest-upgrade recover, the operator CLIs), launch-tick and
+# orchestration-tick. OFF: VALI_NET_LAUNCH_SPEC="false" is the code default.
+# `miners` (explicit ids, or `*`) and `isolate` render only when enabled.
+# List a miner only once its agent knows `net` (an older one refuses every
+# launch that carries it) and `virsh nwfilter-list` shows `clean-traffic`.
+# Strings, like orchestrationTick.netPolicy.
+netLaunchSpec:
+  enabled: "false"
+  miners: "*"
+  isolate: "true"
+  # Isolation-only flip, caps disabled by setting them very high; real caps =
+  # separate decision. Rendered only when `enabled` is "true", as
+  # VALI_NET_CAP_MBPS_BY_FLAVOR / _DEFAULT_MBPS / _PUBLIC_IP_MBPS. Both vali
+  # (net_policy.MAX_VM_CAP_MBPS) and the agent (netpolicy::MAX_VM_CAP_MBPS)
+  # accept at most 100000; edge mode adds 10 % tunnel room (11000). These
+  # also set the per-VM caps of the net-policy push in orchestration-tick.
+  # The CDN node cap (VALI_CDN_NET_CAP_MBPS) is separate and not set here.
+  caps:
+    byFlavor: '{"small": 10000, "medium": 10000, "large": 10000, "xlarge": 10000, "2xlarge": 10000, "4xlarge": 10000}'
+    defaultMbps: "10000"
+    publicIpMbps: "10000"
 
 orchestrationTick:
   enabled: true

@@ -482,6 +482,12 @@ report. Nothing is declared by a miner.
   generated_at}`. `OPERATOR_ONLY`, read-only, published on `api.hippius.network`.
 - `GET /v1/operator/nodes` rows carry `location {country_code, region, city,
   connection_ip, asn, as_holder, rtt_ms, verdict, verdict_reasons, observed_at}`.
+- `GET /v1/operator/nodes` rows also carry the node's own launch failures
+  (`apps.miners.launch_errors`): `last_launch_error {code, class, http_status,
+  stage, order_id, at}|null`, `launch_fail_streak` (failed attempts since the
+  last accepted launch) and `recent_launch_errors` (newest first, max 5).
+  `code` is the agent's `x-hippius-reason` (the failing step's static
+  `MinerAgentError` code), else the body class; recording only, never placement.
 - `POST /v1/vm/launch` accepts an optional `region` (ISO 3166-1 alpha-2,
   case-insensitive). Hard constraint: only miners whose detected location is
   `verified` in that country are candidates; none ⇒ 409 `no-miner-in-region`.

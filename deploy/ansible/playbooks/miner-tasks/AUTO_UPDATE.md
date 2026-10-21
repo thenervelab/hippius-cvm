@@ -80,6 +80,25 @@ error: the play stops with `[MINER_AGENT_INSTALL_FAILED]` and installs
 nothing. A binary already reporting `versions.miner_agent` is never
 reinstalled by the play: from then on only the timer moves it.
 
+## An exact release (`--tag`, play 05's `miner_agent_version`)
+
+`hippius-miner-update [--install] --tag <tag>` installs exactly `<tag>`:
+the release object comes from `releases/tags/<tag>`, the three checks of
+step 6 are the same, and the soak does not apply. It refuses a tag that
+is not `vYYYY.MM.DD[.N]`, one without a complete release, one with a
+`.update-failed-<tag>` marker, and one older than the installed release
+(`installed-release`, or the binary's own tag outside `--install`; the
+same tag as `installed-release` is allowed), and it does not run over a
+cut-short swap (`update-in-progress`; the timer's next run resolves it).
+Without `--install` it is
+an update (steps 7-10: preflight, SIGKILL swap, health check, rollback),
+and nothing at all when the binary already reports `<tag>`. The opt-outs
+do not apply (an operator asked), `MIN_RELEASE_AGE_H` is ignored, and
+`auto-update.env` is never written: the timer keeps its soak. Play 05 runs
+it with `-e miner_agent_version=<tag>`: `--tag` alone when the agent is
+active, `--install --tag` otherwise (missing, foreign, or stopped:
+nothing to swap).
+
 ## Why SIGKILL, never stop/restart
 
 A graceful stop of `hippius-miner-agent` destroys **every** domain on the

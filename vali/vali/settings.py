@@ -819,6 +819,8 @@ _CAPACITY_V2_ENV = (
     "VALI_CAPACITY_EARNED_INFLIGHT_MAX",
     "VALI_CAPACITY_EARN_DECAY_AFTER_S",
     "VALI_CAPACITY_EARN_PROOF",
+    "VALI_CAPACITY_DECLARED_CEILING",
+    "VALI_CAPACITY_SHORTFALL_MIN_OWNERS",
     # Storage-aware placement — the DATA-disk gate and its knobs.
     "VALI_SCHEDULER_DISK_GATE",
     "VALI_SCHEDULER_DISK_UNKNOWN",
@@ -2642,6 +2644,27 @@ VALI_STORAGE_CONFIG_MIN_AGENT_VERSION = os.environ.get(
 VALI_POOL_ROUTING_MIN_AGENT_VERSION = os.environ.get(
     "VALI_POOL_ROUTING_MIN_AGENT_VERSION", ""
 ).strip()
+# ── OS-disk tiers (`apps.disktier.os_tier`, disk-tier design §10.14, E1).
+#
+# The tiers a launch may ask as `os_disk_tier` (a MINIMUM; absent = nvme).
+# Another one is refused 409 `disk-tier-not-offered`, and so is any tier but
+# nvme unless the tier gate below is `enforce` (a tier vali does not place
+# by is not sold).
+VALI_SELLABLE_OS_TIERS = _env_list("VALI_SELLABLE_OS_TIERS", ["nvme"])
+if not VALI_SELLABLE_OS_TIERS or not set(VALI_SELLABLE_OS_TIERS) <= {"nvme", "ssd", "hdd"}:
+    raise RuntimeError("VALI_SELLABLE_OS_TIERS must list one or more of nvme, ssd, hdd")
+# The per-node OS-pool tier gate: `off` (no query, today's placement),
+# `record` (a placement `enforce` would refuse is logged, not refused) or
+# `enforce` (a node with no OS pool at the VM's tier is not a candidate).
+VALI_SCHEDULER_DISK_TIER_GATE = os.environ.get("VALI_SCHEDULER_DISK_TIER_GATE", "off").strip()
+if VALI_SCHEDULER_DISK_TIER_GATE not in ("off", "record", "enforce"):
+    raise RuntimeError("VALI_SCHEDULER_DISK_TIER_GATE must be off, record or enforce")
+# The largest flavor sold on the hdd OS tier: its first boot wipes the whole
+# integrity overlay on a spindle (design §10.18, Q-D15).
+VALI_HDD_OS_MAX_FLAVOR = os.environ.get("VALI_HDD_OS_MAX_FLAVOR", "large").strip()
+# Miner reward per unit scaled by the VM's sold OS-disk tier (nvme 1.0, ssd
+# 0.8, hdd 0.6; decision Q7). Off = every unit as today.
+VALI_DISK_TIER_UNIT_FACTOR = _env_bool("VALI_DISK_TIER_UNIT_FACTOR", False)
 # ── Live storage move (`apps.disktier.storage_move`): a running VM's OS disk
 # moves to another pool of its host, no downtime. ALL DARK by default: off,
 # no miner selected, and no agent version good enough. Turning it OFF stops

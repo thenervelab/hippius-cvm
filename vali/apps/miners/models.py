@@ -338,3 +338,40 @@ class MinerLocation(models.Model):
     @property
     def region(self) -> str:
         return self.country_code.upper()
+
+
+class MinerLaunchErrors(models.Model):
+    """The launch failures vali OBSERVED on one miner — for the miner's own
+    operator (`GET /v1/operator/nodes`), never for placement.
+
+    Written ONLY by `apps.miners.launch_errors`, from the answer to a
+    `tenant-preflight` / `launch` order vali dispatched to this miner (the
+    miner is the one vali chose, never one a response named). Every code
+    the miner sent passed `launch_errors.sanitize_code` first: a closed
+    charset, bounded, so a miner can put nothing in it but a code — and
+    only on its own row.
+
+    - `fail_streak`  failed attempts since the last accepted launch (every
+                     attempt counts, a same-miner retry included).
+    - `last_ok_at`   the last launch this miner accepted.
+    - `errors`       newest first, at most `launch_errors.MAX_RECENT`:
+                     `{code, class, http_status, stage, order_id, at}`.
+    """
+
+    miner = models.OneToOneField(
+        MinerIdentity,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="launch_errors",
+    )
+    fail_streak = models.PositiveIntegerField(default=0)
+    last_ok_at = models.DateTimeField(null=True, blank=True)
+    errors = models.JSONField(default=list, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["miner_id"]
+        verbose_name_plural = "miner launch errors"
+
+    def __str__(self) -> str:
+        return f"MinerLaunchErrors {self.miner_id} (streak {self.fail_streak})"

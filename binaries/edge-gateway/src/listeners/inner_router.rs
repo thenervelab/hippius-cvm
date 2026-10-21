@@ -84,6 +84,7 @@
 //! `forward-transport` / `forward-upstream-status` / …) — the same
 //! `&'static str`-only discipline the miner router uses.
 
+use crate::forward::miner_forward::REASON_HEADER;
 use crate::forward::{
     MinerForward, MinerForwardError, MinerForwardResponse, OrderKind, MAX_MULTIPART_ORDER_BODY,
 };
@@ -291,7 +292,8 @@ fn map_forward_error(_err: &MinerForwardError) -> Response {
 /// (`content-type: application/octet-stream` — the miner-agent's
 /// response shape on `4xx` is a short static classifier string, on
 /// `2xx` an empty body). Vali branches on the exact status to decide
-/// `Bound` vs `Failed`.
+/// `Bound` vs `Failed`. The miner's `x-hippius-reason` code, when it sent
+/// a well-formed one, is relayed as the same header.
 fn relay_miner_response(
     target_addr: SocketAddr,
     kind: OrderKind,
@@ -310,7 +312,15 @@ fn relay_miner_response(
         },
     );
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    (status, resp.body).into_response()
+    let mut response = (status, resp.body).into_response();
+    // Already checked against the code charset (`reason_from_headers`).
+    if let Some(value) = resp
+        .reason
+        .and_then(|r| axum::http::HeaderValue::from_str(&r).ok())
+    {
+        response.headers_mut().insert(REASON_HEADER, value);
+    }
+    response
 }
 
 /// Pull [`TARGET_ADDR_HEADER`], parse as [`SocketAddr`], and confirm

@@ -38,6 +38,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
+from apps.disktier import os_tier
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
 
@@ -72,7 +73,14 @@ _MAX_NODE_ID = 64
 
 # `LaunchIntentError` categories that are a caller mistake (400) vs a
 # state conflict (409) vs an internal/config fault (503).
-_LAUNCH_CONFLICT_CATEGORIES = frozenset({"conflict", launch_jobs.CATEGORY_LAUNCH_CANCELLED})
+_LAUNCH_CONFLICT_CATEGORIES = frozenset(
+    {
+        "conflict",
+        launch_jobs.CATEGORY_LAUNCH_CANCELLED,
+        os_tier.CATEGORY_NOT_OFFERED,
+        launch_jobs.CATEGORY_DEDICATED_NOT_OFFERED,
+    }
+)
 _LAUNCH_INTERNAL_CATEGORIES = frozenset({"internal"})
 
 # `StartError` categories that are a caller mistake (400) rather than
@@ -506,10 +514,16 @@ class LaunchStartView(APIView):
                 "the largest offered size (`flavor-not-offered`), or a vm id / owner "
                 "reserved for the disk-tier probe (`disk-probe-id-reserved`), or an "
                 "`os_pool` (vali chooses it; only the disk-tier probe pins one: "
-                "`os-pool-reserved`).",
+                "`os-pool-reserved`), or an `os_disk_tier` off the enum "
+                "(`disk-tier-invalid`).",
             ),
             403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
-            409: OpenApiResponse(ErrorSerializer, "In-flight launch already exists for this VM."),
+            409: OpenApiResponse(
+                ErrorSerializer,
+                "In-flight launch already exists for this VM, or an `os_disk_tier` not "
+                "sold here (`disk-tier-not-offered`), or `dedicated_disks` "
+                "(`dedicated-disks-not-offered`: not sold yet).",
+            ),
             503: OpenApiResponse(ErrorSerializer, "Vault stage / config fault (`internal`)."),
         },
     )

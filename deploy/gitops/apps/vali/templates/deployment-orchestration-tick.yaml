@@ -86,6 +86,9 @@ spec:
                   key: secret-key
             {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}
             {{- include "vali.vaultAuthEnv" . | nindent 12 }}
+            # Guest NIC spec on launch/relaunch/§25 orders (vali.netLaunchSpecEnv):
+            # identical in every process that builds one.
+            {{- include "vali.netLaunchSpecEnv" . | nindent 12 }}
             - name: VALI_VAULT_ADDR
               valueFrom:
                 secretKeyRef:

@@ -374,6 +374,11 @@ data:
   VALI_SCHEDULER_RESOURCE_ADMISSION: {{ .Values.scheduler.resourceAdmission | quote }}
   VALI_SCHEDULER_CPU_OVERCOMMIT: {{ .Values.scheduler.cpuOvercommit | quote }}
   VALI_SCHEDULER_PER_VM_OVERHEAD_MB: {{ .Values.scheduler.perVmOverheadMb | quote }}
+  # Earned growth + self-service hardware ceiling — see values.yaml
+  # `scheduler.capacityEarnProof` / `scheduler.capacityDeclaredCeiling`.
+  VALI_CAPACITY_EARN_PROOF: {{ .Values.scheduler.capacityEarnProof | default "off" | toString | quote }}
+  VALI_CAPACITY_DECLARED_CEILING: {{ .Values.scheduler.capacityDeclaredCeiling | default "false" | toString | quote }}
+  VALI_CAPACITY_SHORTFALL_MIN_OWNERS: {{ .Values.scheduler.capacityShortfallMinOwners | default "2" | toString | quote }}
   # Customer-held disk keys (M1 split / M2 customer) on NEW launches — see
   # values.yaml `customerKeys.enabled`.
   VALI_CUSTOMER_KEYS_ENABLED: {{ .Values.customerKeys.enabled | quote }}

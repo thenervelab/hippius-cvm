@@ -67,6 +67,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from apps.disktier import os_tier
 from apps.orchestration.services import flavors
 
 from . import capacity, capacity_config, chain, service
@@ -106,6 +107,11 @@ class HostFit:
     budget_disk_gb: int | None = None
     free_disk_gb: int | None = None
     disk_gate: str = capacity.DISK_GATE_OFF
+    #: What the answer for this host rests on (`capacity.SOURCE_*`):
+    #: `trusted` (operator anchor), `declared+earned` (an `earned` host's
+    #: proven ceiling clamped by its own declaration), `earned` (proof
+    #: alone, no hardware figure) or `unknown`.
+    capacity_source: str = capacity.SOURCE_UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,13 @@ class Feasibility:
     #: The region the question was asked for (`""` = anywhere). Echoed so
     #: a caller holding several answers can tell which is which.
     region: str = ""
+    #: The OS-disk tier asked for, echoed; `None` when none was (the view
+    #: then leaves the key out: the answer is the one before tiers existed).
+    os_disk_tier: str | None = None
+    #: The weakest `capacity_source` among the hosts the headroom counts
+    #: (`fits`), weakest first: `earned`, `declared+earned`, `trusted` (all
+    #: anchored); `""` when nothing fits.
+    capacity_source: str = ""
 
 
 def _disk_fields(disk: capacity.DiskBudget, state: str) -> dict[str, object]:
@@ -246,6 +259,7 @@ def _fit_one(
         budget_memory_mb=res.budget_memory_mb,
         budget_cpus=res.budget_cpus,
         shortfall="; ".join(short),
+        capacity_source=capacity.SOURCE_TRUSTED,
         **_disk_fields(disk, disk_state),
     )
 
@@ -307,6 +321,7 @@ def _fit_one_v2(
         shortfall="; ".join(short),
         free_vms=budget.free_vms,
         headroom=capacity.headroom(budget, **dims),
+        capacity_source=budget.source,
         **_disk_fields(budget.disk, budget.disk_gate),
     )
 
@@ -317,6 +332,7 @@ def assess(
     tenant_id: str = "",
     user_id: str = "",
     region: str = "",
+    os_disk_tier: str | None = None,
 ) -> Feasibility:
     """Answer "could a VM of `flavor` be placed right now?". Read-only.
 
@@ -331,6 +347,11 @@ def assess(
     validate (the view does); here an unparseable value simply matches
     no miner.
 
+    `os_disk_tier` (a valid tier, or `None`: the question as before tiers)
+    asks for a VM sold at that OS-disk tier: `never` / `disk-tier-not-offered`
+    when it is not sold, and, gate (n) enforced, `never` / `no-miner-at-tier`
+    when no counted host has an OS pool at it at all.
+
     Raises `flavors.UnknownFlavor` for a flavor outside the catalogue —
     the caller asked about something that does not exist, which is a
     different thing from "cannot place" and must not be flattened into
@@ -338,7 +359,9 @@ def assess(
     """
     size = flavors.resolve_flavor(flavor)
     region = region.strip().upper()
-    if not flavors.is_offered(flavor):
+    offered = flavors.is_offered(flavor)
+    tier_why = os_tier.not_offered(os_disk_tier, flavor) if os_disk_tier and offered else ""
+    if not offered or tier_why:
         # Not for sale, whatever the hardware could hold — the answer that
         # must stop a sale, so `never`, and before any chain read: the
         # verdict does not depend on the fleet.
@@ -351,8 +374,10 @@ def assess(
             cpu_count=size.cpu_count,
             memory_mb=size.memory_mb,
             data_disk_size_gb=size.data_disk_size_gb,
-            reason="flavor-not-offered",
+            reason="disk-tier-not-offered" if tier_why else "flavor-not-offered",
+            scheduler_error=tier_why,
             region=region,
+            os_disk_tier=os_disk_tier,
         )
 
     try:
@@ -374,6 +399,7 @@ def assess(
             reason="chain-unavailable",
             scheduler_error=str(exc),
             region=region,
+            os_disk_tier=os_disk_tier,
         )
 
     service.refresh_miner_capacity(snapshot)
@@ -453,6 +479,7 @@ def assess(
                 region=region,
                 shadow_log=False,
                 budgets=budgets,
+                os_disk_tier=os_disk_tier or "",
             ),
         )
         scheduler_ok = True
@@ -497,6 +524,16 @@ def assess(
         verdict, reason = "not-now", "region-unverified"
     elif not hosts:
         verdict, reason = "not-now", "no-dispatchable-miner"
+    elif (
+        os_disk_tier
+        and os_tier.gate_mode() == os_tier.GATE_ENFORCE
+        and not os_tier.ever_holding([h.node_id for h in hosts], os_disk_tier)
+    ):
+        # No counted host has an OS pool configured at the tier: a pool is
+        # a miner's configuration, so waiting does not bring one. (One that
+        # is full, unreported or degraded for now is the scheduler's
+        # `not-now`.)
+        verdict, reason = "never", os_tier.CATEGORY_NO_MINER_AT_TIER
     elif not big_enough and unknown:
         # `never` must be earned from KNOWLEDGE, never from missing data.
         # Every miner on the live fleet has `total_memory_mb = None` (the
@@ -535,15 +572,40 @@ def assess(
             and all(h.disk_checked for h in fitting)
         ),
         region=region,
+        os_disk_tier=os_disk_tier,
+        capacity_source=_weakest_source(fitting),
     )
 
 
+def _weakest_source(hosts: list[HostFit]) -> str:
+    """See `Feasibility.capacity_source`."""
+    sources = {h.capacity_source for h in hosts}
+    for source in (
+        capacity.SOURCE_UNKNOWN,
+        capacity.SOURCE_EARNED,
+        capacity.SOURCE_DECLARED_EARNED,
+    ):
+        if source in sources:
+            return source
+    return capacity.SOURCE_TRUSTED if sources else ""
+
+
 def assess_catalogue(
-    *, tenant_id: str = "", user_id: str = "", region: str = ""
+    *,
+    tenant_id: str = "",
+    user_id: str = "",
+    region: str = "",
+    os_disk_tier: str | None = None,
 ) -> list[Feasibility]:
     """[`assess`] for every catalogue flavor — the "what can I sell right
     now" board, in catalogue order."""
     return [
-        assess(name, tenant_id=tenant_id, user_id=user_id, region=region)
+        assess(
+            name,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            region=region,
+            os_disk_tier=os_disk_tier,
+        )
         for name in flavors.FLAVOR_NAMES
     ]
