@@ -33,6 +33,7 @@ pub mod adopt;
 pub mod cid_verify;
 pub mod cvm_handle;
 pub mod data_disk;
+pub mod dhcp_reservation;
 pub(crate) mod disk_space;
 pub mod golden;
 pub mod guardian;
@@ -275,6 +276,9 @@ pub struct CvmLifecycle {
     /// What this process saw of each VM's current run — the evidence the
     /// guest-poweroff policy decides on ([`power_policy::GuestRuns`]).
     guest_runs: Arc<power_policy::GuestRuns>,
+    /// Serialises [`dhcp_reservation`] changes: two launches planning at
+    /// once could pick the same address.
+    dhcp_lock: tokio::sync::Mutex<()>,
 }
 
 /// How long a preflight's ASID reservation holds without a launch.
@@ -394,6 +398,7 @@ impl CvmLifecycle {
             asid_reservations: Mutex::new(HashMap::new()),
             net_policy_gate: None,
             guest_runs: Arc::new(power_policy::GuestRuns::new()),
+            dhcp_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1336,6 +1341,8 @@ impl CvmLifecycle {
             // below, before `to_libvirt_xml` ever runs.
             cid: crate::vsock::peer::MIN_GUEST_CID,
             net: order.net,
+            // Reserved below, once the launch is admitted.
+            dhcp: None,
         };
         config.validate()?;
         let domain_id = config.domain_name()?;
@@ -1495,6 +1502,21 @@ impl CvmLifecycle {
             self.unreserve_handle(&vm_id);
             self.release_cid(&vm_id);
             return Err(err);
+        }
+
+        // A `net` NIC's MAC and address, reserved on the network before
+        // the domain exists: its clean-traffic filter pins that address
+        // instead of learning the first DHCP lease (which a guest that
+        // runs DHCP twice, initramfs then OS, does not keep).
+        if config.net.is_some() {
+            match self.reserve_guest_ip(&vm_id).await {
+                Ok(reservation) => config.dhcp = Some(reservation),
+                Err(err) => {
+                    self.unreserve_handle(&vm_id);
+                    self.release_cid(&vm_id);
+                    return Err(err);
+                }
+            }
         }
 
         // Pre-flight launch digest — computed BEFORE any virsh call.
@@ -2160,18 +2182,25 @@ impl CvmLifecycle {
                 vm_id.as_str()
             );
         }
-        if handle_disk.is_none()
-            && !anything
-            && self.tenant_domain_defined(vm_id).await != Some(true)
-        {
+        let defined = if handle_disk.is_none() && !anything {
+            self.tenant_domain_defined(vm_id).await
+        } else {
+            Some(true)
+        };
+        if defined != Some(true) {
             // Never hosted here (or already reclaimed and undefined) —
             // idempotent success. A defined-but-down domain with no files
             // left (a shut-off VM whose disks an earlier destroy already
             // reclaimed) is NOT this case: it falls through so the record
             // is undefined below. A libvirt error (`None`) keeps the
             // misrouted-destroy no-op: "cannot tell" must not fail §24.
-            // A move journal left by an earlier destroy goes too.
+            // A move journal left by an earlier destroy goes too, and so
+            // does a DHCP reservation — only once libvirt has said no
+            // domain holds its address.
             self.forget_move(vm_id);
+            if defined == Some(false) {
+                self.release_guest_ip(vm_id).await;
+            }
             return Ok(());
         }
 
@@ -2327,8 +2356,88 @@ impl CvmLifecycle {
         // other caller) still finds the disks through it. So does a live
         // storage move's journal.
         self.forget_move(vm_id);
+        self.release_guest_ip(vm_id).await;
         self.forget_vm_pool(vm_id);
         Ok(())
+    }
+
+    /// Reserve `vm_id`'s NIC MAC and address ([`dhcp_reservation::ensure`]).
+    async fn reserve_guest_ip(&self, vm_id: &VmId) -> Result<dhcp_reservation::DhcpReservation> {
+        let _serial = self.dhcp_lock.lock().await;
+        let result = dhcp_reservation::ensure(&*self.driver, &self.state_disk_root, vm_id).await;
+        if let Err(err) = &result {
+            eprintln!(
+                "hippius-miner-agent: launch: vm {} DHCP reservation refused: {err}",
+                vm_id.as_str()
+            );
+        }
+        result
+    }
+
+    /// Release `vm_id`'s DHCP reservation (destroy, once the domain is
+    /// proven down). Logged, not returned: the data death already
+    /// happened; an entry left behind is deleted by the next start's
+    /// [`Self::reconcile_dhcp_reservations`].
+    async fn release_guest_ip(&self, vm_id: &VmId) {
+        let _serial = self.dhcp_lock.lock().await;
+        if let Err(err) =
+            dhcp_reservation::release(&*self.driver, &self.state_disk_root, vm_id).await
+        {
+            eprintln!(
+                "hippius-miner-agent: destroy: vm {} DHCP reservation not fully released: {err}",
+                vm_id.as_str()
+            );
+        }
+    }
+
+    /// At start, after the pool-record backfill: release the DHCP
+    /// reservations of VMs that no longer exist here (no pool record, no
+    /// libvirt domain, not tracked), re-add any reservation the network
+    /// lost, and delete the agent's network entries no record names.
+    /// A host with no reservation and no entry of the agent's changes
+    /// nothing.
+    pub async fn reconcile_dhcp_reservations(&self) -> Result<dhcp_reservation::Reconciled> {
+        let _serial = self.dhcp_lock.lock().await;
+        let records = dhcp_reservation::list(&self.state_disk_root)?;
+        let mut gone = std::collections::HashSet::new();
+        if !records.is_empty() && vm_pool::backfilled(&self.state_disk_root) {
+            let domains = self.driver.list_domains().await?;
+            let tracked: std::collections::HashSet<VmId> =
+                self.lock_handles()?.keys().cloned().collect();
+            for (vm, _) in records {
+                let defined = DomainId::new(&format!("hippius-tenant-{}", vm.as_str()))
+                    .is_ok_and(|id| domains.iter().any(|(d, _)| *d == id));
+                let pool = vm_pool::read(&self.state_disk_root, &vm);
+                if !defined && !tracked.contains(&vm) && matches!(pool, Ok(None)) {
+                    gone.insert(vm);
+                }
+            }
+        }
+        let domain_macs = self.domain_macs().await;
+        dhcp_reservation::reconcile(
+            &*self.driver,
+            &self.state_disk_root,
+            &gone,
+            domain_macs.as_ref(),
+        )
+        .await
+    }
+
+    /// The NIC MACs of every domain libvirt has, running or not. `None`
+    /// when any one cannot be read: then no entry may be taken for unused.
+    async fn domain_macs(&self) -> Option<std::collections::HashSet<String>> {
+        let mut macs = std::collections::HashSet::new();
+        for (id, _) in self.driver.list_domains().await.ok()? {
+            let xml = self.driver.domain_xml(&id).await.ok()?;
+            for block in adopt::sections(&xml, "interface") {
+                if let Some(mac) =
+                    adopt::tag_attrs(&block, "mac").and_then(|a| adopt::attr(&a, "address"))
+                {
+                    macs.insert(mac.to_ascii_lowercase());
+                }
+            }
+        }
+        Some(macs)
     }
 
     /// Drop `vm_id`'s pool record (destroy). Logged, not returned: the

@@ -1014,6 +1014,115 @@ async fn readopt_tracks_old_and_new_style_domains_side_by_side() {
     assert_eq!(lc2.cid_allocator().cid_for_vm(&new).unwrap(), Some(new_cid));
 }
 
+fn net_order(vm_id: &str) -> LaunchOrder {
+    let mut o = order(vm_id);
+    o.net = Some(hippius_miner_agent::orders::NetSpec {
+        cap_mbps: None,
+        isolate: true,
+    });
+    o
+}
+
+async fn live_xml(driver: &MockLibvirtDriver, vm: &str) -> String {
+    let id = DomainId::new(&format!("hippius-tenant-{vm}")).unwrap();
+    driver.domain_xml(&id).await.unwrap()
+}
+
+/// A `net` launch reserves its MAC and address on the network before the
+/// domain exists and pins both in the XML; a relaunch reuses them, a
+/// launch without the spec touches neither the network nor its XML, and
+/// §24 destroy releases the reservation.
+#[tokio::test]
+async fn a_net_launch_reserves_its_address_and_destroy_releases_it() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+
+    let plain = lc.launch(order("cvm-plain")).await.unwrap();
+    assert!(driver.dhcp_hosts().is_empty());
+    assert!(!live_xml(&driver, "cvm-plain")
+        .await
+        .contains("<mac address"));
+
+    let vm = lc.launch(net_order("cvm-net")).await.unwrap();
+    let hosts = driver.dhcp_hosts();
+    assert_eq!(hosts.len(), 1);
+    let (mac, ip) = hosts[0].clone();
+    assert!(mac.starts_with("02:68:76:"), "{mac}");
+    let xml = live_xml(&driver, "cvm-net").await;
+    assert!(xml.contains(&format!("<mac address='{mac}'/>")), "{xml}");
+    assert!(
+        xml.contains(&format!("<parameter name='IP' value='{ip}'/>")),
+        "{xml}"
+    );
+    assert!(!xml.contains("CTRL_IP_LEARNING"), "{xml}");
+
+    // Stop + relaunch: same MAC, same address, still one entry.
+    lc.stop(&vm, false).await.unwrap();
+    lc.launch(net_order("cvm-net")).await.unwrap();
+    assert_eq!(driver.dhcp_hosts(), vec![(mac.clone(), ip)]);
+    assert!(live_xml(&driver, "cvm-net")
+        .await
+        .contains(&format!("<parameter name='IP' value='{ip}'/>")));
+
+    lc.stop(&vm, false).await.unwrap();
+    lc.destroy(&vm, None).await.unwrap();
+    assert!(driver.dhcp_hosts().is_empty());
+    lc.stop(&plain, false).await.unwrap();
+}
+
+/// No free address: refused with the static code before any domain is
+/// defined, the CID released.
+#[tokio::test]
+async fn a_net_launch_on_a_full_dhcp_range_is_refused_and_defines_nothing() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    let only: std::net::Ipv4Addr = "192.168.122.2".parse().unwrap();
+    driver.set_dhcp_range(only, only);
+    driver.seed_dhcp_lease("52:54:00:00:00:09", only);
+
+    let err = lc.launch(net_order("cvm-full")).await.unwrap_err();
+    assert_eq!(err.to_string(), "net/ip-range-exhausted");
+    assert_eq!(driver.defined_count().unwrap(), 0);
+    let vm = VmId::new("cvm-full").unwrap();
+    assert_eq!(lc.cid_allocator().cid_for_vm(&vm).unwrap(), None);
+    assert!(lc.list().await.unwrap().is_empty());
+
+    // A failing network is the other static code.
+    driver.clear_dhcp_leases();
+    driver.fail_net_updates(true);
+    let err = lc.launch(net_order("cvm-full")).await.unwrap_err();
+    assert_eq!(err.to_string(), "net/dhcp-reservation-failed");
+    assert_eq!(driver.defined_count().unwrap(), 0);
+}
+
+/// At start, a reservation whose VM is gone from this host (no pool
+/// record, no domain, not tracked) is released; a live one is kept.
+#[tokio::test]
+async fn reconcile_releases_only_the_reservations_of_vms_gone_from_the_host() {
+    let driver = Arc::new(MockLibvirtDriver::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = lifecycle(driver.clone(), ok_digest()).with_state_disk_root(tmp.path().to_path_buf());
+    lc.launch(net_order("cvm-running")).await.unwrap();
+    let gone = lc.launch(net_order("cvm-gone")).await.unwrap();
+    lc.stop(&gone, false).await.unwrap();
+    assert_eq!(driver.dhcp_hosts().len(), 2);
+    // Without the pool-record backfill marker nothing is ever "gone".
+    let done = lc.reconcile_dhcp_reservations().await.unwrap();
+    assert_eq!(done.released, 0);
+    let pool_dir = tmp.path().join("vm-pool");
+    std::fs::create_dir_all(&pool_dir).unwrap();
+    std::fs::write(pool_dir.join(".backfilled"), b"").unwrap();
+    let done = lc.reconcile_dhcp_reservations().await.unwrap();
+    assert_eq!(done.released, 1);
+    let left = driver.dhcp_hosts();
+    assert_eq!(left.len(), 1);
+    assert!(live_xml(&driver, "cvm-running")
+        .await
+        .contains(&format!("<mac address='{}'/>", left[0].0)));
+}
+
 /// A cap outside the miner's bounds is refused before anything is
 /// reserved.
 #[tokio::test]

@@ -462,10 +462,20 @@ and still fail every tenant launch at `virsh start` (`dispatch-failed`,
 class `libvirt-driver/create`). Play 09 checks what a tenant VM adds,
 after libvirt and the agent are installed, and reports every failure at
 once in the same `FAIL [CODE] ... -- fix: ...` form. Its last check
-starts a small smoke VM: paused, transient, not SNP, 64 MiB, a 16 MiB raw
-disk under `miner_data_disk_root` opened the way tenant disks are
-(`cache='none'`), and a network card on `default` with the tenant
-filter. It is destroyed straight away, and so are its scratch files.
+starts a small smoke VM, paused, transient, not SNP, 64 MiB, laid out like
+a golden tenant. It has:
+- a per-VM dir under `staging/` holding a copy of the host's kernel, a
+  dummy initrd, and read-only rootfs and dm-verity disks;
+- overlay, state and data disks in the agent's `overlay/`, `state/` and
+  `data/` dirs (their roots on a fresh host), opened the way tenant
+  disks are (`cache='none'`);
+- the tenant OVMF as its firmware;
+- a network card on `default` with the tenant filter.
+
+Every file goes through libvirt's ownership handling and AppArmor
+profile like a tenant's. If the VM doesn't start, the AppArmor denials
+from that moment are named (`APPARMOR_DENIED_<DIR>`). It is destroyed
+straight away, and so are its scratch files.
 Running tenant VMs are not touched. Set `miner_launch_smoke_enabled:
 false` to skip only the smoke VM.
 
@@ -494,6 +504,9 @@ smoke VM) and prints `WOULD FAIL [CODE]` lines without stopping.
 | `QEMU_CANNOT_OPEN_DATA_ROOT` | root can do direct I/O on a file there, QEMU's user can't, on a file it owns. Also given as a likely cause when the smoke VM fails with `Permission denied`. | Look for an ACL, a mount option (NFS root-squash) or a security module denial: `getfacl`, `findmnt`, `journalctl -k \| grep -i denied`. |
 | `DATA_ROOT_NO_ODIRECT` | The filesystem under a storage root refuses `O_DIRECT`. Tenant disks are `cache='none'`, which QEMU opens with `O_DIRECT`. | Put the storage roots on ext4, xfs or btrfs: not tmpfs, overlayfs, or a network or FUSE filesystem without direct I/O. |
 | `AGENT_SANDBOX_CANNOT_WRITE` | The agent's systemd sandbox (`ProtectSystem=strict`) can't write a storage root that its installed config names. Either the root is missing from the unit's `ReadWritePaths`, or a file couldn't be created there under the unit's own sandbox properties, drop-ins included. Also given when the unit isn't installed. | Set `miner_data_disk_root` / `miner_state_disk_root` in host_vars and rerun the play: it renders both the config and the unit. Don't edit `config.toml` by hand. Check that the root is a writable mount (`findmnt`) and look for drop-ins under `/etc/systemd/system/hippius-miner-agent.service.d/`. |
+| `STORAGE_PATH_SYMLINK` | A symlink sits on the way to something QEMU opens: a storage root, `staging/`, `overlay/`, `state/`, `data/`, the image cache or the tenant OVMF. Inside the agent's tree (`/var/lib/hippius-miner/...`) it's a failure: the agent's own checks assume that tree has no links. Above it, it's a warning: libvirt follows the link, but if a launch is then denied by AppArmor, this is the first place to look. | Replace the symlink with a bind mount at the same path (`<target> <link> none bind 0 0` in `/etc/fstab`, then `mount <link>`). Or point the play's variables at the real path. Then rerun the play. |
+| `AGENT_UMASK_BLOCKS_QEMU` | The agent's unit runs with a `UMask` that removes "others" execute permission (e.g. `0077` or `0027`, from a drop-in or `DefaultUMask=`). Every per-VM dir the agent creates is then closed to QEMU's user, and every launch fails with `disk-open-permission`. | Rerun the play: the unit now sets `UMask=0022` explicitly. Remove the override, then restart the agent the supported way (`systemctl kill --signal=SIGKILL hippius-miner-agent`). Per-VM dirs a failed launch left behind are listed under `QEMU_CANNOT_TRAVERSE_DATA_ROOT`: `chmod o+x` them or delete them. |
+| `APPARMOR_DENIED_<DIR>` (`STAGING`, `OVERLAY`, `STATE`, `DATA`, `OVMF`, `OTHER`) | The smoke VM failed, and AppArmor (the domain's profile, or virt-aa-helper building it) denied QEMU the path shown. That is the resolved path, and `<DIR>` says which of the smoke VM's files it was. | The path QEMU reached isn't the one libvirt was given: usually a symlink (`STORAGE_PATH_SYMLINK`), so use a bind mount instead. `journalctl -k \| grep 'apparmor="DENIED"'` shows every denial. Don't disable AppArmor for libvirt. |
 | `LAUNCH_SMOKE_FAILED` | The smoke VM didn't start. The message has libvirt's error, and usually `(looks like <CODE>)`. | Fix what libvirt names. `journalctl -u libvirtd` and `/var/log/libvirt/qemu/hippius-preflight-smoke-*.log` have the rest. |
 
 ### Heartbeats
@@ -555,6 +568,12 @@ Common classes:
 - `refused kbs-transport`: the KBS CA is missing.
 - `*-disk/mkdir`: a data root outside the agent's writable paths. Set it
   in host_vars and rerun the play.
+- `libvirt-driver/create:disk-open-permission`: QEMU was refused a disk,
+  kernel or firmware. Play 09 reproduces it with a golden-like smoke VM
+  and names the cause: a directory QEMU can't enter
+  (`QEMU_CANNOT_TRAVERSE_DATA_ROOT`, per-VM staging dirs included), the
+  agent's umask (`AGENT_UMASK_BLOCKS_QEMU`), a symlink
+  (`STORAGE_PATH_SYMLINK`) or an AppArmor denial (`APPARMOR_DENIED_<DIR>`).
 - `libvirt-driver/create`: `virsh start` failed. Run
   `--tags launch_preflight` ([Launch preflight codes](#launch-preflight-codes-play-09)).
   It checks the `default` network, QEMU's access to the disk roots, and

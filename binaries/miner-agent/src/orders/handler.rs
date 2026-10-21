@@ -213,6 +213,16 @@ fn reject_class<L: FnOnce(String)>(
         MinerAgentError::VsockCid(_) => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "vsock-cid-exhausted")
         }
+        // Every address of the guest network's DHCP range is held: the
+        // host is full for a `net` NIC, like any capacity refusal (vali
+        // re-places; not a SEV start fault). A failed reservation is a
+        // host fault and keeps the catch-all `dispatch-failed`.
+        MinerAgentError::NetReservation("ip-range-exhausted") => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: insufficient-resources-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "insufficient-resources")
+        }
         // The order itself is unprocessable — bad launch inputs.
         MinerAgentError::LaunchInput(_) | MinerAgentError::LaunchDigest(_) => {
             OrderRejection::new(StatusCode::UNPROCESSABLE_ENTITY, "launch-input")
@@ -1680,6 +1690,10 @@ mod tests {
                 MinerAgentError::Destroy("disk-remove"),
                 "cvm-destroy/disk-remove",
             ),
+            (
+                MinerAgentError::NetReservation("dhcp-reservation-failed"),
+                "net/dhcp-reservation-failed",
+            ),
         ];
         for (err, expected_display) in cases {
             let (rej, line) = capture_detail(err, "tenant-x");
@@ -1746,6 +1760,25 @@ mod tests {
         ] {
             assert_eq!(capture_detail(&err, "t").0.class, "dispatch-failed");
         }
+    }
+
+    /// A full guest DHCP range is a capacity refusal vali re-places, with
+    /// its step on the detail line.
+    #[test]
+    fn an_exhausted_guest_ip_range_is_insufficient_resources() {
+        let (rej, line) = capture_detail(
+            &MinerAgentError::NetReservation("ip-range-exhausted"),
+            "tenant-n",
+        );
+        assert_eq!(rej.class, "insufficient-resources");
+        assert_eq!(rej.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "hippius-miner-agent: orders: insufficient-resources-detail vm=tenant-n \
+                 class=net/ip-range-exhausted"
+            ),
+        );
     }
 
     /// The already-classified variants are NOT double-logged: their

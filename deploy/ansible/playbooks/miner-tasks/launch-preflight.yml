@@ -7,8 +7,9 @@
 # fail every tenant launch at `virsh start` (`dispatch-failed`,
 # `libvirt-driver/create`). The probe (files/launch-preflight-probe.sh)
 # looks at what a tenant domain adds — the `default` network and its
-# nwfilter, QEMU's access to the disk roots, O_DIRECT there, the agent's
-# sandbox — and starts a paused smoke domain; the verdict is
+# nwfilter, QEMU's access to the disk roots, O_DIRECT there, symlinks on
+# the way, the agent's sandbox — and starts a paused smoke domain laid out
+# like a golden tenant (AppArmor denials named if it fails); the verdict is
 # filter_plugins/launch_preflight.py (tests/test_launch_preflight.py).
 #
 # Inputs: `miner_launch_probe_script` (the probe's path on the controller),
@@ -28,6 +29,7 @@
       --staging-root {{ (miner_agent.state_dir ~ '/staging') | quote }}
       --unit {{ miner_agent.systemd_unit_name | quote }}
       --config {{ miner_agent.config_path | quote }}
+      --ovmf {{ miner_tenant_ovmf_path | quote }}
       {{ '' if ansible_check_mode else '--write' }}
       {{ '--smoke' if (miner_launch_smoke_enabled | bool) and not ansible_check_mode else '' }}
       --smoke-timeout {{ miner_launch_smoke_timeout_s | int }}
@@ -43,12 +45,18 @@
   ansible.builtin.set_fact:
     miner_lpf: >-
       {{ (miner_launch_probe_canned | default(miner_launch_probe.stdout | default('')))
-         | miner_launch_preflight({'unit_name': miner_agent.systemd_unit_name}) }}
+         | miner_launch_preflight({'unit_name': miner_agent.systemd_unit_name,
+                                   'state_dir': miner_agent.state_dir}) }}
 
 - name: Report the tenant-launch preflight verdict
   # One machine-readable line for the operator dashboard / backend.
   ansible.builtin.debug:
     msg: "HIPPIUS_LAUNCH_PREFLIGHT {{ miner_lpf.summary | to_json }}"
+
+- name: Report the tenant-launch preflight warnings
+  ansible.builtin.debug:
+    msg: "{{ miner_lpf.warnings | map('miner_preflight_line', 'WARN') | list }}"
+  when: miner_lpf.warnings | length > 0
 
 - name: Preview the tenant-launch refusals (--check)
   ansible.builtin.debug:

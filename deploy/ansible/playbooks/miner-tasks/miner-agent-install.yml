@@ -633,6 +633,10 @@
       RestartSec=10
       User=root
       Group=root
+      # Explicit, so a host DefaultUMask cannot shut QEMU's user out of
+      # the per-VM dirs the agent creates (play 09: AGENT_UMASK_BLOCKS_QEMU).
+      # Secret files set their own mode.
+      UMask=0022
 
       # Hardening — a root service kept on a tight leash. The agent
       # reaches libvirt over its UNIX socket and Hippius S3 over the

@@ -324,10 +324,23 @@ def _strikes() -> list[tuple[str, str]]:
 
 @CEILING_ON
 def test_an_at_floor_fault_lands_one_strike_per_incident() -> None:
-    _row(earned_vms=4, earned_vcpus=8, earned_memory_mb=32768)
+    _row(earned_vms=4, earned_vcpus=8, earned_memory_mb=32768, cvm_last_ok_at=timezone.now())
     for _ in range(3):
         assert not capacity_earn.record_event(NODE, capacity_earn.START_FAILED, incident="vm=vm-1")
     assert _strikes() == [("event:start-failed", "start-failed vm=vm-1")]
+
+
+@CEILING_ON
+def test_no_strike_before_the_first_successful_start() -> None:
+    """Claim: probation — a host that has never started a CVM is still
+    onboarding; its at-floor start failures lower nothing and strike
+    nothing. The first success ends probation."""
+    _row(earned_vms=4, earned_vcpus=8, earned_memory_mb=32768)
+    capacity_earn.record_event(NODE, capacity_earn.START_FAILED, incident="vm=vm-1")
+    assert _strikes() == []
+    MinerCapacity.objects.filter(miner_node_id=NODE).update(cvm_last_ok_at=timezone.now())
+    capacity_earn.record_event(NODE, capacity_earn.START_FAILED, incident="vm=vm-2")
+    assert _strikes() == [("event:start-failed", "start-failed vm=vm-2")]
 
 
 def test_flag_off_no_strike() -> None:
