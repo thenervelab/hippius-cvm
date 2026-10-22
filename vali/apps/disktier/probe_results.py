@@ -26,7 +26,8 @@ OS target's: `verified`, or `failed` with the reason — `suspect-cache`, the
 guest's target error code (`io-error`, `precondition-incomplete`, ...),
 `malformed-metrics`, `profile-mismatch`, or `targets-mismatch` when the
 result does not cover exactly the requested slots. A dedicated (`d1`)
-target's verdict is stored only: its disk state machine is R3.
+target's verdict is stored here; the disk takes it once the probe VM is
+gone (`dedicated_probe.settle`, R3).
 
 Nothing here touches a pool, a dedicated disk, a cordon, placement or
 rewards. The VM is torn down later by the orchestrator tick, after its
@@ -38,6 +39,7 @@ import hmac
 import logging
 from datetime import datetime, timedelta
 
+from django.conf import settings
 from django.utils import timezone
 
 from apps.telemetry.verifier import DiskProbeResult, DiskProbeTarget
@@ -50,11 +52,20 @@ log = logging.getLogger("apps.disktier.probe_results")
 _ROUTABLE = (ProbeRunState.LAUNCHING, ProbeRunState.RUNNING)
 
 
+def routing_on() -> bool:
+    """Results are routed to their runs while either probe runs: pools
+    (`VALI_DISK_PROBE_ENABLED`) or dedicated disks
+    (`VALI_DEDICATED_PROBE_ENABLED`, R3)."""
+    return bool(settings.VALI_DISK_PROBE_ENABLED) or bool(
+        getattr(settings, "VALI_DEDICATED_PROBE_ENABLED", False)
+    )
+
+
 def record_unverified(probe: DiskProbeResult, *, vm_id: str, receipt_digest: str) -> None:
-    """While the probe orchestrator is off: note that a receipt carried a
-    probe result. Nothing else."""
+    """While both probes are off: note that a receipt carried a probe
+    result. Nothing else."""
     log.info(
-        "disk_probe result seen, not routed (VALI_DISK_PROBE_ENABLED off): "
+        "disk_probe result seen, not routed (both probe switches off): "
         "vm=%s run=%s targets=%d receipt=%s",
         vm_id,
         probe.run_id_hex,
@@ -139,7 +150,8 @@ def route(
     if extra:
         failure = "targets-mismatch"
     elif os_entry is None:
-        # Only a dedicated-disk run (R3) has no OS target; none exist yet.
+        # A dedicated-disk run (R3) has no OS target: its summary is the first
+        # failing disk; each disk takes its own verdict (`dedicated_probe.settle`).
         failure = next((t["verdict_detail"] for t in targets if t["verdict_detail"]), "")
     else:
         failure = os_entry["verdict_detail"]
@@ -153,6 +165,9 @@ def route(
         "kernel": probe.kernel,
         "started_at": probe.started_at,
         "finished_at": probe.finished_at,
+        # Slots the result carried that the run never asked: no disk of such
+        # a result is graded (`dedicated_probe.verdict_for`).
+        **({"extra_slots": extra} if extra else {}),
     }
     run.result_digest = receipt_digest
     run.result_at = now

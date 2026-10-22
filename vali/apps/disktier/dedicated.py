@@ -35,7 +35,7 @@ from typing import Any
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, QuerySet
+from django.db.models import F, Q, QuerySet
 from django.utils import timezone
 
 from .models import (
@@ -210,6 +210,17 @@ def parse_request(raw: object) -> DedicatedRequest:
     return DedicatedRequest(tier=tier, count=count, min_size_gb=size)
 
 
+def not_offered(*, tenant_id: str, user_id: str) -> str:
+    """Why dedicated disks are not sold to this owner (`""` when they are):
+    the feature is off, or an allowlist is set and names neither id."""
+    if not enabled():
+        return "dedicated_disks is not offered on this validator"
+    owners = allowed_owners()
+    if owners and not ({tenant_id, user_id} & owners):
+        return "dedicated_disks is not offered to this owner"
+    return ""
+
+
 def check_launch(
     raw: object,
     *,
@@ -225,13 +236,9 @@ def check_launch(
     nothing else; then the body (400); then the conflicts (409).
     `guest_release` is the blessed guest release of the launched image
     (`None` for a launch that is not by image)."""
-    if not enabled():
-        raise DedicatedError(
-            "dedicated_disks is not offered on this validator", CATEGORY_NOT_OFFERED
-        )
-    owners = allowed_owners()
-    if owners and not ({tenant_id, user_id} & owners):
-        raise DedicatedError("dedicated_disks is not offered to this owner", CATEGORY_NOT_OFFERED)
+    why = not_offered(tenant_id=tenant_id, user_id=user_id)
+    if why:
+        raise DedicatedError(why, CATEGORY_NOT_OFFERED)
     request = parse_request(raw)
     if pinned_ack is not True:
         raise DedicatedError(
@@ -299,6 +306,10 @@ def qualifying(request: DedicatedRequest, *, now: datetime | None = None) -> Que
     heartbeat."""
     now = now or timezone.now()
     return DedicatedDisk.objects.filter(
+        # R3: a disk a VM held before (its probe VM, every time) is placeable
+        # only on a report newer than that hold's end — the agent's report
+        # after its release wipe, never one from before.
+        Q(freed_at__isnull=True) | Q(reported_at__gt=F("freed_at")),
         state=DedicatedDiskState.FREE,
         desired_state=DedicatedDiskDesiredState.ACTIVE,
         verified_tier__in=_tiers_at_least(request.tier),
@@ -307,6 +318,7 @@ def qualifying(request: DedicatedRequest, *, now: datetime | None = None) -> Que
         size_bytes__gte=F("verified_size_bytes"),
         reported_state="free",
         reported_vm_id="",
+        reported_error="",
         reported_at__gte=now - REPORT_MAX_AGE,
     )
 
@@ -686,6 +698,28 @@ def read_back(vm: Any, *, os_disk: tuple[int, str] | None = None) -> dict[str, A
     return read_back_many([vm], os_disks={vm.pk: os_disk} if os_disk else None).get(vm.pk, {})
 
 
+def milliunits_per_gb() -> int:
+    return int(getattr(settings, "VALI_DEDICATED_MILLIUNITS_PER_GB", 0) or 0)
+
+
+def payable_gb(vm_id: str) -> int:
+    """GiB of `vm_id`'s dedicated slots its host is paid for right now: the
+    size classes of the slots whose state is `attached` — on positive HOST
+    evidence only (`_held_slot_state`: the agent's fresh report that it holds
+    the disk for this VM at its probed size); every other slot is withheld.
+    The guest's own (forgeable) claim never withholds anything."""
+    from apps.lifecycle.models import Vm, VmState
+
+    vm = Vm.objects.filter(vm_id=vm_id).first()
+    if vm is None:
+        return 0
+    rows = _rows_by_vm([vm]).get(vm.pk, [])
+    destroyed = vm.state == VmState.DESTROYED
+    return sum(
+        row.size_gb for row in rows if _slot_state(row, vm, destroyed=destroyed) == SLOT_ATTACHED
+    )
+
+
 def _os_disk_of(vm_id: str) -> tuple[int, str]:
     """`(size_gb, tier)` of the VM's OS disk as sold: its data disk and its
     OS-disk tier, from its launch record."""
@@ -710,8 +744,12 @@ def is_pinned(vm: Any) -> bool:
         return True
     from apps.scheduler.service import _launch_spec
 
+    spec = _launch_spec(vm.vm_id)
+    if spec.get("probe_extra_disks"):
+        # A dedicated-disk probe VM (R3): its disks never follow it elsewhere.
+        return True
     try:
-        return spec_request(_launch_spec(vm.vm_id)) is not None
+        return spec_request(spec) is not None
     except ValueError:
         return True
 
@@ -748,8 +786,13 @@ def release_for_destroyed_vm(vm: Any) -> int:
     probe. Idempotent. Returns how many disks were released."""
     now = timezone.now()
     with transaction.atomic():
+        holding = list(
+            DedicatedDisk.objects.select_for_update().filter(
+                assigned_vm=vm, state=DedicatedDiskState.ASSIGNED
+            )
+        )
         released = DedicatedDisk.objects.filter(
-            assigned_vm=vm, state=DedicatedDiskState.ASSIGNED
+            pk__in=[d.pk for d in holding], state=DedicatedDiskState.ASSIGNED
         ).update(
             state=DedicatedDiskState.RELEASED,
             assigned_vm=None,
@@ -757,6 +800,14 @@ def release_for_destroyed_vm(vm: Any) -> int:
             freed_at=now,
             updated_at=now,
         )
+        for disk in holding:
+            audit_transition(
+                disk,
+                before=DedicatedDiskState.ASSIGNED,
+                after=DedicatedDiskState.RELEASED,
+                reason="vm-destroyed",
+                detail={"vm_id": vm.vm_id},
+            )
         held = PlacementDisk.objects.filter(placement__vm=vm, kind=DiskKind.DEDICATED).values_list(
             "dedicated_disk_id", flat=True
         )
@@ -790,7 +841,7 @@ def reconcile_released(node_id: str, now: datetime) -> int:
         ).values("assigned_vm")
     ):
         release_for_destroyed_vm(vm)
-    return DedicatedDisk.objects.filter(
+    wiped = DedicatedDisk.objects.filter(
         miner_node_id=node_id,
         state=DedicatedDiskState.RELEASED,
         reported_state="free",
@@ -798,7 +849,51 @@ def reconcile_released(node_id: str, now: datetime) -> int:
         reported_error="",
         freed_at__isnull=False,
         reported_at__gt=F("freed_at"),
-    ).update(state=DedicatedDiskState.PENDING_PROBE, updated_at=now)
+    )
+    moved = 0
+    for disk in wiped:
+        if DedicatedDisk.objects.filter(pk=disk.pk, state=DedicatedDiskState.RELEASED).update(
+            state=DedicatedDiskState.PENDING_PROBE, updated_at=now
+        ):
+            moved += 1
+            audit_transition(
+                disk,
+                before=DedicatedDiskState.RELEASED,
+                after=DedicatedDiskState.PENDING_PROBE,
+                reason="wiped-and-free",
+            )
+    return moved
+
+
+# ── the audit trail (design §4.3) ────────────────────────────────────
+
+#: Who every automatic dedicated-disk state change is attributed to.
+AUDIT_ACTOR = "disk-tier"
+#: The `MinerCapacityAudit.field` of a dedicated disk's state change (the
+#: disk id rides in `before` / `after`: it does not fit the field).
+AUDIT_FIELD = "dedicated_disk_state"
+
+
+def audit_transition(
+    disk: DedicatedDisk,
+    *,
+    before: str,
+    after: str,
+    reason: str,
+    detail: Mapping[str, Any] | None = None,
+) -> None:
+    """One `MinerCapacityAudit` row for one disk's state change (actor
+    `disk-tier`), written by the caller's transaction when it has one."""
+    from apps.scheduler.models import MinerCapacityAudit
+
+    MinerCapacityAudit.objects.create(
+        miner_node_id=disk.miner_node_id,
+        actor=AUDIT_ACTOR,
+        field=AUDIT_FIELD,
+        before={"disk_id": disk.disk_id, "state": str(before)},
+        after={"disk_id": disk.disk_id, "state": str(after), **dict(detail or {})},
+        reason=reason[:512],
+    )
 
 
 # ── the receipt's slot verdicts ──────────────────────────────────────

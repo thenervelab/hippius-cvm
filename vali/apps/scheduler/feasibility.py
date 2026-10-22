@@ -67,11 +67,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.disktier import os_tier
+from apps.disktier.dedicated import DedicatedRequest
 from apps.orchestration.services import flavors
 
 from . import capacity, capacity_config, chain, service
-from .placement import PlacementError, decide_placement
+from .placement import (
+    NO_DEDICATED_CAPACITY,
+    NO_HOST_FITS_DISKS,
+    PlacementError,
+    decide_placement,
+)
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,21 @@ class Feasibility:
     #: (`fits`), weakest first: `earned`, `declared+earned`, `trusted` (all
     #: anchored); `""` when nothing fits.
     capacity_source: str = ""
+    #: The dedicated-disk answer (E4 contract §4) when the question named
+    #: dedicated disks: `{tier, count, min_size_gb, placeable,
+    #: max_count_at_size}`. `None` otherwise (the view then leaves the key
+    #: out: the answer is the one before dedicated disks existed).
+    dedicated: dict[str, object] | None = None
+
+
+def _dedicated_block(
+    request: DedicatedRequest, *, placeable: bool, max_count_at_size: int
+) -> dict[str, object]:
+    return {
+        **request.as_spec(),
+        "placeable": placeable,
+        "max_count_at_size": max_count_at_size,
+    }
 
 
 def _disk_fields(disk: capacity.DiskBudget, state: str) -> dict[str, object]:
@@ -333,6 +355,7 @@ def assess(
     user_id: str = "",
     region: str = "",
     os_disk_tier: str | None = None,
+    dedicated: DedicatedRequest | None = None,
 ) -> Feasibility:
     """Answer "could a VM of `flavor` be placed right now?". Read-only.
 
@@ -352,6 +375,13 @@ def assess(
     when it is not sold, and, gate (n) enforced, `never` / `no-miner-at-tier`
     when no counted host has an OS pool at it at all.
 
+    `dedicated` (a valid request, or `None`: the question as before
+    dedicated disks) asks for a VM with dedicated disks (E4 contract §4):
+    `never` / `dedicated-disks-not-offered` when they are not sold to this
+    owner; otherwise the scheduler is asked with gate (o), and the answer
+    carries `dedicated: {…, placeable, max_count_at_size}`, a not-placeable
+    one reading `not-now` / `no-dedicated-capacity` or `no-host-fits-disks`.
+
     Raises `flavors.UnknownFlavor` for a flavor outside the catalogue —
     the caller asked about something that does not exist, which is a
     different thing from "cannot place" and must not be flattened into
@@ -361,7 +391,19 @@ def assess(
     region = region.strip().upper()
     offered = flavors.is_offered(flavor)
     tier_why = os_tier.not_offered(os_disk_tier, flavor) if os_disk_tier and offered else ""
-    if not offered or tier_why:
+    dedicated_why = (
+        disk_dedicated.not_offered(tenant_id=tenant_id, user_id=user_id)
+        if dedicated is not None and offered and not tier_why
+        else ""
+    )
+    # Every answer that names dedicated disks carries their block; the early
+    # ones cannot place them.
+    unplaceable = (
+        _dedicated_block(dedicated, placeable=False, max_count_at_size=0)
+        if dedicated is not None
+        else None
+    )
+    if not offered or tier_why or dedicated_why:
         # Not for sale, whatever the hardware could hold — the answer that
         # must stop a sale, so `never`, and before any chain read: the
         # verdict does not depend on the fleet.
@@ -374,10 +416,17 @@ def assess(
             cpu_count=size.cpu_count,
             memory_mb=size.memory_mb,
             data_disk_size_gb=size.data_disk_size_gb,
-            reason="disk-tier-not-offered" if tier_why else "flavor-not-offered",
-            scheduler_error=tier_why,
+            reason=(
+                "flavor-not-offered"
+                if not offered
+                else "disk-tier-not-offered"
+                if tier_why
+                else disk_dedicated.CATEGORY_NOT_OFFERED
+            ),
+            scheduler_error=tier_why or dedicated_why,
             region=region,
             os_disk_tier=os_disk_tier,
+            dedicated=unplaceable,
         )
 
     try:
@@ -400,6 +449,7 @@ def assess(
             scheduler_error=str(exc),
             region=region,
             os_disk_tier=os_disk_tier,
+            dedicated=unplaceable,
         )
 
     service.refresh_miner_capacity(snapshot)
@@ -480,6 +530,7 @@ def assess(
                 shadow_log=False,
                 budgets=budgets,
                 os_disk_tier=os_disk_tier or "",
+                dedicated=dedicated,
             ),
         )
         scheduler_ok = True
@@ -554,6 +605,25 @@ def assess(
     else:
         verdict, reason = "yes", ""
 
+    block = None
+    if dedicated is not None:
+        # Per counted host, every free disk the request could take (its
+        # count aside); the most of them on one host that fits the VM.
+        free = disk_dedicated.free_counts(
+            DedicatedRequest(dedicated.tier, 1, dedicated.min_size_gb),
+            [h.node_id for h in hosts],
+        )
+        on_fitting = max((free.get(h.node_id.lower(), 0) for h in fitting), default=0)
+        placeable = scheduler_ok and on_fitting >= dedicated.count
+        if verdict == "yes" and not placeable:
+            verdict = "not-now"
+            reason = (
+                NO_DEDICATED_CAPACITY
+                if max(free.values(), default=0) < dedicated.count
+                else NO_HOST_FITS_DISKS
+            )
+        block = _dedicated_block(dedicated, placeable=placeable, max_count_at_size=on_fitting)
+
     return Feasibility(
         flavor=flavor,
         verdict=verdict,
@@ -574,6 +644,7 @@ def assess(
         region=region,
         os_disk_tier=os_disk_tier,
         capacity_source=_weakest_source(fitting),
+        dedicated=block,
     )
 
 
@@ -596,6 +667,7 @@ def assess_catalogue(
     user_id: str = "",
     region: str = "",
     os_disk_tier: str | None = None,
+    dedicated: DedicatedRequest | None = None,
 ) -> list[Feasibility]:
     """[`assess`] for every catalogue flavor — the "what can I sell right
     now" board, in catalogue order."""
@@ -606,6 +678,7 @@ def assess_catalogue(
             user_id=user_id,
             region=region,
             os_disk_tier=os_disk_tier,
+            dedicated=dedicated,
         )
         for name in flavors.FLAVOR_NAMES
     ]

@@ -49,7 +49,7 @@ from apps.telemetry.verifier import DeclaredStorage, DiskIoDelta, ServedReceiptF
 if TYPE_CHECKING:
     from apps.scheduler.models import Placement
 
-from . import dedicated, probe_results
+from . import dedicated, dedicated_probe, probe_results
 from .models import (
     OS_SLOT,
     DedicatedDisk,
@@ -157,6 +157,10 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
         # released that the agent now reports wiped and free waits for a
         # probe (`pending_probe`), never straight back to `free`.
         dedicated.reconcile_released(node_id, now)
+        # R3: a disk on sale or awaiting a probe that the agent reports with
+        # an on-disk signature after its wipe goes back to `released`, and
+        # alerts (`dedicated_probe.reconcile_signatures`).
+        dedicated_probe.reconcile_signatures(node_id, now)
 
         # The revision of the vali-pushed document the agent has in force
         # (0 = its local config): the storage-config sync status and drift
@@ -269,7 +273,7 @@ _COUNTER_NAMES = (
     # another miner (a §25 move inside the hour).
     "rejected_counters",
     "straddled_move",
-    # `disk_probe` results seen (routed while VALI_DISK_PROBE_ENABLED, else
+    # `disk_probe` results seen (routed while either probe switch is on, else
     # only logged), and what routing concluded (`probe_results.route`).
     "probe_results",
     "probe_accepted",
@@ -308,7 +312,7 @@ def flush_counters_safe() -> dict[str, int]:
     ingest is on) and return them for the caller's log line. Never raises:
     a lost tally is logged, the receipt ingest goes on."""
     drained = drain_counters()
-    if not drained or not (settings.VALI_DISK_IO_INGEST or settings.VALI_DISK_PROBE_ENABLED):
+    if not drained or not (settings.VALI_DISK_IO_INGEST or probe_results.routing_on()):
         return drained
     try:
         with transaction.atomic():
@@ -436,10 +440,10 @@ def on_verified_receipt(
     path use `on_verified_receipt_safe`.
 
     Two switches: `VALI_DISK_IO_INGEST` folds `disk_io`;
-    `VALI_DISK_PROBE_ENABLED` routes `disk_probe` to its run
+    `VALI_DISK_PROBE_ENABLED` or `VALI_DEDICATED_PROBE_ENABLED` routes `disk_probe` to its run
     (`probe_results.route`), whichever the other is."""
     io_on = bool(settings.VALI_DISK_IO_INGEST)
-    probe_on = bool(settings.VALI_DISK_PROBE_ENABLED) and fields.disk_probe is not None
+    probe_on = probe_results.routing_on() and fields.disk_probe is not None
     # E4: the guest's verdict on each dedicated slot (the VM status's
     # informational `guest_state`), recorded with either switch on. Pure until then.
     verdicts = dedicated.slot_verdicts(fields.disk_io)

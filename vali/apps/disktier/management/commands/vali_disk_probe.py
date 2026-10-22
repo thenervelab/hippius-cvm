@@ -18,8 +18,9 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
-from apps.disktier import probe
+from apps.disktier import dedicated_probe, probe
 from apps.synthetic import metrics
 
 _NODE_ID_RE = re.compile(r"[0-9a-f]{64}")
@@ -58,11 +59,24 @@ class Command(BaseCommand):
             f"refused={report.refused} transitions={dict(report.transitions)} "
             f"torn_down={report.torn_down} forced={report.forced} skipped={dict(report.skipped)}"
         )
-        if not report.enabled:
+        self.stdout.write(
+            f"dedicated probe: enabled={report.dedicated_enabled} due={report.dedicated_due} "
+            f"launched={report.dedicated_launched} refused={report.dedicated_refused} "
+            f"settled={dict(report.dedicated_settled)} skipped={dict(report.dedicated_skipped)}"
+        )
+        if not report.enabled and not report.dedicated_enabled:
             # Nothing pushed: the alert rules key on a fresh push with
-            # `hippius_disk_probe_enabled == 1`, so they stay silent.
+            # `hippius_disk_probe_enabled == 1` (pools) or
+            # `hippius_dedicated_probe_enabled == 1` (R3), so they stay silent.
             return
-        ms = probe.report_metrics(report)
+        if report.enabled:
+            ms = probe.report_metrics(report)
+        else:
+            # Dedicated disks only: the pool series stay out of the push (and
+            # `hippius_disk_probe_enabled` 0 keeps the pool alerts silent).
+            ms = probe.base_metrics(report)
+        if report.dedicated_enabled:
+            dedicated_probe.report_metrics(ms, report, now=timezone.now())
         if opts["no_push"]:
             self.stdout.write(ms.render())
             return

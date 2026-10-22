@@ -1069,6 +1069,11 @@ class VmBillingBinding(models.Model):
     #: what its miner's units are scaled by under
     #: `VALI_DISK_TIER_UNIT_FACTOR`. Never read off a receipt.
     os_disk_tier = models.CharField(max_length=8, default="nvme", db_default="nvme")
+    #: The dedicated disks vali provisioned for the VM (E4), as the sum of
+    #: their size classes (GiB) at launch: the most its miner is ever paid
+    #: dedicated units for (`VALI_DEDICATED_MILLIUNITS_PER_GB`). 0 for every
+    #: VM without dedicated disks. Never read off a receipt.
+    dedicated_gb = models.PositiveIntegerField(default=0, db_default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

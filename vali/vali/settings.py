@@ -2748,6 +2748,58 @@ if VALI_DEDICATED_MIN_GUEST_RELEASE is not None and VALI_DEDICATED_MIN_GUEST_REL
 # The oldest agent release (`vYYYY.MM.DD[.N]`) that takes `extra_disks` on its
 # launch order. Empty = no node qualifies; `*` = any agent (test hosts only).
 VALI_DEDICATED_MIN_AGENT_VERSION = os.environ.get("VALI_DEDICATED_MIN_AGENT_VERSION", "").strip()
+# R3 — the dedicated-disk probe (`apps.disktier.dedicated_probe`, design
+# §3.3, §5.2): a `pending_probe` disk becomes `free` only through a passing
+# d1 verdict. Its own switch, independent of VALI_DISK_PROBE_ENABLED (pool
+# probing stays off while this runs); the `vali_disk_probe` tick (CronJob
+# `disktier-probe`) drives both. Off ⇒ nothing is launched for a dedicated
+# disk; runs already in flight are still settled and torn down.
+VALI_DEDICATED_PROBE_ENABLED = _env_bool("VALI_DEDICATED_PROBE_ENABLED", False)
+# Chain node ids whose dedicated disks may be probed (the canary). Empty =
+# none; `*` = every node.
+VALI_DEDICATED_PROBE_MINERS = [m.lower() for m in _env_list("VALI_DEDICATED_PROBE_MINERS")]
+# The guest's wait before any I/O, random in [MIN, MAX] (s). Shorter than the
+# pool probe's 6-48 h: a disk under probe is one the miner just declared or
+# got back, so the probe cannot be hidden from it, and no tenant shares the
+# disk (nothing to un-throttle for).
+VALI_DEDICATED_PROBE_START_DELAY_MIN_S = _env_int("VALI_DEDICATED_PROBE_START_DELAY_MIN_S", 120)
+VALI_DEDICATED_PROBE_START_DELAY_MAX_S = _env_int("VALI_DEDICATED_PROBE_START_DELAY_MAX_S", 900)
+if not (
+    0
+    <= VALI_DEDICATED_PROBE_START_DELAY_MIN_S
+    <= VALI_DEDICATED_PROBE_START_DELAY_MAX_S
+    <= 259200
+):
+    raise RuntimeError(
+        "0 <= VALI_DEDICATED_PROBE_START_DELAY_MIN_S <= VALI_DEDICATED_PROBE_START_DELAY_MAX_S "
+        "<= 259200 is required"
+    )
+# A disk whose probe attempt ended without a verdict (launch refused or
+# failed, timeout, the guest could not measure it) waits RETRY_S × 2^(n-1),
+# capped at RETRY_MAX_S, before the next one; it is never `free` meanwhile.
+VALI_DEDICATED_PROBE_RETRY_S = _env_int("VALI_DEDICATED_PROBE_RETRY_S", 1800)
+VALI_DEDICATED_PROBE_RETRY_MAX_S = _env_int("VALI_DEDICATED_PROBE_RETRY_MAX_S", 86400)
+# A dedicated run's verdict window after its start delay: one guest target
+# budget per disk (the d1 target budget, 30 min, plus the 60 s cleanup grace
+# of an aborted target; binaries/agent-disk-probe) plus a margin for boot,
+# receipt and routing — so an 8-disk run with one hanging disk still gets
+# its result instead of timing out wholesale.
+VALI_DEDICATED_PROBE_TARGET_BUDGET_S = _env_int("VALI_DEDICATED_PROBE_TARGET_BUDGET_S", 1860)
+VALI_DEDICATED_PROBE_MARGIN_S = _env_int("VALI_DEDICATED_PROBE_MARGIN_S", 3600)
+# The lowest blessed guest release of the probe image dedicated probing
+# needs, on top of the pool probe's floor: 7 (the probe closes the
+# initramfs opener's slot mapping, #1764, and reports the measured size,
+# #1766). Below it a dedicated run could never pass.
+VALI_DEDICATED_PROBE_MIN_GUEST_RELEASE = _env_int("VALI_DEDICATED_PROBE_MIN_GUEST_RELEASE", 7)
+if VALI_DEDICATED_PROBE_MIN_GUEST_RELEASE < 7:
+    raise RuntimeError("VALI_DEDICATED_PROBE_MIN_GUEST_RELEASE must be at least 7")
+# Miner pay for dedicated disks (design §8): resource units per served
+# second, in thousandths, per GiB of a dedicated slot's size class — added to
+# the VM's units for each slot the host still serves (only a slot the agent
+# freshly reports holding for the VM: every other slot is withheld). 0 = off: epoch weights are byte
+# for byte what they were. An operator sets it so a disk's units are
+# proportional to its revenue next to the VM's.
+VALI_DEDICATED_MILLIUNITS_PER_GB = _env_nonneg_int("VALI_DEDICATED_MILLIUNITS_PER_GB", 0)
 # ── Live storage move (`apps.disktier.storage_move`): a running VM's OS disk
 # moves to another pool of its host, no downtime. ALL DARK by default: off,
 # no miner selected, and no agent version good enough. Turning it OFF stops

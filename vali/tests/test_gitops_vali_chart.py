@@ -1263,6 +1263,44 @@ def test_the_disk_probe_alerts_cannot_fire_while_the_probe_is_off() -> None:
     assert not [d for d in off if d["metadata"].get("name") == "hippius-disktier-probe"]
 
 
+@_needs_helm
+def test_the_dedicated_probe_ships_off_and_its_alerts_cannot_fire_while_off() -> None:
+    """R3: VALI_DEDICATED_PROBE_ENABLED renders "false" by default, its
+    miner allowlist and the shared probe identity only when set (no
+    VALI_DISK_* key by default), and every dedicated alert is guarded on a
+    fresh push with `hippius_dedicated_probe_enabled == 1`."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    assert data["VALI_DEDICATED_PROBE_ENABLED"] == "false"
+    assert "VALI_DEDICATED_PROBE_MINERS" not in data
+    assert not [k for k in data if k.startswith("VALI_DISK_PROBE")]
+    (rule,) = [
+        d
+        for d in docs
+        if d.get("kind") == "PrometheusRule"
+        and d["metadata"]["name"] == "hippius-dedicated-probe"
+    ]
+    alerts = {r["alert"]: r["expr"] for g in rule["spec"]["groups"] for r in g["rules"]}
+    assert set(alerts) == {"DedicatedDiskSignatureAfterWipe", "DedicatedDiskProbeFailing"}
+    for name, expr in alerts.items():
+        assert "and on() (hippius_dedicated_probe_enabled == 1)" in expr, name
+        assert "time() - hippius_disk_probe_push_timestamp_seconds < 3600" in expr, name
+    on = _configmap_data(
+        _docs(
+            "--set", "dedicatedDisks.probe.enabled=true",
+            "--set", "dedicatedDisks.probe.miners=" + "ab" * 32,
+            "--set", "disktierProbe.owners=4242:5Grw",
+            "--set", "disktierProbe.minGuestRelease=7",
+        )
+    )
+    assert on["VALI_DEDICATED_PROBE_ENABLED"] == "true"
+    assert on["VALI_DEDICATED_PROBE_MINERS"] == "ab" * 32
+    assert on["VALI_DISK_PROBE_OWNERS"] == "4242:5Grw"
+    assert on["VALI_DISK_PROBE_MIN_GUEST_RELEASE"] == "7"
+    # Pool probing keeps its code default (off): no chart key turns it on.
+    assert "VALI_DISK_PROBE_ENABLED" not in on
+
+
 def test_the_stale_threshold_clears_the_longest_healthy_gap() -> None:
     """A healthy node's next verified probe can land period + jitter +
     start delay + timeout + linger after its last one; `DiskProbeStale`

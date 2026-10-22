@@ -1187,14 +1187,29 @@ storageMove:
 #   is also never upgraded or initrd-swapped below it.
 # - minAgentVersion: the oldest agent release that takes `extra_disks`;
 #   empty = no node qualifies.
+# - milliunitsPerGb: miner pay for dedicated disks (design §8), resource
+#   units per served second in thousandths per GiB of a served slot's size
+#   class. Empty / "0" = off: epoch weights unchanged.
 # Flip together with the backend's COMPUTE_DEDICATED_ENABLED, after the
 # internal end-to-end test.
 dedicatedDisks:
   enabled: "false"
   allowedOwners: ""
   maxPerVm: ""
-  minGuestRelease: "6"
-  minAgentVersion: ""
+  minGuestRelease: "7"
+  minAgentVersion: "v2026.10.22.1"
+  # R3, the dedicated-disk probe (apps.disktier.dedicated_probe): a declared
+  # or released disk becomes `free` only through a passing d1 verdict. Its
+  # own switch (pool probing stays off); driven by the `disktier-probe`
+  # CronJob, which must be unsuspended for it to run. `miners`: comma-
+  # separated chain node ids (the canary), `*` = every node, empty = none.
+  # Also needs `disktierProbe.owners` / `.minGuestRelease` (the probe VM's
+  # identity and image floor: guest release 7, whose probe closes the
+  # initramfs opener's slot mapping).
+  probe:
+    enabled: "false"
+    miners: ""
+  milliunitsPerGb: ""
 # §18.10 host inventory ingest (`apps.disktier.host_inventory`): the
 # Edge-relayed, miner-signed `POST /v1/telemetry/host-inventory` (web pod,
 # the only reader of the flag). UNTRUSTED, shown to the node owner only;
@@ -1243,6 +1258,11 @@ agentReleaseWatch:
 disktierProbe:
   enabled: "true"
   suspend: true
+  # The probe owners (`<numeric user id>:<SS58>`, comma-separated) and the
+  # lowest blessed guest release of the probe image. Empty = the settings.py
+  # defaults (none, 0): nothing launches, whichever probe switch is on.
+  owners: ""
+  minGuestRelease: ""
   schedule: "7,22,37,52 * * * *"
   activeDeadlineSeconds: 840
   resources:
@@ -1264,6 +1284,9 @@ disktierProbe:
     staleDays: 12
     # DiskProbeFailing: this many failed / timed-out runs in a row.
     failingRuns: 2
+    # DedicatedDiskProbeFailing (R3): this many probe attempts in a row
+    # without a verdict for one pending dedicated disk.
+    dedicatedFailingAttempts: 3
 
 postgres:
   # Postgres 16 — pinned by digest.
