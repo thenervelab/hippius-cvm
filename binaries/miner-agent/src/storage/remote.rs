@@ -464,6 +464,9 @@ pub struct StorageConfigService {
     identities: Arc<dedicated::IdentityStore>,
     /// One order at a time: two cannot both pass the revision check.
     lock: Mutex<()>,
+    /// The dedicated-disk claim lock ([`super::assignment::DedicatedDisks::
+    /// assignment_lock`]), held from the check of held disks to the commit.
+    assignment_lock: Arc<Mutex<()>>,
     /// Taken by the route before it starts a blocking worker, so a burst
     /// of orders waits here instead of filling the blocking pool.
     gate: tokio::sync::Mutex<()>,
@@ -482,8 +485,21 @@ impl StorageConfigService {
             host,
             identities,
             lock: Mutex::new(()),
+            assignment_lock: Arc::default(),
             gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Share the lifecycle's dedicated-disk claim lock.
+    pub fn with_assignment_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.assignment_lock = lock;
+        self
+    }
+
+    fn assignments(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.assignment_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// See [`Self::accept`]: hold it across the blocking call.
@@ -520,6 +536,8 @@ impl StorageConfigService {
             }
             // A dry run judges the document, not its place in the
             // revision sequence, and touches nothing.
+            let _assignments = self.assignments();
+            self.check_assigned_kept(&order)?;
             let candidate = self.validate_pools(&order)?;
             if has_disks {
                 let mut ids = self.identities.lock();
@@ -550,6 +568,10 @@ impl StorageConfigService {
         if has_disks {
             self.host.facts.refresh();
         }
+        // No dedicated disk is claimed between this check of the held ones
+        // and the new set in force (a launch claims under the same lock).
+        let _assignments = self.assignments();
+        self.check_assigned_kept(&order)?;
         let candidate = self.validate_pools(&order)?;
         // The identity lock only for a document that binds disks: a hung
         // disk read in the heartbeat must not hold up pool-only changes.
@@ -728,6 +750,19 @@ impl StorageConfigService {
         Ok(candidate)
     }
 
+    /// A dedicated disk a VM holds (or §24 freed and is not wiped yet)
+    /// stays declared: only `draining` may change (`disk-assigned`).
+    fn check_assigned_kept(&self, doc: &StorageConfigOrder) -> Outcome<()> {
+        let owners = super::assignment::owners(&self.local.state_root)
+            .map_err(|_| StorageConfigError::Store("assignments"))?;
+        for disk_id in owners.keys() {
+            if !doc.dedicated_disks.iter().any(|d| &d.id == disk_id) {
+                return Err(disk("disk-assigned", disk_id));
+            }
+        }
+        Ok(())
+    }
+
     /// The inventory of the document's active dedicated disks against the
     /// pools it declares. `identities` is the loaded map (`None`: the file
     /// is corrupt). `Some` carries it with the newly accepted disks bound,
@@ -750,15 +785,24 @@ impl StorageConfigService {
         };
         let mut identities = before.clone();
         let facts = self.host.facts.facts();
-        let reports = dedicated::inventory(
+        let mut reports = dedicated::inventory(
             &active,
             facts.as_ref().map_err(|e| *e),
             &super::system_devs(&self.local.state_root, candidate),
             &mut identities,
         );
+        // A disk a VM holds carries the guest's data (its signature is
+        // expected), one awaiting its wipe is the agent's: both stay.
+        let owners = super::assignment::owners(&self.local.state_root)
+            .map_err(|_| StorageConfigError::Store("assignments"))?;
+        super::assignment::apply_owners(&mut reports, &owners, facts.as_ref().map_err(|e| *e));
         for report in reports {
+            if !active.iter().any(|d| d.id == report.id) {
+                continue;
+            }
             match report.state {
-                DedicatedDiskState::Free => {}
+                DedicatedDiskState::Free | DedicatedDiskState::Assigned => {}
+                DedicatedDiskState::Unavailable if report.error == "disk-release-pending" => {}
                 DedicatedDiskState::Replaced => return Err(disk("disk-replaced", &report.id)),
                 _ => {
                     let code = dedicated_code(&report.error);
@@ -1491,6 +1535,77 @@ mod tests {
         );
         doc.dedicated_disks[0].state = StorageDesiredState::Draining;
         svc.accept(doc, NOW).unwrap();
+    }
+
+    #[test]
+    fn a_disk_a_vm_holds_stays_declared_and_passes_with_the_guests_data_on_it() {
+        let m = Miner::new();
+        add_disk(&m);
+        // The guest's own partition table, seen by the host kernel.
+        let part = m.host_dir.path().join("sys/sdb/sdb1");
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(part.join("partition"), "1\n").unwrap();
+        let (svc, _) = m.service();
+        let spec = |state| DedicatedDiskSpec {
+            id: "wwn-0x1".into(),
+            state,
+        };
+        let mut doc = m.doc(2, Vec::new());
+        doc.dedicated_disks = vec![spec(StorageDesiredState::Active)];
+        // Not held: the inventory refuses it.
+        assert_eq!(
+            code(svc.accept(doc.clone(), NOW)),
+            ("disk-has-partitions", Subject::Disk("wwn-0x1".into()))
+        );
+        super::super::assignment::write_vm(
+            m.root.path(),
+            "vm-a",
+            &super::super::assignment::VmDedicatedRecord {
+                disks: vec![super::super::assignment::AssignedDisk {
+                    slot: "x0".into(),
+                    disk_id: "wwn-0x1".into(),
+                    identity: "naa.1".into(),
+                }],
+            },
+        )
+        .unwrap();
+        // Held: accepted as it is.
+        svc.accept(doc.clone(), NOW).unwrap();
+        // Dropped, as a dry run or for real: refused, whatever else changes.
+        let mut dropped = m.doc(3, Vec::new());
+        dropped.dry_run = true;
+        assert_eq!(
+            code(svc.accept(dropped.clone(), NOW)),
+            ("disk-assigned", Subject::Disk("wwn-0x1".into()))
+        );
+        dropped.dry_run = false;
+        assert_eq!(
+            code(svc.accept(dropped, NOW)),
+            ("disk-assigned", Subject::Disk("wwn-0x1".into()))
+        );
+        // Draining is the one change allowed.
+        let mut draining = m.doc(4, Vec::new());
+        draining.dedicated_disks = vec![spec(StorageDesiredState::Draining)];
+        svc.accept(draining, NOW).unwrap();
+        // Freed by §24 but not wiped yet: still the agent's.
+        super::super::assignment::remove_vm(m.root.path(), "vm-a").unwrap();
+        super::super::assignment::write_release(
+            m.root.path(),
+            "wwn-0x1",
+            &super::super::assignment::ReleaseRecord {
+                vm_id: "vm-a".into(),
+                slot: "x0".into(),
+                identity: "naa.1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            code(svc.accept(m.doc(5, Vec::new()), NOW)),
+            ("disk-assigned", Subject::Disk("wwn-0x1".into()))
+        );
+        let mut active = m.doc(5, Vec::new());
+        active.dedicated_disks = vec![spec(StorageDesiredState::Active)];
+        svc.accept(active, NOW).unwrap();
     }
 
     #[test]

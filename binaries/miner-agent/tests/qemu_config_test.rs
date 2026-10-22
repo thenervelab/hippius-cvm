@@ -129,6 +129,7 @@ fn kat_config() -> QemuConfig {
         cid: 5,
         net: None,
         dhcp: None,
+        extra_disks: Vec::new(),
     }
 }
 
@@ -295,4 +296,113 @@ fn validate_bounds_the_net_cap() {
         });
         assert_eq!(cfg.validate().is_ok(), ok, "{cap:?}");
     }
+}
+
+/// The dedicated disks of [`dedicated_config`]: between the OS disks and
+/// the NIC, by by-id path, with only the virtual serial for identity.
+const EXPECTED_DEDICATED_DISKS: &str = "\
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native' discard='ignore'/>
+      <source dev='/dev/disk/by-id/wwn-0x5000c500a1b2c3d4'/>
+      <target dev='vdf' bus='virtio'/>
+      <serial>hippius-x0</serial>
+    </disk>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native' discard='ignore'/>
+      <source dev='/dev/disk/by-id/ata-ST18000NM000J_ZR5ABCDE'/>
+      <target dev='vdg' bus='virtio'/>
+      <serial>hippius-x2</serial>
+    </disk>
+";
+
+fn dedicated_config() -> QemuConfig {
+    use hippius_miner_agent::storage::assignment::AttachDisk;
+    let mut cfg = kat_config();
+    cfg.extra_disks = vec![
+        AttachDisk {
+            slot: "x0".into(),
+            disk_id: "wwn-0x5000c500a1b2c3d4".into(),
+        },
+        AttachDisk {
+            slot: "x2".into(),
+            disk_id: "ata-ST18000NM000J_ZR5ABCDE".into(),
+        },
+    ];
+    cfg
+}
+
+#[test]
+fn dedicated_disks_render_as_raw_block_devices_with_a_virtual_serial_only() {
+    let cfg = dedicated_config();
+    assert!(cfg.validate().is_ok());
+    let xml = cfg.to_libvirt_xml();
+    // Exactly the KAT with the two disks inserted after the state disk.
+    let anchor = "      <target dev='vdd' bus='virtio'/>\n    </disk>\n";
+    // (The const's first line loses its indent to the `\` continuation.)
+    let expected = EXPECTED_XML.replacen(
+        anchor,
+        &format!("{anchor}    {EXPECTED_DEDICATED_DISKS}"),
+        1,
+    );
+    assert_eq!(xml, expected);
+    // No device name collides with the OS, rootfs, verity and state disks.
+    for dev in ["vda", "vdb", "vdc", "vdd", "vdf", "vdg"] {
+        assert_eq!(
+            xml.matches(&format!("<target dev='{dev}'")).count(),
+            1,
+            "{dev}"
+        );
+    }
+    // Without dedicated disks: the KAT, byte for byte.
+    assert!(!kat_config().to_libvirt_xml().contains("type='block'"));
+}
+
+#[test]
+fn dedicated_disks_follow_a_legacy_data_disk_without_colliding() {
+    let mut cfg = dedicated_config();
+    cfg.data_disk_path = Some(PathBuf::from("/var/lib/hippius-miner/data/kat-cvm.img"));
+    cfg.data_disk_size_gb = 20;
+    let xml = cfg.to_libvirt_xml();
+    let vde = xml.find("<target dev='vde'").unwrap();
+    let vdf = xml.find("<target dev='vdf'").unwrap();
+    assert!(vde < vdf);
+    for dev in ["vda", "vdb", "vdc", "vdd", "vde", "vdf", "vdg"] {
+        assert_eq!(
+            xml.matches(&format!("<target dev='{dev}'")).count(),
+            1,
+            "{dev}"
+        );
+    }
+}
+
+#[test]
+fn validate_refuses_a_dedicated_disk_list_it_cannot_render_safely() {
+    use hippius_miner_agent::storage::assignment::AttachDisk;
+    let code = |disks: Vec<AttachDisk>| {
+        let mut cfg = kat_config();
+        cfg.extra_disks = disks;
+        match cfg.validate() {
+            Err(hippius_miner_agent::MinerAgentError::LaunchInput(c)) => c,
+            other => panic!("{:?}", other.err()),
+        }
+    };
+    let d = |slot: &str, id: &str| AttachDisk {
+        slot: slot.into(),
+        disk_id: id.into(),
+    };
+    assert_eq!(code(vec![d("x0", "/dev/sdb")]), "extra-disk");
+    assert_eq!(code(vec![d("x0", "wwn-0x1'/><x")]), "extra-disk");
+    assert_eq!(code(vec![d("x99", "wwn-0x1")]), "extra-disk");
+    assert_eq!(
+        code(vec![d("x0", "wwn-0x1"), d("x0", "wwn-0x2")]),
+        "extra-disk-duplicate"
+    );
+    assert_eq!(
+        code(vec![d("x0", "wwn-0x1"), d("x1", "wwn-0x1")]),
+        "extra-disk-duplicate"
+    );
+    let nine = (0..9)
+        .map(|i| d(&format!("x{i}"), &format!("wwn-0x{i}")))
+        .collect();
+    assert_eq!(code(nine), "extra-disks-too-many");
 }

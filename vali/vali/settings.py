@@ -2651,6 +2651,19 @@ VALI_HOST_INVENTORY_CHANGE_RETENTION_DAYS = _env_int(
 VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS = _env_int(
     "VALI_HOST_ADVISORY_RESOLVED_RETENTION_DAYS", 90
 )
+
+# Miner-agent releases (`vali_agent_release_watch`, apps.miners.agent_release):
+# the command reads the GitHub release list and stores the complete
+# releases, for `latest_agent_release` / `update_pending` on the operator
+# rows. Off: the command exits without a request (the chart's CronJob sets
+# it on).
+VALI_AGENT_RELEASE_WATCH = _env_bool("VALI_AGENT_RELEASE_WATCH", False)
+# The repository the miners' updater installs from (its RELEASE_REPO).
+VALI_AGENT_RELEASE_REPO = os.environ.get("VALI_AGENT_RELEASE_REPO", "thenervelab/hippius-cvm")
+# The updater's MIN_RELEASE_AGE_H default: a release is eligible this many
+# hours after its last required asset landed.
+VALI_AGENT_RELEASE_SOAK_H = _env_nonneg_int("VALI_AGENT_RELEASE_SOAK_H", 24)
+VALI_AGENT_RELEASE_HTTP_TIMEOUT_S = _env_float("VALI_AGENT_RELEASE_HTTP_TIMEOUT_S", 20.0)
 # What a probe verdict may change: `off` nothing, `record` events + audit
 # only, `enforce` tiers, health, cordons.
 VALI_DISK_TIER_CONSEQUENCES = os.environ.get("VALI_DISK_TIER_CONSEQUENCES", "off")
@@ -2698,12 +2711,43 @@ if not VALI_SELLABLE_OS_TIERS or not set(VALI_SELLABLE_OS_TIERS) <= {"nvme", "ss
 VALI_SCHEDULER_DISK_TIER_GATE = os.environ.get("VALI_SCHEDULER_DISK_TIER_GATE", "off").strip()
 if VALI_SCHEDULER_DISK_TIER_GATE not in ("off", "record", "enforce"):
     raise RuntimeError("VALI_SCHEDULER_DISK_TIER_GATE must be off, record or enforce")
+# Owners (`Placement.owner`, the launch's `user_id`, comma-separated) whose
+# VMs may take a LOWER OS-disk tier than the one sold when, under `enforce`,
+# no candidate holds the sold one (nvme → ssd → hdd, the first that fits;
+# `os_tier.may_fall_back`). Our own runners only, never a customer. Empty =
+# nobody, placement exactly as without it.
+VALI_DISK_TIER_FALLBACK_OWNERS = _env_list("VALI_DISK_TIER_FALLBACK_OWNERS", [])
 # The largest flavor sold on the hdd OS tier: its first boot wipes the whole
 # integrity overlay on a spindle (design §10.18, Q-D15).
 VALI_HDD_OS_MAX_FLAVOR = os.environ.get("VALI_HDD_OS_MAX_FLAVOR", "large").strip()
 # Miner reward per unit scaled by the VM's sold OS-disk tier (nvme 1.0, ssd
 # 0.8, hdd 0.6; decision Q7). Off = every unit as today.
 VALI_DISK_TIER_UNIT_FACTOR = _env_bool("VALI_DISK_TIER_UNIT_FACTOR", False)
+# ── Dedicated physical disks (`apps.disktier.dedicated`, E4, frozen contract
+# docs/design/dedicated-disks-contract.md). ALL DARK by default.
+#
+# Off ⇒ every launch naming `dedicated_disks` is refused 409
+# `dedicated-disks-not-offered`, byte for byte today's answer.
+VALI_DEDICATED_ENABLED = _env_bool("VALI_DEDICATED_ENABLED", False)
+# User or tenant ids allowed to launch with dedicated disks (the internal
+# canary). Empty = every owner, once enabled.
+VALI_DEDICATED_ALLOWED_OWNERS = _env_list("VALI_DEDICATED_ALLOWED_OWNERS")
+# The upper bound of `dedicated_disks.count` (the guest opens at most 8).
+VALI_DEDICATED_MAX_PER_VM = _env_int("VALI_DEDICATED_MAX_PER_VM", 8)
+if not 1 <= VALI_DEDICATED_MAX_PER_VM <= 8:
+    raise RuntimeError("VALI_DEDICATED_MAX_PER_VM must be 1..8")
+# The oldest blessed guest release whose guest opens dedicated disks. An image
+# blessed at a lower release (or none) ⇒ 409 `dedicated-needs-release`. Empty
+# = every launch is refused so (nothing launches before the guest exists).
+_dedicated_release = os.environ.get("VALI_DEDICATED_MIN_GUEST_RELEASE", "").strip()
+VALI_DEDICATED_MIN_GUEST_RELEASE: int | None = (
+    int(_dedicated_release) if _dedicated_release else None
+)
+if VALI_DEDICATED_MIN_GUEST_RELEASE is not None and VALI_DEDICATED_MIN_GUEST_RELEASE < 1:
+    raise RuntimeError("VALI_DEDICATED_MIN_GUEST_RELEASE must be a release number >= 1")
+# The oldest agent release (`vYYYY.MM.DD[.N]`) that takes `extra_disks` on its
+# launch order. Empty = no node qualifies; `*` = any agent (test hosts only).
+VALI_DEDICATED_MIN_AGENT_VERSION = os.environ.get("VALI_DEDICATED_MIN_AGENT_VERSION", "").strip()
 # ── Live storage move (`apps.disktier.storage_move`): a running VM's OS disk
 # moves to another pool of its host, no downtime. ALL DARK by default: off,
 # no miner selected, and no agent version good enough. Turning it OFF stops

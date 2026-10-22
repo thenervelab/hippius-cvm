@@ -492,7 +492,9 @@ PY
     while read -r p; do
         l="$(rdsquashfs -x "${p}" "${T}/out1/components.squashfs" | sed -n 's/^security\.selinux=//p')"
         [[ -n "${l}" ]] || err "image entry ${p} is unlabelled"
-    done < <(printf '/\n/bin\n/units\n/etc\n/bin/hippius-agent-keepalive\n/units/hippius-eol-sign.service\n/etc/keepalive.env\n')
+    done < <(printf '/\n/bin\n/units\n/etc\n/bin/hippius-agent-keepalive\n/bin/hippius-disks\n/units/hippius-eol-sign.service\n/etc/keepalive.env\n')
+    cmp -s <(rdsquashfs -c /bin/hippius-disks "${T}/out1/components.squashfs") "${HERE}/../guest/hippius-disks" \
+        || err "the image does not carry scripts/guest/hippius-disks as bin/hippius-disks"
     [[ "$(rdsquashfs -x /bin/hippius-agent-keepalive "${T}/out1/components.squashfs")" == "security.selinux=system_u:object_r:bin_t:s0" ]] \
         || err "agent label"
     ok "builder: image entries carry their SELinux labels"

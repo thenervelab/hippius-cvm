@@ -16,6 +16,15 @@
 //!   probe binary in a vali probe VM. It is attached to every receipt while
 //!   present and naming this VM; anything else is ignored.
 //!
+//! - dedicated-disk slot verdicts: the initramfs opener
+//!   (`hippius-guest-release --open-dedicated-disks`) leaves one line per
+//!   anchored slot in `/run/hippius/dedicated/slots`. A slot it refused is
+//!   reported `mismatch` (on its device), one it could not find `missing`
+//!   (no device, zero counters), and so is an opened slot whose device has
+//!   since disappeared; an opened slot is its device, `ok`. Every slot rides
+//!   every receipt, the first one included (zero counters when there is no
+//!   window), and survives a window dropped for a counter going backwards.
+//!
 //! Both are optional evidence: a value that would not encode is dropped
 //! rather than failing the receipt (the receipt loop also retries without
 //! them), so billing never depends on them.
@@ -26,11 +35,17 @@ use std::sync::Mutex;
 
 use hippius_types::disk_stats::{
     slot_of_serial, validate_disk_io, DiskIoDelta, DiskIoState, DiskProbeResult, MAX_DEV_LEN,
-    MAX_DISK_IO_DEVICES, MAX_SERIAL_LEN,
+    MAX_DISK_IO_DEVICES, MAX_SERIAL_LEN, SLOT_SERIAL_PREFIX,
 };
 
 /// Where the probe binary leaves its result.
 pub const PROBE_RESULT_PATH: &str = "/run/hippius/disk-probe/result.cbor";
+
+/// Where the initramfs opener leaves the dedicated slots' states.
+pub const SLOTS_STATE_PATH: &str = "/run/hippius/dedicated/slots";
+
+/// The largest slot-state file read (8 slots fit in well under 1 KiB).
+const MAX_SLOTS_STATE_BYTES: u64 = 4096;
 
 /// The largest probe result read (the worst case encodes well under it).
 const MAX_PROBE_RESULT_BYTES: u64 = 16 * 1024;
@@ -74,6 +89,7 @@ pub struct SysDiskEvidence {
     sys_block: PathBuf,
     by_id: PathBuf,
     probe_result: PathBuf,
+    slots_state: PathBuf,
     vm_id: String,
     previous: Mutex<Option<Snapshot>>,
 }
@@ -87,6 +103,7 @@ impl SysDiskEvidence {
             PathBuf::from(PROBE_RESULT_PATH),
             vm_id,
         )
+        .with_slots_state(PathBuf::from(SLOTS_STATE_PATH))
     }
 
     /// Over other paths (tests).
@@ -100,9 +117,16 @@ impl SysDiskEvidence {
             sys_block,
             by_id,
             probe_result,
+            slots_state: PathBuf::new(),
             vm_id,
             previous: Mutex::new(None),
         }
+    }
+
+    /// Read dedicated slot verdicts from `path` (none by default).
+    pub fn with_slots_state(mut self, path: PathBuf) -> Self {
+        self.slots_state = path;
+        self
     }
 }
 
@@ -115,6 +139,7 @@ impl DiskEvidenceSource for SysDiskEvidence {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(|before| deltas(before, &now));
+        let io = with_slot_verdicts(io, &now, &read_slot_verdicts(&self.slots_state));
         let probe = read_probe(&self.probe_result, &self.vm_id);
         (DiskEvidence { io, probe }, now)
     }
@@ -249,6 +274,161 @@ pub fn deltas(before: &Snapshot, now: &Snapshot) -> Option<Vec<DiskIoDelta>> {
         return None;
     }
     Some(out)
+}
+
+/// A dedicated slot's verdict from the opener's state file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotVerdict {
+    /// `hippius-<slot>`.
+    pub serial: String,
+    pub state: SlotVerdictState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotVerdictState {
+    Attached,
+    Missing,
+    Mismatch,
+}
+
+/// Parse the opener's state file (`<slot> <state> <gib> <dev|-> <reason>`
+/// per line, after a `#` header). Lines that do not parse are skipped:
+/// the file is guest-root-writable evidence, never trusted for more than
+/// what the receipt carries anyway.
+pub fn parse_slot_verdicts(text: &str) -> Vec<SlotVerdict> {
+    let mut out: Vec<SlotVerdict> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split(' ').collect();
+        let [slot, state, _gib, _dev, _reason] = f.as_slice() else {
+            continue;
+        };
+        let serial = format!("{SLOT_SERIAL_PREFIX}{slot}");
+        if *slot == "os" || slot_of_serial(&serial).is_none() {
+            continue;
+        }
+        let state = match *state {
+            "attached" => SlotVerdictState::Attached,
+            "missing" => SlotVerdictState::Missing,
+            "mismatch" => SlotVerdictState::Mismatch,
+            _ => continue,
+        };
+        if out.iter().any(|v| v.serial == serial) {
+            continue;
+        }
+        out.push(SlotVerdict { serial, state });
+    }
+    out
+}
+
+/// The verdicts at `path`, if it is a small regular file.
+pub fn read_slot_verdicts(path: &Path) -> Vec<SlotVerdict> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Vec::new();
+    };
+    if !meta.is_file() || meta.len() > MAX_SLOTS_STATE_BYTES {
+        return Vec::new();
+    }
+    std::fs::read_to_string(path)
+        .map(|t| parse_slot_verdicts(&t))
+        .unwrap_or_default()
+}
+
+fn zero_counters(dev: String, serial: String, state: DiskIoState) -> DiskIoDelta {
+    DiskIoDelta {
+        dev,
+        serial,
+        state,
+        r_ios: 0,
+        r_sectors: 0,
+        r_ticks_ms: 0,
+        w_ios: 0,
+        w_sectors: 0,
+        w_ticks_ms: 0,
+        io_ticks_ms: 0,
+        tiq_ms: 0,
+        inflight: 0,
+    }
+}
+
+/// Fold the slot verdicts into the window's deltas (`io`, maybe none):
+///
+/// - `mismatch`: the slot's device (found by serial in `now`) carries
+///   `state = mismatch`, with zero counters when the window has none for
+///   it; no device any more ⇒ `missing`;
+/// - `missing`: a `missing` entry (no device, zero counters), replacing
+///   any device that has since appeared under the serial (the guest never
+///   opened it);
+/// - `attached`: its device `ok` (zero counters when the window has none
+///   for it, so the first receipt already names every slot); gone ⇒
+///   `missing`.
+///
+/// The result keeps the wire's order and limits; a list that would not
+/// validate falls back to the plain deltas.
+pub fn with_slot_verdicts(
+    io: Option<Vec<DiskIoDelta>>,
+    now: &Snapshot,
+    verdicts: &[SlotVerdict],
+) -> Option<Vec<DiskIoDelta>> {
+    if verdicts.is_empty() {
+        return io;
+    }
+    let mut list = io.clone().unwrap_or_default();
+    let dev_of = |serial: &str| {
+        now.iter()
+            .find(|(_, (s, _))| s == serial)
+            .map(|(d, _)| d.clone())
+    };
+    let mut add = Vec::new();
+    for v in verdicts {
+        let dev = dev_of(&v.serial);
+        let state = match (v.state, &dev) {
+            (SlotVerdictState::Attached, Some(_)) => DiskIoState::Ok,
+            (SlotVerdictState::Mismatch, Some(_)) => DiskIoState::Mismatch,
+            _ => DiskIoState::Missing,
+        };
+        if state != DiskIoState::Missing {
+            if let Some(d) = list.iter_mut().find(|d| d.serial == v.serial) {
+                d.state = state;
+                continue;
+            }
+            // No counters for it in this window (the first receipt, or a
+            // window dropped for a counter going backwards): the verdict
+            // still goes out, on its device, with zero counters.
+            if let Some(dev) = dev {
+                add.push(zero_counters(dev, v.serial.clone(), state));
+            }
+            continue;
+        }
+        list.retain(|d| d.serial != v.serial);
+        add.push(zero_counters(
+            String::new(),
+            v.serial.clone(),
+            DiskIoState::Missing,
+        ));
+    }
+    // Verdicts first when the list is full: they are what vali acts on.
+    let room = MAX_DISK_IO_DEVICES.saturating_sub(add.len());
+    if list.len() > room {
+        let (mut keep, rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|d| d.state != DiskIoState::Ok);
+        keep.extend(rest.into_iter().take(room.saturating_sub(keep.len())));
+        list = keep;
+    }
+    list.extend(add);
+    list.sort_by(|a, b| {
+        (a.dev.as_str(), a.serial.as_str()).cmp(&(b.dev.as_str(), b.serial.as_str()))
+    });
+    list.truncate(MAX_DISK_IO_DEVICES);
+    if list.is_empty() || validate_disk_io(&list).is_err() {
+        return io;
+    }
+    Some(list)
 }
 
 /// The probe result at `path`, if it is a small regular file holding a
@@ -411,6 +591,178 @@ mod tests {
         twice.get_mut("vdd").unwrap().0 = "hippius-x0".into();
         let io = deltas(&twice, &twice).unwrap();
         assert!(io.iter().all(|d| d.serial.is_empty()));
+    }
+
+    fn verdicts(text: &str) -> Vec<SlotVerdict> {
+        parse_slot_verdicts(text)
+    }
+
+    #[test]
+    fn the_opener_state_file_parses_and_junk_is_skipped() {
+        let v = verdicts(
+            "# hippius-dedicated-disks state v1\nx0 attached 22300 vdb -\nx1 missing 22300 - absent\n\
+             x2 mismatch 1000 vdd uuid-mismatch\nos attached 1 vda -\nx24 missing 1000 - absent\n\
+             x3 exploded 1000 vde -\nx4 attached\nx0 missing 1 - again\n",
+        );
+        assert_eq!(
+            v,
+            [
+                SlotVerdict {
+                    serial: "hippius-x0".into(),
+                    state: SlotVerdictState::Attached
+                },
+                SlotVerdict {
+                    serial: "hippius-x1".into(),
+                    state: SlotVerdictState::Missing
+                },
+                SlotVerdict {
+                    serial: "hippius-x2".into(),
+                    state: SlotVerdictState::Mismatch
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_verdicts_ride_the_first_receipt_and_every_later_one() {
+        let sys = tempfile::tempdir().unwrap();
+        dev(sys.path(), "vda", Some("hippius-os"), ZERO);
+        dev(sys.path(), "vdb", Some("hippius-x0"), ZERO);
+        dev(sys.path(), "vdc", Some("hippius-x2"), ZERO);
+        let state = sys.path().join("slots");
+        std::fs::write(
+            &state,
+            "# hippius-dedicated-disks state v1\nx0 attached 22300 vdb -\nx1 missing 22300 - absent\nx2 mismatch 1000 vdc uuid-mismatch\n",
+        )
+        .unwrap();
+        let src = SysDiskEvidence::with_paths(
+            sys.path().join("sys"),
+            sys.path().join("by-id"),
+            sys.path().join("none"),
+            "vm-1".into(),
+        )
+        .with_slots_state(state.clone());
+        // First window: no counters yet, every slot is there.
+        let (ev, snap) = src.sample();
+        let io = ev.io.unwrap();
+        assert_eq!(
+            io.iter()
+                .map(|d| (d.dev.as_str(), d.serial.as_str(), d.state))
+                .collect::<Vec<_>>(),
+            [
+                ("", "hippius-x1", DiskIoState::Missing),
+                ("vdb", "hippius-x0", DiskIoState::Ok),
+                ("vdc", "hippius-x2", DiskIoState::Mismatch),
+            ]
+        );
+        assert!(io.iter().all(|d| d.w_ios == 0 && d.r_ios == 0));
+        assert!(validate_disk_io(&io).is_ok());
+        src.commit(snap);
+        // Next window: counters for every device, the mismatch kept on its
+        // device, the attached slot plain `ok`.
+        dev(
+            sys.path(),
+            "vdb",
+            Some("hippius-x0"),
+            "1 0 8 1 2 0 16 1 0 2 2",
+        );
+        let (ev, snap) = src.sample();
+        let io = ev.io.unwrap();
+        assert_eq!(
+            io.iter()
+                .map(|d| (d.dev.as_str(), d.serial.as_str(), d.state))
+                .collect::<Vec<_>>(),
+            [
+                ("", "hippius-x1", DiskIoState::Missing),
+                ("vda", "hippius-os", DiskIoState::Ok),
+                ("vdb", "hippius-x0", DiskIoState::Ok),
+                ("vdc", "hippius-x2", DiskIoState::Mismatch),
+            ]
+        );
+        assert_eq!(io[2].r_ios, 1);
+        src.commit(snap);
+        // The attached disk vanishes: now `missing`.
+        std::fs::remove_dir_all(sys.path().join("sys/vdb")).unwrap();
+        std::fs::remove_file(sys.path().join("by-id/virtio-hippius-x0")).unwrap();
+        let (ev, _) = src.sample();
+        let io = ev.io.unwrap();
+        assert!(io.iter().any(|d| d.serial == "hippius-x0"
+            && d.state == DiskIoState::Missing
+            && d.dev.is_empty()));
+        assert!(validate_disk_io(&io).is_ok());
+    }
+
+    #[test]
+    fn a_device_appearing_under_a_missing_slot_stays_missing() {
+        let now = snap(&[
+            ("vda", "hippius-os", [1; 11]),
+            ("vdb", "hippius-x1", [1; 11]),
+        ]);
+        let before = snap(&[
+            ("vda", "hippius-os", [0; 11]),
+            ("vdb", "hippius-x1", [0; 11]),
+        ]);
+        let io = deltas(&before, &now);
+        let v = verdicts("x1 missing 1000 - absent\n");
+        let out = with_slot_verdicts(io, &now, &v).unwrap();
+        assert_eq!(
+            out.iter()
+                .map(|d| (d.dev.as_str(), d.serial.as_str(), d.state))
+                .collect::<Vec<_>>(),
+            [
+                ("", "hippius-x1", DiskIoState::Missing),
+                ("vda", "hippius-os", DiskIoState::Ok),
+            ]
+        );
+    }
+
+    #[test]
+    fn verdicts_survive_a_window_dropped_and_win_when_the_list_is_full() {
+        // A counter went backwards: no deltas, the verdict still goes out.
+        let now = snap(&[("vdb", "hippius-x0", [1; 11])]);
+        let out =
+            with_slot_verdicts(None, &now, &verdicts("x0 mismatch 1000 vdb no-header\n")).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, DiskIoState::Mismatch);
+        // No verdicts: the deltas untouched.
+        assert_eq!(with_slot_verdicts(None, &now, &[]), None);
+        // 16 plain devices + 2 missing verdicts: both verdicts kept.
+        let names: Vec<String> = (0..16)
+            .map(|i| format!("vd{}", (b'a' + i) as char))
+            .collect();
+        let full: Vec<DiskIoDelta> = names
+            .iter()
+            .map(|n| zero_counters(n.clone(), String::new(), DiskIoState::Ok))
+            .collect();
+        let out = with_slot_verdicts(
+            Some(full),
+            &Snapshot::new(),
+            &verdicts("x0 missing 1000 - absent\nx1 missing 1000 - absent\n"),
+        )
+        .unwrap();
+        assert_eq!(out.len(), MAX_DISK_IO_DEVICES);
+        assert_eq!(
+            out.iter()
+                .filter(|d| d.state == DiskIoState::Missing)
+                .count(),
+            2
+        );
+        assert!(validate_disk_io(&out).is_ok());
+    }
+
+    #[test]
+    fn a_slot_state_file_that_is_a_symlink_or_huge_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, "x0 missing 1000 - absent\n").unwrap();
+        assert_eq!(read_slot_verdicts(&real).len(), 1);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_slot_verdicts(&link).is_empty());
+        std::fs::write(&real, "x0 missing 1000 - absent\n".repeat(400)).unwrap();
+        assert!(read_slot_verdicts(&real).is_empty());
+        assert!(read_slot_verdicts(&dir.path().join("none")).is_empty());
+        assert!(read_slot_verdicts(Path::new("")).is_empty());
     }
 
     fn probe(vm_id: &str) -> DiskProbeResult {

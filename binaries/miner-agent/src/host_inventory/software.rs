@@ -99,6 +99,7 @@ pub fn collect_software(
         last_boot_unix: uptime_s
             .and_then(|u| i64::try_from(u).ok())
             .map(|u| now_unix.saturating_sub(u)),
+        auto_update: None,
     }
 }
 

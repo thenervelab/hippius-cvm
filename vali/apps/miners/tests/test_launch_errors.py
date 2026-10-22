@@ -104,25 +104,25 @@ def test_a_malformed_order_id_is_dropped() -> None:
 @pytest.mark.django_db
 def test_the_ledger_keeps_the_newest_and_counts_the_streak() -> None:
     miner = make_dispatchable_identity(1)
-    for i in range(launch_errors.MAX_RECENT + 2):
+    for i in range(launch_errors.MAX_STORED + 2):
         launch_errors.record_failure(
             miner,
-            launch_errors.failure_entry(
-                stage="launch", http_status=500, classifier=f"code-{i}"
-            ),
+            launch_errors.failure_entry(stage="launch", http_status=500, classifier=f"code-{i}"),
         )
     row = MinerLaunchErrors.objects.get(miner=miner)
-    assert row.fail_streak == launch_errors.MAX_RECENT + 2
+    assert row.fail_streak == launch_errors.MAX_STORED + 2
     assert [e["code"] for e in row.errors] == [
-        f"code-{i}" for i in reversed(range(2, launch_errors.MAX_RECENT + 2))
+        f"code-{i}" for i in reversed(range(2, launch_errors.MAX_STORED + 2))
     ]
     assert all(e["at"] for e in row.errors)
+    shown = launch_errors.readout(row)["recent_launch_errors"]
+    assert [e["code"] for e in shown] == [e["code"] for e in row.errors[: launch_errors.MAX_RECENT]]
 
     launch_errors.record_ok(miner)
     row.refresh_from_db()
     assert row.fail_streak == 0
     assert row.last_ok_at is not None
-    assert len(row.errors) == launch_errors.MAX_RECENT
+    assert len(row.errors) == launch_errors.MAX_STORED
 
 
 @pytest.mark.django_db
@@ -164,3 +164,109 @@ def test_printable_keeps_a_class_and_neutralises_the_rest() -> None:
     assert launch_errors.printable("relaunch-disks-missing") == "relaunch-disks-missing"
     assert launch_errors.printable("a\nb\x00cé") == "a?b?c?"
     assert len(launch_errors.printable("x" * 5000)) == launch_errors.MAX_CODE_LEN
+
+
+# ── preflight-timeout ────────────────────────────────────────────────
+
+
+def _edge_timeout(stage: str = launch_errors.STAGE_PREFLIGHT, status: int = 504) -> dict:
+    return launch_errors.failure_entry(stage=stage, http_status=status, classifier="")
+
+
+def _codes(view: dict) -> list[str]:
+    return [e["code"] for e in view["recent_launch_errors"]]
+
+
+@pytest.mark.parametrize("status", [502, 504])
+def test_a_bodiless_edge_answer_to_a_preflight_is_a_preflight_timeout(status: int) -> None:
+    entry = _edge_timeout(status=status)
+    assert entry["code"] == "preflight-timeout"
+    assert entry["code"] == launch_errors.CODE_PREFLIGHT_TIMEOUT
+    assert entry["class"] is None
+    assert entry["stage"] == "preflight"
+
+
+@pytest.mark.parametrize("status", [502, 504])
+def test_a_bodiless_edge_answer_to_a_launch_stays_miner_unreachable(status: int) -> None:
+    assert _edge_timeout(launch_errors.STAGE_LAUNCH, status)["code"] == "miner-unreachable"
+
+
+def test_a_preflight_answer_with_a_class_is_never_a_timeout() -> None:
+    entry = launch_errors.failure_entry(
+        stage=launch_errors.STAGE_PREFLIGHT, http_status=502, classifier="dispatch-failed"
+    )
+    assert entry["code"] == "dispatch-failed"
+
+
+def test_a_bodiless_non_edge_preflight_answer_is_unclassified() -> None:
+    entry = launch_errors.failure_entry(
+        stage=launch_errors.STAGE_PREFLIGHT, http_status=500, classifier=""
+    )
+    assert entry["code"] == "unclassified"
+
+
+@pytest.mark.django_db
+def test_isolated_preflight_timeouts_are_stored_but_hidden_and_not_counted() -> None:
+    miner = make_dispatchable_identity(1)
+    real = launch_errors.failure_entry(
+        stage="launch", http_status=500, classifier="dispatch-failed"
+    )
+    launch_errors.record_failure(miner, real)
+    for _ in range(launch_errors.PREFLIGHT_TIMEOUT_RUN - 1):
+        launch_errors.record_failure(miner, _edge_timeout())
+    row = MinerLaunchErrors.objects.get(miner=miner)
+    assert row.fail_streak == 1
+    assert [e["code"] for e in row.errors] == [
+        *["preflight-timeout"] * (launch_errors.PREFLIGHT_TIMEOUT_RUN - 1),
+        "dispatch-failed",
+    ]
+    view = launch_errors.readout(row)
+    assert _codes(view) == ["dispatch-failed"]
+    assert view["last_launch_error"]["code"] == "dispatch-failed"
+    assert view["launch_fail_streak"] == 1
+
+
+@pytest.mark.django_db
+def test_a_run_of_preflight_timeouts_is_shown_and_counted() -> None:
+    miner = make_dispatchable_identity(1)
+    for _ in range(launch_errors.PREFLIGHT_TIMEOUT_RUN):
+        launch_errors.record_failure(miner, _edge_timeout())
+    view = launch_errors.readout(MinerLaunchErrors.objects.get(miner=miner))
+    assert _codes(view) == ["preflight-timeout"] * launch_errors.PREFLIGHT_TIMEOUT_RUN
+    assert view["last_launch_error"]["code"] == "preflight-timeout"
+    assert view["launch_fail_streak"] == launch_errors.PREFLIGHT_TIMEOUT_RUN
+
+
+@pytest.mark.django_db
+def test_another_error_breaks_a_run_of_preflight_timeouts() -> None:
+    miner = make_dispatchable_identity(1)
+    launch_errors.record_failure(miner, _edge_timeout())
+    launch_errors.record_failure(miner, _edge_timeout())
+    launch_errors.record_failure(miner, _edge_timeout(launch_errors.STAGE_LAUNCH))
+    launch_errors.record_failure(miner, _edge_timeout())
+    view = launch_errors.readout(MinerLaunchErrors.objects.get(miner=miner))
+    assert _codes(view) == ["miner-unreachable"]
+    assert view["launch_fail_streak"] == 1
+
+
+@pytest.mark.django_db
+def test_an_accepted_launch_breaks_a_run_and_resets_its_count() -> None:
+    miner = make_dispatchable_identity(1)
+    for _ in range(2):
+        launch_errors.record_failure(miner, _edge_timeout())
+    launch_errors.record_ok(miner)
+    for _ in range(2):
+        launch_errors.record_failure(miner, _edge_timeout())
+    row = MinerLaunchErrors.objects.get(miner=miner)
+    view = launch_errors.readout(row)
+    assert _codes(view) == []
+    assert view["launch_fail_streak"] == 0
+
+    # A run that completed BEFORE the accepted launch stays visible as
+    # history, but the streak only counts what came after it.
+    for _ in range(launch_errors.PREFLIGHT_TIMEOUT_RUN):
+        launch_errors.record_failure(miner, _edge_timeout())
+    launch_errors.record_ok(miner)
+    view = launch_errors.readout(MinerLaunchErrors.objects.get(miner=miner))
+    assert len(_codes(view)) == launch_errors.MAX_RECENT
+    assert view["launch_fail_streak"] == 0

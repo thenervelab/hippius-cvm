@@ -7,7 +7,11 @@
 //! - `signed_host_inventory_full.cbor` — its `{body, sig}` envelope,
 //!   signed by a fixed test Ed25519 key (deterministic);
 //! - `host_inventory_body_counters.cbor` / `signed_host_inventory_counters.cbor`
-//!   — a `counters` report (memory, storage advisories, sensors, software).
+//!   — a `counters` report (memory, storage advisories, sensors, software);
+//! - `host_inventory_body_auto_update.cbor` / `signed_host_inventory_auto_update.cbor`
+//!   — the same `counters` report with `software.auto_update` (off, with
+//!   a failed tag). The two vectors above carry no `auto_update` and stay
+//!   byte-identical to what an encoder without the field produced.
 //!
 //! vali's verifier tests and any parallel encoder must reproduce these
 //! bytes. A failure is drift: fix the implementation, never silently
@@ -248,7 +252,24 @@ fn kat_software() -> SoftwareSection {
         libvirt_version: Some(s("12.0.0")),
         uptime_s: 1_234_567,
         last_boot_unix: Some(1_790_965_433),
+        auto_update: None,
     }
+}
+
+pub fn kat_auto_update() -> HostInventory {
+    let mut body = HostInventory {
+        sequence: 5,
+        ..kat_counters()
+    };
+    if let Some(sw) = body.sections.software.as_mut() {
+        sw.auto_update = Some(AutoUpdateStatus {
+            enabled: false,
+            disabled_reason: Some(AutoUpdateDisabledReason::NoAutoUpdateFile),
+            last_check_unix: Some(1_792_200_000),
+            failed_tag: Some(s("v2026.10.18.1")),
+        });
+    }
+    body
 }
 
 pub fn kat_counters() -> HostInventory {
@@ -276,8 +297,12 @@ fn signed(body: &HostInventory) -> SignedHostInventory {
     }
 }
 
-fn cases() -> [(&'static str, HostInventory); 2] {
-    [("full", kat_full()), ("counters", kat_counters())]
+fn cases() -> [(&'static str, HostInventory); 3] {
+    [
+        ("full", kat_full()),
+        ("counters", kat_counters()),
+        ("auto_update", kat_auto_update()),
+    ]
 }
 
 #[test]

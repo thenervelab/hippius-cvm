@@ -25,7 +25,10 @@ convention as the geo-probe — per-host gauges are pushed:
 `hippius_vali_disk_gate_would_refuse{flavor}` (1 when `enforce` would
 refuse that offered flavor there right now, whatever the mode — the
 `record`-mode metric). Per-decision would-rejects are the structured
-`disk_gate_would_reject` log lines.
+`disk_gate_would_reject` log lines. In the same push,
+`hippius_disk_tier_fallback_vms{tier}`: the active VMs of a
+`VALI_DISK_TIER_FALLBACK_OWNERS` owner whose OS disk sits below its sold
+tier (each fallback is also a `disk_tier_fallback` log line).
 
 It also pushes each miner's SEV-SNP host-health report from the v5
 heartbeat (`host_health_survey`, job `vali-host-health`):
@@ -78,6 +81,7 @@ M_DISK_FREE = "hippius_vali_disk_free_gb"
 M_DISK_KNOWN = "hippius_vali_disk_known"
 M_DISK_OVER_CLAIM = "hippius_vali_disk_over_claim"
 M_DISK_WOULD_REFUSE = "hippius_vali_disk_gate_would_refuse"
+M_TIER_FALLBACK = "hippius_disk_tier_fallback_vms"
 
 
 def disk_survey() -> None:
@@ -105,6 +109,10 @@ def disk_survey() -> None:
             for name in offered:
                 refused = bool(service.disk_refusal(d, service.flavor_disk_gb(name)))
                 ms.gauge(M_DISK_WOULD_REFUSE, 1.0 if refused else 0.0, node_id=nid, flavor=name)
+        from apps.disktier import os_tier
+
+        for tier, count in sorted(os_tier.fallback_vm_counts().items()):
+            ms.gauge(M_TIER_FALLBACK, count, tier=tier)
         metrics.push(ms, gateway_url=gateway, job="vali-disk", grouping_key={}, replace=True)
     except Exception:  # noqa: BLE001 — observability must never break the loop.
         log.exception("disk survey failed")

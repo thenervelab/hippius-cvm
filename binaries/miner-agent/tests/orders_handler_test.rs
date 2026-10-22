@@ -369,6 +369,7 @@ fn launch_payload(vm: &str) -> LaunchOrder {
         net: None,
         on_guest_poweroff: None,
         os_pool: None,
+        extra_disks: Vec::new(),
     }
 }
 
@@ -1986,4 +1987,117 @@ async fn move_vm_storage_orders_reach_the_move_engine() {
         },
     );
     assert_eq!(post(addr, route, &wrong).await.0, 400);
+}
+
+// ── dedicated disks: a pinned VM never moves ─────────────────────────
+
+/// A VM holding a dedicated disk here (its record under the state root)
+/// is refused every route that would move, copy or rebuild it elsewhere,
+/// before anything starts; a §25 destination is refused on the measured
+/// cmdline alone; a malformed `extra_disks` list is a 400.
+#[tokio::test]
+async fn a_pinned_vm_is_refused_on_every_route_that_would_move_it() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = Arc::new(BackupManager::new(
+        Arc::new(VirshQmp::new("/nonexistent/virsh".into())),
+        Arc::new(QemuImg::default()),
+        Arc::new(Transfer::new().unwrap()),
+    ));
+    let (addr, sk, _lc, migration, uploader, _dl) = spawn_server_inner(
+        Arc::new(RecordingDownloader::default()),
+        Some(backup),
+        Arc::new(MockLibvirtDriver::new()),
+        Some(root.path()),
+    )
+    .await;
+    use hippius_miner_agent::storage::assignment;
+    assignment::write_vm(
+        root.path(),
+        "vm-a",
+        &assignment::VmDedicatedRecord {
+            disks: vec![assignment::AssignedDisk {
+                slot: "x0".into(),
+                disk_id: "wwn-0x1".into(),
+                identity: "naa.1".into(),
+            }],
+        },
+    )
+    .unwrap();
+    let pinned = (409, "dedicated-pinned".to_string());
+
+    let snap = signed_wire(
+        &sk,
+        "pin-snap",
+        OrderKind::MigrateSnapshot,
+        MigrateSnapshotOrder {
+            vm_id: VmId::new("vm-a").unwrap(),
+            node_id: TEST_MINER_ID.to_string(),
+            put_url: "https://s3.example/snapshots/vm-a?sig=abc".to_string(),
+            state_put_url: String::new(),
+            disk_part_urls: Vec::new(),
+            part_size: 0,
+        },
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-snapshot", &snap).await,
+        pinned
+    );
+    assert!(uploader.calls().is_empty(), "nothing uploaded");
+    assert!(migration.phase(&VmId::new("vm-a").unwrap()).is_none());
+
+    let wire = signed_wire(
+        &sk,
+        "pin-backup",
+        OrderKind::Backup,
+        backup_payload("vm-a", "r1", None, 1),
+    );
+    assert_eq!(post(addr, "/v1/miner/order/backup", &wire).await, pinned);
+
+    let (full, state) = (vec![1u8; 1 << 20], vec![2u8; 1 << 20]);
+    let chain = RestoreChain {
+        restore_id: RID.to_string(),
+        full: chain_piece("https://s3.example/full?X-Amz-Signature=s".into(), &full),
+        incrementals: Vec::new(),
+        state: chain_piece("https://s3.example/state?X-Amz-Signature=s".into(), &state),
+    };
+    let wire = signed_wire(
+        &sk,
+        "pin-restore",
+        OrderKind::Restore,
+        restore_order("vm-a", RestoreOp::Stage, Some(chain), 1 << 20),
+    );
+    assert_eq!(post(addr, "/v1/miner/order/restore", &wire).await, pinned);
+
+    // §25 destination: this host holds disks for the VM, or the measured
+    // cmdline says it has some.
+    let wire = signed_wire(
+        &sk,
+        "pin-act",
+        OrderKind::MigrateActivate,
+        activate_payload("vm-a", "https://s3.example/snap?sig=x"),
+    );
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-activate", &wire).await,
+        pinned
+    );
+    let mut act = activate_payload("vm-b", "https://s3.example/snap?sig=x");
+    act.cmdline = "ro hippius.vm_generation=6 hippius.dedicated=x0:16000".into();
+    let wire = signed_wire(&sk, "pin-act-b", OrderKind::MigrateActivate, act);
+    assert_eq!(
+        post(addr, "/v1/miner/order/migrate-activate", &wire).await,
+        pinned
+    );
+
+    // A malformed list is the order's fault.
+    let mut launch = launch_payload("vm-c");
+    launch.extra_disks = vec![hippius_miner_agent::orders::ExtraDisk {
+        slot: "x24".into(),
+        kind: "dedicated".into(),
+        disk_id: "wwn-0x2".into(),
+    }];
+    let wire = signed_wire(&sk, "pin-launch", OrderKind::Launch, launch);
+    assert_eq!(
+        post(addr, "/v1/miner/order/launch", &wire).await,
+        (400, "dedicated-invalid".to_string())
+    );
 }

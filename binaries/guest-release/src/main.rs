@@ -156,6 +156,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+mod dedicated;
 mod guardian_leg;
 #[cfg(test)]
 mod keyed_tests;
@@ -171,6 +172,8 @@ const EXIT_RELEASE_FAILED: u8 = 3;
 /// `--integrity-wipe` failed: the device is NOT fully initialised and
 /// must not get a filesystem.
 const EXIT_WIPE_FAILED: u8 = 4;
+/// `--open-dedicated-disks` could not report (cmdline or state file).
+const EXIT_DEDICATED_FAILED: u8 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -183,7 +186,7 @@ struct Cli {
     /// `https://kbs.hippius.network`. The release POST hits
     /// `${KBS_URL}/v1/kbs/release`. Required in every mode except
     /// `--integrity-wipe`, which talks to no KBS.
-    #[arg(long, required_unless_present = "integrity_wipe")]
+    #[arg(long, required_unless_present_any = ["integrity_wipe", "open_dedicated_disks"])]
     kbs_url: Option<String>,
 
     /// Path to the raw COSE_Sign1 OrderTicket bytes (same bytes
@@ -415,6 +418,53 @@ struct Cli {
         "cdn_fleet_dir",
     ])]
     integrity_wipe: Option<std::path::PathBuf>,
+
+    /// DEDICATED-DISKS MODE (docs/design/disk-tier-verification.md
+    /// §4.2). Reads the measured `hippius.dedicated=` anchor; absent ⇒
+    /// does nothing. Otherwise derives each slot's key from the KEK in
+    /// this file (the 32-byte tmpfs keyfile the OS volume was opened
+    /// with), formats a slot's disk on its first boot, opens every slot
+    /// as `/dev/mapper/hippius-<slot>`, and writes the slot states to
+    /// `--dedicated-state-out`. No KBS traffic; the keys only ever reach
+    /// `cryptsetup`'s stdin. See [`dedicated`].
+    #[arg(long, conflicts_with_all = [
+        "kbs_url",
+        "ticket",
+        "userdata_out",
+        "lifecycle_key_out",
+        "last_counter_file",
+        "new_counter_file",
+        "volume_stamp_ctx_out",
+        "volume_stamp_expected_out",
+        "volume_stamp_transition_out",
+        "confirm_volume_stamp",
+        "share_c_version",
+        "share_c_version_out",
+        "instance_id_out",
+        "cdn_fleet_dir",
+        "integrity_wipe",
+    ], requires_all = ["dedicated_volume_root", "dedicated_state_out"])]
+    open_dedicated_disks: Option<std::path::PathBuf>,
+
+    /// With `--open-dedicated-disks`: the mounted root of the guest-keyed
+    /// OS volume, where the slot record lives.
+    #[arg(long, requires = "open_dedicated_disks")]
+    dedicated_volume_root: Option<std::path::PathBuf>,
+
+    /// With `--open-dedicated-disks`: the slot-state file (strictly under
+    /// `/run/`).
+    #[arg(long, requires = "open_dedicated_disks")]
+    dedicated_state_out: Option<std::path::PathBuf>,
+
+    /// Test seam for `--open-dedicated-disks`: read the cmdline from this
+    /// file instead of `/proc/cmdline`.
+    #[arg(long, hide = true, requires = "open_dedicated_disks")]
+    dedicated_cmdline: Option<std::path::PathBuf>,
+
+    /// Test seam for `--open-dedicated-disks`: the by-id directory
+    /// (default `/dev/disk/by-id`).
+    #[arg(long, hide = true, requires = "open_dedicated_disks")]
+    dedicated_by_id: Option<std::path::PathBuf>,
 }
 
 /// The tmpfs subtree every SECRET-bearing `*_out` file must live under.
@@ -567,7 +617,11 @@ fn main() -> ExitCode {
             }
         };
     }
-    // `required_unless_present` guarantees this outside wipe mode.
+    if let Some(kek_file) = cli.open_dedicated_disks.as_deref() {
+        return run_dedicated(&cli, kek_file);
+    }
+    // `required_unless_present_any` guarantees this outside the
+    // wipe and dedicated-disks modes.
     let Some(kbs_url) = cli.kbs_url.as_deref() else {
         eprintln!("hippius-guest-release: fail-closed: usage: --kbs-url is required");
         return ExitCode::from(EXIT_USAGE);
@@ -1860,6 +1914,57 @@ fn snp_provider() -> Box<dyn hippius_agent_initramfs::SnpReportProvider> {
 /// Emit a single static diagnostic to stderr. §20: no secret bytes,
 /// no plaintext from the inner classifier — only the closed-vocab
 /// `class()` family + `sub_class()` tag, both `&'static str`.
+/// `--open-dedicated-disks`: never fails the boot over a slot (a slot
+/// problem is a slot state); exits non-zero only on a usage error or when
+/// the state file cannot be written.
+fn run_dedicated(cli: &Cli, kek_file: &std::path::Path) -> ExitCode {
+    let (Some(volume_root), Some(state_out)) = (
+        cli.dedicated_volume_root.as_deref(),
+        cli.dedicated_state_out.as_deref(),
+    ) else {
+        eprintln!("hippius-guest-release: dedicated: usage: --dedicated-volume-root and --dedicated-state-out are required");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    if let Err(msg) = check_secret_out_path("--dedicated-state-out", state_out) {
+        eprintln!("hippius-guest-release: dedicated: {msg}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let cmdline_path = cli
+        .dedicated_cmdline
+        .as_deref()
+        .unwrap_or(std::path::Path::new("/proc/cmdline"));
+    let cmdline = match std::fs::read_to_string(cmdline_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "hippius-guest-release: dedicated: cmdline unreadable: {}",
+                e.kind()
+            );
+            return ExitCode::from(EXIT_DEDICATED_FAILED);
+        }
+    };
+    let mut host = dedicated::SysHost {
+        by_id: cli
+            .dedicated_by_id
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/dev/disk/by-id")),
+        sys_block: std::path::PathBuf::from("/sys/class/block"),
+        volume_root: volume_root.to_path_buf(),
+        cryptsetup: std::path::PathBuf::from("cryptsetup"),
+        scratch: state_out.parent().map_or_else(
+            || std::path::PathBuf::from("/run/hippius"),
+            std::path::Path::to_path_buf,
+        ),
+    };
+    match dedicated::run(&cmdline, kek_file, &mut host, state_out) {
+        Ok(_) => ExitCode::from(EXIT_OK),
+        Err(e) => {
+            eprintln!("hippius-guest-release: dedicated: state file: {e}");
+            ExitCode::from(EXIT_DEDICATED_FAILED)
+        }
+    }
+}
+
 fn log_fatal(err: &AgentError) {
     match err.sub_class() {
         Some(sub) => eprintln!(

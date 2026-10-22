@@ -307,6 +307,26 @@ def test_a_guest_without_recent_receipts_does_not_move(host: Vm) -> None:
 
 
 @pytest.mark.usefixtures("move_on")
+def test_a_vm_pinned_by_dedicated_disks_does_not_move(host: Vm) -> None:
+    """E4: only the operations the contract lists re-define a pinned VM."""
+    from apps.disktier.models import DedicatedDisk
+
+    DedicatedDisk.objects.create(
+        miner_node_id=NODE,
+        disk_id="wwn-0x01",
+        state="assigned",
+        assigned_vm=host,
+        assigned_slot="x0",
+        size_bytes=20000 * 2**30,
+        verified_tier="hdd",
+    )
+    with pytest.raises(MoveRefused) as exc:
+        storage_move.request_move(vm_id=VM, target_pool="nvme0")
+    assert exc.value.code == "dedicated-pinned"
+    assert not VmStorageMove.objects.exists()
+
+
+@pytest.mark.usefixtures("move_on")
 def test_the_target_needs_room_for_exactly_the_os_disk(host: Vm) -> None:
     MinerStoragePool.objects.filter(pool_id="nvme0").update(available_gb=50)
     move = storage_move.request_move(vm_id=VM, target_pool="nvme0")

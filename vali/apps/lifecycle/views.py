@@ -40,6 +40,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
+from apps.disktier import dedicated as disk_dedicated
 from apps.identity import scoping
 from apps.orchestration import power_policy
 from apps.orchestration.effects import EffectError, EffectUnavailable
@@ -201,8 +202,10 @@ class VmListView(APIView):
                         data_deaths,
                         last_failovers,
                         power_policy_hosts,
+                        dedicated_by_vm,
                     )
                     for region_by_host in [_region_by_host({r.host for r in rows})]
+                    for dedicated_by_vm in [disk_dedicated.read_back_many(rows)]
                     for power_policy_hosts in [power_policy.capable_hosts({r.host for r in rows})]
                     for public_ips in [_public_ip_by_vm(rows)]
                     for backup_states in [_backup_state_by_vm(rows)]
@@ -435,6 +438,14 @@ class VmTransitionView(APIView):
         except TransitionError as exc:
             return _error(status.HTTP_400_BAD_REQUEST, exc.message, exc.category)
 
+        # E4: a VM with dedicated disks never moves, whoever drives the SM.
+        if req.to_state == VmState.MIGRATING and disk_dedicated.is_pinned(vm):
+            return _error(
+                status.HTTP_409_CONFLICT,
+                disk_dedicated.pinned_message(vm, "migrated"),
+                disk_dedicated.CATEGORY_PINNED,
+            )
+
         # Generation arithmetic per §25 + Rust `u64` mirror.
         if req.to_state == VmState.MIGRATING and from_state == VmState.ACTIVE:
             # §25 generation fencing: the destination MUST run on a
@@ -563,6 +574,9 @@ class VmTransitionView(APIView):
             from apps.network.service import release_for_destroyed_vm
 
             release_for_destroyed_vm(vm)
+
+            # Its dedicated disks (E4): released, re-probed before resale.
+            disk_dedicated.release_for_destroyed_vm(vm)
 
         # Re-read so the response carries the post-update row + the
         # bumped version.
@@ -1179,6 +1193,7 @@ def _serialize_vm(
     data_death_by_vm: dict[Any, str] | None = None,
     last_failover_by_vm: dict[Any, Any] | None = None,
     power_policy_hosts: set[str] | None = None,
+    dedicated_by_vm: dict[Any, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Render a `Vm` row as the wire response. `eol_nonce` is OMITTED
     on purpose — clients shouldn't see it; only the guest sees it via
@@ -1202,6 +1217,8 @@ def _serialize_vm(
         data_death_by_vm = _data_death_by_vm([vm])
     if last_failover_by_vm is None:
         last_failover_by_vm = _last_failover_by_vm([vm])
+    if dedicated_by_vm is None:
+        dedicated_by_vm = disk_dedicated.read_back_many([vm])
     return {
         "vm_id": vm.vm_id,
         "tenant_id": vm.tenant_id,
@@ -1291,6 +1308,10 @@ def _serialize_vm(
         **power_policy.view(vm, power_policy_hosts),
         "created_at": vm.created_at.isoformat(),
         "updated_at": vm.updated_at.isoformat(),
+        # Dedicated disks (E4 contract §2): `pinned: true` + `disks[]` with
+        # each slot's size class, sold tier and state — present ONLY for a
+        # VM with a dedicated disk, so every other VM is byte-identical.
+        **dedicated_by_vm.get(vm.pk, {}),
     }
 
 

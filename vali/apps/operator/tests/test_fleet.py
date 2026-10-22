@@ -1204,3 +1204,68 @@ def test_disk_health_shows_the_latest_hour_per_target_without_tenants(
     (d,) = dh["dedicated_disks"]
     assert (d["disk_id"], d["verdict"], d["tier"]) == ("wwn-0x1", None, None)
     assert "user-secret" not in str(dh)
+
+
+# ─── agent release, update pending, auto-update ──────────────────────
+
+
+def _software(seed: int, auto_update: dict[str, Any]) -> None:
+    from apps.disktier.models import HostInventorySection
+
+    now = timezone.now()
+    HostInventorySection.objects.create(
+        miner_node_id=node_id(seed),
+        section="software",
+        digest="0" * 64,
+        body={"status": "ok", "uptime_s": 1, "auto_update": auto_update},
+        status="ok",
+        reported_at=now,
+        sequence=1,
+        received_at=now,
+    )
+
+
+def test_release_and_auto_update_mirror_the_nodes_rows(operator_client: APIClient) -> None:
+    """Claims: the fleet row carries the same three fields as
+    `/v1/operator/nodes`, and auto-update off / a failed release raise an
+    alert (off is abnormal); on and clean raises none."""
+    from apps.miners.models import AgentRelease
+
+    now = timezone.now()
+    AgentRelease.objects.create(
+        tag="v2026.10.20", published_at=now, ready_at=now - timedelta(hours=30), seen_at=now
+    )
+    for seed in (1, 2, 3):
+        make_dispatchable_identity(seed)
+        _mirror(seed)
+    MinerCapacity.objects.filter(miner_node_id=node_id(1)).update(agent_version="v2026.10.18")
+    MinerCapacity.objects.filter(miner_node_id=node_id(2)).update(agent_version="v2026.10.20")
+    _software(1, {"enabled": False, "disabled_reason": "disabled_in_env"})
+    _software(2, {"enabled": True, "failed_tag": "v2026.10.21"})
+    _software(3, {"enabled": True, "last_check_unix": 1_792_200_000})
+    body = _fleet(operator_client)
+    one, two, three = (_row(body, s) for s in (1, 2, 3))
+    assert one["latest_agent_release"]["tag"] == "v2026.10.20"
+    assert (one["update_pending"], two["update_pending"], three["update_pending"]) == (
+        True,
+        False,
+        None,
+    )
+    assert one["auto_update"]["disabled_reason"] == "disabled_in_env"
+    assert "auto-update-off" in one["alerts"]
+    assert "agent-update-failed" not in one["alerts"]
+    assert "agent-update-failed" in two["alerts"]
+    assert "auto-update-off" not in two["alerts"]
+    assert three["auto_update"]["last_check_at"] == "2026-10-17T01:20:00+00:00"
+    assert not {"auto-update-off", "agent-update-failed"} & set(three["alerts"])
+    assert body["totals"]["alerts"]["auto-update-off"] == 1
+
+
+def test_no_report_no_release_is_null_and_silent(operator_client: APIClient) -> None:
+    make_dispatchable_identity(1)
+    _mirror(1)
+    row = _row(_fleet(operator_client), 1)
+    assert row["latest_agent_release"] is None
+    assert row["update_pending"] is None
+    assert row["auto_update"] is None
+    assert not {"auto-update-off", "agent-update-failed"} & set(row["alerts"])

@@ -40,6 +40,7 @@ _ERROR_STATUS = {
     "disk-too-large": status.HTTP_409_CONFLICT,
     "no-launch-record": status.HTTP_409_CONFLICT,
     "vm-not-live": status.HTTP_409_CONFLICT,
+    "dedicated-pinned": status.HTTP_409_CONFLICT,
     "failover-auto-unavailable": status.HTTP_409_CONFLICT,
     "backup-unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
 }

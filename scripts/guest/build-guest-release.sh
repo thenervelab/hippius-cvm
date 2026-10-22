@@ -85,6 +85,8 @@ COMPONENTS="${HIPPIUS_GUEST_COMPONENTS_DIR:-${SCRIPT_DIR}/components}"
 INITRAMFS="${SCRIPT_DIR}/../initramfs"
 DRACUT="${SCRIPT_DIR}/../dracut/95hippius-golden"
 SHIM="${SCRIPT_DIR}/hippius-keepalive-start"
+# The tenant-facing dedicated-disks helper (lists, prints, never runs).
+DISKS="${SCRIPT_DIR}/hippius-disks"
 
 for tool in mksquashfs rdsquashfs cpio sha256sum python3; do
     command -v "${tool}" >/dev/null 2>&1 || die "missing host tool: ${tool}"
@@ -95,7 +97,7 @@ for b in "${AGENTS[@]}" "${INITRD_BINS[@]}"; do
     [[ -f "${bin_dir}/${b}" && -x "${bin_dir}/${b}" ]] || die "--bin-dir: missing executable ${b}"
 done
 for f in "${COMPONENTS}/release.conf" "${COMPONENTS}/selinux-labels" \
-         "${COMPONENTS}/etc/keepalive.env" "${SHIM}" \
+         "${COMPONENTS}/etc/keepalive.env" "${SHIM}" "${DISKS}" \
          "${INITRAMFS}/hippius-release-core.sh" "${INITRAMFS}/hippius-golden-overlay.sh" \
          "${INITRAMFS}/hippius-golden-boot" "${INITRAMFS}/hippius-net-teardown" \
          "${DRACUT}/hippius-golden-mount.sh" "${DRACUT}/hippius-net-teardown.sh" \
@@ -144,6 +146,7 @@ for b in "${AGENTS[@]}"; do
     install -m 0755 "${bin_dir}/${b}" "${img}/bin/${b}"
 done
 install -m 0755 "${SHIM}" "${img}/bin/hippius-keepalive-start"
+install -m 0755 "${DISKS}" "${img}/bin/hippius-disks"
 install -m 0644 "${COMPONENTS}/etc/keepalive.env" "${img}/etc/keepalive.env"
 units=()
 while IFS= read -r line; do

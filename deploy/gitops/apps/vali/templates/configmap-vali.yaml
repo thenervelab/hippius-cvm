@@ -365,6 +365,11 @@ data:
   VALI_POWER_POLICY_MIN_AGENT_VERSION: {{ .Values.scheduler.powerPolicyMinAgentVersion | quote }}
   # Pool routing (os_pool) — see values.yaml `scheduler.poolRoutingMinAgentVersion`.
   VALI_POOL_ROUTING_MIN_AGENT_VERSION: {{ .Values.scheduler.poolRoutingMinAgentVersion | default "" | quote }}
+  # OS-disk tiers — see values.yaml `scheduler.diskTierGate` and below.
+  VALI_SCHEDULER_DISK_TIER_GATE: {{ .Values.scheduler.diskTierGate | default "off" | quote }}
+  VALI_SELLABLE_OS_TIERS: {{ .Values.scheduler.sellableOsTiers | default (list "nvme") | join "," | quote }}
+  VALI_HDD_OS_MAX_FLAVOR: {{ .Values.scheduler.hddOsMaxFlavor | default "large" | quote }}
+  VALI_DISK_TIER_FALLBACK_OWNERS: {{ .Values.scheduler.diskTierFallbackOwners | default list | join "," | quote }}
   # External-miner approval gate — see values.yaml `scheduler.minerApprovalRequired`.
   VALI_MINER_APPROVAL_REQUIRED: {{ .Values.scheduler.minerApprovalRequired | default "false" | toString | quote }}
   # Automatic approval after an attested soak — see values.yaml `scheduler.minerAutoApprove`.
@@ -410,6 +415,24 @@ data:
   {{- end }}
   {{- with (.Values.storageMove).minAgentVersion }}
   VALI_STORAGE_MOVE_MIN_AGENT_VERSION: {{ . | quote }}
+  {{- end }}
+  {{- /* Dedicated physical disks (E4) — see values.yaml `dedicatedDisks`.
+         `enabled` always renders ("false" by default); every other key
+         renders only when set (unset = the settings.py default: every
+         owner once enabled, 8 per VM, no guest release and no agent
+         version qualify). */}}
+  VALI_DEDICATED_ENABLED: {{ (.Values.dedicatedDisks).enabled | default "false" | toString | quote }}
+  {{- with (.Values.dedicatedDisks).allowedOwners }}
+  VALI_DEDICATED_ALLOWED_OWNERS: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.dedicatedDisks).maxPerVm }}
+  VALI_DEDICATED_MAX_PER_VM: {{ . | toString | quote }}
+  {{- end }}
+  {{- with (.Values.dedicatedDisks).minGuestRelease }}
+  VALI_DEDICATED_MIN_GUEST_RELEASE: {{ . | toString | quote }}
+  {{- end }}
+  {{- with (.Values.dedicatedDisks).minAgentVersion }}
+  VALI_DEDICATED_MIN_AGENT_VERSION: {{ . | quote }}
   {{- end }}
   # §18.10 host inventory ingest — see values.yaml `hostInventory.ingest`.
   VALI_HOST_INVENTORY_INGEST: {{ (.Values.hostInventory).ingest | default "false" | toString | quote }}

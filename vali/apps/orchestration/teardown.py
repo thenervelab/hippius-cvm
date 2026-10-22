@@ -315,6 +315,12 @@ def force_destroy(vm_id: str, *, handoff_reason: str, label: str) -> str:
         Vm.objects.filter(vm_id=vm_id).exclude(state=VmState.DESTROYED).update(
             state=VmState.DESTROYED, **destroyed_power_fields()
         )
+        # Its dedicated disks, if any (E4): released for a wipe and a probe.
+        from apps.disktier.dedicated import release_for_destroyed_vm
+
+        destroyed = Vm.objects.filter(vm_id=vm_id).first()
+        if destroyed is not None:
+            release_for_destroyed_vm(destroyed)
     else:
         Vm.objects.filter(vm_id=vm_id).exclude(
             state__in=(VmState.DESTROYED, VmState.DECOMMISSIONING)

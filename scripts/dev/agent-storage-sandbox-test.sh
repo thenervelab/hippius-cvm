@@ -4,8 +4,10 @@
 # a pool bind-mounted at /var/lib/hippius-miner/pools/<id> is usable, one
 # elsewhere is refused, the same pool without the writable path reads
 # read-only, a dedicated disk is judged from the collector's facts, and
-# the sandbox really hides /dev/disk. Needs root (sudo -n) and systemd;
-# skips cleanly without them.
+# the sandbox really hides /dev/disk; and the dedicated-disk helpers hold
+# and wipe a real (loop) block device under their units' properties, which
+# the agent's own sandbox cannot. Needs root (sudo -n) and systemd; skips
+# cleanly without them.
 #
 #   scripts/dev/agent-storage-sandbox-test.sh <path to hippius-miner-agent>
 set -euo pipefail
@@ -31,7 +33,15 @@ fail=0
 err() { echo "FAIL: $*" >&2; fail=1; }
 ok() { echo "ok   $*"; }
 
+LOOP=""
+DED_RULE=/etc/udev/rules.d/61-hippius-dedicated-wwn-0x5000c500cafef00d.rules
 cleanup() {
+    sudo systemctl stop hippius-sbx-hold 2>/dev/null || true
+    sudo umount "${WORK}/mnt" 2>/dev/null || true
+    if [[ -n "${LOOP}" ]]; then sudo losetup -d "${LOOP}" 2>/dev/null || true; fi
+    sudo rm -r -f "${WORK}/dedfix" "${WORK}/results" "${WORK}/mnt" "${WORK}/dedicated.img" \
+        /var/lib/hippius-miner/vm-dedicated /var/lib/hippius-miner/dedicated-release \
+        /var/lib/hippius-miner/dedicated-disks.json "${DED_RULE}"
     sudo umount "${POOL}" 2>/dev/null || true
     sudo rm -f "${WORK}/pool.img" "${WORK}/config.toml" "${WORK}/facts.json" "${AGENT}" \
         /etc/hippius-miner/candidate.toml /root/sbxtest-candidate.toml /run/hippius-miner/disk-facts.json
@@ -190,6 +200,125 @@ if sudo systemd-run --quiet --wait --pipe --collect "${props[@]}" /bin/sh -c \
     ok "the sandbox hides /dev/disk and every block device"
 else
     err "the sandbox shows block devices"
+fi
+
+# ── Dedicated disks: the privileged hold and release wipe ───────────────
+# On a real block device (a loop device: it has no WWID, so its by-id link
+# and sysfs identity come from a fixture), each helper run under the
+# properties of its Ansible unit (no PrivateDevices), and refused under
+# the agent's own sandbox, which shows no device at all.
+DISK_ID=wwn-0x5000c500cafef00d
+STATE=/var/lib/hippius-miner
+sudo truncate -s 64M "${WORK}/dedicated.img"
+LOOP="$(sudo losetup --find --show "${WORK}/dedicated.img")"
+LOOP_NAME="$(basename "${LOOP}")"
+FIX="${WORK}/dedfix"
+sudo mkdir -p "${FIX}/by-id" "${FIX}/sys/${LOOP_NAME}/device" "${WORK}/results" "${STATE}/vm-dedicated"
+sudo ln -sfn "${LOOP}" "${FIX}/by-id/${DISK_ID}"
+sudo cp "/sys/block/${LOOP_NAME}/dev" "${FIX}/sys/${LOOP_NAME}/dev"
+echo "naa.sbxtest" | sudo tee "${FIX}/sys/${LOOP_NAME}/device/wwid" >/dev/null
+# The disk carries a filesystem (as a guest's LUKS would) and a marker in
+# the middle the wipe must not touch.
+sudo mkfs.ext4 -q -F "${LOOP}"
+printf 'HIPPIUS-MIDDLE' | sudo dd of="${LOOP}" bs=1 seek=$((32 * 1024 * 1024)) conv=notrunc status=none
+sudo tee "${STATE}/dedicated-disks.json" >/dev/null <<JSON
+{"disks": {"${DISK_ID}": "naa.sbxtest"}}
+JSON
+sudo tee "${STATE}/vm-dedicated/sbx-vm" >/dev/null <<JSON
+{"disks": [{"slot": "x0", "disk_id": "${DISK_ID}", "identity": "naa.sbxtest"}]}
+JSON
+
+helper_props=(-p ProtectSystem=strict -p ProtectHome=true -p PrivateTmp=true
+              -p PrivateNetwork=true -p NoNewPrivileges=true
+              -p ProtectKernelTunables=true -p ProtectControlGroups=true
+              -p "ReadWritePaths=/etc/udev/rules.d ${WORK}/results")
+helper_args=(--config "${WORK}/config.toml" --disk "${DISK_ID}" --result-dir "${WORK}/results"
+             --by-id-dir "${FIX}/by-id" --sys-block-dir "${FIX}/sys")
+verdict() { sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code"])' "${WORK}/results/${DISK_ID}.$1.json"; }
+release() {
+    sudo systemd-run --quiet --wait --pipe --collect "${helper_props[@]}" \
+        "${AGENT}" dedicated-release "${helper_args[@]}" >/dev/null 2>&1
+}
+
+# Not held yet, the host may mount it (what the hold must prevent).
+sudo mkdir -p "${WORK}/mnt"
+if sudo mount "${LOOP}" "${WORK}/mnt"; then
+    sudo umount "${WORK}/mnt"
+else
+    err "the unheld loop device does not mount (test setup)"
+fi
+
+# The hold, as its unit runs it (Type=notify: started once held).
+if sudo systemd-run --quiet --collect --unit=hippius-sbx-hold -p Type=notify -p NotifyAccess=main \
+    "${helper_props[@]}" "${AGENT}" dedicated-hold "${helper_args[@]}"; then
+    ok "the hold unit reached READY"
+else
+    err "the hold unit did not start: $(sudo journalctl -u hippius-sbx-hold -n 5 --no-pager 2>/dev/null)"
+fi
+[[ "$(verdict hold)" == "" ]] || err "hold verdict: $(verdict hold)"
+if sudo mount "${LOOP}" "${WORK}/mnt" 2>/dev/null; then
+    sudo umount "${WORK}/mnt"
+    err "a held disk could still be mounted by the host"
+else
+    ok "a held disk cannot be mounted by the host (O_EXCL)"
+fi
+if [[ -f "/etc/udev/rules.d/61-hippius-dedicated-${DISK_ID}.rules" ]]; then
+    ok "the hold installed its udev rule"
+else
+    err "no udev rule from the hold"
+fi
+
+# While a VM record names it: never wiped.
+release && err "a disk a VM holds was released"
+[[ "$(verdict release)" == "release-assigned" ]] || err "assigned: $(verdict release)"
+# §24 queued it, but the hold (a process) still has it open.
+sudo rm -f "${STATE}/vm-dedicated/sbx-vm"
+sudo mkdir -p "${STATE}/dedicated-release"
+sudo tee "${STATE}/dedicated-release/${DISK_ID}" >/dev/null <<JSON
+{"vm_id": "sbx-vm", "slot": "x0", "identity": "naa.sbxtest"}
+JSON
+release && err "a disk a process holds open was released"
+[[ "$(verdict release)" == "release-device-open" ]] || err "open: $(verdict release)"
+sudo systemctl stop hippius-sbx-hold
+# Another device behind the name.
+echo "naa.other" | sudo tee "${FIX}/sys/${LOOP_NAME}/device/wwid" >/dev/null
+release && err "a disk with another identity was released"
+[[ "$(verdict release)" == "release-identity-mismatch" ]] || err "identity: $(verdict release)"
+echo "naa.sbxtest" | sudo tee "${FIX}/sys/${LOOP_NAME}/device/wwid" >/dev/null
+sudo blkid -p "${LOOP}" >/dev/null 2>&1 || err "the filesystem vanished before the wipe (test setup)"
+
+# Everything allows the wipe now, but the agent's own sandbox cannot do it:
+# it shows no device. The privileged unit is required.
+if sudo systemd-run --quiet --wait --pipe --collect "${props[@]}" -p ReadWritePaths="${WORK}/results" \
+    "${AGENT}" dedicated-release "${helper_args[@]}" >/dev/null 2>&1; then
+    err "dedicated-release succeeded inside the agent's sandbox"
+elif [[ "$(verdict release)" == "helper-not-found" ]]; then
+    ok "inside the agent's sandbox the release helper cannot reach the device"
+else
+    err "inside the agent's sandbox: $(verdict release)"
+fi
+
+# The wipe: head and tail zeroed, the middle kept, nothing left for blkid.
+if release && [[ "$(verdict release)" == "" ]]; then
+    ok "the release unit wiped the disk"
+else
+    err "release failed: $(verdict release)"
+fi
+WIPE=$((16 * 1024 * 1024))
+SIZE="$(sudo blockdev --getsize64 "${LOOP}")"
+cmp -s -n "${WIPE}" <(sudo head -c "${WIPE}" "${LOOP}") /dev/zero || err "the first 16 MiB are not zero"
+cmp -s -n "${WIPE}" <(sudo tail -c "${WIPE}" "${LOOP}") /dev/zero || err "the last 16 MiB are not zero"
+[[ "$(sudo dd if="${LOOP}" bs=1 skip=$((32 * 1024 * 1024)) count=14 status=none)" == "HIPPIUS-MIDDLE" ]] \
+    || err "the wipe touched the middle of the disk"
+if sudo blkid -p "${LOOP}" >/dev/null 2>&1; then
+    err "a signature is left after the wipe"
+else
+    ok "no signature left (blkid -p), ${SIZE}-byte disk"
+fi
+if [[ ! -e "/etc/udev/rules.d/61-hippius-dedicated-${DISK_ID}.rules" ]]; then
+    ok "the release removed the udev rule"
+else
+    err "the udev rule outlived the release"
 fi
 
 if [[ ${fail} -ne 0 ]]; then

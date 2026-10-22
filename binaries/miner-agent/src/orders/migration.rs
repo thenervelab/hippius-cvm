@@ -2028,6 +2028,9 @@ pub fn dest_launch_failure(class: &str) -> MinerAgentError {
         MinerAgentError::Migration("dest-insufficient-disk")
     } else if class.starts_with("pool-unavailable:") {
         MinerAgentError::Migration("dest-pool-unavailable")
+    } else if class.starts_with("dedicated-") {
+        // Dedicated disks pin a VM to its host: refused before any start.
+        MinerAgentError::Migration("dest-dedicated-pinned")
     } else if class == "vm-pool-record" {
         // The VM's pool record could not be read or written: refused
         // before any domain start, not a statement about SEV.
@@ -2247,6 +2250,14 @@ mod tests {
             (
                 MinerAgentError::VmPoolRecord("unreadable"),
                 "migration/dest-vm-pool-record",
+            ),
+            (
+                MinerAgentError::DedicatedRefused("dedicated-pinned"),
+                "migration/dest-dedicated-pinned",
+            ),
+            (
+                MinerAgentError::DedicatedRefused("dedicated-order-mismatch"),
+                "migration/dest-dedicated-pinned",
             ),
             (
                 MinerAgentError::InsufficientResources,
@@ -3684,6 +3695,7 @@ mod tests {
                 net: None,
                 on_guest_poweroff: None,
                 os_pool: None,
+                extra_disks: Vec::new(),
             })
             .await
             .expect("launch should succeed");
@@ -4003,6 +4015,7 @@ mod tests {
                 net: None,
                 on_guest_poweroff: None,
                 os_pool: None,
+                extra_disks: Vec::new(),
             })
             .await
             .expect("launch should succeed");
@@ -4287,6 +4300,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         };
         lifecycle
             .launch(order)
@@ -4348,6 +4362,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         }
     }
 
@@ -4395,9 +4410,16 @@ mod tests {
         let repush = lifecycle.begin_ticket_push(&vm);
         let (lc, v) = (lifecycle.clone(), vm.clone());
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let (cid, ticket) = lc.ticket_for_vm(&v).unwrap();
-            lc.note_ticket_delivered(&v, cid, &ticket);
+            // Delivered once the launch has a ticket to deliver (a fixed
+            // sleep could fire before it, and the launch then waited out
+            // its far deadline).
+            loop {
+                if let Some((cid, ticket)) = lc.ticket_for_vm(&v) {
+                    lc.note_ticket_delivered(&v, cid, &ticket);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         });
         let out = launch_dest(
             &lifecycle,
@@ -4466,6 +4488,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         };
         lifecycle
             .launch(order(2))

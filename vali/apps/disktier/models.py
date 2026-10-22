@@ -163,6 +163,9 @@ class DedicatedDiskState(models.TextChoices):
     #: Probed at ≥ the hdd floor; placeable.
     FREE = "free", "free"
     ASSIGNED = "assigned", "assigned"
+    #: Its VM was decommissioned (§24): waits for the agent to report it
+    #: wiped and free again, then `pending_probe`. Never placeable.
+    RELEASED = "released", "released"
     #: Vanished, offline, or I/O errors.
     FAILED = "failed", "failed"
     DRAINING = "draining", "draining"
@@ -185,6 +188,11 @@ class DedicatedDisk(models.Model):
     miner_node_id = models.CharField(max_length=64)
     disk_id = models.CharField(max_length=DISK_ID_MAX_LEN)
     size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
+    #: The size the last probe measured (R3 writes it with the tier). What a
+    #: disk is sold, measured and billed at — never `size_bytes`, which the
+    #: miner rewrites on every heartbeat (a report below it means the disk
+    #: is not the one probed). `None` (never probed) is never placeable.
+    verified_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     declared_at = models.DateTimeField(null=True, blank=True)
     desired_state = models.CharField(
         max_length=10,
@@ -372,6 +380,12 @@ class PlacementDisk(models.Model):
     )
     size_gb = models.PositiveIntegerField()
     required_tier = models.CharField(max_length=8, choices=DiskTier.choices)
+    #: A dedicated slot's latest verdict from the guest's signed receipt
+    #: (`disk_io`): `ok`, `missing` or `mismatch`; blank until one arrives.
+    #: Forgeable by root in the VM: shown as the slot's `guest_state` only, never
+    #: its `state` (host evidence decides that, `apps.disktier.dedicated`).
+    observed_state = models.CharField(max_length=10, blank=True, default="", db_default="")
+    observed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

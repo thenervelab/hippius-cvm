@@ -91,8 +91,8 @@ def test_list_renders_regions_with_one_location_query(
     for i in range(6):
         _vm(f"vm-{i}", "miner-fr" if i % 2 else "miner-de")
     # 9: +1 for the page's flavor lookup (boot-stall deadline), one query;
-    # 10: +1 for the page's last failovers, one query.
-    with django_assert_max_num_queries(11):
+    # 10: +1 for the page's last failovers, one query; +1 for its dedicated disks.
+    with django_assert_max_num_queries(12):
         body = client.get(reverse("vm_list")).json()
     regions = {row["vm_id"]: row["region"] for row in body["vms"]}
     assert regions["vm-1"] == "FR" and regions["vm-2"] == "DE"

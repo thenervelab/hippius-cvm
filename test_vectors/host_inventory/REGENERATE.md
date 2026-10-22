@@ -11,9 +11,12 @@ Frozen outputs of the §18.10 host inventory wire format
 | `signed_host_inventory_full.cbor` | `SignedHostInventory::canonical()`: that body + an Ed25519 signature by the pinned test key. |
 | `host_inventory_body_counters.cbor` | the `counters` report `kat_counters()` (memory, storage, sensors, software). |
 | `signed_host_inventory_counters.cbor` | its signed envelope, same key. |
+| `host_inventory_body_auto_update.cbor` | `kat_auto_update()`: the counters report with `software.auto_update` set (added later; the two reports above carry none and did not move). |
+| `signed_host_inventory_auto_update.cbor` | its signed envelope, same key. |
 | `kat_vk.hex` | the test key's verifying key (hex), what vali resolves for the miner. |
 
 The inputs are pinned in the test (`kat_full()`, `kat_counters()`,
+`kat_auto_update()`,
 `KAT_SEED`). Every value is synthetic: no real serial, by-id name or host.
 
 A parallel encoder must reproduce these bytes for the same inputs. A

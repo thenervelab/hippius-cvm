@@ -11,10 +11,18 @@
   pool other than `default` with room, or `default` itself (its room is
   the data-disk gate's).
 - Nothing is measured: the tier only drives placement and billing.
+- [`may_fall_back`]: an owner in `VALI_DISK_TIER_FALLBACK_OWNERS` (our
+  own runners), under `enforce` only, whose VM no candidate can hold at its
+  sold tier, is placed at the first lower tier some candidate holds
+  (`DiskTierFit.fallbacks`). The sold tier in `spec_json` never changes:
+  where the disk landed is a placement fact ([`landing_tier`]), recorded on
+  its `PlacementDisk` and billing binding ([`log_fallback`]).
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Iterable
 
 from django.conf import settings
@@ -31,7 +39,9 @@ from .routing import (
     serves_os_disk_tier,
 )
 from .storage_config import version_at_least
-from .tiers import SELLABLE_TIERS, DiskTier, satisfies
+from .tiers import SELLABLE_TIERS, DiskTier, rank, satisfies
+
+log = logging.getLogger(__name__)
 
 #: What an absent `os_disk_tier` means: every OS disk was always sold so.
 DEFAULT_TIER: str = DiskTier.NVME
@@ -57,6 +67,153 @@ def gate_mode() -> str:
 
 def sellable_tiers() -> frozenset[str]:
     return frozenset(getattr(settings, "VALI_SELLABLE_OS_TIERS", [DiskTier.NVME]) or ())
+
+
+def fallback_owners() -> frozenset[str]:
+    """`VALI_DISK_TIER_FALLBACK_OWNERS`, as strings."""
+    raw = getattr(settings, "VALI_DISK_TIER_FALLBACK_OWNERS", ()) or ()
+    return frozenset(str(o).strip() for o in raw if str(o).strip())
+
+
+def may_fall_back(owner: object) -> bool:
+    """Whether a VM of `owner` (`Placement.owner`: the launch's `user_id`,
+    set by vali's operator-only launch API) may take a lower OS-disk tier
+    than its sold one when none holds it: only under `enforce`, and only
+    for an owner listed in `VALI_DISK_TIER_FALLBACK_OWNERS` — matched
+    exactly, as the string vali stores (never a customer's VM)."""
+    if gate_mode() != GATE_ENFORCE:
+        return False
+    return isinstance(owner, str) and bool(owner) and owner in fallback_owners()
+
+
+def lower_tiers(tier: str) -> tuple[str, ...]:
+    """The sellable tiers below `tier`, fastest first (nvme → ssd, hdd)."""
+    return tuple(t for t in SELLABLE_TIERS if rank(t) < rank(tier))
+
+
+def landing_tier(
+    node_id: str, tier: str, need_gb: int, owner: object, *, default_only: bool = False
+) -> str:
+    """The tier a `need_gb` OS disk sold at `tier` goes at on `node_id`:
+    `tier` itself, except for an owner that [`may_fall_back`] on a node
+    that does not hold it — then the first lower tier the node holds
+    (`tier` when it holds none: the gate refuses it as ever)."""
+    if not may_fall_back(owner) or not refusal_at(node_id, tier, need_gb, default_only):
+        return tier
+    for lower in lower_tiers(tier):
+        if not refusal_at(node_id, lower, need_gb, default_only):
+            return lower
+    return tier
+
+
+def refusal_at(node_id: str, tier: str, need_gb: int, default_only: bool = False) -> str:
+    """[`refusal`] with `default_only`."""
+    return refusals([node_id], tier, need_gb, default_only=default_only).get(node_id, "")
+
+
+def held_tier(node_id: str, pool_id: str, tier: str) -> str:
+    """The tier an OS disk sold at `tier` sits at on `node_id`'s `pool_id`
+    (`""` or `default` for the default pool): the pool's own OS-disk tier
+    when it is below `tier`, else `tier` (a pool of unknown tier: `tier`)."""
+    from .routing import default_pool_tier
+
+    if not pool_id or pool_id == DEFAULT_POOL_ID:
+        own = default_pool_tier(node_id)
+    else:
+        pool = MinerStoragePool.objects.filter(
+            miner_node_id=node_id, pool_id=pool_id, retired_at__isnull=True
+        ).first()
+        own = os_disk_tier_of(pool) if pool is not None else None
+    return own if own is not None and rank(own) < rank(tier) else tier
+
+
+def vm_owner(vm_id: str) -> str:
+    """The owner of `vm_id`'s newest placement (`""` without one)."""
+    from apps.scheduler.models import Placement
+
+    return (
+        Placement.objects.filter(vm__vm_id=vm_id)
+        .order_by("-decided_at")
+        .values_list("owner", flat=True)
+        .first()
+        or ""
+    )
+
+
+def fallback_owner_of(vm_id: str) -> str:
+    """`vm_id`'s owner ([`vm_owner`]) when it [`may_fall_back`], else `""`
+    — no query while the gate is not enforced or nobody is listed."""
+    if gate_mode() != GATE_ENFORCE or not fallback_owners():
+        return ""
+    owner = vm_owner(vm_id)
+    return owner if may_fall_back(owner) else ""
+
+
+def placed_tier(vm_id: str) -> str:
+    """The tier recorded for `vm_id`'s OS disk on its active placement
+    (`""` without such a row: a placement on `default` at its sold tier)."""
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES
+
+    from .models import OS_SLOT, PlacementDisk
+
+    return (
+        PlacementDisk.objects.filter(
+            placement__vm__vm_id=vm_id,
+            placement__status__in=list(ACTIVE_PLACEMENT_STATES),
+            slot=OS_SLOT,
+        )
+        .order_by("-placement__decided_at")
+        .values_list("required_tier", flat=True)
+        .first()
+        or ""
+    )
+
+
+def log_fallback(
+    *, vm_id: str, owner: str, node_id: str, sold: str, tier: str, context: str
+) -> None:
+    """A VM's OS disk placed below its sold tier: one structured WARNING
+    under the stable event name `disk_tier_fallback` (like E1's
+    `disk_tier_gate_would_reject`); the live count is the
+    `hippius_disk_tier_fallback_vms{tier}` gauge ([`fallback_vm_counts`])."""
+    log.warning(
+        "%s",
+        json.dumps(
+            {
+                "event": "disk_tier_fallback",
+                "vm_id": vm_id,
+                "owner": owner,
+                "node_id": node_id,
+                "os_disk_tier": sold,
+                "placed_tier": tier,
+                "context": context,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def fallback_vm_counts() -> dict[str, int]:
+    """`{tier: active VMs whose OS disk is recorded below its sold tier}`
+    for every tier below nvme. Only a fallback owner's VM can be, so only
+    theirs are read (none while the list is empty)."""
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES
+
+    from .models import OS_SLOT, PlacementDisk
+
+    counts = dict.fromkeys(lower_tiers(DiskTier.NVME), 0)
+    owners = fallback_owners()
+    if not owners:
+        return counts
+    rows = PlacementDisk.objects.filter(
+        slot=OS_SLOT,
+        placement__status__in=list(ACTIVE_PLACEMENT_STATES),
+        placement__owner__in=owners,
+    ).values_list("placement__vm__vm_id", "required_tier")
+    for vm_id, tier in rows:
+        if tier in counts and rank(tier) < rank(launch_tier(vm_id)):
+            counts[tier] += 1
+    return counts
 
 
 def parse(value: object) -> str:

@@ -52,6 +52,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
+from apps.disktier import dedicated as disk_dedicated
 from apps.disktier import os_tier
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
@@ -201,6 +202,14 @@ class SchedulerPlaceView(APIView):
         active = _active_placement(vm)
         if active is not None:
             return _idempotent_or_conflict(active, resource_class)
+        # A VM with dedicated disks is placed only by its launch, with its
+        # disks (E4): a bare placement elsewhere would strand them.
+        if disk_dedicated.is_pinned(vm):
+            return _error(
+                status.HTTP_409_CONFLICT,
+                disk_dedicated.pinned_message(vm, "placed again"),
+                disk_dedicated.CATEGORY_PINNED,
+            )
 
         # Gate (f) — `/place` sees no intent of its own: the region is the
         # VM's (its launch's, else where it ran). A VM that ran somewhere
@@ -234,7 +243,9 @@ class SchedulerPlaceView(APIView):
                 **service.cdn_edge_arguments(vm_family, vm_id),
                 **service.group_arguments(vm_id),
                 # Gate (n) — an OS pool at the VM's disk tier.
-                **service.disk_tier_arguments(resource_class, vm_id=vm_id),
+                **service.disk_tier_arguments(
+                    resource_class, vm_id=vm_id, owner=getattr(ticket, "user_id", "") or ""
+                ),
                 # Gate (m) — a `require_failover_peer` VM keeps it.
                 **service.failover_peer_arguments(
                     service.launch_requires_failover_peer(vm_id), vm_id
@@ -1041,8 +1052,14 @@ def _replace(
 
     Returns `(placement, None)` on success or `(None, error)` if the
     chain read failed or no miner was eligible. Excludes the miner
-    the failed placement was on so the VM genuinely moves.
+    the failed placement was on so the VM genuinely moves — never a VM
+    with dedicated disks (E4), whose disks cannot move.
     """
+    if disk_dedicated.is_pinned(vm):
+        return None, {
+            "error": disk_dedicated.pinned_message(vm, "placed elsewhere"),
+            "category": disk_dedicated.CATEGORY_PINNED,
+        }
     # Gate (f) — a re-placement stays in the VM's region (its launch's,
     # else where it ran); one that ran somewhere unknown goes nowhere.
     region = service.placement_region_for_vm(vm)
@@ -1071,7 +1088,9 @@ def _replace(
             max_family_per_node=service.cdn_family_cap(failed.vm_family),
             **service.cdn_edge_arguments(failed.vm_family, vm.vm_id),
             **service.group_arguments(vm.vm_id),
-            **service.disk_tier_arguments(failed.resource_class, vm_id=vm.vm_id),
+            **service.disk_tier_arguments(
+                failed.resource_class, vm_id=vm.vm_id, owner=failed.owner
+            ),
             **service.failover_peer_arguments(
                 service.launch_requires_failover_peer(vm.vm_id), vm.vm_id
             ),

@@ -354,7 +354,7 @@ class MinerLaunchErrors(models.Model):
     - `fail_streak`  failed attempts since the last accepted launch (every
                      attempt counts, a same-miner retry included).
     - `last_ok_at`   the last launch this miner accepted.
-    - `errors`       newest first, at most `launch_errors.MAX_RECENT`:
+    - `errors`       newest first, at most `launch_errors.MAX_STORED`:
                      `{code, class, http_status, stage, order_id, at}`.
     """
 
@@ -375,3 +375,28 @@ class MinerLaunchErrors(models.Model):
 
     def __str__(self) -> str:
         return f"MinerLaunchErrors {self.miner_id} (streak {self.fail_streak})"
+
+
+class AgentRelease(models.Model):
+    """A COMPLETE miner-agent release of the public repository, as the last
+    `vali_agent_release_watch` run read it (`apps.miners.agent_release`):
+    not a draft or prerelease, a `vYYYY.MM.DD[.N]` tag, and every file the
+    miners' updater needs attached. Each run replaces the table: a release
+    pulled from GitHub drops out.
+
+    Display only (`latest_agent_release`, `update_pending` on the operator
+    rows): nothing that places, pays or gates reads it."""
+
+    tag = models.CharField(max_length=32, primary_key=True)
+    published_at = models.DateTimeField()
+    #: When the last required asset landed (newest `updated_at`): the
+    #: updater's soak counts from here.
+    ready_at = models.DateTimeField()
+    #: The last run that listed it.
+    seen_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["-published_at"]
+
+    def __str__(self) -> str:
+        return f"AgentRelease {self.tag}"

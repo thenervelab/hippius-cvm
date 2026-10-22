@@ -279,6 +279,9 @@ pub struct CvmLifecycle {
     /// Serialises [`dhcp_reservation`] changes: two launches planning at
     /// once could pick the same address.
     dhcp_lock: tokio::sync::Mutex<()>,
+    /// Dedicated physical disks: claims, re-attach checks, holds and the
+    /// §24 release ([`crate::storage::assignment`]).
+    dedicated: Arc<crate::storage::assignment::DedicatedDisks>,
 }
 
 /// How long a preflight's ASID reservation holds without a launch.
@@ -399,6 +402,7 @@ impl CvmLifecycle {
             net_policy_gate: None,
             guest_runs: Arc::new(power_policy::GuestRuns::new()),
             dhcp_lock: tokio::sync::Mutex::new(()),
+            dedicated: Arc::new(crate::storage::assignment::DedicatedDisks::default()),
         }
     }
 
@@ -468,6 +472,154 @@ impl CvmLifecycle {
     pub fn with_storage_state(mut self, state: Arc<crate::storage::state::StorageState>) -> Self {
         self.pools = state;
         self
+    }
+
+    /// Decide dedicated disks with `dedicated` (production: the shared
+    /// identities, the collector's facts, the systemd helper units).
+    pub fn with_dedicated(
+        mut self,
+        dedicated: Arc<crate::storage::assignment::DedicatedDisks>,
+    ) -> Self {
+        self.dedicated = dedicated;
+        self
+    }
+
+    /// The dedicated-disk service (the heartbeat report shares it).
+    pub fn dedicated(&self) -> Arc<crate::storage::assignment::DedicatedDisks> {
+        Arc::clone(&self.dedicated)
+    }
+
+    /// The VM's dedicated-disk operations lock, when it has a record here
+    /// (or `wants` one): launches, destroys and reboot-watcher restarts of
+    /// such a VM never interleave. `None` for every other VM: their paths
+    /// are unchanged.
+    pub async fn dedicated_ops(
+        &self,
+        vm_id: &VmId,
+        wants: bool,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let path =
+            crate::storage::assignment::vm_record_path(&self.state_disk_root, vm_id.as_str());
+        if !wants
+            && matches!(path.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return None;
+        }
+        Some(self.dedicated.vm_ops(vm_id).await)
+    }
+
+    /// [`crate::storage::assignment::DedicatedDisks::prepare`] off the
+    /// async workers, against the storage set in force.
+    async fn prepare_dedicated(
+        &self,
+        vm_id: &VmId,
+        extra: &[crate::orders::ExtraDisk],
+        require_existing: bool,
+    ) -> Result<crate::storage::assignment::Prepared> {
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let storage = Arc::clone(&self.pools);
+        let (vm, extra) = (vm_id.clone(), extra.to_vec());
+        tokio::task::spawn_blocking(move || {
+            dedicated.prepare(
+                &crate::storage::assignment::Ctx {
+                    state_root: &root,
+                    storage: &storage,
+                },
+                &vm,
+                &extra,
+                require_existing,
+            )
+        })
+        .await
+        .unwrap_or(Err(MinerAgentError::DedicatedUnavailable("dedicated-join")))
+    }
+
+    /// Right before the domain starts: the record still names the disks,
+    /// and each is held.
+    async fn hold_dedicated(
+        &self,
+        vm_id: &VmId,
+        prepared: &crate::storage::assignment::Prepared,
+    ) -> Result<()> {
+        if prepared.attach.is_empty() && !prepared.created {
+            return Ok(());
+        }
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let (vm, prepared) = (vm_id.clone(), prepared.clone());
+        tokio::task::spawn_blocking(move || {
+            dedicated.confirm(&root, &vm, &prepared)?;
+            dedicated.hold_all(&prepared.attach)
+        })
+        .await
+        .unwrap_or(Err(MinerAgentError::DedicatedUnavailable("dedicated-join")))
+    }
+
+    async fn rollback_dedicated(
+        &self,
+        vm_id: &VmId,
+        prepared: &crate::storage::assignment::Prepared,
+    ) {
+        if !prepared.created {
+            return;
+        }
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let (vm, prepared) = (vm_id.clone(), prepared.clone());
+        let _ =
+            tokio::task::spawn_blocking(move || dedicated.rollback(&root, &vm, &prepared)).await;
+    }
+
+    /// Refuse what a VM pinned by dedicated disks may not undergo (§25
+    /// migration source or destination, a storage move, a backup, a
+    /// restore): 409 `dedicated-pinned`.
+    pub fn check_not_pinned(&self, vm_id: &VmId) -> Result<()> {
+        self.dedicated
+            .check_not_pinned(&self.state_disk_root, vm_id)
+    }
+
+    /// The reboot-watcher's identity and hold check before it restarts a
+    /// VM's persistent definition.
+    pub async fn check_dedicated_before_restart(&self, vm_id: &VmId) -> Result<()> {
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let vm = vm_id.clone();
+        tokio::task::spawn_blocking(move || dedicated.check_before_restart(&root, &vm))
+            .await
+            .unwrap_or(Err(MinerAgentError::DedicatedUnavailable("dedicated-join")))
+    }
+
+    /// Wipe the dedicated disks §24 freed and could not wipe at once.
+    pub async fn drain_dedicated_releases(&self) -> usize {
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        tokio::task::spawn_blocking(move || dedicated.drain_disks(&root, None))
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Whether `vm_id` has a dedicated-disk record here (readable or not).
+    pub fn has_dedicated_record(&self, vm_id: &VmId) -> bool {
+        !matches!(
+            crate::storage::assignment::vm_record_path(&self.state_disk_root, vm_id.as_str())
+                .symlink_metadata(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
+    /// Udev rules of dead holds for disks nobody holds any more, dropped.
+    pub async fn sweep_dedicated_rules(&self) {
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let _ = tokio::task::spawn_blocking(move || dedicated.sweep_rules(&root)).await;
+    }
+
+    /// At start: every recorded dedicated disk held again (best effort).
+    pub async fn hold_recorded_dedicated(&self) {
+        let dedicated = Arc::clone(&self.dedicated);
+        let root = self.state_disk_root.clone();
+        let _ = tokio::task::spawn_blocking(move || dedicated.hold_recorded(&root)).await;
     }
 
     /// The storage pools right now.
@@ -1243,7 +1395,75 @@ impl CvmLifecycle {
         // an M0 launch, byte-for-byte today's path.
         let guardian_ep =
             guardian::check_order_guardian(&order.cmdline, order.guardian_ep.as_deref())?;
-        // Phase 2B of audit follow-up Review #2 — compute the per-VM
+        // Dedicated disks: the list's shape, then which disks the VM gets
+        // (a first launch claims and records them; a VM that has disks here
+        // must name exactly those, re-checked by identity). Before anything
+        // is reserved, staged or defined.
+        crate::storage::assignment::validate_shape(&order.extra_disks)?;
+        crate::storage::assignment::check_anchor(&order.cmdline, &order.extra_disks)?;
+        // A VM with (or asking for) dedicated disks: no other launch,
+        // destroy or restart of it runs until this launch is over.
+        let _dedicated_ops = self
+            .dedicated_ops(&vm_id, !order.extra_disks.is_empty())
+            .await;
+        // Without dedicated disks asked or recorded: nothing to decide,
+        // no blocking hop (every other VM's launch path is unchanged).
+        let dedicated = if order.extra_disks.is_empty() && !self.has_dedicated_record(&vm_id) {
+            crate::storage::assignment::Prepared::default()
+        } else {
+            self.prepare_dedicated(&vm_id, &order.extra_disks, require_existing_disks)
+                .await?
+        };
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = self
+            .launch_prepared(
+                order,
+                LaunchPrepared {
+                    domain_uuid,
+                    cose_ticket,
+                    require_existing_disks,
+                    on_guest_poweroff,
+                    guardian_ep,
+                    dedicated: &dedicated,
+                    started: &started,
+                },
+            )
+            .await;
+        // A record this launch wrote, for a domain never started: no guest
+        // saw the disks, they are free again — once libvirt says the domain
+        // is down (a `virsh start` can fail while QEMU runs on, e.g. across
+        // a libvirtd restart; then the record stays until §24).
+        if result.is_err()
+            && dedicated.created
+            && !started.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if self.tenant_domain_liveness(&vm_id).await == DomainLiveness::Down {
+                self.rollback_dedicated(&vm_id, &dedicated).await;
+            } else {
+                eprintln!(
+                    "hippius-miner-agent: dedicated: vm {} launch failed and its domain is not \
+                     proven down: its disks stay assigned until §24",
+                    vm_id.as_str()
+                );
+            }
+        }
+        result
+    }
+
+    /// [`Self::launch_inner`] once the order's checks passed and its
+    /// dedicated disks are decided.
+    async fn launch_prepared(&self, order: LaunchOrder, pre: LaunchPrepared<'_>) -> Result<VmId> {
+        let LaunchPrepared {
+            domain_uuid,
+            cose_ticket,
+            require_existing_disks,
+            on_guest_poweroff,
+            guardian_ep,
+            dedicated,
+            started,
+        } = pre;
+        let vm_id = order.vm_id.clone();
+        // Phase 2B of audit follow-up Codex #2 — compute the per-VM
         // state-disk path BEFORE constructing the QemuConfig. The path
         // is rooted under `self.state_disk_root` (defaults to
         // `MINER_ROOT`; tests override via [`Self::with_state_disk_root`]).
@@ -1343,6 +1563,7 @@ impl CvmLifecycle {
             net: order.net,
             // Reserved below, once the launch is admitted.
             dhcp: None,
+            extra_disks: dedicated.attach.clone(),
         };
         config.validate()?;
         let domain_id = config.domain_name()?;
@@ -1616,6 +1837,15 @@ impl CvmLifecycle {
             }
         }
 
+        // The dedicated disks: still this VM's (a concurrent failed launch
+        // of the same VM may have taken a fresh record back), and held
+        // exclusively by the privileged hold unit before QEMU opens them.
+        if let Err(err) = self.hold_dedicated(&vm_id, dedicated).await {
+            self.unreserve_handle(&vm_id);
+            self.release_cid(&vm_id);
+            return Err(err);
+        }
+
         // The guest may use its disks from the moment the domain starts:
         // from then on a missing disk is refused, never recreated blank.
         // Recorded before the start, or the launch does not happen.
@@ -1629,7 +1859,9 @@ impl CvmLifecycle {
 
         // From here a failure HAS entered the virsh stage, so the
         // rollback force-destroys the domain — which is this CVM's own.
-        match self.run_domain(&mut config, &domain_id).await {
+        // Once the domain was created a guest may have seen the dedicated
+        // disks: they then stay recorded until §24 (`run_domain` says so).
+        match self.run_domain(&mut config, &domain_id, started).await {
             Ok(()) => {
                 // Promote the reservation to `Running` under the lock,
                 // which is released before any further `.await`.
@@ -1894,7 +2126,15 @@ impl CvmLifecycle {
     /// definition, and retry — bounded by `MAX_CID_COLLISION_RETRIES`. The
     /// tracked handle's CID is updated in lockstep so the vsock relay
     /// routes to the right guest.
-    async fn run_domain(&self, config: &mut QemuConfig, domain_id: &DomainId) -> Result<()> {
+    /// `started` turns true once `create_domain` succeeded: a guest ran
+    /// (a define or create failure leaves it false, and the launch's
+    /// dedicated disks go back).
+    async fn run_domain(
+        &self,
+        config: &mut QemuConfig,
+        domain_id: &DomainId,
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
         self.set_phase(&config.vm_id, CvmPhase::Launching)?;
         let mut attempt = 0u32;
         loop {
@@ -1902,6 +2142,7 @@ impl CvmLifecycle {
             self.driver.define_domain(&xml).await?;
             match self.driver.create_domain(domain_id).await {
                 Ok(()) => {
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
                     // The kernel just bound `config.cid` to THIS guest — the
                     // strongest proof there is. Clears an unverified mark the
                     // idempotent `allocate` may have handed back from a
@@ -2064,6 +2305,11 @@ impl CvmLifecycle {
         // A live storage move stops first: no block job may still write
         // the copy the reclaim below unlinks (every pool's overlay). No
         // move step runs until the destroy is over.
+        // Never interleaved with a launch or a restart of a VM with
+        // dedicated disks (taken even without a record yet: a first launch
+        // may be writing one), so the disks it releases are not being
+        // attached. Before the move lock, in the order a launch takes them.
+        let _dedicated_ops = self.dedicated_ops(vm_id, true).await;
         let _move_ops = self.move_ops_for(vm_id).await;
         self.abort_move_for_destroy(vm_id).await?;
         // The handle carries the LEGACY disk path when we still track the
@@ -2165,9 +2411,13 @@ impl CvmLifecycle {
         // trust — applied to the entry itself rather than its target.
         // A pool record left alone counts too: its pool may just be
         // unmounted, and the reclaim below records that.
+        // Dedicated disks this VM holds are a footprint too (released
+        // below, once the domain is proven down and undefined).
+        let dedicated = crate::storage::assignment::read_vm(&self.state_disk_root, vm_id.as_str());
         let mut anything = staging.symlink_metadata().is_ok()
             || backups.iter().any(|b| b.symlink_metadata().is_ok())
-            || !matches!(record, Ok(None));
+            || !matches!(record, Ok(None))
+            || !matches!(dedicated, Ok(None));
         for f in &files {
             if !f.as_os_str().is_empty() && f.exists() {
                 anything = true;
@@ -2305,6 +2555,28 @@ impl CvmLifecycle {
                      reclaim — libvirt record may need a manual `virsh undefine`",
                     vm_id.as_str()
                 );
+            }
+        }
+        // The dedicated disks go back to the host: queued for their wipe
+        // (durably) and the VM's record removed, here; the wipe itself
+        // (zero head and tail through the privileged release unit, then
+        // `blkid -p` must find nothing) runs detached, so the destroy
+        // answers at once, and the 5-min drain retries it. The KEK erase
+        // already killed the data; the wipe is what lets a re-probe prove
+        // it. A failure to queue fails the destroy (vali retries it); a
+        // failed wipe does not (the disk stays `unavailable` until it
+        // succeeds).
+        if !matches!(dedicated, Ok(None)) {
+            let svc = Arc::clone(&self.dedicated);
+            let (root, vm) = (self.state_disk_root.clone(), vm_id.clone());
+            let queued = tokio::task::spawn_blocking(move || svc.release_vm(&root, &vm))
+                .await
+                .unwrap_or(Err(MinerAgentError::DedicatedUnavailable("dedicated-join")))
+                .map_err(|_| MinerAgentError::Destroy("dedicated-release"))?;
+            if !queued.is_empty() {
+                let svc = Arc::clone(&self.dedicated);
+                let root = self.state_disk_root.clone();
+                tokio::task::spawn_blocking(move || svc.drain_disks(&root, Some(&queued)));
             }
         }
         if !staging.as_os_str().is_empty() {
@@ -4403,6 +4675,21 @@ fn require_disk(path: &std::path::Path, which: &'static str, pool: &str) -> Resu
     }
 }
 
+/// What [`CvmLifecycle::launch_inner`] decided before the launch proper.
+struct LaunchPrepared<'a> {
+    domain_uuid: DomainUuid,
+    cose_ticket: Vec<u8>,
+    require_existing_disks: bool,
+    on_guest_poweroff: Option<crate::orders::OnGuestPoweroff>,
+    guardian_ep: Option<hippius_types::guardian::GuardianEndpoint>,
+    /// The VM's dedicated disks ([`crate::storage::assignment`]).
+    dedicated: &'a crate::storage::assignment::Prepared,
+    /// Set right before the domain is first started: from then on a
+    /// failed launch keeps the dedicated-disk record (a guest may have
+    /// written to the disks; only §24 releases them).
+    started: &'a std::sync::atomic::AtomicBool,
+}
+
 /// Where a launch puts (or finds) the VM's writable disks.
 #[derive(Debug)]
 struct LaunchTarget {
@@ -6034,6 +6321,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         };
         let err = lc.launch(order).await.unwrap_err();
         assert!(

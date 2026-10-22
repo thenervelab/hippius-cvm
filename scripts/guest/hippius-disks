@@ -1,0 +1,133 @@
+#!/bin/sh
+# `hippius-disks` — list this VM's dedicated physical disks and print
+# example commands to build on them (docs/design/disk-tier-verification.md
+# §4.2). Shipped in the guest components release at
+# /run/hippius/guest/bin/hippius-disks.
+#
+# It only READS: the slot states the initramfs opener left in
+# /run/hippius/dedicated/slots and each mapping's size. It NEVER runs mdadm,
+# zpool, mkfs or anything that writes: RAID, filesystems and redundancy are
+# yours to choose. Every command it prints is an example.
+#
+# Exit: 0 ok (also when the VM has no dedicated disk), 2 usage.
+set -u
+
+STATE="${HIPPIUS_DISKS_STATE:-/run/hippius/dedicated/slots}"
+SYS_BLOCK="${HIPPIUS_DISKS_SYS_BLOCK:-/sys/class/block}"
+MAPPER_DIR="${HIPPIUS_DISKS_MAPPER_DIR:-/dev/mapper}"
+
+case "${1:-}" in
+    "") ;;
+    -h|--help)
+        printf 'Usage: hippius-disks\n\nLists the dedicated disks of this VM (slot, size, state, mapper path)\nand prints example mdadm / ZFS / filesystem commands. Runs nothing.\n'
+        exit 0 ;;
+    *) printf 'hippius-disks: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+esac
+
+if [ ! -r "${STATE}" ]; then
+    echo "This VM has no dedicated disks (no slot state at ${STATE})."
+    exit 0
+fi
+
+# Real size of a mapping in GiB, or "-".
+mapper_gib() {
+    _dev="$(readlink -f "${MAPPER_DIR}/$1" 2>/dev/null)" || _dev=""
+    _name="${_dev##*/}"
+    if [ -n "${_name}" ] && [ -r "${SYS_BLOCK}/${_name}/size" ]; then
+        echo $(( $(cat "${SYS_BLOCK}/${_name}/size") / 2097152 ))
+    else
+        echo "-"
+    fi
+}
+
+attached=""
+n_attached=0
+problems=0
+printf '%-5s %-10s %-10s %-26s %s\n' SLOT STATE "SIZE(GiB)" MAPPER NOTE
+while read -r slot state gib dev reason; do
+    case "${slot}" in ''|'#'*) continue ;; esac
+    case "${slot}" in x[0-9]|x[0-9][0-9]) ;; *) continue ;; esac
+    mapper="-"
+    note=""
+    case "${state}" in
+        attached)
+            mapper="/dev/mapper/hippius-${slot}"
+            real="$(mapper_gib "hippius-${slot}")"
+            [ "${real}" != "-" ] && gib="${real}"
+            attached="${attached} ${mapper}"
+            n_attached=$((n_attached + 1))
+            ;;
+        missing)
+            note="disk not present this boot (${reason})"
+            problems=$((problems + 1))
+            ;;
+        mismatch)
+            note="refused, not opened (${reason}, device ${dev})"
+            problems=$((problems + 1))
+            ;;
+        *) continue ;;
+    esac
+    printf '%-5s %-10s %-10s %-26s %s\n' "${slot}" "${state}" "${gib}" "${mapper}" "${note}"
+done < "${STATE}"
+
+echo
+if [ "${problems}" -gt 0 ]; then
+    echo "Some slots are not usable this boot. Hippius has been told (they are in the VM's"
+    echo "disk report); a missing or refused disk is never formatted again by the VM."
+    echo
+fi
+if [ "${n_attached}" -eq 0 ]; then
+    echo "No dedicated disk is open."
+    exit 0
+fi
+
+# shellcheck disable=SC2086  # the list is split on purpose
+set -- ${attached}
+cat <<EOF
+The disks above are already encrypted (LUKS2, AES-XTS, opened by the VM at
+boot under keys only this VM can obtain). They are raw block devices: no
+filesystem, no RAID. They have NO integrity protection of their own; use a
+checksumming layer (ZFS, btrfs) if you need corruption detection. Hippius
+does not back them up and they cannot be migrated: keep your own backups.
+
+Examples (NOT run — pick one, adapt, run it yourself):
+
+EOF
+if [ "$#" -eq 1 ]; then
+    cat <<EOF
+  # One filesystem on the disk
+  mkfs.xfs -L data $1
+  echo 'LABEL=data /data xfs defaults,nofail 0 2' >> /etc/fstab
+
+  # Or a ZFS pool (checksums, compression, snapshots)
+  zpool create -o ashift=12 -O compression=lz4 tank $1
+EOF
+else
+    level=1
+    [ "$#" -ge 3 ] && level=5
+    [ "$#" -ge 4 ] && level=6
+    raidz=mirror
+    [ "$#" -ge 3 ] && raidz=raidz1
+    [ "$#" -ge 4 ] && raidz=raidz2
+    cat <<EOF
+  # ZFS: one pool over all $# disks (${raidz}), with checksums
+  zpool create -o ashift=12 -O compression=lz4 tank ${raidz} $*
+
+  # Or Linux software RAID ${level}, then a filesystem
+  mdadm --create /dev/md0 --level=${level} --raid-devices=$# $*
+  mdadm --detail --scan >> /etc/mdadm/mdadm.conf   # /etc/mdadm.conf on RHEL-family
+  mkfs.xfs -L data /dev/md0
+  echo 'LABEL=data /data xfs defaults,nofail 0 2' >> /etc/fstab
+
+  # Or each disk on its own
+EOF
+    for m in "$@"; do
+        echo "  mkfs.xfs ${m}"
+    done
+fi
+cat <<EOF
+
+Use the /dev/mapper/hippius-xN paths (they are the same on every boot) and
+'nofail' in /etc/fstab, so a missing disk degrades the array instead of
+stopping the boot.
+EOF

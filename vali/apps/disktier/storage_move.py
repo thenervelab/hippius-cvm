@@ -63,7 +63,7 @@ from apps.orchestration import order_dispatch
 from apps.scheduler import usage
 from apps.scheduler.models import Placement, PlacementStatus, ReceiptWatermark
 
-from . import os_tier, routing
+from . import dedicated, os_tier, routing
 from .models import (
     OS_SLOT,
     TERMINAL_MOVE_STATES,
@@ -257,6 +257,10 @@ def request_move(
     placement = _bound_placement(vm)
     if placement is None:
         raise MoveRefused("move-vm-not-placed", "the VM has no bound placement")
+    if dedicated.is_pinned(vm):
+        # E4: a pinned VM's domain carries its dedicated disks; only the
+        # operations the contract lists may re-define it.
+        raise MoveRefused(dedicated.CATEGORY_PINNED, dedicated.pinned_message(vm, "moved"))
     node_id = placement.miner_node_id
     miner, why = gate(node_id)
     if why:

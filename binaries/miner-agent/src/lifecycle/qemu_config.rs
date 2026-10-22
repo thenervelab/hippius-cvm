@@ -155,6 +155,12 @@ pub struct QemuConfig {
     /// the interface and its address in the filter, so the filter learns
     /// nothing. Ignored without [`Self::net`]. Not a measured input.
     pub dhcp: Option<DhcpReservation>,
+    /// Dedicated physical disks ([`crate::storage::assignment`]), in slot
+    /// order: each a raw virtio block device on `/dev/disk/by-id/<id>`
+    /// (`vdf`, `vdg`, …), whose only identity in the guest is the virtual
+    /// serial `hippius-<slot>` — never the device's WWN or serial. Empty
+    /// renders the XML byte for byte as before. Not a measured input.
+    pub extra_disks: Vec<crate::storage::assignment::AttachDisk>,
 }
 
 impl QemuConfig {
@@ -239,7 +245,29 @@ impl QemuConfig {
             // path-without-size or size-without-path is a wiring bug.
             _ => return Err(MinerAgentError::LaunchInput("data-disk-mismatch")),
         }
+        validate_extra_disks(&self.extra_disks)?;
         Ok(())
+    }
+
+    /// The dedicated disks' `<disk>` elements (`""` without any).
+    fn extra_disks_xml(&self) -> String {
+        self.extra_disks
+            .iter()
+            .enumerate()
+            .map(|(n, d)| {
+                format!(
+                    "<disk type='block' device='disk'>\n      \
+                     <driver name='qemu' type='raw' cache='none' io='native' discard='ignore'/>\n      \
+                     <source dev='{src}'/>\n      \
+                     <target dev='{dev}' bus='virtio'/>\n      \
+                     <serial>hippius-{slot}</serial>\n    \
+                     </disk>\n    ",
+                    src = xml_escape(&d.source().to_string_lossy()),
+                    dev = crate::storage::assignment::AttachDisk::target_dev(n),
+                    slot = xml_escape(&d.slot),
+                )
+            })
+            .collect()
     }
 
     /// Render the libvirt domain XML for `virsh define`.
@@ -384,6 +412,7 @@ impl QemuConfig {
              <target dev='vdd' bus='virtio'/>\n    \
              </disk>\n    \
              {data_disk_xml}\
+             {extra_disks_xml}\
              {interface_xml}\
              <serial type='pty'>\n      \
              <target type='isa-serial' port='0'/>\n    \
@@ -414,6 +443,7 @@ impl QemuConfig {
             rootfs_hash = rootfs_hash,
             state_disk = state_disk,
             data_disk_xml = data_disk_xml,
+            extra_disks_xml = self.extra_disks_xml(),
             interface_xml = self.interface_xml(),
             cid = self.cid,
         )
@@ -595,6 +625,32 @@ fn validate_state_disk_path(path: &Path) -> Result<()> {
     validate_input_path(path, "state-disk-path")
 }
 
+/// The dedicated disks to render: at most
+/// [`crate::storage::assignment::MAX_EXTRA_DISKS`], each a valid slot and
+/// by-id name, none twice (the assignment already checked them; a wiring
+/// bug surfaces here, never as a disk attached twice or another device).
+fn validate_extra_disks(disks: &[crate::storage::assignment::AttachDisk]) -> Result<()> {
+    use crate::storage::assignment::{slot_index, MAX_EXTRA_DISKS};
+    if disks.len() > MAX_EXTRA_DISKS {
+        return Err(MinerAgentError::LaunchInput("extra-disks-too-many"));
+    }
+    let (mut slots, mut ids) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    for d in disks {
+        if slot_index(&d.slot).is_none()
+            || !hippius_types::storage_report::is_valid_dedicated_disk_id(&d.disk_id)
+        {
+            return Err(MinerAgentError::LaunchInput("extra-disk"));
+        }
+        if !slots.insert(d.slot.as_str()) || !ids.insert(d.disk_id.as_str()) {
+            return Err(MinerAgentError::LaunchInput("extra-disk-duplicate"));
+        }
+    }
+    Ok(())
+}
+
 /// Probe the first 4 bytes of `path` and return the libvirt `<driver
 /// type='…'>` attribute value. Recognises `QFI\xfb` as qcow2; falls
 /// back to `raw` on every other case (including read errors, missing
@@ -661,6 +717,7 @@ mod tests {
             cid: 7,
             net: None,
             dhcp: None,
+            extra_disks: Vec::new(),
         }
     }
 

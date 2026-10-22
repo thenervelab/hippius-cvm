@@ -781,6 +781,60 @@ def test_pool_routing_min_agent_version_is_one_shared_value() -> None:
     assert off["VALI_POOL_ROUTING_MIN_AGENT_VERSION"] == ""
 
 
+_DISK_TIER_KEYS = {
+    "VALI_SCHEDULER_DISK_TIER_GATE": "off",
+    "VALI_SELLABLE_OS_TIERS": "nvme",
+    "VALI_HDD_OS_MAX_FLAVOR": "large",
+    "VALI_DISK_TIER_FALLBACK_OWNERS": "",
+}
+
+
+@_needs_helm
+def test_the_os_disk_tier_keys_render_at_the_code_defaults() -> None:
+    """Every process that places a VM (web, launch tick, orchestration
+    tick) reads the tier gate, the sold tiers and the runner fallback from
+    the shared ConfigMap, never a per-pod override — and as shipped they
+    are the settings.py defaults: the gate off, nvme only, nobody falls
+    back. Unset values render the same."""
+    docs = _docs()
+    data = _configmap_data(docs)
+    assert {k: data[k] for k in _DISK_TIER_KEYS} == _DISK_TIER_KEYS
+    for label, env in _env_by_workload(docs).items():
+        assert not set(_DISK_TIER_KEYS) & set(env), label
+    unset = _configmap_data(
+        _docs(
+            "--set", "scheduler.diskTierGate=null",
+            "--set", "scheduler.sellableOsTiers=null",
+            "--set", "scheduler.hddOsMaxFlavor=null",
+            "--set", "scheduler.diskTierFallbackOwners=null",
+        )
+    )
+    assert {k: unset[k] for k in _DISK_TIER_KEYS} == _DISK_TIER_KEYS
+    on = _configmap_data(
+        _docs(
+            "--set", "scheduler.diskTierGate=enforce",
+            "--set", "scheduler.diskTierFallbackOwners={1334,77}",
+        )
+    )
+    assert on["VALI_SCHEDULER_DISK_TIER_GATE"] == "enforce"
+    assert on["VALI_DISK_TIER_FALLBACK_OWNERS"] == "1334,77"
+
+
+def test_the_os_disk_tier_defaults_match_settings() -> None:
+    """The chart's stated values ARE the code defaults, so stating them
+    changes nothing a pod does."""
+    src = SETTINGS.read_text()
+    assert '_env_list("VALI_SELLABLE_OS_TIERS", ["nvme"])' in src
+    assert 'os.environ.get("VALI_SCHEDULER_DISK_TIER_GATE", "off")' in src
+    assert 'os.environ.get("VALI_HDD_OS_MAX_FLAVOR", "large")' in src
+    assert '_env_list("VALI_DISK_TIER_FALLBACK_OWNERS", [])' in src
+    scheduler = yaml.safe_load(VALUES.read_text())["scheduler"]
+    assert scheduler["diskTierGate"] == "off"
+    assert scheduler["sellableOsTiers"] == ["nvme"]
+    assert scheduler["hddOsMaxFlavor"] == "large"
+    assert scheduler["diskTierFallbackOwners"] == []
+
+
 @_needs_helm
 def test_storage_move_canary_is_one_shared_value_and_renders_only_when_set() -> None:
     """The move driver (orchestration tick) and the operator command (web
@@ -1170,7 +1224,12 @@ def test_the_disktier_cronjobs_ship_suspended_with_the_vali_identity() -> None:
         assert template["metadata"]["labels"]["app.kubernetes.io/name"] == "vali", name
         (container,) = template["spec"]["containers"]
         assert container["command"] == ["python", "manage.py", commands[name]]
-    assert not [k for k in _configmap_data(docs) if k.startswith("VALI_DISK")]
+    # The runner tier fallback is a placement key, stated empty (its own test).
+    assert not [
+        k
+        for k in _configmap_data(docs)
+        if k.startswith("VALI_DISK") and k != "VALI_DISK_TIER_FALLBACK_OWNERS"
+    ]
 
 
 @_needs_helm
@@ -1447,3 +1506,60 @@ def test_per_miner_alerts_never_reuse_the_full_tier_series() -> None:
     }
     for r in rules:
         assert "hippius_synthetic_e2e_success" not in r["expr"], r["alert"]
+
+
+# ─── agent-release-watch ─────────────────────────────────────────────
+
+_WORLD_OFF = (
+    "--set", "createVm.enabled=false",
+    "--set", "vmBackup.failoverAutoEnabled=false",
+    "--set", "disktierProbe.enabled=false",
+    "--set", "syntheticMonitor.perMiner.enabled=false",
+)
+
+
+def _world_443_rules(docs: list[dict]) -> list[dict]:
+    (cnp,) = [
+        d
+        for d in docs
+        if d.get("kind") == "CiliumNetworkPolicy" and d["metadata"]["name"] == "vali"
+    ]
+    return [
+        r
+        for r in cnp["spec"].get("egress", [])
+        if "world" in (r.get("toEntities") or [])
+        and any(p.get("port") == "443" for tp in r.get("toPorts", []) for p in tp["ports"])
+    ]
+
+
+@_needs_helm
+def test_agent_release_watch_is_off_by_default_and_renders_nothing() -> None:
+    docs = _docs()
+    names = {(d.get("kind"), d["metadata"]["name"]) for d in docs}
+    assert ("CronJob", "agent-release-watch") not in names
+    assert "VALI_AGENT_RELEASE_WATCH" not in yaml.safe_dump(docs)
+    # Its egress rule is not there either: with the other world:443 users
+    # off, nothing opens the port.
+    assert _world_443_rules(_docs(*_WORLD_OFF)) == []
+
+
+@_needs_helm
+def test_agent_release_watch_on_renders_the_cronjob_and_its_egress() -> None:
+    docs = _docs("--set", "agentReleaseWatch.enabled=true", *_WORLD_OFF)
+    (job,) = [
+        d
+        for d in docs
+        if d.get("kind") == "CronJob" and d["metadata"]["name"] == "agent-release-watch"
+    ]
+    pod = job["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    (container,) = pod["containers"]
+    assert container["command"] == ["python", "manage.py", "vali_agent_release_watch"]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["VALI_AGENT_RELEASE_WATCH"] == "true"
+    # The flag lives in this pod only, never in the shared ConfigMap.
+    (cm,) = [
+        d for d in docs if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "vali-config"
+    ]
+    assert "VALI_AGENT_RELEASE_WATCH" not in cm["data"]
+    # The CNP that selects every vali pod opens world:443 for it.
+    assert len(_world_443_rules(docs)) == 1

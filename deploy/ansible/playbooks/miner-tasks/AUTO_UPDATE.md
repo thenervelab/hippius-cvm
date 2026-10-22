@@ -136,6 +136,16 @@ kill, `inactive` is a binary that exited cleanly: the agent unit uses
 rollback still cannot bring it back, the run logs an ERROR and marks the
 tag failed.
 
+A rollback to a binary older than the dedicated-disk helpers (no
+`dedicated-hold` / `dedicated-release` subcommands) leaves the hold and
+release units pointing at subcommands that binary does not have: holds
+fail (a launch with dedicated disks is refused, `dedicated-hold-failed`),
+release wipes fail and stay queued (the disks read `unavailable`,
+`disk-release-pending`), and the running holds keep holding. Nothing is
+wiped or attached wrongly, but no dedicated disk is given or freed until a
+binary with the helpers is back: on a host with assigned dedicated disks,
+roll forward rather than back.
+
 `/var/lib/hippius-miner/update-in-progress` holds the target tag from
 just before the new binary is installed until the update is committed or
 rolled back. A run cut short in between (unit timeout, power loss) is

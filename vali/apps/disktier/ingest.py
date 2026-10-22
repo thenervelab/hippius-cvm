@@ -4,8 +4,12 @@
 The report is an untrusted self-report: it fills the miner-reported columns
 of `MinerStoragePool` / `DedicatedDisk` (and the reported revision of a
 node's `MinerStorageConfig`) and nothing else. It never sets a
-tier, a health, a vali-side disk state or an assignment, and nothing reads
-these rows for placement yet.
+tier, a health or an assignment, and the one vali-side disk state it moves
+is `released → pending_probe` (E4, `dedicated.reconcile_released`): a disk
+§24 released that the agent reports wiped and free again, which only a
+probe then puts back on sale. Placement reads the reported columns of a
+`free` dedicated disk (`dedicated.qualifying`), never its size or tier from
+here alone.
 
 - A reported pool is upserted and un-retired; a known pool missing from
   the report is marked retired (its rows stay, so committed disks stay
@@ -45,7 +49,7 @@ from apps.telemetry.verifier import DeclaredStorage, DiskIoDelta, ServedReceiptF
 if TYPE_CHECKING:
     from apps.scheduler.models import Placement
 
-from . import probe_results
+from . import dedicated, probe_results
 from .models import (
     OS_SLOT,
     DedicatedDisk,
@@ -149,6 +153,10 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
             )
             if not created:
                 DedicatedDisk.objects.filter(pk=row.pk).update(**reported)
+        # The one vali-side disk state a report moves (E4): a disk §24
+        # released that the agent now reports wiped and free waits for a
+        # probe (`pending_probe`), never straight back to `free`.
+        dedicated.reconcile_released(node_id, now)
 
         # The revision of the vali-pushed document the agent has in force
         # (0 = its local config): the storage-config sync status and drift
@@ -432,7 +440,11 @@ def on_verified_receipt(
     (`probe_results.route`), whichever the other is."""
     io_on = bool(settings.VALI_DISK_IO_INGEST)
     probe_on = bool(settings.VALI_DISK_PROBE_ENABLED) and fields.disk_probe is not None
-    if not io_on and not probe_on:
+    # E4: the guest's verdict on each dedicated slot (the VM status's
+    # informational `guest_state`), recorded with either switch on. Pure until then.
+    verdicts = dedicated.slot_verdicts(fields.disk_io)
+    verdicts_on = bool(verdicts) and (io_on or dedicated.enabled())
+    if not io_on and not probe_on and not verdicts_on:
         _count("skipped_flag_off")
         return "off"
     if not fields.disk_io and fields.disk_probe is None:
@@ -452,10 +464,14 @@ def on_verified_receipt(
         _count("rejected_no_placement")
         return "rejected-no-placement"
 
+    if verdicts_on:
+        dedicated.record_slot_verdicts(
+            placement.pk, verdicts, datetime.fromtimestamp(fields.period_end, tz=UTC)
+        )
     digest = receipt_digest(body)
     probe_outcome = _route_probe(fields, placement, digest, now) if probe_on else ""
     if not io_on:
-        return f"probe-{probe_outcome}"
+        return f"probe-{probe_outcome}" if probe_on else "slot-verdicts"
     window_s = fields.period_end - fields.period_start
     hour = hour_of_window(fields.period_start, fields.period_end)
     with transaction.atomic():

@@ -73,6 +73,7 @@ from .models import (
 )
 from .placement import (
     MINER_ACTIVE,
+    DedicatedFit,
     DiskTierFit,
     ResourceFit,
     SelectionWeights,
@@ -82,6 +83,7 @@ from .placement import (
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from apps.disktier.dedicated import DedicatedRequest
     from apps.lifecycle.models import Vm
     from apps.miners.models import MinerIdentity
     from apps.telemetry.release_service import AttestorCoverageMap
@@ -1047,6 +1049,7 @@ def placement_arguments(
     power_policy_stop: bool = False,
     require_failover_peer: bool = False,
     os_disk_tier: str = "",
+    dedicated: DedicatedRequest | None = None,
 ) -> dict[str, Any]:
     """Every [`decide_placement`] argument EXCEPT `snapshot`, assembled
     from settings + the DB exactly as a real launch assembles them.
@@ -1055,6 +1058,9 @@ def placement_arguments(
 
     `os_disk_tier` is gate (n)'s tier (`""` ⇒ the VM's launch's, nvme
     without one), while the gate is not `off`.
+
+    `dedicated` (a launch sold dedicated disks) adds gate (o): only a node
+    with enough qualifying free disks. `None` ⇒ no gate, no query.
 
     `power_policy_stop` adds gate (l): only miners whose agent supports
     the guest-poweroff policy (an `on_guest_poweroff=stop` launch).
@@ -1128,17 +1134,44 @@ def placement_arguments(
         # ever find a destination.
         **failover_peer_arguments(require_failover_peer, vm_id),
         # Gate (n) — an OS pool at the VM's disk tier.
-        **disk_tier_arguments(flavor, vm_id=vm_id, os_disk_tier=os_disk_tier),
+        **disk_tier_arguments(flavor, vm_id=vm_id, os_disk_tier=os_disk_tier, owner=user_id),
+        # Gate (o) — the dedicated disks the VM was sold.
+        **dedicated_arguments(dedicated, vm_id=vm_id),
+    }
+
+
+def dedicated_arguments(request: DedicatedRequest | None, *, vm_id: str = "") -> dict[str, Any]:
+    """Gate (o)'s [`decide_placement`] argument: per dispatchable node whose
+    agent takes `extra_disks`, how many disks it has free that `request`
+    could take — or, for a VM that already holds disks (an earlier attempt
+    of its launch got past the KBS register), only their node, counted with
+    them. `{}` (no query) without a request."""
+    if request is None:
+        return {}
+    from apps.disktier import dedicated
+
+    held = dedicated.held_counts(vm_id) if vm_id else None
+    return {
+        "dedicated_fit": DedicatedFit(
+            count=request.count,
+            free_by_node=(
+                held
+                if held is not None
+                else dedicated.free_counts(request, dispatchable_node_ids())
+            ),
+        )
     }
 
 
 def disk_tier_arguments(
-    flavor: str, *, vm_id: str = "", os_disk_tier: str = ""
+    flavor: str, *, vm_id: str = "", os_disk_tier: str = "", owner: str = ""
 ) -> dict[str, Any]:
     """Gate (n)'s [`decide_placement`] argument: per dispatchable node, why
     it holds no OS disk of `flavor` (its data disk: `vm_id`'s launch's when
     it has one) at the tier (`os_disk_tier`, else `vm_id`'s launch's, else
-    nvme). `{}` (no query) while `VALI_SCHEDULER_DISK_TIER_GATE` is `off`."""
+    nvme). `{}` (no query) while `VALI_SCHEDULER_DISK_TIER_GATE` is `off`.
+    For an `owner` that `os_tier.may_fall_back`, the same at each lower
+    tier too (`DiskTierFit.fallbacks`)."""
     from apps.disktier import os_tier
 
     mode = os_tier.gate_mode()
@@ -1155,13 +1188,19 @@ def disk_tier_arguments(
     # names a pool); a VM with no launch yet is asked about as golden.
     golden = "golden_verity_overlay"
     legacy = bool(vm_id) and _launch_spec(vm_id).get("disk_mode", golden) != golden
-    return {
-        "disk_tier_fit": DiskTierFit(
+    nodes = dispatchable_node_ids()
+
+    def fit(at: str) -> DiskTierFit:
+        return DiskTierFit(
             mode=mode,
-            tier=tier,
-            refusal_by_node=os_tier.refusals(
-                dispatchable_node_ids(), tier, need_gb, default_only=legacy
-            ),
+            tier=at,
+            refusal_by_node=os_tier.refusals(nodes, at, need_gb, default_only=legacy),
+        )
+
+    fallbacks = os_tier.lower_tiers(tier) if os_tier.may_fall_back(owner) else ()
+    return {
+        "disk_tier_fit": dataclasses.replace(
+            fit(tier), fallbacks=tuple(fit(at) for at in fallbacks)
         )
     }
 
@@ -2791,6 +2830,9 @@ def _carry_placement_disks(src: Placement, dst: Placement) -> None:
                 "dedicated_disk_id": disk.dedicated_disk_id,
                 "size_gb": disk.size_gb,
                 "required_tier": disk.required_tier,
+                # A dedicated slot's last guest verdict (E4 `guest_state`).
+                "observed_state": disk.observed_state,
+                "observed_at": disk.observed_at,
             },
         )
 

@@ -213,6 +213,26 @@ fn reject_class<L: FnOnce(String)>(
         MinerAgentError::VsockCid(_) => {
             OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, "vsock-cid-exhausted")
         }
+        // Dedicated disks (`extra_disks`): a malformed list is the order's
+        // fault (400); a disk that cannot be given, or a pinned VM, is a
+        // conflict named after the slot (409); a decision that could not
+        // be made now is retryable (503). Refused before anything is
+        // staged or defined.
+        MinerAgentError::DedicatedInvalid(_) => {
+            OrderRejection::new(StatusCode::BAD_REQUEST, "dedicated-invalid")
+        }
+        MinerAgentError::DedicatedRefused(class) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: dedicated-refused-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::CONFLICT, class)
+        }
+        MinerAgentError::DedicatedUnavailable(class) => {
+            log_detail(format!(
+                "hippius-miner-agent: orders: dedicated-unavailable-detail vm={vm_id} class={err}"
+            ));
+            OrderRejection::new(StatusCode::SERVICE_UNAVAILABLE, class)
+        }
         // Every address of the guest network's DHCP range is held: the
         // host is full for a `net` NIC, like any capacity refusal (vali
         // re-places; not a SEV start fault). A failed reservation is a
@@ -535,6 +555,12 @@ pub async fn handle_move_vm_storage(
 ) -> std::result::Result<String, OrderRejection> {
     // A re-sent start of a move that did start answers its journal: the
     // conflicts below are for a new move only.
+    // Its dedicated disks pin a VM to its host and its storage (§6.1).
+    if order.action == crate::orders::MoveAction::Start {
+        if let Err(err) = lifecycle.check_not_pinned(&order.vm_id) {
+            return Err(reject_dispatch(&err, order.vm_id.as_str()));
+        }
+    }
     if order.action == crate::orders::MoveAction::Start
         && !lifecycle.is_journaled_move(&order.vm_id, &order.move_id)
     {
@@ -634,6 +660,10 @@ pub async fn handle_migrate_quiesce(
     order: MigrateQuiesceOrder,
 ) -> std::result::Result<String, OrderRejection> {
     let vm_id_str = order.vm_id.as_str().to_owned();
+    // A VM pinned by dedicated disks never migrates (§6.1).
+    if let Err(err) = lifecycle.check_not_pinned(&order.vm_id) {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     // A VM mid storage move migrates once it runs on the destination; the
     // source is released first.
     if let Err(err) = lifecycle.release_before_departure(&order.vm_id).await {
@@ -679,6 +709,10 @@ pub async fn handle_migrate_snapshot(
 ) -> std::result::Result<String, OrderRejection> {
     let vm_id = order.vm_id.clone();
     let vm_id_str = vm_id.as_str().to_owned();
+    // A VM pinned by dedicated disks never migrates (§6.1).
+    if let Err(err) = lifecycle.check_not_pinned(&vm_id) {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     // Fast, synchronous gate: a snapshot MUST follow a quiesce. Failing
     // here (before spawning) lets vali see `not-quiesced`/`disk-missing`
     // directly on the order response.
@@ -835,6 +869,16 @@ pub async fn handle_migrate_activate(
     if let Err(err) = lifecycle.check_net_policy_gate() {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
+    // A VM pinned by dedicated disks never moves (§6.1): its measured
+    // cmdline names them, or this host already holds disks for it.
+    let pinned = if crate::storage::assignment::cmdline_is_pinned(&order.cmdline) {
+        Err(MinerAgentError::DedicatedRefused("dedicated-pinned"))
+    } else {
+        lifecycle.check_not_pinned(&vm_id)
+    };
+    if let Err(err) = pinned {
+        return Err(reject_dispatch(&err, &vm_id_str));
+    }
     let _restore_lock = crate::backup::staged::restore_lock().await;
     if let Err(class) = check_staged_activate(&lifecycle, &order).await {
         let status = match class {
@@ -925,6 +969,10 @@ pub async fn handle_restore(
     let vm_id = order.vm_id.clone();
     match order.op {
         RestoreOp::Stage => {
+            // A pinned VM is never restored (§6.1).
+            if let Err(err) = lifecycle.check_not_pinned(&vm_id) {
+                return Err(reject_dispatch(&err, vm_id.as_str()));
+            }
             let chain = order.chain.ok_or(OrderRejection::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "restore-chain-missing",
@@ -1000,6 +1048,10 @@ pub fn handle_backup(
     order: crate::orders::types::BackupOrder,
 ) -> std::result::Result<String, OrderRejection> {
     let req = order.into_request();
+    // No backup of any kind for a VM with dedicated disks (§6.1).
+    if let Err(err) = lifecycle.check_not_pinned(&req.vm_id) {
+        return Err(reject_dispatch(&err, req.vm_id.as_str()));
+    }
     // A VM mid storage move is backed up once the move settles.
     if let Err(err) = lifecycle.check_no_move(&req.vm_id) {
         return Err(reject_dispatch(&err, req.vm_id.as_str()));
@@ -1484,6 +1536,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         }
     }
 

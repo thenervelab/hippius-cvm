@@ -41,6 +41,12 @@ zeroize = "1.8"
 ciborium = "0.2"
 # The stable cloud-init instance-id of an M1/M2 VM (`--instance-id-out`).
 sha2 = "0.10"
+# `--open-dedicated-disks`: the per-slot key (same crate and features as
+# hippius-guest, so nothing else in the workspace changes).
+hkdf = "0.12"
+# `--open-dedicated-disks`: the LUKS2 metadata check (already in this
+# binary through kbs-core, same features).
+serde_json = "1"
 # `O_DIRECT` / `O_EXCL` for `--integrity-wipe` (constants only; the
 # workspace forbids `unsafe`).
 libc = "0.2"

@@ -50,6 +50,7 @@ from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle import boot_stall, guest_liveness
 from apps.lifecycle import validator as lifecycle_validator
 from apps.lifecycle.models import (
@@ -701,13 +702,19 @@ def _reject_disk_tier_dest(vm: Vm, dest_node_id: str) -> None:
         return  # nothing vali knows of the host — the miner's own gate decides
     row = (
         Placement.objects.filter(vm=vm, status__in=ACTIVE_PLACEMENT_STATES)
-        .values_list("resource_class", "data_disk_gb")
+        .values_list("resource_class", "data_disk_gb", "owner")
         .first()
     )
     need_gb = sched.placement_disk_gb(row[0], row[1]) if row is not None else 0
     tier = os_tier.launch_tier(vm.vm_id)
     reason = os_tier.refusal(chain_node_id, tier, need_gb)
     if not reason:
+        return
+    # A fallback owner's VM may land below its sold tier: the choosers
+    # (`decide_placement`, `restore._pick_failover_dest`) try the sold tier
+    # first; a destination holding a lower one is not refused.
+    owner = row[2] if row is not None else ""
+    if os_tier.landing_tier(chain_node_id, tier, need_gb, owner) != tier:
         return
     if mode == os_tier.GATE_RECORD:
         log.info(
@@ -752,6 +759,13 @@ def start_migration(
     opens at that flavor — see `MigrationJob.resize_to_flavor`."""
     if vm.state != VmState.ACTIVE:
         raise StartError(f"vm is {vm.state!r}, not Active", "vm-not-active")
+    # A VM with dedicated disks never leaves its host (E4): its disks are
+    # physically there. Every §25 path (API, drain, price watch, migrating
+    # resize) comes through here.
+    if disk_dedicated.is_pinned(vm):
+        raise StartError(
+            disk_dedicated.pinned_message(vm, "migrated"), disk_dedicated.CATEGORY_PINNED
+        )
     cold = cold and vm.power_state == VmPowerState.STOPPED
     if vm.power_state != VmPowerState.RUNNING and not cold:
         # §25 needs the running source guest: its graceful quiesce produces
@@ -1607,6 +1621,10 @@ def enroll_departing_miner_migrations(
         if _has_active_job(vm):
             skipped[vm.vm_id] = "job-in-flight"
             continue
+        if disk_dedicated.is_pinned(vm):
+            # Its disks are on this host: it cannot follow the drain (E4).
+            skipped[vm.vm_id] = disk_dedicated.CATEGORY_PINNED
+            continue
         # The region the VM was sold in. An auto-migration is the one path
         # where nobody is watching the destination get chosen, so it is
         # exactly where a "FR" VM would otherwise quietly end up in "DE".
@@ -1646,7 +1664,9 @@ def enroll_departing_miner_migrations(
                 **sched.cdn_edge_arguments(placement.vm_family, vm.vm_id),
                 **sched.group_arguments(vm.vm_id),
                 # Gate (n) — an OS pool at the VM's disk tier.
-                **sched.disk_tier_arguments(placement.resource_class, vm_id=vm.vm_id),
+                **sched.disk_tier_arguments(
+                    placement.resource_class, vm_id=vm.vm_id, owner=placement.owner
+                ),
                 # No gate (m): a `require_failover_peer` VM leaving a
                 # departing miner moves in-region even without a peer, rather
                 # than staying stranded (logged below; its policy then reads
@@ -3949,7 +3969,13 @@ def _pin_dest_os_pool(job: MigrationJob) -> str | None:
 def _record_dest_os_pool(job: MigrationJob, placement: Any) -> None:
     """A4b: the destination placement's OS disk is on the pool the activate
     order named (none named: `default`, no row). Attribution only (passive
-    disk stats): a failure is logged, never fails the activation."""
+    disk stats): a failure is logged, never fails the activation. A
+    fallback owner's VM: `_record_dest_os_tier` instead."""
+    from apps.disktier import os_tier
+
+    if placement is not None and os_tier.may_fall_back(placement.owner):
+        _record_dest_os_tier(job, placement)
+        return
     if placement is None or not job.dest_os_pool:
         return
     try:
@@ -3961,6 +3987,30 @@ def _record_dest_os_pool(job: MigrationJob, placement: Any) -> None:
         log.exception(
             "migration: job=%s dest os pool %s not recorded", job.job_id, job.dest_os_pool
         )
+
+
+def _record_dest_os_tier(job: MigrationJob, placement: Any) -> None:
+    """A fallback owner's VM arrived: its destination placement's OS disk
+    row (`default` included) and its billing binding carry the tier the
+    disk sits at there (`os_tier.held_tier`: the pool's, when below the
+    sold one), logged when below. A failure is logged, never fails the
+    activation."""
+    from apps.disktier import os_tier
+    from apps.disktier.routing import DEFAULT_POOL_ID
+    from apps.orchestration.services.launch import _log_fallback, _record_os_pool
+    from apps.scheduler.models import VmBillingBinding
+
+    try:
+        with transaction.atomic():
+            sold = os_tier.launch_tier(job.vm.vm_id)
+            tier = os_tier.held_tier(placement.miner_node_id, job.dest_os_pool, sold)
+            _record_os_pool(placement, job.dest_os_pool or DEFAULT_POOL_ID, tier)
+            VmBillingBinding.objects.filter(vm_id=job.vm.vm_id).update(os_disk_tier=tier)
+    except Exception:  # noqa: BLE001 — attribution must not break custody.
+        log.exception("migration: job=%s dest os disk tier not recorded", job.job_id)
+        return
+    if tier != sold:
+        _log_fallback(placement, tier, context="migration")
 
 
 def _guarded(key: str, effect: Callable[[], None]) -> None:
@@ -5681,7 +5731,9 @@ def _destroy_vm(job: DecommissionJob) -> None:
     vm = Vm.objects.get(id=job.vm_id)
     if vm.state == VmState.DESTROYED:
         # A re-run after a crash between the CAS below and the tombstone:
-        # the row is already dead, but the KBS may not have heard.
+        # the row is already dead, but the KBS may not have heard — nor its
+        # dedicated disks been released (idempotent).
+        disk_dedicated.release_for_destroyed_vm(vm)
         _try_kbs_tombstone(job, vm)
         return
     if vm.state != VmState.DECOMMISSIONING:
@@ -5714,6 +5766,10 @@ def _destroy_vm(job: DecommissionJob) -> None:
     from apps.network.service import release_for_destroyed_vm
 
     release_for_destroyed_vm(vm)
+
+    # …and its dedicated disks (E4): `released`, then re-probed before they
+    # are sold again — never straight back to `free`.
+    disk_dedicated.release_for_destroyed_vm(vm)
 
     # Last: tell the KBS. Never raises — a KBS that cannot be reached must
     # not hold a destroyed VM open; the sweep re-drives a failure.

@@ -268,6 +268,9 @@ fn d1_phases(device: &Path, nonce: &[u8; 32], t: &Timing, out: &mut DiskProbeTar
     if size < t.d1_min_bytes {
         return Err(ProbeError::Target("disk-too-small"));
     }
+    // The size the guest sees (ungraded): vali sells the disk at this
+    // size, never at the miner's own figure.
+    out.metrics.push(metric("size_mib", size / MIB));
     let run = Run { file: &file, nonce };
     let zone_len = t.d1_zone_len.min(size / 4) / MIB * MIB;
     let zone = |name: &'static str, at_percent: u64| Phase {
@@ -437,8 +440,13 @@ mod tests {
                 "seq_read_mid_mbps",
                 "seq_read_outer_mbps",
                 "seq_write_mbps",
+                "size_mib",
                 "surface_errors"
             ]
+        );
+        assert_eq!(
+            t.metrics.iter().find(|(k, _)| k == "size_mib").unwrap().1,
+            16
         );
         assert_eq!(
             t.metrics

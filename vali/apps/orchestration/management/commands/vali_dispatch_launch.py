@@ -235,6 +235,17 @@ class Command(BaseCommand):
                 f"miner {miner_id!r} has no netbird_ip recorded — "
                 "register the miner via PR #120 first"
             )
+        # E4: this hand-built order names no dedicated disk, so it never
+        # (re)launches a VM that holds or was sold them.
+        from apps.disktier import dedicated
+        from apps.lifecycle.models import Vm
+
+        vm = Vm.objects.filter(vm_id=opts["vm_id"]).first()
+        if vm is not None and dedicated.is_pinned(vm):
+            raise CommandError(
+                f"vm {opts['vm_id']!r} has dedicated disks: relaunch it through vali "
+                "(power start / reboot-recovery), which sends them"
+            )
 
         # Read the COSE_Sign1 envelope from disk. The bytes flow
         # opaquely through every downstream layer (vali → Edge sign →

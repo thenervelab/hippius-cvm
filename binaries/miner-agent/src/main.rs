@@ -323,6 +323,18 @@ enum Command {
         #[arg(long, default_value = hippius_miner_agent::storage::dedicated::DISK_FACTS_PATH)]
         facts: PathBuf,
     },
+    /// Hold a dedicated disk exclusively (`O_EXCL`) for the VM the agent's
+    /// records give it to, until stopped. Run by
+    /// `hippius-miner-dedicated-hold@<id>.service` OUTSIDE the agent's
+    /// sandbox; refuses a disk no VM record names or whose identity
+    /// changed.
+    DedicatedHold(HelperArgs),
+    /// Zero the first and last 16 MiB of a dedicated disk §24 released and
+    /// verify no signature is left. Run by
+    /// `hippius-miner-dedicated-release@<id>.service` OUTSIDE the agent's
+    /// sandbox; refuses a disk without a release record, one any VM record
+    /// names, one whose identity changed, or one a process has open.
+    DedicatedRelease(HelperArgs),
     /// Long-running daemon (MA-4 + MA-5 + MA-6). Loads + validates the
     /// config and identity, then hosts the AF_VSOCK guest relay, the
     /// signed-order HTTP server and the §K signed-heartbeat subsystem
@@ -332,6 +344,28 @@ enum Command {
         #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
         config: PathBuf,
     },
+}
+
+/// `dedicated-hold` / `dedicated-release`.
+#[derive(Args)]
+struct HelperArgs {
+    /// Operator config file (its state root holds the records).
+    #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
+    config: PathBuf,
+    /// The `/dev/disk/by-id/` basename.
+    #[arg(long)]
+    disk: String,
+    /// Where the verdict is written.
+    #[arg(long, default_value = hippius_miner_agent::storage::dedicated_helper::RESULT_DIR)]
+    result_dir: PathBuf,
+    /// Test hooks (the sandbox CI test drives a loop device): another
+    /// by-id directory and sysfs block directory, and no udev rule.
+    #[arg(long, hide = true)]
+    by_id_dir: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    sys_block_dir: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    no_udev: bool,
 }
 
 /// `host-inventory-collect --mode`.
@@ -483,6 +517,8 @@ fn run() -> Result<()> {
         Command::GracefulExitHeartbeat { config } => cmd_graceful_exit_heartbeat(&config),
         Command::Serve { config } => cmd_serve(&config),
         Command::StorageCollect { out } => cmd_storage_collect(&out),
+        Command::DedicatedHold(args) => cmd_dedicated_hold(&args),
+        Command::DedicatedRelease(args) => cmd_dedicated_release(&args),
         Command::StorageCheck {
             config,
             collect,
@@ -649,6 +685,92 @@ fn cmd_storage_collect(out: &Path) -> Result<()> {
         out.display()
     );
     Ok(())
+}
+
+/// Where the helper reads the host and the agent's records.
+fn helper_env(
+    args: &HelperArgs,
+) -> Result<hippius_miner_agent::storage::dedicated_helper::HelperEnv> {
+    let config = Config::read(&args.config)?;
+    let mut env = hippius_miner_agent::storage::dedicated_helper::HelperEnv::system(
+        config.storage.state_disk_root,
+    );
+    if let Some(dir) = &args.by_id_dir {
+        env.paths.by_id = dir.clone();
+    }
+    if let Some(dir) = &args.sys_block_dir {
+        env.paths.sys_block = dir.clone();
+    }
+    if args.no_udev {
+        env.udev_rules_dir = None;
+    }
+    Ok(env)
+}
+
+/// `dedicated-hold`: check, hold, tell systemd, wait for SIGTERM.
+fn cmd_dedicated_hold(args: &HelperArgs) -> Result<()> {
+    use hippius_miner_agent::storage::dedicated_helper as helper;
+    use nix::sys::signal::{SigSet, Signal};
+    let (dir, disk) = (args.result_dir.as_path(), args.disk.as_str());
+    let env = match helper_env(args) {
+        Ok(env) => env,
+        Err(err) => {
+            helper::write_result(dir, disk, "hold", "helper-records-unreadable");
+            return Err(err);
+        }
+    };
+    // Block the stop signals before the hold exists, so none is lost.
+    let mut stop = SigSet::empty();
+    stop.add(Signal::SIGTERM);
+    stop.add(Signal::SIGINT);
+    stop.thread_block()
+        .map_err(|_| MinerAgentError::ConfigInvalid("dedicated-hold-signals"))?;
+    let held = match helper::hold(&env, disk) {
+        Ok(file) => file,
+        Err(code) => {
+            helper::write_result(dir, disk, "hold", code);
+            eprintln!("hippius-miner-agent: dedicated-hold: {disk} refused: {code}");
+            // The unit's `RestartPreventExitStatus`: a refusal is final.
+            std::process::exit(helper::HOLD_REFUSED_EXIT);
+        }
+    };
+    helper::write_result(dir, disk, "hold", "");
+    helper::notify_ready();
+    eprintln!("hippius-miner-agent: dedicated-hold: {disk} held");
+    let _ = stop.wait();
+    drop(held);
+    helper::after_hold(&env, disk);
+    eprintln!("hippius-miner-agent: dedicated-hold: {disk} let go on stop");
+    Ok(())
+}
+
+/// `dedicated-release`: the checks, the head/tail wipe, the verification.
+fn cmd_dedicated_release(args: &HelperArgs) -> Result<()> {
+    use hippius_miner_agent::storage::dedicated_helper as helper;
+    let (dir, disk) = (args.result_dir.as_path(), args.disk.as_str());
+    let env = match helper_env(args) {
+        Ok(env) => env,
+        Err(err) => {
+            helper::write_result(dir, disk, "release", "helper-records-unreadable");
+            return Err(err);
+        }
+    };
+    match helper::release(
+        &env,
+        disk,
+        &hippius_miner_agent::storage::dedicated::BlkidProbe,
+    ) {
+        Ok(()) => {
+            helper::write_result(dir, disk, "release", "");
+            eprintln!("hippius-miner-agent: dedicated-release: {disk} wiped and verified clean");
+            Ok(())
+        }
+        Err(code) => {
+            helper::write_result(dir, disk, "release", code);
+            eprintln!("hippius-miner-agent: dedicated-release: {disk} refused: {code}");
+            Err(MinerAgentError::ConfigInvalid("dedicated-release-refused"))
+        }
+    }
 }
 
 /// `host-inventory-collect --mode kernel`: the journal tail. Busy (a
@@ -1178,6 +1300,13 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             config.storage.state_disk_root.clone(),
         )
         .with_storage_state(Arc::clone(&storage_state))
+        .with_dedicated(Arc::new(
+            hippius_miner_agent::storage::assignment::DedicatedDisks::new(
+                Box::new(hippius_miner_agent::storage::dedicated::FileFacts::default()),
+                Box::new(hippius_miner_agent::storage::assignment::SystemdHelper::default()),
+                Arc::clone(&disk_identities),
+            ),
+        ))
         .with_progress_sink(progress.clone())
         .with_net_policy_gate(Arc::clone(&net_policy)),
     );
@@ -1336,7 +1465,8 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             Arc::clone(&storage_state),
             hippius_miner_agent::storage::remote::Host::system(),
             Arc::clone(&disk_identities),
-        ),
+        )
+        .with_assignment_lock(lifecycle.dedicated().assignment_lock()),
     ));
 
     // Bind the orders HTTP server. `Config::validate` already proved
@@ -1423,7 +1553,8 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
                 Arc::clone(&storage_state),
                 config.storage.state_disk_root.clone(),
             )
-            .with_identities(Arc::clone(&disk_identities)),
+            .with_identities(Arc::clone(&disk_identities))
+            .with_dedicated(lifecycle.dedicated()),
         ));
     }
     let heartbeat_builder = Arc::new(heartbeat_builder);
@@ -1581,6 +1712,12 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     // Unlinks the disks destroys could not reach on a pool that was off
     // its filesystem, once it is back (nothing to do without pools).
     let _pool_reclaim_task = tokio::spawn(hippius_miner_agent::storage::reclaim::run(
+        Arc::clone(&lifecycle),
+        cancel.clone(),
+    ));
+    // Dedicated disks: re-take the holds of the recorded ones, and retry
+    // the release wipes §24 could not finish (nothing to do without any).
+    let _dedicated_task = tokio::spawn(hippius_miner_agent::storage::assignment::run(
         Arc::clone(&lifecycle),
         cancel.clone(),
     ));
@@ -1877,6 +2014,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
             cid: MIN_GUEST_CID,
             net: None,
             dhcp: None,
+            extra_disks: Vec::new(),
         };
         let digest = compute_launch_digest(&config)?;
         // stdout: the digest is the §F allowlist measurement — pipe it
@@ -1914,6 +2052,7 @@ fn cmd_launch_test(args: LaunchTestArgs) -> Result<()> {
         net: None,
         on_guest_poweroff: None,
         os_pool: None,
+        extra_disks: Vec::new(),
     };
 
     // The lifecycle is async (`tokio::process` drives `virsh`); a

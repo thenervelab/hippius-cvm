@@ -228,6 +228,7 @@ impl InfraDomainConfig {
             cid: self.cid,
             net: None,
             dhcp: None,
+            extra_disks: Vec::new(),
         })
     }
 

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use hippius_types::disk_stats::{DiskProbeResult, DiskProbeTarget, HIST_BUCKETS};
 
-use crate::crypt::Mapping;
+use crate::crypt::{close_opener_mapping, Mapping};
 use crate::error::{ProbeError, Result};
 use crate::profiles::{self, Timing};
 use crate::request::{Profile, Request};
@@ -20,6 +20,8 @@ pub struct Host {
     /// udev's `/dev/disk/by-id` (slot serials, without device I/O).
     pub by_id: PathBuf,
     pub dev_root: PathBuf,
+    /// `/dev/mapper` (where the initramfs opener's slot mappings are).
+    pub mapper_root: PathBuf,
     pub cryptsetup: PathBuf,
     /// The guest components record (`version=` is the release).
     pub components_record: PathBuf,
@@ -35,6 +37,7 @@ impl Host {
             probe_dir: PathBuf::from("/var/lib/hippius-probe"),
             by_id: PathBuf::from("/dev/disk/by-id"),
             dev_root: PathBuf::from("/dev"),
+            mapper_root: PathBuf::from("/dev/mapper"),
             cryptsetup: PathBuf::from("/usr/sbin/cryptsetup"),
             components_record: PathBuf::from("/run/hippius/guest-components"),
             osrelease: PathBuf::from("/proc/sys/kernel/osrelease"),
@@ -125,6 +128,11 @@ fn probe_one(
             };
             if !host.crypt {
                 return profiles::run_d1(slot, &device, &nonce, timing);
+            }
+            // The opener's LUKS mapping of a slot (guest release 6+) holds
+            // the device the probe's plain mapping needs (crypt.rs).
+            if let Err(e) = close_opener_mapping(&host.cryptsetup, &host.mapper_root, slot) {
+                return failed(slot, profile, error_code(&e));
             }
             match Mapping::open(&host.cryptsetup, &device, slot) {
                 Ok(mapping) => profiles::run_d1(slot, &mapping.device, &nonce, timing),
@@ -254,6 +262,7 @@ mod tests {
             probe_dir: r.join("probe"),
             by_id: r.join("by-id"),
             dev_root: r.join("dev"),
+            mapper_root: r.join("mapper"),
             cryptsetup: r.join("no-cryptsetup"),
             components_record: r.join("components"),
             osrelease: r.join("osrelease"),
@@ -313,6 +322,7 @@ mod tests {
             probe_dir: r.join("probe"),
             by_id: r.join("by-id"),
             dev_root: r.join("dev"),
+            mapper_root: r.join("mapper"),
             cryptsetup: r.join("no-cryptsetup"),
             components_record: r.join("none"),
             osrelease: r.join("none"),
@@ -332,5 +342,74 @@ mod tests {
         assert_eq!(result.targets[0].error, "crypt-open-failed");
         assert_eq!(result.release_version, 0);
         assert!(result.to_value().is_ok());
+    }
+
+    /// A slot the initramfs opener formatted and opened (guest release 6+):
+    /// its mapping is closed first, then the probe maps the device; a
+    /// mapping that will not close is the target's error and the device is
+    /// never mapped.
+    #[test]
+    fn the_openers_mapping_is_closed_before_the_probe_opens_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("by-id")).unwrap();
+        std::os::unix::fs::symlink("../../vdf", r.join("by-id/virtio-hippius-x0")).unwrap();
+        std::fs::create_dir_all(r.join("mapper")).unwrap();
+        // `close` removes the mapping and exits `$CLOSE`; `open` always
+        // fails here (no device-mapper in a unit test).
+        let script = |name: &str, close_code: i32| {
+            let path = r.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"$1 $2\" >> '{log}'\nif [ \"$1\" = close ]; then\n  \
+                     [ {close_code} -eq 0 ] && rm -f '{mapper}/'\"$2\"\n  exit {close_code}\nfi\nexit 1\n",
+                    log = r.join("calls").display(),
+                    mapper = r.join("mapper").display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::crypt::test_support::exec_ready(&path, &r.join("calls"));
+            path
+        };
+        let host = |cryptsetup: PathBuf| Host {
+            probe_dir: r.join("probe"),
+            by_id: r.join("by-id"),
+            dev_root: r.join("dev"),
+            mapper_root: r.join("mapper"),
+            cryptsetup,
+            components_record: r.join("none"),
+            osrelease: r.join("none"),
+            crypt: true,
+        };
+        let req = Request::parse(
+            format!(
+                r#"{{"vm_id":"probe-1","run_id":"{}","nonce":"{}","start_delay_s":0,
+                "targets":[{{"slot":"x0","profile":"d1"}}]}}"#,
+                "01".repeat(16),
+                "02".repeat(32)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        std::fs::write(r.join("mapper/hippius-x0"), b"").unwrap();
+        let refused = run(&req, &host(script("cs-refuse", 3)), &timing());
+        assert_eq!(refused.targets[0].error, "opener-close-failed");
+        assert_eq!(
+            std::fs::read_to_string(r.join("calls")).unwrap(),
+            "close hippius-x0\n"
+        );
+
+        std::fs::remove_file(r.join("calls")).unwrap();
+        let closed = run(&req, &host(script("cs-close", 0)), &timing());
+        assert!(!r.join("mapper/hippius-x0").exists());
+        assert_eq!(
+            std::fs::read_to_string(r.join("calls")).unwrap(),
+            "close hippius-x0\nopen --type\n"
+        );
+        assert_eq!(closed.targets[0].error, "crypt-open-failed");
     }
 }

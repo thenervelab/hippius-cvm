@@ -123,7 +123,9 @@ PROFILE_D1 = Profile(
     sanity_metrics=("qd1_p50_us",),
     error_metric="surface_errors",
     # The middle zone of the sequential read and the bounded-window write.
-    reported_metrics=("seq_read_mid_mbps", "seq_write_mbps"),
+    # `size_mib`: the size the guest sees (guest release 7), which a
+    # dedicated disk is sold at (R3).
+    reported_metrics=("seq_read_mid_mbps", "seq_write_mbps", "size_mib"),
 )
 
 PROFILES: dict[str, Profile] = {p.name: p for p in (PROFILE_V1, PROFILE_D1)}
