@@ -59,8 +59,10 @@ bind_addr = "<THIS_MINER_MESH_IP>:9700"
 cvm_cpu_budget = 8
 cvm_memory_mb_budget = 16384
 # Leave tenant CVMs running across an agent restart/upgrade (they are
-# re-adopted at startup). Without it a graceful stop tears down every
-# domain on the host.
+# re-adopted at startup). This is the default, but keep the line: agent
+# releases before this default changed tear down every domain on a
+# graceful stop when it is missing, and the auto-updater refuses to swap
+# without it. `false` opts in to that teardown (logged as a WARNING).
 skip_shutdown_teardown = true
 # Total GiB of tenant DATA disk the host commits to. Set it to the real
 # free capacity of `[storage].data_disk_root` (e.g. the NVMe RAID below).

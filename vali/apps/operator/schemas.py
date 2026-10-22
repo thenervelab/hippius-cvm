@@ -197,6 +197,25 @@ class OperatorLaunchErrorSerializer(serializers.Serializer):
         return fields
 
 
+class OperatorLastProbeSerializer(serializers.Serializer):
+    """vali's last synthetic probe of the node that reached it
+    (`apps.synthetic.per_miner`): a throwaway VM launched onto the node
+    through the real launch path, booted, then decommissioned."""
+
+    at = serializers.DateTimeField(help_text="When the probe finished.")
+    ok = serializers.BooleanField(help_text="Every stage passed.")
+    stage = serializers.CharField(
+        allow_null=True,
+        help_text=(
+            "The stage that failed, `null` on a pass: `launch`, `launch_complete`, "
+            "`release`, `kek_alive`, `boot`, `resources` (the guest attested fewer "
+            "vCPUs or less RAM than its flavor), `netbird`, `decommission`, "
+            "`crypto_erase`."
+        ),
+    )
+    vm_id = serializers.CharField(help_text="The probe VM (`synmon-pm-…`).")
+
+
 class OperatorNodeSerializer(serializers.Serializer):
     """One node's status row."""
 
@@ -289,6 +308,25 @@ class OperatorNodeSerializer(serializers.Serializer):
         many=True,
         required=False,
         help_text="The node's last failed launch attempts, newest first (max 5).",
+    )
+    agent_version = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "The release tag the node's miner agent last reported in its heartbeat "
+            "(e.g. `v2026.10.21.1`), self-reported; `null` before the first report. "
+            "Optional during the rollout."
+        ),
+    )
+    last_probe = OperatorLastProbeSerializer(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "vali's last synthetic probe of the node, `null` if none reached it yet. "
+            "A probe vali could not place on the node is not recorded. Observability "
+            "only — a failed probe changes nothing by itself; the launch it made "
+            "counts like any launch. Optional during the rollout."
+        ),
     )
 
 
@@ -626,6 +664,14 @@ class FleetMinerSerializer(serializers.Serializer):
         ),
     )
     last_seen_at = serializers.DateTimeField(allow_null=True, help_text="Last heartbeat.")
+    agent_version = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "The release tag the miner agent last reported in its heartbeat "
+            "(self-reported); null before the first report."
+        ),
+    )
     heartbeat_age_s = serializers.IntegerField(allow_null=True)
     heartbeat_stale = serializers.BooleanField()
     on_chain = serializers.BooleanField(

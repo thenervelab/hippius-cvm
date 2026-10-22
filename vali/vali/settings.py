@@ -711,7 +711,7 @@ VALI_SCHEDULER_MAX_OWNER_PLACEMENTS_PER_MINER = _env_int(
 # the launch WAITS up to BOOT_WAIT_S for a slot, re-asking every
 # BOOT_WAIT_POLL_S, then fails `miners-booting`. Admission only prices the
 # reserved vCPU, so without this a burst all lands on the roomiest host and
-# boots at once (2026-10-05: 13 boots on one host). `0` = no cap.
+# boots at once (2026-10-05: 13 boots on miner-4). `0` = no cap.
 VALI_SCHEDULER_MAX_BOOTING_PER_MINER = _env_int("VALI_SCHEDULER_MAX_BOOTING_PER_MINER", 3)
 VALI_SCHEDULER_BOOT_WAIT_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_S", 900)
 VALI_SCHEDULER_BOOT_WAIT_POLL_S = _env_int("VALI_SCHEDULER_BOOT_WAIT_POLL_S", 15)
@@ -1110,8 +1110,8 @@ VALI_ZOMBIE_ERASE_GRACE_S = int(os.environ.get("VALI_ZOMBIE_ERASE_GRACE_S", "300
 # VM owners (`Placement.owner`, i.e. the launch spec's `user_id`) whose
 # hosting earns NO reward weight and NO bill — OUR OWN infrastructure, not
 # tenants. With `VALI_EPOCH_WEIGHT_SOURCE=usage` the ledger IS the reward,
-# and without this filter an operator VM could hold a large share of the
-# epoch's units (even a destroyed synthetic-monitor probe). Paying
+# and measured live on 2026-08-11 our own VMs held 30.6 % of the whole pot
+# (one destroyed synthetic-monitor probe carried 30 % by itself). Paying
 # ourselves out of the miner pot dilutes every honest miner.
 #
 # Comma-separated. EMPTY IS A STRICT NO-OP — the default cannot zero a real
@@ -1119,8 +1119,13 @@ VALI_ZOMBIE_ERASE_GRACE_S = int(os.environ.get("VALI_ZOMBIE_ERASE_GRACE_S", "300
 # `scoring._excluded_owners`, so editing this list to add a one-off
 # rehearsal identity can never drop the probe fleet back into the pot.
 # Live, this needs the operator identities that are NOT the synthetic
-# tenant — e.g. a one-off operator harness identity.
+# tenant — e.g. `kbsrehearse`.
 VALI_REWARD_EXCLUDED_OWNERS = _env_list("VALI_REWARD_EXCLUDED_OWNERS", [])
+# `ServiceClient.name`s, besides the orchestration-root principal and the
+# disk-tier probe's actor, whose launches may carry a `purpose` (one of
+# OUR VMs: no pay, no bill, no fill proof — `orchestration.launch_purpose`).
+# Comma-separated; empty by default.
+VALI_LAUNCH_PURPOSE_PRINCIPALS = _env_list("VALI_LAUNCH_PURPOSE_PRINCIPALS", [])
 
 # Time basis of `MinerPrice`: USD-micros per resource-unit per this many
 # seconds (default 3600 ⇒ a per-resource-unit-hour price). Drives the
@@ -1205,7 +1210,7 @@ VALI_UNBOUND_LAUNCH_WARN_INTERVAL_S = _env_float(
 #    the `Vm` row, stages the per-VM KEK and KBS-registers the vm_id
 #    BEFORE it dispatches; a launch that fails after that leaves the row
 #    `state=active host=""` with a LIVE Vault-Transit KEK and no VM
-#    anywhere (seen in production 2026-08-13). Nothing reaped
+#    anywhere (proved live 2026-08-13: p1final-1/2/3). Nothing reaped
 #    them, and every sweep filtering `exclude(state='destroyed')` counted
 #    them as running tenants.
 #
@@ -1629,16 +1634,16 @@ VALI_GEO_HTTP_TIMEOUT_S = _env_float("VALI_GEO_HTTP_TIMEOUT_S", 10.0)
 # The latency bound is `distance(vantage, geo) <= rtt_ms * KM_PER_MS +
 # SLACK_KM`; a wrong vantage flips every miner to `latency-inconsistent`
 # (fail-closed, visible), never to a false `verified`. Set these to the
-# control plane's own location.
+# Gravelines.
 VALI_GEO_VANTAGE_NAME = os.environ.get("VALI_GEO_VANTAGE_NAME", "vali")
-VALI_GEO_VANTAGE_LAT = _env_float("VALI_GEO_VANTAGE_LAT", 0.0)
-VALI_GEO_VANTAGE_LON = _env_float("VALI_GEO_VANTAGE_LON", 0.0)
+VALI_GEO_VANTAGE_LAT = _env_float("VALI_GEO_VANTAGE_LAT", 50.99)
+VALI_GEO_VANTAGE_LON = _env_float("VALI_GEO_VANTAGE_LON", 2.13)
 # Light in fibre ≈ 200 km/ms one way ⇒ ~100 km per ms of ROUND-TRIP. Raising
 # this loosens the bound (more tunnels pass); it is physics, leave it.
 VALI_GEO_KM_PER_MS = _env_float("VALI_GEO_KM_PER_MS", 100.0)
 # Tolerance for GeoIP centroid error + queueing: a country-level GeoLite
-# point (a provider's ranges may resolve to its capital whatever the DC)
-# needs a few hundred km.
+# point (a provider's range can resolve to its capital whatever the DC) needs
+# a few hundred km.
 VALI_GEO_SLACK_KM = _env_float("VALI_GEO_SLACK_KM", 300.0)
 # A peer not seen by NetBird within this window is `peer-stale`
 # (unverified) — its connection_ip may be history.
@@ -2304,7 +2309,7 @@ VALI_SYNTHETIC_LAUNCH_TIMEOUT_S = _env_int("VALI_SYNTHETIC_LAUNCH_TIMEOUT_S", 42
 # Fresh per-wait cap for the `release`, `boot` (-> `running`) and NetBird
 # waits; the whole run is still hard-capped by E2E_BUDGET_S. Measured
 # 2026-09-25: an Ubuntu golden VM reaches `running` in ~150-250 s on the
-# NVMe hosts and ~340 s on a Milan host with rotational disks — 300 s failed
+# NVMe hosts and ~340 s on miner-4 (Milan, rotational disk) — 300 s failed
 # a healthy slow host. The budget holds a slow run: launch (≤420) + boot
 # (≤600, release included) + decommission (≤720) = 1740 s < 1800 s; NetBird
 # lands seconds after `running`.
@@ -2346,6 +2351,40 @@ VALI_SYNTHETIC_REAP_AGE_S = _env_int("VALI_SYNTHETIC_REAP_AGE_S", 5400)
 # tunable cap or horizon is itself the blanket mute. Read that module's
 # preamble before adding an entry.
 VALI_SYNTHETIC_ACK = os.environ.get("VALI_SYNTHETIC_ACK", "")
+
+# ── Per-miner probe (apps.synthetic.per_miner) ───────────────────────
+# `vali_synthetic_monitor --tier per-miner` launches the full e2e PINNED to
+# one dispatchable miner per run (round-robin), so every miner is tested,
+# not whichever one the scheduler prefers. Off by default: with the flag
+# off the tier launches nothing and pushes nothing.
+VALI_SYNTHETIC_PER_MINER = _env_bool("VALI_SYNTHETIC_PER_MINER", False)
+# Canary: probe only these miners (`chain_node_id` or `miner_id`, comma-
+# separated). Empty = every dispatchable miner.
+VALI_SYNTHETIC_PER_MINER_MINERS = _env_list("VALI_SYNTHETIC_PER_MINER_MINERS", [])
+# Probe VMs in flight across the fleet (one per miner, always).
+VALI_SYNTHETIC_PER_MINER_MAX_CONCURRENT = _env_int("VALI_SYNTHETIC_PER_MINER_MAX_CONCURRENT", 1)
+# A miner is due again this long after its last attempt. Ordering is
+# never-probed first, then a host whose attested boot (chip, boot_id,
+# measurement) changed since its last attempt, then the oldest — so with
+# enough runs a day every miner is probed at least daily.
+VALI_SYNTHETIC_PER_MINER_INTERVAL_S = _env_int("VALI_SYNTHETIC_PER_MINER_INTERVAL_S", 21600)
+VALI_SYNTHETIC_PER_MINER_FLAVOR = os.environ.get("VALI_SYNTHETIC_PER_MINER_FLAVOR", "small")
+VALI_SYNTHETIC_PER_MINER_DISTRO = os.environ.get("VALI_SYNTHETIC_PER_MINER_DISTRO", "ubuntu")
+# Never take a tenant's room: a miner is probed only while admission would
+# still take at least this many probe-flavor VMs on it (so one stays free
+# for tenants while the probe runs).
+VALI_SYNTHETIC_PER_MINER_MIN_FREE_SLOTS = _env_int("VALI_SYNTHETIC_PER_MINER_MIN_FREE_SLOTS", 2)
+# Whole-run cap: launch (≤420) + boot (≤600) + resources (≤300) +
+# decommission (≤720) = 2040 s, with margin. The `finally` teardown can add
+# a fresh DECOMMISSION_TIMEOUT_S, so the CronJob deadline is 3600 s — still
+# under REAP_AGE_S, so the reaper never kills a healthy probe.
+VALI_SYNTHETIC_PER_MINER_BUDGET_S = _env_int("VALI_SYNTHETIC_PER_MINER_BUDGET_S", 2400)
+# How long the `resources` stage waits for a judged live attestation (the
+# keepalive runs every few minutes; boot `running` often already rests on
+# one).
+VALI_SYNTHETIC_PER_MINER_RESOURCE_TIMEOUT_S = _env_int(
+    "VALI_SYNTHETIC_PER_MINER_RESOURCE_TIMEOUT_S", 300
+)
 
 # ── Scheduled golden re-bake (F6, apps.images.rebake) ────────────────
 # `vali_scheduled_golden_rebake` re-bakes every golden image with a

@@ -2294,6 +2294,7 @@ def move_placement_to_node(
         vm=vm,
         vm_family=template.vm_family,
         owner=template.owner,
+        purpose=template.purpose,
         resource_class=resource_class or template.resource_class,
         data_disk_gb=(
             template.data_disk_gb
@@ -2493,6 +2494,7 @@ def swap_placement_class(
             vm=vm,
             vm_family=row.vm_family,
             owner=row.owner,
+            purpose=row.purpose,
             resource_class=new_class,
             # The disk does not change with the flavor: pin the one the VM
             # holds (its flavor's, until a first resize recorded it).
@@ -2756,6 +2758,7 @@ def open_placement_on_node(
                 vm=vm,
                 vm_family=template.vm_family,
                 owner=template.owner,
+                purpose=template.purpose,
                 resource_class=template.resource_class,
                 data_disk_gb=template.data_disk_gb,
                 miner_node_id=node_id,
@@ -2824,7 +2827,7 @@ def reeval_once() -> ReevalReport:
     (`move_placement_to_node`). Draining it anyway left a running VM with
     NO active placement: the host looked emptier than it was to admission
     and the #668 fit gate for the rest of the VM's life (three VMs on
-    two miners after a 2026-09-21 reboot), and a quarantined miner's VMs
+    miner-2/3 after the 2026-09-21 reboot), and a quarantined miner's VMs
     dropped out of the graceful-exit enrolment, which selects BOUND
     placements. A sick miner is kept out of NEW placements by the
     dispatchability gate, not by this ledger. A miner dark for longer than

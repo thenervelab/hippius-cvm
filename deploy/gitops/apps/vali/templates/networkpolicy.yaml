@@ -85,7 +85,7 @@ spec:
             - port: "{{ .Values.config.listenPort }}"
               protocol: TCP
     {{- end }}
-    {{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
+    {{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled .Values.syntheticMonitor.perMiner.enabled }}
     # ── synthetic-monitor (apps.synthetic) → vali public API ──
     # The light tier GET /healthz-probes the vali API; the full tier POSTs
     # the real /v1/vm/launch + §24 decommission. The synthetic Job pods
@@ -100,6 +100,9 @@ spec:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
             k8s:app.kubernetes.io/component: synthetic-monitor-full
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            k8s:app.kubernetes.io/component: synthetic-monitor-per-miner
       toPorts:
         - ports:
             - port: "{{ .Values.config.listenPort }}"
@@ -192,7 +195,7 @@ spec:
         - ports:
             - port: "8001"
               protocol: TCP
-    {{- $syntheticEgress := or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") (eq (toString .Values.guestReport.enabled) "true") (eq (toString .Values.disktierEvaluate.enabled) "true") (eq (toString .Values.disktierProbe.enabled) "true") .Values.vmBackup.failoverAutoEnabled }}
+    {{- $syntheticEgress := or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled .Values.syntheticMonitor.perMiner.enabled (eq (toString .Values.goldenRebake.enabled) "true") (eq (toString .Values.goldenRebake.freshness.enabled) "true") (eq (toString .Values.guestReport.enabled) "true") (eq (toString .Values.disktierEvaluate.enabled) "true") (eq (toString .Values.disktierProbe.enabled) "true") .Values.vmBackup.failoverAutoEnabled }}
     {{- if $syntheticEgress }}
     # ── synthetic-monitor (apps.synthetic) + golden re-bake egress ──
     # (1) the vali public API on the listen port — the light vali_api
@@ -247,14 +250,16 @@ spec:
     - toEntities:
         - kube-apiserver
     {{- end }}
-    {{- if or .Values.createVm.enabled .Values.vmBackup.failoverAutoEnabled (eq (toString .Values.disktierProbe.enabled) "true") }}
+    {{- if or .Values.createVm.enabled .Values.vmBackup.failoverAutoEnabled (eq (toString .Values.disktierProbe.enabled) "true") .Values.syntheticMonitor.perMiner.enabled }}
     # ── `vali_create_vm` operator-tier egress (DEV-MODE only) ──
     # Also with the automatic failover worker on: its dead-miner proof reads
     # the NetBird management API (`world:443`). And for the disk-tier probe
     # CronJob: its in-process launch stages the probe VM's KEK + user-data
     # in Vault (`world:8200`). Like the others, this one policy selects
     # every vali pod, the web pod included; today the rule is already open
-    # (failover is on), so naming the probe changes nothing rendered.
+    # (failover is on), so naming the probe changes nothing rendered. The
+    # per-miner synthetic probe reads Vault the same way (`kek_alive`,
+    # `crypto_erase`, the force-erase fallback), so it names itself too.
     #
     # The mgmt command writes tenant secrets to Vault (KV v2 PUT) and
     # uploads the freshly-signed §22 allowlist to Hippius S3. Both
@@ -268,7 +273,7 @@ spec:
         - ports:
             - port: "443"  # s3.hippius.com — presign + cp
               protocol: TCP
-            - port: "8200" # Vault (vault.example.com) — KV v2 PUT/GET
+            - port: "8200" # vault.hippius.network — KV v2 PUT/GET
               protocol: TCP
     {{- end }}
 ---

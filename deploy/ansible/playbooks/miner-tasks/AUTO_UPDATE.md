@@ -102,14 +102,17 @@ nothing to swap).
 ## Why SIGKILL, never stop/restart
 
 A graceful stop of `hippius-miner-agent` destroys **every** domain on the
-host (tenants and the host-attestor) unless the running process started
-with `skip_shutdown_teardown = true` under `[host]`. SIGKILL runs no
+host (tenants and the host-attestor) when the running process started
+with `skip_shutdown_teardown = false` under `[host]` — or, for releases
+before the default flipped to `true`, without the key at all. SIGKILL runs no
 shutdown path at all. QEMU runs in `machine.slice`, outside the agent's
 cgroup, so the domains survive. `Restart=always` brings the agent
 back, and it re-adopts the running CVMs.
 
 The updater still refuses to swap without `skip_shutdown_teardown = true`
-in `/etc/hippius-miner/config.toml` (logged as `ERROR: refusing to swap`).
+in `/etc/hippius-miner/config.toml` (logged as `ERROR: refusing to swap`),
+even though current agents treat an absent key as `true`: the binary it
+rolls back to may be an older release whose default is still `false`.
 Every later graceful stop needs it: `systemctl stop netbird` also stops
 the agent, and so does a host shutdown. It also refuses when the unit has
 no `Restart=`, when the agent is not running (an operator stopped it), or

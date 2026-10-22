@@ -42,7 +42,7 @@ from apps.disktier import os_tier
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
 
-from . import launch_jobs, service
+from . import launch_jobs, launch_purpose, service
 from .launch_jobs import LaunchIntentError
 from .models import DecommissionJob, LaunchJob, MeasurementLedger, MigrationJob
 from .permissions import IsOrchestrationRoot
@@ -79,6 +79,7 @@ _LAUNCH_CONFLICT_CATEGORIES = frozenset(
         launch_jobs.CATEGORY_LAUNCH_CANCELLED,
         os_tier.CATEGORY_NOT_OFFERED,
         launch_jobs.CATEGORY_DEDICATED_NOT_OFFERED,
+        launch_purpose.CATEGORY_FIXED,
     }
 )
 _LAUNCH_INTERNAL_CATEGORIES = frozenset({"internal"})
@@ -515,9 +516,13 @@ class LaunchStartView(APIView):
                 "reserved for the disk-tier probe (`disk-probe-id-reserved`), or an "
                 "`os_pool` (vali chooses it; only the disk-tier probe pins one: "
                 "`os-pool-reserved`), or an `os_disk_tier` off the enum "
-                "(`disk-tier-invalid`).",
+                "(`disk-tier-invalid`), or a `purpose` off the enum (`purpose-invalid`).",
             ),
-            403: OpenApiResponse(ErrorSerializer, "Not the orchestration root principal."),
+            403: OpenApiResponse(
+                ErrorSerializer,
+                "Not the orchestration root principal, or a `purpose` from a caller "
+                "that is not one of vali's own launchers (`purpose-forbidden`).",
+            ),
             409: OpenApiResponse(
                 ErrorSerializer,
                 "In-flight launch already exists for this VM, or an `os_disk_tier` not "
@@ -692,6 +697,8 @@ class MeasurementAuditView(APIView):
 
 
 def _launch_http_status(category: str) -> int:
+    if category == launch_purpose.CATEGORY_FORBIDDEN:
+        return status.HTTP_403_FORBIDDEN
     if category in _LAUNCH_CONFLICT_CATEGORIES:
         return status.HTTP_409_CONFLICT
     if category in _LAUNCH_INTERNAL_CATEGORIES:
@@ -715,6 +722,7 @@ def _serialize_launch(job: LaunchJob) -> dict[str, Any]:
         "reason": job.reason or None,
         "result": job.result_json,
         "decided_by": job.decided_by.name,
+        "purpose": job.purpose or None,
         "started_at": job.started_at.isoformat(),
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "version": job.version,

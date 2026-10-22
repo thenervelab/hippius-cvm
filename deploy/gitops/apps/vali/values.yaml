@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "131ba96b78bbb60962ee77f6f19fc499d631411f"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39640253333/attempts/1"
+    commitSha: "9132d1fef8dcee1db01ef6c2a72d50f97643517a"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39685428256/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -974,6 +974,43 @@ syntheticMonitor:
     # for this PR. Acceptable interim because the full tier is INERT by
     # default (`enabled: false`) and the token lives only in Vault/k8s.
     tokenVaultPath: hippius-compute/vali/synthetic-monitor
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  # ── Per-miner probe (apps.synthetic.per_miner) ─────────────────────────
+  # The full tier leaves the host to the scheduler, which picked the same
+  # miner for 28 of 31 runs in a week. This tier pins the same probe to
+  # each dispatchable miner in turn (externals included), so every miner is
+  # tested, and fails the probe when the guest attests fewer vCPUs / less
+  # RAM than its flavor. Its launch counts like any tenant launch (CVM
+  # ledger, launch errors, capacity start-failed with probation); its VM
+  # never bills (owner = the synthetic tenant). Read the module docstring.
+  #
+  # `enabled` renders the CronJob AND sets VALI_SYNTHETIC_PER_MINER; off,
+  # nothing launches and no series exists. Reuses the full tier's root
+  # token (vali-synthetic-monitor Secret).
+  perMiner:
+    # ON 2026-10-21 for every dispatchable miner, externals included, one
+    # probe VM at a time (canary on miner-1 first, #1746).
+    enabled: true
+    # One run claims (at most) one miner. Every 30 min = 48 runs a day:
+    # with the 6 h interval each miner is probed ~4×/day on a small fleet,
+    # and at least daily up to ~48 miners × maxConcurrent.
+    schedule: "7,37 * * * *"
+    # Fleet-wide probe VMs in flight (one per miner, always).
+    maxConcurrent: 1
+    # Canary: comma-separated chain node ids or miner ids. Empty = every
+    # dispatchable miner.
+    miners: ""
+    # SyntheticMinerProbeFailing fires at this many failed probes in a row.
+    failStreakAlert: 3
+    # VALI_SYNTHETIC_PER_MINER_BUDGET_S (2400) + a fresh §24 in the finally
+    # teardown (720) + scheduling margin. Stays under REAP_AGE_S (5400).
+    activeDeadlineSeconds: 3600
     resources:
       requests:
         cpu: 50m

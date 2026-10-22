@@ -1030,10 +1030,17 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
 /// in-flight handlers finish, no new order is accepted; **(2b)** the
 /// detached order-dispatch tasks drain — a launch/stop/destroy whose
 /// HTTP client already disconnected still completes; **(3)** only then
-/// does `shutdown_all` gracefully stop every CVM. Draining the order
+/// does `shutdown_all` gracefully stop every CVM — only when the config
+/// sets `[host] skip_shutdown_teardown = false`. Draining the order
 /// intake AND every in-flight dispatch before stopping the CVMs means
 /// no order can race the teardown.
 async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
+    if !config.host.skip_shutdown_teardown {
+        eprintln!(
+            "hippius-miner-agent: serve — WARNING: [host] skip_shutdown_teardown = false — \
+             graceful stop will DESTROY every VM on this host (tenants + host-attestor)"
+        );
+    }
     let pubkey = identity.pubkey_hex();
     // Shared — the skeleton Edge client and the §K heartbeat builder
     // both sign with the miner identity.
@@ -1238,7 +1245,7 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
     let verifier = Arc::new(OrderVerifier::from_hex(&config.edge.order_signing_pubkey)?);
     let idem = Arc::new(IdempotencyStore::new());
     let dispatch_tasks = TaskTracker::new();
-    // `self_miner_id` + `clock` close the review-r1 High findings:
+    // `self_miner_id` + `clock` close the gemini-r1 High findings:
     // every order body MUST name this host (target binding) AND fall
     // within ±MAX_ORDER_AGE_SECS of this clock (freshness window).
     let clock: Arc<dyn hippius_miner_agent::orders::Clock> =

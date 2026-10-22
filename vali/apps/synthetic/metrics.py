@@ -58,6 +58,26 @@ M_LIGHT_CHECK_ACKED = "hippius_synthetic_light_check_acknowledged"
 M_ACK_EXPIRES_TS = "hippius_synthetic_ack_expires_timestamp"
 M_ACK_STALE = "hippius_synthetic_ack_stale"
 M_ACK_INVALID = "hippius_synthetic_ack_invalid"
+# ── Per-miner probe (apps.synthetic.per_miner) ────────────────────────
+# Names of their own, never the full tier's: `SyntheticE2EFailing` keys on
+# `hippius_synthetic_e2e_success` with no tier filter, and one miner's
+# probe failing is not "the tenant launch path is broken".
+#
+# Per run, grouped by `{tier=per-miner, miner=<miner_id>}` (PUT on a pass,
+# POST on a failure — the same staleness discipline as the full tier):
+M_PM_SUCCESS = "hippius_synthetic_miner_probe_success"
+M_PM_STAGE_SUCCESS = "hippius_synthetic_miner_probe_stage_success"
+M_PM_DURATION = "hippius_synthetic_miner_probe_duration_seconds"
+M_PM_LAST_SUCCESS_TS = "hippius_synthetic_miner_probe_last_success_timestamp"
+# Fleet readout, every run, PUT to `{tier=per-miner-fleet}` — one series
+# per miner in the universe (dispatchable ∩ canary), from the ledger, so a
+# miner that was NEVER probed is still there (timestamp 0):
+M_PM_LAST_PROBE_TS = "hippius_synthetic_miner_last_probe_timestamp"
+M_PM_FAIL_STREAK = "hippius_synthetic_miner_probe_fail_streak"
+M_PM_BLOCKED = "hippius_synthetic_miner_probe_blocked"
+M_PM_IN_FLIGHT = "hippius_synthetic_per_miner_in_flight"
+M_PM_UNIVERSE = "hippius_synthetic_per_miner_universe"
+M_TEARDOWN_FORCED = "hippius_synthetic_teardown_forced"
 
 
 @dataclass

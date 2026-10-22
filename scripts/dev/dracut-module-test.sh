@@ -89,8 +89,23 @@ done
 INNER
 }
 
+# CentOS Stream 10 images from 2026-10-20 on need x86-64-v3 ("Fatal glibc
+# error: CPU does not support x86-64-v3" at exec) and quay garbage-collects
+# older manifests, so the leg cannot be pinned back: skip it, loudly, on a
+# host without AVX2/BMI2/FMA/MOVBE. Tenant images only ever boot on EPYC.
+x86_64_v3() {
+    local flags
+    flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null)"
+    for f in avx2 bmi2 fma movbe; do
+        [[ " ${flags} " == *" ${f} "* ]] || return 1
+    done
+}
 rc=0
 for img in "${IMAGES[@]}"; do
+    if [[ "${img}" == *centos*stream10* ]] && ! x86_64_v3; then
+        echo "dracut-module-test: SKIP ${img} — this CPU lacks x86-64-v3, which CentOS Stream 10 now requires"
+        continue
+    fi
     run_one "${img}" || { echo "FAILED for ${img}" >&2; rc=1; }
 done
 exit "${rc}"

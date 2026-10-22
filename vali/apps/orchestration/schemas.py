@@ -190,6 +190,18 @@ class LaunchIntentSerializer(serializers.Serializer):
             "keeps it. Not measured."
         ),
     )
+    purpose = serializers.ChoiceField(
+        choices=["", "probe", "canary", "load_test", "synmon"],
+        required=False,
+        default="",
+        help_text=(
+            "Marks one of the validator's OWN VMs (a probe, a canary, a load test, "
+            "the synthetic monitor): it earns the miner nothing, is never billed and "
+            "proves no capacity. Only the validator's own launchers may set it "
+            "(otherwise 403 `purpose-forbidden`); off the enum ⇒ 400 "
+            "`purpose-invalid`. Never sent to the miner."
+        ),
+    )
     dedicated_disks = serializers.JSONField(
         required=False,
         allow_null=True,
@@ -267,6 +279,11 @@ class LaunchJobSerializer(serializers.Serializer):
     reason = serializers.CharField(allow_null=True)
     result = serializers.JSONField(allow_null=True, help_text="Terminal launch result summary.")
     decided_by = serializers.CharField(help_text="Principal that requested the launch.")
+    purpose = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="The launch's `purpose` (one of our own VMs), `null` for a tenant launch.",
+    )
     started_at = serializers.DateTimeField()
     finished_at = serializers.DateTimeField(allow_null=True)
     version = serializers.IntegerField(help_text="Optimistic-concurrency version.")

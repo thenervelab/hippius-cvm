@@ -861,6 +861,9 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
                 now=now,
             )
         )
+        # The release tag the agent last reported (heartbeat), self-reported.
+        mirror_row = mirror_by_node.get(nid)
+        rows[-1]["agent_version"] = (mirror_row.agent_version or None) if mirror_row else None
     for m in unbridged:
         rows.append(
             _row(
@@ -888,6 +891,7 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
                 now=now,
             )
         )
+        rows[-1]["agent_version"] = None
     for row in rows:
         row["alerts"] = _alerts(row, now=now)
         # Internal helper for `_alerts`; never on the wire.

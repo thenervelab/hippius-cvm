@@ -178,6 +178,7 @@ def _live_attested(node_id: str, *, now: datetime) -> Sample:
     one inside every span to attest. The gap bound makes that a sustained
     effort, not a free one — but it is a limit of liveness sampling, and
     why this source is opt-in."""
+    from apps.orchestration.launch_purpose import exclude_purpose
     from apps.telemetry.models import VmLiveAttestation
     from apps.telemetry.vm_liveness import (
         chip_matches_node,
@@ -188,13 +189,16 @@ def _live_attested(node_id: str, *, now: datetime) -> Sample:
     from .scoring import _excluded_owners
     from .service import _committed_resources
 
-    # Our own VMs (synthetic probes, disk probes, canaries, rehearsals —
-    # the reward-excluded owners) are never proof of fill: a miner earns
-    # neither pay nor capacity for hosting them.
+    # Our own VMs (synthetic probes, disk probes, canaries, rehearsals,
+    # load tests — the reward-excluded owners, and any VM launched with a
+    # `purpose`) are never proof of fill: a miner earns neither pay nor
+    # capacity for hosting them.
     classes = dict(
-        Placement.objects.filter(miner_node_id=node_id, status=PlacementStatus.BOUND.value)
-        .exclude(owner__in=_excluded_owners())
-        .values_list("vm__vm_id", "resource_class")
+        exclude_purpose(
+            Placement.objects.filter(
+                miner_node_id=node_id, status=PlacementStatus.BOUND.value
+            ).exclude(owner__in=_excluded_owners())
+        ).values_list("vm__vm_id", "resource_class")
     )
     if not classes:
         return Sample()

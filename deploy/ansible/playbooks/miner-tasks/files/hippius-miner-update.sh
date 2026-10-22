@@ -267,6 +267,8 @@ running_domains() {
 # ── Preflight: refuse anything that could take the domains down ─────────────
 
 preflight_swap() {
+    # An explicit `true`, even though current agents default to it: the
+    # binary a rollback reinstalls may predate that and default to false.
     if ! python3 -I -c '
 import sys, tomllib
 with open(sys.argv[1], "rb") as f:

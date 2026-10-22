@@ -44,6 +44,8 @@ ROW_KEYS = {
     "last_launch_error",
     "launch_fail_streak",
     "recent_launch_errors",
+    "agent_version",
+    "last_probe",
 }
 
 #: A stored reason the scheduler's §13 re-eval writes — a real refusal.
@@ -248,6 +250,8 @@ def test_full_row_for_a_healthy_node(operator_client: APIClient) -> None:
         "last_launch_error": None,
         "launch_fail_streak": 0,
         "recent_launch_errors": [],
+        "agent_version": None,
+        "last_probe": None,
     }
 
 
@@ -952,3 +956,67 @@ def test_schema_publishes_the_launch_error_shape() -> None:
     err = comps["OperatorLaunchError"]
     assert set(err["properties"]) == {"code", "class", "http_status", "stage", "order_id", "at"}
     assert set(_enum(comps, err["properties"]["stage"])) == {"preflight", "launch"}
+
+
+def test_agent_version_is_the_last_reported_tag(operator_client: APIClient) -> None:
+    """Claim: the row carries the release tag the node's agent last reported
+    (heartbeat mirror), and null before any report."""
+    make_dispatchable_identity(1)
+    make_dispatchable_identity(2)
+    MinerCapacity.objects.create(
+        miner_node_id=node_id(1),
+        status="active",
+        capacity_slots=6,
+        observed_epoch=10,
+        data_epoch=10,
+        refreshed_at=timezone.now(),
+        agent_version="v2026.10.21.1",
+    )
+    rows = {r["node_id"]: r for r in _get(operator_client, node_id(1), node_id(2)).json()["nodes"]}
+    assert rows[node_id(1)]["agent_version"] == "v2026.10.21.1"
+    assert rows[node_id(2)]["agent_version"] is None
+
+
+# ─── `last_probe` on /v1/operator/nodes ──────────────────────────────
+
+
+def test_last_probe_is_served_for_the_requested_nodes_only(operator_client: APIClient) -> None:
+    from apps.synthetic.models import MinerProbe
+
+    make_dispatchable_identity(1)
+    make_dispatchable_identity(2)
+    at = timezone.now()
+    MinerProbe.objects.create(
+        miner_node_id=node_id(1),
+        last_probe_at=at,
+        last_ok=False,
+        last_stage="boot",
+        last_vm_id="synmon-pm-000000000000-1",
+        last_detail="internal: do not serve",
+        fail_streak=2,
+    )
+    MinerProbe.objects.create(
+        miner_node_id=node_id(3), last_probe_at=at, last_ok=True, last_vm_id="synmon-pm-x-1"
+    )
+    resp = _get(operator_client, node_id(1), node_id(2))
+    assert resp.status_code == 200, resp.content
+    rows = {r["node_id"]: r for r in resp.json()["nodes"]}
+    assert set(rows) == {node_id(1), node_id(2)}  # never a node it did not ask for
+    assert rows[node_id(1)]["last_probe"] == {
+        "at": at.isoformat(),
+        "ok": False,
+        "stage": "boot",
+        "vm_id": "synmon-pm-000000000000-1",
+    }
+    assert rows[node_id(2)]["last_probe"] is None
+    assert b"do not serve" not in resp.content
+
+
+def test_schema_publishes_last_probe() -> None:
+    from drf_spectacular.generators import SchemaGenerator
+
+    comps = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+    node = comps["OperatorNode"]
+    assert "last_probe" in node["properties"]
+    assert "last_probe" not in node.get("required", [])
+    assert set(comps["OperatorLastProbe"]["properties"]) == {"at", "ok", "stage", "vm_id"}

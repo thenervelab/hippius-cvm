@@ -65,6 +65,10 @@ def enqueue_launch_terminal(job: LaunchJob) -> WebhookDelivery | None:
     """
     if not is_enabled():
         return None
+    if job.purpose:
+        # One of OUR VMs (`launch_purpose`): the product backend never
+        # hears of it, so nothing upstream can bill or surface it.
+        return None
     event = f"launch.{job.state}"
     payload = {
         "event": event,

@@ -4,8 +4,8 @@ from django.apps import AppConfig
 
 
 class SyntheticConfig(AppConfig):
-    """Model-less app — carries only the `vali_synthetic_monitor` command
-    and its light/full-tier probe logic. No migrations."""
+    """Carries the `vali_synthetic_monitor` command, its light / full /
+    per-miner probe logic, and the per-miner probe ledger (`MinerProbe`)."""
 
     default_auto_field = "django.db.models.BigAutoField"
     name = "apps.synthetic"

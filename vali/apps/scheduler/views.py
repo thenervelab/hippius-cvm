@@ -1110,6 +1110,7 @@ def _replace(
                 vm=vm,
                 vm_family=failed.vm_family,
                 owner=failed.owner,
+                purpose=failed.purpose,
                 resource_class=failed.resource_class,
                 data_disk_gb=failed.data_disk_gb,
                 miner_node_id=chosen,

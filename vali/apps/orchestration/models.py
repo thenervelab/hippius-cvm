@@ -868,6 +868,9 @@ class LaunchJob(models.Model):
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    # The authenticated launch `purpose` (`launch_purpose`): non-empty ⇒
+    # one of OUR VMs — no pay, no bill, no fill proof, no backend webhook.
+    purpose = models.CharField(max_length=16, blank=True, default="", db_default="")
     decided_by = models.ForeignKey(
         "identity.ServiceClient",
         on_delete=models.PROTECT,
@@ -880,6 +883,13 @@ class LaunchJob(models.Model):
         indexes = [
             models.Index(fields=["state"]),
             models.Index(fields=["vm_id", "state"]),
+            # The few launches that are ours (`launch_purpose`): every pay /
+            # fill read excludes them by subquery over this.
+            models.Index(
+                fields=["vm_id"],
+                condition=~models.Q(purpose=""),
+                name="orch_launchjob_purpose_idx",
+            ),
         ]
         constraints = [
             models.UniqueConstraint(
