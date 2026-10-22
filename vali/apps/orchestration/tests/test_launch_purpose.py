@@ -350,7 +350,8 @@ def test_the_disk_probe_marks_its_launch_with_its_own_actor() -> None:
     from apps.disktier.probe_owners import ProbeOwner
 
     run = SimpleNamespace(
-        vm_id="hipc-4242-0a0b0c0d", flavor="medium", chip_id="ab" * 32, os_pool_id="default"
+        vm_id="hipc-4242-0a0b0c0d", flavor="medium", chip_id="ab" * 32, os_pool_id="default",
+        targets=[{"slot": "os", "kind": "pool", "pool_id": "default", "profile": "v1"}],
     )
     intent = probe.launch_intent(run, ProbeOwner(user_id="4242", tenant_id="5" * 48))
     assert intent["purpose"] == launch_purpose.PROBE

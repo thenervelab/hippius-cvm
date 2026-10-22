@@ -270,6 +270,20 @@ def _build_spec_json(intent: dict[str, Any], *, guest_release: int | None = None
             raise LaunchIntentError("os_pool needs a golden launch", "bad-field")
         spec["pinned_os_pool"] = pin
 
+    # R3: a dedicated-disk probe run's disks (`_check_probe_disks` admitted
+    # them, from that run's own launch only). Written only when set.
+    probe_disks = intent.get(_PROBE_DISKS_KEY)
+    if probe_disks:
+        from apps.disktier import dedicated_probe
+
+        try:
+            dedicated_probe.spec_extra_disks(probe_disks)
+        except ValueError as exc:
+            raise LaunchIntentError(str(exc), "bad-field") from exc
+        if spec["disk_mode"] != _DISK_MODE_GOLDEN_VERITY:
+            raise LaunchIntentError("probe_extra_disks needs a golden launch", "bad-field")
+        spec[_PROBE_DISKS_KEY] = [dict(d) for d in probe_disks]
+
     # The OS-disk tier (a minimum; absent ⇒ nvme): 400 off the enum, 409
     # when not sold (`os_tier.not_offered`). Written only when not nvme,
     # like the three above.
@@ -680,6 +694,38 @@ def _check_os_pool_pin(intent: dict[str, Any], run: DiskProbeRun | None) -> None
         )
 
 
+#: The intent key a dedicated-disk probe run names its disks under (R3).
+_PROBE_DISKS_KEY = "probe_extra_disks"
+#: The category of `probe_extra_disks` in a launch that is not its run's.
+CATEGORY_PROBE_DISKS_RESERVED = "dedicated-probe-reserved"
+
+
+def _check_probe_disks(intent: dict[str, Any], run: DiskProbeRun | None) -> None:
+    """The dedicated disks of a probe launch at intake, after
+    `_check_disk_probe_role` (R3, `apps.disktier.dedicated_probe`). Only the
+    disk-tier probe names disks itself, and only its own run's, exactly
+    (slots, by-id names, size classes, in slot order); a pool run names
+    none. Any other launch naming `probe_extra_disks`, whoever calls, is
+    refused `dedicated-probe-reserved` (400) before anything is staged.
+    The order then carries them as `extra_disks` with their measured
+    anchor (`services.launch`), never assigned to the probe VM."""
+    from apps.disktier import dedicated_probe
+
+    raw = intent.get(_PROBE_DISKS_KEY)
+    if run is None:
+        if raw is not None:
+            raise LaunchIntentError(
+                "probe_extra_disks is the disk-tier probe's own", CATEGORY_PROBE_DISKS_RESERVED
+            )
+        return
+    expected = dedicated_probe.intent_disks(run)
+    if (raw if raw is not None else []) != expected:
+        raise LaunchIntentError(
+            f"a disk-probe launch must name exactly its run's dedicated disks ({len(expected)})",
+            CATEGORY_PROBE_DISKS_RESERVED,
+        )
+
+
 def _resolve_bake(intent: dict[str, Any]) -> int | None:
     """Fill the launch-spec artifact fields from a Succeeded `TenantBake`
     named by `intent['bake_id']`. A no-op when `bake_id` is absent.
@@ -978,6 +1024,7 @@ def start_launch(
     # launch naming a probe's vm id or owner stages nothing.
     probe_run = _check_disk_probe_role(intent, disk_probe=disk_probe)
     _check_os_pool_pin(intent, probe_run)
+    _check_probe_disks(intent, probe_run)
     # The authenticated `purpose` (our own VM: no pay, no bill, no fill
     # proof), before anything is staged — a caller that may not set one
     # stages nothing.

@@ -338,6 +338,24 @@ def _assert_order_matches_cmdline(payload: dict[str, Any]) -> None:
 
 
 @override_settings(**ON)
+def test_the_billing_binding_records_the_disks_size_classes(monkeypatch) -> None:
+    from apps.scheduler.models import VmBillingBinding
+
+    miner, _seen = _rig(monkeypatch)
+    _assigned(miner)
+    launch.launch_on_miner(_spec(dedicated_disks=GOOD, pinned_ack=True), miner)
+    assert VmBillingBinding.objects.get(vm_id="vm-launch-1").dedicated_gb == 16000 + 22300
+
+
+def test_a_plain_vms_binding_has_no_dedicated_gb(monkeypatch) -> None:
+    from apps.scheduler.models import VmBillingBinding
+
+    miner, _seen = _rig(monkeypatch)
+    launch.launch_on_miner(_spec(), miner)
+    assert VmBillingBinding.objects.get(vm_id="vm-launch-1").dedicated_gb == 0
+
+
+@override_settings(**ON)
 def test_a_relaunch_sends_the_same_disks_and_token(monkeypatch) -> None:
     miner, seen = _rig(monkeypatch)
     placement = _assigned(miner)

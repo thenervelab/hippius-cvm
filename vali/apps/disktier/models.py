@@ -213,6 +213,12 @@ class DedicatedDisk(models.Model):
         "DiskProbeRun", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     probed_at = models.DateTimeField(null=True, blank=True)
+    #: R3 (`apps.disktier.dedicated_probe`): probe attempts in a row that
+    #: ended without a verdict (launch refused or failed, timeout, the guest
+    #: could not measure the disk); reset by a verdict. The next attempt
+    #: waits until `probe_retry_at`.
+    probe_failures = models.PositiveSmallIntegerField(default=0, db_default=0)
+    probe_retry_at = models.DateTimeField(null=True, blank=True)
     assigned_vm = models.ForeignKey(
         Vm, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )

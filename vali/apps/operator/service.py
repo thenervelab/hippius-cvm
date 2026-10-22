@@ -397,6 +397,39 @@ def _add_os_disk_tiers(
             }
 
 
+def _add_dedicated_disks(
+    by_region: dict[str, dict[str, Any]], offering: dict[str, list[str]]
+) -> None:
+    """Each region's `dedicated_disks` (E4 contract §4), only while they are
+    sold (`VALI_DEDICATED_ENABLED`; off, every row is byte-identical):
+    `{hdd: {sizes: [{size_gb, free, max_per_host}]}}` — per size class, the
+    free disks a launch could take on its offering miners whose agent takes
+    `extra_disks`, and the most of them on one host. Advisory."""
+    from apps.disktier import dedicated
+
+    if not dedicated.enabled():
+        return
+    nodes = [nid for nids in offering.values() for nid in nids]
+    for tier in dedicated.SOLD_TIERS:
+        sizes = dedicated.free_sizes(
+            dedicated.DedicatedRequest(tier, 1, dedicated.MIN_SIZE_GB), nodes
+        )
+        for region, row in by_region.items():
+            per_class: dict[int, list[int]] = {}
+            for nid in offering.get(region, []):
+                counts: dict[int, int] = {}
+                for size in sizes.get(nid.lower(), []):
+                    counts[size] = counts.get(size, 0) + 1
+                for size, n in counts.items():
+                    per_class.setdefault(size, []).append(n)
+            row.setdefault("dedicated_disks", {})[str(tier)] = {
+                "sizes": [
+                    {"size_gb": size, "free": sum(ns), "max_per_host": max(ns)}
+                    for size, ns in sorted(per_class.items())
+                ]
+            }
+
+
 def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]:
     """`GET /v1/operator/regions` — the regions vali has DETECTED miners in,
     with how many are verified / dispatchable and the capacity they add up
@@ -498,6 +531,7 @@ def operator_region_rows(*, verified_only: bool | None = None) -> dict[str, Any]
     for row in by_region.values():
         row["node_ids"].sort()
     _add_os_disk_tiers(by_region, offering)
+    _add_dedicated_disks(by_region, offering)
     vantage = geo.vantage_from_settings()
     return {
         "regions": [by_region[k] for k in sorted(by_region)],

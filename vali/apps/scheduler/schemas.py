@@ -346,7 +346,10 @@ class FeasibilitySerializer(serializers.Serializer):
             "`?os_disk_tier=`: `disk-tier-not-offered` (the tier is not sold for "
             "this flavor — `never`), `no-miner-at-tier` (tier gate enforced: no host "
             "has an OS pool at the tier — `never`; with pools but no room, the "
-            "scheduler's own `not-now`)."
+            "scheduler's own `not-now`). With `?dedicated_count=`: "
+            "`dedicated-disks-not-offered` (`never`), `no-dedicated-capacity` (no "
+            "node has the disks) and `no-host-fits-disks` (nodes have them, none "
+            "takes the VM), both `not-now`."
         ),
     )
     scheduler_error = serializers.CharField(allow_blank=True)
@@ -371,6 +374,17 @@ class FeasibilitySerializer(serializers.Serializer):
         choices=["nvme", "ssd", "hdd"],
         required=False,
         help_text="The `?os_disk_tier=` asked for. Absent when none was.",
+    )
+    dedicated = serializers.DictField(
+        required=False,
+        help_text=(
+            "Only when `?dedicated_count=` was asked: `{tier, count, min_size_gb, "
+            "placeable, max_count_at_size}` — `placeable` true when a node fits the "
+            "VM AND has the disks; `max_count_at_size` the most qualifying free disks "
+            "on one node that fits the VM. Advisory: the launch is authoritative, and "
+            "`verdict` decides a sale (`placeable` can be true while it reads "
+            "`not-now` for another reason, e.g. `fleet-full`)."
+        ),
     )
     capacity_source = serializers.ChoiceField(
         choices=["", "trusted", "declared+earned", "earned"],

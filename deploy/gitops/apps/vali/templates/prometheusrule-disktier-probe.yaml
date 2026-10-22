@@ -118,3 +118,61 @@ spec:
               that pool unfit, was suspect-cache, or that pool's last two runs
               timed out. Nothing is cordoned in R1.
 {{- end }}
+{{- if and (eq (toString .Values.disktierProbe.enabled) "true") (eq (toString .Values.disktierProbe.alerts.enabled) "true") }}
+---
+# Dedicated-disk probe alerts (apps.disktier.dedicated_probe, phase R3).
+# CANNOT FIRE WHILE R3 IS OFF: every rule is `and on()` a FRESH push (< 1 h)
+# with `hippius_dedicated_probe_enabled == 1`, and `vali_disk_probe` pushes
+# the dedicated series only while VALI_DEDICATED_PROBE_ENABLED is true.
+{{- $dguard := "and on() (hippius_dedicated_probe_enabled == 1) and on() (time() - hippius_disk_probe_push_timestamp_seconds < 3600)" }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hippius-dedicated-probe
+  namespace: vali
+  labels:
+    {{- include "vali.labels" . | nindent 4 }}
+    app.kubernetes.io/name: hippius-dedicated-probe
+    app.kubernetes.io/component: alerts
+    role: alert-rules
+spec:
+  groups:
+    - name: hippius-dedicated-probe
+      interval: 5m
+      rules:
+        - alert: DedicatedDiskSignatureAfterWipe
+          # A released disk (or one on sale / awaiting a probe, moved back to
+          # `released`) that the agent reports with an on-disk signature
+          # after its release wipe: a header survived the wipe, or something
+          # wrote to it. Never sold until a clean report and a new probe.
+          expr: (hippius_dedicated_disk_signature_after_wipe > 0) {{ $dguard }}
+          for: 15m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "node {{`{{ $labels.node }}`}}: {{`{{ $value }}`}} dedicated disk(s) carry a signature after their wipe"
+            description: |
+              The agent of node {{`{{ $labels.node }}`}} reports
+              `disk-has-signature` on released dedicated disk(s) after the
+              release wipe (a LUKS header or any other signature). They stay
+              `released` (not for sale). Check the `MinerCapacityAudit` rows
+              (field `dedicated_disk_state`, reason `signature-after-wipe`)
+              and the agent's release-wipe log on the host.
+        - alert: DedicatedDiskProbeFailing
+          # Probe attempts in a row that ended without a verdict for one of
+          # the node's pending disks (launch refused / failed, timeout, the
+          # guest could not measure it). The disk is never `free` meanwhile.
+          expr: (hippius_dedicated_disk_probe_failures_max >= {{ .Values.disktierProbe.alerts.dedicatedFailingAttempts }}) {{ $dguard }}
+          for: 30m
+          labels:
+            severity: warning
+            component: disk-tier
+          annotations:
+            summary: "dedicated-disk probe failing on node {{`{{ $labels.node }}`}}"
+            description: |
+              A pending dedicated disk of node {{`{{ $labels.node }}`}} had
+              {{`{{ $value }}`}} probe attempts in a row without a verdict.
+              Check the `MinerCapacityAudit` rows (reason
+              `probe-no-verdict:<why>`) and the runs' `failure_reason`.
+{{- end }}

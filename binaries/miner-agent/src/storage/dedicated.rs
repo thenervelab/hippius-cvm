@@ -33,6 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{DedicatedDiskConfig, StorageDesiredStateConfig};
 
+/// `device/state` values of a healthy disk: SCSI/SATA `running`, NVMe `live`.
+const ONLINE_STATES: [&str; 2] = ["running", "live"];
+
 /// Smallest disk worth dedicating (design §4.2), GiB.
 pub const MIN_DEDICATED_DISK_GB: u64 = 1000;
 
@@ -253,8 +256,12 @@ fn inspect(
         out.error = "disk-not-whole-device";
         return out;
     }
-    // The kernel marks a failing disk `offline` (SCSI `device/state`).
-    if read_trimmed(&sys.join("device/state")).is_some_and(|st| st != "running") {
+    // The kernel marks a failing disk in `device/state`: a SCSI/SATA disk
+    // reads `running` while healthy, an NVMe controller `live`. Anything
+    // else (`offline`, `dead`, `resetting`, …) is not offered.
+    if read_trimmed(&sys.join("device/state"))
+        .is_some_and(|st| !ONLINE_STATES.contains(&st.as_str()))
+    {
         out.error = "disk-offline";
         out.offline = true;
         return out;
@@ -1092,6 +1099,22 @@ mod tests {
             one(&host, "wwn-0x1", &CLEAN).state,
             DedicatedDiskState::Free
         );
+    }
+
+    #[test]
+    fn a_live_nvme_disk_is_online_and_a_dead_one_is_not() {
+        let host = Host::new();
+        host.disk("nvme-eui.1", "nvme1n1", "259:1", 4 * TIB_SECTORS, "e1");
+        let mut ids = IdentityMap::default();
+        std::fs::write(host.sys("nvme1n1").join("device/state"), "live\n").unwrap();
+        assert_eq!(
+            run(&host, &[cfg("nvme-eui.1")], &CLEAN, &mut ids)[0].state,
+            DedicatedDiskState::Free
+        );
+        std::fs::write(host.sys("nvme1n1").join("device/state"), "dead\n").unwrap();
+        let r = run(&host, &[cfg("nvme-eui.1")], &CLEAN, &mut ids).remove(0);
+        assert_eq!(r.state, DedicatedDiskState::Failed);
+        assert_eq!(r.error, "disk-offline");
     }
 
     #[test]

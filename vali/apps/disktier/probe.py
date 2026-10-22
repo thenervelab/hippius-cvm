@@ -45,6 +45,14 @@ name — active, recently reported, not retired (else `pool-not-active`)
 or health (`probe_os_pool`). Hdd-only pools (`os_disks=false`) are R3's
 (a dedicated-style extra disk), counted `not-os-eligible`.
 
+**Dedicated disks (R3, `apps.disktier.dedicated_probe`).** The same tick,
+behind its own switch (`VALI_DEDICATED_PROBE_ENABLED`), launches probe VMs
+for `pending_probe` dedicated disks and applies their verdicts to the disk
+state machine once each probe VM is gone. Those runs (triggers `declared`
+/ `released`) share the 1-run-per-miner rule and the fleet cap with the
+pool runs, but are never a pool's probe: the due set, the pool history
+and the pool metrics read pool runs only (`_pool_runs_q`).
+
 **Record only.** A verdict is stored on the run (per target: metrics, the
 tier it classifies as, the verdict detail) and in metrics. Nothing here
 writes `MinerStoragePool`, a cordon, placement or rewards; the
@@ -67,11 +75,12 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.synthetic import metrics
 
-from . import probe_userdata, routing
+from . import dedicated_probe, probe_userdata, routing
 from .models import OS_SLOT, DiskKind, DiskProbeRun, MinerStoragePool, ProbeRunState, ProbeTrigger
 from .probe_owners import ProbeOwner, probe_owners
 from .storage_doc import DEFAULT_POOL_ID, is_valid_pool_id
@@ -98,6 +107,12 @@ _rng = secrets.SystemRandom()
 
 
 # ─── pools and the due set ───────────────────────────────────────────
+
+
+def _pool_runs_q() -> Q:
+    """The pool runs: a dedicated-disk run (R3) never counts as a pool's
+    probe (no due date, no history, no pool metric)."""
+    return dedicated_probe.pool_runs_q()
 
 
 def probe_os_disk_gb() -> int:
@@ -189,6 +204,15 @@ class TickReport:
     refused: int = 0
     #: Fallback teardowns run this tick (bounded per tick).
     fallbacks: int = 0
+    # ── R3, the dedicated-disk probe (`apps.disktier.dedicated_probe`) ──
+    dedicated_enabled: bool = False
+    #: Disks a probe could take at this tick.
+    dedicated_due: int = 0
+    dedicated_launched: int = 0
+    dedicated_refused: int = 0
+    dedicated_skipped: Counter[str] = field(default_factory=Counter)
+    #: Disks whose run closed this tick, by outcome.
+    dedicated_settled: Counter[str] = field(default_factory=Counter)
 
 
 def _period_jitter_s(run: DiskProbeRun) -> int:
@@ -268,7 +292,7 @@ def due_set(*, nodes: Iterable[str], now: datetime, report: TickReport) -> list[
         rows.setdefault(p.miner_node_id.lower(), []).append(p)
     history: dict[tuple[str, str], list[DiskProbeRun]] = {}
     for r in (
-        DiskProbeRun.objects.filter(miner_node_id__in=node_ids)
+        DiskProbeRun.objects.filter(_pool_runs_q(), miner_node_id__in=node_ids)
         .exclude(state__in=(ProbeRunState.SCHEDULED, *IN_FLIGHT))
         .order_by("-scheduled_at")
     ):
@@ -300,7 +324,9 @@ def due_set(*, nodes: Iterable[str], now: datetime, report: TickReport) -> list[
     periodic.sort(key=lambda d: (-d.overdue_s, d.node_id))
     queued = [
         Due(node_id=r.miner_node_id.lower(), pool_id=r.os_pool_id, trigger=r.trigger, run=r)
-        for r in DiskProbeRun.objects.filter(state=ProbeRunState.SCHEDULED).order_by("scheduled_at")
+        for r in DiskProbeRun.objects.filter(
+            _pool_runs_q(), state=ProbeRunState.SCHEDULED
+        ).order_by("scheduled_at")
     ]
     return onboarding + periodic + queued
 
@@ -472,6 +498,11 @@ def launch_intent(run: DiskProbeRun, owner: ProbeOwner) -> dict[str, Any]:
         # no fill proof — on top of the probe owner's exclusion. Vali-side
         # only: the miner never sees it, so the probe still looks a tenant's.
         "purpose": "probe",
+        # R3: the dedicated disks under test (only from this run's own
+        # disk-probe launch, `launch_jobs._check_probe_disks`): the order
+        # carries them as `extra_disks` with their measured
+        # `hippius.dedicated=` anchor. A pool run names none.
+        **({"probe_extra_disks": disks} if (disks := dedicated_probe.intent_disks(run)) else {}),
     }
 
 
@@ -624,13 +655,14 @@ def request_manual(
     return new_run(node_id=nid, pool_id=pool_id, trigger=ProbeTrigger.MANUAL, chip_id=chip, now=now)
 
 
-def _image_ready() -> bool:
+def _image_ready(minimum: int | None = None) -> bool:
     """The probe image is blessed and carries a guest release with the
     probe (`VALI_DISK_PROBE_MIN_GUEST_RELEASE`; unset, 0, launches nothing:
-    an image without the probe would time every node out)."""
+    an image without the probe would time every node out). `minimum`: a
+    floor of the caller's own (the dedicated probe's), taken instead."""
     from apps.images.models import GoldenImage
 
-    need = int(settings.VALI_DISK_PROBE_MIN_GUEST_RELEASE)
+    need = int(settings.VALI_DISK_PROBE_MIN_GUEST_RELEASE) if minimum is None else minimum
     if need <= 0:
         return False
     image = GoldenImage.objects.filter(image_name=str(settings.VALI_DISK_PROBE_IMAGE)).first()
@@ -733,9 +765,14 @@ def advance(*, now: datetime, report: TickReport) -> None:
             # The VM is up from here: the guest's start delay runs from its
             # boot, so the deadline is re-armed from this moment.
             launched = job.finished_at or now
-            deadline = launched + timedelta(
-                seconds=int(run.start_delay_s or 0) + int(settings.VALI_DISK_PROBE_TIMEOUT_S)
+            # A dedicated run measures its disks one after another: its
+            # window grows with them (`dedicated_probe.run_timeout_s`).
+            timeout_s = (
+                dedicated_probe.run_timeout_s(run)
+                if dedicated_probe.is_dedicated_run(run)
+                else int(settings.VALI_DISK_PROBE_TIMEOUT_S)
             )
+            deadline = launched + timedelta(seconds=int(run.start_delay_s or 0) + timeout_s)
             if DiskProbeRun.objects.filter(pk=run.pk, state=ProbeRunState.LAUNCHING).update(
                 state=ProbeRunState.RUNNING, deadline_at=deadline
             ):
@@ -889,16 +926,29 @@ def tick(*, now: datetime | None = None) -> TickReport:
     under them) are still advanced and torn down, so no probe VM outlives
     the switch. With nothing in flight it writes nothing."""
     now = now or timezone.now()
-    report = TickReport(enabled=bool(settings.VALI_DISK_PROBE_ENABLED))
-    if not report.enabled and not _open_runs():
+    report = TickReport(
+        enabled=bool(settings.VALI_DISK_PROBE_ENABLED),
+        dedicated_enabled=dedicated_probe.enabled(),
+    )
+    if (
+        not report.enabled
+        and not report.dedicated_enabled
+        and not _open_runs()
+        and not dedicated_probe.probing_exists()
+    ):
         return report
     advance(now=now, report=report)
     teardown_due(now=now, report=report)
+    # R3: the disks of every run closed by now take their verdict (or go
+    # back to `pending_probe`), whichever switch is on.
+    dedicated_probe.settle(now=now, report=report)
+    # One tick at a time: the CronJob is `concurrencyPolicy: Forbid`.
+    # Not under one DB transaction: a launch stages Vault material, which
+    # a rollback would strand.
     if report.enabled:
-        # One tick at a time: the CronJob is `concurrencyPolicy: Forbid`.
-        # Not under one DB transaction: a launch stages Vault material, which
-        # a rollback would strand.
         schedule(now=now, report=report)
+    if report.dedicated_enabled:
+        dedicated_probe.schedule(now=now, report=report)
     return report
 
 
@@ -962,6 +1012,17 @@ def _os_target(run: DiskProbeRun) -> dict[str, Any]:
     return next((t for t in run.targets if t.get("slot") == OS_SLOT), {})
 
 
+def base_metrics(report: TickReport) -> metrics.MetricSet:
+    """The gauges every push carries: the pool switch and the push time
+    (the alert guards read both)."""
+    ms = metrics.MetricSet()
+    ms.gauge(
+        M_ENABLED, 1 if report.enabled else 0, help_text="1 while the probe orchestrator runs."
+    )
+    ms.gauge(M_PUSH_TS, time.time(), help_text="When the orchestrator last pushed.")
+    return ms
+
+
 def report_metrics(
     report: TickReport,
     *,
@@ -970,16 +1031,10 @@ def report_metrics(
 ) -> metrics.MetricSet:
     """The gauges of one tick. Per-node series cover `nodes` (default: the
     dispatchable fleet), so a miner that left does not keep an alert alive."""
-    from django.db.models import Q
-
     from .models import DiskIngestCounter
 
     now = now or timezone.now()
-    ms = metrics.MetricSet()
-    ms.gauge(
-        M_ENABLED, 1 if report.enabled else 0, help_text="1 while the probe orchestrator runs."
-    )
-    ms.gauge(M_PUSH_TS, time.time(), help_text="When the orchestrator last pushed.")
+    ms = base_metrics(report)
     ms.gauge(M_DUE, report.due, help_text="Pools due for a probe at the last tick.")
     for reason in _SKIP_REASONS:
         ms.gauge(
@@ -996,7 +1051,9 @@ def report_metrics(
     ):
         ms.gauge(M_TICK, n, help_text="What the last tick did.", action=what)
     open_by_state = Counter(
-        "awaiting-teardown" if r.state in VERDICTS else r.state for r in _open_runs()
+        "awaiting-teardown" if r.state in VERDICTS else r.state
+        for r in _open_runs()
+        if not dedicated_probe.is_dedicated_run(r)
     )
     for state in ("scheduled", "launching", "running", "awaiting-teardown"):
         ms.gauge(
@@ -1009,7 +1066,7 @@ def report_metrics(
     recent = list(
         DiskProbeRun.objects.filter(
             Q(finished_at__gte=week) | Q(state=ProbeRunState.TORN_DOWN, torn_down_at__gte=week)
-        )
+        ).filter(_pool_runs_q())
     )
     by_state = Counter(r.state for r in recent)
     for state in (*VERDICTS, ProbeRunState.TORN_DOWN):
@@ -1081,7 +1138,7 @@ def _node_metrics(ms: metrics.MetricSet, nodes: set[str]) -> None:
         else:
             retired.add((p.miner_node_id.lower(), p.pool_id))
     rows = (
-        DiskProbeRun.objects.filter(state__in=VERDICTS, miner_node_id__in=node_ids)
+        DiskProbeRun.objects.filter(_pool_runs_q(), state__in=VERDICTS, miner_node_id__in=node_ids)
         .order_by("miner_node_id", "-finished_at")
         .only("miner_node_id", "state", "failure_reason", "finished_at", "targets", "os_pool_id")
     )
@@ -1092,12 +1149,14 @@ def _node_metrics(ms: metrics.MetricSet, nodes: set[str]) -> None:
             by_pool.setdefault(key, []).append(r)
     first_attempt = {
         (n.lower(), pool): at
-        for n, pool, at in DiskProbeRun.objects.filter(miner_node_id__in=node_ids)
+        for n, pool, at in DiskProbeRun.objects.filter(_pool_runs_q(), miner_node_id__in=node_ids)
         .order_by()
         .values_list("miner_node_id", "os_pool_id")
         .annotate(at=Min("scheduled_at"))
     }
-    fleet_start = DiskProbeRun.objects.aggregate(at=Min("scheduled_at"))["at"]
+    fleet_start = DiskProbeRun.objects.filter(_pool_runs_q()).aggregate(at=Min("scheduled_at"))[
+        "at"
+    ]
     # A miner that joined after the probe started is watched from its
     # registration, not from the fleet's first probe.
     registered = {

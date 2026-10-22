@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from django.conf import settings
 from django.db import transaction
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.disktier import ingest as disktier_ingest
 from apps.disktier import os_tier
 from apps.telemetry import service as telemetry
@@ -611,6 +612,17 @@ def _accrue_one(
         factor_bps = os_tier.unit_factor_bps(binding.os_disk_tier)
         if factor_bps != _BPS_FULL:
             unit_seconds = unit_seconds * factor_bps // _BPS_FULL
+        # Dedicated disks (E4, design §8): units per GiB of each slot its host
+        # still serves, never more than vali provisioned (the binding).
+        # Nothing is read, and nothing changes, while the rate is 0. Not
+        # scaled by the guest's degradation or the OS-disk tier (a disk's
+        # service is the disk). The slot states are read at accrual time,
+        # not over the receipt's window: a lagging receipt is paid on the
+        # current host evidence (bounded by the receipt lag).
+        dedicated_rate = disk_dedicated.milliunits_per_gb()
+        if dedicated_rate and binding.dedicated_gb:
+            paid_gb = min(binding.dedicated_gb, disk_dedicated.payable_gb(fields.vm_id))
+            unit_seconds += paid_gb * dedicated_rate * billable // 1000
 
         wm.last_period_end = max(wm.last_period_end, fields.period_end)
         wm.save(update_fields=[*seq_fields, "last_period_end"])

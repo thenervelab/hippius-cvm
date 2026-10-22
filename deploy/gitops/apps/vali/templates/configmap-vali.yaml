@@ -434,6 +434,26 @@ data:
   {{- with (.Values.dedicatedDisks).minAgentVersion }}
   VALI_DEDICATED_MIN_AGENT_VERSION: {{ . | quote }}
   {{- end }}
+  {{- /* R3, the dedicated-disk probe — values.yaml `dedicatedDisks.probe`.
+         Its own switch: pool probing (VALI_DISK_PROBE_ENABLED) stays off.
+         `enabled` always renders ("false" by default); `miners` only when
+         set (unset = no node). */}}
+  VALI_DEDICATED_PROBE_ENABLED: {{ ((.Values.dedicatedDisks).probe).enabled | default "false" | toString | quote }}
+  {{- with ((.Values.dedicatedDisks).probe).miners }}
+  VALI_DEDICATED_PROBE_MINERS: {{ . | quote }}
+  {{- end }}
+  {{- /* The probe identity and image floor both probes share (R1): only
+         when set; unset = the settings.py defaults (no owner, release 0:
+         nothing launches). */}}
+  {{- with (.Values.disktierProbe).owners }}
+  VALI_DISK_PROBE_OWNERS: {{ . | quote }}
+  {{- end }}
+  {{- with (.Values.disktierProbe).minGuestRelease }}
+  VALI_DISK_PROBE_MIN_GUEST_RELEASE: {{ . | toString | quote }}
+  {{- end }}
+  {{- with (.Values.dedicatedDisks).milliunitsPerGb }}
+  VALI_DEDICATED_MILLIUNITS_PER_GB: {{ . | toString | quote }}
+  {{- end }}
   # §18.10 host inventory ingest — see values.yaml `hostInventory.ingest`.
   VALI_HOST_INVENTORY_INGEST: {{ (.Values.hostInventory).ingest | default "false" | toString | quote }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}

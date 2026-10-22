@@ -500,6 +500,13 @@ class OperatorRegionSerializer(serializers.Serializer):
         help_text="Per OS-disk tier (`nvme`, `ssd`, `hdd`): whether a VM sold at it can "
         "be placed in the region, and on how many hosts.",
     )
+    dedicated_disks = serializers.DictField(
+        required=False,
+        help_text="Only while dedicated disks are sold: per tier (`hdd`), `{sizes: "
+        "[{size_gb, free, max_per_host}]}` — per size class (GiB, floored to 100), the "
+        "free disks a launch could take in the region and the most on one host. "
+        "Advisory: the launch is authoritative.",
+    )
 
 
 class OperatorVantageSerializer(serializers.Serializer):

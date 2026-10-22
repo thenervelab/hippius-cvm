@@ -737,6 +737,14 @@ class LaunchSpec:
     # pool. Empty (every other launch) ⇒ `_choose_os_pool`. Written into
     # `spec_json` only when set, like `require_failover_peer`.
     pinned_os_pool: str = ""
+    # R3: the dedicated disks a dedicated-disk probe VM measures
+    # (`apps.disktier.dedicated_probe`): `[{"slot", "disk_id", "size_gb"}]`,
+    # accepted from that run's own disk-probe launch only
+    # (`launch_jobs._check_probe_disks`). Never assigned to the VM: the
+    # order carries them as `extra_disks` with the measured
+    # `hippius.dedicated=` anchor while the disks are `probing` for its run.
+    # Written into `spec_json` only when set.
+    probe_extra_disks: list[dict[str, Any]] | None = None
     # The OS-disk tier the VM is sold at, a minimum (`apps.disktier.os_tier`):
     # `""` = nvme, and the only value intake writes into `spec_json` is
     # another one. Drives placement (gate (n), the pool choice) and the
@@ -1432,6 +1440,22 @@ def _refuse_miner_for_customer_keys(
         )
 
 
+def _pre_pin_dedicated_value(spec: LaunchSpec) -> str | None:
+    """The `hippius.dedicated=` value the pre-pin length check measures: a
+    stand-in at least as long as any real one for a VM sold dedicated disks,
+    the real one for a dedicated-disk probe VM (its disks are known), `None`
+    otherwise."""
+    request = disk_dedicated.spec_request(spec)
+    if request is not None:
+        return disk_dedicated.stand_in_cmdline_value(request)
+    if spec.probe_extra_disks:
+        from apps.disktier import dedicated_probe
+
+        disks = dedicated_probe.spec_extra_disks(spec.probe_extra_disks)
+        return disk_dedicated.cmdline_value(disks)
+    return None
+
+
 def _refuse_measured_cmdline_before_pin(
     spec: LaunchSpec, binding: customer_keys.GuardianBinding | None
 ) -> None:
@@ -1460,11 +1484,7 @@ def _refuse_measured_cmdline_before_pin(
         validator_nonce_hex=_PRE_PIN_HEX64,
         telemetry_epoch=_PRE_PIN_EPOCH_UPPER_BOUND,
         eol_nonce_hex=eol_nonce_hex,
-        dedicated=(
-            disk_dedicated.stand_in_cmdline_value(request)
-            if (request := disk_dedicated.spec_request(spec)) is not None
-            else None
-        ),
+        dedicated=_pre_pin_dedicated_value(spec),
     )
     refusal = _measured_cmdline_refusal(cmdline, binding)
     if refusal is not None:
@@ -1610,6 +1630,29 @@ def launch_on_miner(
             out = _terminal(DEDICATED_DISKS_UNAVAILABLE, why, EXIT_CONFIG_ERROR)
             # Only a same-miner retry after the KBS register reaches here
             # without a first attempt: say so (see gate (n) above).
+            out.registered = not first_attempt
+            return out
+    elif spec.probe_extra_disks:
+        # R3 — a dedicated-disk probe VM: the disks its run holds `probing`
+        # on THIS node, exactly (`dedicated_probe.launch_disks`); never a
+        # disk the run does not hold (a disk assigned to a VM never is).
+        from apps.disktier import dedicated_probe
+
+        try:
+            extra_disks = dedicated_probe.launch_disks(
+                spec.vm_id, miner.chain_node_id or "", spec.probe_extra_disks
+            )
+        except (dedicated_probe.ProbeDisksRefused, ValueError) as exc:
+            out = _terminal(DEDICATED_DISKS_UNAVAILABLE, str(exc), EXIT_CONFIG_ERROR)
+            out.registered = not first_attempt
+            return out
+        node = (miner.chain_node_id or "").lower()
+        if not require_existing_disks and node not in disk_dedicated.capable_node_ids([node]):
+            out = _terminal(
+                DEDICATED_DISKS_UNAVAILABLE,
+                f"miner {miner.miner_id} runs an agent that does not take extra_disks",
+                EXIT_CONFIG_ERROR,
+            )
             out.registered = not first_attempt
             return out
 
@@ -1929,6 +1972,12 @@ def launch_on_miner(
         spec.flavor,
         spec.lease_id,
         os_disk_tier=_landing_tier(spec),
+        # E4: the size classes of the disks this VM was SOLD (0 without).
+        # A dedicated-disk probe VM (R3) names disks it was never sold:
+        # it pays nothing for them.
+        dedicated_gb=(
+            sum(d.size_gb for d in extra_disks) if dedicated_request is not None else 0
+        ),
     )
 
     # ── 3. allowed_userdata_digest_hex ──────────────────────────────
@@ -3610,6 +3659,7 @@ def _persist_billing_binding(
     lease_id: str,
     *,
     os_disk_tier: str = "nvme",
+    dedicated_gb: int = 0,
 ) -> None:
     """§23 — record the authoritative billing identity vali provisioned for
     `vm_id` (the miner `node_id`, `resource_class`, `lease_id`). The usage
@@ -3640,6 +3690,7 @@ def _persist_billing_binding(
             "resource_class": resource_class,
             "lease_id": lease_id,
             "os_disk_tier": os_disk_tier,
+            "dedicated_gb": dedicated_gb,
         },
     )
     billing.record_assignment(

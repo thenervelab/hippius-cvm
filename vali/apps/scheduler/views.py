@@ -603,11 +603,39 @@ class SchedulerFeasibilityView(APIView):
                 required=False,
                 type=str,
             ),
+            OpenApiParameter(
+                name="dedicated_count",
+                description=(
+                    "Optional, with `dedicated_min_size_gb`: the answer for a VM with "
+                    "this many dedicated disks (1..8), adding `dedicated: {tier, count, "
+                    "min_size_gb, placeable, max_count_at_size}`. Adds "
+                    "`dedicated-disks-not-offered` (`never`), `no-dedicated-capacity` and "
+                    "`no-host-fits-disks` (`not-now`) to `reason`. 400 "
+                    "`dedicated-invalid` / `dedicated-count-invalid` / "
+                    "`dedicated-size-invalid` when malformed. None of the three: the "
+                    "answer without the key, as before."
+                ),
+                required=False,
+                type=int,
+            ),
+            OpenApiParameter(
+                name="dedicated_min_size_gb",
+                description="With `dedicated_count`: every disk at least this (GiB, >= 1000).",
+                required=False,
+                type=int,
+            ),
+            OpenApiParameter(
+                name="dedicated_tier",
+                description="With `dedicated_count`: `hdd` (the default, and the only one sold).",
+                required=False,
+                type=str,
+            ),
         ],
         responses={
             200: FeasibilityListSerializer,
             400: OpenApiResponse(
-                ErrorSerializer, "Unknown flavor / malformed region / os_disk_tier."
+                ErrorSerializer,
+                "Unknown flavor / malformed region / os_disk_tier / dedicated_* parameters.",
             ),
         },
     )
@@ -631,6 +659,10 @@ class SchedulerFeasibilityView(APIView):
             tier = os_tier.parse(raw_tier) if raw_tier else None
         except ValueError as exc:
             return _error(status.HTTP_400_BAD_REQUEST, str(exc), os_tier.CATEGORY_INVALID)
+        try:
+            dedicated_request = _dedicated_query(request.query_params)
+        except disk_dedicated.DedicatedError as exc:
+            return _error(status.HTTP_400_BAD_REQUEST, exc.message, exc.category)
 
         try:
             if flavor:
@@ -641,11 +673,16 @@ class SchedulerFeasibilityView(APIView):
                         user_id=user_id,
                         region=region,
                         os_disk_tier=tier,
+                        dedicated=dedicated_request,
                     )
                 ]
             else:
                 results = feasibility.assess_catalogue(
-                    tenant_id=tenant_id, user_id=user_id, region=region, os_disk_tier=tier
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    region=region,
+                    os_disk_tier=tier,
+                    dedicated=dedicated_request,
                 )
         except flavors.UnknownFlavor as exc:
             # A flavor that does not exist is a CALLER error, not "cannot
@@ -659,12 +696,51 @@ class SchedulerFeasibilityView(APIView):
         )
 
 
+#: The feasibility query parameters naming dedicated disks (E4 contract §4).
+_DEDICATED_PARAMS = ("dedicated_count", "dedicated_min_size_gb", "dedicated_tier")
+
+
+def _dedicated_query(params: Any) -> disk_dedicated.DedicatedRequest | None:
+    """The dedicated-disk request the feasibility query names, `None` when
+    it names none (the answer then stays byte-identical). Validated like a
+    launch's `dedicated_disks` (`DedicatedError`, the §1.1 400 categories):
+    count and size are required with any of the three, the tier defaults to
+    `hdd` (the only one sold)."""
+    if not any(params.get(p) is not None for p in _DEDICATED_PARAMS):
+        return None
+
+    def number(name: str) -> object:
+        raw = (params.get(name) or "").strip()
+        if not raw:
+            raise disk_dedicated.DedicatedError(
+                f"{name} is required with any dedicated_* parameter",
+                disk_dedicated.CATEGORY_INVALID,
+            )
+        try:
+            return int(raw, 10)
+        except ValueError:
+            raise disk_dedicated.DedicatedError(
+                f"{name} must be an integer", disk_dedicated.CATEGORY_INVALID
+            ) from None
+
+    return disk_dedicated.parse_request(
+        {
+            "tier": (params.get("dedicated_tier") or "").strip() or disk_dedicated.SOLD_TIERS[0],
+            "count": number("dedicated_count"),
+            "min_size_gb": number("dedicated_min_size_gb"),
+        }
+    )
+
+
 def _feasibility_body(result: feasibility.Feasibility) -> dict[str, Any]:
     """One answer on the wire: without `os_disk_tier` when none was asked,
-    so a caller that names no tier gets the answer as before tiers."""
+    so a caller that names no tier gets the answer as before tiers; the
+    same for `dedicated`."""
     body = asdict(result)
     if body["os_disk_tier"] is None:
         del body["os_disk_tier"]
+    if body["dedicated"] is None:
+        del body["dedicated"]
     return body
 
 
