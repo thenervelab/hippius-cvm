@@ -103,7 +103,7 @@ def test_the_universe_is_the_dispatchable_set(fleet: _Fleet) -> None:
     make_dispatchable_identity(2)  # registered, not dispatchable
     views = _views()
     assert [v.node_id for v in views] == [a]
-    assert views[0].miner_id == "miner-1"
+    assert views[0].miner_id == "miner-01"
     assert views[0].platform_id == "01" + "cd" * 15
     assert views[0].blocked == ""
 
@@ -161,7 +161,7 @@ def test_the_canary_allowlist_restricts_the_universe(fleet: _Fleet, settings: An
     _miner(fleet, 1)
     b = _miner(fleet, 2)
     c = _miner(fleet, 3)
-    settings.VALI_SYNTHETIC_PER_MINER_MINERS = [b.upper(), "MINER-3"]
+    settings.VALI_SYNTHETIC_PER_MINER_MINERS = [b.upper(), "MINER-03"]
     assert [v.node_id for v in _views()] == [b, c]
 
 
@@ -192,7 +192,7 @@ def test_the_real_scheduler_reads_drive_the_views(settings: Any) -> None:
 def _v(seed: int, *, attempt: datetime | None = None, now_fp: str = "fp-a", seen_fp: str = ""):
     return per_miner.MinerView(
         node_id=node_id(seed),
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{seed:02d}",
         platform_id="ab" * 16,
         blocked="",
         last_attempt_at=attempt,

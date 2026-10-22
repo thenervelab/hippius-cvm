@@ -38,7 +38,7 @@ def pushed(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 def _view(seed: int, *, blocked: str = "", probed: datetime | None = None) -> per_miner.MinerView:
     return per_miner.MinerView(
         node_id=node_id(seed),
-        miner_id=f"miner-{seed}",
+        miner_id=f"miner-{seed:02d}",
         platform_id="ab" * 16,
         blocked=blocked,
         last_attempt_at=probed,
@@ -88,7 +88,7 @@ def test_a_failed_probe_pushes_the_miner_group_and_the_fleet(
     call_command("vali_synthetic_monitor", "--tier", "per-miner", "--json")
 
     run, fleet = pushed
-    assert run["grouping_key"] == {"tier": "per-miner", "miner": "miner-1"}
+    assert run["grouping_key"] == {"tier": "per-miner", "miner": "miner-01"}
     assert run["replace"] is False  # failure → POST, the last-success ts survives
     assert "hippius_synthetic_miner_probe_success 0" in run["text"]
     assert 'hippius_synthetic_miner_probe_stage_success{stage="boot"} 0' in run["text"]
@@ -103,16 +103,16 @@ def test_a_failed_probe_pushes_the_miner_group_and_the_fleet(
     assert fleet["replace"] is True
     text = fleet["text"]
     ts = int(AT.timestamp())
-    assert f'hippius_synthetic_miner_last_probe_timestamp{{miner="miner-1"}} {ts}' in text
-    assert 'hippius_synthetic_miner_last_probe_timestamp{miner="miner-2"} 0' in text
-    assert 'hippius_synthetic_miner_probe_fail_streak{miner="miner-1"} 2' in text
-    assert 'hippius_synthetic_miner_probe_blocked{miner="miner-2",reason="capacity"} 1' in text
-    assert 'miner="miner-1",reason=' not in text
+    assert f'hippius_synthetic_miner_last_probe_timestamp{{miner="miner-01"}} {ts}' in text
+    assert 'hippius_synthetic_miner_last_probe_timestamp{miner="miner-02"} 0' in text
+    assert 'hippius_synthetic_miner_probe_fail_streak{miner="miner-01"} 2' in text
+    assert 'hippius_synthetic_miner_probe_blocked{miner="miner-02",reason="capacity"} 1' in text
+    assert 'miner="miner-01",reason=' not in text
     assert "hippius_synthetic_per_miner_universe 2" in text
     assert "hippius_synthetic_per_miner_config_error 0" in text
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["verdict"] == "failed" and payload["miner_id"] == "miner-1"
+    assert payload["verdict"] == "failed" and payload["miner_id"] == "miner-01"
 
 
 def test_a_pass_replaces_the_miner_group(settings: Any, pushed: list, monkeypatch) -> None:

@@ -262,7 +262,7 @@ def test_a_failed_probe_start_feeds_every_ledger_a_tenant_failure_does(monkeypat
     assert MinerCapacityAudit.objects.filter(
         miner_node_id=node_id(1), actor="event:start-failed", reason=f"start-failed vm={PROBE_VM}"
     ).exists()
-    assert MinerLaunchErrors.objects.get(miner__miner_id="miner-1").fail_streak == 1
+    assert MinerLaunchErrors.objects.get(miner__miner_id="miner-a").fail_streak == 1
 
 
 @override_settings(VALI_CAPACITY_DECLARED_CEILING=True)
