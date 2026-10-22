@@ -55,7 +55,7 @@ Two signals, with different trust and different jobs:
 | A miner-as-tenant forges good stats on its own VMs | dilutes the aggregate | Per-owner aggregation; the trigger fires on **any** sustained bad non-internal owner. Internal owners are trusted witnesses. |
 | Probe I/O hurts tenants on a weak host | collateral | ≤ ~4-5 min of I/O on a pool, early stop once the tier is decided, never probe a host with fewer than 2 free admission slots. |
 | Operator-requested probe (announced by definition) | un-throttle for it | It runs at a random time 6-48 h later, at most once per 7 days per node. It may lower or confirm a tier; an upgrade, or lifting `degraded`, needs the next unannounced probe to pass too. |
-| Swap or substitute a dedicated disk | serve another disk's data, or an empty one | The agent binds the by-id name to the device WWN/serial (honest agent). The guest records each slot's LUKS UUID on the integrity-protected OS disk and refuses to format or open a slot whose header is missing or different (`dedicated-disk-mismatch`). The miner cannot forge that record. |
+| Swap or substitute a dedicated disk | serve another disk's data, or an empty one | The agent binds the by-id name to the device WWN/serial (honest agent). The guest records each slot's LUKS UUID on the integrity-protected OS disk and refuses to format or open a slot whose header is missing or different (`dedicated-disk-mismatch`). The miner cannot forge that record. It CAN replay this slot's own ciphertext (header included) onto another disk: that is the corruption/rollback residual risk below, never a confidentiality loss (§4.2.1). |
 
 **Dedicated disks, residual risk.** They use LUKS2 AES-XTS without
 dm-integrity (an integrity wipe at 18+ TB is not workable). The miner never
@@ -140,7 +140,13 @@ Every `pending_probe` dedicated disk of a node (declared, or just
 released) is probed by the next probe VM, up to 8 disks per run, one disk at
 a time, through
 **dm-crypt plain with an ephemeral random key** (the tenant cipher path,
-AES-XTS, no header written):
+AES-XTS, no header written). The probe VM's disks come with their measured
+`hippius.dedicated=` anchor like any VM's, so on guest release 6+ the
+initramfs opener (§4.2.1) has already formatted each blank slot as LUKS2
+and opened it as `hippius-<slot>`; that mapping holds the device, so the
+probe closes it before mapping the slot (guest release 7;
+`opener-close-failed` when it will not close). The opener's LUKS header
+stays on the disk until the miner's §24 release wipe:
 
 1. zoned sequential read at 0 %, 50 % and 95 % of the LBA range, 1 MiB QD8,
    15 s each (the inner zone is graded);
@@ -266,8 +272,9 @@ A **pool** is a miner-declared mounted filesystem:
   discard='ignore'`, and a **virtual serial** `hippius-x<N>`. The guest sees
   slots, never the real serial or WWN.
 - **Guest**: per-slot key `HKDF-SHA256(ikm=released KEK,
-  salt="hippius-dedicated-disk-v1", info=vm_id‖slot)` via
-  `hippius-guest-release --derive <slot>`. One KBS release per boot opens
+  salt="hippius-dedicated-disk-v1", info=vm_id‖slot)`, derived inside
+  `hippius-guest-release --open-dedicated-disks` in the initramfs (§4.2.1).
+  One KBS release per boot opens
   every slot; erasing `kek-<vm_id>` crypto-erases every slot, in the
   customer-held key modes too. First boot of a slot: LUKS2 AES-XTS-plain64,
   512-bit, no integrity (instant), with `{slot, luks_uuid, size}` recorded
@@ -280,6 +287,176 @@ A **pool** is a miner-declared mounted filesystem:
   The guest refuses a slot smaller than the measured size. A listed but
   absent slot is `missing`: boot continues, the customer's array runs
   degraded, an alert fires.
+
+### 4.2.1 Guest implementation (G3/G4, guest release 6)
+
+**Where it runs: the golden initramfs.** `hippius_golden_open_dedicated`
+(`scripts/initramfs/hippius-golden-overlay.sh`) runs inside the boot
+attempt after the guest-keyed OS volume is open and the overlay mounted,
+and before the KEK keyfile is shredded. It calls `hippius-guest-release
+--open-dedicated-disks <kek-file>` (`binaries/guest-release/src/dedicated.rs`),
+which derives each slot's key in its own memory (`Zeroizing`) and hands it
+only to `cryptsetup` on a pipe. Nothing key-bearing is ever written, the KEK
+never leaves the initramfs, and no key is handed to the booted OS, where
+tenant userspace could read it. The mappings exist before the tenant's
+systemd starts, so the customer's mdadm/ZFS/fstab assemble on them at boot.
+A slot problem is a slot state, never a failed boot. Without the anchor
+the step is a strict no-op.
+
+**Anchor grammar** (measured cmdline, parsed strictly; any doubt refuses
+every slot, reported `mismatch` on each `virtio-hippius-x*` device, and
+nothing is opened):
+
+```
+hippius.dedicated=<slot>:<GiB>[,<slot>:<GiB>]…      exactly one token
+  <slot> = x[0-9]{1,2}, no leading zero, ≤ x23 (what the receipt wire carries)
+  <GiB>  = decimal, no leading zero, 1000 ≤ GiB ≤ 1048576 (the size class)
+  1..8 entries, slots unique; hippius.vm_id= present exactly once
+```
+
+A `/proc/cmdline` at the kernel limit (2047) whose last token is the
+anchor is refused (it may have lost its tail).
+
+**Per slot**: `/dev/disk/by-id/virtio-hippius-<slot>` absent (after a 15 s
+wait) ⇒ `missing`. A partition, a device with holders or an existing
+`hippius-<slot>` mapping, a device two slots resolve to, or one smaller than
+`GiB × 2^30` ⇒ `mismatch`. The 64-byte HKDF output is the LUKS2 **volume
+key** (aes-xts-plain64, 512-bit), and the slot is opened **by volume key**:
+a forged keyslot (the null-cipher keyslot trick) cannot substitute a key the
+miner knows, because the header's digest must accept a key only the guest
+can compute. What the header still controls is the segment layout (a
+`cipher_null` or `linear` segment, or a reencryption "in flight" that maps
+part of the disk through one). So the header is first copied into guest RAM
+(`luksHeaderBackup`, the #296 pattern), the copy must carry the recorded
+UUID and pass a metadata check (exactly one `crypt` segment,
+aes-xts-plain64, no integrity, no requirements, only plain `luks2`
+keyslots, one digest, no tokens; else `mismatch bad-header`), and the slot
+is activated **from that copy** (`--header`), so the host cannot swap the
+header between check and use. The **live mapping** is checked again after
+activation (`cryptsetup status`: LUKS2, aes-xts-plain64, 512 bits, no
+integrity, our device); anything else is closed again ⇒ `mismatch`. The layout is pinned, not autodetected:
+data offset 16 MiB, 4096-byte encryption sectors, 16 KiB metadata and a
+16744448-byte keyslot area; the metadata check and the live check both
+require it. (The keyslot `luksFormat` must create is
+keyed with the same 64 bytes, PBKDF2 with 1000 iterations: it wraps nothing
+that is not already the key, and no argon2 memory cost in an initramfs.)
+
+| record says | device | action |
+|---|---|---|
+| nothing | no LUKS header, no signature in the first 4 MiB (LUKS, GPT, MBR, ext, xfs, btrfs, md 1.1/1.2, LVM, ZFS L0/L1, swap, squashfs, verity, f2fs) or the last 1 MiB (md 0.90/1.0, GPT backup, ZFS L2/L3) | record `formatting <new uuid>`, then `luksFormat --uuid`, open, record `ready` |
+| nothing | any header or signature | `mismatch not-blank`, untouched |
+| `formatting U` | no LUKS header | format again with `U` (nothing was ever opened under it) |
+| `formatting U` | header `U` | open; record `ready` |
+| `ready U` / `formatting U` | header `U'` ≠ `U` | `mismatch uuid-mismatch`, untouched |
+| `ready U` | no LUKS header | `mismatch no-header`, never reformatted |
+| `ready U` | header `U`, key refused | `mismatch open-failed` |
+| `ready U` / `formatting U` | header `U` but not a header this guest writes | `mismatch bad-header` (never activated) |
+
+The record is `<volume root>/.hippius-dedicated-disks` (mode 0600), next to
+the anti-rollback stamp: on the guest-keyed, integrity-protected OS volume,
+covered by the stamp, outside the tenant's merged root:
+
+```
+hippius-dedicated-disks v1
+x0 ready 0b6f8a52-61d4-4c9e-9f2b-3f6e0a1c2d4e 22300
+x1 formatting 7c1e0d9a-2b3f-4a5c-8d6e-9f0a1b2c3d4e 22300
+```
+
+Entries are never removed (slots are never reused). An unreadable or
+malformed record opens and formats nothing (every present slot
+`mismatch record-*`).
+
+**HKDF vector** (RFC 5869, computed independently with Python
+`hmac`/`hashlib`, pinned in `dedicated_tests.rs`): ikm = bytes `00..1f`,
+salt = `hippius-dedicated-disk-v1`, L = 64:
+
+| info | OKM |
+|---|---|
+| `vm-0123456789abcdefx0` | `7dceb685bcecdde450d2c8d64193bde1f16264e39a7060270024c9dd70b2589f3b994e95f31ee59cf9255eba17c4014226d0c933e4bb27a3a736a6cd1b18c73e` |
+| `vm-0123456789abcdefx1` | `ee60213aa0bf9c26f1ba1027c7fb6decea40908be6ca9627627761af82f892660caf7c6cdc409b97781da83d2c6b849679a287e7104608b2475bcb738136329b` |
+| `vm-fedcba9876543210x0` | `31c71b9a34687fcbeff70ec582288be65aaf506be25a1a619c0484a4990d4557469c354439785c1649a036b1eb7d4dc2983a297124493ded1ade1bb74e844cb7` |
+
+A slot is handed to the tenant only once its `ready` record is durable;
+if that write fails the mapping is closed again (`mismatch
+record-write-failed`), so `formatting` means "never opened". (Should the
+close itself fail, the slot is reported `record-write-failed-mapped`; a
+later re-format of that slot writes the same header, same UUID, same
+derived key and data offset, and touches no data sector.)
+
+**Residual limits** (none gives the miner plaintext or a key):
+
+- *Replay.* Without integrity, nothing binds a header to the data behind
+  it. A miner can copy this slot's own header (or any of its ciphertext)
+  onto another disk and the guest opens it as the slot: the customer sees
+  garbage or old data. That is the "corrupt or roll back sectors" risk of
+  §2. ZFS/btrfs checksums on top detect incoherent replay (sectors from
+  different times); a coherent rollback of the whole device (old data with
+  its matching old metadata and checksums) validates normally: there is no
+  freshness guarantee for dedicated disks.
+- *Boot-granular record.* The record shares the anti-rollback stamp's
+  granularity: the stamp is confirmed before the opener runs, so a miner
+  that snapshots the OS volume after the confirm and restores it on a later
+  boot can drop that boot's record writes. Combined with a blank disk under
+  the slot, the guest then formats the blank disk as a new slot and reports
+  it `attached` instead of `mismatch`. The miner can always destroy a
+  slot's data; this only hides the swap from the guest's report (the
+  agent's identity binding still sees it). Moving the record write before
+  the stamp write would narrow it, not close it (the host can mix sectors
+  from different times on any unauthenticated-freshness disk).
+- *Stalled disks.* The by-id wait is bounded (15 s); I/O to a device that
+  never completes is not (virtio-blk has no timeout), so a stalled
+  dedicated disk stalls the boot, like a stalled OS disk. A failing honest
+  disk returns I/O errors, which are slot states.
+- *HKDF state.* The derived key and the HKDF `info` are `Zeroizing`; the
+  `hkdf` crate's internal HMAC state is not zeroized (it lives on the stack
+  of a process that exits right after).
+- *RAM.* The header copy lives in tmpfs for the duration of one open (the
+  LUKS2 header plus keyslot area, 16 MiB as we format it, at most ~136 MiB
+  for a forged one).
+
+**Reporting.** The opener writes `/run/hippius/dedicated/slots` (tmpfs,
+`<slot> <attached|missing|mismatch> <GiB> <dev|-> <reason>` per line). The
+telemetry agent folds it into every receipt's `disk_io` (T1 wire, no type
+change): an attached slot is its device with state `ok`, `mismatch` on the
+slot's device, `missing` with no device and zero counters, and an attached
+slot whose device later vanishes becomes `missing`. Every slot rides the
+first receipt (zero counters when there is no window yet) and wins a full
+list. vali maps receipt `ok` to `attached`; `failed` stays vali's own
+verdict. Like all `disk_io`, these are in-VM-root-forgeable: a tenant can
+claim `mismatch` for its own slot, so vali must not zero a slot's billing on
+the guest's word alone (cross-check with the agent's identity binding, or
+treat a guest-only `mismatch` as notify-only).
+
+**`hippius-disks`** (`scripts/guest/hippius-disks`, shipped at
+`/run/hippius/guest/bin/hippius-disks`) lists slot, state, size and mapper
+path and prints example ZFS / mdadm / mkfs commands. It never runs them.
+
+**Shipping (guest components release 6).** Everything is in the release
+cpio appended to the base initrd: the overlay library and
+`hippius-guest-release` in the initramfs part, the telemetry agent and
+`hippius-disks` in `components.squashfs`. No re-bake: every golden base
+already stages `cryptsetup` and `udevadm` in its initrd. `security_epoch`
+stays 1 (an older release ignores the anchor and opens nothing; it never
+formats). Steps, in order:
+
+1. Merge (release.conf `version=6`); the `tenant-baker-image` workflow
+   builds and signs the baker image at that commit (note its digest).
+2. Per live base (ubuntu-b5, ubuntu-b4, debian-b5, debian-3 initrd,
+   fedora-b5, cs10-b5): the one-off `guest-initrd-build.sh --build-release
+   --commit <C> --source-date-epoch <commit time>` Job (operator note in
+   that script), output prefix `tenant/<base prefix>-gr6-<short>/`; then
+   `vali_guest_build_register --from-s3-prefix tenant/<base prefix>-gr6-<short>/`.
+3. Canary per family (ubuntu, debian, fedora, cs10): `vali_guest_upgrade
+   --vm-id <throwaway> --release 6` (dry-run, `--apply`, `--status`); check
+   health 15, receipts flowing, and on a VM without dedicated disks that the
+   boot log has no `dedicated` line.
+4. `vali_bless_guest_release <image> --release 6 --blessed-by …` per image.
+5. vali E4 gate: `dedicated-needs-release` unless the image's blessed
+   `guest_release ≥ 6` (same shape as `VALI_DISK_PROBE_MIN_GUEST_RELEASE`,
+   e.g. `VALI_DEDICATED_MIN_GUEST_RELEASE=6`), and refuse any relaunch of a
+   pinned VM onto a build below 6 (the epoch floor does not hold it there).
+6. X2′ on an internal VM with a spare disk: first boot formats, reboot
+   reopens, `hippius-disks` lists, receipts carry the slot, §24 erases.
 
 ### 4.3 Data model (`vali/apps/disktier`)
 
@@ -604,7 +781,7 @@ Every PR touching the UKI closure carries its KAT re-pin.
 | A4 | agent | launch order `os_pool` / `extra_disks` (dedicated), block-device XML with virtual serial | vali never sends non-defaults |
 | V1 | vali | `MinerStorageConfig` + push loop + operator API (incl. dedicated disks) | `VALI_STORAGE_CONFIG_PUSH`, miner allowlist, min agent version |
 | B0, U0a/U0b | backend, console | operator storage views; providers StoragePanel | backend flag + beta gate |
-| G1-G4 | guest | `DiskStatsSource`; `agent-disk-probe` (v1 + d1); `--derive <slot>`, dedicated-disks unit, `hippius-disks`; guest release | inert without request file / cmdline token |
+| G1-G4 | guest | `DiskStatsSource`; `agent-disk-probe` (v1 + d1); `--open-dedicated-disks` (initramfs opener, §4.2.1), slot verdicts in receipts, `hippius-disks`; guest release 6 | inert without request file / cmdline token |
 | P1/P2 | vali | ingest → hourly rows; evaluator per pool | `VALI_DISK_IO_INGEST`, consequences `record` |
 | R1/R3 | vali | probe orchestrator per pool; dedicated-disk probe and disk state machine; alerts | `VALI_DISK_PROBE_ENABLED`, CronJobs suspended; calibration week |
 | E1/E2 | vali | per-pool fit + tier gate, `os_disk_tier`, feasibility/regions | `VALI_SCHEDULER_DISK_TIER_GATE=off\|record\|enforce` |

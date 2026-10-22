@@ -1482,13 +1482,16 @@ def resolve_boot_artifacts(vm: Vm) -> dict[str, Any] | None:
     return staging
 
 
-def _arrival_os_pool(dest_miner_id: str, cmdline: str, tier: str = "nvme") -> str | None:
+def _arrival_os_pool(
+    dest_miner_id: str, cmdline: str, tier: str = "nvme", owner: str = ""
+) -> str | None:
     """A4b: the pool a golden VM sold at OS-disk `tier` arriving on
     `dest_miner_id` is written to when the dest holds no record of it
     (`apps.disktier.routing`; the dest keeps a record it has — a
     migrate-back, a re-drive). Sized from the measured `hippius.disk_gb=`
-    plus the rootfs; `None` ⇒ `default`."""
-    from apps.disktier import routing
+    plus the rootfs; `None` ⇒ `default`. A fallback `owner`'s VM on a dest
+    without its sold tier: at the tier it lands at (`os_tier.landing_tier`)."""
+    from apps.disktier import os_tier, routing
     from apps.miners.models import MinerIdentity
     from apps.orchestration.services.flavors import ROOTFS_DISK_GB
 
@@ -1508,7 +1511,10 @@ def _arrival_os_pool(dest_miner_id: str, cmdline: str, tier: str = "nvme") -> st
     )
     if not node_id:
         return None
-    return routing.choose_os_pool(node_id, disk_gb + ROOTFS_DISK_GB, tier)
+    need_gb = disk_gb + ROOTFS_DISK_GB
+    if owner:
+        tier = os_tier.landing_tier(node_id, tier, need_gb, owner)
+    return routing.choose_os_pool(node_id, need_gb, tier)
 
 
 def arrival_os_pool(vm: Vm, dest_miner_id: str) -> str | None:
@@ -1516,7 +1522,10 @@ def arrival_os_pool(vm: Vm, dest_miner_id: str) -> str | None:
     from apps.disktier import os_tier
 
     return _arrival_os_pool(
-        dest_miner_id, _launch_paths(vm)["cmdline"], os_tier.launch_tier(vm.vm_id)
+        dest_miner_id,
+        _launch_paths(vm)["cmdline"],
+        os_tier.launch_tier(vm.vm_id),
+        os_tier.fallback_owner_of(vm.vm_id),
     )
 
 
@@ -1682,7 +1691,12 @@ def dispatch_migrate_activate(
         staged_restore_id=staged_restore_id,
         net=net_policy.launch_net_spec(miner_id=miner_id, vm_id=vm.vm_id),
         os_pool=(
-            _arrival_os_pool(dest_node_id, cmdline, os_tier.launch_tier(vm.vm_id))
+            _arrival_os_pool(
+                dest_node_id,
+                cmdline,
+                os_tier.launch_tier(vm.vm_id),
+                os_tier.fallback_owner_of(vm.vm_id),
+            )
             if os_pool is _CHOOSE_POOL
             else os_pool
         ),

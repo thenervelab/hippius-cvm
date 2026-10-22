@@ -10,8 +10,10 @@
 //! each in the `v7` heartbeat as `free`, `draining`,
 //! `unavailable` (with the refusal code), `failed` (gone after having been
 //! seen) or `replaced` (the by-id name now points at another device). The
-//! agent never formats, wipes, partitions or mounts a disk: an operator
-//! clears a signature with `wipefs -a` deliberately.
+//! agent never formats, partitions or mounts a disk, and never wipes one an
+//! operator declared: an operator clears a signature with `wipefs -a`
+//! deliberately. (A disk a VM had is zeroed at its head and tail after §24,
+//! by the privileged helper: [`super::assignment`].)
 //!
 //! Identity binding: the first time a disk passes every check, its WWID
 //! (or serial) is recorded in `<state_disk_root>/dedicated-disks.json`. A
@@ -19,8 +21,9 @@
 //! disk, and the disk is reported `replaced`, never offered again under
 //! that name.
 //!
-//! Nothing is assigned to a VM in this phase, so no disk is ever reported
-//! `assigned` here.
+//! This inventory knows nothing of VMs: which disk a VM holds (`assigned`),
+//! and which one awaits its release wipe, is folded in afterwards from the
+//! agent's records ([`super::assignment::apply_owners`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

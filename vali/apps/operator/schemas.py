@@ -197,6 +197,79 @@ class OperatorLaunchErrorSerializer(serializers.Serializer):
         return fields
 
 
+class AgentReleaseSerializer(serializers.Serializer):
+    """The newest COMPLETE miner-agent release of the public repository, as
+    vali last read it (`vali_agent_release_watch`): not a draft or
+    prerelease, every file the updater needs attached."""
+
+    tag = serializers.CharField(help_text="`vYYYY.MM.DD` or `vYYYY.MM.DD.N`.")
+    published_at = serializers.DateTimeField(help_text="GitHub `published_at`.")
+    eligible_at = serializers.DateTimeField(
+        help_text=(
+            "When the miners' updater may install it: its last required file "
+            "landed + the default soak (24 h). In the future = still soaking."
+        )
+    )
+
+
+class AutoUpdateSerializer(serializers.Serializer):
+    """The miner-agent auto-updater as the node reports it (host inventory
+    `software.auto_update`): SELF-REPORTED, display only. Off is abnormal:
+    show a warning with the remedy for `disabled_reason`
+    (deploy/ansible/playbooks/miner-tasks/AUTO_UPDATE.md, "Dashboard")."""
+
+    enabled = serializers.BooleanField(
+        help_text="No opt-out in force and the updater's timer is enabled."
+    )
+    disabled_reason = serializers.ChoiceField(
+        choices=["no_auto_update_file", "disabled_in_env", "timer_disabled"],
+        allow_null=True,
+        help_text=(
+            "`null` when enabled. `no_auto_update_file`: "
+            "/var/lib/hippius-miner/.no-auto-update exists. `disabled_in_env`: "
+            "`AUTO_UPDATE_DISABLED=true` (ansible `miner_auto_update_enabled: false`). "
+            "`timer_disabled`: hippius-miner-update.timer not enabled (or never "
+            "installed)."
+        ),
+    )
+    last_check_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text=(
+            "When a timer run last read the release list; `null` before the first "
+            "one. Runs every 30 min plus up to 6 h of jitter, and reaches vali with "
+            "the node's 6-hourly report: older than ~13 h while `enabled` means the "
+            "updater is not running or cannot reach GitHub."
+        ),
+    )
+    failed_tag = serializers.CharField(
+        allow_null=True,
+        help_text=(
+            "The newest release that failed its health check on the node and is "
+            "newer than the agent reporting: the updater never retries it (remove "
+            "/var/lib/hippius-miner/.update-failed-<tag> to retry)."
+        ),
+    )
+    reported_at = serializers.DateTimeField(
+        help_text="The signed timestamp of the report that carried this block."
+    )
+
+
+_AGENT_RELEASE_HELP = (
+    "The newest complete miner-agent release vali knows; `null` before the "
+    "release watch ever ran (`VALI_AGENT_RELEASE_WATCH`). Optional during the rollout."
+)
+_UPDATE_PENDING_HELP = (
+    "The node's `agent_version` is older than the newest release past the "
+    "soak (eligible now). `null` when it cannot be told: no release known, or "
+    "no release tag reported (none yet, or a `dev` build). Optional during the rollout."
+)
+_AUTO_UPDATE_HELP = (
+    "The auto-updater's state as the node reports it; `null` until the node's "
+    "host inventory carries it (agent collector run with `--report-auto-update`). "
+    "Optional during the rollout."
+)
+
+
 class OperatorLastProbeSerializer(serializers.Serializer):
     """vali's last synthetic probe of the node that reached it
     (`apps.synthetic.per_miner`): a throwaway VM launched onto the node
@@ -318,6 +391,13 @@ class OperatorNodeSerializer(serializers.Serializer):
             "Optional during the rollout."
         ),
     )
+    latest_agent_release = AgentReleaseSerializer(
+        required=False, allow_null=True, help_text=_AGENT_RELEASE_HELP
+    )
+    update_pending = serializers.BooleanField(
+        required=False, allow_null=True, help_text=_UPDATE_PENDING_HELP
+    )
+    auto_update = AutoUpdateSerializer(required=False, allow_null=True, help_text=_AUTO_UPDATE_HELP)
     last_probe = OperatorLastProbeSerializer(
         required=False,
         allow_null=True,
@@ -672,6 +752,13 @@ class FleetMinerSerializer(serializers.Serializer):
             "(self-reported); null before the first report."
         ),
     )
+    latest_agent_release = AgentReleaseSerializer(
+        required=False, allow_null=True, help_text=_AGENT_RELEASE_HELP
+    )
+    update_pending = serializers.BooleanField(
+        required=False, allow_null=True, help_text=_UPDATE_PENDING_HELP
+    )
+    auto_update = AutoUpdateSerializer(required=False, allow_null=True, help_text=_AUTO_UPDATE_HELP)
     heartbeat_age_s = serializers.IntegerField(allow_null=True)
     heartbeat_stale = serializers.BooleanField()
     on_chain = serializers.BooleanField(

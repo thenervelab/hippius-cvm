@@ -494,3 +494,30 @@ def test_an_artifact_preflight_failure_is_not_a_capacity_event(monkeypatch) -> N
     monkeypatch.setattr(preflight_svc, "dispatch_preflight", sha)
     launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
     assert seen == []
+
+
+@pytest.mark.parametrize("status", [502, 504])
+def test_an_edge_timeout_at_preflight_is_no_strike_and_no_demotion(monkeypatch, status) -> None:
+    """A bodiless Edge 502/504 to a preflight (`preflight-timeout`) is the
+    Edge giving up on a slow staging, not the miner refusing: no capacity
+    event (no strike, no ceiling cut) and nothing in the SEV ledger."""
+    from apps.miners.models import MinerLaunchErrors
+    from apps.orchestration.services import preflight as preflight_svc
+
+    _mirror(1)
+    miner = _register_miner(1)
+    _fake_the_launch_choreography(monkeypatch, dispatch_ok=True)
+    seen = _record_events(monkeypatch)
+
+    def edge_timeout(*a, **k):
+        raise preflight_svc.PreflightRejected("edge", classifier="", status=status)
+
+    monkeypatch.setattr(preflight_svc, "dispatch_preflight", edge_timeout)
+    out = launch.launch_on_miner(_spec(userdata=_USERDATA), miner)
+
+    assert out.disposition == launch.RETRIABLE
+    assert out.emit["miner_error"]["code"] == "preflight-timeout"
+    assert seen == []
+    row = MinerCapacity.objects.get(miner_node_id=node_id(1))
+    assert (row.cvm_fail_streak, row.cvm_last_fail_at) == (0, None)
+    assert MinerLaunchErrors.objects.get(miner=miner).fail_streak == 0

@@ -214,6 +214,7 @@ fn software(uptime_s: u64) -> SoftwareSection {
         libvirt_version: None,
         uptime_s,
         last_boot_unix: None,
+        auto_update: None,
     }
 }
 

@@ -49,6 +49,7 @@ _ERROR_STATUS = {
     "rollback-rate-limited": status.HTTP_429_TOO_MANY_REQUESTS,
     "job-in-flight": status.HTTP_409_CONFLICT,
     "vm-not-restorable": status.HTTP_409_CONFLICT,
+    "dedicated-pinned": status.HTTP_409_CONFLICT,
     "no-eligible-miner": status.HTTP_409_CONFLICT,
     "region-unknown": status.HTTP_409_CONFLICT,
     "region-conflict": status.HTTP_409_CONFLICT,

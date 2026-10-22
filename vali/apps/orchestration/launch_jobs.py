@@ -23,7 +23,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from apps.disktier import os_tier
+from apps.disktier import dedicated, os_tier
 from apps.disktier.storage_doc import is_valid_pool_id
 from apps.identity import scoping
 from apps.orchestration import launch_purpose, power_policy, webhook
@@ -176,9 +176,11 @@ def _check_flavor(flavor: object) -> None:
         )
 
 
-def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
+def _build_spec_json(intent: dict[str, Any], *, guest_release: int | None = None) -> dict[str, Any]:
     """Validate + normalise the non-secret launch intent into the
     `spec_json` dict the worker feeds to `LaunchSpec(**spec_json, …)`.
+    `guest_release` is the launched image's blessed guest release
+    (`_resolve_bake`), which dedicated disks need.
     """
     spec: dict[str, Any] = {}
     for key in _REQUIRED:
@@ -281,15 +283,28 @@ def _build_spec_json(intent: dict[str, Any]) -> dict[str, Any]:
     if tier != os_tier.DEFAULT_TIER:
         spec["os_disk_tier"] = tier
 
-    # Dedicated disks (design §10.20) are reserved, not sold yet: any value
-    # but null is refused 409 so a caller can wire the field now.
-    # `pinned_ack` goes with it, a boolean, and is not kept.
-    if intent.get("dedicated_disks") is not None:
-        raise LaunchIntentError(
-            "dedicated_disks is not offered on this validator", CATEGORY_DEDICATED_NOT_OFFERED
-        )
+    # Dedicated disks (E4, `apps.disktier.dedicated`): off ⇒ any value but
+    # null is refused 409 `dedicated-disks-not-offered`, as before. On, the
+    # contract's 400 / 409 categories; written into `spec_json` only when
+    # present (the request, and `pinned_ack: true`), so every other
+    # launch's record is as before.
+    raw_dedicated = intent.get("dedicated_disks")
     ack = intent.get("pinned_ack")
-    if ack is not None and not isinstance(ack, bool):
+    if raw_dedicated is not None:
+        try:
+            dedicated_request = dedicated.check_launch(
+                raw_dedicated,
+                pinned_ack=ack,
+                tenant_id=spec["tenant_id"],
+                user_id=spec["user_id"],
+                require_failover_peer=bool(spec.get("require_failover_peer")),
+                guest_release=guest_release,
+            )
+        except dedicated.DedicatedError as exc:
+            raise LaunchIntentError(exc.message, exc.category) from exc
+        spec["dedicated_disks"] = dedicated_request.as_spec()
+        spec["pinned_ack"] = True
+    elif ack is not None and not isinstance(ack, bool):
         raise LaunchIntentError("pinned_ack must be a boolean", "bad-field")
 
     # Tenant price ceiling — optional positive int (USD/unit ×1e6) or None
@@ -626,8 +641,8 @@ def _check_disk_probe_role(intent: dict[str, Any], *, disk_probe: bool) -> DiskP
 
 #: The category of an `os_pool` in a launch that is not the disk probe's.
 CATEGORY_OS_POOL_RESERVED = "os-pool-reserved"
-#: A launch naming `dedicated_disks` before they are sold (409).
-CATEGORY_DEDICATED_NOT_OFFERED = "dedicated-disks-not-offered"
+#: A launch naming `dedicated_disks` while they are not offered to it (409).
+CATEGORY_DEDICATED_NOT_OFFERED = dedicated.CATEGORY_NOT_OFFERED
 #: The intent key the disk-tier probe pins its pool under test with.
 _OS_POOL_KEY = "os_pool"
 
@@ -665,11 +680,13 @@ def _check_os_pool_pin(intent: dict[str, Any], run: DiskProbeRun | None) -> None
         )
 
 
-def _resolve_bake(intent: dict[str, Any]) -> None:
+def _resolve_bake(intent: dict[str, Any]) -> int | None:
     """Fill the launch-spec artifact fields from a Succeeded `TenantBake`
     named by `intent['bake_id']`. A no-op when `bake_id` is absent.
     Caller-supplied values are NOT overwritten — `bake_id` is a
     convenience that resolves only the fields the bake determines.
+    Returns the image's blessed guest release the launch boots (`None`
+    for a launch that is not by image, or an image blessed without one).
 
     Launch-by-image is resolved FIRST: if the intent names an `image`, it is
     mapped (via the operator-blessed `GoldenImage` catalog) to the current
@@ -686,7 +703,7 @@ def _resolve_bake(intent: dict[str, Any]) -> None:
     guest_release = intent.pop(_IMAGE_GUEST_RELEASE_KEY, None)
     bake_id = intent.get("bake_id")
     if not bake_id:
-        return
+        return None
     if not isinstance(bake_id, str):
         raise LaunchIntentError("bake_id must be a string", "bad-field")
     from apps.tenant_bake.models import TenantBake, TenantBakeState
@@ -756,6 +773,7 @@ def _resolve_bake(intent: dict[str, Any]) -> None:
     for key, val in resolved.items():
         if val and not intent.get(key):
             intent[key] = val
+    return int(guest_release) if guest_release is not None else None
 
 
 def _canonical_kek_path(intent: dict[str, Any]) -> str:
@@ -838,6 +856,28 @@ def _provision_golden_overlay_kek(intent: dict[str, Any]) -> None:
     # Point the launch at the canonical (KV-relative) path — the validation
     # below asserts `kek_vault_path == {prefix}/{vm_id}/luks-kek`.
     intent["kek_vault_path"] = luks_path
+
+
+def _check_dedicated_fixed(existing: Any, spec_json: dict[str, Any]) -> None:
+    """A VM's dedicated disks are fixed by its first launch (E4): a re-POST
+    for an existing vm_id must ask exactly what it was sold — or nothing,
+    if it was sold none. Otherwise it could boot without the disks it holds,
+    or take a second set (`conflict`, before any Vault write)."""
+    from apps.scheduler.service import _launch_spec
+
+    asked = spec_json.get("dedicated_disks")
+    if asked is None and not dedicated.is_pinned(existing):
+        return
+    try:
+        sold = dedicated.spec_request(_launch_spec(existing.vm_id))
+    except ValueError:
+        sold = None
+    if sold is None or asked is None or sold.as_spec() != asked:
+        raise LaunchIntentError(
+            f"vm {existing.vm_id!r} was launched with dedicated_disks "
+            f"{sold.as_spec() if sold else None!r}; a later launch must ask the same",
+            "conflict",
+        )
 
 
 def _refuse_held(locked: Any) -> None:
@@ -988,7 +1028,7 @@ def start_launch(
             "conflict",
         )
 
-    _resolve_bake(intent)
+    guest_release = _resolve_bake(intent)
     _check_artifact_restriction(intent)
     _check_cdn_role(intent, cdn_node=cdn_node)
     binding = _intent_binding(intent)
@@ -1056,7 +1096,9 @@ def start_launch(
     # overlay KEK, the userdata): a refusal after those would strand Vault
     # material under a vm_id that never gets a `Vm` row, where §24 never
     # looks.
-    spec_json = _build_spec_json(intent)
+    spec_json = _build_spec_json(intent, guest_release=guest_release)
+    if existing is not None:
+        _check_dedicated_fixed(existing, spec_json)
     prefix = str(getattr(settings, "VALI_VAULT_KV_PREFIX", ""))
     if not prefix:
         raise LaunchIntentError("VALI_VAULT_KV_PREFIX is not configured", "internal")
@@ -1482,6 +1524,10 @@ def run_job(job: LaunchJob) -> None:
         "attempts": result.attempts,
         "emit": result.emit,
     }
+    if result.ok and spec.dedicated_disks is not None:
+        # E4: `pinned` + `disks[]` (contract §2), only for a VM with
+        # dedicated disks — every other result is as before.
+        result_json.update(_dedicated_read_back(spec))
     if result.ok:
         # The ticket's OrderTicketIntake was written by launch_on_miner
         # at mint time; nothing more to persist here.
@@ -1504,6 +1550,16 @@ def run_job(job: LaunchJob) -> None:
             placement_id=result.placement_id or "",
             phase=LaunchPhase.FAILED,
         )
+
+
+def _dedicated_read_back(spec: launch.LaunchSpec) -> dict[str, Any]:
+    """The launched VM's `pinned` + `disks[]`; its OS disk as this launch
+    sold it (its job is not the VM's launch record yet)."""
+    from apps.lifecycle.models import Vm
+
+    vm = Vm.objects.filter(vm_id=spec.vm_id).first()
+    os_disk = (launch.data_disk_gb(spec), os_tier.spec_tier({"os_disk_tier": spec.os_disk_tier}))
+    return dedicated.read_back(vm, os_disk=os_disk)
 
 
 def _phase_callback(job: LaunchJob):

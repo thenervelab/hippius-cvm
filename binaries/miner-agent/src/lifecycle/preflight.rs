@@ -345,6 +345,7 @@ async fn run_inner(order: TenantPreflightOrder, policy: StagePolicy) -> Result<P
         cid: crate::vsock::peer::MIN_GUEST_CID,
         net: None,
         dhcp: None,
+        extra_disks: Vec::new(),
     };
 
     let digest: [u8; LAUNCH_DIGEST_LEN] = compute_launch_digest(&cfg)?;

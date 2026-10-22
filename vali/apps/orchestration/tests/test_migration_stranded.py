@@ -889,7 +889,7 @@ def test_dispatch_migrate_activate_passes_settle_by_to_the_payload(
     # A4b: the dest's pool reaches the body (`effects._arrival_os_pool`).
     assert built[0]["os_pool"] is None
     monkeypatch.setattr(
-        effects, "_arrival_os_pool", lambda miner_id, cmdline, tier="nvme": "nvme0"
+        effects, "_arrival_os_pool", lambda miner_id, cmdline, tier="nvme", owner="": "nvme0"
     )
     fx.real["dispatch_migrate_activate"](
         vm,

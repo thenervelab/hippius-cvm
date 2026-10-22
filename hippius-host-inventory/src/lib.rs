@@ -832,6 +832,78 @@ pub struct SoftwareSection {
     pub uptime_s: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_boot_unix: Option<i64>,
+    /// The agent auto-updater's state, as the host's files show it.
+    /// Absent: not collected (the collector runs without
+    /// `--report-auto-update`, or could not read the files). An older
+    /// decoder refuses the key (`deny_unknown_fields`), so vali accepts it
+    /// before any agent sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<AutoUpdateStatus>,
+}
+
+/// Why auto-update is off on a host, in the order the checks run: the
+/// first that applies is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpdateDisabledReason {
+    /// `/var/lib/hippius-miner/.no-auto-update` exists.
+    NoAutoUpdateFile,
+    /// `AUTO_UPDATE_DISABLED=true` in `/etc/hippius-miner/auto-update.env`
+    /// (ansible `miner_auto_update_enabled: false`).
+    DisabledInEnv,
+    /// `hippius-miner-update.timer` is not enabled (never installed, or
+    /// disabled): no run ever fires.
+    TimerDisabled,
+}
+
+/// The miner-agent auto-updater (`hippius-miner-update`), read from its
+/// files — never by running it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoUpdateStatus {
+    /// No opt-out in force and the timer is enabled.
+    pub enabled: bool,
+    /// Present exactly when `enabled` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<AutoUpdateDisabledReason>,
+    /// When a timer run last read the release list (unix seconds). Absent
+    /// when no run has recorded one yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_unix: Option<i64>,
+    /// The newest release that failed its health check on this host
+    /// (`.update-failed-<tag>`) and is newer than the agent reporting:
+    /// the updater never retries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tag: Option<String>,
+}
+
+/// The latest instant a reported time may name: 9999-12-31T23:59:59Z,
+/// the last second every consumer's calendar type holds.
+pub const MAX_UNIX_TIME: i64 = 253_402_300_799;
+
+/// `true` for a miner-agent release tag exactly as the updater accepts
+/// it: `vYYYY.MM.DD` or `vYYYY.MM.DD.N`, N = 1..999 without a leading
+/// zero.
+pub fn is_release_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('v') else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let digits = |p: Option<&str>, n: usize| {
+        p.is_some_and(|p| p.len() == n && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !(digits(parts.next(), 4) && digits(parts.next(), 2) && digits(parts.next(), 2)) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, _) => true,
+        (Some(n), None) => {
+            (1..=3).contains(&n.len())
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && !n.starts_with('0')
+        }
+        _ => false,
+    }
 }
 
 // ─── validation ──────────────────────────────────────────────────────
@@ -1314,6 +1386,20 @@ impl SoftwareSection {
         ] {
             opt_text(s, MAX_TEXT_LEN, E)?;
         }
+        if let Some(a) = &self.auto_update {
+            const A: &str = "host-inventory-auto-update";
+            if a.enabled == a.disabled_reason.is_some() {
+                return Err(A);
+            }
+            if a.last_check_unix
+                .is_some_and(|t| !(0..=MAX_UNIX_TIME).contains(&t))
+            {
+                return Err(A);
+            }
+            if a.failed_tag.as_deref().is_some_and(|t| !is_release_tag(t)) {
+                return Err(A);
+            }
+        }
         Ok(())
     }
 }
@@ -1541,6 +1627,7 @@ mod tests {
                     libvirt_version: None,
                     uptime_s: 5,
                     last_boot_unix: None,
+                    auto_update: None,
                 }),
                 ..Sections::default()
             },
@@ -1617,6 +1704,139 @@ mod tests {
         let mut r = minimal();
         r.report = ReportKind::Full;
         assert_eq!(r.canonical(), Err("host-inventory-full-incomplete"));
+    }
+
+    fn with_auto_update(a: AutoUpdateStatus) -> HostInventory {
+        let mut r = minimal();
+        r.sections.software.as_mut().unwrap().auto_update = Some(a);
+        r
+    }
+
+    fn auto_update_on() -> AutoUpdateStatus {
+        AutoUpdateStatus {
+            enabled: true,
+            disabled_reason: None,
+            last_check_unix: Some(1_700_000_000),
+            failed_tag: Some("v2026.10.21.1".into()),
+        }
+    }
+
+    #[test]
+    fn release_tags_are_the_updaters_shape() {
+        for ok in ["v2026.10.08", "v2026.10.08.1", "v2026.10.08.999"] {
+            assert!(is_release_tag(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "dev",
+            "2026.10.08",
+            "v2026.10.8",
+            "v26.10.08",
+            "v2026.10.08.0",
+            "v2026.10.08.01",
+            "v2026.10.08.1000",
+            "v2026.10.08.",
+            "v2026.10.08.1.2",
+            "v2026.10.08-rc1",
+            "v2026.1a.08",
+        ] {
+            assert!(!is_release_tag(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn auto_update_round_trips_and_is_optional() {
+        let r = with_auto_update(auto_update_on());
+        let bytes = r.canonical().unwrap();
+        assert_eq!(HostInventory::decode(&bytes).unwrap(), r);
+        let off = AutoUpdateStatus {
+            enabled: false,
+            disabled_reason: Some(AutoUpdateDisabledReason::TimerDisabled),
+            last_check_unix: None,
+            failed_tag: None,
+        };
+        let r = with_auto_update(off);
+        assert_eq!(HostInventory::decode(&r.canonical().unwrap()).unwrap(), r);
+        // Absent: the body is byte for byte what an older encoder made.
+        let plain = minimal().canonical().unwrap();
+        let v: Value = ciborium::de::from_reader(plain.as_slice()).unwrap();
+        assert!(!format!("{v:?}").contains("auto_update"));
+    }
+
+    #[test]
+    fn auto_update_reason_matches_enabled() {
+        let mut a = auto_update_on();
+        a.disabled_reason = Some(AutoUpdateDisabledReason::NoAutoUpdateFile);
+        assert_eq!(
+            with_auto_update(a).canonical(),
+            Err("host-inventory-auto-update")
+        );
+        let mut a = auto_update_on();
+        a.enabled = false;
+        assert_eq!(
+            with_auto_update(a).canonical(),
+            Err("host-inventory-auto-update")
+        );
+    }
+
+    #[test]
+    fn auto_update_times_and_tags_are_checked() {
+        let mut a = auto_update_on();
+        a.last_check_unix = Some(-1);
+        assert_eq!(
+            with_auto_update(a).canonical(),
+            Err("host-inventory-auto-update")
+        );
+        let mut a = auto_update_on();
+        a.last_check_unix = Some(0);
+        assert!(with_auto_update(a).canonical().is_ok());
+        let mut a = auto_update_on();
+        a.last_check_unix = Some(MAX_UNIX_TIME);
+        assert!(with_auto_update(a).canonical().is_ok());
+        let mut a = auto_update_on();
+        a.last_check_unix = Some(MAX_UNIX_TIME + 1);
+        assert_eq!(
+            with_auto_update(a).canonical(),
+            Err("host-inventory-auto-update")
+        );
+        let mut a = auto_update_on();
+        a.failed_tag = Some("dev".into());
+        assert_eq!(
+            with_auto_update(a).canonical(),
+            Err("host-inventory-auto-update")
+        );
+    }
+
+    #[test]
+    fn auto_update_refuses_unknown_keys() {
+        let mut r = with_auto_update(auto_update_on());
+        r.sections.software.as_mut().unwrap().auto_update = None;
+        let mut v = Value::serialized(&r).unwrap();
+        // sections.software.auto_update = {enabled: true, extra: 1}
+        let Value::Map(top) = &mut v else { panic!() };
+        let sections = top
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("sections"))
+            .unwrap();
+        let Value::Map(secs) = &mut sections.1 else {
+            panic!()
+        };
+        let software = secs
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("software"))
+            .unwrap();
+        let Value::Map(sw) = &mut software.1 else {
+            panic!()
+        };
+        sw.push((
+            Value::Text("auto_update".into()),
+            Value::Map(vec![
+                (Value::Text("enabled".into()), Value::Bool(true)),
+                (Value::Text("extra".into()), Value::Integer(1.into())),
+            ]),
+        ));
+        let bytes = to_canonical_vec(&v).unwrap();
+        assert!(HostInventory::decode(&bytes).is_err());
     }
 
     #[test]

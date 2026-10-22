@@ -37,6 +37,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmPowerState, VmState
 from apps.orchestration import effects
 from apps.storage import s3
@@ -561,6 +562,12 @@ def put_policy(
     interval, retention, mode = _validate_policy_fields(interval_s, retention_days, failover_mode)
     if vm.state in (VmState.DESTROYED, VmState.DECOMMISSIONING):
         raise BackupError("vm-not-live", "the vm is being or has been destroyed")
+    if disk_dedicated.is_pinned(vm):
+        # E4: no backup of any kind for a pinned VM (its restore could only
+        # land elsewhere, which it never may).
+        raise BackupError(
+            disk_dedicated.CATEGORY_PINNED, disk_dedicated.pinned_message(vm, "backed up")
+        )
     if mode == FailoverMode.AUTO:
         blocker = failover_region_blocker(vm)
         if blocker is not None:

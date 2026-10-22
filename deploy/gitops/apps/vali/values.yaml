@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "9132d1fef8dcee1db01ef6c2a72d50f97643517a"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39685428256/attempts/1"
+    commitSha: "f192e9aa97d82399ef26f605711163985f67050a"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39808115812/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -134,6 +134,25 @@ scheduler:
   # ConfigMap. v2026.10.16.2 is the first release that takes it; older
   # agents stay gated.
   poolRoutingMinAgentVersion: "v2026.10.16.2"
+  # OS-disk tiers (`apps.disktier.os_tier`, E1 #1715), stated at their
+  # settings.py defaults: read by the web pods (launch intake, feasibility),
+  # the launch tick (placement, pool choice) and the orchestration tick
+  # (§25 destinations), hence the shared ConfigMap.
+  # diskTierGate: off | record | enforce — gate (n), a node without an OS
+  # pool at the VM's sold tier (`VALI_SCHEDULER_DISK_TIER_GATE`).
+  diskTierGate: "off"
+  # The tiers a launch may be sold at (`os_disk_tier`); one besides nvme
+  # also needs diskTierGate "enforce" (`VALI_SELLABLE_OS_TIERS`, CSV).
+  sellableOsTiers:
+    - nvme
+  # The largest flavor sold on the hdd OS tier (`VALI_HDD_OS_MAX_FLAVOR`).
+  hddOsMaxFlavor: "large"
+  # Owners (`Placement.owner`, the launch `user_id` our product API sets)
+  # whose VMs may take a LOWER OS-disk tier when, under diskTierGate
+  # "enforce", no candidate holds the sold one (nvme -> ssd -> hdd, first
+  # that fits). Our own runners only, never a customer. Empty = nobody
+  # (`VALI_DISK_TIER_FALLBACK_OWNERS`, CSV).
+  diskTierFallbackOwners: []
   # External-miner approval gate (#1631, `apps.scheduler.approval`): while
   # "true", a miner the chain refresh first sees starts PENDING (no
   # placement, no rewards) until an operator runs `vali_approve_miner`,
@@ -1152,6 +1171,30 @@ storageMove:
     enabled: "true"
     # A move held mid-pivot this long pages (the VM is down meanwhile).
     pivotUnknownAfterMinutes: 10
+# Dedicated physical disks (E4, `apps.disktier.dedicated`, frozen contract
+# docs/design/dedicated-disks-contract.md): whole HDDs passed to a VM, which
+# is then pinned to its host. DARK: `enabled` "false" ⇒ every launch naming
+# `dedicated_disks` answers 409 `dedicated-disks-not-offered`, as before.
+# Read by the web pods (launch intake, VM status), the launch tick
+# (placement, order, cmdline) and the receipt ingest, hence the shared
+# ConfigMap. Every other key renders only when set:
+# - allowedOwners: user or tenant ids (comma-separated) allowed to launch
+#   with dedicated disks (the internal canary); empty = every owner.
+# - maxPerVm: the upper bound of `count` (1..8, default 8).
+# - minGuestRelease: the oldest blessed guest release whose guest opens
+#   dedicated disks; empty = every launch answers `dedicated-needs-release`.
+#   "6": the guest opener ships as guest release 6 (PR #1756); a pinned VM
+#   is also never upgraded or initrd-swapped below it.
+# - minAgentVersion: the oldest agent release that takes `extra_disks`;
+#   empty = no node qualifies.
+# Flip together with the backend's COMPUTE_DEDICATED_ENABLED, after the
+# internal end-to-end test.
+dedicatedDisks:
+  enabled: "false"
+  allowedOwners: ""
+  maxPerVm: ""
+  minGuestRelease: "6"
+  minAgentVersion: ""
 # §18.10 host inventory ingest (`apps.disktier.host_inventory`): the
 # Edge-relayed, miner-signed `POST /v1/telemetry/host-inventory` (web pod,
 # the only reader of the flag). UNTRUSTED, shown to the node owner only;
@@ -1160,6 +1203,24 @@ storageMove:
 # their settings.py defaults (no chart key).
 hostInventory:
   ingest: "true"
+# Miner-agent releases (`vali_agent_release_watch`, apps.miners.agent_release):
+# reads api.github.com/repos/thenervelab/hippius-cvm/releases?per_page=20
+# and stores the complete releases, for `latest_agent_release` /
+# `update_pending` on /v1/operator/nodes and /fleet (display only). "false"
+# renders nothing: no CronJob, no egress, no ConfigMap key (the rows show
+# `null`). "true" renders the CronJob (VALI_AGENT_RELEASE_WATCH set in its
+# own pod) and a `world:443` egress rule. Unauthenticated GitHub API: 60
+# requests/hour per IP, one per run.
+agentReleaseWatch:
+  enabled: "false"
+  schedule: "23 * * * *"
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
 # The disk-tier probe orchestrator (docs/design/disk-tier-verification.md
 # §4.4, R1; `vali_disk_probe`): RECORD ONLY. SUSPENDED, and
 # VALI_DISK_PROBE_ENABLED keeps its code default (off, no chart key), so the

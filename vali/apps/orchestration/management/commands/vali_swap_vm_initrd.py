@@ -132,9 +132,10 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import Q
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmPowerState, VmState
 from apps.orchestration.models import LaunchJob, LaunchJobState
-from apps.orchestration.services import launch_record
+from apps.orchestration.services import guest_components, launch_record
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _GOLDEN = "golden_verity_overlay"
@@ -377,6 +378,11 @@ def verdict(vm: Vm, rebuild: Rebuild) -> tuple[str, dict[str, Any]]:
     )
     if str(spec.get("disk_mode") or "") != _GOLDEN:
         return "not-golden", detail
+    # E4: a VM with dedicated disks never boots a guest that cannot open
+    # them (a rebuild of no known guest release counts as below).
+    target = guest_components.build_for_initrd(rebuild.initrd_sha256)
+    if disk_dedicated.guest_release_refusal(vm, target.release_id if target else None):
+        return disk_dedicated.CATEGORY_NEEDS_RELEASE, detail
     if _norm(spec.get("measurement_hex")):
         return "measurement-pinned", detail
     if spec.get("auto_pin_allowlist") is not True:

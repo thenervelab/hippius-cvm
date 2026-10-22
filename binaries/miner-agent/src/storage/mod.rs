@@ -7,6 +7,10 @@
 //!   disks was dropped from the config.
 //! - [`dedicated`] — the read-only dedicated-disk inventory and identity
 //!   binding.
+//! - [`assignment`] — which VM holds which dedicated disk (launch claim,
+//!   re-attach, §24 release), inside the agent's sandbox.
+//! - [`dedicated_helper`] — the privileged hold and release wipe, run in
+//!   systemd units outside the sandbox.
 //! - [`state`] — the storage set in force, swapped whole by an applied
 //!   `storage-config`.
 //! - [`reclaim`] — the per-VM disks a destroy could not reach on a pool
@@ -16,8 +20,10 @@
 //! - [`StorageReporter`] — the `v7` heartbeat's storage report, built from
 //!   all of it.
 
+pub mod assignment;
 pub mod check;
 pub mod dedicated;
+pub mod dedicated_helper;
 pub mod pools;
 pub mod reclaim;
 pub mod registry;
@@ -72,6 +78,9 @@ pub struct StorageReporter {
     /// identity is recorded (and none forgotten) until an operator looks.
     /// Shared with the `storage-config` route.
     identities: Arc<dedicated::IdentityStore>,
+    /// Who holds which dedicated disk, and whether the privileged helper
+    /// is installed (shared with the lifecycle).
+    dedicated: Arc<assignment::DedicatedDisks>,
 }
 
 /// `bytes` as whole GiB, saturating into `u32`.
@@ -104,7 +113,15 @@ impl StorageReporter {
             pool_fs,
             facts,
             identities: Arc::default(),
+            dedicated: Arc::default(),
         }
+    }
+
+    /// Share the lifecycle's dedicated-disk service (its records and its
+    /// helper).
+    pub fn with_dedicated(mut self, dedicated: Arc<assignment::DedicatedDisks>) -> Self {
+        self.dedicated = dedicated;
+        self
     }
 
     /// Share the dedicated-disk identities with the `storage-config`
@@ -200,7 +217,69 @@ impl StorageReporter {
     /// applied `storage-config` (`0` for the local set).
     pub fn report(&self) -> StorageReport {
         let set = self.storage.current();
-        let dedicated_disks = if set.dedicated.is_empty() {
+        let owners = assignment::owners(&self.state_root);
+        let dedicated_disks =
+            if set.dedicated.is_empty() && matches!(&owners, Ok(o) if o.is_empty()) {
+                Vec::new()
+            } else {
+                self.dedicated_reports(&set, owners)
+            };
+        StorageReport {
+            disk_pools: self.pool_reports_of(&set),
+            dedicated_disks,
+            storage_config_revision: set.revision,
+        }
+    }
+
+    /// The dedicated disks: the inventory of the declared ones, then who
+    /// holds which ([`assignment::apply_owners`]). A free disk is offered
+    /// only where the privileged helper (hold, release wipe) is installed.
+    fn dedicated_reports(
+        &self,
+        set: &state::EffectiveStorage,
+        owners: std::result::Result<
+            std::collections::BTreeMap<String, assignment::Owner>,
+            assignment::Unreadable,
+        >,
+    ) -> Vec<hippius_types::storage_report::DedicatedDiskReport> {
+        use hippius_types::storage_report::DedicatedDiskState;
+        let facts = self.facts.facts();
+        let mut reports = self.inventory_reports(set, facts.as_ref().map_err(|e| *e));
+        match owners {
+            Ok(owners) => {
+                assignment::apply_owners(&mut reports, &owners, facts.as_ref().map_err(|e| *e));
+            }
+            Err(assignment::Unreadable) => {
+                eprintln!(
+                    "hippius-miner-agent: storage: dedicated-disk assignment records unreadable; \
+                     dedicated disks reported unavailable"
+                );
+                for r in &mut reports {
+                    r.state = DedicatedDiskState::Unavailable;
+                    r.vm.clear();
+                    r.error = "disk-assignment-unreadable".into();
+                }
+            }
+        }
+        if !self.dedicated.helper().installed() {
+            for r in &mut reports {
+                if r.state == DedicatedDiskState::Free {
+                    r.state = DedicatedDiskState::Unavailable;
+                    r.error = "disk-helper-missing".into();
+                }
+            }
+        }
+        reports
+    }
+
+    /// The inventory of the declared dedicated disks (binding new
+    /// identities).
+    fn inventory_reports(
+        &self,
+        set: &state::EffectiveStorage,
+        facts: std::result::Result<&dedicated::DiskFacts, &'static str>,
+    ) -> Vec<hippius_types::storage_report::DedicatedDiskReport> {
+        if set.dedicated.is_empty() {
             Vec::new()
         } else {
             let mut guard = self.identities.lock();
@@ -211,8 +290,8 @@ impl StorageReporter {
                     let before = identities.clone();
                     let reports = dedicated::inventory(
                         &set.dedicated,
-                        self.facts.facts().as_ref().map_err(|e| *e),
-                        &self.system_devs(&set),
+                        facts,
+                        &self.system_devs(set),
                         identities,
                     );
                     let mut reports = reports;
@@ -256,11 +335,6 @@ impl StorageReporter {
                     reports
                 }
             }
-        };
-        StorageReport {
-            disk_pools: self.pool_reports_of(&set),
-            dedicated_disks,
-            storage_config_revision: set.revision,
         }
     }
 }
@@ -350,11 +424,36 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn the_report_carries_every_pool_and_disk_and_is_valid() {
+    /// The privileged helper as installed (or not).
+    struct Helper(bool);
+    impl assignment::DedicatedHelper for Helper {
+        fn installed(&self) -> bool {
+            self.0
+        }
+        fn hold(&self, _: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn unhold(&self, _: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn release(&self, _: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    /// A 2 TiB clean whole disk `wwn-0x1` (`naa.1`) on a fixture host, the
+    /// default pool and an absent `hdd0`, and a reporter over them whose
+    /// helper is `installed`.
+    struct Fixture {
+        root: tempfile::TempDir,
+        _hdd: tempfile::TempDir,
+        _host: tempfile::TempDir,
+        reporter: StorageReporter,
+    }
+
+    fn fixture(installed: bool) -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let hdd = tempfile::tempdir().unwrap();
-        // A 2 TiB clean whole disk, linked by id.
         let host = tempfile::tempdir().unwrap();
         let h = host.path();
         for d in ["dev", "by-id", "sys/sdb/device", "sys/sdb/holders"] {
@@ -379,12 +478,7 @@ mod tests {
             revision: 7,
             bindings,
         }));
-        let reporter = StorageReporter::with_host(
-            storage,
-            root.path().to_path_buf(),
-            Box::new(Fs {
-                missing: vec![hdd.path().to_path_buf()],
-            }),
+        let facts = || {
             Box::new(dedicated::LiveFacts {
                 paths: dedicated::SysPaths {
                     by_id: h.join("by-id"),
@@ -394,9 +488,33 @@ mod tests {
                     require_block_device: false,
                 },
                 probe: Box::new(Clean),
+            })
+        };
+        let reporter = StorageReporter::with_host(
+            storage,
+            root.path().to_path_buf(),
+            Box::new(Fs {
+                missing: vec![hdd.path().to_path_buf()],
             }),
-        );
-        let report = reporter.report();
+            facts(),
+        )
+        .with_dedicated(Arc::new(assignment::DedicatedDisks::new(
+            facts(),
+            Box::new(Helper(installed)),
+            Arc::default(),
+        )));
+        Fixture {
+            root,
+            _hdd: hdd,
+            _host: host,
+            reporter,
+        }
+    }
+
+    #[test]
+    fn the_report_carries_every_pool_and_disk_and_is_valid() {
+        let f = fixture(true);
+        let report = f.reporter.report();
         assert_eq!(report.validate(), Ok(()));
         assert_eq!(report.storage_config_revision, 7);
         let ids: Vec<_> = report.disk_pools.iter().map(|p| p.id.as_str()).collect();
@@ -410,8 +528,59 @@ mod tests {
         assert_eq!(report.dedicated_disks.len(), 1);
         assert_eq!(report.dedicated_disks[0].state, DedicatedDiskState::Free);
         // The accepted disk's identity is now on disk.
-        let ids = dedicated::IdentityMap::load(root.path()).unwrap();
+        let ids = dedicated::IdentityMap::load(f.root.path()).unwrap();
         assert_eq!(ids.disks["wwn-0x1"], "naa.1");
+    }
+
+    #[test]
+    fn a_free_disk_is_offered_only_where_the_privileged_helper_is_installed() {
+        let f = fixture(false);
+        let report = f.reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        let disk = &report.dedicated_disks[0];
+        assert_eq!(disk.state, DedicatedDiskState::Unavailable);
+        assert_eq!(disk.error, "disk-helper-missing");
+    }
+
+    #[test]
+    fn held_disks_report_assigned_with_their_vm_even_once_undeclared() {
+        let f = fixture(true);
+        let record = |id: &str, identity: &str| assignment::VmDedicatedRecord {
+            disks: vec![assignment::AssignedDisk {
+                slot: "x0".into(),
+                disk_id: id.into(),
+                identity: identity.into(),
+            }],
+        };
+        assignment::write_vm(f.root.path(), "vm-a", &record("wwn-0x1", "naa.1")).unwrap();
+        let report = f.reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        let disk = &report.dedicated_disks[0];
+        assert_eq!(
+            (disk.state, disk.vm.as_str()),
+            (DedicatedDiskState::Assigned, "vm-a")
+        );
+        // A disk the declaration no longer lists is still reported: gone
+        // from the host here, so `failed`.
+        assignment::write_vm(f.root.path(), "vm-b", &record("wwn-0x9", "naa.9")).unwrap();
+        let report = f.reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        let ids: Vec<_> = report
+            .dedicated_disks
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, ["wwn-0x1", "wwn-0x9"]);
+        assert_eq!(report.dedicated_disks[1].state, DedicatedDiskState::Failed);
+        // Unreadable records: nothing offered on a guess.
+        std::fs::write(f.root.path().join("vm-dedicated/vm-c"), b"{").unwrap();
+        let report = f.reporter.report();
+        assert_eq!(report.validate(), Ok(()));
+        assert!(report
+            .dedicated_disks
+            .iter()
+            .all(|d| d.state == DedicatedDiskState::Unavailable
+                && d.error == "disk-assignment-unreadable"));
     }
 
     #[test]

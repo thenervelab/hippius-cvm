@@ -288,6 +288,11 @@ jobs:
           shellcheck -S error scripts/dev/guest-release-test.sh scripts/guest/build-guest-release.sh
           GUEST_RELEASE_TEST_STATIC_BUSYBOX="$(find "${RUNNER_TEMP}/bbs" -name busybox -type f | head -n1)" \
             bash scripts/dev/guest-release-test.sh
+          # The tenant-facing dedicated-disks helper the release ships:
+          # lists the slots, prints examples, runs nothing.
+          shellcheck -S error -s sh scripts/guest/hippius-disks
+          shellcheck -S error scripts/dev/hippius-disks-test.sh
+          bash scripts/dev/hippius-disks-test.sh
           # guest-initrd-build.sh: the release appended to fixture base sets
           # of both families, the output measurement vali_swap_vm_initrd
           # reads, reproducibility and every refusal.
@@ -768,6 +773,7 @@ jobs:
           apps/scheduler/tests/test_usage_disk_hook.py
           apps/disktier/tests/test_probe.py
           apps/disktier/tests/test_probe_results.py
+          apps/disktier/tests/test_dedicated_assign_race.py
           apps/scheduler/tests/test_miner_auto_approval.py
 
   audit:

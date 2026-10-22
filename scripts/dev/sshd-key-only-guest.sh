@@ -11,13 +11,26 @@ fail=0
 ok()  { echo "${NAME}: OK — $*"; }
 err() { echo "${NAME}: FAIL — $*" >&2; fail=1; }
 
+# Package installs: quiet when they work, retried (distro mirrors flap), and
+# loud when they do not — a silent exit here reads as a test failure.
+pkg() {
+    local log=/tmp/pkg.log try
+    for try in 1 2 3; do
+        "$@" >"${log}" 2>&1 && return 0
+        sleep $((try * 5))
+    done
+    echo "${NAME}: package install failed after 3 tries: $*" >&2
+    tail -n 30 "${log}" >&2
+    exit 1
+}
+
 # The distro's own openssh-server and cloud-init.
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq >/dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        openssh-server cloud-init >/dev/null 2>&1
+    pkg apt-get update -qq
+    pkg env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        openssh-server cloud-init
 else
-    dnf -y -q install openssh-server openssh-clients cloud-init >/dev/null 2>&1
+    pkg dnf -y -q install openssh-server openssh-clients cloud-init
 fi
 DISTRO="$(. /etc/os-release && echo "${ID}-${VERSION_ID}")"
 

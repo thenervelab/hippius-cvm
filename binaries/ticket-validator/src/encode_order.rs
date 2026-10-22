@@ -165,6 +165,8 @@
 use ciborium::value::Value;
 use clap::Args;
 use hippius_types::cbor::to_canonical_vec;
+// The agent's own by-id rule (the `v7` storage report's): one definition.
+use hippius_types::storage_report::is_valid_dedicated_disk_id;
 use serde_json::Value as Json;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
@@ -423,7 +425,127 @@ fn build_launch(obj: &serde_json::Map<String, Json>) -> Result<Value, &'static s
         ));
     }
     push_os_pool(&mut entries, obj)?;
+    push_extra_disks(&mut entries, obj, &string_field(obj, "cmdline")?)?;
     Ok(Value::Map(entries))
+}
+
+/// The measured cmdline token naming a VM's dedicated slots (E4).
+const DEDICATED_CMDLINE_KEY: &str = "hippius.dedicated=";
+/// The guest opens at most this many dedicated slots.
+const MAX_EXTRA_DISKS: usize = 8;
+
+/// The highest dedicated slot index (`x23`): slots are never reused, so a
+/// VM has at most 24 over its life.
+const MAX_SLOT_INDEX: u32 = 23;
+/// The size classes (GiB) the guest takes on its measured cmdline.
+const DEDICATED_GIB: std::ops::RangeInclusive<u64> = 1_000..=1_048_576;
+
+/// A canonical decimal: digits only, no leading zero (but `0` itself).
+fn canonical_decimal(s: &str) -> Option<u64> {
+    let ok = !s.is_empty()
+        && s.len() <= 7
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'));
+    ok.then(|| s.parse().ok()).flatten()
+}
+
+/// A dedicated slot as the guest takes it: `x0`..`x23`, no leading zero.
+fn is_dedicated_slot(slot: &str) -> bool {
+    slot.strip_prefix('x')
+        .filter(|d| d.len() <= 2)
+        .and_then(canonical_decimal)
+        .is_some_and(|i| i <= u64::from(MAX_SLOT_INDEX))
+}
+
+/// The slots the measured `hippius.dedicated=x0:<GiB>,…` token names, in
+/// order; empty without the token. A malformed token is refused.
+fn cmdline_dedicated_slots(cmdline: &str) -> Result<Vec<String>, &'static str> {
+    let tokens: Vec<&str> = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|t| t.strip_prefix(DEDICATED_CMDLINE_KEY))
+        .collect();
+    match tokens.as_slice() {
+        [] => Ok(Vec::new()),
+        [value] => value
+            .split(',')
+            .map(|entry| match entry.split_once(':') {
+                Some((slot, gib))
+                    if is_dedicated_slot(slot)
+                        && canonical_decimal(gib).is_some_and(|g| DEDICATED_GIB.contains(&g)) =>
+                {
+                    Ok(slot.to_string())
+                }
+                _ => Err("bad-dedicated-cmdline"),
+            })
+            .collect(),
+        _ => Err("bad-dedicated-cmdline"),
+    }
+}
+
+/// `extra_disks` (E4) — the VM's dedicated disks, `[{slot, kind:
+/// "dedicated", disk_id}]`, mirroring the miner-agent's
+/// `LaunchOrder::extra_disks`. Absent / null / empty ⇒ not emitted, so an
+/// order without it is byte-identical to before. Never dropped and never
+/// out of step with what the guest measures: the slots must be exactly
+/// the ones the cmdline's `hippius.dedicated=` names, in that order (a
+/// token with no disks, or disks with no token, is refused — the #365
+/// lesson: a re-serialising bridge must not boot a guest that waits for
+/// disks the order lost). An agent too old to know the key refuses the
+/// order (`deny_unknown_fields`).
+fn push_extra_disks(
+    entries: &mut Vec<(Value, Value)>,
+    obj: &serde_json::Map<String, Json>,
+    cmdline: &str,
+) -> Result<(), &'static str> {
+    let listed = match obj.get("extra_disks") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Array(items)) => items.clone(),
+        Some(_) => return Err("bad-extra-disks"),
+    };
+    let measured = cmdline_dedicated_slots(cmdline)?;
+    if listed.len() > MAX_EXTRA_DISKS {
+        return Err("bad-extra-disks");
+    }
+    let mut slots = Vec::with_capacity(listed.len());
+    let mut disks = Vec::with_capacity(listed.len());
+    for item in &listed {
+        let entry = item.as_object().ok_or("bad-extra-disks")?;
+        if entry.len() != 3 {
+            return Err("bad-extra-disks");
+        }
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(Json::as_str)
+                .ok_or("bad-extra-disks")
+        };
+        let (slot, kind, disk_id) = (text("slot")?, text("kind")?, text("disk_id")?);
+        if !is_dedicated_slot(slot) || kind != "dedicated" || !is_valid_dedicated_disk_id(disk_id) {
+            return Err("bad-extra-disks");
+        }
+        if slots.iter().any(|s: &String| s == slot) {
+            return Err("bad-extra-disks");
+        }
+        slots.push(slot.to_string());
+        disks.push(Value::Map(vec![
+            (Value::Text("disk_id".into()), Value::Text(disk_id.into())),
+            (Value::Text("kind".into()), Value::Text(kind.into())),
+            (Value::Text("slot".into()), Value::Text(slot.into())),
+        ]));
+    }
+    if slots != measured {
+        return Err(if measured.is_empty() {
+            "extra-disks-orphan"
+        } else if slots.is_empty() {
+            "extra-disks-missing"
+        } else {
+            "extra-disks-mismatch"
+        });
+    }
+    if !disks.is_empty() {
+        entries.push((Value::Text("extra_disks".into()), Value::Array(disks)));
+    }
+    Ok(())
 }
 
 /// `on_guest_poweroff` — mirrors the miner-agent's `OnGuestPoweroff`
@@ -4275,6 +4397,166 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    const TWO_DISKS: &str = r#""extra_disks": [
+        {"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x5000c500a1b2c3d4"},
+        {"slot": "x1", "kind": "dedicated", "disk_id": "ata-ST22000NM_ZR5ABCD"}],"#;
+    const TWO_SLOTS: &str = "console=hvc0 hippius.dedicated=x0:22300,x1:16000";
+
+    /// E4: `extra_disks` on a launch — carried only when set (absent, null
+    /// or empty is byte-identical), every entry checked, and always exactly
+    /// the slots the measured `hippius.dedicated=` names.
+    #[test]
+    fn extra_disks_are_carried_only_with_the_measured_slots() {
+        let plain = build(&args("g", "launch"), launch_payload()).unwrap();
+        for absent in ["\"extra_disks\": null,", "\"extra_disks\": [],"] {
+            let json = launch_json_with("console=hvc0", absent);
+            assert_eq!(build(&args("g", "launch"), json.as_bytes()).unwrap(), plain);
+        }
+        let json = launch_json_with(TWO_SLOTS, TWO_DISKS);
+        let bytes = build(&args("g", "launch"), json.as_bytes()).unwrap();
+        assert_canonical(&bytes).unwrap();
+
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct WireExtraDisk {
+            slot: String,
+            kind: String,
+            disk_id: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireLaunch {
+            cmdline: String,
+            extra_disks: Vec<WireExtraDisk>,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireBody {
+            payload: WireLaunch,
+        }
+        let back: WireBody = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.payload.cmdline, TWO_SLOTS);
+        assert_eq!(
+            back.payload.extra_disks,
+            vec![
+                WireExtraDisk {
+                    slot: "x0".into(),
+                    kind: "dedicated".into(),
+                    disk_id: "wwn-0x5000c500a1b2c3d4".into(),
+                },
+                WireExtraDisk {
+                    slot: "x1".into(),
+                    kind: "dedicated".into(),
+                    disk_id: "ata-ST22000NM_ZR5ABCD".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_disks_out_of_step_with_the_cmdline_are_refused_never_dropped() {
+        let one = r#""extra_disks": [{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x01"}],"#;
+        for (cmdline, extra, err) in [
+            ("console=hvc0", TWO_DISKS, "extra-disks-orphan"),
+            (TWO_SLOTS, "", "extra-disks-missing"),
+            (TWO_SLOTS, one, "extra-disks-mismatch"),
+            (
+                "console=hvc0 hippius.dedicated=x1:1000,x0:1000",
+                TWO_DISKS,
+                "extra-disks-mismatch",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=y0:1000",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:1000 hippius.dedicated=x0:1000",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            // The guest's grammar: no leading zero, x0..x23, 1000..1048576 GiB.
+            (
+                "console=hvc0 hippius.dedicated=x00:1000",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x24:1000",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:999",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:01000",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:1048577",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+        ] {
+            let json = launch_json_with(cmdline, extra);
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                err,
+                "{cmdline} / {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_extra_disk_is_refused() {
+        let entry = |e: &str| format!("\"extra_disks\": [{e}],");
+        for bad in [
+            entry(r#"{"slot": "x0", "kind": "pool", "disk_id": "wwn-0x01"}"#),
+            entry(r#"{"slot": "x100", "kind": "dedicated", "disk_id": "wwn-0x01"}"#),
+            entry(r#"{"slot": "x24", "kind": "dedicated", "disk_id": "wwn-0x01"}"#),
+            entry(r#"{"slot": "x01", "kind": "dedicated", "disk_id": "wwn-0x01"}"#),
+            entry(r#"{"slot": "x0", "kind": "dedicated", "disk_id": "sda"}"#),
+            entry(r#"{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x01-part1"}"#),
+            entry(r#"{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-../x"}"#),
+            entry(r#"{"slot": "x0", "kind": "dedicated"}"#),
+            entry(
+                r#"{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x01", "path": "/dev/sda"}"#,
+            ),
+            entry(
+                r#"{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x01"},
+                   {"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x02"}"#,
+            ),
+            "\"extra_disks\": {},".to_string(),
+            "\"extra_disks\": \"x0\",".to_string(),
+        ] {
+            let json = launch_json_with("console=hvc0 hippius.dedicated=x0:1000", &bad);
+            assert_eq!(
+                build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+                "bad-extra-disks",
+                "{bad}"
+            );
+        }
+        let nine: Vec<String> = (0..9)
+            .map(|i| format!(r#"{{"slot": "x{i}", "kind": "dedicated", "disk_id": "wwn-0x0{i}"}}"#))
+            .collect();
+        let slots: Vec<String> = (0..9).map(|i| format!("x{i}:1000")).collect();
+        let json = launch_json_with(
+            &format!("console=hvc0 hippius.dedicated={}", slots.join(",")),
+            &format!("\"extra_disks\": [{}],", nine.join(",")),
+        );
+        assert_eq!(
+            build(&args("g", "launch"), json.as_bytes()).unwrap_err(),
+            "bad-extra-disks"
+        );
     }
 
     #[test]

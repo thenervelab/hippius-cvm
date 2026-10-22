@@ -206,13 +206,23 @@ class LaunchIntentSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         help_text=(
-            "Reserved for whole physical disks passed to the VM (not sold yet): any "
-            "value but null ⇒ 409 `dedicated-disks-not-offered`."
+            "Whole physical disks passed to the VM: `{\"tier\": \"hdd\", \"count\": "
+            "1..8, \"min_size_gb\": >= 1000}` (GiB; every disk at least that). Null or "
+            "absent ⇒ none. Not offered (feature off, or an owner off the allowlist) ⇒ "
+            "409 `dedicated-disks-not-offered`; malformed ⇒ 400 `dedicated-invalid` / "
+            "`dedicated-count-invalid` / `dedicated-size-invalid`; with "
+            "`require_failover_peer` ⇒ 409 `dedicated-no-failover`; on an image whose "
+            "guest cannot open them ⇒ 409 `dedicated-needs-release`. The VM is then "
+            "PINNED to its host: no migration, no failover, no backup. A launch no "
+            "node can place fails with `no-dedicated-capacity` or `no-host-fits-disks`."
         ),
     )
     pinned_ack = serializers.BooleanField(
         required=False,
-        help_text="Reserved, with `dedicated_disks`. Ignored.",
+        help_text=(
+            "Required, and true, with `dedicated_disks` (else 400 "
+            "`dedicated-ack-required`): the customer acknowledged the VM is pinned."
+        ),
     )
     max_price_per_unit = serializers.IntegerField(
         required=False,

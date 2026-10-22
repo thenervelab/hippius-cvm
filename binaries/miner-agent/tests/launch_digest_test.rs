@@ -73,6 +73,7 @@ fn kat_config() -> QemuConfig {
         cid: MIN_GUEST_CID,
         net: None,
         dhcp: None,
+        extra_disks: Vec::new(),
     }
 }
 

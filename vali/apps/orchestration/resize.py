@@ -64,6 +64,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmPowerState, VmState
 
 from . import effects
@@ -155,7 +156,8 @@ def _migrates(vm: Vm, from_flavor: str, to_flavor: str) -> bool:
     the dimension it shrinks, on a destination chosen for the new size
     alone (it may not even hold the old guest). And only a GOLDEN VM: §25
     carries a golden VM's writable overlay, but not a legacy VM's separate
-    `/dev/vde` data disk."""
+    `/dev/vde` data disk. (A VM with dedicated disks never gets this far:
+    every caller refuses it first, `dedicated-pinned`.)"""
     return _grows(from_flavor, to_flavor) and _is_golden(vm)
 
 
@@ -304,6 +306,8 @@ def compatible_flavors(vm: Vm) -> CompatibleFlavors:
 
     placement = _active_placement(vm)
     node = placement.miner_node_id if placement is not None else ""
+    # A pinned VM (dedicated disks) resizes in place or not at all.
+    pinned = disk_dedicated.is_pinned(vm)
     options: list[FlavorOption] = []
     for name in candidates:
         size = flavors.resolve_flavor(name)
@@ -315,7 +319,9 @@ def compatible_flavors(vm: Vm) -> CompatibleFlavors:
         needs_migration = False
         reason = ""
         if not fits_here:
-            if vm.power_state == VmPowerState.RUNNING and node and _migrates(vm, current, name):
+            if pinned:
+                reason = disk_dedicated.CATEGORY_PINNED
+            elif vm.power_state == VmPowerState.RUNNING and node and _migrates(vm, current, name):
                 dest, why = _pick_destination(vm, placement, name)
                 needs_migration = dest is not None
                 reason = "" if needs_migration else f"{NO_CAPACITY}: {why or shortfall}"
@@ -493,6 +499,14 @@ def start_resize(*, vm: Vm, to_flavor: str, decided_by: Any) -> ResizeJob:
         raise StartError(stopped_refusal[1], stopped_refusal[0])
     shortfall = _in_place_shortfall(vm, placement.miner_node_id, from_flavor, to_flavor)
     if shortfall:
+        # A pinned VM first, whatever its power state: what the options read
+        # says of the same target (`dedicated-pinned`).
+        if disk_dedicated.is_pinned(vm):
+            raise StartError(
+                f"{to_flavor} does not fit on this VM's miner ({shortfall}) and "
+                + disk_dedicated.pinned_message(vm, "migrated"),
+                disk_dedicated.CATEGORY_PINNED,
+            )
         if vm.power_state != VmPowerState.RUNNING:
             raise StartError(
                 f"{to_flavor} does not fit on this VM's miner ({shortfall}); a stopped "
@@ -760,6 +774,9 @@ def _start_migration(job: ResizeJob, vm: Vm, *, shortfall: str) -> None:
     placement = _active_placement(vm)
     if placement is None:
         _fail(job, "no-placement", rolled_back=True)
+        return
+    if disk_dedicated.is_pinned(vm):
+        _fail(job, f"{disk_dedicated.CATEGORY_PINNED}: here {shortfall}", rolled_back=True)
         return
     if not _migrates(vm, job.from_flavor, job.to_flavor):
         _fail(job, f"{NO_CAPACITY}: here {shortfall}; this VM cannot migrate", rolled_back=True)

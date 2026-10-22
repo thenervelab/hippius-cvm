@@ -471,4 +471,23 @@ pub enum MinerAgentError {
     /// range), `dhcp-reservation-failed` (libvirt or the record store).
     #[error("net/{0}")]
     NetReservation(&'static str),
+
+    /// A launch order's `extra_disks` is malformed (a slot outside
+    /// `x0`..`x23`, an unknown kind, a duplicate, too many): 400
+    /// `dedicated-invalid`. The sub-classifier names the check.
+    #[error("dedicated-invalid/{0}")]
+    DedicatedInvalid(&'static str),
+
+    /// A dedicated disk cannot be given to this VM, or the VM is pinned by
+    /// its dedicated disks: 409 with this code as the class
+    /// (`dedicated-disk-replaced:x1`, `dedicated-order-mismatch`,
+    /// `dedicated-pinned`, …; [`crate::storage::assignment`]).
+    #[error("{0}")]
+    DedicatedRefused(&'static str),
+
+    /// The dedicated-disk decision could not be made right now (the disk
+    /// facts are stale, a record is unreadable, the privileged helper
+    /// failed): 503 with this code as the class, retryable.
+    #[error("{0}")]
+    DedicatedUnavailable(&'static str),
 }

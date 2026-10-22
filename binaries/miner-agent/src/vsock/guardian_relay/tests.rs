@@ -897,6 +897,7 @@ fn order(vm: &str, ep: Option<&str>) -> LaunchOrder {
         net: None,
         on_guest_poweroff: None,
         os_pool: None,
+        extra_disks: Vec::new(),
     }
 }
 

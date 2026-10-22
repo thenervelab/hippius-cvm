@@ -254,6 +254,21 @@ def test_the_real_verifier_takes_the_kat_reports_end_to_end(kat_miner: MinerIden
 
 
 @real
+def test_the_real_verifier_takes_a_report_with_auto_update(kat_miner: MinerIdentity) -> None:
+    """Claim: this vali's verifier accepts `software.auto_update` (an older
+    one refuses the whole report), and the block lands in the section."""
+    resp = _post((_VECTORS / "signed_host_inventory_auto_update.cbor").read_bytes())
+    assert resp.status_code == 200, resp.content
+    software = HostInventorySection.objects.get(miner_node_id=NODE_ID, section="software")
+    assert software.body["auto_update"] == {
+        "enabled": False,
+        "disabled_reason": "no_auto_update_file",
+        "last_check_unix": 1_792_200_000,
+        "failed_tag": "v2026.10.18.1",
+    }
+
+
+@real
 def test_the_real_verifier_refuses_another_key(kat_miner: MinerIdentity) -> None:
     MinerIdentity.objects.filter(pk=MINER_ID).update(
         pubkey_hex="d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"

@@ -137,6 +137,7 @@ fn order(vm_id: &str) -> LaunchOrder {
         net: None,
         on_guest_poweroff: None,
         os_pool: None,
+        extra_disks: Vec::new(),
     }
 }
 

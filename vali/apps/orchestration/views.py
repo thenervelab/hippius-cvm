@@ -38,7 +38,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.schemas import ErrorSerializer
-from apps.disktier import os_tier
+from apps.disktier import dedicated, os_tier
 from apps.identity import scoping
 from apps.lifecycle.models import Vm
 
@@ -78,7 +78,7 @@ _LAUNCH_CONFLICT_CATEGORIES = frozenset(
         "conflict",
         launch_jobs.CATEGORY_LAUNCH_CANCELLED,
         os_tier.CATEGORY_NOT_OFFERED,
-        launch_jobs.CATEGORY_DEDICATED_NOT_OFFERED,
+        *dedicated.CONFLICT_CATEGORIES,
         launch_purpose.CATEGORY_FIXED,
     }
 )
@@ -516,7 +516,10 @@ class LaunchStartView(APIView):
                 "reserved for the disk-tier probe (`disk-probe-id-reserved`), or an "
                 "`os_pool` (vali chooses it; only the disk-tier probe pins one: "
                 "`os-pool-reserved`), or an `os_disk_tier` off the enum "
-                "(`disk-tier-invalid`), or a `purpose` off the enum (`purpose-invalid`).",
+                "(`disk-tier-invalid`), or a `purpose` off the enum (`purpose-invalid`), "
+                "or a malformed `dedicated_disks` (`dedicated-invalid`, "
+                "`dedicated-count-invalid`, `dedicated-size-invalid`) or one without "
+                "`pinned_ack: true` (`dedicated-ack-required`).",
             ),
             403: OpenApiResponse(
                 ErrorSerializer,
@@ -526,8 +529,11 @@ class LaunchStartView(APIView):
             409: OpenApiResponse(
                 ErrorSerializer,
                 "In-flight launch already exists for this VM, or an `os_disk_tier` not "
-                "sold here (`disk-tier-not-offered`), or `dedicated_disks` "
-                "(`dedicated-disks-not-offered`: not sold yet).",
+                "sold here (`disk-tier-not-offered`), or `dedicated_disks` not offered "
+                "(feature off, or an owner off the allowlist: "
+                "`dedicated-disks-not-offered`), or with `require_failover_peer` "
+                "(`dedicated-no-failover`), or on an image whose blessed guest release "
+                "cannot open them (`dedicated-needs-release`).",
             ),
             503: OpenApiResponse(ErrorSerializer, "Vault stage / config fault (`internal`)."),
         },

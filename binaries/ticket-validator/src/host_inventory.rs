@@ -253,12 +253,36 @@ mod tests {
                 "host_inventory_body_counters.cbor",
                 4,
             ),
+            (
+                "signed_host_inventory_auto_update.cbor",
+                "host_inventory_body_auto_update.cbor",
+                4,
+            ),
         ] {
             let a = verify(&vector(env), &kat_vk()).unwrap();
             assert_eq!(a.body, HostInventory::decode(&vector(body)).unwrap());
             assert_eq!(a.section_digests.len(), sections, "{env}");
             assert!(a.section_digests.values().all(|d| d.len() == 64));
         }
+    }
+
+    #[test]
+    fn the_auto_update_block_reaches_vali_as_json() {
+        let a = verify(&vector("signed_host_inventory_auto_update.cbor"), &kat_vk()).unwrap();
+        let json = serde_json::to_value(&a.body).unwrap();
+        assert_eq!(
+            json["sections"]["software"]["auto_update"],
+            serde_json::json!({
+                "enabled": false,
+                "disabled_reason": "no_auto_update_file",
+                "last_check_unix": 1_792_200_000_i64,
+                "failed_tag": "v2026.10.18.1",
+            })
+        );
+        // The older vectors carry no key at all (not a null).
+        let c = verify(&vector("signed_host_inventory_counters.cbor"), &kat_vk()).unwrap();
+        let json = serde_json::to_value(&c.body).unwrap();
+        assert!(json["sections"]["software"].get("auto_update").is_none());
     }
 
     #[test]

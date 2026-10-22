@@ -39,8 +39,12 @@ tenants), this surface lists the hosted VMs by id with their tenant and
 owner: it is for Hippius staff, behind the upstream's superuser gate. It
 is still `OPERATOR_ONLY` — no tenant principal reaches it.
 
-Not available here, by construction: the miner-agent version (the
-heartbeat carries no version field) and the miner's owning family (the
+Self-reported, display only: the agent's release tag (heartbeat) and the
+auto-updater's state (host inventory `software.auto_update`), next to the
+newest complete release vali read (`miners.AgentRelease`) — the same
+three fields as `/v1/operator/nodes`.
+
+Not available here, by construction: the miner's owning family (the
 chain holds `FamilyChildren`; vali keeps no family table).
 """
 
@@ -56,8 +60,10 @@ from django.utils import timezone
 
 from apps.backup import service as backup_service
 from apps.backup.models import ACTIVE_RUN_STATUSES, BackupPolicy, BackupRun, RunStatus
+from apps.disktier.hardware_views import auto_update_by_node
 from apps.lifecycle import zombie
 from apps.lifecycle.models import Vm, VmPowerState, VmState
+from apps.miners import agent_release
 from apps.miners.models import MinerIdentity, MinerLocation
 from apps.network.models import PublicIP, PublicIpState
 from apps.orchestration.effects import EffectError
@@ -754,6 +760,14 @@ def _alerts(row: dict[str, Any], *, now: datetime) -> list[str]:
         alerts.append("backup-failures")
     if row["backups"] is not None and row["backups"]["overdue_vm_ids"]:
         alerts.append("backup-overdue")
+    # The node's own report: auto-update cut is abnormal ("if you cut it,
+    # you put it back"), and a release that failed its health check there
+    # is never retried.
+    auto_update = row.get("auto_update")
+    if auto_update is not None and not auto_update["enabled"]:
+        alerts.append("auto-update-off")
+    if auto_update is not None and auto_update["failed_tag"] is not None:
+        alerts.append("agent-update-failed")
     return alerts
 
 
@@ -823,6 +837,8 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
         else:
             unbridged.append(m)
     node_ids = sorted(set(identity_by_node) | set(mirror_by_node) | set(chain_by_node))
+    releases = agent_release.release_view(now=now)
+    auto_update = auto_update_by_node(node_ids)
 
     rows: list[dict[str, Any]] = []
     for nid in node_ids:
@@ -864,6 +880,9 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
         # The release tag the agent last reported (heartbeat), self-reported.
         mirror_row = mirror_by_node.get(nid)
         rows[-1]["agent_version"] = (mirror_row.agent_version or None) if mirror_row else None
+        rows[-1]["latest_agent_release"] = releases.latest
+        rows[-1]["update_pending"] = releases.update_pending(rows[-1]["agent_version"])
+        rows[-1]["auto_update"] = auto_update.get(nid)
     for m in unbridged:
         rows.append(
             _row(
@@ -892,6 +911,9 @@ def operator_fleet(*, include_chain: bool = True) -> dict[str, Any]:
             )
         )
         rows[-1]["agent_version"] = None
+        rows[-1]["latest_agent_release"] = releases.latest
+        rows[-1]["update_pending"] = None
+        rows[-1]["auto_update"] = None
     for row in rows:
         row["alerts"] = _alerts(row, now=now)
         # Internal helper for `_alerts`; never on the wire.

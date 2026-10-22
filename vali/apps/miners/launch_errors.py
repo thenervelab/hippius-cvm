@@ -13,7 +13,14 @@ What is recorded, and from where:
   reason code in the `x-hippius-reason` response header that the Edge
   relays (`libvirt-driver/define`, `tenant-preflight/ovmf-missing`, …);
 - an Edge 502/504 with no body: the Edge could not reach the miner, or gave
-  up waiting on it (code `miner-unreachable`).
+  up waiting on it — code `preflight-timeout` for a `tenant-preflight`
+  order, `miner-unreachable` for a `launch` order.
+
+A `preflight-timeout` is usually the Edge's 30 s forward giving up on a
+preflight that is still staging a cold artefact set — the miner did nothing
+wrong, and vali re-places. It stays in the ledger, but the operator only
+sees it, and it only counts in the streak, once `PREFLIGHT_TIMEOUT_RUN`
+of them follow each other with no accepted launch in between.
 
 A vali-side fault (Vault, minting, the KBS, vali → Edge transport) is not
 the miner's and is never recorded here.
@@ -32,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime
 from typing import Any
 
 from django.db import transaction
@@ -39,8 +47,13 @@ from django.utils import timezone
 
 log = logging.getLogger(__name__)
 
-#: Newest errors kept per miner.
+#: Newest errors the operator sees per miner.
 MAX_RECENT = 5
+#: Newest errors stored per miner — more than `MAX_RECENT`, so hidden
+#: `preflight-timeout`s never push a visible error out.
+MAX_STORED = 20
+#: Consecutive `preflight-timeout`s from which they are shown and counted.
+PREFLIGHT_TIMEOUT_RUN = 3
 #: Longest code kept. `MinerAgentError` codes are under 64 bytes; the rest
 #: is headroom, not an invitation.
 MAX_CODE_LEN = 128
@@ -53,6 +66,7 @@ STAGE_LAUNCH = "launch"
 #: vali's own codes, for answers that carry no miner code.
 CODE_INVALID = "invalid"
 CODE_UNREACHABLE = "miner-unreachable"
+CODE_PREFLIGHT_TIMEOUT = "preflight-timeout"
 CODE_UNCLASSIFIED = "unclassified"
 
 _CODE_RE = re.compile(r"[a-z0-9][a-z0-9._:/-]*")
@@ -89,12 +103,15 @@ def failure_entry(
     """The sanitized record of one failed attempt (without `at`).
 
     `code` is the finest thing known: the miner's reason code, else its
-    class, else `miner-unreachable` for a bodiless Edge 502/504, else
+    class, else, for a bodiless Edge 502/504, `preflight-timeout` at the
+    preflight stage and `miner-unreachable` at the launch stage, else
     `unclassified`. `class` is the body class as vali branched on it."""
     cls = sanitize_code(classifier)
     code = sanitize_code(reason) or cls
-    if not code:
-        code = CODE_UNREACHABLE if http_status in _EDGE_STATUSES else CODE_UNCLASSIFIED
+    if not code and http_status in _EDGE_STATUSES:
+        code = CODE_PREFLIGHT_TIMEOUT if stage == STAGE_PREFLIGHT else CODE_UNREACHABLE
+    elif not code:
+        code = CODE_UNCLASSIFIED
     oid = order_id if len(order_id) <= MAX_ORDER_ID_LEN and _ORDER_ID_RE.fullmatch(order_id) else ""
     return {
         "code": code,
@@ -107,7 +124,9 @@ def failure_entry(
 
 def record_failure(miner: Any, entry: dict[str, Any]) -> None:
     """Prepend `entry` (from `failure_entry`) to `miner`'s errors and bump
-    its streak. `miner` is the `MinerIdentity` vali dispatched to."""
+    its streak — except for a `preflight-timeout`, which `readout` counts
+    only as part of a run. `miner` is the `MinerIdentity` vali dispatched
+    to."""
     _write(miner, entry)
 
 
@@ -125,9 +144,7 @@ def _write(miner: Any, entry: dict[str, Any] | None) -> None:
         return
     try:
         with transaction.atomic():
-            row, _ = MinerLaunchErrors.objects.select_for_update().get_or_create(
-                miner_id=miner_id
-            )
+            row, _ = MinerLaunchErrors.objects.select_for_update().get_or_create(miner_id=miner_id)
             # Read under the lock: outcomes apply in the order they are
             # stamped, so `errors` stays newest-first and a success is
             # never undone by an older failure that waited on the lock.
@@ -136,19 +153,67 @@ def _write(miner: Any, entry: dict[str, Any] | None) -> None:
                 row.fail_streak = 0
                 row.last_ok_at = now
             else:
-                row.fail_streak += 1
+                if not _is_preflight_timeout(entry):
+                    row.fail_streak += 1
                 recent = row.errors if isinstance(row.errors, list) else []
-                row.errors = [{**entry, "at": now.isoformat()}, *recent][:MAX_RECENT]
+                row.errors = [{**entry, "at": now.isoformat()}, *recent][:MAX_STORED]
             row.save()
     except Exception as exc:  # noqa: BLE001 — bookkeeping is never load-bearing
         log.warning("launch-errors: not recorded for miner=%s: %s", miner_id, exc)
 
 
+def _is_preflight_timeout(entry: Any) -> bool:
+    return isinstance(entry, dict) and entry.get("code") == CODE_PREFLIGHT_TIMEOUT
+
+
+def _at(entry: dict[str, Any]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(entry.get("at", "")))
+    except ValueError:
+        return None
+
+
+def _visible(errors: list[Any], last_ok_at: datetime | None) -> tuple[list[Any], int]:
+    """`errors` without the `preflight-timeout`s that are not part of a run
+    of `PREFLIGHT_TIMEOUT_RUN` consecutive ones (an accepted launch breaks a
+    run), and how many shown ones came after `last_ok_at` — the ones the
+    streak counts."""
+
+    def after_ok(entry: dict[str, Any]) -> bool:
+        at = _at(entry)
+        return last_ok_at is None or (at is not None and at > last_ok_at)
+
+    visible: list[Any] = []
+    since_ok = 0
+    run: list[dict[str, Any]] = []
+
+    def close_run() -> None:
+        nonlocal since_ok
+        if len(run) >= PREFLIGHT_TIMEOUT_RUN:
+            visible.extend(run)
+            since_ok += sum(1 for e in run if after_ok(e))
+        run.clear()
+
+    for entry in errors:
+        if not _is_preflight_timeout(entry):
+            close_run()
+            visible.append(entry)
+            continue
+        if run and after_ok(run[-1]) != after_ok(entry):
+            close_run()
+        run.append(entry)
+    close_run()
+    return visible, since_ok
+
+
 def readout(row: Any) -> dict[str, Any]:
     """The operator-API view of a `MinerLaunchErrors` row (or `None`)."""
     errors = list(row.errors) if row is not None and isinstance(row.errors, list) else []
+    last_ok = getattr(row, "last_ok_at", None) if row is not None else None
+    visible, timeouts = _visible(errors, last_ok)
+    visible = visible[:MAX_RECENT]
     return {
-        "last_launch_error": errors[0] if errors else None,
-        "launch_fail_streak": row.fail_streak if row is not None else 0,
-        "recent_launch_errors": errors,
+        "last_launch_error": visible[0] if visible else None,
+        "launch_fail_streak": (row.fail_streak if row is not None else 0) + timeouts,
+        "recent_launch_errors": visible,
     }

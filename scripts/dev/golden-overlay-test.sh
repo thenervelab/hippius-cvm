@@ -378,6 +378,11 @@ hippius_golden_mount_overlay() { echo mount_overlay >>"${ORDER_LOG}"; }
 # one tested in golden-userdata-test.sh).
 hippius_golden_install_seed()  { echo install_seed >>"${ORDER_LOG}"; }
 hippius_golden_harden_root()   { echo harden_root  >>"${ORDER_LOG}"; }
+# Dedicated disks: runs inside the attempt, while the KEK still exists
+# (real one tested in section 6).
+hippius_golden_open_dedicated() {
+    if [[ -s "$1" ]]; then echo open_dedicated >>"${ORDER_LOG}"; else echo open_dedicated-no-kek >>"${ORDER_LOG}"; fi
+}
 # Pin the KEK path so the test can assert it is shredded.
 mktemp() {
     case "$*" in
@@ -414,8 +419,8 @@ fi
 # H5b: the seed after the upper is open and the overlay mounted, and
 # BEFORE harden_root, so harden_root's masks and cloud-init pin win over
 # anything seeded.
-[[ "$(tail -4 "${ORDER_LOG}" | tr '\n' ' ')" == "open_upper mount_overlay install_seed harden_root " ]] \
-    && ok "H5b: the cloud-init seed is installed after open_upper + mount_overlay and before harden_root" \
+[[ "$(tail -5 "${ORDER_LOG}" | tr '\n' ' ')" == "open_upper mount_overlay install_seed open_dedicated harden_root " ]] \
+    && ok "H5b: the cloud-init seed is installed after open_upper + mount_overlay and before harden_root; dedicated disks open after the overlay, with the KEK still present" \
     || err "install_seed order: $(tr '\n' ' ' < "${ORDER_LOG}")"
 sd_ln="$(grep -n '^install_seed$' "${ORDER_LOG}" | head -1 | cut -d: -f1)"
 [[ -n "${sd_ln}" && -n "${hrd_ln}" && "${sd_ln}" -lt "${hrd_ln}" ]] \
@@ -452,9 +457,64 @@ fi
 ! grep -q '^install_seed$' "${ORDER_LOG}" \
     && ok "H5b: a failed boot never reaches the seed install" \
     || err "install_seed ran on a failed boot"
+! grep -q '^open_dedicated' "${ORDER_LOG}" \
+    && ok "a failed boot never opens dedicated disks" \
+    || err "open_dedicated ran on a failed boot"
 [[ ! -e "${KEK_PATH}" ]] && ok "KEK shredded even on a mid-path failure (§20)" || err "KEK survived a mid-path failure — secret-hygiene breach"
 
 rm -f "${ORDER_LOG}" "${KEK_PATH}" "${FLAGS_SEEN}"
+
+# ── 6. Dedicated disks: the real step, with a stub opener ───────────
+# (The opener itself: binaries/guest-release/src/dedicated.rs unit tests
+# and scripts/dev/dedicated-disks-e2e.sh against real loop devices.)
+DD="$(command mktemp -d)"
+STUB_ARGS="${DD}/args"
+cat >"${DD}/opener" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >>"${STUB_ARGS}"
+exit "\${STUB_RC:-0}"
+STUB
+chmod +x "${DD}/opener"
+HIPPIUS_GOLDEN_RELEASE_BIN="${DD}/opener"
+hippius_golden_ephemeral() { [[ -n "${STUB_EPHEMERAL:-}" ]]; }
+udevadm() { :; }
+GOLDEN_LINE="ro dm-verity.root=${GOOD_HASH} boot=hippius-golden hippius.vm_id=vm-1"
+
+hippius_golden_dedicated_in_cmdline "${GOLDEN_LINE}" \
+    && err "dedicated anchor detected on a cmdline without one" \
+    || ok "no anchor ⇒ no dedicated step"
+hippius_golden_dedicated_in_cmdline "${GOLDEN_LINE} hippius.dedicated_x=1" \
+    && err "a lookalike key was taken for the anchor" \
+    || ok "a lookalike key is not the anchor"
+for tok in "hippius.dedicated=x0:22300" "hippius.dedicated" "hippius.dedicated=garbage"; do
+    hippius_golden_dedicated_in_cmdline "${GOLDEN_LINE} ${tok}" \
+        && ok "anchor detected (${tok}) — the opener judges its form" \
+        || err "anchor NOT detected (${tok})"
+done
+
+: >"${STUB_ARGS}"
+_hippius_golden_open_dedicated_from /run/kek "${GOLDEN_LINE}" \
+    && [[ ! -s "${STUB_ARGS}" ]] \
+    && ok "no anchor: the opener never runs (byte-identical boot)" \
+    || err "the opener ran without an anchor: $(cat "${STUB_ARGS}")"
+
+: >"${STUB_ARGS}"
+_hippius_golden_open_dedicated_from /run/kek "${GOLDEN_LINE} hippius.dedicated=x0:22300" \
+    && [[ "$(cat "${STUB_ARGS}")" == "--open-dedicated-disks /run/kek --dedicated-volume-root ${HIPPIUS_GOLDEN_UPPER_MNT} --dedicated-state-out /run/hippius/dedicated/slots" ]] \
+    && ok "anchor: the opener gets the KEK keyfile, the volume root and the /run state path" \
+    || err "opener call: '$(cat "${STUB_ARGS}")'"
+
+: >"${STUB_ARGS}"
+( STUB_RC=5; export STUB_RC; _hippius_golden_open_dedicated_from /run/kek "${GOLDEN_LINE} hippius.dedicated=x0:22300" ) 2>/dev/null \
+    && ok "a failing opener never fails the boot" \
+    || err "a failing opener failed the boot"
+
+: >"${STUB_ARGS}"
+( STUB_EPHEMERAL=1 _hippius_golden_open_dedicated_from /run/kek "${GOLDEN_LINE} hippius.dedicated=x0:22300" ) \
+    && [[ ! -s "${STUB_ARGS}" ]] \
+    && ok "an ephemeral (cdn-node) image never opens dedicated disks" \
+    || err "ephemeral image ran the opener"
+rm -rf "${DD}"
 
 if [[ "${fail}" -ne 0 ]]; then
     echo "golden-overlay-test: FAILED" >&2

@@ -276,6 +276,19 @@ spec:
             - port: "8200" # vault.hippius.network — KV v2 PUT/GET
               protocol: TCP
     {{- end }}
+    {{- if eq (toString .Values.agentReleaseWatch.enabled) "true" }}
+    # ── agent-release-watch CronJob ──
+    # `vali_agent_release_watch` GETs api.github.com (the miner-agent release
+    # list). `world:443` for the same reason as above (no `toFQDNs` without
+    # Cilium's DNS proxy); a duplicate of the rule above when that one
+    # renders, which Cilium unions.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"  # api.github.com
+              protocol: TCP
+    {{- end }}
 ---
 # Postgres network policy — only vali (the Deployment + the migration
 # Job, both `name: vali`) and the backup CronJob may connect. PR-K7.

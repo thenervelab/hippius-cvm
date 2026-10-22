@@ -713,6 +713,83 @@
     state: started
     daemon_reload: true
 
+- name: Install the dedicated-disk hold unit (template)
+  # One instance per dedicated disk a VM holds, started and stopped by the
+  # agent, OUTSIDE its PrivateDevices sandbox: it opens the disk O_EXCL (so
+  # the host cannot mount it or assemble md/LVM on it) and installs a udev
+  # rule hiding it from the host. It refuses a disk the agent's records do
+  # not give to a VM, or whose identity changed. Without this unit and the
+  # release unit the agent offers no dedicated disk (`disk-helper-missing`).
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hippius-miner-dedicated-hold@.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hippius miner: hold dedicated disk %i for its VM
+
+      [Service]
+      Type=notify
+      NotifyAccess=main
+      ExecStart={{ miner_agent.install_path }} dedicated-hold --config {{ miner_agent.config_path }} --disk %i
+      # A hold that dies (OOM, a kill) comes back; a refusal (exit 3: not
+      # assigned, another device, busy) does not. The agent also re-takes
+      # every recorded hold every 5 min.
+      Restart=on-failure
+      RestartSec=10
+      RestartPreventExitStatus=3
+      User=root
+      Group=root
+      RuntimeDirectory=hippius-miner/dedicated
+      RuntimeDirectoryPreserve=yes
+      ProtectSystem=strict
+      ReadWritePaths=/etc/udev/rules.d
+      ProtectHome=true
+      PrivateTmp=true
+      PrivateNetwork=true
+      NoNewPrivileges=true
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+      TimeoutStartSec=60
+      TimeoutStopSec=60
+
+- name: Install the dedicated-disk release unit (template)
+  # A oneshot per disk §24 released, started by the agent OUTSIDE its
+  # sandbox: zeroes the first and last 16 MiB and checks with `blkid -p`
+  # that no signature is left. It refuses a disk without a release record,
+  # one any VM record names, one whose identity changed, or one a process
+  # (QEMU) still has open.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hippius-miner-dedicated-release@.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hippius miner: wipe released dedicated disk %i
+
+      [Service]
+      Type=oneshot
+      ExecStart={{ miner_agent.install_path }} dedicated-release --config {{ miner_agent.config_path }} --disk %i
+      User=root
+      Group=root
+      RuntimeDirectory=hippius-miner/dedicated
+      RuntimeDirectoryPreserve=yes
+      ProtectSystem=strict
+      ReadWritePaths=/etc/udev/rules.d
+      ProtectHome=true
+      PrivateTmp=true
+      PrivateNetwork=true
+      NoNewPrivileges=true
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+      TimeoutStartSec=300
+
+- name: Reload systemd for the dedicated-disk units
+  ansible.builtin.systemd:
+    daemon_reload: true
+
 - name: Enable the miner-agent unit — but DO NOT start it
   # Intentionally no `state:` — the operator starts the service
   # manually after provisioning the mTLS cert (play 06 + the README

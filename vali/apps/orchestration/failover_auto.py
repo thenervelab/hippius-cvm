@@ -57,6 +57,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmPowerState, VmState
 
 from .models import (
@@ -371,6 +372,9 @@ def _try_one(
     ):
         # No longer an auto VM on this miner: nothing to report.
         return "skipped"
+    if disk_dedicated.is_pinned(vm):
+        # Its dedicated disks died with the host (E4): never failed over.
+        return _skip(vm, miner_id, disk_dedicated.CATEGORY_PINNED)
     eligible, blocker = backup_service.failover_auto_status(policy)
     if not eligible:
         # No peer right now (one cordoned, quarantined, unlocated) is the

@@ -80,7 +80,7 @@ pub use migration::{
     SnapshotUploader, SourceAckInputs, StagedArtifact,
 };
 pub use types::{
-    BackupOrder, DestroyOrder, LaunchOrder, MigrateActivateOrder, MigrateOrder,
+    BackupOrder, DestroyOrder, ExtraDisk, LaunchOrder, MigrateActivateOrder, MigrateOrder,
     MigrateQuiesceOrder, MigrateSnapshotOrder, MoveAction, MoveVmStorageOrder, NetEndpoint,
     NetPolicyLocalAction, NetPolicyMode, NetPolicyOrder, NetProto, NetSpec, OnGuestPoweroff, Order,
     OrderBody, OrderKind, OrderSubject, PowerPolicyOrder, PreflightArtifact, RestoreOrder,

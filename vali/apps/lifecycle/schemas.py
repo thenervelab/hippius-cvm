@@ -268,6 +268,26 @@ class VmSerializer(serializers.Serializer):
     )
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
+    pinned = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Present, and true, only for a VM with dedicated disks: it is pinned to its "
+            "host (no migration, no failover, no backup)."
+        ),
+    )
+    disks = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        help_text=(
+            "Present only for a VM with dedicated disks: `{slot, kind, size_gb, tier, "
+            "state}` per disk — `os` (kind `pool`), then `x0`, `x1`, … (kind "
+            "`dedicated`, `size_gb` the billed size class, `tier` the sold tier, "
+            "`state` attached | missing | failed | mismatch | released, from host "
+            "evidence only). A dedicated slot may add `guest_state` (attached | "
+            "missing | mismatch): what the guest itself last reported — "
+            "informational, never billing-relevant (root in the VM can forge it)."
+        ),
+    )
 
 
 class VmListSerializer(serializers.Serializer):

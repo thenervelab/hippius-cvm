@@ -18,6 +18,13 @@ already keeps and NEVER from a miner's self-report:
 - last probe             `synthetic.MinerProbe` — vali's own per-miner
                          synthetic probe of the node (`synthetic.per_miner`):
                          when, pass/fail, the stage that failed, its VM
+- agent release         `miners.AgentRelease` — the complete releases of the
+                         public repository (`vali_agent_release_watch`):
+                         `latest_agent_release`, and `update_pending` against
+                         the node's heartbeat `agent_version`
+- auto-update           the node's own report (host inventory
+                         `software.auto_update`, `disktier.hardware_views`):
+                         SELF-REPORTED, display only
 - recent refusals        FAILED `Placement` rows that are a judgement
                          about the node, selected by PROVENANCE
                          (`Placement.failure_source`, stamped by the
@@ -53,7 +60,8 @@ from django.db.models import Count, F, Q, QuerySet, Window
 from django.db.models.functions import Lower, RowNumber
 from django.utils import timezone
 
-from apps.miners import geo, launch_errors
+from apps.disktier.hardware_views import auto_update_by_node
+from apps.miners import agent_release, geo, launch_errors
 from apps.miners.models import (
     LocationVerdict,
     MinerIdentity,
@@ -290,6 +298,8 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
     refusals_by_node = _recent_refusals_by_node(list(by_id))
     breakdown_by_node = _refusal_breakdown_by_node(list(by_id), since=now - REFUSAL_COUNT_WINDOW)
     probes_by_node = per_miner.operator_readout(list(by_id))
+    releases = agent_release.release_view(now=now)
+    auto_update = auto_update_by_node(list(by_id))
     rows: list[dict[str, Any]] = []
     for nid in wanted:
         miner = by_id.get(nid)
@@ -335,6 +345,12 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                 # The release tag the node's agent last reported in its
                 # heartbeat (`hippius-miner-agent --version`); self-reported.
                 "agent_version": agent_version_by_node.get(nid),
+                # The newest complete release, and whether this agent is
+                # behind the newest one past the updater's soak.
+                "latest_agent_release": releases.latest,
+                "update_pending": releases.update_pending(agent_version_by_node.get(nid)),
+                # The updater's state as the node reports it (self-reported).
+                "auto_update": auto_update.get(nid),
                 "last_probe": probes_by_node.get(nid),
             }
         )

@@ -504,6 +504,7 @@ mod tests {
             cid: 3,
             net: None,
             dhcp: None,
+            extra_disks: Vec::new(),
         }
     }
 

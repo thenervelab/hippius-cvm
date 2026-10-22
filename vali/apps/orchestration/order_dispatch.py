@@ -569,9 +569,15 @@ def build_launch_payload(
     net: dict[str, Any] | None = None,
     on_guest_poweroff: str | None = None,
     os_pool: str | None = None,
+    extra_disks: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the JSON payload for a ``launch`` order — mirrors the
     Rust ``LaunchOrder`` shape.
+
+    ``extra_disks`` (E4, ``apps.disktier.dedicated.order_entries``) are the
+    VM's dedicated disks, ``[{slot, kind: "dedicated", disk_id}]``. Carried
+    only when non-empty, so every other payload is unchanged (an agent that
+    predates the key refuses the whole order).
 
     ``on_guest_poweroff`` (``"stop"``) asks the miner to leave the VM
     stopped when its guest powers itself off. Carried only when set, and
@@ -639,6 +645,8 @@ def build_launch_payload(
     # only for an agent that takes the key; absent ⇒ `default`.
     if os_pool:
         payload["os_pool"] = os_pool
+    if extra_disks:
+        payload["extra_disks"] = [dict(d) for d in extra_disks]
     return payload
 
 

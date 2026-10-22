@@ -597,6 +597,75 @@ hippius_golden_install_seed() {
 }
 
 # ── cmdline token readers (pure; unit-tested) ───────────────────────
+# ── Dedicated physical disks (disk-tier-verification.md §4.2, G3) ───
+# vali adds `hippius.dedicated=x0:<GiB>,…` to the MEASURED cmdline only
+# for a VM with dedicated disks; every other cmdline is byte-identical and
+# this step is a strict no-op. With it, `hippius-guest-release
+# --open-dedicated-disks` derives each slot's key from the KEK keyfile
+# (HKDF, never written anywhere: it goes down a pipe to cryptsetup), formats
+# a slot's disk on its first boot (LUKS2 aes-xts-plain64, no integrity),
+# opens every slot as /dev/mapper/hippius-<slot>, and keeps its record
+# (slot, LUKS UUID, size) at the guest-keyed volume's root, next to the
+# anti-rollback stamp. It runs HERE, in the initramfs, because:
+#   - the KEK exists only here (shredded right after); handing it, or
+#     keys derived from it, to the booted OS would put key material in a
+#     file the tenant's userspace can read for the whole boot;
+#   - the mappings then exist before the tenant's systemd starts, so the
+#     customer's mdadm/ZFS/fstab assemble on them at boot like any disk;
+#   - the record lives where the tenant root cannot reach it by accident
+#     and the anti-rollback stamp covers it.
+# A slot problem is a slot state (missing/mismatch, reported in receipts),
+# never a failed boot: this step always returns 0.
+HIPPIUS_DEDICATED_STATE="/run/hippius/dedicated/slots"
+: "${HIPPIUS_GOLDEN_RELEASE_BIN:=hippius-guest-release}"
+
+# Pure predicate: does this cmdline carry the dedicated-disk anchor (well
+# formed or not — the opener judges and reports a malformed one)?
+hippius_golden_dedicated_in_cmdline() {
+    for _hgdc_tok in $1; do
+        case "${_hgdc_tok}" in
+            hippius.dedicated | hippius.dedicated=*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+hippius_golden_open_dedicated() {
+    _hippius_golden_open_dedicated_from "$1" "$(cat /proc/cmdline 2>/dev/null || true)"
+}
+
+# The step proper, with the cmdline as an argument (for the unit test).
+_hippius_golden_open_dedicated_from() {
+    _hgod_kek="$1"
+    hippius_golden_dedicated_in_cmdline "$2" || return 0
+    if hippius_golden_ephemeral; then
+        hippius_log "golden: dedicated: WARN an ephemeral (cdn-node) image never opens dedicated disks"
+        return 0
+    fi
+    # The slots' by-id links come from udev; let it finish with the disks
+    # it has (the opener itself waits a bounded time for a late one).
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle --timeout=10 >/dev/null 2>&1 || true
+    fi
+    # Its diagnostics (slots, states, reason codes; never key bytes) go
+    # through hippius_log, one line each.
+    _hgod_rc=0
+    _hgod_out="$("${HIPPIUS_GOLDEN_RELEASE_BIN}" --open-dedicated-disks "${_hgod_kek}" \
+        --dedicated-volume-root "${HIPPIUS_GOLDEN_UPPER_MNT}" \
+        --dedicated-state-out "${HIPPIUS_DEDICATED_STATE}" 2>&1 </dev/null)" || _hgod_rc=$?
+    while IFS= read -r _hgod_line; do
+        [ -n "${_hgod_line}" ] && hippius_log "${_hgod_line}"
+    done <<HIPPIUS_DEDICATED_EOF
+${_hgod_out}
+HIPPIUS_DEDICATED_EOF
+    if [ "${_hgod_rc}" -eq 0 ]; then
+        hippius_log "golden: dedicated: slots processed (states in ${HIPPIUS_DEDICATED_STATE})"
+    else
+        hippius_log "golden: dedicated: WARN the opener failed (exit ${_hgod_rc}) — dedicated disks not reported this boot; the OS boots on"
+    fi
+    return 0
+}
+
 # Read a `key=value` token from a cmdline string. Echoes the value or
 # nothing. Kept parameterized (not reading /proc/cmdline directly) so
 # the resolvers are testable without a live /proc.
@@ -2444,7 +2513,8 @@ hippius_golden_run() {
         && hippius_golden_open_upper "${_hgrun_kek}" \
         && hippius_golden_mount_overlay "${_hgrun_rootmnt}" \
         && hippius_golden_install_seed \
-        && hippius_golden_ephemeral_harden "${_hgrun_rootmnt}" ) || _hgrun_rc=$?
+        && hippius_golden_ephemeral_harden "${_hgrun_rootmnt}" \
+        && hippius_golden_open_dedicated "${_hgrun_kek}" ) || _hgrun_rc=$?
 
     # §20: ALWAYS shred the KEK — success OR any failure path. H5b: and
     # the staged user-data, which the success path has already moved or

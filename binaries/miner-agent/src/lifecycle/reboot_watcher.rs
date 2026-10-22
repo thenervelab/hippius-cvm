@@ -170,7 +170,7 @@ pub async fn run(
                     pusher: &pusher,
                     migration: &migration,
                     history: &history,
-                    control: control.as_ref(),
+                    control: &control,
                 };
                 run_one(child, &ctx, &cancel).await;
             }
@@ -200,7 +200,7 @@ struct WatchCtx<'a> {
     pusher: &'a Arc<dyn TicketPusher>,
     migration: &'a Arc<crate::orders::MigrationStore>,
     history: &'a Arc<Mutex<RestartHistory>>,
-    control: &'a dyn DomainControl,
+    control: &'a Arc<dyn DomainControl>,
 }
 
 /// The two libvirt calls the `Stopped` path makes — a seam so tests can
@@ -600,7 +600,8 @@ async fn handle_stopped(vm_id: &VmId, domain_name: &str, ctx: &WatchCtx<'_>) {
         OnGuestPoweroff::Restart
     });
     if policy == OnGuestPoweroff::Stop {
-        if leave_stopped_after_guest_poweroff(vm_id, domain_name, lifecycle, control).await {
+        if leave_stopped_after_guest_poweroff(vm_id, domain_name, lifecycle, control.as_ref()).await
+        {
             return;
         }
     } else {
@@ -615,7 +616,7 @@ async fn handle_stopped(vm_id: &VmId, domain_name: &str, ctx: &WatchCtx<'_>) {
         );
         return;
     }
-    if !wait_for_shut_off(domain_name, control).await {
+    if !wait_for_shut_off(domain_name, control.as_ref()).await {
         eprintln!(
             "hippius-miner-agent: reboot-watcher: vm={} domstate-poll-timeout",
             vm_id.as_str()
@@ -641,6 +642,63 @@ async fn handle_stopped(vm_id: &VmId, domain_name: &str, ctx: &WatchCtx<'_>) {
         );
         return;
     }
+    // Dedicated disks: the definition names them by by-id path, so each
+    // must still be the device the VM was given (identity re-checked on
+    // fresh facts) and held. Any doubt leaves the VM down for vali's
+    // relaunch, which re-checks the same way — never another disk. That
+    // check runs the collector and the hold unit, so it runs on a task of
+    // its own: other VMs' events keep flowing.
+    if lifecycle.has_dedicated_record(vm_id) {
+        let (lifecycle, control) = (Arc::clone(lifecycle), Arc::clone(control));
+        let (vm_id, domain_name) = (vm_id.clone(), domain_name.to_string());
+        tokio::spawn(async move {
+            restart_with_dedicated_disks(&vm_id, &domain_name, &lifecycle, control.as_ref()).await;
+        });
+        return;
+    }
+    // Uncontended for a VM without dedicated disks, unless a first
+    // dedicated-disk launch or a destroy of it (which may not have written
+    // a record yet) is in flight.
+    let _dedicated_ops = lifecycle.dedicated_ops(vm_id, true).await;
+    if !lifecycle.restart_eligible(vm_id) {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} stopped by the agent meanwhile, not restarting",
+            vm_id.as_str()
+        );
+        return;
+    }
+    start_domain(vm_id, domain_name, control.as_ref()).await;
+}
+
+/// The restart of a VM with dedicated disks, under its operations lock:
+/// still ours to restart (no stop / destroy took it meanwhile), the same
+/// devices, held — then `virsh start`.
+async fn restart_with_dedicated_disks(
+    vm_id: &VmId,
+    domain_name: &str,
+    lifecycle: &Arc<CvmLifecycle>,
+    control: &dyn DomainControl,
+) {
+    let _dedicated_ops = lifecycle.dedicated_ops(vm_id, true).await;
+    if !lifecycle.restart_eligible(vm_id) {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} stopped by the agent meanwhile, not restarting",
+            vm_id.as_str()
+        );
+        return;
+    }
+    if let Err(err) = lifecycle.check_dedicated_before_restart(vm_id).await {
+        eprintln!(
+            "hippius-miner-agent: reboot-watcher: vm={} not restarted: {err}",
+            vm_id.as_str()
+        );
+        return;
+    }
+    start_domain(vm_id, domain_name, control).await;
+}
+
+/// `virsh start` the shut-off domain, logged.
+async fn start_domain(vm_id: &VmId, domain_name: &str, control: &dyn DomainControl) {
     match control.start(domain_name).await {
         Ok(()) => {
             eprintln!(
@@ -1003,6 +1061,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         }
     }
 
@@ -1377,7 +1436,8 @@ mod tests {
         struct Rig {
             lc: Arc<CvmLifecycle>,
             driver: Arc<MockLibvirtDriver>,
-            virsh: FakeVirsh,
+            virsh: Arc<FakeVirsh>,
+            control: Arc<dyn DomainControl>,
             pusher: Arc<dyn TicketPusher>,
             migration: Arc<crate::orders::MigrationStore>,
             history: Arc<Mutex<RestartHistory>>,
@@ -1386,13 +1446,18 @@ mod tests {
 
         impl Rig {
             fn new() -> Self {
+                Self::with(|lc, _| lc)
+            }
+
+            /// A rig whose lifecycle `build` finishes (over its state root).
+            fn with(build: impl FnOnce(CvmLifecycle, &std::path::Path) -> CvmLifecycle) -> Self {
                 crate::snp_config::install_for_tests(crate::snp_config::SnpCpuConfig {
                     cbitpos: 51,
                     reduced_phys_bits: 1,
                 });
                 let root = tempfile::tempdir().unwrap();
                 let driver = Arc::new(MockLibvirtDriver::new());
-                let lc = Arc::new(
+                let lc = Arc::new(build(
                     CvmLifecycle::new_with_poll(
                         driver.clone(),
                         Arc::new(MockLaunchDigest::fixed([0u8; 48])),
@@ -1406,13 +1471,16 @@ mod tests {
                     )
                     .skip_state_disk_provision_for_tests()
                     .with_state_disk_root(root.path().to_path_buf()),
-                );
+                    root.path(),
+                ));
+                let virsh = Arc::new(FakeVirsh {
+                    driver: driver.clone(),
+                    starts: Mutex::new(Vec::new()),
+                });
                 Self {
                     lc,
-                    virsh: FakeVirsh {
-                        driver: driver.clone(),
-                        starts: Mutex::new(Vec::new()),
-                    },
+                    control: virsh.clone(),
+                    virsh,
                     driver,
                     pusher: Arc::new(ListenerPusher::default()),
                     migration: Arc::new(crate::orders::MigrationStore::new()),
@@ -1438,7 +1506,7 @@ mod tests {
                     pusher: &self.pusher,
                     migration: &self.migration,
                     history: &self.history,
-                    control: &self.virsh,
+                    control: &self.control,
                 };
                 handle_event_line(line, &ctx).await;
             }
@@ -1479,6 +1547,109 @@ mod tests {
             fn starts(&self) -> usize {
                 self.virsh.starts.lock().unwrap().len()
             }
+        }
+
+        /// Scripted disk facts and an always-installed helper, for a VM
+        /// with a dedicated disk.
+        struct Facts(Arc<Mutex<crate::storage::dedicated::DiskFacts>>);
+        impl crate::storage::dedicated::FactsSource for Facts {
+            fn facts(
+                &self,
+            ) -> std::result::Result<crate::storage::dedicated::DiskFacts, &'static str>
+            {
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+        struct Helper;
+        impl crate::storage::assignment::DedicatedHelper for Helper {
+            fn installed(&self) -> bool {
+                true
+            }
+            fn hold(&self, _: &str) -> std::result::Result<(), &'static str> {
+                Ok(())
+            }
+            fn unhold(&self, _: &str) -> std::result::Result<(), &'static str> {
+                Ok(())
+            }
+            fn release(&self, _: &str) -> std::result::Result<(), &'static str> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn a_vm_with_a_dedicated_disk_restarts_only_on_the_same_device() {
+            use crate::storage::dedicated::{DiskFact, DiskFacts, IdentityMap};
+            let facts = Arc::new(Mutex::new(DiskFacts {
+                collected_at_unix: 1,
+                disks: [(
+                    "wwn-0x1".to_string(),
+                    DiskFact {
+                        size_mb: 18 << 20,
+                        error: String::new(),
+                        identity: Some("naa.1".into()),
+                        dev: Some("250:1".into()),
+                        offline: false,
+                    },
+                )]
+                .into(),
+            }));
+            let shared = Arc::clone(&facts);
+            let rig = Rig::with(move |lc, root| {
+                let mut ids = IdentityMap::default();
+                ids.disks.insert("wwn-0x1".into(), "naa.1".into());
+                ids.save(root).unwrap();
+                lc.with_storage_state(Arc::new(crate::storage::state::StorageState::new(
+                    crate::storage::state::EffectiveStorage::local(
+                        Arc::new(crate::storage::StoragePools::implicit(
+                            root.to_path_buf(),
+                            0,
+                        )),
+                        vec![crate::config::DedicatedDiskConfig {
+                            id: "wwn-0x1".into(),
+                            state: crate::config::StorageDesiredStateConfig::Active,
+                        }],
+                        Default::default(),
+                    ),
+                )))
+                .with_dedicated(Arc::new(
+                    crate::storage::assignment::DedicatedDisks::new(
+                        Box::new(Facts(shared)),
+                        Box::new(Helper),
+                        Arc::default(),
+                    ),
+                ))
+            });
+            let mut o = order("dd-1");
+            o.cmdline = "quiet panic=0 hippius.dedicated=x0:16000".into();
+            o.extra_disks = vec![crate::orders::ExtraDisk {
+                slot: "x0".into(),
+                kind: "dedicated".into(),
+                disk_id: "wwn-0x1".into(),
+            }];
+            rig.lc.launch(o).await.unwrap();
+            rig.event("event 'lifecycle' for domain 'hippius-tenant-dd-1': Started Booted")
+                .await;
+            // An in-guest reboot: the same device is still there. (The
+            // restart runs on its own task.)
+            rig.stopped("dd-1", "Shutdown").await;
+            for _ in 0..200 {
+                if rig.starts() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(rig.starts(), 1);
+            // Another device behind the recorded name: left down.
+            facts
+                .lock()
+                .unwrap()
+                .disks
+                .get_mut("wwn-0x1")
+                .unwrap()
+                .identity = Some("naa.swapped".into());
+            rig.stopped("dd-1", "Shutdown").await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(rig.starts(), 1, "restarted onto another disk");
         }
 
         const POWEROFF: &str = r#"{"guest":true,"reason":"guest-shutdown"}"#;

@@ -1303,7 +1303,7 @@ GUEST_V1 = {
 }
 GUEST_D1 = {
     "qd1_p50_us", "qd1_p99_us", "rr_iops", "rw_sustained_iops", "seq_read_inner_mbps",
-    "seq_read_mid_mbps", "seq_read_outer_mbps", "seq_write_mbps", "surface_errors",
+    "seq_read_mid_mbps", "seq_read_outer_mbps", "seq_write_mbps", "size_mib", "surface_errors",
 }
 
 

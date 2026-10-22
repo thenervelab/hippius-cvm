@@ -100,6 +100,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from .chain import ChainSnapshot
 
@@ -127,6 +128,10 @@ ANTI_AFFINITY_UNSATISFIABLE = "placement-anti-affinity-unsatisfiable"
 NO_FAILOVER_CAPABLE_HOST = "no-failover-capable-host"
 #: Gate (n) emptied the set: no host has an OS pool at the VM's tier.
 NO_MINER_AT_TIER = "no-miner-at-tier"
+#: Gate (o), dedicated disks: no node has enough free disks at all, or the
+#: nodes that have them do not take the VM (`apps.disktier.dedicated`).
+NO_DEDICATED_CAPACITY = "no-dedicated-capacity"
+NO_HOST_FITS_DISKS = "no-host-fits-disks"
 
 # The two `cvm_capability` verdicts this module acts on. Re-declared as
 # plain literals rather than imported so this module stays free of the
@@ -175,11 +180,27 @@ class DiskTierFit:
     """Gate (n), the OS-disk tier (`VALI_SCHEDULER_DISK_TIER_GATE`, see
     `apps.disktier.os_tier`): `record` admits but logs a CHOSEN node
     `enforce` would have refused; `enforce` refuses. The map holds, per
-    node, why it has no OS pool at `tier` (a node absent from it has one)."""
+    node, why it has no OS pool at `tier` (a node absent from it has one).
+
+    `fallbacks`: the same gate at each lower tier, fastest first — set only
+    for a VM that may take one (`os_tier.may_fall_back`, enforced). Tried
+    in order, only when no candidate holds `tier` ([`decide_placement`])."""
 
     mode: str
     tier: str
     refusal_by_node: Mapping[str, str] = field(default_factory=dict)
+    fallbacks: tuple[DiskTierFit, ...] = ()
+
+
+@dataclass(frozen=True)
+class DedicatedFit:
+    """Gate (o), dedicated disks (`apps.disktier.dedicated`): only a node
+    with at least `count` qualifying free disks. `free_by_node` holds, per
+    lower-cased node id, how many it has (a node absent from it has none).
+    Always hard: a VM sold dedicated disks never lands without them."""
+
+    count: int
+    free_by_node: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -347,7 +368,32 @@ def _score(
     )
 
 
-def decide_placement(
+def decide_placement(*, disk_tier_fit: DiskTierFit | None = None, **kwargs: Any) -> str:
+    """[`_decide_placement`], with gate (n)'s tier fallback: when no
+    candidate is eligible at the VM's sold tier (any refusal but
+    `miners-booting`, which waits for a slot at that tier), the same
+    decision at each `disk_tier_fit.fallbacks` tier in turn — the first
+    that places wins (one busy booting raises `miners-booting`: wait). The
+    gates are identical but for the tier, and a lower tier refuses no node a
+    higher one admits, so a fallback only ever picks a node that does not
+    hold the sold tier. Every tier refusing raises the sold tier's error."""
+    try:
+        return _decide_placement(disk_tier_fit=disk_tier_fit, **kwargs)
+    except PlacementError as exc:
+        if disk_tier_fit is None or not disk_tier_fit.fallbacks or exc.category == MINERS_BOOTING:
+            raise
+        for lower in disk_tier_fit.fallbacks:
+            try:
+                return _decide_placement(disk_tier_fit=lower, **kwargs)
+            except PlacementError as low:
+                # The first lower tier with a node is busy booting: wait for
+                # it, as at the sold tier, rather than skip to a slower one.
+                if low.category == MINERS_BOOTING:
+                    raise
+        raise
+
+
+def _decide_placement(
     *,
     snapshot: ChainSnapshot,
     capacity_by_node: dict[str, int],
@@ -381,6 +427,7 @@ def decide_placement(
     power_policy_capable: frozenset[str] | None = None,
     failover_capable: frozenset[str] | None = None,
     disk_tier_fit: DiskTierFit | None = None,
+    dedicated_fit: DedicatedFit | None = None,
 ) -> str:
     """Return the `node_id` of the miner the VM should be placed on.
 
@@ -525,6 +572,10 @@ def decide_placement(
     - `disk_tier_fit`    gate (n): the nodes with no OS pool at the VM's
                          OS-disk tier ([`DiskTierFit`]). Enforced: HARD, no
                          fallback. `None` ⇒ no gate.
+    - `dedicated_fit`    gate (o): only a node with enough qualifying free
+                         dedicated disks ([`DedicatedFit`]). HARD, no
+                         fallback. `None` ⇒ no gate (every VM without
+                         dedicated disks).
 
     Raises [`PlacementError`]: `miners-booting` when gate (g) removed every
     candidate that passed all the others (retry shortly);
@@ -533,7 +584,9 @@ def decide_placement(
     `placement-anti-affinity-unsatisfiable` when gate (k) removed every host
     that passed all the others; `no-miner-supports-power-policy` likewise
     for gate (l), `no-failover-capable-host` for gate (m), `no-miner-at-tier`
-    for gate (n); otherwise
+    for gate (n); with gate (o), `no-dedicated-capacity` when no node has
+    the disks at all and `no-host-fits-disks` when the nodes that have them
+    do not take the VM (only `miners-booting` goes before them); otherwise
     `no-eligible-miner`.
     """
     weights = weights or SelectionWeights()
@@ -725,6 +778,11 @@ def decide_placement(
             if tier_refusals.get(miner.node_id, ""):
                 tier_skipped += 1
                 continue
+        # (o) dedicated disks — only a node with enough qualifying free ones.
+        if dedicated_fit is not None and (
+            dedicated_fit.free_by_node.get(miner.node_id.lower(), 0) < dedicated_fit.count
+        ):
+            continue
         # (a) admission bounded by proven capacity.
         capacity = capacity_by_node.get(miner.node_id)
         load = load_by_node.get(miner.node_id, 0)
@@ -845,6 +903,20 @@ def decide_placement(
                 "every eligible miner is already at its concurrent-boot cap "
                 f"(booting/cap: {booted}); retry once one of them is up",
                 MINERS_BOOTING,
+            )
+        if dedicated_fit is not None:
+            # The contract's two causes, whatever else removed the nodes:
+            # no node has the disks, or none of those that do takes the VM.
+            if max(dedicated_fit.free_by_node.values(), default=0) < dedicated_fit.count:
+                raise PlacementError(
+                    f"no node has {dedicated_fit.count} free dedicated disk(s) of the "
+                    "requested tier and size",
+                    NO_DEDICATED_CAPACITY,
+                )
+            raise PlacementError(
+                f"the nodes with {dedicated_fit.count} free dedicated disk(s) of the "
+                "requested tier and size cannot take this VM",
+                NO_HOST_FITS_DISKS,
             )
         if group_skipped:
             raise PlacementError(

@@ -105,6 +105,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmPowerState, VmState
 
 from . import effects
@@ -355,6 +356,9 @@ def _refusal(
         return "no-bound-miner", "vm has no bound miner"
     if build.withdrawn_at is not None or build.release.withdrawn_at is not None:
         return "build-withdrawn", f"build {build.s3_key_prefix} is withdrawn"
+    dedicated_why = disk_dedicated.guest_release_refusal(vm, build.release_id)
+    if dedicated_why:
+        return disk_dedicated.CATEGORY_NEEDS_RELEASE, dedicated_why
     record = _record(vm)
     if record is None:
         return "no-launch-record", "vm has no launch record"

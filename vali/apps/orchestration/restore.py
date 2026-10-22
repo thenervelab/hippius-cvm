@@ -55,6 +55,7 @@ import logging
 import re
 import secrets
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -64,6 +65,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Exists, F, OuterRef
 from django.utils import timezone
 
+from apps.disktier import dedicated as disk_dedicated
 from apps.lifecycle.models import Vm, VmBootPhase, VmPowerState, VmState
 
 from . import effects, idempotency
@@ -364,6 +366,13 @@ def start_restore(
         )
     if service._has_active_job(vm):
         raise RestoreError("job-in-flight", "the vm already has an in-flight orchestration job")
+    if disk_dedicated.is_pinned(vm):
+        # Pinned (E4): never backed up, and a restore boots through the §25
+        # activation, which carries no dedicated disk — refused wherever it
+        # would land.
+        raise RestoreError(
+            disk_dedicated.CATEGORY_PINNED, disk_dedicated.pinned_message(vm, "restored")
+        )
 
     from apps.backup.models import BackupRun
 
@@ -1971,7 +1980,8 @@ def _pick_failover_dest(vm: Vm, source: str, *, region: str | None = None) -> st
         own = service._snp_generation(source)
     except service.StartError:
         own = ""
-    best: tuple[tuple[bool, bool, int], int, str] | None = None
+    tier_rank = _landing_rank(vm)
+    best: tuple[tuple[bool, int, bool, int], int, str] | None = None
     for miner in MinerIdentity.objects.exclude(miner_id=source).order_by("miner_id"):
         node = (miner.chain_node_id or "").lower()
         if node in cordoned:
@@ -1993,7 +2003,10 @@ def _pick_failover_dest(vm: Vm, source: str, *, region: str | None = None) -> st
         # with the gap): a cross-generation restore is a fallback, never a
         # tie-break on room.
         gap = cross_gen.GENERATION_ORDER.get(theirs, -9) - cross_gen.GENERATION_ORDER.get(own, 9)
-        rank = (theirs == own, gap >= 0, -abs(gap))
+        # A fallback owner's VM: a host holding its sold OS-disk tier before
+        # one it would land below it on, the higher lower tier first (a
+        # fallback, never a tie-break on room).
+        rank = (theirs == own, tier_rank(miner.chain_node_id or ""), gap >= 0, -abs(gap))
         if best is None or (rank, score) > best[:2]:
             best = (rank, score, miner.miner_id)
     if best is None:
@@ -2003,6 +2016,42 @@ def _pick_failover_dest(vm: Vm, source: str, *, region: str | None = None) -> st
             "has room for the vm",
         )
     return best[2]
+
+
+def _landing_rank(vm: Vm) -> Callable[[str], int]:
+    """The rank (`tiers.rank`) of the best OS-disk tier at or below `vm`'s
+    sold one a node holds (0: none) — asked only for a fallback owner's VM
+    (`os_tier.fallback_owner_of`); the same for every node for any other (a
+    node without its sold tier is refused before ranking)."""
+    from apps.disktier import os_tier
+    from apps.disktier.tiers import rank
+    from apps.scheduler import service as sched
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES, Placement
+
+    try:
+        if not os_tier.fallback_owner_of(vm.vm_id):
+            return lambda _node: 0
+        row = (
+            Placement.objects.filter(vm=vm, status__in=ACTIVE_PLACEMENT_STATES)
+            .values_list("resource_class", "data_disk_gb")
+            .first()
+        )
+        need_gb = sched.placement_disk_gb(row[0], row[1]) if row is not None else 0
+        tier = os_tier.launch_tier(vm.vm_id)
+    except Exception:
+        log.exception("failover: vm=%s os disk tier unread — ranked without it", vm.vm_id)
+        return lambda _node: 0
+
+    def landing_rank(node: str) -> int:
+        try:
+            for at in (tier, *os_tier.lower_tiers(tier)):
+                if node and not os_tier.refusal(node, at, need_gb):
+                    return rank(at)
+        except Exception:
+            log.exception("failover: vm=%s os disk tier of %s unread", vm.vm_id, node)
+        return 0
+
+    return landing_rank
 
 
 def start_failover(
@@ -2060,6 +2109,11 @@ def start_failover(
     # A storage move on the dead host is moot: the VM leaves it.
     if service._has_active_job(vm, ignore_storage_move=True):
         raise RestoreError("job-in-flight", "the vm already has an in-flight orchestration job")
+    if disk_dedicated.is_pinned(vm):
+        # Its disks died with the host (E4): no failover, ever.
+        raise RestoreError(
+            disk_dedicated.CATEGORY_PINNED, disk_dedicated.pinned_message(vm, "failed over")
+        )
     source = vm.host
 
     from apps.backup.models import BackupRun

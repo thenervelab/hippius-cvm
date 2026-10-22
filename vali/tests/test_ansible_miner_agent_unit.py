@@ -97,6 +97,63 @@ def test_the_storage_collector_reads_devices_and_has_no_network() -> None:
     assert "OnUnitActiveSec=5min" in timer
 
 
+def test_the_dedicated_disk_helpers_see_devices_and_match_the_agent() -> None:
+    """The hold and release units run outside the agent's PrivateDevices
+    sandbox, as templates whose instance is the by-id name, and write their
+    verdict where the agent reads it (`storage/dedicated_helper.rs`)."""
+    source = (REPO / "binaries/miner-agent/src/storage/dedicated_helper.rs").read_text()
+    (line,) = [x for x in source.splitlines() if x.startswith("pub const RESULT_DIR")]
+    result_dir = line.split('"')[1]
+    assignment = (REPO / "binaries/miner-agent/src/storage/assignment.rs").read_text()
+    tasks = yaml.safe_load(TASKS.read_text())
+    for name, verb, kind, unit_const in (
+        (
+            "Install the dedicated-disk hold unit (template)",
+            "dedicated-hold",
+            "notify",
+            "HOLD_UNIT",
+        ),
+        (
+            "Install the dedicated-disk release unit (template)",
+            "dedicated-release",
+            "oneshot",
+            "RELEASE_UNIT",
+        ),
+    ):
+        (task,) = [t for t in tasks if t.get("name") == name]
+        dest = task["ansible.builtin.copy"]["dest"]
+        prefix = [x for x in assignment.splitlines() if x.startswith(f"pub const {unit_const}")][0]
+        assert dest == f"/etc/systemd/system/{prefix.split(chr(34))[1]}.service"
+        unit = task["ansible.builtin.copy"]["content"]
+        assert f"{verb} --config {{{{ miner_agent.config_path }}}} --disk %i" in unit
+        assert "PrivateDevices" not in unit
+        assert "PrivateNetwork=true" in unit
+        assert "ProtectSystem=strict" in unit
+        assert f"Type={kind}" in unit
+        assert f"RuntimeDirectory={result_dir.removeprefix('/run/')}" in unit
+        assert "ReadWritePaths=/etc/udev/rules.d" in unit
+
+    # The agent waits for each unit from the same constants the units use.
+    def const(name: str) -> str:
+        (line,) = [x for x in source.splitlines() if x.startswith(f"pub const {name}:")]
+        return line.split("=", 1)[1].strip().rstrip(";")
+
+    (hold,) = [
+        t for t in tasks if t.get("name") == "Install the dedicated-disk hold unit (template)"
+    ]
+    hold_unit = hold["ansible.builtin.copy"]["content"]
+    assert f"TimeoutStartSec={const('HOLD_UNIT_TIMEOUT_SECS')}" in hold_unit
+    assert f"TimeoutStopSec={const('HOLD_UNIT_TIMEOUT_SECS')}" in hold_unit
+    # A dead hold comes back; a refusal does not restart-loop.
+    assert "Restart=on-failure" in hold_unit
+    assert f"RestartPreventExitStatus={const('HOLD_REFUSED_EXIT')}" in hold_unit
+    (rel,) = [
+        t for t in tasks if t.get("name") == "Install the dedicated-disk release unit (template)"
+    ]
+    release_unit = rel["ansible.builtin.copy"]["content"]
+    assert f"TimeoutStartSec={const('RELEASE_UNIT_TIMEOUT_SECS')}" in release_unit
+
+
 def test_storage_pools_are_bind_mounted_durably_under_the_pools_root() -> None:
     """A pool with a `source` gets an fstab bind at <state_dir>/pools/<id>,
     ordered after its source mount, so a reboot brings it back before the

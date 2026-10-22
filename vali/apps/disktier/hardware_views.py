@@ -23,9 +23,10 @@ allows, or `never` when none has arrived (agent too old or opted out).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
+from django.db.models.functions import Lower
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import serializers
@@ -278,6 +279,59 @@ def hardware_readout(node_id: str, *, now: datetime) -> dict[str, Any]:
         "attested": attested_readout(node_id, now=now),
         "sections": {name: _section(rows.get(name), now) for name in SECTIONS},
     }
+
+
+#: `software.auto_update.disabled_reason` (`hippius-host-inventory`).
+AUTO_UPDATE_DISABLED_REASONS = frozenset(
+    {"no_auto_update_file", "disabled_in_env", "timer_disabled"}
+)
+
+
+def _unix_iso(value: Any) -> str | None:
+    """A miner-reported unix time as ISO, `None` when it is not one a
+    calendar holds: the report is untrusted, and one bad value must never
+    fail a request that lists other nodes."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=UTC).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _auto_update(body: Any, reported_at: datetime) -> dict[str, Any] | None:
+    block = body.get("auto_update") if isinstance(body, dict) else None
+    if not isinstance(block, dict) or not isinstance(block.get("enabled"), bool):
+        return None
+    reason = block.get("disabled_reason")
+    failed = block.get("failed_tag")
+    return {
+        "enabled": block["enabled"],
+        "disabled_reason": reason if reason in AUTO_UPDATE_DISABLED_REASONS else None,
+        "last_check_at": _unix_iso(block.get("last_check_unix")),
+        "failed_tag": failed if isinstance(failed, str) else None,
+        "reported_at": reported_at.isoformat(),
+    }
+
+
+def auto_update_by_node(node_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """`software.auto_update` of each node's latest host inventory (keys
+    lowercase), for the operator rows (`/v1/operator/nodes`, `/fleet`): the
+    miner-agent updater's state as the node reports it. UNTRUSTED, display
+    only; no serial, no by-id name. A node whose software section carries
+    no `auto_update` (collector without `--report-auto-update`, or a source
+    it could not read) is absent. ONE query."""
+    out: dict[str, dict[str, Any]] = {}
+    rows = (
+        HostInventorySection.objects.annotate(nid=Lower("miner_node_id"))
+        .filter(nid__in=[n.lower() for n in node_ids], section="software")
+        .values_list("nid", "body", "reported_at")
+    )
+    for nid, body, reported_at in rows:
+        readout = _auto_update(body, reported_at)
+        if readout is not None:
+            out[nid] = readout
+    return out
 
 
 def cross_check(

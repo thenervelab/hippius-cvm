@@ -34,6 +34,7 @@ owns its own copy and should drop it too.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import secrets
@@ -47,6 +48,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from apps.cdn import identity as cdn_identity
+from apps.disktier import dedicated as disk_dedicated
 from apps.disktier import routing as disk_routing
 from apps.miners import launch_errors
 from apps.miners.models import MinerIdentity
@@ -154,6 +156,10 @@ _ACCEPT_MEMORY_CMDLINE_KEY = "accept_memory"
 # FINAL augmented cmdline against this before preflight, fail-closed, in
 # every key mode.
 _MAX_CMDLINE_BYTES = customer_keys.MAX_MEASURED_CMDLINE_LEN
+# E4: a measured cmdline carrying `hippius.dedicated=` stays 50 bytes under
+# the limit above (its /proc/cmdline, with OVMF's 14-byte prefix, at most
+# 1997 of the kernel's 2047), so its anchor can never be a truncated tail.
+_MAX_DEDICATED_CMDLINE_BYTES = _MAX_CMDLINE_BYTES - 50
 
 # ── golden-bake disk modes + the dm-verity root-hash cmdline token ───
 # `disk_mode` selects how the boot disk's integrity is anchored into the
@@ -736,6 +742,20 @@ class LaunchSpec:
     # another one. Drives placement (gate (n), the pool choice) and the
     # billing binding; never measured.
     os_disk_tier: str = ""
+    # The dedicated disks the VM was sold (`apps.disktier.dedicated`):
+    # `{"tier", "count", "min_size_gb"}`, and the customer's `pinned_ack`.
+    # Written into `spec_json` only when present (`None` / False for every
+    # other launch). Placement assigns the disks (gate (o)); every launch of
+    # the VM sends them as `extra_disks` and measures `hippius.dedicated=`.
+    dedicated_disks: dict[str, Any] | None = None
+    pinned_ack: bool = False
+    # The tier the OS disk is placed at when it is NOT `os_disk_tier`: a
+    # fallback owner's VM on a node without its sold tier
+    # (`os_tier.may_fall_back`, gate (n) fallbacks). Set by vali per attempt
+    # (`_at_decided_tier`) or relaunch, never by intake nor in `spec_json`:
+    # the sold tier stays the VM's. Drives the pool choice, the default-pool
+    # refusal, the billing binding and the placement's disk row.
+    placed_os_disk_tier: str = ""
     # The authenticated launch purpose (`orchestration.launch_purpose`):
     # stamped on every `Placement` this launch writes, never sent to the
     # miner. Written into `spec_json` only when set.
@@ -1014,7 +1034,7 @@ def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
         return _pinned_os_pool(spec)
     try:
         return disk_routing.choose_os_pool(
-            miner.chain_node_id or "", _os_disk_need_gb(spec), _os_disk_tier(spec)
+            miner.chain_node_id or "", _os_disk_need_gb(spec), _landing_tier(spec)
         )
     except Exception:
         log.exception("launch: vm_id=%s os pool choice failed — using default", spec.vm_id)
@@ -1024,6 +1044,13 @@ def _choose_os_pool(miner: MinerIdentity, spec: LaunchSpec) -> str | None:
 #: `launch_on_miner`'s outcome when gate (n) refuses the disk's landing
 #: on `default` at dispatch.
 NO_OS_POOL_AT_TIER = "no-os-pool-at-tier"
+#: `launch_on_miner`'s outcome when a VM sold dedicated disks cannot be
+#: given them on this miner (no assignment here, or an agent too old).
+DEDICATED_DISKS_UNAVAILABLE = "dedicated-disks-unavailable"
+#: How many times one launch re-asks the scheduler after losing a node's
+#: dedicated disks to a concurrent placement, before excluding the nodes
+#: it keeps losing.
+_MAX_DEDICATED_RACES = 3
 
 
 def _default_pool_refusal(miner: MinerIdentity, spec: LaunchSpec) -> str:
@@ -1035,7 +1062,7 @@ def _default_pool_refusal(miner: MinerIdentity, spec: LaunchSpec) -> str:
 
     if os_tier.gate_mode() != os_tier.GATE_ENFORCE:
         return ""
-    tier = _os_disk_tier(spec)
+    tier = _landing_tier(spec)
     own = disk_routing.default_pool_tier(miner.chain_node_id or "")
     if own is not None and satisfies(own, tier):
         return ""
@@ -1050,6 +1077,65 @@ def _os_disk_tier(spec: LaunchSpec) -> str:
     from apps.disktier import os_tier
 
     return os_tier.spec_tier({"os_disk_tier": getattr(spec, "os_disk_tier", "")})
+
+
+def _landing_tier(spec: LaunchSpec) -> str:
+    """The tier the spec's OS disk goes at: its placed tier when vali set
+    one (a fallback, `placed_os_disk_tier`), else its sold tier."""
+    from apps.disktier import os_tier
+
+    placed = getattr(spec, "placed_os_disk_tier", "")
+    return os_tier.spec_tier({"os_disk_tier": placed}) if placed else _os_disk_tier(spec)
+
+
+def _decided_tier(fit: Any, node_id: str) -> str:
+    """The tier gate (n) placed `node_id` at: the first of the sold tier and
+    its fallbacks (`DiskTierFit.fallbacks`) that admits it, read off the
+    very maps the decision used (`""` without fallbacks: the sold tier, as
+    ever). A decision at the sold tier admits its node there; one that fell
+    back cannot (that node would have been eligible at the sold tier)."""
+    if fit is None or not fit.fallbacks:
+        return ""
+    for at in (fit, *fit.fallbacks):
+        if not at.refusal_by_node.get(node_id, ""):
+            return str(at.tier)
+    return ""
+
+
+def _at_decided_tier(spec: LaunchSpec, fit: Any, node_id: str) -> LaunchSpec:
+    """`spec` for the attempt on `node_id`, carrying the tier the decision
+    placed its OS disk at when it fell back below the sold one
+    ([`_decided_tier`], a fallback owner's VM only); `spec` itself for every
+    other launch. Nothing is re-read: a node that no longer holds that tier
+    at dispatch is re-placed (`_default_pool_refusal`), as for any tier."""
+    from apps.disktier import os_tier
+    from apps.disktier.tiers import rank
+
+    tier = _decided_tier(fit, node_id)
+    sold = _os_disk_tier(spec)
+    if not tier or rank(tier) >= rank(sold) or not os_tier.may_fall_back(spec.user_id):
+        return spec
+    return dataclasses.replace(spec, placed_os_disk_tier=tier)
+
+
+def _at_placed_tier(spec: LaunchSpec) -> LaunchSpec:
+    """`spec` for a relaunch onto the disks a VM already has: one whose
+    placement recorded its OS disk below the sold tier (a fallback,
+    `os_tier.placed_tier`) keeps that tier — whatever the fallback list
+    says now, the disk is where it is. Any failure: the sold tier."""
+    from apps.disktier import os_tier
+    from apps.disktier.tiers import rank
+
+    if spec.placed_os_disk_tier:
+        return spec
+    try:
+        placed = os_tier.placed_tier(spec.vm_id)
+    except Exception:
+        log.exception("relaunch: vm_id=%s placed os disk tier unread", spec.vm_id)
+        return spec
+    if not placed or rank(placed) >= rank(_os_disk_tier(spec)):
+        return spec
+    return dataclasses.replace(spec, placed_os_disk_tier=placed)
 
 
 def _own_retry_pool(out: LaunchOutcome, dispatch_retries: int) -> None:
@@ -1110,10 +1196,13 @@ def _derive_measured_cmdline(
     telemetry_epoch: int,
     eol_nonce_hex: str,
     cdn_node: bool = False,
+    dedicated: str | None = None,
 ) -> str:
     """The MEASURED cmdline of a launch of `spec`, from its per-launch
     inputs. `cdn_node` (a CDN node's launch, `apps.cdn.identity`) adds the
-    CDN role tokens. Pure: no Vault, no DB write, no randomness. `launch_on_miner`
+    CDN role tokens. `dedicated` (`apps.disktier.dedicated.cmdline_value`,
+    `x0:<GiB>,…`) adds `hippius.dedicated=`; `None` (every VM without
+    dedicated disks) adds nothing. Pure: no Vault, no DB write, no randomness. `launch_on_miner`
     calls it with the real values; `_ensure_vm_row` calls it with
     same-length stand-ins BEFORE it pins a new M1/M2 row (see
     `_refuse_measured_cmdline_before_pin`), so a cmdline that would be
@@ -1157,6 +1246,13 @@ def _derive_measured_cmdline(
         )
     augmented_cmdline = _augment_cmdline_with_token(
         augmented_cmdline, _DISK_GB_CMDLINE_KEY, str(disk_gb)
+    )
+    # E4 — the dedicated disks' slots and size classes, MEASURED: the guest
+    # opens exactly these slots and refuses one smaller than measured.
+    # Forced both ways: vali's placement decides it, never the base cmdline,
+    # so a VM without dedicated disks never carries the token.
+    augmented_cmdline = _force_cmdline_token(
+        augmented_cmdline, disk_dedicated.CMDLINE_KEY, dedicated
     )
     # §7 — bake the lifecycle-key tmpfs path into the MEASURED cmdline so
     # the guest's keyscript writes the released key there and the `eol`
@@ -1286,6 +1382,19 @@ def _measured_cmdline_refusal(
             f"{customer_keys.KEY_MODE_TOKEN} token; the guest refuses to boot "
             "such a cmdline (a key-mode token may have been truncated off)",
         )
+    # E4: the guest refuses a `hippius.dedicated=` anchor that could have
+    # been truncated at the kernel's 2047-byte limit — so a VM with
+    # dedicated disks keeps its measured cmdline well under it.
+    if (
+        any(t.startswith(f"{disk_dedicated.CMDLINE_KEY}=") for t in cmdline.split())
+        and cmdline_len > _MAX_DEDICATED_CMDLINE_BYTES
+    ):
+        return (
+            "cmdline-too-long",
+            f"measured cmdline is {cmdline_len} bytes (> {_MAX_DEDICATED_CMDLINE_BYTES}) "
+            f"with a {disk_dedicated.CMDLINE_KEY} anchor: too close to the kernel's "
+            "2047-byte limit for the guest to trust it",
+        )
     return None
 
 
@@ -1351,6 +1460,11 @@ def _refuse_measured_cmdline_before_pin(
         validator_nonce_hex=_PRE_PIN_HEX64,
         telemetry_epoch=_PRE_PIN_EPOCH_UPPER_BOUND,
         eol_nonce_hex=eol_nonce_hex,
+        dedicated=(
+            disk_dedicated.stand_in_cmdline_value(request)
+            if (request := disk_dedicated.spec_request(spec)) is not None
+            else None
+        ),
     )
     refusal = _measured_cmdline_refusal(cmdline, binding)
     if refusal is not None:
@@ -1404,6 +1518,8 @@ def launch_on_miner(
             f"miner {miner.miner_id!r} has no netbird_ip — register via "
             "PR #120 first"
         )
+    if require_existing_disks:
+        spec = _at_placed_tier(spec)
     # Customer-held keys: the binding (None ⇒ M0) — grammar-validated and
     # golden-only. M2 has NO Hippius-held KEK, so a caller handing one in
     # is refused before anything is staged.
@@ -1467,6 +1583,35 @@ def launch_on_miner(
             cdn_identity.check_launch_spec(spec)
     except cdn_identity.CdnRoleError as exc:
         return _terminal("cdn-role-refused", str(exc), EXIT_CONFIG_ERROR)
+    # E4 — the dedicated disks this order names: the VM's placement rows on
+    # THIS node (`apps.disktier.dedicated`), the same on every launch of the
+    # VM. A VM sold dedicated disks never boots without them: too few rows
+    # here, or (first launch) an agent that does not take `extra_disks`,
+    # refuses before any row, secret or pin exists. A relaunch is never
+    # refused for the agent version (a flag change must not strand a
+    # pinned VM; an agent that cannot honour the order refuses it). A VM
+    # without dedicated disks reads nothing.
+    extra_disks: list[disk_dedicated.ExtraDisk] = []
+    dedicated_request = disk_dedicated.spec_request(spec)
+    if dedicated_request is not None:
+        node = miner.chain_node_id or ""
+        extra_disks = disk_dedicated.extra_disks(spec.vm_id, node)
+        why = ""
+        if len(extra_disks) < dedicated_request.count:
+            why = (
+                f"vm {spec.vm_id} was sold {dedicated_request.count} dedicated disk(s) but its "
+                f"placement on this node holds {len(extra_disks)}"
+            )
+        elif not require_existing_disks and node.lower() not in disk_dedicated.capable_node_ids(
+            [node]
+        ):
+            why = f"miner {miner.miner_id} runs an agent that does not take extra_disks"
+        if why:
+            out = _terminal(DEDICATED_DISKS_UNAVAILABLE, why, EXIT_CONFIG_ERROR)
+            # Only a same-miner retry after the KBS register reaches here
+            # without a first attempt: say so (see gate (n) above).
+            out.registered = not first_attempt
+            return out
 
     # ── 0. the control-plane row, BEFORE any effect that can leave a
     #        running domain behind (P9/#18) ─────────────────────────────
@@ -1783,7 +1928,7 @@ def launch_on_miner(
         miner.chain_node_id,
         spec.flavor,
         spec.lease_id,
-        os_disk_tier=_os_disk_tier(spec),
+        os_disk_tier=_landing_tier(spec),
     )
 
     # ── 3. allowed_userdata_digest_hex ──────────────────────────────
@@ -1821,6 +1966,7 @@ def launch_on_miner(
         telemetry_epoch=_current_billing_epoch(),
         eol_nonce_hex=nonce_seed,
         cdn_node=cdn_node,
+        dedicated=disk_dedicated.cmdline_value(extra_disks),
     )
     effective_eol_nonce_hex = _extract_cmdline_token(
         augmented_cmdline, _EOL_NONCE_CMDLINE_KEY
@@ -2260,6 +2406,7 @@ def launch_on_miner(
         ),
         on_guest_poweroff=poweroff_field,
         os_pool=os_pool,
+        extra_disks=disk_dedicated.order_entries(extra_disks),
     )
     import json as _json
 
@@ -2843,6 +2990,10 @@ def _place_and_launch(
 
     cap_attempts = max_attempts or max_replace_attempts()
     vm = _ensure_vm_row(spec)
+    # E4: the dedicated disks the VM was sold, `None` for every other VM
+    # (no gate, no query, no assignment).
+    dedicated_request = disk_dedicated.spec_request(spec)
+    dedicated_races = 0
     excluded: set[str] = set()
     audit: list[dict[str, str]] = []
 
@@ -2867,31 +3018,30 @@ def _place_and_launch(
         service.refresh_miner_capacity(snapshot)
         cap, load, fam = service.decision_inputs(spec.tenant_id)
         try:
-            node_id = decide_placement(
+            # Every gate, assembled in ONE place so the feasibility
+            # check (`apps.scheduler.feasibility`) asks the scheduler
+            # the identical question. A preflight built from its own
+            # copy of these arguments drifts, and a drifted preflight
+            # is worse than none: the caller sells on its answer.
+            arguments = service.placement_arguments(
                 snapshot=snapshot,
-                # Every gate, assembled in ONE place so the feasibility
-                # check (`apps.scheduler.feasibility`) asks the scheduler
-                # the identical question. A preflight built from its own
-                # copy of these arguments drifts, and a drifted preflight
-                # is worse than none: the caller sells on its answer.
-                **service.placement_arguments(
-                    snapshot=snapshot,
-                    tenant_id=spec.tenant_id,
-                    user_id=spec.user_id,
-                    flavor=spec.flavor,
-                    excluded=frozenset(excluded),
-                    region=spec.region,
-                    platform_id=spec.platform_id,
-                    boot_gate=True,
-                    vm_id=spec.vm_id,
-                    power_policy_stop=(
-                        getattr(spec, "on_guest_poweroff", power_policy.RESTART)
-                        == power_policy.STOP
-                    ),
-                    require_failover_peer=getattr(spec, "require_failover_peer", False),
-                    os_disk_tier=_os_disk_tier(spec),
+                tenant_id=spec.tenant_id,
+                user_id=spec.user_id,
+                flavor=spec.flavor,
+                excluded=frozenset(excluded),
+                region=spec.region,
+                platform_id=spec.platform_id,
+                boot_gate=True,
+                vm_id=spec.vm_id,
+                power_policy_stop=(
+                    getattr(spec, "on_guest_poweroff", power_policy.RESTART)
+                    == power_policy.STOP
                 ),
+                require_failover_peer=getattr(spec, "require_failover_peer", False),
+                os_disk_tier=_os_disk_tier(spec),
+                dedicated=dedicated_request,
             )
+            node_id = decide_placement(snapshot=snapshot, **arguments)
         except PlacementError as exc:
             # Every eligible miner is busy booting: a boot slot frees up in
             # minutes, so wait for it — without spending a miner attempt —
@@ -2933,6 +3083,9 @@ def _place_and_launch(
             audit.append({"miner_node_id": node_id, "disposition": "no-identity"})
             continue
 
+        # E4: disks the VM already holds (an earlier attempt got past the KBS
+        # register) are taken again, never given back by this attempt.
+        reusing_disks = dedicated_request is not None and bool(disk_dedicated.held_disks(vm))
         # Record the Pending placement. The partial unique index makes
         # this the race boundary; a pre-existing active placement for
         # this VM is a conflict the caller must resolve.
@@ -2949,6 +3102,24 @@ def _place_and_launch(
                     chain_epoch=snapshot.current_epoch,
                     decided_by=decided_by,
                 )
+                # E4: the VM's dedicated disks, in THIS transaction, row-locked:
+                # the placement and its disks commit together or not at all.
+                if dedicated_request is not None:
+                    disk_dedicated.assign(placement, vm, dedicated_request)
+        except disk_dedicated.DisksTaken as exc:
+            # The node's disks went to a concurrent placement since the
+            # scheduler counted them: nothing was written (the placement
+            # rolled back with them). Ask again WITHOUT spending a miner
+            # attempt — gate (o) recounts, so the node is chosen again only
+            # if it still has enough — and stop asking about it after a few.
+            log.warning("launch: vm_id=%s dedicated disks on %s: %s", spec.vm_id, node_id, exc)
+            audit.append({"miner_node_id": node_id, "disposition": "dedicated-disks-taken"})
+            dedicated_races += 1
+            if dedicated_races <= _MAX_DEDICATED_RACES:
+                attempts_used -= 1
+            else:
+                excluded.add(node_id)
+            continue
         except IntegrityError:
             existing = Placement.objects.filter(
                 vm=vm, status__in=ACTIVE_PLACEMENT_STATES
@@ -2969,7 +3140,10 @@ def _place_and_launch(
         # Progress: a miner is chosen + the Pending placement recorded —
         # `launch_on_miner` now stages refs, mints, KBS-registers + dispatches.
         _emit_phase("dispatching")
-        out = launch_on_miner(spec, miner)
+        # A fallback owner's VM placed below its sold tier carries that tier
+        # through the attempt (pool choice, refusal, billing, disk row).
+        attempt_spec = _at_decided_tier(spec, arguments.get("disk_tier_fit"), node_id)
+        out = launch_on_miner(attempt_spec, miner)
 
         # Post-register dispatch failure: the KBS has already bound this
         # vm_id to THIS miner's host (step 8), so re-placing to another
@@ -2998,7 +3172,7 @@ def _place_and_launch(
             )
             time.sleep(dispatch_retry_backoff_s())
             dispatched.extend(_candidate_of(spec, out))
-            out = launch_on_miner(spec, miner, os_pool=_retry_os_pool(spec, out))
+            out = launch_on_miner(attempt_spec, miner, os_pool=_retry_os_pool(spec, out))
         _own_retry_pool(out, dispatch_retries)
         if answered_already_launched(out):
             _await_the_attested_boot(
@@ -3030,7 +3204,7 @@ def _place_and_launch(
         )
 
         if out.disposition == ACCEPTED:
-            _bind_placement(placement, out)
+            _bind_placement(placement, out, placed_tier=attempt_spec.placed_os_disk_tier)
             # Root-cause fix: stamp the placed miner's node_id onto the Vm
             # row. The async launch worker records the miner ONLY on
             # `LaunchJob.miner_id`; historically `vm.host` stayed "" until
@@ -3058,6 +3232,18 @@ def _place_and_launch(
         # Not accepted — fail the placement so it stops counting against
         # the miner's load + the one-active-placement index frees up.
         _fail_placement(placement, reason=out.emit.get("outcome", "launch-failed"))
+        # E4: an attempt that never got past the KBS register never sent an
+        # order naming its disks — they go straight back. One that did (any
+        # same-miner retry follows a registered attempt, whatever the last
+        # retry's own flag says) keeps them until §24 releases them for a
+        # wipe and a re-probe.
+        if (
+            dedicated_request is not None
+            and not reusing_disks
+            and not out.registered
+            and dispatch_retries == 0
+        ):
+            disk_dedicated.revert_unused(placement)
 
         # A post-register dispatch failure that survived the same-miner
         # retries is TERMINAL: the vm is KBS-bound to this miner and the
@@ -3203,6 +3389,22 @@ def resolve_forced_launch_principal(name: str = "") -> Any:
     return client
 
 
+def _refuse_pinned_forced_launch(spec: LaunchSpec) -> None:
+    """E4: an operator-forced launch never carries dedicated disks — it
+    neither assigns them nor names them — so it refuses a spec sold them and
+    an existing vm_id that holds (or was sold) them."""
+    from apps.lifecycle.models import Vm
+
+    vm = Vm.objects.filter(vm_id=spec.vm_id).first()
+    if disk_dedicated.spec_request(spec) is not None or (
+        vm is not None and disk_dedicated.is_pinned(vm)
+    ):
+        raise LaunchConfigError(
+            f"vm {spec.vm_id!r} has dedicated disks: only the scheduler's launch "
+            "places it (with its disks); a forced launch would boot it without them"
+        )
+
+
 def _forced_placement_epoch(node_id: str) -> int:
     """`Placement.chain_epoch` for a forced placement.
 
@@ -3287,6 +3489,7 @@ def launch_on_named_miner(
     # identity must leave nothing behind.
     _refuse_miner_for_customer_keys(_spec_binding(spec), miner)
     _refuse_cordoned_miner(miner)
+    _refuse_pinned_forced_launch(spec)
     from apps.scheduler import service as sched
 
     reason = sched.cdn_dest_reason(spec.tenant_id, spec.vm_id, miner.miner_id)
@@ -4230,8 +4433,12 @@ def _mark_launch_abandoned(
     )
 
 
-def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
+def _bind_placement(placement: Any, out: LaunchOutcome, *, placed_tier: str = "") -> None:
     """CAS Pending→Bound for an accepted launch.
+
+    `placed_tier`: the tier a fallback placed the OS disk at (below its
+    sold one) — recorded on the placement's disk row whatever its pool,
+    `default` included, and logged (`os_tier.log_fallback`).
 
     `kbs_release_ref` records the dispatch evidence (the accepted order +
     ticket) as the §23 audit reference. A lost CAS (concurrent /fail or
@@ -4259,7 +4466,15 @@ def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
             placement.id,
         )
         return
-    if out.os_pool:
+    if placed_tier:
+        try:
+            _record_os_pool(placement, out.os_pool or disk_routing.DEFAULT_POOL_ID, placed_tier)
+        except Exception:
+            log.exception(
+                "launch bind: placement=%s os disk tier %s not recorded", placement.id, placed_tier
+            )
+        _log_fallback(placement, placed_tier, context="launch")
+    elif out.os_pool:
         try:
             _record_os_pool(placement, out.os_pool)
         except Exception:
@@ -4270,10 +4485,32 @@ def _bind_placement(placement: Any, out: LaunchOutcome) -> None:
             )
 
 
-def _record_os_pool(placement: Any, pool_id: str) -> None:
+def _log_fallback(placement: Any, tier: str, *, context: str) -> None:
+    """`os_tier.log_fallback` for `placement`'s VM. Never raises, and its
+    read runs in its own savepoint (a caller's transaction survives it)."""
+    from django.db import transaction
+
+    from apps.disktier import os_tier
+
+    try:
+        with transaction.atomic():
+            sold = os_tier.launch_tier(placement.vm.vm_id)
+        os_tier.log_fallback(
+            vm_id=placement.vm.vm_id,
+            owner=placement.owner,
+            node_id=placement.miner_node_id,
+            sold=sold,
+            tier=tier,
+            context=context,
+        )
+    except Exception:  # noqa: BLE001 — a log line must never fail a bind.
+        log.exception("disk tier fallback for placement=%s not logged", placement.id)
+
+
+def _record_os_pool(placement: Any, pool_id: str, tier: str = "") -> None:
     """A4b: the placement's OS disk is on `pool_id` (a placement without
-    a row is on `default`). Sized as the placement commits it, at the tier
-    its VM was sold at."""
+    a row is on `default`). Sized as the placement commits it, at `tier`
+    (a fallback's placed tier), else the tier its VM was sold at."""
     from apps.disktier import os_tier
     from apps.disktier.models import OS_SLOT, DiskKind, PlacementDisk
     from apps.scheduler.service import placement_disk_gb
@@ -4285,7 +4522,7 @@ def _record_os_pool(placement: Any, pool_id: str) -> None:
             "kind": DiskKind.POOL,
             "pool_id": pool_id,
             "size_gb": placement_disk_gb(placement.resource_class, placement.data_disk_gb),
-            "required_tier": os_tier.launch_tier(placement.vm.vm_id),
+            "required_tier": tier or os_tier.launch_tier(placement.vm.vm_id),
         },
     )
 

@@ -335,6 +335,34 @@ pub struct LaunchOrder {
     /// know it (`deny_unknown_fields` refuses it on older ones).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_pool: Option<String>,
+    /// Whole physical disks given to the VM (docs/design/
+    /// disk-tier-verification.md §4.2, §7.1): each is attached as a raw
+    /// virtio block device whose only identity in the guest is the virtual
+    /// serial `hippius-<slot>`. At most 8, by unique slot (`x0`..`x23`)
+    /// and unique disk. A first launch claims free declared disks; a VM
+    /// that already has disks here must name exactly the same ones (see
+    /// [`crate::storage::assignment`]). Not measured itself (the measured
+    /// cmdline carries `hippius.dedicated=`), not part of the L1 ticket.
+    ///
+    /// `serde(default)` ⇒ empty = no dedicated disk, and encoded ONLY when
+    /// non-empty: a body without it is byte-identical to before, and an
+    /// agent too old to know the key refuses one that carries it at decode
+    /// (`deny_unknown_fields`), so vali sends it only to agents that
+    /// advertise heartbeat v7.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_disks: Vec<ExtraDisk>,
+}
+
+/// One dedicated disk of a [`LaunchOrder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraDisk {
+    /// `x0`..`x23`: the slot, never reused within a VM.
+    pub slot: String,
+    /// Only `dedicated` exists.
+    pub kind: String,
+    /// The declared `/dev/disk/by-id/` basename.
+    pub disk_id: String,
 }
 
 /// What the agent does when a tenant guest powers itself off — the
@@ -1312,6 +1340,7 @@ impl MigrateActivateOrder {
             // The arrival recorded its pool before writing (`place_arriving`):
             // the launch reads the record, not this.
             os_pool: self.os_pool,
+            extra_disks: Vec::new(),
         }
     }
 }
@@ -1347,6 +1376,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         };
         assert_eq!(order.vm_id().as_str(), "tenant-1");
     }
@@ -1374,6 +1404,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         };
         let encode = |o: &LaunchOrder| {
             let mut buf = Vec::new();
@@ -1947,6 +1978,7 @@ mod tests {
             net: None,
             on_guest_poweroff: None,
             os_pool: None,
+            extra_disks: Vec::new(),
         }
     }
 

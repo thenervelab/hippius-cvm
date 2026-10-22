@@ -45,6 +45,9 @@ ROW_KEYS = {
     "launch_fail_streak",
     "recent_launch_errors",
     "agent_version",
+    "latest_agent_release",
+    "update_pending",
+    "auto_update",
     "last_probe",
 }
 
@@ -251,6 +254,9 @@ def test_full_row_for_a_healthy_node(operator_client: APIClient) -> None:
         "launch_fail_streak": 0,
         "recent_launch_errors": [],
         "agent_version": None,
+        "latest_agent_release": None,
+        "update_pending": None,
+        "auto_update": None,
         "last_probe": None,
     }
 
@@ -1020,3 +1026,213 @@ def test_schema_publishes_last_probe() -> None:
     assert "last_probe" in node["properties"]
     assert "last_probe" not in node.get("required", [])
     assert set(comps["OperatorLastProbe"]["properties"]) == {"at", "ok", "stage", "vm_id"}
+
+
+# ─── agent release, update pending, auto-update ──────────────────────
+
+
+def _release(tag: str, *, ready_hours_ago: float, published_hours_ago: float | None = None):
+    from apps.miners.models import AgentRelease
+
+    now = timezone.now()
+    published = now - timedelta(hours=published_hours_ago or ready_hours_ago)
+    return AgentRelease.objects.create(
+        tag=tag,
+        published_at=published,
+        ready_at=now - timedelta(hours=ready_hours_ago),
+        seen_at=now,
+    )
+
+
+def _agent(seed: int, version: str | None) -> None:
+    MinerCapacity.objects.create(
+        miner_node_id=node_id(seed),
+        status="active",
+        capacity_slots=6,
+        observed_epoch=10,
+        data_epoch=10,
+        refreshed_at=timezone.now(),
+        agent_version=version or "",
+    )
+
+
+def _software(seed: int, auto_update: dict | None, *, reported_at=None) -> None:
+    from apps.disktier.models import HostInventorySection
+
+    body: dict = {"status": "ok", "uptime_s": 5}
+    if auto_update is not None:
+        body["auto_update"] = auto_update
+    at = reported_at or timezone.now()
+    HostInventorySection.objects.create(
+        miner_node_id=node_id(seed),
+        section="software",
+        digest="0" * 64,
+        body=body,
+        status="ok",
+        reported_at=at,
+        sequence=1,
+        received_at=at,
+    )
+
+
+def test_latest_release_is_the_newest_complete_one_with_its_eligibility() -> None:
+    """Claim: `latest_agent_release` is the highest tag vali stored (tag
+    order, not publication order), eligible = ready + the 24 h soak."""
+    older = _release("v2026.10.20", ready_hours_ago=72)
+    newest = _release("v2026.10.21.2", ready_hours_ago=2, published_hours_ago=3)
+    # Published later but a lower tag: never "latest".
+    _release("v2026.10.21.1", ready_hours_ago=1)
+    from apps.miners.agent_release import release_view
+
+    view = release_view(now=timezone.now())
+    assert view.latest == {
+        "tag": "v2026.10.21.2",
+        "published_at": newest.published_at.isoformat(),
+        "eligible_at": (newest.ready_at + timedelta(hours=24)).isoformat(),
+    }
+    assert older.tag != view.latest["tag"]
+
+
+def test_update_pending_compares_with_the_newest_eligible_release(
+    operator_client: APIClient,
+) -> None:
+    """Claims: pending = running tag < newest release past the soak; a
+    newer release still soaking does not count; equal or newer is not
+    pending; an unknown running tag is `null`."""
+    _release("v2026.10.18", ready_hours_ago=100)
+    _release("v2026.10.20.1", ready_hours_ago=30)  # eligible
+    _release("v2026.10.21", ready_hours_ago=5)  # soaking
+    versions = {
+        1: "v2026.10.18",  # behind the eligible one
+        2: "v2026.10.20.1",  # at the eligible one (the soaking one is ignored)
+        3: "v2026.10.21",  # ahead
+        4: "dev",  # not a release
+        5: None,  # never reported
+        6: "v2026.10.20",  # .1 is newer than the bare date
+    }
+    for seed, version in versions.items():
+        make_dispatchable_identity(seed)
+        _agent(seed, version)
+    rows = {r["node_id"]: r for r in _get(operator_client, *map(node_id, versions)).json()["nodes"]}
+    pending = {seed: rows[node_id(seed)]["update_pending"] for seed in versions}
+    assert pending == {1: True, 2: False, 3: False, 4: None, 5: None, 6: True}
+    assert all(r["latest_agent_release"]["tag"] == "v2026.10.21" for r in rows.values())
+
+
+def test_update_pending_is_false_when_nothing_is_eligible_yet(
+    operator_client: APIClient,
+) -> None:
+    make_dispatchable_identity(1)
+    _agent(1, "v2026.10.01")
+    _release("v2026.10.21", ready_hours_ago=1)
+    row = _get(operator_client, node_id(1)).json()["nodes"][0]
+    assert row["update_pending"] is False
+    assert row["latest_agent_release"]["tag"] == "v2026.10.21"
+
+
+@override_settings(VALI_AGENT_RELEASE_SOAK_H=0)
+def test_the_soak_follows_the_setting(operator_client: APIClient) -> None:
+    make_dispatchable_identity(1)
+    _agent(1, "v2026.10.01")
+    rel = _release("v2026.10.21", ready_hours_ago=0.01)
+    row = _get(operator_client, node_id(1)).json()["nodes"][0]
+    assert row["update_pending"] is True
+    assert row["latest_agent_release"]["eligible_at"] == rel.ready_at.isoformat()
+
+
+def test_auto_update_is_the_nodes_own_report(operator_client: APIClient) -> None:
+    """Claim: `auto_update` passes the software section's block through
+    (unix → ISO), per node, `null` without one."""
+    reported = timezone.now() - timedelta(hours=2)
+    for seed in (1, 2, 3, 4):
+        make_dispatchable_identity(seed)
+    _software(
+        1,
+        {
+            "enabled": False,
+            "disabled_reason": "no_auto_update_file",
+            "last_check_unix": 1_792_200_000,
+            "failed_tag": "v2026.10.21.1",
+        },
+        reported_at=reported,
+    )
+    _software(2, {"enabled": True})
+    _software(3, None)  # a collector without --report-auto-update
+    rows = {
+        r["node_id"]: r
+        for r in _get(operator_client, *(node_id(s) for s in (1, 2, 3, 4))).json()["nodes"]
+    }
+    assert rows[node_id(1)]["auto_update"] == {
+        "enabled": False,
+        "disabled_reason": "no_auto_update_file",
+        "last_check_at": "2026-10-17T01:20:00+00:00",
+        "failed_tag": "v2026.10.21.1",
+        "reported_at": reported.isoformat(),
+    }
+    assert rows[node_id(2)]["auto_update"]["enabled"] is True
+    assert rows[node_id(2)]["auto_update"]["disabled_reason"] is None
+    assert rows[node_id(2)]["auto_update"]["last_check_at"] is None
+    assert rows[node_id(2)]["auto_update"]["failed_tag"] is None
+    assert rows[node_id(3)]["auto_update"] is None
+    assert rows[node_id(4)]["auto_update"] is None
+
+
+def test_an_impossible_last_check_never_fails_the_request(operator_client: APIClient) -> None:
+    """Claim: an untrusted out-of-calendar time is dropped for that node,
+    and every other row is still served (one node must not 500 the list)."""
+    for seed in (1, 2, 3):
+        make_dispatchable_identity(seed)
+    _software(1, {"enabled": True, "last_check_unix": 10**12})
+    _software(2, {"enabled": True, "last_check_unix": 2**63 - 1})
+    _software(3, {"enabled": True, "last_check_unix": 1_792_200_000})
+    resp = _get(operator_client, node_id(1), node_id(2), node_id(3))
+    assert resp.status_code == 200, resp.content
+    rows = {r["node_id"]: r for r in resp.json()["nodes"]}
+    assert rows[node_id(1)]["auto_update"]["last_check_at"] is None
+    assert rows[node_id(2)]["auto_update"]["last_check_at"] is None
+    assert rows[node_id(3)]["auto_update"]["last_check_at"] == "2026-10-17T01:20:00+00:00"
+
+
+def test_release_and_auto_update_cost_flat_queries(operator_client: APIClient) -> None:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    _release("v2026.10.20", ready_hours_ago=30)
+    make_dispatchable_identity(1)
+    _agent(1, "v2026.10.18")
+    _software(1, {"enabled": True})
+    with CaptureQueriesContext(connection) as one:
+        _get(operator_client, node_id(1))
+    for seed in range(2, 6):
+        make_dispatchable_identity(seed)
+        _agent(seed, "v2026.10.18")
+        _software(seed, {"enabled": True})
+    with CaptureQueriesContext(connection) as five:
+        body = _get(operator_client, *(node_id(s) for s in range(1, 6))).json()
+    assert all(r["update_pending"] is True for r in body["nodes"])
+    assert all(r["auto_update"]["enabled"] for r in body["nodes"])
+    assert len(five) == len(one), (len(one), len(five))
+
+
+def test_schema_publishes_the_release_and_auto_update_shapes() -> None:
+    from drf_spectacular.generators import SchemaGenerator
+
+    comps = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+    node = comps["OperatorNode"]
+    for key in ("latest_agent_release", "update_pending", "auto_update"):
+        assert key in node["properties"]
+        assert key not in node.get("required", [])  # optional during the rollout
+    assert set(comps["AgentRelease"]["properties"]) == {"tag", "published_at", "eligible_at"}
+    au = comps["AutoUpdate"]
+    assert set(au["properties"]) == {
+        "enabled",
+        "disabled_reason",
+        "last_check_at",
+        "failed_tag",
+        "reported_at",
+    }
+    assert set(_enum(comps, au["properties"]["disabled_reason"])) >= {
+        "no_auto_update_file",
+        "disabled_in_env",
+        "timer_disabled",
+    }
