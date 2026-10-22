@@ -317,8 +317,8 @@ data:
   VALI_EPOCH_WEIGHT_SOURCE: {{ .Values.epochWeightSource | default "snapshot" | quote }}
   # §23 — VM owners (the launch spec's `user_id`, recorded as
   # `Placement.owner`) whose usage earns NO reward weight and NO bill:
-  # the operator's OWN infrastructure, which would otherwise dilute the
-  # reward pot away from honest miners. The synthetic monitor's own tenant
+  # OUR OWN infrastructure. Measured live 2026-08-11, operator VMs held
+  # 30.6 % of the reward pot. The synthetic monitor's own tenant
   # (`VALI_SYNTHETIC_TENANT_ID`) is excluded by construction and does NOT
   # need to be listed here — this is for the OTHER operator identities
   # (rehearsals, proofs). Empty ⇒ only the synthetic tenant is excluded.
@@ -419,6 +419,15 @@ data:
   # metrics are pushed to. Every other VALI_SYNTHETIC_* knob keeps its
   # settings.py default.
   VALI_SYNTHETIC_PUSHGATEWAY_URL: {{ .Values.config.syntheticPushgatewayUrl | quote }}
+  {{- if .Values.syntheticMonitor.perMiner.enabled }}
+  # Per-miner probe (apps.synthetic.per_miner) — see values.yaml
+  # `syntheticMonitor.perMiner`. Rendered only when enabled, so the off
+  # state leaves the ConfigMap (and every pod's config checksum) untouched;
+  # absent, the code default is off.
+  VALI_SYNTHETIC_PER_MINER: "true"
+  VALI_SYNTHETIC_PER_MINER_MAX_CONCURRENT: {{ .Values.syntheticMonitor.perMiner.maxConcurrent | toString | quote }}
+  VALI_SYNTHETIC_PER_MINER_MINERS: {{ .Values.syntheticMonitor.perMiner.miners | default "" | quote }}
+  {{- end }}
   {{- if .Values.tenantBake.cache.enabled }}
   # Stage-1 bake cache PVC (perf) — bake Jobs mount this at /cache
   # and reuse the tenant-independent half of the bake across bakes.

@@ -1,6 +1,6 @@
 # Design: Unified vali control-plane API ("everything through the API")
 
-**Status:** ✅ Implemented + deployed + live-verified (2026-06-30) — see §12 · **Date:** 2026-06-30
+**Status:** ✅ Implemented + deployed + live-verified (2026-06-30) — see §12 · **Author:** Codex · **Date:** 2026-06-30
 
 ## 1. Goal & principles
 
@@ -488,6 +488,11 @@ report. Nothing is declared by a miner.
   last accepted launch) and `recent_launch_errors` (newest first, max 5).
   `code` is the agent's `x-hippius-reason` (the failing step's static
   `MinerAgentError` code), else the body class; recording only, never placement.
+- `GET /v1/operator/nodes` rows also carry `last_probe {at, ok, stage, vm_id}|null`:
+  vali's last per-miner synthetic probe that reached the node
+  (`apps.synthetic.per_miner`, behind `VALI_SYNTHETIC_PER_MINER`). `stage` is the
+  stage that failed (`null` on a pass; `resources` = the guest attested less than
+  its flavor). Observability only; the probe's launch counts like any launch.
 - `POST /v1/vm/launch` accepts an optional `region` (ISO 3166-1 alpha-2,
   case-insensitive). Hard constraint: only miners whose detected location is
   `verified` in that country are candidates; none ⇒ 409 `no-miner-in-region`.

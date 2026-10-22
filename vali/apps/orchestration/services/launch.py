@@ -736,6 +736,10 @@ class LaunchSpec:
     # another one. Drives placement (gate (n), the pool choice) and the
     # billing binding; never measured.
     os_disk_tier: str = ""
+    # The authenticated launch purpose (`orchestration.launch_purpose`):
+    # stamped on every `Placement` this launch writes, never sent to the
+    # miner. Written into `spec_json` only when set.
+    purpose: str = ""
 
 
 @dataclass
@@ -2215,7 +2219,7 @@ def launch_on_miner(
     # path. `spec.rootfs_data_path` defaults to
     # `/var/lib/hippius-miner/rootfs.img`: fixed, shared and MUTABLE. On
     # 2026-08-13 that one path was a symlink into the shared legacy base
-    # on one host and a real 709 MB 2026-07-29 file on another — the same
+    # on miner-2 and a real 709 MB 2026-07-29 file on miner-3 — the same
     # spec resolving to two different operating systems. Falling back to
     # it made the divergence invisible AND aimed the launch at bytes some
     # other VM may be booting. There is nothing to fall back TO: the
@@ -2394,7 +2398,7 @@ def launch_on_miner(
     # fresh LaunchJob or CLI retry for the same `vm_id` on a different
     # miner, after an operator clears the KBS registration, which is the
     # documented recovery for exactly that outcome (and the path that
-    # produced `vm-migrate-1`).
+    # produced `migproof-1`).
     #
     # A rejected dispatch that nonetheless left a domain up is covered
     # instead by `effects.destroy_target_miner_id`, which reads the
@@ -2938,6 +2942,7 @@ def _place_and_launch(
                     vm=vm,
                     vm_family=spec.tenant_id,
                     owner=spec.user_id,
+                    purpose=spec.purpose,
                     resource_class=spec.flavor,
                     miner_node_id=node_id,
                     status=PlacementStatus.PENDING.value,
@@ -3303,6 +3308,7 @@ def launch_on_named_miner(
                 vm=vm,
                 vm_family=spec.tenant_id,
                 owner=spec.user_id,
+                purpose=spec.purpose,
                 resource_class=spec.flavor,
                 miner_node_id=node_id,
                 status=PlacementStatus.PENDING.value,

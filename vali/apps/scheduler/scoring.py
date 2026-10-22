@@ -173,11 +173,11 @@ def _excluded_owners() -> frozenset[str]:
     OUR OWN infrastructure, not tenants.
 
     **Why this exists.** With `VALI_EPOCH_WEIGHT_SOURCE=usage` the ledger
-    IS the reward. Without this filter an operator VM could hold a large
-    share of the epoch's units: a single dead synthetic-monitor probe
-    (destroyed days earlier) can keep carrying a large slice of the
-    epoch's unit_seconds on its own, because a suspended closer never
-    rolls the bucket over. Paying ourselves out of the miner
+    IS the reward. Measured live on 2026-08-11 (chain epoch 2702), our own
+    operator VMs held 30.6 % of the whole pot: one dead synthetic-monitor
+    probe (`synmon-debian-1785751760`, destroyed five days earlier) alone
+    carried 400,974,150 of 1,322,247,180 unit_seconds, because a suspended
+    closer never rolls the bucket over. Paying ourselves out of the miner
     reward pot is a straight dilution of every honest miner.
 
     **The discriminator is `Placement.owner`, not `UsageAccrual.lease_id`.**
@@ -193,12 +193,12 @@ def _excluded_owners() -> frozenset[str]:
       again). `owner` comes from the launch spec, the same
       `VALI_SYNTHETIC_TENANT_ID` the synthetic reaper already keys its
       "never touch a real tenant" invariant on.
-    - It covers MORE of the operator rows for LESS configuration. Operator
-      lease ids come in several shapes (`synmon-*`, a one-off harness's
-      own lease, an ordinary-looking lease id); a lease filter needs a
-      separate pattern for each, while an ordinary-looking lease that
-      carries `owner="synthetic-monitor"` is caught for free — a couple of
-      configured owners cover every operator row.
+    - It covers MORE of the live rows for LESS configuration. The three
+      live operator lease shapes are `synmon-*` (31 rows), `kbsrehearse-1`
+      and `stampproof-1-lease`; a lease filter needs three separate
+      patterns, while `stampproof-1-lease` already carries
+      `owner="synthetic-monitor"` and is caught for free — two configured
+      owners cover all 33 rows.
 
     **Neither field is authenticated, and that is load-bearing.** `owner`
     is `spec.user_id` copied straight out of the launch body
@@ -242,7 +242,8 @@ def _excluded_owners() -> frozenset[str]:
 
 
 def _excluded_vm_ids() -> frozenset[str]:
-    """`vm_id`s that vali placed on behalf of an excluded owner.
+    """`vm_id`s that are OURS: placed on behalf of an excluded owner, or
+    launched / placed with a `purpose`.
 
     `UsageAccrual` carries no owner (only `lease_id` / `vm_id` /
     `miner_node_id`), so the ownership fact lives one join away on
@@ -255,10 +256,17 @@ def _excluded_vm_ids() -> frozenset[str]:
     might keep paying for one of our own rows, never that a tenant's
     miner silently loses an epoch of reward.
     """
+    from apps.orchestration.launch_purpose import purpose_vm_ids
+
+    # Two independent keys, either suffices: the owner (config list) and
+    # the launch's authenticated `purpose` (`orchestration.launch_purpose`)
+    # — so a probe whose `user_id` drifts from the owner list still earns
+    # nothing.
+    by_purpose = purpose_vm_ids()
     owners = _excluded_owners()
     if not owners:
-        return frozenset()
-    return frozenset(
+        return by_purpose
+    return by_purpose | frozenset(
         Placement.objects.filter(owner__in=owners)
         .values_list("vm__vm_id", flat=True)
         .distinct()
@@ -318,8 +326,10 @@ def _snapshot_weights() -> dict[str, int]:
     are payable, or flipping `VALI_EPOCH_WEIGHT_SOURCE` back to `snapshot`
     would quietly re-open the skim.
     """
+    from apps.orchestration.launch_purpose import exclude_purpose
+
     weights: dict[str, int] = {}
-    query = Placement.objects.filter(status=PlacementStatus.BOUND.value)
+    query = exclude_purpose(Placement.objects.filter(status=PlacementStatus.BOUND.value))
     owners = _excluded_owners()
     if owners:
         query = query.exclude(owner__in=owners)
@@ -360,11 +370,11 @@ def billing_epoch() -> int | None:
     while the chain epoch keeps advancing, so the SAME bucket is handed
     to every subsequent close and paid again each time.
 
-    It is not hypothetical. In production the ledger once held exactly
-    one row for an older epoch N and the closer logged the same
-    `vali weights: 1 miner(s), total ...` on three consecutive closes —
-    one bucket of proven uptime submitted as the weights of chain epochs
-    N+4, N+5 and N+6.
+    It is not hypothetical. In production on 2026-08-03 the ledger held
+    exactly one row for epoch 2696 (100170 unit_seconds) and the closer
+    logged `vali weights: 1 miner(s), total 100170` at 06:40, 06:50 AND
+    07:20 — one bucket of proven uptime submitted as the weights of chain
+    epochs 2700, 2701 and 2702.
 
     Keying on the chain epoch makes a stalled ledger fail CLOSED instead:
     the close reads the new epoch's bucket, finds it empty, and submits
@@ -432,8 +442,8 @@ def compute_owed_micro_usd(price_by_node: dict[str, int]) -> dict[str, int]:
 
     **Operator-owned VMs are excluded here too** (see [`_excluded_owners`]),
     for the same reason the epochs must match: this readout is the direct
-    answer an operator gets to "how much do we owe each miner", and a
-    large share of it could otherwise be the cost of our own monitoring. Two defensible
+    answer an operator gets to "how much do we owe each miner", and 30.6 %
+    of it was, live, the cost of our own monitoring. Two defensible
     positions existed — a miner really did burn CPU hosting our probe, so
     one could argue we owe for it — and this one is chosen because the
     readout's stated purpose is the miner payout, and a bill that says a

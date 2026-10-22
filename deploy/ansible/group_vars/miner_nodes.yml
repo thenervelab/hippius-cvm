@@ -30,7 +30,7 @@
 #
 #   25.10  libvirt 11.6 / QEMU 10.1 / kernel 6.17 — older hosts.
 #          End of life since 2026-07; do not provision new hosts on it.
-#   26.04  libvirt 12.0 / QEMU 10.2 / kernel 7.0 — validated on Genoa and
+#   26.04  libvirt 12.0 / QEMU 10.2 / kernel 7.0 — the Milan host
 #          Milan, including in-place upgrades from 24.04.
 #
 # 24.04 is NOT supported: it ships libvirt 10.0 / QEMU 8.2, which boot
@@ -86,7 +86,7 @@ versions:
 # ── Network — NetBird mesh, no vRack ────────────────────────────────
 network:
   # The existing NetBird group for miners (dashboard id
-  # <miner-group-id>). The setup key the operator creates must be
+  # d85j0vr36cos73atf2mg). The setup key the operator creates must be
   # bound to this group; the agent inherits it on join.
   netbird_group: "miner"
   # Miners have a public IP only — they are NOT in the hippius-compute
@@ -304,8 +304,9 @@ miner_cosign:
 # ── Host inventory (§18.10) ─────────────────────────────────────────
 # The collector units (`hippius-host-inventory@{full,counters,kernel}`)
 # and their timers are always installed; the timers run, and the agent's
-# `[inventory] enabled` posts the report, only when this is true. OFF by
-# default: vali and the Edge must accept the report first.
+# `[inventory] enabled` posts the report, only when this is true. ON by
+# default: the collector only reads (lsblk, smartctl, sensors) and vali
+# ingests the report; set false to opt out.
 #
 # `--tags miner_inventory` applies the collector side alone: the tools
 # (play 02) and the units, starting or stopping the timers (play 05). It
@@ -313,7 +314,7 @@ miner_cosign:
 # derives), so the agent's `[inventory]` (the poster) changes only with a
 # full play-05 run — and takes effect only at the agent's next restart
 # (the SIGKILL swap, or an auto-update): the play never restarts the agent.
-miner_inventory_enabled: false
+miner_inventory_enabled: true
 
 # Local in-band IPMI (sensors' power supplies, the BMC firmware):
 # ipmitool is installed, and ipmi_devintf loaded (now and at boot, for
@@ -434,7 +435,7 @@ edge_order_signing_pubkey: "075f1bf8d7a62bbb21f7faab14d8c414c2aace842b1ca99ebadf
 # takes min(derived, override), so a value above the derivation is
 # ignored — never an overcommit.
 host_cvm:
-  # 2:1 vCPU:thread is the default; RAM 1:1.
+  # 2:1 vCPU:thread is the fleet default (approved 2026-09-27); RAM 1:1.
   cpu_ratio_pct: 200
   reserve_cpus: 2
   reserve_memory_mb: 8192
@@ -449,7 +450,8 @@ miner_heartbeat_schema_capacity: true
 
 # Storage-aware placement — v4 heartbeat (v3 + the declared disk budget and
 # a statvfs of the data/staging filesystems, down-only clamps for vali).
-# vali accepts v4 since #1353; agents from #1344 on know the key. An agent older than
+# vali accepts v4 since the sha-f34a12444a3d pin (#1353), and all five
+# miners run the #1344 agent with it on (2026-09-30). An agent older than
 # #1344 refuses the key (`deny_unknown_fields`) and will not start: set
 # this false in host_vars for such a host until its agent is upgraded.
 miner_heartbeat_schema_disk: true
@@ -554,7 +556,7 @@ mtls:
 # The NetBird setup key is read from the operator workstation at run
 # time; it is never written to the repo or copied to a managed host.
 operator_secret_dir: "{{ lookup('env', 'HOME') }}/.config/hippius"
-netbird_setup_key_file: "netbird-miner-setupkey"
+netbird_setup_key_file: "netbird-miner-1-setupkey"
 
 # ── EXPLICITLY NOT SET for miner_nodes (asserted absent at preflight) ─
 #   - vault_addr        miners never reach the hippius-compute Vault

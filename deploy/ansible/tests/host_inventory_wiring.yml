@@ -30,13 +30,14 @@
         state: directory
       register: scratch
 
-    - name: The group default is off
+    - name: The group default is on
       ansible.builtin.assert:
         that:
-          - not (miner_inventory_enabled | bool)
+          - miner_inventory_enabled | bool
 
-    - name: Render with the default (off)
+    - name: Render switched off
       vars:
+        miner_inventory_enabled: false
         miner_inventory_unit_dir: "{{ scratch.path }}"
       ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory.yml
 

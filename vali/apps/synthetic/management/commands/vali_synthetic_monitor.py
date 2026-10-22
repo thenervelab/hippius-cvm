@@ -2,10 +2,13 @@
 
     python manage.py vali_synthetic_monitor --tier light
     python manage.py vali_synthetic_monitor --tier full [--distro ubuntu]
+    python manage.py vali_synthetic_monitor --tier per-miner
 
-Two tiers (see `apps.synthetic`): `light` is read-only fleet health;
+Three tiers (see `apps.synthetic`): `light` is read-only fleet health;
 `full` launches a THROWAWAY golden VM through the real public API and
-ALWAYS decommissions it. Both push result metrics to the Pushgateway;
+ALWAYS decommissions it; `per-miner` runs the same probe pinned to the
+next miner of a round-robin (`apps.synthetic.per_miner`, behind
+`VALI_SYNTHETIC_PER_MINER`). All push result metrics to the Pushgateway;
 the `synthetic-monitor` PrometheusRule alerts on `success==0`/staleness
 and routes to the Alertmanager Slack receiver.
 
@@ -26,7 +29,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from apps.synthetic import ack, checks, e2e, metrics
+from apps.synthetic import ack, checks, e2e, metrics, per_miner
 
 log = logging.getLogger("apps.synthetic.command")
 
@@ -46,12 +49,16 @@ _E2E_STAGES = (
     "crypto_erase",
 )
 
+# The per-miner probe's stages: the full tier's, plus `resources` (the
+# guest's attested vCPUs/RAM against its flavor) when it is checked.
+_PER_MINER_STAGES = (*_E2E_STAGES[:5], "resources", *_E2E_STAGES[5:])
+
 
 class Command(BaseCommand):
     help = "Synthetic monitor — light (read-only health) or full (e2e VM probe)."
 
     def add_arguments(self, parser: Any) -> None:
-        parser.add_argument("--tier", required=True, choices=["light", "full"])
+        parser.add_argument("--tier", required=True, choices=["light", "full", "per-miner"])
         parser.add_argument(
             "--distro",
             default="",
@@ -69,6 +76,8 @@ class Command(BaseCommand):
     def handle(self, *args: Any, **opts: Any) -> None:
         if opts["tier"] == "light":
             success, payload = self._run_light(opts)
+        elif opts["tier"] == "per-miner":
+            success, payload = self._run_per_miner(opts)
         else:
             success, payload = self._run_full(opts)
 
@@ -238,11 +247,7 @@ class Command(BaseCommand):
     def _run_full(self, opts: dict) -> tuple[bool, dict]:
         distro = opts["distro"] or e2e.distro_for(time.time())
         try:
-            api = e2e.ApiClient(
-                base=settings.VALI_SYNTHETIC_API_BASE,
-                token=settings.VALI_SYNTHETIC_ROOT_TOKEN,
-                timeout_s=float(settings.VALI_SYNTHETIC_HTTP_TIMEOUT_S),
-            )
+            api = _api_client()
         except e2e.ConfigError as exc:
             # Mis-config is a failure we still want to alert on — push a 0.
             log.error("synthetic full tier mis-configured: %s", exc)
@@ -318,6 +323,167 @@ class Command(BaseCommand):
         )
         return outcome.success, payload
 
+    # ── per-miner tier ───────────────────────────────────────────────
+
+    def _run_per_miner(self, opts: dict) -> tuple[bool, dict]:
+        if not per_miner.enabled():
+            # Off: launch nothing, push nothing (no series appears until the
+            # flag is on, so no alert can fire on an unused tier).
+            log.info("synthetic per-miner tier: VALI_SYNTHETIC_PER_MINER is off")
+            return True, {"tier": "per-miner", "enabled": False}
+
+        from apps.telemetry import guest_resources
+
+        report = per_miner.tick(api_factory=_api_client)
+        if report.error:
+            log.error("synthetic per-miner tier mis-configured: %s", report.error)
+        outcome = report.outcome
+        claim = report.claim
+        conclusive = report.verdict in (per_miner.VERDICT_OK, per_miner.VERDICT_FAILED)
+        if claim is not None and outcome is not None and conclusive:
+            self._push_per_miner_run(
+                opts,
+                claim.view.miner_id,
+                outcome,
+                resources_checked=guest_resources.attest_on_launch(),
+            )
+        rows = per_miner.fleet_readout(now=timezone.now())
+        self._push_per_miner_fleet(opts, rows, report)
+
+        success = not report.error and report.verdict != per_miner.VERDICT_FAILED
+        payload: dict[str, Any] = {
+            "tier": "per-miner",
+            "enabled": True,
+            "error": report.error,
+            "universe": report.universe,
+            "in_flight": report.in_flight,
+            "due": report.due,
+            "skipped": dict(sorted(report.skipped.items())),
+            "verdict": report.verdict,
+        }
+        if claim is not None:
+            payload.update(miner_id=claim.view.miner_id, node_id=claim.view.node_id)
+            payload["vm_id"] = claim.vm_id
+        if outcome is not None:
+            payload.update(
+                success=outcome.success,
+                teardown_detail=outcome.teardown_detail,
+                teardown_forced=outcome.teardown_forced,
+                stages=[
+                    {
+                        "name": st.name,
+                        "ok": st.ok,
+                        "duration_s": round(st.duration_s, 2),
+                        "detail": st.detail,
+                    }
+                    for st in outcome.stages
+                ],
+            )
+        log.info(
+            "synthetic per-miner miner=%s vm=%s verdict=%s skipped=%s",
+            claim.view.miner_id if claim else "-",
+            claim.vm_id if claim else "-",
+            report.verdict or "-",
+            dict(report.skipped),
+        )
+        return success, payload
+
+    def _push_per_miner_run(
+        self,
+        opts: dict,
+        miner_id: str,
+        outcome: e2e.E2EOutcome,
+        *,
+        resources_checked: bool,
+    ) -> None:
+        ms = metrics.MetricSet()
+        ms.gauge(
+            metrics.M_PM_SUCCESS,
+            1 if outcome.success else 0,
+            help_text="1 if the last per-miner probe of this miner passed every stage.",
+        )
+        by_stage = {st.name: st for st in outcome.stages}
+        for name in _PER_MINER_STAGES:
+            if name == "resources" and not resources_checked:
+                continue
+            st = by_stage.get(name)
+            ms.gauge(
+                metrics.M_PM_STAGE_SUCCESS,
+                1 if (st and st.ok) else 0,
+                help_text="Per-stage pass/fail of the last per-miner probe.",
+                stage=name,
+            )
+            ms.gauge(
+                metrics.M_PM_DURATION,
+                st.duration_s if st else 0.0,
+                help_text="Per-stage duration of the last per-miner probe (seconds).",
+                stage=name,
+            )
+        ms.gauge(
+            metrics.M_TEARDOWN_FORCED,
+            1 if outcome.teardown_forced else 0,
+            help_text="1 if the in-process force-teardown fallback had to run (alertable).",
+        )
+        ms.gauge(metrics.M_RUN_TIMESTAMP, metrics.now())
+        if outcome.success:
+            ms.gauge(
+                metrics.M_PM_LAST_SUCCESS_TS,
+                metrics.now(),
+                help_text="Unix ts of the last passing per-miner probe of this miner.",
+            )
+        self._push(
+            opts,
+            ms,
+            grouping_key={"tier": "per-miner", "miner": miner_id},
+            replace=outcome.success,
+        )
+
+    def _push_per_miner_fleet(
+        self, opts: dict, rows: list[per_miner.FleetRow], report: per_miner.TickReport
+    ) -> None:
+        ms = metrics.MetricSet()
+        for row in rows:
+            v = row.view
+            ms.gauge(
+                metrics.M_PM_LAST_PROBE_TS,
+                v.last_probe_at.timestamp() if v.last_probe_at else 0,
+                help_text="Unix ts of the last probe that reached the miner (0 = never).",
+                miner=v.miner_id,
+            )
+            ms.gauge(
+                metrics.M_PM_FAIL_STREAK,
+                row.fail_streak,
+                help_text="Failed per-miner probes of the miner since its last pass.",
+                miner=v.miner_id,
+            )
+            if v.blocked:
+                ms.gauge(
+                    metrics.M_PM_BLOCKED,
+                    1,
+                    help_text="1 while the miner cannot be probed now, labelled with why.",
+                    miner=v.miner_id,
+                    reason=v.blocked,
+                )
+        ms.gauge(
+            metrics.M_PM_UNIVERSE,
+            len(rows),
+            help_text="Miners the per-miner probe covers (dispatchable, canary-filtered).",
+        )
+        ms.gauge(
+            metrics.M_PM_IN_FLIGHT,
+            sum(1 for r in rows if r.view.blocked == per_miner.BLOCKED_BUSY),
+            help_text="Per-miner probe VMs in flight.",
+        )
+        ms.gauge(
+            "hippius_synthetic_per_miner_config_error",
+            1 if report.error else 0,
+            help_text="1 if the per-miner tier refused to run (mis-configured).",
+        )
+        ms.gauge(metrics.M_RUN_TIMESTAMP, metrics.now())
+        # PUT: the readout is complete every run, so a miner that left the
+        # universe drops out instead of lingering at its last value.
+        self._push(opts, ms, grouping_key={"tier": "per-miner-fleet"}, replace=True)
+
     def _push_e2e_failure(self, opts: dict, distro: str, *, detail: str) -> None:
         ms = metrics.MetricSet()
         ms.gauge(metrics.M_E2E_SUCCESS, 0, help_text="1 if the full e2e passed.")
@@ -338,3 +504,13 @@ class Command(BaseCommand):
             replace=replace,
             timeout_s=float(settings.VALI_SYNTHETIC_HTTP_TIMEOUT_S),
         )
+
+
+def _api_client() -> e2e.ApiClient:
+    """The orchestration-root client the full and per-miner tiers drive the
+    real launch / §24 API with. Raises `e2e.ConfigError` without a token."""
+    return e2e.ApiClient(
+        base=settings.VALI_SYNTHETIC_API_BASE,
+        token=settings.VALI_SYNTHETIC_ROOT_TOKEN,
+        timeout_s=float(settings.VALI_SYNTHETIC_HTTP_TIMEOUT_S),
+    )

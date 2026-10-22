@@ -45,8 +45,24 @@ chmod 0644 "${T}"/*
 
 [[ "$#" -gt 0 ]] || set -- mirror.gcr.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 mirror.gcr.io/library/debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 quay.io/centos/centos:stream10 mirror.gcr.io/library/fedora:43@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
 rc=0
+# CentOS Stream 10 images from 2026-10-20 on are built for x86-64-v3 and
+# die at exec ("Fatal glibc error: CPU does not support x86-64-v3") on a
+# runner without AVX2/BMI2/FMA/MOVBE; quay garbage-collects the older
+# manifests, so the leg cannot be pinned back. Skip it, loudly, on such a
+# host: the tenant images themselves only ever boot on EPYC (v3 and up).
+x86_64_v3() {
+    local flags
+    flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null)"
+    for f in avx2 bmi2 fma movbe; do
+        [[ " ${flags} " == *" ${f} "* ]] || return 1
+    done
+}
 for image in "$@"; do
     echo "== ${image}"
+    if [[ "${image}" == *centos*stream10* ]] && ! x86_64_v3; then
+        echo "${NAME}: SKIP ${image} — this CPU lacks x86-64-v3, which CentOS Stream 10 now requires"
+        continue
+    fi
     docker run --rm -v "${GUEST}:/sshd-key-only-guest.sh:ro" -v "${T}:/t:ro" "${image}" \
         bash /sshd-key-only-guest.sh || rc=1
 done

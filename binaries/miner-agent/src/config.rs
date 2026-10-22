@@ -345,11 +345,14 @@ pub struct HostSection {
     /// restarts. This makes an agent restart/upgrade transparent to
     /// tenants instead of tearing every VM down.
     ///
-    /// Default `false` preserves the historical "stop every CVM on
-    /// shutdown" behaviour. Startup re-adoption (`readopt_running`)
-    /// restores tracking of the CVMs left running, so every deployed
-    /// miner sets this — the Ansible template renders it `true`.
-    #[serde(default)]
+    /// Default `true`: an absent key leaves the CVMs running. The old
+    /// `false` default destroyed every domain on the host (tenants +
+    /// host-attestor) on a plain `systemctl stop` whenever a hand-written
+    /// config lacked the key (2026-09-21). Startup re-adoption
+    /// (`readopt_running`) restores tracking of the CVMs left running.
+    /// An explicit `false` still opts in to the teardown; `serve` logs a
+    /// WARNING at startup when it does.
+    #[serde(default = "default_skip_shutdown_teardown")]
     pub skip_shutdown_teardown: bool,
 }
 
@@ -430,6 +433,10 @@ impl Default for HeartbeatSection {
             emit_pools: false,
         }
     }
+}
+
+fn default_skip_shutdown_teardown() -> bool {
+    true
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -1376,16 +1383,26 @@ cvm_memory_mb_budget = 16384
     }
 
     #[test]
-    fn skip_shutdown_teardown_defaults_false_and_parses_true() {
-        // Omitted → false: the historical "stop every CVM on graceful
-        // shutdown" behaviour is preserved unless the operator opts in.
+    fn skip_shutdown_teardown_absent_key_leaves_cvms_running() {
+        // Omitted → true: a hand-written config that forgets the key must
+        // not destroy every domain on the next `systemctl stop`
+        // (2026-09-21).
+        assert!(!VALID.contains("skip_shutdown_teardown"));
         let c = parse(VALID).unwrap();
-        assert!(!c.host.skip_shutdown_teardown);
+        assert!(c.host.skip_shutdown_teardown);
+    }
+
+    #[test]
+    fn skip_shutdown_teardown_explicit_values_keep_their_meaning() {
         // Explicit true → the agent leaves tenant CVMs running across a
         // restart (they live in libvirtd's cgroup, not the agent's).
         let cfg = format!("{VALID}skip_shutdown_teardown = true\n");
         let c = parse(&cfg).unwrap();
         assert!(c.host.skip_shutdown_teardown);
+        // Explicit false → still an opt-in to the teardown.
+        let cfg = format!("{VALID}skip_shutdown_teardown = false\n");
+        let c = parse(&cfg).unwrap();
+        assert!(!c.host.skip_shutdown_teardown);
     }
 
     #[test]
@@ -1504,9 +1521,11 @@ cvm_memory_mb_budget = 16384
     #[test]
     fn deployed_and_example_configs_keep_cvms_across_an_agent_restart() {
         // 2026-09-21: an Ansible re-render had silently dropped this key
-        // (it was only ever hand-added), so `systemctl stop` on one host
-        // tore down every tenant domain. The template is what every miner
-        // actually runs — pin the key in it, inside `[host]`.
+        // (it was only ever hand-added), so `systemctl stop` on miner-3
+        // tore down every tenant domain. The agent now defaults to true,
+        // but an older binary (the updater's rollback target, a pinned
+        // release) still defaults to false — so the configs keep spelling
+        // the key out, and the updater still refuses to swap without it.
         let sources = [
             (
                 "ansible template",

@@ -26,7 +26,7 @@ from django.utils import timezone
 from apps.disktier import os_tier
 from apps.disktier.storage_doc import is_valid_pool_id
 from apps.identity import scoping
-from apps.orchestration import power_policy, webhook
+from apps.orchestration import launch_purpose, power_policy, webhook
 from apps.orchestration.effects import EffectError, EffectUnavailable
 from apps.orchestration.models import (
     TERMINAL_LAUNCH_STATES,
@@ -938,6 +938,13 @@ def start_launch(
     # launch naming a probe's vm id or owner stages nothing.
     probe_run = _check_disk_probe_role(intent, disk_probe=disk_probe)
     _check_os_pool_pin(intent, probe_run)
+    # The authenticated `purpose` (our own VM: no pay, no bill, no fill
+    # proof), before anything is staged — a caller that may not set one
+    # stages nothing.
+    try:
+        purpose = launch_purpose.parse(intent, decided_by)
+    except launch_purpose.PurposeError as exc:
+        raise LaunchIntentError(str(exc), exc.category) from exc
     # #587 Phase 1C — bake→launch chaining: if the intent names a
     # `bake_id`, fill the artifact fields a Succeeded TenantBake already
     # determined (the qcow2/kernel/initrd SHAs + the LUKS-header MAC + the
@@ -1009,6 +1016,13 @@ def start_launch(
     # A VM another operation holds is refused BEFORE any Vault write (KEK,
     # userdata); the insert below re-checks it under the row lock.
     _refuse_held(existing)
+    # A VM's purpose is fixed by its first launch, for its whole life — so
+    # a later launch can neither mark a tenant VM as ours nor clear one of
+    # ours, and "any launch of the VM carried it" is the VM's purpose.
+    try:
+        launch_purpose.check_fixed(intent.get("vm_id") or "", purpose, existing)
+    except launch_purpose.PurposeError as exc:
+        raise LaunchIntentError(str(exc), exc.category) from exc
     if existing is not None:
         # A re-POST for an existing vm_id is held to the mode pinned on its
         # row and to NOTHING else: the new-launch gates below (flag, golden,
@@ -1182,7 +1196,13 @@ def start_launch(
             # the job this creates becomes that record once it succeeds, so
             # it must either be visible to their decision or come after it.
             # No row yet (a first launch) ⇒ nothing to serialize with.
-            _refuse_held(Vm.objects.select_for_update().filter(vm_id=vm_id).first())
+            locked_vm = Vm.objects.select_for_update().filter(vm_id=vm_id).first()
+            _refuse_held(locked_vm)
+            # The purpose check again, inside the transaction: a launch of
+            # this VM that turned terminal since the intake check is
+            # visible now, and one still in flight collides on the
+            # one-active-launch index below.
+            launch_purpose.check_fixed(vm_id, purpose, locked_vm)
             job = LaunchJob.objects.create(
                 job_id=secrets.token_hex(16),
                 vm_id=vm_id,
@@ -1195,8 +1215,13 @@ def start_launch(
                 state=LaunchJobState.QUEUED.value,
                 phase=LaunchPhase.QUEUED.value,
                 phase_started_at=now,
+                # On the job row, NOT in `spec_json`: an older worker would
+                # pass an unknown key to its `LaunchSpec` and crash mid-roll.
+                purpose=purpose,
                 decided_by=decided_by,
             )
+    except launch_purpose.PurposeError as exc:
+        raise LaunchIntentError(str(exc), exc.category) from exc
     except IntegrityError as exc:
         # Partial unique index: an in-flight launch already exists for
         # this VM.
@@ -1393,7 +1418,9 @@ def run_job(job: LaunchJob) -> None:
             )
             return
 
-        spec = launch.LaunchSpec(**job.spec_json, kek_bytes=None, userdata=userdata)
+        spec = launch.LaunchSpec(
+            **job.spec_json, kek_bytes=None, userdata=userdata, purpose=job.purpose
+        )
         try:
             # `on_phase` lets the in-process choreography advance the job's
             # progress phase (placing → dispatching) as it moves through the

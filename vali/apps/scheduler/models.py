@@ -628,6 +628,10 @@ class Placement(models.Model):
         db_default=PlacementFailureSource.LEGACY.value,
     )
     kbs_release_ref = models.CharField(max_length=256, blank=True, default="")
+    # The launch's authenticated `purpose` (`orchestration.launch_purpose`):
+    # non-empty ⇒ one of OUR VMs — no pay, no bill, no fill proof. Copied
+    # onto every row that carries the VM's reservation forward.
+    purpose = models.CharField(max_length=16, blank=True, default="", db_default="")
     decided_by = models.ForeignKey(
         "identity.ServiceClient",
         on_delete=models.PROTECT,
@@ -646,6 +650,12 @@ class Placement(models.Model):
             models.Index(fields=["vm_family", "status"]),
             # Per-owner-per-miner sub-budget lookup (audit M-per-tenant-cap).
             models.Index(fields=["owner", "miner_node_id", "status"]),
+            # The few placements of OUR VMs (`orchestration.launch_purpose`).
+            models.Index(
+                fields=["vm"],
+                condition=~models.Q(purpose=""),
+                name="sched_placement_purpose_idx",
+            ),
         ]
         constraints = [
             # At most one active placement per VM. Postgres + SQLite

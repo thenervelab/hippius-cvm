@@ -468,6 +468,10 @@ def launch_intent(run: DiskProbeRun, owner: ProbeOwner) -> dict[str, Any]:
         # order carries no `os_pool`). Only a disk-probe launch may pin it
         # (`launch_jobs._check_os_pool_pin`).
         "os_pool": run.os_pool_id,
+        # One of OUR VMs (`orchestration.launch_purpose`): no pay, no bill,
+        # no fill proof — on top of the probe owner's exclusion. Vali-side
+        # only: the miner never sees it, so the probe still looks a tenant's.
+        "purpose": "probe",
     }
 
 

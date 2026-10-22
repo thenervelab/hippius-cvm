@@ -483,6 +483,48 @@ def test_our_own_vms_are_never_proof_of_fill() -> None:
     assert sample is not None and sample.vms == 1
 
 
+@override_settings(
+    VALI_CAPACITY_EARN_PROOF="live-attestation",
+    VALI_CAPACITY_EARN_HOLD_S=HOLD,
+    VALI_REWARD_EXCLUDED_OWNERS=[],
+)
+@pytest.mark.parametrize("on", ["placement", "launch_job"])
+def test_a_vm_launched_with_a_purpose_is_never_proof_of_fill(on: str) -> None:
+    """Claim: the authenticated launch `purpose` (a probe, a canary, the
+    registration load test) excludes a VM from the fill proof on its own,
+    whatever its owner — on the placement row or only on the launch job."""
+    import secrets
+
+    from apps.identity.models import PrincipalScope, ServiceClient
+    from apps.orchestration.models import LaunchJob, LaunchJobState
+
+    now = _proof_setup(2)
+    if on == "placement":
+        Placement.objects.filter(vm__vm_id="vm-small-bound-1").update(purpose="load_test")
+    else:
+        LaunchJob.objects.create(
+            job_id=secrets.token_hex(8),
+            vm_id="vm-small-bound-1",
+            tenant_id="t",
+            flavor="small",
+            spec_json={},
+            userdata_vault_path="x",
+            userdata_vault_version=1,
+            kek_vault_path="x",
+            state=LaunchJobState.SUCCEEDED.value,
+            phase_started_at=timezone.now(),
+            finished_at=timezone.now(),
+            purpose="load_test",
+            decided_by=ServiceClient.objects.create(
+                name="load-tester", scope=PrincipalScope.OPERATOR.value
+            ),
+        )
+    _alive("vm-small-bound-0", report="p1", now=now)
+    _alive("vm-small-bound-1", report="p2", now=now)
+    sample = capacity_earn.proven_concurrency(NODE, now=timezone.now())
+    assert sample is not None and sample.vms == 1
+
+
 @override_settings(VALI_CAPACITY_EARN_PROOF="live-attestation", VALI_CAPACITY_EARN_HOLD_S=HOLD)
 def test_live_attestation_proof_ignores_what_is_not_proof() -> None:
     now = _proof_setup(8)

@@ -15,6 +15,9 @@ already keeps and NEVER from a miner's self-report:
 - launch errors          `miners.MinerLaunchErrors` — the node's own
                          answers to the launch orders vali sent it, as
                          sanitized static codes (`miners.launch_errors`)
+- last probe             `synthetic.MinerProbe` — vali's own per-miner
+                         synthetic probe of the node (`synthetic.per_miner`):
+                         when, pass/fail, the stage that failed, its VM
 - recent refusals        FAILED `Placement` rows that are a judgement
                          about the node, selected by PROVENANCE
                          (`Placement.failure_source`, stamped by the
@@ -71,6 +74,7 @@ from apps.scheduler.reasons import (
     REASON_NO_STORAGE,
     public_refusal_reason,
 )
+from apps.synthetic import per_miner
 from apps.telemetry.models import HostAttestor, HostAttestorStatus
 
 #: Cap on `node_id` values per request — bounds the per-node queries.
@@ -277,8 +281,15 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
     capacity_by_node, load_by_node, _family = scheduler_service.decision_inputs("")
 
     by_id = {m.nid: m for m in identities}  # type: ignore[attr-defined]
+    agent_version_by_node = {
+        nid.lower(): (version or None)
+        for nid, version in MinerCapacity.objects.annotate(nid=Lower("miner_node_id"))
+        .filter(nid__in=list(by_id))
+        .values_list("nid", "agent_version")
+    }
     refusals_by_node = _recent_refusals_by_node(list(by_id))
     breakdown_by_node = _refusal_breakdown_by_node(list(by_id), since=now - REFUSAL_COUNT_WINDOW)
+    probes_by_node = per_miner.operator_readout(list(by_id))
     rows: list[dict[str, Any]] = []
     for nid in wanted:
         miner = by_id.get(nid)
@@ -321,6 +332,10 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                     else storage_by_node.get(nid)
                 ),
                 **launch_errors.readout(_launch_errors_of(miner)),
+                # The release tag the node's agent last reported in its
+                # heartbeat (`hippius-miner-agent --version`); self-reported.
+                "agent_version": agent_version_by_node.get(nid),
+                "last_probe": probes_by_node.get(nid),
             }
         )
     return rows

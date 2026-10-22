@@ -227,7 +227,14 @@ def _golden_bake_id(distro: str) -> str:
     return str(golden.bake_id)
 
 
-def build_launch_body(distro: str, vm_id: str, bake_id: str | None = None) -> dict:
+def build_launch_body(
+    distro: str,
+    vm_id: str,
+    bake_id: str | None = None,
+    *,
+    platform_id: str = "",
+    flavor: str = "",
+) -> dict:
     """Assemble the `POST /v1/vm/launch` body for a throwaway golden VM.
     The golden `bake_id` resolves the artifact SHAs + verity trio, and
     the launch service provisions the per-VM overlay KEK server-side, so
@@ -235,7 +242,16 @@ def build_launch_body(distro: str, vm_id: str, bake_id: str | None = None) -> di
 
     `bake_id` overrides the blessed catalog lookup — ONLY for the scheduled
     re-bake (F6), which proves a new, not-yet-blessed bake boots before a
-    human blesses it. The periodic monitor never passes it."""
+    human blesses it. The periodic monitor never passes it.
+
+    `platform_id` pins the launch to that miner's chip (the per-miner
+    probe, `apps.synthetic.per_miner`); empty lets the scheduler choose.
+    `flavor` overrides `VALI_SYNTHETIC_FLAVOR`.
+
+    Every synthetic launch carries the authenticated `purpose`
+    (`orchestration.launch_purpose`): `probe` when pinned to a miner,
+    `synmon` otherwise — so the miner is never paid for it, whatever the
+    owner list says."""
     tenant = settings.VALI_SYNTHETIC_TENANT_ID
     userdata = settings.VALI_SYNTHETIC_USERDATA or _DEFAULT_USERDATA
     return {
@@ -243,12 +259,14 @@ def build_launch_body(distro: str, vm_id: str, bake_id: str | None = None) -> di
         "user_id": tenant,
         "vm_id": vm_id,
         "lease_id": f"synmon-{vm_id}",
-        "flavor": settings.VALI_SYNTHETIC_FLAVOR,
+        "flavor": flavor or settings.VALI_SYNTHETIC_FLAVOR,
         "cmdline": settings.VALI_SYNTHETIC_CMDLINE,
         "bake_id": bake_id or _golden_bake_id(distro),
         "disk_mode": "golden_verity_overlay",
-        # Empty platform_id ⇒ the scheduler picks any dispatchable miner.
-        "platform_id": "",
+        # Empty platform_id ⇒ the scheduler picks any dispatchable miner;
+        # a chip id ⇒ that miner or no placement (`pin_arguments`).
+        "platform_id": platform_id,
+        "purpose": "probe" if platform_id else "synmon",
         "enable_netbird": True,
         "auto_pin_allowlist": True,
         "userdata": userdata,
@@ -258,14 +276,32 @@ def build_launch_body(distro: str, vm_id: str, bake_id: str | None = None) -> di
 # ── The state machine ────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class Target:
+    """A per-miner probe's pin (`apps.synthetic.per_miner`): the VM id it
+    claimed, the miner's chip, the probe flavor, and whether to check the
+    guest's attested resources against that flavor (`resources` stage)."""
+
+    vm_id: str
+    platform_id: str
+    flavor: str
+    check_resources: bool
+
+
 def run_e2e(
-    *, api: ApiClient, distro: str, budget_s: float, bake_id: str | None = None
+    *,
+    api: ApiClient,
+    distro: str,
+    budget_s: float,
+    bake_id: str | None = None,
+    target: Target | None = None,
 ) -> E2EOutcome:
     """Drive the full launch→boot→decommission→erase probe for `distro`,
     hard-capped at `budget_s`. ALWAYS tears the VM down before returning.
     `bake_id` targets a specific (possibly unblessed) bake — see
-    `build_launch_body`."""
-    vm_id = _synthetic_vm_id(distro)
+    `build_launch_body`. `target` pins the probe to one miner (and adds
+    the `resources` stage when it asks for it)."""
+    vm_id = target.vm_id if target else _synthetic_vm_id(distro)
     outcome = E2EOutcome(distro=distro, vm_id=vm_id, success=False)
     deadline = _now() + budget_s
     launched = False
@@ -273,7 +309,7 @@ def run_e2e(
         # 1) LAUNCH via the real API. Once the POST is attempted, teardown
         #    is MANDATORY — the request may have created a Vm even if the
         #    response then errored, so we must always try to clean it up.
-        job = _stage(outcome, "launch", lambda: _do_launch(api, distro, vm_id, bake_id))
+        job = _stage(outcome, "launch", lambda: _do_launch(api, distro, vm_id, bake_id, target))
         launched = True
         if job is None:
             return _finish(outcome)
@@ -308,6 +344,19 @@ def run_e2e(
 
         # 4) BOOT — the guest reached running (cloud-init done).
         if not _stage(outcome, "boot", lambda: _await_boot_phase(vm_id, "running", deadline)):
+            return _finish(outcome)
+
+        # 4b) RESOURCES (per-miner probe only) — the guest ATTESTS at least
+        #     its flavor's vCPUs and RAM. See `_verify_guest_resources`.
+        if (
+            target is not None
+            and target.check_resources
+            and not _stage(
+                outcome,
+                "resources",
+                lambda: _verify_guest_resources(vm_id, deadline),
+            )
+        ):
             return _finish(outcome)
 
         # 5) NETBIRD — a mesh IP was assigned.
@@ -387,8 +436,20 @@ def _synthetic_vm_id(distro: str) -> str:
 # ── Stage implementations ────────────────────────────────────────────
 
 
-def _do_launch(api: ApiClient, distro: str, vm_id: str, bake_id: str | None = None) -> dict:
-    body = build_launch_body(distro, vm_id, bake_id)
+def _do_launch(
+    api: ApiClient,
+    distro: str,
+    vm_id: str,
+    bake_id: str | None = None,
+    target: Target | None = None,
+) -> dict:
+    body = build_launch_body(
+        distro,
+        vm_id,
+        bake_id,
+        platform_id=target.platform_id if target else "",
+        flavor=target.flavor if target else "",
+    )
     job = api.launch(body)
     if not job.get("job_id"):
         raise ApiError(f"launch returned no job_id: {job}")
@@ -447,6 +508,57 @@ def _await_netbird(vm_id: str, deadline: float) -> bool:
         "when the guest's boot journal shows a systemd ordering cycle — check "
         "the serial console for 'hippius-synthetic: systemd ordering cycle')"
     )
+
+
+def _verify_guest_resources(vm_id: str, deadline: float) -> bool:
+    """The anti-fake check: the probe guest's OWN attested vCPUs and RAM
+    are at least its flavor's.
+
+    The figures are the ones `telemetry.guest_resources` already judges
+    on every live attestation: read by the guest, folded into the
+    `REPORT_DATA` of its SNP report and signed by the KBS, so the miner
+    relays them but cannot change one. The ingest stores the verdict on
+    `VmLiveAttestation.resource_verdict` and, for `short` / `superseded`,
+    writes the `GuestResourceShortfall` row that is evidence against the
+    node — this stage only reads it, so the probe and a tenant VM are
+    judged by the same code. The probe guest is ours (golden image, our
+    userdata, no tenant root inside), so a shortfall here is the miner's
+    doing, not a forgery.
+
+    Passes on the newest judged sample being `ok` with no `short` /
+    `superseded` one before it. Fails on any of those, on `unattested`
+    (the image cannot prove its size, nothing to judge), and when no
+    judged sample arrives in time (`VALI_SYNTHETIC_PER_MINER_RESOURCE_
+    TIMEOUT_S`)."""
+    from apps.telemetry import guest_resources
+    from apps.telemetry.models import VmLiveAttestation
+
+    res_deadline = min(
+        deadline, _now() + float(settings.VALI_SYNTHETIC_PER_MINER_RESOURCE_TIMEOUT_S)
+    )
+    interval = float(settings.VALI_SYNTHETIC_POLL_INTERVAL_S)
+    while True:
+        rows = list(
+            VmLiveAttestation.objects.filter(vm_id=vm_id)
+            .exclude(resource_verdict="")
+            .order_by("-verified_at_unix")
+        )
+        bad = next(
+            (r for r in rows if r.resource_verdict in guest_resources.EVIDENCE_VERDICTS), None
+        )
+        if bad is not None:
+            raise ApiError(
+                f"guest attested {bad.resource_verdict}: vcpus_online={bad.vcpus_online} "
+                f"mem_firmware_kib={bad.mem_firmware_kib} mem_total_kib={bad.mem_total_kib} "
+                f"mem_unaccepted_kib={bad.mem_unaccepted_kib}"
+            )
+        if rows and rows[0].resource_verdict == guest_resources.VERDICT_OK:
+            return True
+        if rows and rows[0].resource_verdict == guest_resources.VERDICT_UNATTESTED:
+            raise ApiError("the guest's live attestation carries no resources (unattested)")
+        if _now() >= res_deadline:
+            raise ApiError("no resource-attested live attestation within timeout")
+        _sleep(interval)
 
 
 def _do_decommission(api: ApiClient, vm_id: str, deadline: float) -> bool:

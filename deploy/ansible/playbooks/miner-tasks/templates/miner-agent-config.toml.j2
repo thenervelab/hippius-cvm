@@ -92,9 +92,11 @@ cvm_memory_mb_budget = {{ [_cvm_mem, _ov.memory_mb_budget_max | default(_cvm_mem
 cvm_disk_gb_budget = {{ _disk_budget }}
 # Leave the tenant CVMs RUNNING when the agent stops: a `systemctl
 # restart`/upgrade is then transparent to tenants and the new process
-# re-adopts them at startup. Without it a graceful stop force-stops
-# EVERY domain on the host (tenants + host-attestor). Read once at
-# startup — a running agent keeps the value it started with.
+# re-adopts them at startup. Current agents default to this; older
+# releases (the updater's rollback target) default to false, where a
+# graceful stop force-stops EVERY domain on the host (tenants +
+# host-attestor) — so it stays explicit, and the updater requires it.
+# Read once at startup — a running agent keeps the value it started with.
 skip_shutdown_teardown = true
 
 [heartbeat]

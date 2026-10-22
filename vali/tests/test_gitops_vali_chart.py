@@ -1327,3 +1327,123 @@ def test_the_price_keeper_state_alerts_only_read_fresh_gauges() -> None:
     rules = {r["alert"]: r["expr"] for g in rule["spec"]["groups"] for r in g["rules"]}
     for name in ("PriceKeeperBalanceLow", "PriceKeeperFailing", "PriceKeeperBacklog"):
         assert "and on() (time() - hippius_price_keeper_last_run_timestamp_seconds <" in rules[name]
+
+
+# ── per-miner probe (apps.synthetic.per_miner) ────────────────────────
+#
+# Off, the chart must not change a byte of what any pod reads (the keys
+# render only when enabled, so no config checksum rolls on merge); on, the
+# CronJob must carry everything the full tier needed to launch AND clean
+# up, and its deadline must stay under the reaper age so the reaper never
+# kills a healthy probe.
+
+_PER_MINER_ON = (
+    "--set", "syntheticMonitor.perMiner.enabled=true",
+    "--set-string", "syntheticMonitor.perMiner.miners=",
+)
+_PER_MINER_OFF = ("--set", "syntheticMonitor.perMiner.enabled=false")
+_PER_MINER = "CronJob/synthetic-monitor-per-miner"
+
+
+@_needs_helm
+def test_per_miner_ships_on_for_every_miner() -> None:
+    """The shipped values probe every dispatchable miner (an empty list),
+    one VM at a time."""
+    data = _configmap_data(_docs())
+    assert data["VALI_SYNTHETIC_PER_MINER"] == "true"
+    assert data["VALI_SYNTHETIC_PER_MINER_MINERS"] == ""
+    assert data["VALI_SYNTHETIC_PER_MINER_MAX_CONCURRENT"] == "1"
+
+
+@_needs_helm
+def test_per_miner_off_renders_no_workload_and_no_key() -> None:
+    docs = _docs(*_PER_MINER_OFF)
+    assert _PER_MINER not in dict(_pod_specs(docs))
+    assert not [k for k in _configmap_data(docs) if k.startswith("VALI_SYNTHETIC_PER_MINER")]
+    rules = [d for d in docs if d.get("kind") == "PrometheusRule"]
+    assert "SyntheticMinerProbeFailing" not in yaml.safe_dump(rules)
+
+
+@_needs_helm
+def test_per_miner_on_renders_a_complete_probe_workload() -> None:
+    docs = _docs(*_PER_MINER_ON, *_MTLS_ON)
+    data = _configmap_data(docs)
+    assert data["VALI_SYNTHETIC_PER_MINER"] == "true"
+    assert data["VALI_SYNTHETIC_PER_MINER_MAX_CONCURRENT"] == "1"
+    assert data["VALI_SYNTHETIC_PER_MINER_MINERS"] == ""
+
+    cron = next(
+        d for d in docs
+        if d.get("kind") == "CronJob" and d["metadata"]["name"] == "synthetic-monitor-per-miner"
+    )
+    # The budget is the DB claim, not the CronJob: overlapping runs exit.
+    assert cron["spec"]["concurrencyPolicy"] == "Allow"
+    job = cron["spec"]["jobTemplate"]["spec"]
+    reap_age = int(re.search(r'"VALI_SYNTHETIC_REAP_AGE_S", (\d+)', SETTINGS.read_text())[1])
+    assert job["activeDeadlineSeconds"] < reap_age
+    pod = dict(_pod_specs(docs))[_PER_MINER]
+    (container,) = pod["containers"]
+    assert container["command"][-2:] == ["--tier", "per-miner"]
+    env = {e["name"] for e in container.get("env") or []}
+    assert "VALI_SYNTHETIC_ROOT_TOKEN" in env  # the real launch / §24 API
+    assert "VALI_VAULT_ADDR" in env  # kek_alive + crypto_erase + force-erase
+    assert any(v["name"] == "kbs-admin-tls" for v in pod.get("volumes") or [])
+    # The Secret the token comes from exists even with the full tier off.
+    docs_no_full = _docs(*_PER_MINER_ON, "--set", "syntheticMonitor.full.enabled=false")
+    assert any(
+        d.get("kind") == "ExternalSecret" and "synthetic" in d["metadata"]["name"]
+        for d in docs_no_full
+    )
+
+
+@_needs_helm
+def test_per_miner_refuses_to_render_without_the_light_tier_reaper() -> None:
+    """The light tier's reaper is the only thing that destroys a probe VM
+    whose run was SIGKILLed; without it a killed probe leaks for good."""
+    proc = _render(*_PER_MINER_ON, "--set", "syntheticMonitor.light.enabled=false")
+    assert proc.returncode != 0
+    assert "light.enabled" in proc.stderr
+
+
+@_needs_helm
+def test_per_miner_pods_are_admitted_by_the_network_policies() -> None:
+    """Same gap as the tenant baker / synthetic tiers before it: a pod
+    the CNP does not name is dropped silently — the vali API (launch,
+    §24) and the Edge order listener (force-destroy) both."""
+    docs = _docs(*_PER_MINER_ON)
+    cnp = yaml.safe_dump([d for d in docs if d.get("kind") == "CiliumNetworkPolicy"])
+    assert "synthetic-monitor-per-miner" in cnp
+    # Vault (kek_alive, crypto_erase, the force-erase fallback) is reached
+    # on world:8200 — opened by the probe itself, not by an unrelated flag.
+    off = (
+        "--set", "createVm.enabled=false",
+        "--set", "vmBackup.failoverAutoEnabled=false",
+        "--set", "disktierProbe.enabled=false",
+    )
+    alone = yaml.safe_dump(
+        [d for d in _docs(*_PER_MINER_ON, *off) if d.get("kind") == "CiliumNetworkPolicy"]
+    )
+    assert "port: '8200'" in alone or 'port: "8200"' in alone
+    edge = REPO_ROOT / "deploy" / "gitops" / "apps" / "edge-gateway" / "templates"
+    assert "synthetic-monitor-per-miner" in (edge / "networkpolicy.yaml").read_text()
+
+
+@_needs_helm
+def test_per_miner_alerts_never_reuse_the_full_tier_series() -> None:
+    docs = _docs(*_PER_MINER_ON)
+    rules = [
+        r
+        for d in docs
+        if d.get("kind") == "PrometheusRule"
+        for g in d["spec"]["groups"]
+        if g["name"] == "hippius-synthetic-per-miner"
+        for r in g["rules"]
+    ]
+    assert {r["alert"] for r in rules} == {
+        "SyntheticMinerProbeFailing",
+        "SyntheticMinerNotProbed",
+        "SyntheticPerMinerStale",
+        "SyntheticPerMinerMisconfigured",
+    }
+    for r in rules:
+        assert "hippius_synthetic_e2e_success" not in r["expr"], r["alert"]

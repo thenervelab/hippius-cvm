@@ -1,4 +1,4 @@
-{{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled }}
+{{- if or .Values.syntheticMonitor.light.enabled .Values.syntheticMonitor.full.enabled .Values.syntheticMonitor.perMiner.enabled }}
 ---
 # Synthetic-monitor alerts (apps.synthetic). Prometheus discovers this via
 # `ruleSelector: {}` (all namespaces). The alerts carry a `severity` label
@@ -144,7 +144,7 @@ spec:
           # A VM that HAS produced SNP live attestations has stopped, while
           # still bound + billable. That is "running and earning nothing".
           #
-          # This is the signal a 2026-08-13 production incident did not
+          # This is the signal the 2026-08-13 gateproof-a incident did not
           # have: a KBS restart reseeded the per-VM attestation sequence,
           # vali mistook every post-restart attestation for a replay of the
           # old sequence, and dropped 3.7h of a live tenant's uptime while
@@ -219,7 +219,7 @@ spec:
     # The cost is that an edited ConfigMap can sit next to a process that
     # never read it, indefinitely, while ArgoCD reports Synced + Healthy.
     # On 2026-08-13 the suppressed-confirm anti-rollback gate was armed
-    # (0 → 3), merged and synced, and the already-running process was still
+    # (0 → 3), merged and synced, and the 152-minute-old process was still
     # running with the gate DISABLED. `check_kbs_config_drift` asks the
     # RUNNING process every ~15 min; these two rules split its answer.
     - name: hippius-kbs-config-drift
@@ -378,4 +378,100 @@ spec:
               check name, or the hard cap of 3 exceeded — which voids the
               WHOLE spec). Nothing is acknowledged by a refused entry. The
               synthetic-monitor-light Job log names each refusal.
+    {{- if .Values.syntheticMonitor.perMiner.enabled }}
+    # ── per-miner probe (apps.synthetic.per_miner) ────────────────────
+    # Series of their own (`hippius_synthetic_miner_*`), never the full
+    # tier's: one miner failing is not "the tenant launch path is broken".
+    # The fleet readout is PUT every run from the probe ledger, so a miner
+    # never probed is a series at timestamp 0, and one that left the
+    # dispatchable set drops out.
+    - name: hippius-synthetic-per-miner
+      interval: 60s
+      rules:
+        - alert: SyntheticMinerProbeFailing
+          # Only probes that REACHED the miner count (a placement on it
+          # existed); a launch vali itself refused never moves the streak.
+          expr: hippius_synthetic_miner_probe_fail_streak >= {{ .Values.syntheticMonitor.perMiner.failStreakAlert }}
+          for: 0m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "per-miner probe failing on {{`{{ $labels.miner }}`}}"
+            description: |
+              {{`{{ $value }}`}} probes in a row failed on miner
+              {{`{{ $labels.miner }}`}}. The failed stage is
+              hippius_synthetic_miner_probe_stage_success{miner=...} == 0 and
+              `last_probe.stage` on /v1/operator/nodes; `resources` means the
+              guest attested fewer vCPUs or less RAM than its flavor. If
+              every miner fails at once, look at the full tier first.
+        - alert: SyntheticMinerNotProbed
+          # >36 h since the last conclusive probe of the miner. A miner held
+          # back only for want of room is excluded: its tenants are the
+          # ones using it.
+          expr: |
+            (
+              hippius_synthetic_miner_last_probe_timestamp > 0
+              and time() - hippius_synthetic_miner_last_probe_timestamp > 129600
+            )
+            unless on(miner) (hippius_synthetic_miner_probe_blocked{reason="capacity"} == 1)
+          for: 1h
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "miner {{`{{ $labels.miner }}`}} not probed for >36h"
+            description: |
+              The per-miner probe has not reached miner {{`{{ $labels.miner }}`}}
+              in over 36 h. hippius_synthetic_miner_probe_blocked says why it
+              is skipped (cordoned, gated, booting, net-policy, busy); with no
+              blocked series, its launches are refused before they reach it —
+              see the synthetic-monitor-per-miner Job logs.
+        - alert: SyntheticMinerNotProbed
+          # Never probed (timestamp 0): the same 36 h of grace, counted by
+          # `for` from when the miner entered the readout — a miner that
+          # just became dispatchable is not late yet.
+          expr: |
+            (hippius_synthetic_miner_last_probe_timestamp == 0)
+            unless on(miner) (hippius_synthetic_miner_probe_blocked{reason="capacity"} == 1)
+          for: 36h
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "miner {{`{{ $labels.miner }}`}} not probed for >36h"
+            description: |
+              The per-miner probe has not reached miner {{`{{ $labels.miner }}`}}
+              in over 36 h. hippius_synthetic_miner_probe_blocked says why it
+              is skipped (cordoned, gated, booting, net-policy, busy); with no
+              blocked series, its launches are refused before they reach it —
+              see the synthetic-monitor-per-miner Job logs.
+        - alert: SyntheticPerMinerStale
+          # `absent` too: a tier that never published at all is as stale.
+          expr: |
+            time() - hippius_synthetic_run_timestamp{tier="per-miner-fleet"} > 7200
+            or absent(hippius_synthetic_run_timestamp{tier="per-miner-fleet"})
+          for: 2h
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "per-miner probe tier STALE"
+            description: |
+              No per-miner run has pushed its fleet readout in >2 h — the
+              synthetic-monitor-per-miner CronJob or the Pushgateway may be
+              down.
+        - alert: SyntheticPerMinerMisconfigured
+          expr: hippius_synthetic_per_miner_config_error == 1
+          for: 0m
+          labels:
+            severity: warning
+            component: synthetic-monitor
+          annotations:
+            summary: "per-miner probe tier refuses to run"
+            description: |
+              The per-miner tier refused to run (no root token, the probe
+              distro not blessed, or an unknown probe flavor). No miner is
+              being probed; the Job log names the cause.
+    {{- end }}
 {{- end }}
