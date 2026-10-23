@@ -104,6 +104,15 @@
       loop_control:
         loop_var: mode
 
+    - name: The auto-update report is off by default
+      ansible.builtin.assert:
+        that:
+          - not (miner_inventory_report_auto_update | bool)
+          - "'--report-auto-update' not in units[mode ~ '.service'] | regex_replace('(?m)^#.*$', '')"
+      loop: [full, counters, kernel]
+      loop_control:
+        loop_var: mode
+
     - name: Full and counters are retried within the agent's 15 min deadline
       ansible.builtin.assert:
         that:
@@ -152,6 +161,36 @@
           - miner_inventory_timer_enabled | bool
           - miner_inventory_timer_state == 'started'
           - miner_inventory_services_to_stop | length == 0
+
+    - name: Render with the auto-update report on
+      vars:
+        miner_inventory_unit_dir: "{{ scratch.path }}"
+        miner_inventory_report_auto_update: true
+      ansible.builtin.include_tasks: ../playbooks/miner-tasks/host-inventory.yml
+
+    - name: Read the services rendered with the report on
+      ansible.builtin.slurp:
+        src: "{{ scratch.path }}/hippius-host-inventory@{{ item }}.service"
+      loop: [full, counters, kernel]
+      register: rendered_au
+
+    - name: Full and counters pass --report-auto-update, the kernel tail does not
+      vars:
+        au: >-
+          {{ dict(rendered_au.results | map(attribute='item')
+                  | zip(rendered_au.results | map(attribute='content') | map('b64decode'))) }}
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('ExecStart=' ~ miner_agent.install_path ~ ' host-inventory-collect --mode full'
+             ~ ' --out-dir /run/hippius-miner/inventory --config ' ~ miner_agent.config_path
+             ~ ' --report-auto-update') in au['full']
+          - >-
+            ('ExecStart=' ~ miner_agent.install_path ~ ' host-inventory-collect --mode counters'
+             ~ ' --out-dir /run/hippius-miner/inventory --config ' ~ miner_agent.config_path
+             ~ ' --report-auto-update') in au['counters']
+          - "'--report-auto-update' not in au['kernel'] | regex_replace('(?m)^#.*$', '')"
+          - au['full'] | regex_findall('(?m)^ExecStart=') | length == 1
 
     # ── the agent config render: guarded when [inventory] is rendered ───
     - name: Read the agent install tasks

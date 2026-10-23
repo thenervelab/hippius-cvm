@@ -305,6 +305,13 @@ enum Command {
         /// `partial`, the other sections unaffected.
         #[arg(long, default_value = "/etc/hippius-miner/config.toml")]
         config: PathBuf,
+        /// Add `software.auto_update` (the auto-updater's flag, env
+        /// switch, timer, last check and failed markers, read from their
+        /// files). Off unless given: a vali whose verifier predates the
+        /// key refuses the whole report, so ansible passes it
+        /// (`miner_inventory_report_auto_update`) only once vali accepts it.
+        #[arg(long)]
+        report_auto_update: bool,
     },
     /// Print, as JSON, what the agent would make of the storage
     /// declaration in `--config` on this host: pools, filesystem
@@ -528,7 +535,8 @@ fn run() -> Result<()> {
             mode,
             out_dir,
             config,
-        } => cmd_host_inventory_collect(mode, &out_dir, &config),
+            report_auto_update,
+        } => cmd_host_inventory_collect(mode, &out_dir, &config, report_auto_update),
     }
 }
 
@@ -810,7 +818,12 @@ fn cmd_host_inventory_kernel(out_dir: &Path, started: std::time::Instant, now: i
     Ok(())
 }
 
-fn cmd_host_inventory_collect(mode: InventoryMode, out_dir: &Path, config: &Path) -> Result<()> {
+fn cmd_host_inventory_collect(
+    mode: InventoryMode,
+    out_dir: &Path,
+    config: &Path,
+    report_auto_update: bool,
+) -> Result<()> {
     // The run's deadline counts from here (`host_inventory::RUN_DEADLINE`).
     let started = std::time::Instant::now();
     use hippius_miner_agent::host_inventory::{self, HostPaths, Mode, StorageView, SystemRunner};
@@ -833,9 +846,13 @@ fn cmd_host_inventory_collect(mode: InventoryMode, out_dir: &Path, config: &Path
             None
         }
     };
+    let paths = HostPaths {
+        auto_update: report_auto_update.then(host_inventory::auto_update::AutoUpdatePaths::default),
+        ..HostPaths::default()
+    };
     let summary = host_inventory::run_collect(
         mode,
-        &HostPaths::default(),
+        &paths,
         &SystemRunner::default(),
         now,
         out_dir,

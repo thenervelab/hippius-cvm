@@ -171,9 +171,10 @@ pool-probe duration and collateral limits do not apply. **hdd floors, d1:**
 | surface sample | 0 I/O errors |
 
 Any I/O error ⇒ `unfit` and the disk is `failed`. The suspect-cache sanity
-applies as in v1. Better results classify `ssd`/`nvme`; in v1 every
-dedicated disk is sold as `hdd`-minimum, so an SSD offered as a dedicated
-disk is fine.
+applies as in v1. Better results classify `ssd`/`nvme` (thresholds and
+their calibration: `dedicated-disks-contract.md` §8); the disk is verified
+at the lower of that grade and its operator's declared class (`hdd` when
+none is declared), and sold at the tier a launch asks, never above.
 
 ### 3.4 Hysteresis (pools)
 

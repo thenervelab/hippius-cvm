@@ -626,7 +626,10 @@ class SchedulerFeasibilityView(APIView):
             ),
             OpenApiParameter(
                 name="dedicated_tier",
-                description="With `dedicated_count`: `hdd` (the default, and the only one sold).",
+                description=(
+                    "With `dedicated_count`: the minimum tier, `hdd` (the default), `ssd` or "
+                    "`nvme`. A tier not on sale reads `never` / `dedicated-disks-not-offered`."
+                ),
                 required=False,
                 type=str,
             ),
@@ -705,7 +708,7 @@ def _dedicated_query(params: Any) -> disk_dedicated.DedicatedRequest | None:
     it names none (the answer then stays byte-identical). Validated like a
     launch's `dedicated_disks` (`DedicatedError`, the §1.1 400 categories):
     count and size are required with any of the three, the tier defaults to
-    `hdd` (the only one sold)."""
+    `hdd`."""
     if not any(params.get(p) is not None for p in _DEDICATED_PARAMS):
         return None
 
@@ -725,7 +728,7 @@ def _dedicated_query(params: Any) -> disk_dedicated.DedicatedRequest | None:
 
     return disk_dedicated.parse_request(
         {
-            "tier": (params.get("dedicated_tier") or "").strip() or disk_dedicated.SOLD_TIERS[0],
+            "tier": (params.get("dedicated_tier") or "").strip() or disk_dedicated.REQUEST_TIERS[0],
             "count": number("dedicated_count"),
             "min_size_gb": number("dedicated_min_size_gb"),
         }

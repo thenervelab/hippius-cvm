@@ -402,15 +402,18 @@ def _add_dedicated_disks(
 ) -> None:
     """Each region's `dedicated_disks` (E4 contract §4), only while they are
     sold (`VALI_DEDICATED_ENABLED`; off, every row is byte-identical):
-    `{hdd: {sizes: [{size_gb, free, max_per_host}]}}` — per size class, the
-    free disks a launch could take on its offering miners whose agent takes
-    `extra_disks`, and the most of them on one host. Advisory."""
+    `{<tier>: {sizes: [{size_gb, free, max_per_host}]}}` for each tier on
+    sale (`VALI_DEDICATED_SELLABLE_TIERS`, default only `hdd`) — per size
+    class, the free disks a launch at that tier could take (a disk counts
+    under every tier it qualifies for: an nvme disk under nvme, ssd and
+    hdd) on its offering miners whose agent takes `extra_disks`, and the
+    most of them on one host. Advisory."""
     from apps.disktier import dedicated
 
     if not dedicated.enabled():
         return
     nodes = [nid for nids in offering.values() for nid in nids]
-    for tier in dedicated.SOLD_TIERS:
+    for tier in dedicated.sellable_tiers():
         sizes = dedicated.free_sizes(
             dedicated.DedicatedRequest(tier, 1, dedicated.MIN_SIZE_GB), nodes
         )

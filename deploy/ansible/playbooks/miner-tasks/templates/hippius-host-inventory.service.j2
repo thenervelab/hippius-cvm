@@ -23,7 +23,14 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
+{% if (miner_inventory_report_auto_update | default(false) | bool) and miner_inventory_mode != 'kernel' %}
+# `--report-auto-update` (`miner_inventory_report_auto_update`): the
+# software section carries the auto-updater's state. Only once vali accepts
+# the key: an older vali refuses the whole report.
+ExecStart={{ miner_agent.install_path }} host-inventory-collect --mode {{ miner_inventory_mode }} --out-dir /run/hippius-miner/inventory --config {{ miner_agent.config_path }} --report-auto-update
+{% else %}
 ExecStart={{ miner_agent.install_path }} host-inventory-collect --mode {{ miner_inventory_mode }} --out-dir /run/hippius-miner/inventory --config {{ miner_agent.config_path }}
+{% endif %}
 User=root
 Group=root
 {% if miner_inventory_mode == 'kernel' %}

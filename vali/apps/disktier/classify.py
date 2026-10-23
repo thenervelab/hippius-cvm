@@ -7,8 +7,25 @@ an edit to this table and nothing else.
 - `v1` — a storage pool, benchmarked through the OS disk (LUKS2 +
   dm-integrity) from a `medium` probe VM.
 - `d1` — a dedicated physical disk, benchmarked whole through dm-crypt with
-  an ephemeral key. It grades `hdd` / `unfit` only: dedicated disks are sold
-  as `hdd`-minimum, and its ssd/nvme columns come with calibration.
+  an ephemeral key, graded `nvme` / `ssd` / `hdd` / `unfit`. What a disk is
+  SOLD at is the lower of this grade and its operator's declared class
+  (`dedicated_probe.verdict_for`). The ssd/nvme columns are calibrated on a
+  Samsung PM9A3 3.84 TB through the SNP guest (2026-10-22: seq read
+  inner/outer ~2190/2380 MB/s, random read QD32 181-194k IOPS, QD1 p99
+  31-44 µs, sustained random write QD32 136-158k IOPS) and on what SATA
+  (6 Gb/s, ~550 MB/s raw) and a 24 TB HDD (~130 / ~280 MB/s inner / outer,
+  a few hundred random IOPS, QD1 p99 in tens of ms) can deliver:
+  - nvme seq read 1400 MB/s: PM9A3 clears it by >= 1.5x (design §3.2's
+    calibration rule; 1500 would leave the inner zone at 1.46x), and no
+    SATA link can reach it (2.5x its raw ceiling), so a SATA SSD is never
+    nvme whatever its IOPS. rr 100k (PM9A3 1.8x), QD1 p99 500 µs (>10x),
+    sustained write 40k (PM9A3 3.4x; a gen3 or QLC drive whose cache
+    collapses within the 8 GiB window lands ssd).
+  - ssd seq read 300 MB/s (v1's ssd floor; a SATA SSD through dm-crypt
+    reads ~450-530, 1.5x), rr 20k, QD1 p99 3 ms, sustained write 5k: an
+    HDD misses ssd on three independent axes (random read ~50x below,
+    QD1 p99 ~10x above, the inner zone ~2x below), so a fast 24 TB
+    disk's ~280 MB/s outer zone alone never makes it an ssd.
 
 Rules:
 
@@ -16,9 +33,14 @@ Rules:
   with no threshold for a tier cannot clear that tier.
 - The verdict is the MINIMUM over all graded metrics: one bad axis caps the
   tier. Below the hdd floor on any axis is `unfit`.
-- `qd1_p50_us` below `SUSPECT_CACHE_P50_US` is implausible through virtio +
-  SNP + disk crypto: the numbers came from host RAM or page cache, so the
-  probe FAILED (`suspect-cache`) and yields no tier at all.
+- `qd1_p50_us` below the profile's suspect-cache floor is implausible
+  through virtio + SNP + disk crypto: the numbers came from host RAM or page
+  cache, so the probe FAILED (`suspect-cache`) and yields no tier at all.
+  `v1` (a pool, a file on a filesystem) uses `SUSPECT_CACHE_P50_US`; `d1`
+  (a whole dedicated disk) a lower floor, because a fast datacenter NVMe
+  answers reads of its not-yet-written (deallocated) blocks in ~10-15 µs
+  of device time, ~24-28 µs through the guest: measured live on two
+  PM9A3 3.84 TB (2026-10-22), one run at 24 µs.
 - `d1` only: any I/O error in the surface sample is `unfit`, and the disk
   is failed (`io-errors`).
 
@@ -36,8 +58,12 @@ from dataclasses import dataclass
 
 from .tiers import DiskTier, rank
 
-#: QD1 4 KiB read p50 below this is host RAM, not a disk (both profiles).
+#: QD1 4 KiB read p50 below this is host RAM, not a disk (`v1`).
 SUSPECT_CACHE_P50_US = 25
+#: The same floor for `d1`: below the virtio + SNP + dm-crypt round trip
+#: itself, so still only RAM; a real NVMe reading deallocated blocks stays
+#: above it.
+SUSPECT_CACHE_P50_US_D1 = 12
 
 #: Why a probe failed instead of yielding a tier.
 FAILURE_SUSPECT_CACHE = "suspect-cache"
@@ -83,6 +109,8 @@ class Profile:
     #: Outputs the profile measures but does not grade (yet). Optional, and
     #: validated like the others when present.
     reported_metrics: tuple[str, ...] = ()
+    #: `qd1_p50_us` below this fails the probe (`suspect-cache`).
+    suspect_cache_p50_us: int = SUSPECT_CACHE_P50_US
 
     @property
     def required_metrics(self) -> frozenset[str]:
@@ -114,11 +142,11 @@ PROFILE_V1 = Profile(
 PROFILE_D1 = Profile(
     name="d1",
     thresholds=(
-        Threshold("seq_read_inner_mbps", True, nvme=None, ssd=None, hdd=60),
-        Threshold("seq_read_outer_mbps", True, nvme=None, ssd=None, hdd=120),
-        Threshold("rr_iops", True, nvme=None, ssd=None, hdd=200),
-        Threshold("qd1_p99_us", False, nvme=None, ssd=None, hdd=60_000),
-        Threshold("rw_sustained_iops", True, nvme=None, ssd=None, hdd=100),
+        Threshold("seq_read_inner_mbps", True, nvme=1_400, ssd=300, hdd=60),
+        Threshold("seq_read_outer_mbps", True, nvme=1_400, ssd=300, hdd=120),
+        Threshold("rr_iops", True, nvme=100_000, ssd=20_000, hdd=200),
+        Threshold("qd1_p99_us", False, nvme=500, ssd=3_000, hdd=60_000),
+        Threshold("rw_sustained_iops", True, nvme=40_000, ssd=5_000, hdd=100),
     ),
     sanity_metrics=("qd1_p50_us",),
     error_metric="surface_errors",
@@ -126,6 +154,7 @@ PROFILE_D1 = Profile(
     # `size_mib`: the size the guest sees (guest release 7), which a
     # dedicated disk is sold at (R3).
     reported_metrics=("seq_read_mid_mbps", "seq_write_mbps", "size_mib"),
+    suspect_cache_p50_us=SUSPECT_CACHE_P50_US_D1,
 )
 
 PROFILES: dict[str, Profile] = {p.name: p for p in (PROFILE_V1, PROFILE_D1)}
@@ -181,7 +210,7 @@ def classify(profile_name: str, metrics: Mapping[str, object]) -> Verdict:
     # it wins over the cache sanity check.
     if profile.error_metric is not None and values[profile.error_metric] > 0:
         return Verdict(profile.name, DiskTier.UNFIT, per_metric, FAILURE_IO_ERRORS)
-    if values["qd1_p50_us"] < SUSPECT_CACHE_P50_US:
+    if values["qd1_p50_us"] < profile.suspect_cache_p50_us:
         return Verdict(profile.name, DiskTier.UNKNOWN, per_metric, FAILURE_SUSPECT_CACHE)
     tier = min(per_metric.values(), key=rank)
     return Verdict(profile.name, DiskTier(tier), per_metric)

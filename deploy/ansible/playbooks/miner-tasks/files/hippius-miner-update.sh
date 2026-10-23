@@ -116,6 +116,11 @@ TXN_FILE="${STATE_DIR}/update-in-progress"
 # cleanly; without one, "inactive" is an operator stop.
 KILLED_FLAG="${STATE_DIR}/.update-killed"
 BACKUP_PATH="${BINARY_PATH}.bak"
+# Rewritten by every timer run that read the release list:
+# {"schema":1,"last_check_unix":<epoch s>}. The agent's host inventory
+# reports it (`software.auto_update.last_check_unix`); nothing reads it back
+# here.
+STATUS_FILE="${STATE_DIR}/auto-update-status.json"
 LOG_TAG="hippius-miner-update"
 
 # Fallbacks go to stderr: stdout of some functions is captured (a PID).
@@ -175,6 +180,19 @@ installed_tag() {
         if [ -z "$best" ] || [ "$(tag_cmp "$t" "$best")" = 1 ]; then best="$t"; fi
     done
     printf '%s\n' "$best"
+}
+
+# Records that this timer run read the release list (atomic, world-readable:
+# it holds a timestamp). A failure is logged, never fatal: it only ages the
+# "last check" the dashboard shows.
+record_check() {
+    local now
+    now="$(date +%s)"
+    if ! { printf '{"schema":1,"last_check_unix":%s}\n' "$now" >"${STATUS_FILE}.new" \
+            && chmod 0644 "${STATUS_FILE}.new" && mv -f "${STATUS_FILE}.new" "$STATUS_FILE"; }; then
+        rm -f -- "${STATUS_FILE}.new" 2>/dev/null || true
+        warn "cannot write $STATUS_FILE; the reported last check stays at its previous value"
+    fi
 }
 
 # ── systemd ──────────────────────────────────────────────────────────────────
@@ -620,6 +638,10 @@ say("info", "no eligible release; nothing to do")
             ?*) err "$line" ;;
         esac
     done <"$tmp/select.log"
+    # A timer run (not --install, not --tag) has now checked for releases.
+    if [ -z "$PIN_TAG" ] && [ "$INSTALL_MODE" = false ]; then
+        record_check
+    fi
 
     # mapfile, not a chain of `read`s: a short answer (no release) must not
     # trip errexit on EOF.

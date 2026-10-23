@@ -135,7 +135,21 @@ def _spy_writes(monkeypatch) -> list[str]:
         ),
         (ON, 5, dict(dedicated_disks=[], pinned_ack=True), 400, "dedicated-invalid"),
         (ON, 5, dict(dedicated_disks={**GOOD, "x": 1}), 400, "dedicated-invalid"),
-        (ON, 5, dict(dedicated_disks={**GOOD, "tier": "ssd"}), 400, "dedicated-invalid"),
+        (ON, 5, dict(dedicated_disks={**GOOD, "tier": "sas"}), 400, "dedicated-invalid"),
+        (
+            ON,
+            5,
+            dict(dedicated_disks={**GOOD, "tier": "ssd"}, pinned_ack=True),
+            409,
+            "dedicated-disks-not-offered",
+        ),
+        (
+            {**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["hdd", "ssd"]},
+            5,
+            dict(dedicated_disks={**GOOD, "tier": "nvme"}, pinned_ack=True),
+            409,
+            "dedicated-disks-not-offered",
+        ),
         (ON, 5, dict(dedicated_disks={**GOOD, "count": 9}), 400, "dedicated-count-invalid"),
         (ON, 5, dict(dedicated_disks={**GOOD, "min_size_gb": 999}), 400, "dedicated-size-invalid"),
         (ON, 5, dict(dedicated_disks=GOOD), 400, "dedicated-ack-required"),
@@ -576,6 +590,32 @@ def test_the_placement_assigns_the_disks_of_the_chosen_node(monkeypatch) -> None
         PlacementDisk.objects.filter(placement=placement).values_list("slot", flat=True)
     ) == {"x0", "x1"}
     assert DedicatedDisk.objects.get(disk_id="wwn-0x11").state == "free"
+
+
+@override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["hdd", "ssd", "nvme"]})
+def test_an_ssd_launch_takes_qualifying_disks_and_is_sold_at_ssd(monkeypatch) -> None:
+    from .test_launch_service import _spec as service_spec
+
+    m1, m2 = _fleet(monkeypatch, 1, 2)
+    # Node 1 has only hdd disks: it does not qualify.
+    make_disk("wwn-0x11", node=m1.chain_node_id, tier="hdd")
+    make_disk("wwn-0x12", node=m1.chain_node_id, tier="hdd")
+    make_disk("wwn-0x21", node=m2.chain_node_id, tier="nvme", size_gib=16384)
+    make_disk("wwn-0x22", node=m2.chain_node_id, tier="ssd", size_gib=30000)
+    make_disk("wwn-0x23", node=m2.chain_node_id, tier="hdd", size_gib=16384)
+    monkeypatch.setattr(launch, "launch_on_miner", lambda spec, miner, **_k: _outcome("accepted"))
+    ssd = {**GOOD, "tier": "ssd"}
+    result = launch.launch_vm(service_spec(dedicated_disks=ssd, pinned_ack=True), _actor())
+    assert result.ok and result.miner_node_id == m2.chain_node_id
+    rows = PlacementDisk.objects.filter(kind="dedicated").order_by("slot")
+    # The ssd disk first (lowest qualifying tier), then the nvme one.
+    assert [(r.slot, r.dedicated_disk.disk_id, r.required_tier) for r in rows] == [
+        ("x0", "wwn-0x22", "ssd"),
+        ("x1", "wwn-0x21", "ssd"),
+    ]
+    vm = Vm.objects.get(vm_id=rows[0].placement.vm.vm_id)
+    tiers = [d["tier"] for d in dedicated.read_back(vm, os_disk=(40, "nvme"))["disks"]]
+    assert tiers == ["nvme", "ssd", "ssd"]
 
 
 @override_settings(**ON)

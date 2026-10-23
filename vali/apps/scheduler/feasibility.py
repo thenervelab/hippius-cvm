@@ -392,7 +392,10 @@ def assess(
     offered = flavors.is_offered(flavor)
     tier_why = os_tier.not_offered(os_disk_tier, flavor) if os_disk_tier and offered else ""
     dedicated_why = (
-        disk_dedicated.not_offered(tenant_id=tenant_id, user_id=user_id)
+        (
+            disk_dedicated.not_offered(tenant_id=tenant_id, user_id=user_id)
+            or disk_dedicated.tier_not_sold(dedicated.tier)
+        )
         if dedicated is not None and offered and not tier_why
         else ""
     )

@@ -380,11 +380,53 @@ def test_dedicated_disks_inventory_and_drain(
             "reported_at": data["disks"][0]["reported_at"],
             "state": "pending_probe",
             "verified_tier": "unknown",
+            "declared_class": None,
             "last_probed_on": None,
             "behind_controller": False,
             "assigned": False,
         }
     ]
+
+
+def test_a_declared_class_is_kept_vali_side_and_locked_on_an_assigned_disk(
+    owned: dict[str, Any], writer_client: APIClient
+) -> None:
+    from apps.scheduler.tests.factories import make_vm
+
+    disk = DedicatedDisk.objects.create(
+        miner_node_id=NODE,
+        disk_id="wwn-0x1",
+        size_bytes=18 * 10**12,
+        reported_state="free",
+        reported_at=timezone.now(),
+    )
+    declared = _doc(disks=[{"id": "wwn-0x1", "state": "active", "class": "ssd"}])
+    assert _put(writer_client, declared).status_code == 202
+    assert DedicatedDisk.objects.get().declared_class == "ssd"
+    data = writer_client.get(_url("operator_dedicated_disks"), **HEADERS).json()
+    assert data["disks"][0]["declared_class"] == "ssd"
+    stored = writer_client.get(_url("operator_storage"), **HEADERS).json()
+    assert stored["desired"]["dedicated_disks"] == [
+        {"id": "wwn-0x1", "state": "active", "class": "ssd"}
+    ]
+    bad = _doc(disks=[{"id": "wwn-0x1", "state": "active", "class": "sas"}])
+    response = _put(writer_client, bad)
+    assert response.status_code == 400 and response.json()["code"] == "disk-class-invalid"
+    # Assigned to a VM: any change of its class is refused, nothing written.
+    vm = make_vm("vm-held", "lease-held")
+    DedicatedDisk.objects.filter(pk=disk.pk).update(
+        state="assigned", assigned_vm=vm, assigned_slot="x0"
+    )
+    for klass in ("nvme", "hdd", None):
+        entry: dict[str, Any] = {"id": "wwn-0x1", "state": "active"}
+        if klass:
+            entry["class"] = klass
+        response = _put(writer_client, _doc(disks=[entry]))
+        assert response.status_code == 409, response.content
+        assert (response.json()["code"], response.json()["disk"]) == ("disk-assigned", "wwn-0x1")
+    assert DedicatedDisk.objects.get().declared_class == "ssd"
+    # The same class is no change: accepted.
+    assert _put(writer_client, declared).status_code == 202
 
 
 def test_disk_tiers(owned: dict[str, Any], operator_client: APIClient) -> None:

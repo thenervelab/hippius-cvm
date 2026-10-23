@@ -502,10 +502,11 @@ class OperatorRegionSerializer(serializers.Serializer):
     )
     dedicated_disks = serializers.DictField(
         required=False,
-        help_text="Only while dedicated disks are sold: per tier (`hdd`), `{sizes: "
-        "[{size_gb, free, max_per_host}]}` — per size class (GiB, floored to 100), the "
-        "free disks a launch could take in the region and the most on one host. "
-        "Advisory: the launch is authoritative.",
+        help_text="Only while dedicated disks are sold: per tier on sale (`hdd`, `ssd`, "
+        "`nvme`; by default `hdd` only), `{sizes: [{size_gb, free, max_per_host}]}` — per "
+        "size class (GiB, floored to 100), the free disks a launch at that tier could take "
+        "in the region (a disk counts under every tier it qualifies for) and the most on "
+        "one host. Advisory: the launch is authoritative.",
     )
 
 

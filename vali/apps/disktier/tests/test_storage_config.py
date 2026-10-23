@@ -1293,3 +1293,288 @@ def test_a_held_status_never_hides_the_gate_or_an_applied_revision(
     monkeypatch.setattr(storage_config, "_owner_hold", lambda row: "chain-unavailable")
     assert storage_config.sync_node(NODE, force=True) == "chain-unavailable"
     assert storage_config.sync_status(_row()) == "in_sync"
+
+
+# ─── declared dedicated-disk classes (vali-side only, contract §8) ───
+
+
+def _disk_entry(disk_id: str = "wwn-0x1", klass: str | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"id": disk_id, "state": "active"}
+    if klass is not None:
+        entry["class"] = klass
+    return entry
+
+
+def _free(disk_id: str = "wwn-0x1", tier: str = "hdd", **kw: Any) -> DedicatedDisk:
+    fields: dict[str, Any] = dict(
+        state="free",
+        verified_tier=tier,
+        reported_state="free",
+        reported_at=timezone.now(),
+    )
+    fields.update(kw)
+    return DedicatedDisk.objects.create(miner_node_id=NODE, disk_id=disk_id, **fields)
+
+
+def _disk_audits() -> list[tuple[str, str, str]]:
+    from apps.disktier import dedicated
+    from apps.scheduler.models import MinerCapacityAudit
+
+    return [
+        (a.before["state"], a.after["state"], a.reason)
+        for a in MinerCapacityAudit.objects.filter(field=dedicated.AUDIT_FIELD).order_by("id")
+    ]
+
+
+@pytest.mark.usefixtures("push_on")
+def test_the_class_is_never_pushed_and_the_agent_hashes_what_it_always_did(
+    agent: FakeAgent,
+) -> None:
+    from apps.disktier import storage_doc
+
+    _miner()
+    with_class = _doc(disks=[_disk_entry("wwn-0x1", "nvme"), _disk_entry("wwn-0x2")])
+    without = _doc(disks=[_disk_entry("wwn-0x1"), _disk_entry("wwn-0x2")])
+    assert with_class["dedicated_disks"][0] == {"id": "wwn-0x1", "state": "active", "class": "nvme"}
+    assert storage_doc.order_payload(
+        with_class, revision=3, not_after_unix=9, dry_run=False
+    ) == storage_doc.order_payload(without, revision=3, not_after_unix=9, dry_run=False)
+    _stage(with_class)
+    storage_config.reconcile()
+    (sent,) = agent.sent
+    assert sent["dedicated_disks"] == [
+        {"id": "wwn-0x1", "state": "active"},
+        {"id": "wwn-0x2", "state": "active"},
+    ]
+    row = _row()
+    assert row.acked_current and row.body_sha == agent.sha
+    assert row.body["dedicated_disks"][0]["class"] == "nvme"
+
+
+def test_a_document_without_a_class_is_byte_identical() -> None:
+    doc = _doc(disks=[_disk_entry()])
+    assert doc["dedicated_disks"] == [{"id": "wwn-0x1", "state": "active"}]
+
+
+@pytest.mark.parametrize("klass", ["sas", "HDD", "", None, 3, "unfit"])
+def test_a_bad_class_is_refused(klass: Any) -> None:
+    with pytest.raises(DocError) as exc:
+        normalize({"pools": [_pool()], "dedicated_disks": [{**_disk_entry(), "class": klass}]})
+    assert (exc.value.code, exc.value.disk) == ("disk-class-invalid", "wwn-0x1")
+
+
+def test_raising_a_free_disks_class_sends_it_back_to_the_probe() -> None:
+    _free(tier="hdd")
+    _stage(_doc(disks=[_disk_entry(klass="nvme")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("nvme", "pending_probe", "hdd")
+    assert _disk_audits() == [("free", "pending_probe", "declared-class-raised")]
+
+
+def test_lowering_a_free_disks_class_caps_its_tier_at_once() -> None:
+    _free(tier="nvme", declared_class="nvme")
+    _stage(_doc(disks=[_disk_entry(klass="ssd")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("ssd", "free", "ssd")
+    _stage(_doc(disks=[_disk_entry()]))  # no class: capped at hdd
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == (None, "free", "hdd")
+    assert _disk_audits() == [
+        ("free", "free", "declared-class-lowered"),
+        ("free", "free", "declared-class-lowered"),
+    ]
+
+
+def test_a_lower_class_above_the_verified_tier_changes_no_tier() -> None:
+    _free(tier="ssd", declared_class="nvme")
+    _stage(_doc(disks=[_disk_entry(klass="ssd")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("ssd", "free", "ssd")
+    assert _disk_audits() == []
+
+
+def test_no_class_and_hdd_are_the_same_cap() -> None:
+    _free(tier="hdd")
+    _stage(_doc(disks=[_disk_entry(klass="hdd")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("hdd", "free", "hdd")
+    assert _disk_audits() == []
+
+
+def test_a_class_change_on_an_assigned_disk_is_refused_and_nothing_is_written() -> None:
+    from apps.scheduler.tests.factories import make_vm
+
+    vm = make_vm("vm-1", "lease-1")
+    _free(tier="hdd", declared_class="hdd", state="assigned", assigned_vm=vm, assigned_slot="x0")
+    _free("wwn-0x2", tier="hdd")
+    _stage(_doc(disks=[_disk_entry(klass="hdd"), _disk_entry("wwn-0x2")]))
+    revision = _row().revision
+    for klass in ("ssd", "nvme"):
+        with pytest.raises(storage_config.DiskClassLocked) as exc:
+            _stage(_doc(disks=[_disk_entry(klass=klass), _disk_entry("wwn-0x2", "nvme")]))
+        assert exc.value.disk == "wwn-0x1"
+    assert _row().revision == revision
+    assert dict(DedicatedDisk.objects.values_list("disk_id", "declared_class")) == {
+        "wwn-0x1": "hdd",
+        "wwn-0x2": None,
+    }
+    assert DedicatedDisk.objects.get(disk_id="wwn-0x2").state == "free"
+
+
+def test_on_an_assigned_disk_absent_and_hdd_are_one_cap_only_the_spelling_is_stored() -> None:
+    from apps.scheduler.tests.factories import make_vm
+
+    vm = make_vm("vm-1", "lease-1")
+    _free(tier="hdd", state="assigned", assigned_vm=vm, assigned_slot="x0")
+    _stage(_doc(disks=[_disk_entry(klass="hdd")]))
+    assert DedicatedDisk.objects.get().declared_class == "hdd"
+    _stage(_doc(disks=[_disk_entry()]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == (None, "assigned", "hdd")
+    assert _disk_audits() == []
+
+
+def test_a_new_familys_first_write_keeps_an_assigned_disks_cap() -> None:
+    from apps.scheduler.tests.factories import make_vm
+
+    vm = make_vm("vm-1", "lease-1")
+    _free(tier="ssd", declared_class="ssd", state="assigned", assigned_vm=vm, assigned_slot="x0")
+    _stage(_doc(disks=[_disk_entry(klass="ssd")]))
+    other = Actor(principal="backend-operator-config", family="5Other", account=FAMILY_B.hex())
+    # The new family cannot see the former document; omitting the class
+    # would lower what the VM was sold: refused until it names it.
+    with pytest.raises(storage_config.DiskClassLocked):
+        storage_config.stage(NODE, _doc(disks=[_disk_entry()]), actor=other, action="put")
+    row, changed = storage_config.stage(
+        NODE, _doc(disks=[_disk_entry(klass="ssd")]), actor=other, action="put"
+    )
+    assert changed and row.owner_family == FAMILY_B.hex()
+
+
+def test_the_class_sync_runs_even_when_the_content_is_unchanged() -> None:
+    doc = _doc(disks=[_disk_entry(klass="ssd")])
+    _free(tier="ssd", declared_class="ssd")
+    _stage(doc)
+    # The row drifted from the document (it never should): a re-stage of the
+    # same content puts the document's class back.
+    DedicatedDisk.objects.update(declared_class="nvme")
+    row, changed = storage_config.stage(NODE, doc, actor=ACTOR, action="put")
+    assert not changed
+    assert DedicatedDisk.objects.get().declared_class == "ssd"
+
+
+def test_class_audits_name_who_wrote_the_document() -> None:
+    from apps.scheduler.models import MinerCapacityAudit
+
+    _free(tier="hdd")
+    _stage(_doc(disks=[_disk_entry(klass="nvme")]))
+    (row,) = MinerCapacityAudit.objects.filter(reason="declared-class-raised")
+    assert row.actor == "storage-config:backend-operator-config"
+    assert (row.after["declared_class"], row.after["user"]) == ("nvme", "42")
+
+
+def test_a_drain_keeps_the_class_of_an_assigned_disk() -> None:
+    from apps.scheduler.tests.factories import make_vm
+
+    vm = make_vm("vm-1", "lease-1")
+    _free(tier="ssd", declared_class="ssd", state="assigned", assigned_vm=vm, assigned_slot="x0")
+    _stage(_doc(disks=[_disk_entry(klass="ssd")]))
+
+    def _drain(doc: dict[str, Any]) -> dict[str, Any]:
+        doc["dedicated_disks"][0]["state"] = "draining"
+        return doc
+
+    row, changed = storage_config.edit(NODE, _drain, actor=ACTOR, action="disk-drain")
+    assert changed
+    assert row.body["dedicated_disks"] == [{"id": "wwn-0x1", "state": "draining", "class": "ssd"}]
+    assert DedicatedDisk.objects.get().declared_class == "ssd"
+
+
+def test_a_report_never_changes_a_known_disks_class() -> None:
+    from apps.telemetry.verifier import DeclaredDedicatedDisk
+
+    _free(tier="hdd", declared_class="hdd")
+    _stage(_doc(disks=[_disk_entry(klass="hdd")]))
+    # A document written later (or by hand) names another class: only a
+    # stage moves it, never the heartbeat.
+    MinerStorageConfig.objects.filter(miner_node_id=NODE).update(
+        body=_doc(disks=[_disk_entry(klass="nvme")])
+    )
+    pool = DeclaredPool(
+        pool_id="default",
+        declared_class="nvme",
+        total_gb=0,
+        available_gb=0,
+        budget_gb=3000,
+        committed_gb=0,
+        os_disks=True,
+        state="active",
+        error="",
+    )
+    disk = DeclaredDedicatedDisk(disk_id="wwn-0x1", size_mb=1, state="free", vm="", error="")
+    report = DeclaredStorage(pools=(pool,), dedicated_disks=(disk,), storage_config_revision=0)
+    record_storage_report(NODE, report, timezone.now())
+    disk_row = DedicatedDisk.objects.get()
+    assert (disk_row.declared_class, disk_row.verified_tier) == ("hdd", "hdd")
+
+
+@pytest.mark.parametrize("state", ["pending_probe", "probing", "unfit", "released"])
+def test_in_any_other_state_up_is_only_recorded_and_down_caps_at_once(state: str) -> None:
+    _free(tier="hdd", state=state)
+    _stage(_doc(disks=[_disk_entry(klass="nvme")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("nvme", state, "hdd")
+    assert _disk_audits() == []
+    # A disk verified nvme (an earlier probe) whose class drops to ssd.
+    DedicatedDisk.objects.update(verified_tier="nvme")
+    _stage(_doc(disks=[_disk_entry(klass="ssd")]))
+    disk = DedicatedDisk.objects.get()
+    assert (disk.declared_class, disk.state, disk.verified_tier) == ("ssd", state, "ssd")
+    assert _disk_audits() == [(state, state, "declared-class-lowered")]
+
+
+def test_a_disk_first_reported_after_the_document_takes_its_class() -> None:
+    from apps.telemetry.verifier import DeclaredDedicatedDisk
+
+    _stage(_doc(disks=[_disk_entry("wwn-0x9", "ssd"), _disk_entry("wwn-0x8")]))
+    pool = DeclaredPool(
+        pool_id="default",
+        declared_class="nvme",
+        total_gb=0,
+        available_gb=0,
+        budget_gb=3000,
+        committed_gb=0,
+        os_disks=True,
+        state="active",
+        error="",
+    )
+    disks = tuple(
+        DeclaredDedicatedDisk(disk_id=d, size_mb=1, state="free", vm="", error="")
+        for d in ("wwn-0x9", "wwn-0x8")
+    )
+    report = DeclaredStorage(pools=(pool,), dedicated_disks=disks, storage_config_revision=0)
+    record_storage_report(NODE, report, timezone.now())
+    assert dict(DedicatedDisk.objects.values_list("disk_id", "declared_class")) == {
+        "wwn-0x9": "ssd",
+        "wwn-0x8": None,
+    }
+
+
+def test_adopt_keeps_the_classes_vali_holds() -> None:
+    now = timezone.now()
+    _reported("default", now)
+    DedicatedDisk.objects.create(
+        miner_node_id=NODE,
+        disk_id="wwn-0x1",
+        reported_at=now,
+        reported_state="free",
+        declared_class="nvme",
+    )
+    DedicatedDisk.objects.create(
+        miner_node_id=NODE, disk_id="wwn-0x2", reported_at=now, reported_state="free"
+    )
+    doc = storage_config.adopt_document(NODE, {"default": {"path": "/var/lib/hippius-miner"}})
+    assert doc["dedicated_disks"] == [
+        {"id": "wwn-0x1", "state": "active", "class": "nvme"},
+        {"id": "wwn-0x2", "state": "active"},
+    ]

@@ -6,12 +6,19 @@ docs/design/disk-tier-verification.md §4.2, §5.2, §6.1, §7, §8).
   `pinned_ack`, with the contract's 400 / 409 categories. Off
   (`VALI_DEDICATED_ENABLED`) ⇒ any value but null is today's 409
   `dedicated-disks-not-offered`. Kept in the launch spec only when present.
+- Tiers (contract §8): a request's `tier` is a MINIMUM among `hdd`, `ssd`,
+  `nvme` (anything else 400 `dedicated-invalid`); one not in
+  `VALI_DEDICATED_SELLABLE_TIERS` is 409 `dedicated-disks-not-offered`. A
+  disk is sold at the tier REQUESTED (`PlacementDisk.required_tier`), never
+  at its higher verified tier: the read-back and the miner's pay carry it.
 - Capacity ([`free_counts`]): per node, the `free` disks a request could
   take — active, verified at ≥ the sold tier, at least `min_size_gb` GiB,
   reported free in a recent `v7` heartbeat — on a node whose agent takes
   `extra_disks` (`VALI_DEDICATED_MIN_AGENT_VERSION`, empty = none).
 - Assignment ([`assign`]): in the placement's own transaction, row-locked,
-  smallest qualifying disks first (ties: most recently probed). A disk can
+  the lowest qualifying verified tier first, then the smallest qualifying
+  disks (ties: most recently probed): an nvme disk is taken for an hdd
+  request only when no hdd or ssd disk qualifies. A disk can
   never be assigned twice: the rows are locked and moved `free → assigned`
   under a compare-and-set.
 - The order and the measured cmdline ([`extra_disks`], [`cmdline_value`],
@@ -48,7 +55,7 @@ from .models import (
 )
 from .routing import REPORT_MAX_AGE
 from .storage_config import version_at_least
-from .tiers import SELLABLE_TIERS, DiskTier, satisfies
+from .tiers import SELLABLE_TIERS, DiskTier, rank, satisfies
 
 GIB = 2**30
 #: The size class step: a disk is sold (and measured) as its size floored to it.
@@ -57,8 +64,9 @@ SIZE_CLASS_GIB = 100
 MIN_SIZE_GB = 1000
 #: The largest size class the guest takes on its measured cmdline (1 PiB).
 MAX_SIZE_CLASS_GIB = 1_048_576
-#: The only dedicated tier sold in v1 (a minimum).
-SOLD_TIERS: tuple[str, ...] = (DiskTier.HDD,)
+#: The tiers a request may name (a minimum), lowest first. Which of them are
+#: on sale is `VALI_DEDICATED_SELLABLE_TIERS` ([`sellable_tiers`]).
+REQUEST_TIERS: tuple[str, ...] = (DiskTier.HDD, DiskTier.SSD, DiskTier.NVME)
 #: The measured cmdline token: `hippius.dedicated=x0:<GiB>,x1:<GiB>`.
 CMDLINE_KEY = "hippius.dedicated"
 #: The guest opens at most this many slots.
@@ -164,6 +172,22 @@ def min_agent_version() -> str:
     return str(getattr(settings, "VALI_DEDICATED_MIN_AGENT_VERSION", "") or "")
 
 
+def sellable_tiers() -> tuple[str, ...]:
+    """The dedicated tiers on sale (`VALI_DEDICATED_SELLABLE_TIERS`, default
+    `hdd`), lowest first."""
+    wanted = {
+        str(t).lower() for t in getattr(settings, "VALI_DEDICATED_SELLABLE_TIERS", None) or ()
+    }
+    return tuple(t for t in REQUEST_TIERS if t in wanted)
+
+
+def tier_not_sold(tier: str) -> str:
+    """Why dedicated disks are not sold at `tier` (`""` when they are)."""
+    if tier in sellable_tiers():
+        return ""
+    return f"dedicated disks are not offered at tier {tier} on this validator"
+
+
 # ── intake ───────────────────────────────────────────────────────────
 
 
@@ -187,9 +211,9 @@ def parse_request(raw: object) -> DedicatedRequest:
             CATEGORY_INVALID,
         )
     tier = raw["tier"]
-    if not isinstance(tier, str) or tier not in SOLD_TIERS:
+    if not isinstance(tier, str) or tier not in REQUEST_TIERS:
         raise DedicatedError(
-            f"dedicated_disks.tier must be one of: {', '.join(SOLD_TIERS)}", CATEGORY_INVALID
+            f"dedicated_disks.tier must be one of: {', '.join(REQUEST_TIERS)}", CATEGORY_INVALID
         )
     count = _strict_int(raw["count"])
     if count is None:
@@ -233,7 +257,8 @@ def check_launch(
     """The intake of a launch whose `dedicated_disks` is not null, in the
     contract's order: not offered (flag off, or an owner off the allowlist)
     before anything about the body, so a caller that may not buy learns
-    nothing else; then the body (400); then the conflicts (409).
+    nothing else; then the body (400); then the conflicts (409), the tier
+    not on sale (`dedicated-disks-not-offered`) first.
     `guest_release` is the blessed guest release of the launched image
     (`None` for a launch that is not by image)."""
     why = not_offered(tenant_id=tenant_id, user_id=user_id)
@@ -246,6 +271,9 @@ def check_launch(
             "(no migration, no failover, no backup)",
             CATEGORY_ACK_REQUIRED,
         )
+    why = tier_not_sold(request.tier)
+    if why:
+        raise DedicatedError(why, CATEGORY_NOT_OFFERED)
     if require_failover_peer:
         raise DedicatedError(
             "a VM with dedicated disks is pinned to its host: it cannot require a failover peer",
@@ -296,6 +324,19 @@ def size_class_gb(size_bytes: int | None) -> int:
 
 def _tiers_at_least(tier: str) -> list[str]:
     return [t for t in SELLABLE_TIERS if satisfies(t, tier)]
+
+
+def _placement_order(disk: DedicatedDisk) -> tuple[int, int, bool, float, str]:
+    """[`assign`]'s preference: the lowest verified tier, then the smallest
+    disk, then the most recently probed (never probed last), then `disk_id`."""
+    probed = disk.probed_at
+    return (
+        rank(disk.verified_tier),
+        int(disk.verified_size_bytes or 0),
+        probed is None,
+        -probed.timestamp() if probed is not None else 0.0,
+        disk.disk_id,
+    )
 
 
 def qualifying(request: DedicatedRequest, *, now: datetime | None = None) -> QuerySet:
@@ -410,14 +451,19 @@ def assign(placement: Any, vm: Any, request: DedicatedRequest) -> list[Placement
     if node.lower() not in capable_node_ids([node]):
         raise DisksTaken(f"node {node} does not take extra_disks")
     now = timezone.now()
-    rows = list(
+    # Every qualifying disk of the node is locked, in `disk_id` order — the
+    # one order every writer of a node's disk rows locks them in (the
+    # storage document's class sync, the probe's run creation), so no two
+    # of them can deadlock. A node has at most 24.
+    locked = list(
         qualifying(request, now=now)
         .filter(miner_node_id__iexact=node)
         .select_for_update()
-        .order_by("verified_size_bytes", F("probed_at").desc(nulls_last=True), "disk_id")[
-            : request.count
-        ]
+        .order_by("disk_id")
     )
+    # The lowest qualifying tier first (an nvme disk is not spent on an hdd
+    # sale while an hdd or ssd disk would do), then the smallest disk.
+    rows = sorted(locked, key=_placement_order)[: request.count]
     if len(rows) < request.count:
         raise DisksTaken(f"node {node} has {len(rows)} of {request.count} qualifying disks free")
     first = _next_slot_index(vm)
@@ -698,26 +744,61 @@ def read_back(vm: Any, *, os_disk: tuple[int, str] | None = None) -> dict[str, A
     return read_back_many([vm], os_disks={vm.pk: os_disk} if os_disk else None).get(vm.pk, {})
 
 
-def milliunits_per_gb() -> int:
-    return int(getattr(settings, "VALI_DEDICATED_MILLIUNITS_PER_GB", 0) or 0)
+def milliunits_per_gb(tier: str | None = None) -> int:
+    """The miner's dedicated rate (units per served second, in thousandths,
+    per GiB) for a slot SOLD at `tier`: its entry in
+    `VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER`, else
+    `VALI_DEDICATED_MILLIUNITS_PER_GB` (the rate of every tier when `tier`
+    is `None`)."""
+    base = int(getattr(settings, "VALI_DEDICATED_MILLIUNITS_PER_GB", 0) or 0)
+    if tier is None:
+        return base
+    by_tier = getattr(settings, "VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER", None) or {}
+    return int(by_tier.get(str(tier), base))
 
 
-def payable_gb(vm_id: str) -> int:
-    """GiB of `vm_id`'s dedicated slots its host is paid for right now: the
-    size classes of the slots whose state is `attached` — on positive HOST
-    evidence only (`_held_slot_state`: the agent's fresh report that it holds
-    the disk for this VM at its probed size); every other slot is withheld.
-    The guest's own (forgeable) claim never withholds anything."""
+def pay_enabled() -> bool:
+    """Whether any sold tier earns dedicated units (all rates 0 = off: the
+    accrual reads nothing and is byte for byte what it was)."""
+    return any(milliunits_per_gb(t) for t in REQUEST_TIERS)
+
+
+def _attached_rows(vm_id: str) -> list[PlacementDisk]:
+    """`vm_id`'s dedicated slots whose state is `attached` — on positive
+    HOST evidence only (`_held_slot_state`: the agent's fresh report that it
+    holds the disk for this VM at its probed size), in slot order; every
+    other slot is withheld. The guest's own (forgeable) claim never
+    withholds anything."""
     from apps.lifecycle.models import Vm, VmState
 
     vm = Vm.objects.filter(vm_id=vm_id).first()
     if vm is None:
-        return 0
+        return []
     rows = _rows_by_vm([vm]).get(vm.pk, [])
     destroyed = vm.state == VmState.DESTROYED
-    return sum(
-        row.size_gb for row in rows if _slot_state(row, vm, destroyed=destroyed) == SLOT_ATTACHED
-    )
+    attached = [r for r in rows if _slot_state(r, vm, destroyed=destroyed) == SLOT_ATTACHED]
+    return sorted(attached, key=lambda r: _slot_index(r.slot))
+
+
+def payable_gb(vm_id: str) -> int:
+    """GiB of `vm_id`'s dedicated slots its host is paid for right now: the
+    size classes of its `attached` slots ([`_attached_rows`])."""
+    return sum(row.size_gb for row in _attached_rows(vm_id))
+
+
+def payable_milliunits_gb(vm_id: str, *, cap_gb: int) -> int:
+    """Σ over `vm_id`'s `attached` slots of size class × the rate of the
+    tier the slot was SOLD at (`required_tier`, never the disk's verified
+    tier: an nvme disk sold as hdd earns hdd pay), counting at most
+    `cap_gb` GiB in all (what vali provisioned; slots in slot order). With
+    one rate for every tier this is `min(cap_gb, payable_gb) × rate`."""
+    left = max(0, int(cap_gb))
+    total = 0
+    for row in _attached_rows(vm_id):
+        gb = min(row.size_gb, left)
+        left -= gb
+        total += gb * milliunits_per_gb(row.required_tier)
+    return total
 
 
 def _os_disk_of(vm_id: str) -> tuple[int, str]:
@@ -865,6 +946,52 @@ def reconcile_released(node_id: str, now: datetime) -> int:
     return moved
 
 
+#: The states an operator may send back to a probe ([`request_reprobe`]): a
+#: disk on sale, or one a probe graded below every floor. Never one a VM or a
+#: probe holds, nor one whose wipe is not yet reported (`released`).
+REPROBE_STATES: tuple[str, ...] = (DedicatedDiskState.FREE, DedicatedDiskState.UNFIT)
+
+
+def request_reprobe(
+    disk: DedicatedDisk,
+    *,
+    reason: str,
+    detail: Mapping[str, Any] | None = None,
+    states: Iterable[str] = REPROBE_STATES,
+    actor: str = "",
+) -> bool:
+    """Send `disk` back to `pending_probe` (R3: a re-probe, e.g. after its
+    declared class went up, or on an operator's request), under a
+    compare-and-set on its current state — one of `states`, held by no VM.
+    Its verified tier stays as it was until the probe's verdict, but a
+    `pending_probe` disk is never placeable. Audited. Returns whether it
+    moved."""
+    states = tuple(states)
+    with transaction.atomic():
+        row = (
+            DedicatedDisk.objects.select_for_update()
+            .filter(pk=disk.pk, state__in=states, assigned_vm__isnull=True)
+            .first()
+        )
+        if row is None:
+            return False
+        DedicatedDisk.objects.filter(pk=row.pk).update(
+            state=DedicatedDiskState.PENDING_PROBE,
+            probe_failures=0,
+            probe_retry_at=None,
+            updated_at=timezone.now(),
+        )
+        audit_transition(
+            row,
+            before=row.state,
+            after=DedicatedDiskState.PENDING_PROBE,
+            reason=reason,
+            detail={"verified_tier": row.verified_tier, **dict(detail or {})},
+            actor=actor,
+        )
+    return True
+
+
 # ── the audit trail (design §4.3) ────────────────────────────────────
 
 #: Who every automatic dedicated-disk state change is attributed to.
@@ -881,14 +1008,16 @@ def audit_transition(
     after: str,
     reason: str,
     detail: Mapping[str, Any] | None = None,
+    actor: str = "",
 ) -> None:
     """One `MinerCapacityAudit` row for one disk's state change (actor
-    `disk-tier`), written by the caller's transaction when it has one."""
+    `disk-tier` unless an operator's is given), written by the caller's
+    transaction when it has one."""
     from apps.scheduler.models import MinerCapacityAudit
 
     MinerCapacityAudit.objects.create(
         miner_node_id=disk.miner_node_id,
-        actor=AUDIT_ACTOR,
+        actor=(actor or AUDIT_ACTOR)[:128],
         field=AUDIT_FIELD,
         before={"disk_id": disk.disk_id, "state": str(before)},
         after={"disk_id": disk.disk_id, "state": str(after), **dict(detail or {})},

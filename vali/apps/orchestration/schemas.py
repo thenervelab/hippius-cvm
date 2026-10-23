@@ -206,10 +206,11 @@ class LaunchIntentSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         help_text=(
-            "Whole physical disks passed to the VM: `{\"tier\": \"hdd\", \"count\": "
-            "1..8, \"min_size_gb\": >= 1000}` (GiB; every disk at least that). Null or "
-            "absent ⇒ none. Not offered (feature off, or an owner off the allowlist) ⇒ "
-            "409 `dedicated-disks-not-offered`; malformed ⇒ 400 `dedicated-invalid` / "
+            "Whole physical disks passed to the VM: `{\"tier\": \"hdd\" | \"ssd\" | "
+            "\"nvme\" (a minimum), \"count\": 1..8, \"min_size_gb\": >= 1000}` (GiB; every "
+            "disk at least that). Null or absent ⇒ none. Not offered (feature off, an "
+            "owner off the allowlist, or a tier not on sale) ⇒ 409 "
+            "`dedicated-disks-not-offered`; malformed ⇒ 400 `dedicated-invalid` / "
             "`dedicated-count-invalid` / `dedicated-size-invalid`; with "
             "`require_failover_peer` ⇒ 409 `dedicated-no-failover`; on an image whose "
             "guest cannot open them ⇒ 409 `dedicated-needs-release`. The VM is then "

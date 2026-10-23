@@ -2736,6 +2736,15 @@ VALI_DEDICATED_ALLOWED_OWNERS = _env_list("VALI_DEDICATED_ALLOWED_OWNERS")
 VALI_DEDICATED_MAX_PER_VM = _env_int("VALI_DEDICATED_MAX_PER_VM", 8)
 if not 1 <= VALI_DEDICATED_MAX_PER_VM <= 8:
     raise RuntimeError("VALI_DEDICATED_MAX_PER_VM must be 1..8")
+# The dedicated tiers on sale (a launch's `dedicated_disks.tier` is a
+# minimum among hdd, ssd, nvme). A valid tier not listed ⇒ 409
+# `dedicated-disks-not-offered`; feasibility and regions list only these.
+# Empty = none sold.
+VALI_DEDICATED_SELLABLE_TIERS = [
+    t.lower() for t in _env_list("VALI_DEDICATED_SELLABLE_TIERS", ["hdd"])
+]
+if not set(VALI_DEDICATED_SELLABLE_TIERS) <= {"nvme", "ssd", "hdd"}:
+    raise RuntimeError("VALI_DEDICATED_SELLABLE_TIERS lists only nvme, ssd, hdd")
 # The oldest blessed guest release whose guest opens dedicated disks. An image
 # blessed at a lower release (or none) ⇒ 409 `dedicated-needs-release`. Empty
 # = every launch is refused so (nothing launches before the guest exists).
@@ -2800,6 +2809,22 @@ if VALI_DEDICATED_PROBE_MIN_GUEST_RELEASE < 7:
 # for byte what they were. An operator sets it so a disk's units are
 # proportional to its revenue next to the VM's.
 VALI_DEDICATED_MILLIUNITS_PER_GB = _env_nonneg_int("VALI_DEDICATED_MILLIUNITS_PER_GB", 0)
+# The same rate per SOLD tier, `tier:milliunits` comma-separated (e.g.
+# `ssd:150,nvme:250`): a slot is paid at the tier it was sold at (an nvme disk
+# sold as hdd earns hdd pay). A tier not listed takes
+# VALI_DEDICATED_MILLIUNITS_PER_GB. Empty = every tier at that one rate.
+VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER: dict[str, int] = {}
+for _item in _env_list("VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER"):
+    _tier, _sep, _rate = _item.partition(":")
+    _tier = _tier.strip().lower()
+    if not _sep or _tier not in ("nvme", "ssd", "hdd") or not _rate.strip().isdigit():
+        raise RuntimeError(
+            "VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER is `tier:milliunits,...` "
+            f"(tier nvme|ssd|hdd, milliunits an integer >= 0), got {_item!r}"
+        )
+    if _tier in VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER:
+        raise RuntimeError(f"VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER names {_tier} twice")
+    VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER[_tier] = int(_rate.strip())
 # ── Live storage move (`apps.disktier.storage_move`): a running VM's OS disk
 # moves to another pool of its host, no downtime. ALL DARK by default: off,
 # no miner selected, and no agent version good enough. Turning it OFF stops

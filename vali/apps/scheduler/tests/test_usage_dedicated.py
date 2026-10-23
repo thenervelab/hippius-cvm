@@ -118,6 +118,47 @@ def test_never_more_than_the_binding_provisioned(monkeypatch, settings) -> None:
     assert _accrue(monkeypatch) == (60, 100 * 60 + 22300 * 5 * 60 // 1000)
 
 
+# ── per sold tier (contract §8) ─────────────────────────────────────
+
+
+def test_the_default_by_tier_setting_is_empty(settings) -> None:
+    assert settings.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER == {}
+
+
+def test_a_by_tier_rate_alone_turns_pay_on(monkeypatch, settings) -> None:
+    # The flat rate is 0, but slots sold at hdd have their own rate.
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER = {"hdd": 4}
+    _pinned()
+    assert _accrue(monkeypatch) == (60, 100 * 60 + SLOTS * 4 * 60 // 1000)
+
+
+def test_a_by_tier_rate_for_another_tier_changes_nothing(monkeypatch, settings) -> None:
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB = 5
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER = {"ssd": 50, "nvme": 90}
+    _pinned()
+    assert _accrue(monkeypatch) == (60, 100 * 60 + SLOTS * 5 * 60 // 1000)
+
+
+def test_each_slot_is_paid_at_its_sold_tier_never_the_disks_verified_one(
+    monkeypatch, settings
+) -> None:
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB = 5
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER = {"ssd": 20, "nvme": 90}
+    disks = _pinned()
+    # Both disks verified nvme; x0 sold at ssd, x1 at hdd (the flat rate).
+    DedicatedDisk.objects.update(verified_tier="nvme")
+    PlacementDisk.objects.filter(dedicated_disk=disks[0]).update(required_tier="ssd")
+    assert _accrue(monkeypatch) == (60, 100 * 60 + (22300 * 20 + 22300 * 5) * 60 // 1000)
+
+
+def test_the_binding_cap_counts_slots_in_slot_order(monkeypatch, settings) -> None:
+    settings.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER = {"hdd": 5, "ssd": 20}
+    disks = _pinned(dedicated_gb=22300 + 1000)
+    PlacementDisk.objects.filter(dedicated_disk=disks[1]).update(required_tier="ssd")
+    # x0 (hdd) whole, then 1000 GiB of x1 (ssd).
+    assert _accrue(monkeypatch) == (60, 100 * 60 + (22300 * 5 + 1000 * 20) * 60 // 1000)
+
+
 def test_a_vm_without_dedicated_disks_is_as_before(monkeypatch, settings) -> None:
     settings.VALI_DEDICATED_MILLIUNITS_PER_GB = 5
     VmBillingBinding.objects.create(

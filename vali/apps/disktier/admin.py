@@ -61,6 +61,7 @@ class DedicatedDiskAdmin(_ReadOnlyAdmin):
         "state",
         "desired_state",
         "verified_tier",
+        "declared_class",
         "assigned_vm",
         "assigned_slot",
         "probed_at",

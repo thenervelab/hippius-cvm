@@ -685,5 +685,51 @@ setup v2025.01.08 v2025.01.10 48; write_tag_release v2025.01.10 48; echo inactiv
 check "tag upgrade: a stopped agent is refused (play 05 uses --install for it)" \
     bash -c "[ $RC = 1 ] && [ ! -e '$SB/kills' ] && ! grep -q 'systemctl start' '$SB/calls' && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.08)'"
 
+# ── Status file (the host inventory's software.auto_update.last_check_unix) ──
+# last_check_unix of the status file, empty when there is none.
+status_check() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["last_check_unix"])' "$SB/state/auto-update-status.json" 2>/dev/null; }
+recent_check() {
+    local t; t="$(status_check)" || return 1
+    [ -n "$t" ] && [ $(( $(date +%s) - t )) -ge 0 ] && [ $(( $(date +%s) - t )) -le 60 ]
+}
+no_status() { [ ! -e "$SB/state/auto-update-status.json" ]; }
+
+setup v2025.01.09 v2025.01.09 48; run_update
+check "status: an up-to-date timer run records its check (schema 1, world-readable)" \
+    bash -c "[ $RC = 0 ] && grep -qx '{\"schema\":1,\"last_check_unix\":[0-9]*}' '$SB/state/auto-update-status.json' && [ \"\$(stat -c %a '$SB/state/auto-update-status.json')\" = 644 ] && [ ! -e '$SB/state/auto-update-status.json.new' ]"
+check "status: the recorded check is this run's" recent_check
+
+setup v2025.01.08 v2025.01.09 2; run_update
+check "status: a run waiting out the soak records its check" bash -c "[ $RC = 0 ] && [ ! -e '$SB/kills' ]"
+check "status: the waiting run's check is recorded" recent_check
+
+setup v2025.01.08 v2025.01.09 48; run_update
+check "status: an updating run records its check" bash -c "[ $RC = 0 ] && '$SB/hippius-miner-agent' --version | grep -qF '(v2025.01.09)'"
+check "status: the updating run's check is recorded" recent_check
+
+setup v2025.01.08 v2025.01.09 48; touch "$SB/state/.no-auto-update"; run_update
+check "status: an opted-out run (flag) checks nothing" bash -c "[ $RC = 0 ] && ! grep -q curl '$SB/calls'"
+check "status: the flagged run records nothing" no_status
+
+setup v2025.01.08 v2025.01.09 48; echo AUTO_UPDATE_DISABLED=true >>"$SB/env"; run_update
+check "status: an opted-out run (env) records nothing" bash -c "[ $RC = 0 ] && [ ! -e '$SB/state/auto-update-status.json' ]"
+
+setup v2025.01.08 v2025.01.09 48; echo '{"schema":1,"last_check_unix":1000}' >"$SB/state/auto-update-status.json"; rm "$SB/remote/latest"; run_update
+check "status: GitHub unreachable => exit 1, the previous check is kept" \
+    bash -c "[ $RC = 1 ] && grep -qx '{\"schema\":1,\"last_check_unix\":1000}' '$SB/state/auto-update-status.json'"
+
+setup v2025.01.08 v2025.01.09 48; echo 'not json' >"$SB/remote/latest"; run_update
+check "status: an unreadable release list records nothing" bash -c "[ $RC = 1 ] && [ ! -e '$SB/state/auto-update-status.json' ]"
+
+setup "" v2025.01.09 48; no_agent; run_install
+check "status: --install is not a timer check" bash -c "[ $RC = 0 ] && [ ! -e '$SB/state/auto-update-status.json' ]"
+
+setup v2025.01.08 v2025.01.10 48; write_tag_release v2025.01.10 48; run_args --tag v2025.01.10
+check "status: --tag is not a timer check" bash -c "[ $RC = 0 ] && [ ! -e '$SB/state/auto-update-status.json' ]"
+
+setup v2025.01.09 v2025.01.09 48; mkdir "$SB/state/auto-update-status.json.new"; run_update
+check "status: an unwritable status file is a warning, never a failed run" \
+    bash -c "[ $RC = 0 ] && grep -q 'WARNING: cannot write .*auto-update-status.json' '$SB/journal' && [ ! -e '$SB/state/auto-update-status.json' ]"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

@@ -51,9 +51,10 @@ VM may still hold is never `free`:
 - any I/O error (the guest's `io-error`, surface errors `io-errors`) ⇒
   `failed`, whatever else the result says;
 - the disk's target classified `hdd`/`ssd`/`nvme` with no failure ⇒ `free`
-  (`verified_tier`, `probed_at`, `last_probe`, and `verified_size_bytes` =
-  the size the GUEST measured, d1's `size_mib`, guest release 7 — never
-  the miner's figure);
+  (`verified_tier` = the lower of that grade and the operator's declared
+  class, `hdd` when none is declared (`tiers.capped`: downgrade-only),
+  `probed_at`, `last_probe`, and `verified_size_bytes` = the size the GUEST
+  measured, d1's `size_mib`, guest release 7 — never the miner's figure);
 - classified `unfit`, the guest's `disk-too-small`, or a measured size
   below the size class the run measured on the probe VM's cmdline (the
   miner overstated it) ⇒ `unfit`;
@@ -115,7 +116,7 @@ from .models import (
 from .probe_owners import probe_owners
 from .routing import REPORT_MAX_AGE
 from .storage_doc import DEFAULT_POOL_ID
-from .tiers import SELLABLE_TIERS, DiskTier
+from .tiers import SELLABLE_TIERS, DiskTier, capped
 
 if TYPE_CHECKING:
     from .probe import TickReport
@@ -397,12 +398,16 @@ def create_run(
             .exists()
         ):
             return None
-        # Every selection condition again, under the rows' locks.
+        # Every selection condition again, under the rows' locks — taken in
+        # `disk_id` order, the order every writer of a node's disk rows
+        # locks them in (`dedicated.assign`, the storage document's class
+        # sync).
         locked = {
             d.pk: d
             for d in candidate_rows(now)
             .select_for_update()
             .filter(pk__in=picked, miner_node_id__iexact=node_id)
+            .order_by("disk_id")
         }
         rows = [locked[pk] for pk in picked if pk in locked]
         if not rows:
@@ -579,8 +584,18 @@ def verdict_for(disk: DedicatedDisk, run: DiskProbeRun | None) -> tuple[str, str
     return (
         DedicatedDiskState.FREE,
         PASS,
-        {**probed, "verified_tier": tier, "verified_size_bytes": measured},
+        {
+            **probed,
+            "verified_tier": capped(tier, disk.declared_class),
+            "verified_size_bytes": measured,
+        },
     )
+
+
+def _classified(disk: DedicatedDisk, run: DiskProbeRun) -> str:
+    """The d1 grade the run's target gave `disk`, before the declared cap."""
+    entry = next((t for t in _dedicated_targets(run) if str(t.get("disk_pk")) == str(disk.pk)), {})
+    return str(entry.get("classified_tier") or "")
 
 
 def probe_failure(run: DiskProbeRun | None) -> str:
@@ -612,12 +627,22 @@ def settle(*, now: datetime, report: TickReport) -> None:
         fields.update(state=state, freed_at=now, updated_at=now)
         current = Q(pk=disk.pk, state=DedicatedDiskState.PROBING)
         current &= Q(last_probe=run) if run is not None else Q(last_probe__isnull=True)
+        # The cap was read with the row: a declared class changed meanwhile
+        # leaves the disk probing for the next pass (never sold above it).
+        current &= (
+            Q(declared_class=disk.declared_class)
+            if disk.declared_class is not None
+            else Q(declared_class__isnull=True)
+        )
         with transaction.atomic():
             if not DedicatedDisk.objects.filter(current).update(**fields):
                 continue
             detail: dict[str, Any] = {"run_id": run.run_id.hex if run else ""}
             if "verified_tier" in fields:
                 detail["verified_tier"] = str(fields["verified_tier"])
+            if reason == PASS and run is not None:
+                detail["classified_tier"] = _classified(disk, run)
+                detail["declared_class"] = disk.declared_class or ""
             if state == DedicatedDiskState.PENDING_PROBE:
                 detail["probe_failures"] = fields["probe_failures"]
             dedicated.audit_transition(

@@ -1190,6 +1190,14 @@ storageMove:
 # - milliunitsPerGb: miner pay for dedicated disks (design §8), resource
 #   units per served second in thousandths per GiB of a served slot's size
 #   class. Empty / "0" = off: epoch weights unchanged.
+# - milliunitsPerGbByTier: the same rate per SOLD tier, `tier:milliunits`
+#   comma-separated (e.g. "ssd:150,nvme:250"); a slot is paid at the tier
+#   it was sold at, an unlisted tier at milliunitsPerGb. Empty = one rate.
+# - sellableTiers: the dedicated tiers on sale (contract §8), comma-separated
+#   among hdd, ssd, nvme; always renders, default "hdd" (today's offer; an
+#   empty value renders "hdd" too — `enabled` is the switch that sells none). A
+#   launch at a tier not listed answers 409 `dedicated-disks-not-offered`;
+#   feasibility and regions list only these.
 # Flip together with the backend's COMPUTE_DEDICATED_ENABLED, after the
 # internal end-to-end test.
 dedicatedDisks:
@@ -1197,7 +1205,7 @@ dedicatedDisks:
   allowedOwners: ""
   maxPerVm: ""
   minGuestRelease: "7"
-  minAgentVersion: "v2026.10.22.1"
+  minAgentVersion: ""
   # R3, the dedicated-disk probe (apps.disktier.dedicated_probe): a declared
   # or released disk becomes `free` only through a passing d1 verdict. Its
   # own switch (pool probing stays off); driven by the `disktier-probe`
@@ -1210,6 +1218,8 @@ dedicatedDisks:
     enabled: "false"
     miners: ""
   milliunitsPerGb: ""
+  milliunitsPerGbByTier: ""
+  sellableTiers: "hdd"
 # §18.10 host inventory ingest (`apps.disktier.host_inventory`): the
 # Edge-relayed, miner-signed `POST /v1/telemetry/host-inventory` (web pod,
 # the only reader of the flag). UNTRUSTED, shown to the node owner only;
@@ -1227,7 +1237,7 @@ hostInventory:
 # own pod) and a `world:443` egress rule. Unauthenticated GitHub API: 60
 # requests/hour per IP, one per run.
 agentReleaseWatch:
-  enabled: "false"
+  enabled: "true"
   schedule: "23 * * * *"
   resources:
     requests:
@@ -1261,6 +1271,8 @@ disktierProbe:
   # The probe owners (`<numeric user id>:<SS58>`, comma-separated) and the
   # lowest blessed guest release of the probe image. Empty = the settings.py
   # defaults (none, 0): nothing launches, whichever probe switch is on.
+  # Reserved range 990000000+ (vali probe owners; the backend never
+  # creates user ids there). Fresh SS58s, no key kept.
   owners: ""
   minGuestRelease: ""
   schedule: "7,22,37,52 * * * *"

@@ -1228,8 +1228,10 @@ def test_the_disktier_cronjobs_ship_suspended_with_the_vali_identity() -> None:
     assert not [
         k
         for k in _configmap_data(docs)
-        if k.startswith("VALI_DISK") and k != "VALI_DISK_TIER_FALLBACK_OWNERS"
+        if k.startswith("VALI_DISK")
+        and k not in {"VALI_DISK_TIER_FALLBACK_OWNERS"}
     ]
+    assert "VALI_DISK_PROBE_ENABLED" not in _configmap_data(docs)
 
 
 @_needs_helm
@@ -1258,9 +1260,32 @@ def test_the_disk_probe_alerts_cannot_fire_while_the_probe_is_off() -> None:
     (probe,) = [
         d for d in docs if d.get("kind") == "CronJob" and d["metadata"]["name"] == "disktier-probe"
     ]
+    # The CronJob runs for the dedicated canary; the pool probe stays off,
+    # so `hippius_disk_probe_enabled` is 0 and these rules cannot fire.
     assert probe["spec"]["suspend"] is True
+    assert "VALI_DISK_PROBE_ENABLED" not in _configmap_data(docs)
     off = _docs("--set", "disktierProbe.alerts.enabled=false")
     assert not [d for d in off if d["metadata"].get("name") == "hippius-disktier-probe"]
+
+
+@_needs_helm
+def test_dedicated_tiers_ship_hdd_only_with_one_pay_rate() -> None:
+    """Contract §8: VALI_DEDICATED_SELLABLE_TIERS always renders, "hdd" as
+    shipped and when the key is emptied (today's offer, the settings.py
+    default); the per-tier pay rates render only when set."""
+    shipped = _configmap_data(_docs())
+    assert shipped["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd"
+    assert "VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER" not in shipped
+    emptied = _configmap_data(_docs("--set", "dedicatedDisks.sellableTiers="))
+    assert emptied["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd"
+    set_ = _configmap_data(
+        _docs(
+            "--set", "dedicatedDisks.sellableTiers=hdd\\,ssd\\,nvme",
+            "--set", "dedicatedDisks.milliunitsPerGbByTier=ssd:150\\,nvme:250",
+        )
+    )
+    assert set_["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd,ssd,nvme"
+    assert set_["VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER"] == "ssd:150,nvme:250"
 
 
 @_needs_helm
@@ -1269,11 +1294,21 @@ def test_the_dedicated_probe_ships_off_and_its_alerts_cannot_fire_while_off() ->
     miner allowlist and the shared probe identity only when set (no
     VALI_DISK_* key by default), and every dedicated alert is guarded on a
     fresh push with `hippius_dedicated_probe_enabled == 1`."""
-    docs = _docs()
+    docs = _docs(
+        "--set", "dedicatedDisks.probe.enabled=false",
+        "--set", "dedicatedDisks.probe.miners=",
+        "--set", "disktierProbe.owners=",
+        "--set", "disktierProbe.minGuestRelease=",
+    )
     data = _configmap_data(docs)
     assert data["VALI_DEDICATED_PROBE_ENABLED"] == "false"
     assert "VALI_DEDICATED_PROBE_MINERS" not in data
     assert not [k for k in data if k.startswith("VALI_DISK_PROBE")]
+    # Shipped: off, like the explicit off rendering above.
+    shipped = _configmap_data(_docs())
+    assert shipped["VALI_DEDICATED_PROBE_ENABLED"] == "false"
+    assert "VALI_DEDICATED_PROBE_MINERS" not in shipped
+    assert "VALI_DISK_PROBE_ENABLED" not in shipped
     (rule,) = [
         d
         for d in docs
@@ -1571,14 +1606,17 @@ def _world_443_rules(docs: list[dict]) -> list[dict]:
 
 
 @_needs_helm
-def test_agent_release_watch_is_off_by_default_and_renders_nothing() -> None:
-    docs = _docs()
+def test_agent_release_watch_off_renders_nothing() -> None:
+    docs = _docs("--set", "agentReleaseWatch.enabled=false")
     names = {(d.get("kind"), d["metadata"]["name"]) for d in docs}
     assert ("CronJob", "agent-release-watch") not in names
     assert "VALI_AGENT_RELEASE_WATCH" not in yaml.safe_dump(docs)
     # Its egress rule is not there either: with the other world:443 users
     # off, nothing opens the port.
-    assert _world_443_rules(_docs(*_WORLD_OFF)) == []
+    assert _world_443_rules(_docs("--set", "agentReleaseWatch.enabled=false", *_WORLD_OFF)) == []
+    # Shipped: on (the operator rows' latest_agent_release / update_pending).
+    shipped = {(d.get("kind"), d["metadata"]["name"]) for d in _docs()}
+    assert ("CronJob", "agent-release-watch") in shipped
 
 
 @_needs_helm
