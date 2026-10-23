@@ -57,6 +57,54 @@ def test_the_free_disks_per_size_class(operator_client: APIClient) -> None:
 
 
 @override_settings(**ON)
+def test_by_default_only_hdd_is_listed_and_every_faster_disk_counts_under_it(
+    operator_client: APIClient,
+) -> None:
+    _fleet()
+    from apps.disktier.models import DedicatedDisk
+
+    DedicatedDisk.objects.filter(disk_id="wwn-0x11").update(verified_tier="nvme")
+    DedicatedDisk.objects.filter(disk_id="wwn-0x12").update(verified_tier="ssd")
+    fr = {r["region"]: r for r in operator_client.get(URL).json()["regions"]}["FR"]
+    assert list(fr["dedicated_disks"]) == ["hdd"]
+    assert fr["dedicated_disks"]["hdd"]["sizes"][-1] == {
+        "size_gb": 22300,
+        "free": 3,
+        "max_per_host": 2,
+    }
+
+
+@override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["nvme", "hdd", "ssd"]})
+def test_each_sold_tier_lists_every_disk_that_qualifies_for_it(
+    operator_client: APIClient,
+) -> None:
+    _fleet()
+    from apps.disktier.models import DedicatedDisk
+
+    DedicatedDisk.objects.filter(disk_id="wwn-0x11").update(verified_tier="nvme")
+    DedicatedDisk.objects.filter(disk_id="wwn-0x12").update(verified_tier="ssd")
+    fr = {r["region"]: r for r in operator_client.get(URL).json()["regions"]}["FR"]
+    assert fr["dedicated_disks"] == {
+        "hdd": {
+            "sizes": [
+                {"size_gb": 16000, "free": 1, "max_per_host": 1},
+                {"size_gb": 22300, "free": 3, "max_per_host": 2},
+            ]
+        },
+        "ssd": {"sizes": [{"size_gb": 22300, "free": 2, "max_per_host": 2}]},
+        "nvme": {"sizes": [{"size_gb": 22300, "free": 1, "max_per_host": 1}]},
+    }
+    assert list(fr["dedicated_disks"]) == ["hdd", "ssd", "nvme"]
+
+
+@override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["ssd"]})
+def test_a_tier_not_on_sale_is_not_listed(operator_client: APIClient) -> None:
+    _fleet()
+    fr = {r["region"]: r for r in operator_client.get(URL).json()["regions"]}["FR"]
+    assert fr["dedicated_disks"] == {"ssd": {"sizes": []}}
+
+
+@override_settings(**ON)
 def test_a_gated_miner_offers_none(operator_client: APIClient) -> None:
     _fleet()
     MinerCapacity.objects.filter(miner_node_id=node_id(1)).update(status="quarantined")

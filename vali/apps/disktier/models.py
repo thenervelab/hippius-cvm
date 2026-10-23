@@ -209,6 +209,12 @@ class DedicatedDisk(models.Model):
     verified_tier = models.CharField(
         max_length=8, choices=DiskTier.choices, default=DiskTier.UNKNOWN, db_default="unknown"
     )
+    #: The class (`hdd` | `ssd` | `nvme`) the operator declared for the disk
+    #: in vali's storage document (`dedicated_disks[].class`). VALI-SIDE
+    #: ONLY: never pushed to the agent, whose `DedicatedDiskSpec` refuses
+    #: unknown keys. A cap, never a grade: a probe pass sets `verified_tier`
+    #: to min(d1 classification, this); `None` caps at `hdd`.
+    declared_class = models.CharField(max_length=8, null=True, blank=True)  # noqa: DJ001
     last_probe = models.ForeignKey(
         "DiskProbeRun", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -259,6 +265,11 @@ class DedicatedDisk(models.Model):
                 fields=["assigned_vm", "assigned_slot"],
                 condition=Q(assigned_vm__isnull=False),
                 name="disktier_disk_one_per_vm_slot",
+            ),
+            models.CheckConstraint(
+                condition=Q(declared_class__isnull=True)
+                | Q(declared_class__in=["nvme", "ssd", "hdd"]),
+                name="disktier_disk_declared_class_valid",
             ),
         ]
 

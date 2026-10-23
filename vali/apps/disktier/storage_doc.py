@@ -11,11 +11,19 @@ it.
 The document vali stores and sends:
 
     {"pools": [{"id", "path", "class", "budget_gb", "os_disks", "state"}],
-     "dedicated_disks": [{"id", "state"}]}
+     "dedicated_disks": [{"id", "state", "class"?}]}
 
 pools 1..=4 sorted by id with `default` among them; dedicated disks ≤ 24
 sorted by id. `revision`, `not_after_unix` and `dry_run` are added per
 push.
+
+A dedicated disk's optional `class` (`hdd` | `ssd` | `nvme`) is the
+operator's declared class, the cap of the tier it can be sold at
+(`DedicatedDisk.declared_class`). It is VALI-SIDE ONLY: the agent's
+`DedicatedDiskSpec` is `deny_unknown_fields`, so [`order_payload`] strips
+it from every push and dry run (the agent sees, and hashes, the document
+it always did). A disk without one is stored without the key, so a
+document that never names a class stays byte-identical.
 """
 
 from __future__ import annotations
@@ -42,6 +50,9 @@ DEDICATED_DISK_ID_PREFIXES = ("wwn-", "ata-", "scsi-", "nvme-")
 
 _POOL_KEYS = frozenset({"id", "path", "class", "budget_gb", "os_disks", "state"})
 _DISK_KEYS = frozenset({"id", "state"})
+#: Keys a dedicated disk may carry in vali's document only (never pushed).
+_DISK_VALI_KEYS = frozenset({"class"})
+DEDICATED_CLASSES = ("nvme", "ssd", "hdd")
 _DOC_KEYS = frozenset({"pools", "dedicated_disks"})
 
 _POOL_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
@@ -129,10 +140,11 @@ def _disk(raw: Any) -> dict[str, Any]:
         raise DocError("storage-config-malformed", "each dedicated disk is an object")
     disk_id = raw.get("id")
     label = disk_id if isinstance(disk_id, str) else ""
-    if set(raw) != _DISK_KEYS:
+    if not _DISK_KEYS <= set(raw) <= _DISK_KEYS | _DISK_VALI_KEYS:
         raise DocError(
             "storage-config-malformed",
-            f"a dedicated disk has exactly the keys {sorted(_DISK_KEYS)}",
+            f"a dedicated disk has the keys {sorted(_DISK_KEYS)} and optionally "
+            f"{sorted(_DISK_VALI_KEYS)}",
             disk=label[:MAX_DEDICATED_DISK_ID_LEN],
         )
     if not isinstance(disk_id, str) or not is_valid_dedicated_disk_id(disk_id):
@@ -144,7 +156,14 @@ def _disk(raw: Any) -> dict[str, Any]:
         )
     if raw["state"] not in DESIRED_STATES:
         raise DocError("disk-state-invalid", f"state is one of {DESIRED_STATES}", disk=disk_id)
-    return {"id": disk_id, "state": raw["state"]}
+    out = {"id": disk_id, "state": raw["state"]}
+    if "class" in raw:
+        if raw["class"] not in DEDICATED_CLASSES:
+            raise DocError(
+                "disk-class-invalid", f"class is one of {DEDICATED_CLASSES}", disk=disk_id
+            )
+        out["class"] = raw["class"]
+    return out
 
 
 def normalize(
@@ -239,17 +258,24 @@ def content_key(doc: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def agent_disks(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """The document's dedicated disks as the agent takes them: `{id, state}`
+    only (the vali-side `class` stripped)."""
+    return [{k: d[k] for k in sorted(_DISK_KEYS)} for d in doc.get("dedicated_disks", [])]
+
+
 def order_payload(
     doc: dict[str, Any], *, revision: int, not_after_unix: int, dry_run: bool
 ) -> bytes:
-    """The `storage-config` order JSON `encode-order` reads."""
+    """The `storage-config` order JSON `encode-order` reads — never a
+    vali-side key ([`agent_disks`])."""
     return json.dumps(
         {
             "revision": revision,
             "not_after_unix": not_after_unix,
             "dry_run": dry_run,
             "pools": doc["pools"],
-            "dedicated_disks": doc.get("dedicated_disks", []),
+            "dedicated_disks": agent_disks(doc),
         },
         sort_keys=True,
     ).encode()

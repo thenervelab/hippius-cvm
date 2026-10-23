@@ -46,3 +46,14 @@ def satisfies(actual: str, required: str) -> bool:
     if required not in SELLABLE_TIERS:
         raise ValueError(f"not a sellable tier: {required!r}")
     return rank(actual) > 0 and rank(actual) >= rank(required)
+
+
+def capped(classified: str, declared: str | None) -> str:
+    """What a dedicated disk is verified at: the lower of its probe grade
+    and its operator's declared class, `hdd` when none is declared
+    (downgrade-only: a declaration never raises a grade). `unfit` /
+    `unknown` stay what they are."""
+    cap = declared if declared in SELLABLE_TIERS else DiskTier.HDD
+    if rank(classified) == 0:
+        return classified
+    return classified if rank(classified) <= rank(cap) else str(cap)

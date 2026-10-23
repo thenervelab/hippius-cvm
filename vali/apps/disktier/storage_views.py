@@ -231,7 +231,19 @@ def _write(fn: Any) -> Response:
         )
     except storage_config.PoolNotDrained as exc:
         return _pool_not_drained(exc)
+    except storage_config.DiskClassLocked as exc:
+        return _disk_class_locked(exc)
     return _stage_response(row, changed)
+
+
+def _disk_class_locked(exc: storage_config.DiskClassLocked) -> Response:
+    return _error(
+        409,
+        "the declared class of a dedicated disk assigned to a VM cannot change",
+        "conflict",
+        code="disk-assigned",
+        disk=exc.disk[:96],
+    )
 
 
 def _pool_not_drained(exc: storage_config.PoolNotDrained) -> Response:
@@ -330,6 +342,7 @@ def _disk_row(disk: DedicatedDisk, desired: dict[str, str]) -> dict[str, Any]:
         "reported_at": disk.reported_at,
         "state": disk.state,
         "verified_tier": disk.verified_tier,
+        "declared_class": disk.declared_class,
         "last_probed_on": _day(disk.probed_at),
         "behind_controller": disk.behind_controller,
         "assigned": disk.state == DedicatedDiskState.ASSIGNED,
@@ -718,6 +731,8 @@ class OperatorStorageAdoptView(_NodeStorageView):
             )
         except storage_config.PoolNotDrained as exc:
             return _pool_not_drained(exc)
+        except storage_config.DiskClassLocked as exc:
+            return _disk_class_locked(exc)
         return _stage_response(row, changed)
 
 
@@ -933,6 +948,8 @@ class OperatorStoragePoolForceRemoveView(_NodeStorageView):
             # The current document already drops another pool not drained
             # (a held, pre-guard document): fix that first.
             return _pool_not_drained(exc)
+        except storage_config.DiskClassLocked as exc:
+            return _disk_class_locked(exc)
         except storage_config.StageConflict as exc:
             return _error(
                 412,

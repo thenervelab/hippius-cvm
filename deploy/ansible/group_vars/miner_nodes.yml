@@ -316,6 +316,15 @@ miner_cosign:
 # (the SIGKILL swap, or an auto-update): the play never restarts the agent.
 miner_inventory_enabled: true
 
+# The software section also reports the agent auto-updater's state
+# (`software.auto_update`: on/off and why, last check, failed release),
+# read from its files by the collector (`--report-auto-update`), for the
+# operator dashboard. OFF until vali's verifier accepts the key (a vali
+# older than it refuses the WHOLE report), and needs an agent that knows
+# the flag (an older collector exits on it; the agent itself is never
+# affected). Applied with `--tags miner_inventory`.
+miner_inventory_report_auto_update: false
+
 # Local in-band IPMI (sensors' power supplies, the BMC firmware):
 # ipmitool is installed, and ipmi_devintf loaded (now and at boot, for
 # /dev/ipmi0), when this is true AND the host has a BMC (ipmi_si loaded,

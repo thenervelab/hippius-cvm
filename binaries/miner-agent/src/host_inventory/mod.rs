@@ -21,6 +21,7 @@
 //! storage inventory and its SMART / NVMe / RAID advisories ([`storage`]).
 //! Sensors, IPMI firmware and the kernel journal come later.
 
+pub mod auto_update;
 pub mod cpu;
 pub mod kernel;
 pub mod memory;
@@ -85,6 +86,9 @@ pub struct HostPaths {
     pub host_root: PathBuf,
     /// `/etc/fstab`: what is configured on a boot path, mounted or not.
     pub fstab: PathBuf,
+    /// The auto-updater's files (`software.auto_update`); `None`: not
+    /// reported (`host-inventory-collect` without `--report-auto-update`).
+    pub auto_update: Option<auto_update::AutoUpdatePaths>,
 }
 
 impl Default for HostPaths {
@@ -106,6 +110,7 @@ impl Default for HostPaths {
             udev_data: PathBuf::from("/run/udev/data"),
             host_root: PathBuf::from("/"),
             fstab: PathBuf::from("/etc/fstab"),
+            auto_update: None,
         }
     }
 }
@@ -1069,6 +1074,7 @@ pub(crate) mod fixture {
                 udev_data: r.join("run/udev/data"),
                 host_root: r.join("root"),
                 fstab: r.join("root/etc/fstab"),
+                auto_update: None,
             }
         }
 

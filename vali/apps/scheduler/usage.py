@@ -618,11 +618,14 @@ def _accrue_one(
         # scaled by the guest's degradation or the OS-disk tier (a disk's
         # service is the disk). The slot states are read at accrual time,
         # not over the receipt's window: a lagging receipt is paid on the
-        # current host evidence (bounded by the receipt lag).
-        dedicated_rate = disk_dedicated.milliunits_per_gb()
-        if dedicated_rate and binding.dedicated_gb:
-            paid_gb = min(binding.dedicated_gb, disk_dedicated.payable_gb(fields.vm_id))
-            unit_seconds += paid_gb * dedicated_rate * billable // 1000
+        # current host evidence (bounded by the receipt lag). Each slot at the
+        # rate of the tier it was SOLD at (contract §8), so an nvme disk sold
+        # as hdd earns hdd pay.
+        if binding.dedicated_gb and disk_dedicated.pay_enabled():
+            milli_gb = disk_dedicated.payable_milliunits_gb(
+                fields.vm_id, cap_gb=binding.dedicated_gb
+            )
+            unit_seconds += milli_gb * billable // 1000
 
         wm.last_period_end = max(wm.last_period_end, fields.period_end)
         wm.save(update_fields=[*seq_fields, "last_period_end"])

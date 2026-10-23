@@ -39,6 +39,7 @@ hippius-miner-update.timer → hippius-miner-update.service
        .sigstore.json, not draft/prerelease), newer than installed, no
        .update-failed-<tag> marker, complete for >= MIN_RELEASE_AGE_H.
        None → exit 0 ("up to date", "waiting", "downgrade refused")
+     (the list read, auto-update-status.json records the check)
   6. download → sha256 vs SHA256SUMS → cosign attestation → --version == tag
   7. preflight: skip_shutdown_teardown = true, Restart= set, agent active,
      no QEMU anywhere in the agent's cgroup tree, virsh lists the domains
@@ -239,6 +240,94 @@ cosign is installed by the play at
   That stops and disables the timer and renders
   `AUTO_UPDATE_DISABLED=true`; `hippius-miner-agent.service` is not
   touched.
+
+Off is an abnormal state: the operator dashboard warns about it (below).
+If you cut it, put it back.
+
+## Dashboard: what the node reports
+
+The operator dashboard shows, per node (`GET /v1/operator/nodes`, and the
+staff `/v1/operator/fleet` rows):
+
+| Field | Source |
+|---|---|
+| `agent_version` | the release tag the agent reports in its heartbeat |
+| `latest_agent_release` `{tag, published_at, eligible_at}` | vali's own read of the GitHub release list (`vali_agent_release_watch`, the same completeness rule as the updater); `eligible_at` = last required file + 24 h |
+| `update_pending` | `agent_version` is older than the newest release past `eligible_at`; `null` when either side is unknown |
+| `auto_update` `{enabled, disabled_reason, last_check_at, failed_tag, reported_at}` | the node itself, in its host inventory (`software.auto_update`) |
+
+The node reads `auto_update` from files only; nothing runs the updater:
+
+- `enabled` is false when the first of these applies, in this order
+  (`disabled_reason`): `/var/lib/hippius-miner/.no-auto-update` exists
+  (`no_auto_update_file`); `AUTO_UPDATE_DISABLED=true` in
+  `/etc/hippius-miner/auto-update.env` (`disabled_in_env`);
+  `hippius-miner-update.timer` is not enabled, masked, or was never
+  installed (`timer_disabled`).
+- `last_check_at`: each timer run that reads the release list writes
+  `/var/lib/hippius-miner/auto-update-status.json`
+  (`{"schema":1,"last_check_unix":<epoch>}`). Opted-out runs, runs that
+  cannot reach GitHub, `--install` and `--tag` do not. `null` until the
+  first such run (a host still on an older updater script, or a fresh
+  install). The report reaches vali every 6 h, and the timer adds up to
+  6 h of jitter: older than about 13 h while `enabled` means the timer
+  does not run or GitHub is unreachable from the host.
+- `failed_tag`: the newest `.update-failed-<tag>` newer than the agent
+  reporting. That release is never retried here.
+- `auto_update` is `null` when the node does not report it (below), or
+  when one of the files exists but cannot be read: unknown, never a
+  guess.
+- The node reads the default paths only (`/var/lib/hippius-miner`,
+  `/etc/hippius-miner/auto-update.env`, `/etc/systemd/system`). A host
+  that moves `MINER_STATE_DIR`, points the updater at another env file
+  (`HIPPIUS_MINER_UPDATE_ENV`, e.g. a one-off canary copy), or sets
+  `AUTO_UPDATE_DISABLED` in a systemd drop-in is reported from the
+  defaults. A timer that is enabled but stopped, or whose runs fail
+  before reading the release list, shows `enabled: true` with a
+  `last_check_at` that stops moving.
+
+### Remedy text
+
+For the dashboard, per `disabled_reason`:
+
+- `no_auto_update_file`: "Auto-update is off on this node. Turn it back
+  on: `sudo rm /var/lib/hippius-miner/.no-auto-update`."
+- `disabled_in_env` or `timer_disabled`: "Auto-update is off on this
+  node. Turn it back on: re-run play 06 with `--tags miner_auto_update`,
+  without `miner_auto_update_enabled=false` (remove it from the host's
+  `host_vars` and from `-e`)."
+
+  ```bash
+  cd deploy/ansible
+  ansible-playbook -i inventory.yml playbooks/06-miner-bootstrap.yml \
+      --limit <miner> --tags miner_auto_update
+  ```
+
+- `failed_tag` set: "Release `<tag>` failed its health check on this node
+  and will not be retried. Check `journalctl -t hippius-miner-update`,
+  then `sudo rm /var/lib/hippius-miner/.update-failed-<tag>` to retry it,
+  or wait for the next release."
+
+One sentence for every case: "Auto-update is off on this node: remove
+`/var/lib/hippius-miner/.no-auto-update`, or re-run play 06 with
+`--tags miner_auto_update` without `miner_auto_update_enabled=false`."
+
+### Rollout (vali first, then the nodes)
+
+`software.auto_update` is a new key of the host inventory. vali's verifier
+decodes it with `deny_unknown_fields`: a vali older than the key refuses
+the WHOLE report. So:
+
+1. vali image with the key pinned (and, for `latest_agent_release`,
+   `agentReleaseWatch.enabled: "true"` in the vali chart).
+2. An agent release that knows `--report-auto-update` rolled to the fleet
+   (an older collector exits on the unknown flag: its inventory goes
+   stale, the agent itself is not affected).
+3. `miner_inventory_report_auto_update: true`, applied with
+   `--tags miner_inventory` (the collector units only, no agent restart).
+
+The updater script writes the status file once play 05/06 has installed
+this version of it; until then `last_check_at` is `null`.
 
 ## Variables (`group_vars/miner_nodes.yml`)
 

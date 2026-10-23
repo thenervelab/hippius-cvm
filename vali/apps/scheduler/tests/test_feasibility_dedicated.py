@@ -133,7 +133,8 @@ def test_the_api_carries_the_block_on_every_answer(real_fleet, authed_client) ->
         ({"dedicated_min_size_gb": "16000"}, "dedicated-invalid"),
         ({"dedicated_tier": "hdd"}, "dedicated-invalid"),
         ({"dedicated_count": "two", "dedicated_min_size_gb": "16000"}, "dedicated-invalid"),
-        ({**Q, "dedicated_tier": "ssd"}, "dedicated-invalid"),
+        ({**Q, "dedicated_tier": "sas"}, "dedicated-invalid"),
+        ({**Q, "dedicated_tier": "SSD"}, "dedicated-invalid"),
         ({**Q, "dedicated_count": "0"}, "dedicated-count-invalid"),
         ({**Q, "dedicated_count": "9"}, "dedicated-count-invalid"),
         ({**Q, "dedicated_min_size_gb": "999"}, "dedicated-size-invalid"),
@@ -142,3 +143,47 @@ def test_the_api_carries_the_block_on_every_answer(real_fleet, authed_client) ->
 def test_invalid_parameters_are_400(real_fleet, authed_client, query, category) -> None:  # noqa: F811
     resp = authed_client.get(URL, query)
     assert (resp.status_code, resp.json()["category"]) == (400, category), resp.content
+
+
+# ── tiers (contract §8) ─────────────────────────────────────────────
+
+ALL_TIERS = {**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["hdd", "ssd", "nvme"]}
+
+
+def _tiered(seed: int, tiers: list[str]) -> None:
+    capable(node_id(seed))
+    for i, tier in enumerate(tiers):
+        make_disk(f"wwn-0x{seed}{i}", node=node_id(seed), tier=tier)
+
+
+@pytest.mark.parametrize("tier", ["ssd", "nvme"])
+def test_a_tier_not_on_sale_is_never_not_offered(real_fleet, tier) -> None:  # noqa: F811
+    _tiered(1, ["nvme", "nvme"])
+    request = DedicatedRequest(tier, 2, 16000)
+    with override_settings(**ON):  # the default: hdd only
+        result = feasibility.assess("small", dedicated=request)
+    assert (result.verdict, result.reason) == ("never", "dedicated-disks-not-offered")
+    assert result.dedicated == {**request.as_spec(), "placeable": False, "max_count_at_size": 0}
+
+
+@override_settings(**ALL_TIERS)
+def test_a_tier_counts_only_disks_verified_at_or_above_it(real_fleet) -> None:  # noqa: F811
+    _tiered(1, ["hdd", "ssd", "nvme", "nvme"])
+    counts = {
+        tier: feasibility.assess("small", dedicated=DedicatedRequest(tier, 2, 16000)).dedicated[
+            "max_count_at_size"
+        ]
+        for tier in ("hdd", "ssd", "nvme")
+    }
+    assert counts == {"hdd": 4, "ssd": 3, "nvme": 2}
+    result = feasibility.assess("small", dedicated=DedicatedRequest("nvme", 3, 16000))
+    assert (result.verdict, result.reason) == ("not-now", "no-dedicated-capacity")
+
+
+@override_settings(**ALL_TIERS)
+def test_the_api_takes_each_tier(real_fleet, authed_client) -> None:  # noqa: F811
+    _tiered(1, ["nvme", "nvme"])
+    for tier in ("hdd", "ssd", "nvme"):
+        body = authed_client.get(URL, {**Q, "dedicated_tier": tier}).json()["flavors"][0]
+        assert body["dedicated"]["tier"] == tier
+        assert body["dedicated"]["placeable"] is True

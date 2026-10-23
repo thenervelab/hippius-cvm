@@ -46,6 +46,19 @@ class DedicatedDiskSpecSerializer(serializers.Serializer):
     state = serializers.ChoiceField(choices=list(DESIRED_STATES))
 
 
+# `class` is a Python keyword: declared below.
+DedicatedDiskSpecSerializer._declared_fields["class"] = serializers.ChoiceField(
+    choices=["nvme", "ssd", "hdd"],
+    required=False,
+    help_text=(
+        "Optional, vali-side only (never pushed to the agent): the class the operator "
+        "declares. The disk is sold at most at this tier (the lower of it and the probe's "
+        "grade); absent = at most hdd. Raising it re-probes a free disk; lowering it "
+        "applies at once. Refused (409 `disk-assigned`) on a disk assigned to a VM."
+    ),
+)
+
+
 class StorageDocSerializer(serializers.Serializer):
     pools = StoragePoolSerializer(many=True, help_text="1..4, must include `default`.")
     dedicated_disks = DedicatedDiskSpecSerializer(many=True, required=False, help_text="≤ 24.")
@@ -95,6 +108,7 @@ class DedicatedDiskRowSerializer(serializers.Serializer):
     reported_at = serializers.DateTimeField(allow_null=True)
     state = serializers.ChoiceField(choices=sorted(s.value for s in DedicatedDiskState))
     verified_tier = serializers.ChoiceField(choices=_TIERS)
+    declared_class = serializers.ChoiceField(choices=["nvme", "ssd", "hdd"], allow_null=True)
     last_probed_on = serializers.DateField(allow_null=True)
     behind_controller = serializers.BooleanField()
     assigned = serializers.BooleanField()

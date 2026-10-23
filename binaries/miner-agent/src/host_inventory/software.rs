@@ -99,7 +99,10 @@ pub fn collect_software(
         last_boot_unix: uptime_s
             .and_then(|u| i64::try_from(u).ok())
             .map(|u| now_unix.saturating_sub(u)),
-        auto_update: None,
+        auto_update: paths
+            .auto_update
+            .as_ref()
+            .and_then(|p| super::auto_update::collect_auto_update(p, crate::release::RELEASE_TAG)),
     }
 }
 
@@ -118,6 +121,22 @@ pub(crate) mod tests {
             "PRETTY_NAME=\"Ubuntu 24.04.3 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\n\
              VERSION=\"24.04.3 LTS (Noble Numbat)\"\nID=ubuntu\n",
         );
+    }
+
+    /// A software section with nothing in it.
+    pub(crate) fn empty_software() -> SoftwareSection {
+        SoftwareSection {
+            status: SectionStatus::Ok,
+            kernel: None,
+            os_name: None,
+            os_version_id: None,
+            agent_version: None,
+            qemu_version: None,
+            libvirt_version: None,
+            uptime_s: 0,
+            last_boot_unix: None,
+            auto_update: None,
+        }
     }
 
     pub(crate) fn runner(r: Runner) -> Runner {
@@ -148,6 +167,31 @@ pub(crate) mod tests {
         assert_eq!(s.libvirt_version.as_deref(), Some("10.0.0"));
         assert_eq!(s.uptime_s, 3600);
         assert_eq!(s.last_boot_unix, Some(1_800_000_000 - 3600));
+    }
+
+    #[test]
+    fn auto_update_is_reported_only_when_asked() {
+        let h = Host::new();
+        software_tree(&h);
+        // Off by default: no key, whatever the host holds.
+        h.write("var/lib/hippius-miner/.no-auto-update", "");
+        let s = collect_software(&h.paths(), &Runner::default(), 1);
+        assert_eq!(s.auto_update, None);
+        let mut paths = h.paths();
+        let r = h.dir.path();
+        paths.auto_update = Some(super::super::auto_update::AutoUpdatePaths {
+            state_dir: r.join("var/lib/hippius-miner"),
+            env_file: r.join("etc/hippius-miner/auto-update.env"),
+            timer_wants: r.join("timers.target.wants/hippius-miner-update.timer"),
+        });
+        let a = collect_software(&paths, &Runner::default(), 1)
+            .auto_update
+            .unwrap();
+        assert!(!a.enabled);
+        assert_eq!(
+            a.disabled_reason,
+            Some(hippius_host_inventory::AutoUpdateDisabledReason::NoAutoUpdateFile)
+        );
     }
 
     #[test]

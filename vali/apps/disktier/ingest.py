@@ -60,7 +60,7 @@ from .models import (
     PlacementDisk,
     VmDiskIoHourly,
 )
-from .storage_config import desired_disk_states, record_reported_revision
+from .storage_config import desired_disk_classes, desired_disk_states, record_reported_revision
 
 _MIB = 1024 * 1024
 # The `PositiveIntegerField` range shared by every backend.
@@ -129,9 +129,10 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
         )
 
         # A disk first seen after the desired document named it takes the
-        # document's state from the start (a `draining` declaration must
+        # document's state (and declared class) from the start (a `draining` declaration must
         # not read as `active` until the next write).
         desired = desired_disk_states(node_id)
+        classes = desired_disk_classes(node_id)
         for disk in report.dedicated_disks:
             reported = {
                 "size_bytes": (
@@ -149,6 +150,7 @@ def record_storage_report(node_id: str, report: DeclaredStorage, now: datetime) 
                     **reported,
                     "declared_at": now,
                     "desired_state": desired.get(disk.disk_id, "active"),
+                    "declared_class": classes.get(disk.disk_id),
                 },
             )
             if not created:

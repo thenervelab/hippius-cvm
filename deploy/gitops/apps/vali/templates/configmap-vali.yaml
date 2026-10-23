@@ -454,6 +454,10 @@ data:
   {{- with (.Values.dedicatedDisks).milliunitsPerGb }}
   VALI_DEDICATED_MILLIUNITS_PER_GB: {{ . | toString | quote }}
   {{- end }}
+  {{- with (.Values.dedicatedDisks).milliunitsPerGbByTier }}
+  VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER: {{ . | quote }}
+  {{- end }}
+  VALI_DEDICATED_SELLABLE_TIERS: {{ (.Values.dedicatedDisks).sellableTiers | default "hdd" | quote }}
   # §18.10 host inventory ingest — see values.yaml `hostInventory.ingest`.
   VALI_HOST_INVENTORY_INGEST: {{ (.Values.hostInventory).ingest | default "false" | toString | quote }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}

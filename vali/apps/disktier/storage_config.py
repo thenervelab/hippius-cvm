@@ -33,6 +33,22 @@ storage-config-disabled`) is left alone for
 `VALI_STORAGE_CONFIG_UNSUPPORTED_RETRY_S`. Every push carries a fresh
 `order_id`.
 
+## Declared dedicated-disk classes
+
+A dedicated disk's optional `class` in the document is vali-side only
+(`storage_doc.order_payload` strips it from every push: the agent refuses
+unknown keys). [`stage`] mirrors it onto `DedicatedDisk.declared_class`
+under the disk rows' locks, downgrade-only for what is on sale:
+
+- a disk assigned to a VM: a change of cap is refused ([`DiskClassLocked`],
+  409 `disk-assigned`): what the VM was sold never moves under it (absent
+  and `hdd` are the same cap: that spelling change is only stored);
+- a `free` disk whose class goes UP (absent counts as `hdd`): back to
+  `pending_probe` — only a probe can grant the higher tier (a disk in any
+  other state only records it: its next probe verdict applies it);
+- going DOWN, in any state: its `verified_tier` is capped at once
+  (`tiers.capped`).
+
 ## Draining pools
 
 `DELETE …/pools/{id}` marks a pool `draining` (no new disk). The pass
@@ -184,6 +200,80 @@ def check_removals(node_id: str, row: MinerStorageConfig | None, doc: dict[str, 
             raise PoolNotDrained(pool_id, field)
 
 
+class DiskClassLocked(Exception):
+    """A write would change the declared class of a dedicated disk that is
+    assigned to a VM."""
+
+    def __init__(self, disk: str) -> None:
+        super().__init__(f"dedicated disk {disk!r} is assigned: its class cannot change")
+        self.disk = disk
+
+
+def _cap(declared: str | None) -> str:
+    """The tier a declared class caps a disk at (`None` = `hdd`)."""
+    from .tiers import capped
+
+    return capped("nvme", declared)
+
+
+def _sync_disk_classes(node_id: str, doc: dict[str, Any], now: datetime, actor: Actor) -> None:
+    """Mirror the document's dedicated-disk `class` onto vali's known disks
+    (see the module docstring), the disk rows locked in `disk_id` order (the
+    order `dedicated.assign` and the probe lock them in). Raises
+    `DiskClassLocked` before writing anything when a disk assigned to a VM
+    would change cap (`None` and `hdd` are the same cap: only the spelling
+    is stored). State and tier changes are audited under `actor`."""
+    from . import dedicated
+    from .models import DedicatedDiskState
+    from .tiers import capped, rank
+
+    wanted = {d["id"]: d.get("class") for d in doc.get("dedicated_disks", [])}
+    if not wanted:
+        return
+    rows = list(
+        DedicatedDisk.objects.select_for_update()
+        .filter(miner_node_id=node_id, disk_id__in=list(wanted))
+        .order_by("disk_id")
+    )
+    changed = [d for d in rows if d.declared_class != wanted[d.disk_id]]
+    for disk in changed:
+        held = disk.state == DedicatedDiskState.ASSIGNED
+        if held and _cap(disk.declared_class) != _cap(wanted[disk.disk_id]):
+            raise DiskClassLocked(disk.disk_id)
+    who = f"storage-config:{actor.principal}"
+    for disk in changed:
+        new = wanted[disk.disk_id]
+        DedicatedDisk.objects.filter(pk=disk.pk).update(declared_class=new, updated_at=now)
+        detail = {
+            "declared_class": new or "",
+            "previous_class": disk.declared_class or "",
+            "user": actor.user[:128],
+        }
+        if rank(_cap(new)) > rank(_cap(disk.declared_class)):
+            # Up: only a probe grants the higher tier. A free disk goes back
+            # to one; any other state waits for its next verdict anyway.
+            dedicated.request_reprobe(
+                disk,
+                reason="declared-class-raised",
+                detail=detail,
+                states=(DedicatedDiskState.FREE,),
+                actor=who,
+            )
+            continue
+        # Down (or the same cap): the verified tier is capped at once.
+        tier = capped(disk.verified_tier, new)
+        if tier != disk.verified_tier:
+            DedicatedDisk.objects.filter(pk=disk.pk).update(verified_tier=tier, updated_at=now)
+            dedicated.audit_transition(
+                disk,
+                before=disk.state,
+                after=disk.state,
+                reason="declared-class-lowered",
+                detail={**detail, "verified_tier": tier, "previous_tier": disk.verified_tier},
+                actor=who,
+            )
+
+
 class ForceRefused(Exception):
     """A force removal vali refuses: `code` says which condition fails."""
 
@@ -328,6 +418,7 @@ def stage(
             raise StageConflict(seen)
         new_owner = not actor.system and row.owner_family != actor.account
         check_removals(node_id, row, doc)
+        _sync_disk_classes(node_id, doc, now, actor)
         if row.revision > 0 and row.content_key == key and not new_owner:
             audit(node_id, row.revision, action, actor, doc=doc, outcome="unchanged", now=now)
             return row, False
@@ -365,6 +456,17 @@ def desired_disk_states(node_id: str) -> dict[str, str]:
         .first()
     ) or {}
     return {d["id"]: d["state"] for d in body.get("dedicated_disks", [])}
+
+
+def desired_disk_classes(node_id: str) -> dict[str, str]:
+    """`{disk_id: class}` of the disks the node's desired document declares
+    a class for (vali-side, `DedicatedDisk.declared_class`)."""
+    body = (
+        MinerStorageConfig.objects.filter(miner_node_id=node_id, revision__gt=0)
+        .values_list("body", flat=True)
+        .first()
+    ) or {}
+    return {d["id"]: d["class"] for d in body.get("dedicated_disks", []) if d.get("class")}
 
 
 def _sync_disk_desired_states(node_id: str, doc: dict[str, Any]) -> None:
@@ -602,8 +704,14 @@ def _adopt_document(node_id: str, overrides: dict[str, Any], account: str) -> di
             }
         )
     latest = max(p.reported_at for p in pools if p.reported_at is not None)
+    # The report carries no class (vali-side only): each disk keeps the one
+    # vali already holds for it.
     disks = [
-        {"id": d.disk_id, "state": "draining" if d.reported_state == "draining" else "active"}
+        {
+            "id": d.disk_id,
+            "state": "draining" if d.reported_state == "draining" else "active",
+            **({"class": d.declared_class} if d.declared_class else {}),
+        }
         for d in DedicatedDisk.objects.filter(miner_node_id=node_id, reported_at=latest)
     ]
     return storage_doc.normalize(
@@ -876,9 +984,10 @@ def _remove_drained_pools(row: MinerStorageConfig, *, now: datetime) -> MinerSto
             exc.pool,
         )
         return MinerStorageConfig.objects.get(pk=row.pk)
-    except (StageConflict, LookupError, storage_doc.DocError):
-        # An operator wrote meanwhile (or the document no longer passes):
-        # the next pass looks again.
+    except (StageConflict, LookupError, storage_doc.DocError, DiskClassLocked):
+        # An operator wrote meanwhile (or the document no longer passes, or
+        # its classes no longer match an assigned disk): the next pass looks
+        # again.
         return MinerStorageConfig.objects.get(pk=row.pk)
     if changed:
         log.info(
