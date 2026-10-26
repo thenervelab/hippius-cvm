@@ -8,13 +8,18 @@ One test per CLAIM the gate makes. The claims are:
   C3  the declared workflow identity must be a `*-image.yml` workflow in
       THIS repo (a signature from anywhere else cannot be declared);
   C4  `mergedSource` is a restatement of the ref, not a free-text claim —
-      claiming `true` for a PR build (or `false` for a main build) is REFUSED;
-  C5  a build from an unmerged ref REQUIRES a substantive acknowledgement;
+      claiming `true` for a tag build (or `false` for a main build) is REFUSED;
+  C5  a build from a non-main ref (a `v*` tag) REQUIRES a substantive
+      acknowledgement;
   C6  a stale acknowledgement on a merged build is REFUSED;
   C7  the cosign argv actually carries the DECLARED identity AND the DECLARED
       commit sha as EXACT constraints — this is the binding itself: remove
       either flag and a different build of the same repo verifies clean;
-  C8  the real, committed charts satisfy the policy.
+  C8  the real, committed charts satisfy the policy;
+  C11 only `refs/heads/main` and `refs/tags/v*` identities are declarable —
+      a `refs/pull/<n>/merge` build (signed by the image workflows until
+      hippius-audits#12) or any other branch is REFUSED, ack or not, and so
+      is the pre-rename repo name.
 
 Run: `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`
 (also wired into the required `rust` CI job via
@@ -42,7 +47,7 @@ from verify_image_provenance import (  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-WF = "https://github.com/thenervelab/hippius-compute/.github/workflows"
+WF = "https://github.com/thenervelab/hippius-compute-internal/.github/workflows"
 SHA = "6173f3879b253084594cdc49474850980ca2050a"
 DIGEST = "sha256:" + "ab" * 32
 
@@ -52,7 +57,7 @@ MERGED = {
     "provenance": {
         "workflowRef": f"{WF}/kbs-image.yml@{MAIN_REF}",
         "commitSha": SHA,
-        "runUrl": "https://github.com/thenervelab/hippius-compute/actions/runs/1234",
+        "runUrl": "https://github.com/thenervelab/hippius-compute-internal/actions/runs/1234",
         "mergedSource": True,
     },
 }
@@ -61,13 +66,13 @@ UNMERGED = {
     "repository": "ghcr.io/thenervelab/hippius-kbs-server",
     "digest": DIGEST,
     "provenance": {
-        "workflowRef": f"{WF}/kbs-image.yml@refs/pull/897/merge",
+        "workflowRef": f"{WF}/kbs-image.yml@refs/tags/v2026.10.16",
         "commitSha": SHA,
-        "runUrl": "https://github.com/thenervelab/hippius-compute/actions/runs/1234/attempts/1",
+        "runUrl": "https://github.com/thenervelab/hippius-compute-internal/actions/runs/1234/attempts/1",
         "mergedSource": False,
         "unmergedSourceAck": (
-            "PR #897 was merged as 558c7a5c; the built tree is the ephemeral "
-            "refs/pull/897/merge commit and is not recoverable from this repo."
+            "Tag v2026.10.16 was cut from a hotfix branch that is not on main; "
+            "re-pin to the next main build once the hotfix is merged."
         ),
     },
 }
@@ -151,7 +156,7 @@ class C3_IdentityShape(unittest.TestCase):
 
 
 class C4_MergedSourceIsARestatementOfTheRef(unittest.TestCase):
-    def test_claiming_merged_for_a_pr_build_refused(self):
+    def test_claiming_merged_for_a_tag_build_refused(self):
         img = mutate(UNMERGED, mergedSource=True, unmergedSourceAck=None)
         with self.assertRaisesRegex(ProvenanceError, "contradicts"):
             check_declaration("x", img)
@@ -224,10 +229,42 @@ class C7_CosignArgvIsTheBinding(unittest.TestCase):
         self.assertEqual(argv[argv.index("--certificate-oidc-issuer") + 1], OIDC_ISSUER)
         self.assertEqual(
             argv[argv.index("--certificate-github-workflow-repository") + 1],
-            "thenervelab/hippius-compute",
+            "thenervelab/hippius-compute-internal",
         )
         self.assertEqual(argv[0], "verify")
         self.assertEqual(argv[-1], f"ghcr.io/thenervelab/hippius-kbs-server@{DIGEST}")
+
+
+class C11_OnlyMainOrReleaseTagRefs(unittest.TestCase):
+    """hippius-audits#12: the image workflows pushed AND keyless-signed PR
+    builds, so a `refs/pull/<n>/merge` signature from the very same workflow
+    exists in GHCR for unreviewed code. No acknowledgement can admit it."""
+
+    def test_pr_merge_ref_refused_even_with_ack(self):
+        img = mutate(UNMERGED, workflowRef=f"{WF}/kbs-image.yml@refs/pull/897/merge")
+        with self.assertRaisesRegex(ProvenanceError, "pull_request build is never"):
+            check_declaration("x", img)
+
+    def test_other_branch_refused(self):
+        for ref in ("refs/heads/feature/x", "refs/heads/main-old", "refs/heads/mainx"):
+            with self.subTest(ref=ref):
+                with self.assertRaisesRegex(ProvenanceError, "workflowRef must be"):
+                    check_declaration("x", mutate(UNMERGED, workflowRef=f"{WF}/kbs-image.yml@{ref}"))
+
+    def test_non_v_tag_refused(self):
+        img = mutate(UNMERGED, workflowRef=f"{WF}/kbs-image.yml@refs/tags/test-1")
+        with self.assertRaisesRegex(ProvenanceError, "workflowRef must be"):
+            check_declaration("x", img)
+
+    def test_pre_rename_repo_name_refused(self):
+        old = "https://github.com/thenervelab/hippius-compute/.github/workflows"
+        img = mutate(MERGED, workflowRef=f"{old}/kbs-image.yml@{MAIN_REF}")
+        with self.assertRaisesRegex(ProvenanceError, "workflowRef must be"):
+            check_declaration("x", img)
+
+    def test_release_tag_accepted_with_ack(self):
+        d = check_declaration("x", UNMERGED)
+        self.assertTrue(d["workflow_ref"].endswith("@refs/tags/v2026.10.16"))
 
 
 class C9_GateCannotGoBlind(unittest.TestCase):

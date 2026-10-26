@@ -70,6 +70,11 @@ esac
 
 . /scripts/functions
 
+# Switch_root gap trace (one uptime line on the console log; see
+# hippius_golden_trace in hippius-golden-boot).
+read -r _hnt_up _ < /proc/uptime 2>/dev/null || true
+echo "hippius-trace: net-teardown-start up=${_hnt_up:-}" > /dev/kmsg 2>/dev/null || true
+
 # `ip` is staged by the bake's `hippius-luks-hook` into the initrd at
 # `/sbin/ip` (or `/usr/sbin/ip`, whichever the host has). Fail-quiet
 # if it's somehow not present — we'd rather leave the lease in place

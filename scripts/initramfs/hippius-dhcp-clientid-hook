@@ -32,4 +32,16 @@ conf="${DESTDIR}/etc/dhcpcd.conf"
 # Drop every `duid` line (any DUID type), then ask for the MAC client-id.
 sed -i '/^[[:space:]]*duid\([[:space:]]\|$\)/d' "${conf}"
 grep -qx 'clientid' "${conf}" || printf '\n# hippius: client-id = 01:<MAC>, as the booted guest sends (#289)\nclientid\n' >> "${conf}"
+
+# Switch_root gap trace: one uptime line per dhcpcd event on the console
+# log (dhcpcd-run-hooks sources every file in this directory). Cheap and
+# unconditional: the cmdline is measured, so it cannot be gated.
+hooks="${DESTDIR}/usr/lib/dhcpcd/dhcpcd-hooks"
+mkdir -p "${hooks}"
+cat > "${hooks}/01-hippius-trace" <<'HIPPIUS_DHCPCD_TRACE'
+# hippius: switch_root gap trace, one line per dhcpcd event.
+read -r _hht_up _ < /proc/uptime 2>/dev/null || true
+echo "hippius-trace: dhcpcd ${reason:-} ${interface:-} up=${_hht_up:-}" > /dev/kmsg 2>/dev/null || true
+HIPPIUS_DHCPCD_TRACE
+chmod 0644 "${hooks}/01-hippius-trace"
 exit 0

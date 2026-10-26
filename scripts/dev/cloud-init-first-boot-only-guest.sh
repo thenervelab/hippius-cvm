@@ -40,14 +40,26 @@ fail=0
 ok()  { echo "cloud-init-first-boot-only: OK — $*"; }
 err() { echo "cloud-init-first-boot-only: FAIL — $*" >&2; fail=1; }
 
+# Package installs: quiet when they work, retried (distro mirrors flap), and
+# loud when they do not, as in sshd-key-only-guest.sh.
+pkg() {
+    local log=/tmp/pkg.log try
+    for try in 1 2 3; do
+        "$@" >"${log}" 2>&1 && return 0
+        sleep $((try * 5))
+    done
+    echo "cloud-init-first-boot-only: package install failed after 3 tries: $*" >&2
+    tail -n 30 "${log}" >&2
+    exit 2
+}
 if ! command -v cloud-init >/dev/null 2>&1; then
     echo "cloud-init-first-boot-only: installing cloud-init" >&2
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq >/dev/null \
-            && apt-get install -y -qq --no-install-recommends cloud-init openssh-server sudo >/dev/null 2>&1
+        pkg apt-get update -qq
+        pkg apt-get install -y -qq --no-install-recommends cloud-init openssh-server sudo
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q cloud-init openssh-server sudo >/dev/null 2>&1
+        pkg dnf install -y -q cloud-init openssh-server sudo
     fi
 fi
 command -v cloud-init >/dev/null 2>&1 || { echo "cloud-init-first-boot-only: cannot install cloud-init" >&2; exit 2; }

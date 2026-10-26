@@ -104,8 +104,8 @@ class JobSpec:
     # a byte-identical env.
     package_refresh: str = ""
     # CDN plan I3 bake profile (`TenantBake.profile`). Rendered as
-    # BAKE_PROFILE (+ BAKE_CDN_BACKEND_URL) only for `cdn-node`, so every
-    # standard bake renders a byte-identical env.
+    # BAKE_PROFILE for every non-standard profile (+ BAKE_CDN_BACKEND_URL
+    # for `cdn-node`), so every standard bake renders a byte-identical env.
     profile: str = "standard"
     cdn_backend_url: str = ""
 
@@ -242,12 +242,11 @@ def render_job(spec: JobSpec) -> dict[str, Any]:
         container_env.append(
             {"name": "BAKE_PACKAGE_REFRESH", "value": spec.package_refresh}
         )
+    if spec.profile != "standard":
+        container_env.append({"name": "BAKE_PROFILE", "value": spec.profile})
     if spec.profile == "cdn-node":
-        container_env.extend(
-            [
-                {"name": "BAKE_PROFILE", "value": spec.profile},
-                {"name": "BAKE_CDN_BACKEND_URL", "value": spec.cdn_backend_url},
-            ]
+        container_env.append(
+            {"name": "BAKE_CDN_BACKEND_URL", "value": spec.cdn_backend_url}
         )
 
     # Vault `jwt` auth (M-k8sauth, #94) — the Job exchanges its projected

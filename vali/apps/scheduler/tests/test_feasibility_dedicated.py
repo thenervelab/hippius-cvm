@@ -167,7 +167,32 @@ def test_a_tier_not_on_sale_is_never_not_offered(real_fleet, tier) -> None:  # n
 
 
 @override_settings(**ALL_TIERS)
-def test_a_tier_counts_only_disks_verified_at_or_above_it(real_fleet) -> None:  # noqa: F811
+def test_exact_a_tier_counts_only_disks_verified_at_it(real_fleet) -> None:  # noqa: F811
+    _tiered(1, ["hdd", "ssd", "nvme", "nvme"])
+    counts = {
+        tier: feasibility.assess("small", dedicated=DedicatedRequest(tier, 1, 16000)).dedicated[
+            "max_count_at_size"
+        ]
+        for tier in ("hdd", "ssd", "nvme")
+    }
+    assert counts == {"hdd": 1, "ssd": 1, "nvme": 2}
+    result = feasibility.assess("small", dedicated=DedicatedRequest("hdd", 2, 16000))
+    assert (result.verdict, result.reason) == ("not-now", "no-dedicated-capacity")
+    assert result.dedicated["placeable"] is False
+
+
+@override_settings(**ALL_TIERS)
+def test_exact_an_hdd_order_with_only_nvme_free_is_no_dedicated_capacity(
+    real_fleet,  # noqa: F811
+) -> None:
+    _tiered(1, ["nvme", "nvme"])
+    result = feasibility.assess("small", dedicated=DedicatedRequest("hdd", 1, 16000))
+    assert (result.verdict, result.reason) == ("not-now", "no-dedicated-capacity")
+    assert result.dedicated["max_count_at_size"] == 0
+
+
+@override_settings(**{**ALL_TIERS, "VALI_DEDICATED_TIER_MATCH": "minimum"})
+def test_minimum_a_tier_counts_disks_verified_at_or_above_it(real_fleet) -> None:  # noqa: F811
     _tiered(1, ["hdd", "ssd", "nvme", "nvme"])
     counts = {
         tier: feasibility.assess("small", dedicated=DedicatedRequest(tier, 2, 16000)).dedicated[
@@ -182,8 +207,78 @@ def test_a_tier_counts_only_disks_verified_at_or_above_it(real_fleet) -> None:  
 
 @override_settings(**ALL_TIERS)
 def test_the_api_takes_each_tier(real_fleet, authed_client) -> None:  # noqa: F811
-    _tiered(1, ["nvme", "nvme"])
+    _tiered(1, ["hdd", "hdd", "ssd", "ssd", "nvme", "nvme"])
     for tier in ("hdd", "ssd", "nvme"):
         body = authed_client.get(URL, {**Q, "dedicated_tier": tier}).json()["flavors"][0]
         assert body["dedicated"]["tier"] == tier
         assert body["dedicated"]["placeable"] is True
+
+
+# ── integrity (contract §9) ─────────────────────────────────────────
+
+INTEGRITY_ON = {**ALL_TIERS, "VALI_DEDICATED_INTEGRITY_ENABLED": True}
+
+
+@pytest.mark.parametrize(
+    ("flags", "tier"),
+    [
+        # The switch off: never, at any tier.
+        (ALL_TIERS, "ssd"),
+        (ALL_TIERS, "nvme"),
+        # hdd never takes integrity.
+        (INTEGRITY_ON, "hdd"),
+    ],
+)
+def test_integrity_not_offered_is_never_and_not_placeable(real_fleet, flags, tier) -> None:  # noqa: F811
+    _tiered(1, ["nvme", "nvme"])
+    request = DedicatedRequest(tier, 2, 16000, integrity=True)
+    with override_settings(**flags):
+        result = feasibility.assess("small", dedicated=request)
+    assert (result.verdict, result.reason) == ("never", "dedicated-integrity-not-offered")
+    assert result.dedicated == {
+        "tier": tier,
+        "count": 2,
+        "min_size_gb": 16000,
+        "integrity": True,
+        "placeable": False,
+        "max_count_at_size": 0,
+    }
+
+
+@override_settings(**INTEGRITY_ON)
+def test_integrity_offered_answers_like_a_plain_request(real_fleet) -> None:  # noqa: F811
+    _tiered(1, ["ssd", "ssd"])
+    result = feasibility.assess(
+        "small", dedicated=DedicatedRequest("ssd", 2, 16000, integrity=True)
+    )
+    assert (result.verdict, result.reason) == ("yes", "")
+    assert result.dedicated["integrity"] is True
+    assert result.dedicated["placeable"] is True
+    plain = feasibility.assess("small", dedicated=DedicatedRequest("ssd", 2, 16000))
+    assert "integrity" not in plain.dedicated
+    assert {k: v for k, v in result.dedicated.items() if k != "integrity"} == plain.dedicated
+
+
+@override_settings(**INTEGRITY_ON)
+def test_the_api_takes_dedicated_integrity(real_fleet, authed_client) -> None:  # noqa: F811
+    _tiered(1, ["ssd", "ssd"])
+    q = {**Q, "dedicated_tier": "ssd"}
+    on = authed_client.get(URL, {**q, "dedicated_integrity": "true"}).json()["flavors"][0]
+    assert on["dedicated"]["integrity"] is True and on["dedicated"]["placeable"] is True
+    off = authed_client.get(URL, {**q, "dedicated_integrity": "false"}).json()["flavors"][0]
+    assert off == authed_client.get(URL, q).json()["flavors"][0]
+    assert "integrity" not in off["dedicated"]
+    hdd = authed_client.get(URL, {**Q, "dedicated_integrity": "true"}).json()["flavors"][0]
+    assert (hdd["verdict"], hdd["reason"]) == ("never", "dedicated-integrity-not-offered")
+    assert hdd["dedicated"]["placeable"] is False
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "TRUEISH", "on", "TRUE", "True", " true"])
+def test_a_malformed_dedicated_integrity_is_400(real_fleet, authed_client, value) -> None:  # noqa: F811
+    resp = authed_client.get(URL, {**Q, "dedicated_integrity": value})
+    assert (resp.status_code, resp.json()["category"]) == (400, "dedicated-invalid"), resp.content
+
+
+def test_dedicated_integrity_alone_needs_count_and_size(real_fleet, authed_client) -> None:  # noqa: F811
+    resp = authed_client.get(URL, {"flavor": "small", "dedicated_integrity": "true"})
+    assert (resp.status_code, resp.json()["category"]) == (400, "dedicated-invalid")

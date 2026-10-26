@@ -113,8 +113,9 @@ together with the broker (#102)**, which lights up releases — see the
 `ghcr.io/thenervelab/hippius-kbs-server` is a **public** package, pinned
 in `values.yaml` by SHA-256 digest (never a tag — §F supply-chain
 discipline) and cosign-signed keyless by `.github/workflows/kbs-image.yml`.
-On a `pull_request` the workflow pushes a `sha-<commit>` image so the
-chart can be pinned and live-tested before merge.
+Only main and `v*` tag builds are pushed and signed; a `pull_request` run
+builds the image and discards it (hippius-audits#12), so a pin always
+names a reviewed build.
 
 A `kata-qemu-snp` confidential pod **guest-pulls** its image — the image
 is fetched *inside* the SEV-SNP CVM by the in-guest image service, which
@@ -128,7 +129,7 @@ cosign keyless attestation is the image's integrity anchor:
 
 ```sh
 cosign verify ghcr.io/thenervelab/hippius-kbs-server@<digest> \
-  --certificate-identity-regexp='https://github.com/thenervelab/hippius-compute' \
+  --certificate-identity-regexp='^https://github\.com/thenervelab/hippius-compute-internal/\.github/workflows/kbs-image\.yml@refs/(heads/main|tags/v[^/]+)$' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
 ```
 
@@ -165,7 +166,7 @@ Nothing in the current codebase closes that. What exists is a
 | control | what it proves | what it does not |
 |---|---|---|
 | digest pin in `values.yaml` | the chart names one content-addressed image | nothing about the pod that is actually running |
-| `verify-gitops-signatures.yml` (repo-wide) | the pinned digest was cosign-signed by *some* `*-image.yml` build of this repo, on *any* ref | which source; a PR build of an unreviewed branch qualifies |
+| `verify-gitops-signatures.yml` (repo-wide) | the pinned digest was cosign-signed by *some* `*-image.yml` build of this repo, on main or a `v*` tag (PR-built signatures, still in GHCR from before hippius-audits#12, are rejected) | which commit, or which image workflow |
 | `image.provenance` + `verify_image_provenance.py` (P3 — every first-party gitops image, not just this chart) | the pinned digest was built by an exactly-named workflow **ref** from an exactly-named **commit**, and an unmerged-source build must be acknowledged in the diff | that the cluster pulled that digest; nothing at runtime |
 | broker `kbsMeasurementAllowlist` | the KBS is a CVM of the expected *shape*, on real AMD silicon | **not** which binary is inside it |
 

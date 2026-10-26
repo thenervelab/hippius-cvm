@@ -10,10 +10,10 @@ m3-golden-sshd-key-only.patch, on the pre-M0, M0-era and stamp-v2 bases
 alike.
 
 diff --git a/scripts/initramfs/hippius-golden-overlay.sh b/scripts/initramfs/hippius-golden-overlay.sh
-index 1b7b7a66..cb29875b 100644
+index d332697e..172b3e23 100644
 --- a/scripts/initramfs/hippius-golden-overlay.sh
 +++ b/scripts/initramfs/hippius-golden-overlay.sh
-@@ -1831,6 +1831,327 @@ hippius_golden_harden_root() {
+@@ -2114,6 +2114,396 @@ hippius_golden_harden_root() {
      hippius_log "golden: M0 guest masks + cloud-init pin + sshd key-only re-asserted into the overlay upper"
  }
  
@@ -39,6 +39,9 @@ index 1b7b7a66..cb29875b 100644
 +#   enable=<unit>:<target>   (repeatable) link the unit + its .wants link
 +#   retire=<unit>            (repeatable) mask a unit an earlier release
 +#                            (or the base) shipped
++#   udev=<name>.rules        (repeatable) link the image's udev/<name>.rules
++#                            into the root's /etc/udev/rules.d (release 8:
++#                            the /dev/vsock permissions)
 +#
 +# Policy:
 +#   - no record ⇒ strict no-op (every initrd built before this design):
@@ -66,10 +69,19 @@ index 1b7b7a66..cb29875b 100644
 +    return 1
 +}
 +
++# Pure predicate: a udev rules file name we accept in a record.
++hippius_golden_valid_rules_name() {
++    case "$1" in
++        '' | *[!A-Za-z0-9._-]* | .* ) return 1 ;;
++        *.rules ) return 0 ;;
++    esac
++    return 1
++}
++
 +# Pure parser (testable): validate a release record and print it back as
 +# normalised lines (`version N`, `security_epoch N`, `commit H`,
-+# `squashfs_sha256 H`, then `enable <unit> <target>` / `retire <unit>` in
-+# record order). Non-zero on any malformed line, unknown or repeated
++# `squashfs_sha256 H`, then `enable <unit> <target>` / `retire <unit>` /
++# `udev <name>.rules` in record order). Non-zero on any malformed line, unknown or repeated
 +# scalar key, or a missing required key.
 +hippius_golden_parse_release() (
 +    set -f
@@ -128,6 +140,10 @@ index 1b7b7a66..cb29875b 100644
 +                hippius_golden_valid_unit_name "${_hgpr_val}" || exit 1
 +                _hgpr_out="${_hgpr_out}retire ${_hgpr_val}${_hgpr_nl}"
 +                ;;
++            udev)
++                hippius_golden_valid_rules_name "${_hgpr_val}" || exit 1
++                _hgpr_out="${_hgpr_out}udev ${_hgpr_val}${_hgpr_nl}"
++                ;;
 +            *) exit 1 ;;
 +        esac
 +    done < "${_hgpr_file}"
@@ -151,6 +167,18 @@ index 1b7b7a66..cb29875b 100644
 +        || hippius_die "golden: components: could not label ${_hgls_dst}"
 +    [ "$(_hippius_golden_selinux_ctx "${_hgls_dst}")" = "${_hgls_ctx}" ] \
 +        || hippius_die "golden: components: label of ${_hgls_dst} did not take"
++}
++
++# The context udev rule links get on this base: the label of the LOWER's
++# /etc/udev/rules.d, or nothing on a base without SELinux. Non-zero (no
++# link is written) when the base is SELinux but has no such directory or
++# label: a missing hardening rule never bricks a boot.
++_hippius_golden_udev_ctx() {
++    [ -e "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux/config" ] || return 0
++    command -v getfattr >/dev/null 2>&1 && command -v setfattr >/dev/null 2>&1 || return 1
++    _hgudc_ctx="$(_hippius_golden_selinux_ctx "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/udev/rules.d")"
++    [ -n "${_hgudc_ctx}" ] || return 1
++    printf '%s' "${_hgudc_ctx}"
 +}
 +
 +# The context unit links get on this base: the label of the LOWER's
@@ -266,6 +294,8 @@ index 1b7b7a66..cb29875b 100644
 +    fi
 +    _hgcr_parsed="$(hippius_golden_parse_release "${_hgcr_rec}")" \
 +        || hippius_die "golden: components: malformed release record ${_hgcr_rec} — fail-closed"
++    _hgcr_nl='
++'
 +    _hgcr_version="" _hgcr_epoch="" _hgcr_commit="" _hgcr_sha=""
 +    while read -r _hgcr_k _hgcr_v _hgcr_rest; do
 +        case "${_hgcr_k}" in
@@ -321,6 +351,14 @@ index 1b7b7a66..cb29875b 100644
 +    done <<HIPPIUS_REC_EOF
 +${_hgcr_parsed}
 +HIPPIUS_REC_EOF
++    # The udev rule links (release 8+): same discipline as the unit links,
++    # into /etc/udev/rules.d (which takes precedence over the base's
++    # /usr/lib/udev/rules.d). Best-effort, never fatal: a rule is
++    # hardening, and refusing the boot over it would leave the tenant with
++    # nothing.
++    case "${_hgcr_parsed}" in
++        *"${_hgcr_nl}udev "*) _hippius_golden_components_udev "${_hgcr_root}" "${_hgcr_parsed}" ;;
++    esac
 +    # For the agents to report; nothing at boot reads it.
 +    printf 'version=%s\nsecurity_epoch=%s\ncommit=%s\nmounted=%s\n' \
 +        "${_hgcr_version}" "${_hgcr_epoch}" "${_hgcr_commit}" "${_hgcr_mounted}" \
@@ -333,6 +371,37 @@ index 1b7b7a66..cb29875b 100644
 +    fi
 +}
 +
++# Link each `udev <name>.rules` record line: ${root}/etc/udev/rules.d/<name>
++# -> ${HIPPIUS_GUEST_RUN}/guest/udev/<name> (the path the booted system
++# sees). Skips, with a WARN, when the directory is not a plain one in the
++# guest root or the SELinux label cannot be had.
++_hippius_golden_components_udev() {
++    _hgcu_root="$1"
++    _hgcu_ctx="$(_hippius_golden_udev_ctx)" || {
++        hippius_log "golden: components: WARN no SELinux label for /etc/udev/rules.d — udev rules not linked"
++        return 0
++    }
++    _hippius_golden_real_dir "${_hgcu_root}" etc/udev/rules.d || {
++        hippius_log "golden: components: WARN /etc/udev/rules.d is not a plain directory in the guest root — udev rules not linked"
++        return 0
++    }
++    while read -r _hgcu_k _hgcu_name _hgcu_rest; do
++        [ "${_hgcu_k}" = udev ] || continue
++        _hgcu_path="${_hgcu_root}/etc/udev/rules.d/${_hgcu_name}"
++        rm -rf "${_hgcu_path}" 2>/dev/null || true
++        if ln -s "${HIPPIUS_GUEST_RUN}/${HIPPIUS_GUEST_MOUNT_NAME}/udev/${_hgcu_name}" "${_hgcu_path}" 2>/dev/null; then
++            if [ -n "${_hgcu_ctx}" ]; then
++                setfattr -h -n security.selinux -v "${_hgcu_ctx}" "${_hgcu_path}" 2>/dev/null \
++                    || hippius_log "golden: components: WARN could not label ${_hgcu_path}"
++            fi
++        else
++            hippius_log "golden: components: WARN could not link ${_hgcu_path}"
++        fi
++    done <<HIPPIUS_REC_EOF
++$2
++HIPPIUS_REC_EOF
++}
++
 +hippius_golden_mount_components() {
 +    [ -n "$1" ] || hippius_die "golden: mount_components needs a rootmnt arg"
 +    _hippius_golden_components_run "$1" "${HIPPIUS_GUEST_DIR}" "${HIPPIUS_GUEST_RUN}"
@@ -341,7 +410,7 @@ index 1b7b7a66..cb29875b 100644
  # Caller MUST have already sourced hippius-release-core.sh.
  hippius_golden_run() {
      _hgrun_rootmnt="$1"
-@@ -1915,5 +2236,9 @@ hippius_golden_run() {
+@@ -2220,5 +2610,9 @@ hippius_golden_run() {
      # bake-time hardening. Fail-closed like the rest of this path.
      hippius_golden_harden_root "${_hgrun_rootmnt}"
  

@@ -42,6 +42,8 @@ mapper_gib() {
 
 attached=""
 n_attached=0
+n_integrity=0
+n_init=0
 problems=0
 printf '%-5s %-10s %-10s %-26s %s\n' SLOT STATE "SIZE(GiB)" MAPPER NOTE
 while read -r slot state gib dev reason; do
@@ -51,11 +53,27 @@ while read -r slot state gib dev reason; do
     note=""
     case "${state}" in
         attached)
-            mapper="/dev/mapper/hippius-${slot}"
-            real="$(mapper_gib "hippius-${slot}")"
+            name="hippius-${slot}"
+            # The first-boot integrity wipe could not rename the mapping
+            # (release 8): it keeps its init name until the next boot.
+            [ "${reason}" = init-name ] && name="hippius-${slot}-init"
+            mapper="/dev/mapper/${name}"
+            real="$(mapper_gib "${name}")"
             [ "${real}" != "-" ] && gib="${real}"
             attached="${attached} ${mapper}"
             n_attached=$((n_attached + 1))
+            if [ -e "${MAPPER_DIR}/${name}_dif" ]; then
+                note="integrity (AEAD)"
+                n_integrity=$((n_integrity + 1))
+            fi
+            case "${reason}" in
+                init-name) note="${note:+${note}, }named ${name} until the next boot" ;;
+                no-journal-this-boot) note="${note:+${note}, }no integrity journal until the next boot" ;;
+            esac
+            ;;
+        initializing)
+            note="first-boot integrity initialisation, ${reason#init-}% done — not usable yet"
+            n_init=$((n_init + 1))
             ;;
         missing)
             note="disk not present this boot (${reason})"
@@ -76,19 +94,41 @@ if [ "${problems}" -gt 0 ]; then
     echo "disk report); a missing or refused disk is never formatted again by the VM."
     echo
 fi
+if [ "${n_init}" -gt 0 ]; then
+    echo "Integrity disks are written once in full on their first boot (about an hour"
+    echo "for a large disk); each appears as /dev/mapper/hippius-xN when it is done."
+    echo
+fi
 if [ "${n_attached}" -eq 0 ]; then
     echo "No dedicated disk is open."
     exit 0
 fi
+
+# What the open disks guarantee against a host that alters them.
+integrity_text() {
+    if [ "${n_integrity}" -eq 0 ]; then
+        echo "They have NO integrity protection of their own; use a
+checksumming layer (ZFS, btrfs) if you need corruption detection."
+    elif [ "${n_integrity}" -eq "${n_attached}" ]; then
+        echo "They carry integrity protection (hmac-sha256 per 4 KiB
+sector): a sector altered on the host reads as an I/O error. An older
+version of a sector put back by the host is not detected: use ZFS or btrfs
+if you need that."
+    else
+        echo "The ones marked \"integrity\" carry integrity
+protection (an altered sector reads as an I/O error); the others have none:
+use a checksumming layer (ZFS, btrfs) if you need corruption detection."
+    fi
+}
 
 # shellcheck disable=SC2086  # the list is split on purpose
 set -- ${attached}
 cat <<EOF
 The disks above are already encrypted (LUKS2, AES-XTS, opened by the VM at
 boot under keys only this VM can obtain). They are raw block devices: no
-filesystem, no RAID. They have NO integrity protection of their own; use a
-checksumming layer (ZFS, btrfs) if you need corruption detection. Hippius
-does not back them up and they cannot be migrated: keep your own backups.
+filesystem, no RAID. $(integrity_text)
+Hippius does not back them up and they cannot be migrated: keep your own
+backups.
 
 Examples (NOT run — pick one, adapt, run it yourself):
 

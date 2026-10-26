@@ -3,8 +3,10 @@
 # Unit test for the per-VM upper initialisation in
 # `scripts/initramfs/hippius-golden-overlay.sh`:
 #
-#   - first boot formats with `--integrity-no-wipe --sector-size 4096`
-#     and the init label, wipes through a journal-less activation with
+#   - first boot formats with `--integrity-no-wipe --sector-size 4096`,
+#     the init label and, in M0 only, a pbkdf2 (1000 iterations) keyslot
+#     (customer keys keep the default argon2id), wipes
+#     through a journal-less activation with
 #     `hippius-guest-release --integrity-wipe`, reopens journaled, runs
 #     mkfs, and only THEN marks the volume initialised;
 #   - a failed wipe never gets a filesystem;
@@ -128,12 +130,18 @@ INIT_SEQ=(
     "^cryptsetup config --label ${R} "
 )
 
-FORMAT="^cryptsetup luksFormat .*--integrity hmac-sha256 .*--integrity-no-wipe --sector-size 4096 --label ${I} "
+# M0: pbkdf2 x1000 (the keyslot passphrase is the KBS's 256-bit random KEK;
+# argon2id would only cost boot time). Customer keys (M1/M2): no --pbkdf at
+# all, i.e. cryptsetup's argon2id: their passphrase can rest on a customer
+# share nobody proved random.
+FORMAT="^cryptsetup luksFormat .*--integrity hmac-sha256 .*--integrity-no-wipe --sector-size 4096 --label ${I} --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "
+FORMAT_KEYED="^cryptsetup luksFormat .*--integrity hmac-sha256 .*--integrity-no-wipe --sector-size 4096 --label ${I} --batch-mode "
+no_pbkdf() { ! grep -q -e '--pbkdf' "${LOG}"; }
 
 # 2a. blank disk → the full first boot, in order.
 case_run 1 "" 0 0 0
 if [ "${RC}" -eq 0 ] && in_order "${FORMAT}" "${INIT_SEQ[@]}"; then
-    ok "first boot: no-wipe 4K luksFormat → journal-less wipe → reopen → mkfs → mark ready"
+    ok "first boot: no-wipe 4K pbkdf2 luksFormat → journal-less wipe → reopen → mkfs → mark ready"
 else
     err "first boot sequence (rc=${RC}): $(cat "${LOG}")"
 fi
@@ -238,11 +246,11 @@ NOWRITE="^wipe|^mkfs|luksFormat|config --label|^cryptsetup open"
 for class in blank init; do
     for isluks in 1 0; do
         keyed_run "${class}" "" "${isluks}" "${I}" 0 0 0
-        [ "${RC}" -eq 0 ] && in_order "${FORMAT}" "${INIT_SEQ[@]}" \
+        [ "${RC}" -eq 0 ] && in_order "${FORMAT_KEYED}" "${INIT_SEQ[@]}" && no_pbkdf \
             || err "class ${class} (isLuks ${isluks}), version-less, E=0 (rc=${RC}): $(cat "${LOG}")"
     done
 done
-ok "M1/M2 class blank/init + version-less + E=0: first-boot format"
+ok "M1/M2 class blank/init + version-less + E=0: first-boot format, default argon2id (no --pbkdf)"
 
 # 3b. class blank / init with E != 0 (or none) → refuse, nothing written.
 #     This is the zeroed upper of a VM that has booted before.
@@ -301,7 +309,7 @@ ok "M1/M2 without a pre-release classification: fail-closed"
 eval "real_$(declare -f hippius_golden_keyed_may_format_blank)"
 hippius_golden_keyed_may_format_blank() { echo "e-gate $1" >> "${LOG}"; real_hippius_golden_keyed_may_format_blank "$@"; }
 keyed_run blank "" 1 "" 0 0 0
-[ "${RC}" -eq 0 ] && in_order "^e-gate 0\$" "${FORMAT}" \
+[ "${RC}" -eq 0 ] && in_order "^e-gate 0\$" "${FORMAT_KEYED}" \
     && ok "M1/M2: E == 0 gate → luksFormat, in that order" \
     || err "E-gate ordering (rc=${RC}): $(cat "${LOG}")"
 keyed_run init "" 0 "${I}" 7 0 0

@@ -26,7 +26,7 @@ image:
   # any KBS / miner-agent / Edge half a release depends on FIRST (the
   # release notes say which). Record the reason for each bump in the
   # commit message, not here.
-  digest: "sha256:b0b6d2a078c06a08d0193bdc4482dc30451b5d08d0f131953f9c28833df59fda"
+  digest: "sha256:2c57b2f6bc746751698eee669aea4ade02fd735a30dcb25e793b3d80819a79ab"
   # ── Build provenance of the digest above (P3) ───────────────────────
   # MACHINE-CHECKED against the digest's Sigstore signature — see the
   # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -37,8 +37,8 @@ image:
   # and cannot.
   provenance:
     workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/vali-image.yml@refs/heads/main"
-    commitSha: "f192e9aa97d82399ef26f605711163985f67050a"
-    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/39808115812/attempts/1"
+    commitSha: "9eb2622fe38dffb2690896c0c796dd537ccfceb7"
+    runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/40261642794/attempts/1"
     mergedSource: true
   # vali is a runc workload, so the PRIVATE ghcr.io/thenervelab image is
   # pulled with the `ghcr-pull-secret` dockerconfigjson Secret,
@@ -140,11 +140,15 @@ scheduler:
   # (§25 destinations), hence the shared ConfigMap.
   # diskTierGate: off | record | enforce — gate (n), a node without an OS
   # pool at the VM's sold tier (`VALI_SCHEDULER_DISK_TIER_GATE`).
-  diskTierGate: "off"
+  # Run "record" first and read the would-reject log before "enforce".
+  diskTierGate: "enforce"
   # The tiers a launch may be sold at (`os_disk_tier`); one besides nvme
   # also needs diskTierGate "enforce" (`VALI_SELLABLE_OS_TIERS`, CSV).
+  # hdd is a budget OS tier, sold up to hddOsMaxFlavor.
   sellableOsTiers:
     - nvme
+    - ssd
+    - hdd
   # The largest flavor sold on the hdd OS tier (`VALI_HDD_OS_MAX_FLAVOR`).
   hddOsMaxFlavor: "large"
   # Owners (`Placement.owner`, the launch `user_id` our product API sets)
@@ -153,6 +157,13 @@ scheduler:
   # that fits). Our own runners only, never a customer. Empty = nobody
   # (`VALI_DISK_TIER_FALLBACK_OWNERS`, CSV).
   diskTierFallbackOwners: []
+  # osTierMatch: minimum | exact — how an OS disk's sold tier matches a
+  # pool's tier (`VALI_OS_TIER_MATCH`; settings.py default "minimum": that
+  # tier or above). "exact": only a pool at that very tier.
+  # EXACT 2026-10-25: an hdd order must not get NVMe at the hdd price;
+  # runner fallback unchanged (diskTierFallbackOwners still take the first
+  # LOWER tier a candidate holds exactly).
+  osTierMatch: "exact"
   # External-miner approval gate (#1631, `apps.scheduler.approval`): while
   # "true", a miner the chain refresh first sees starts PENDING (no
   # placement, no rewards) until an operator runs `vali_approve_miner`,
@@ -691,13 +702,27 @@ orchestrationTick:
 # the dev `vali_create_vm` CLI). #587 Phase 1 — the production API path.
 launchTick:
   enabled: true
+  # VALI_LAUNCH_TICK_CONCURRENCY — launch jobs the ONE worker pod runs at
+  # once (threads). "1" = the serial loop (one job, then the next). Above
+  # it, the placement decision is still serialized fleet-wide by a Postgres
+  # advisory lock (`apps.scheduler.decision_lock`), only the slow I/O
+  # (Vault, preflight, dispatch) overlaps. 1..32; 6-8 is the useful range:
+  # the §22 allowlist pin lock serializes pins too, and each job holds a DB
+  # connection and spawns subprocesses (raise `resources` along with it).
+  concurrency: "6"
+  # How long a stopping pod may drain its in-flight jobs after SIGTERM: the
+  # worker stops claiming, a concurrent job still waiting for a boot slot
+  # ends at once (`miners-booting`, nothing placed), a dispatching one
+  # (~18 s typical) finishes. A job killed past this is left `running` for
+  # the orphan reaper.
+  terminationGracePeriodSeconds: 60
   resources:
     requests:
-      cpu: 50m
-      memory: 192Mi
+      cpu: 100m
+      memory: 384Mi
     limits:
-      cpu: "1"
-      memory: 768Mi
+      cpu: "2"
+      memory: 1536Mi
 
 # #587 Phase 3 — outbound job-event webhook delivery worker. Disabled
 # until an upstream product API registers a callback `url` + provisions
@@ -1014,7 +1039,7 @@ syntheticMonitor:
   # token (vali-synthetic-monitor Secret).
   perMiner:
     # ON 2026-10-21 for every dispatchable miner, externals included, one
-    # probe VM at a time (canary on miner-1 first, #1746).
+    # probe VM at a time (canary on one miner first, #1746).
     enabled: true
     # One run claims (at most) one miner. Every 30 min = 48 runs a day:
     # with the 6 h interval each miner is probed ~4×/day on a small fleet,
@@ -1043,7 +1068,7 @@ syntheticMonitor:
 # carry a hundred pending security updates), and unattended-upgrades then
 # patches each VM's overlay upper, away from the measured golden.
 #
-# `enabled` — a monthly CronJob re-bakes ubuntu/debian/cs10/fedora/cdn-node from the
+# `enabled` — a monthly CronJob re-bakes ubuntu/debian/cs10/fedora/cdn-node/ubuntu-runner from the
 #   currently blessed bakes' inputs WITH a package refresh (apt
 #   dist-upgrade / dnf upgrade; the stamp misses the stage-1 cache), ONE
 #   BAKE AT A TIME (concurrent bakes race on loop devices), then runs the
@@ -1067,11 +1092,12 @@ goldenRebake:
   # `external-secret-synthetic.yaml`).
   e2e: "true"
   # Must exceed the in-process worst case so the e2e `finally` teardown
-  # always runs before SIGKILL: one idle wait (3600) + 4 × (bake wait 3600
-  # + e2e budget 1800 + teardown 720) + the cdn-node bake (3600, no tenant
-  # e2e) = 31680 s. A normal run is ~2-3 h (cold bake ~15 min with the
-  # upgrade, e2e ~15-25 min).
-  activeDeadlineSeconds: 32400
+  # always runs before SIGKILL: one idle wait (3600) + 5 × (bake wait 3600
+  # + e2e budget 1800 + teardown 720; ubuntu/debian/cs10/fedora and
+  # ubuntu-runner) + the cdn-node bake (3600, no tenant e2e) = 37800 s.
+  # A normal run is ~2.5-3.5 h (cold bake ~15 min with the upgrade, e2e
+  # ~15-25 min).
+  activeDeadlineSeconds: 38520
   resources:
     requests:
       cpu: 50m
@@ -1198,6 +1224,10 @@ storageMove:
 #   empty value renders "hdd" too — `enabled` is the switch that sells none). A
 #   launch at a tier not listed answers 409 `dedicated-disks-not-offered`;
 #   feasibility and regions list only these.
+# - tierMatch: how a request's tier matches a disk's verified tier (contract
+#   §8); always renders, default "exact": a tier-T order takes only disks
+#   verified at T (premium stock never sold at a lower price). "minimum": a
+#   disk verified at T or above qualifies, the lowest placed first.
 # Flip together with the backend's COMPUTE_DEDICATED_ENABLED, after the
 # internal end-to-end test.
 dedicatedDisks:
@@ -1219,7 +1249,14 @@ dedicatedDisks:
     miners: ""
   milliunitsPerGb: ""
   milliunitsPerGbByTier: ""
-  sellableTiers: "hdd"
+  sellableTiers: "hdd,ssd,nvme"
+  tierMatch: "exact"
+  # Dedicated disks with integrity (contract §9; ssd / nvme only). Stays
+  # "false" until the miners holding dedicated disks run an agent whose
+  # anchor parser takes `x<N>:<GiB>:i`. The guest-release floor of an
+  # integrity launch (release 8 opens integrity slots).
+  integrityEnabled: "false"
+  integrityMinGuestRelease: "8"
 # §18.10 host inventory ingest (`apps.disktier.host_inventory`): the
 # Edge-relayed, miner-signed `POST /v1/telemetry/host-inventory` (web pod,
 # the only reader of the flag). UNTRUSTED, shown to the node owner only;
@@ -1625,7 +1662,7 @@ tenantBake:
     # a bump. Never roll this back past a build the blessed golden images
     # depend on (e.g. the golden dm-verity/overlay support or the
     # SNP-liveness keepalive that `uptimeLiveness` requires).
-    digest: "sha256:e29b271c67e014d8359c2ab8b8892013c67370deb11b33304fabce2b51a17eb1"
+    digest: "sha256:8751a62959a2dd9d90786cd1683436dc2ac730c4a50660ed21dd2c0a62eb1b71"
     # ── Build provenance of the digest above (P3) ─────────────────────
     # MACHINE-CHECKED against the digest's Sigstore signature — see the
     # equivalent block in `deploy/gitops/apps/kbs/values.yaml` and
@@ -1640,8 +1677,8 @@ tenantBake:
     # auto-pin then blesses it.
     provenance:
       workflowRef: "https://github.com/thenervelab/hippius-compute-internal/.github/workflows/tenant-baker-image.yml@refs/heads/main"
-      commitSha: "a9695e633f4a3cfb44921d1d99de37a5b6c445fa"
-      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/38426512573/attempts/1"
+      commitSha: "d837a8da0af2953148a1db6dbdd25b568e3feffb"
+      runUrl: "https://github.com/thenervelab/hippius-compute-internal/actions/runs/40280052324/attempts/1"
       mergedSource: true
   # Vault `jwt` auth for the bake Job (M-k8sauth, #94). The Vault role is
   # bound to `system:serviceaccount:vali:hippius-tenant-baker` — the SA the
@@ -1882,7 +1919,8 @@ publicApiIngress:
     # `/v1/operator/miners/{node_id}/{storage, storage/pools[/{id}],
     # storage/pools/{id}/force-remove, storage/validate, storage/adopt,
     # storage/history, disk-tiers, dedicated-disks, dedicated-disks/{id}/drain,
-    # hardware, hardware/history, disk-inventory, host-disk-advisories}`.
+    # hardware, hardware/history, disk-inventory, host-disk-advisories,
+    # maintenance}` (`maintenance`: the owner's own cordon, `apps.operator`).
     # Published because the
     # operator dashboard edits its own nodes' pools there, and shows each
     # node's host-reported hardware (§18.10, read-only, carries serials:

@@ -472,7 +472,10 @@ def on_verified_receipt(
 
     if verdicts_on:
         dedicated.record_slot_verdicts(
-            placement.pk, verdicts, datetime.fromtimestamp(fields.period_end, tz=UTC)
+            placement.pk,
+            verdicts,
+            datetime.fromtimestamp(fields.period_end, tz=UTC),
+            dedicated.slot_progress(fields.disk_io),
         )
     digest = receipt_digest(body)
     probe_outcome = _route_probe(fields, placement, digest, now) if probe_on else ""
@@ -497,6 +500,10 @@ def on_verified_receipt(
         targets = _targets(placement.pk) if fields.disk_io else {}
         rows = 0
         for delta in fields.disk_io:
+            if delta.state == dedicated.GUEST_INITIALIZING:
+                # An integrity slot's first-boot wipe (§9): recorded above;
+                # its own writes are no tier evidence, and not news.
+                continue
             if delta.state != "ok":
                 _count("slot_verdicts")
                 log.info(

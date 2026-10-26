@@ -270,6 +270,21 @@ pub struct CvmLifecycle {
     /// at the edge of the pool would all pass. Expire after
     /// [`ASID_RESERVATION_TTL`]; released when the launch ends.
     asid_reservations: Mutex<HashMap<VmId, std::time::Instant>>,
+    /// CPU/RAM/disk-budget held by a passed tenant preflight until its
+    /// launch ([`Self::reserve_preflight_capacity`]). vali KBS-registers
+    /// the vm_id to THIS host between preflight and launch, irreversibly;
+    /// without the hold two concurrent preflights could both pass against
+    /// the same free capacity and the second launch fail 503 after its
+    /// register. Always locked AFTER `handles` (lock order handles →
+    /// capacity_reservations) and checked under that same `handles`
+    /// guard, so check + reserve are atomic. In memory only: an agent
+    /// restart drops every hold (errs towards availability; vali's
+    /// per-miner boot cap bounds the exposure).
+    capacity_reservations: Mutex<HashMap<VmId, CapacityReservation>>,
+    /// How long a [`CapacityReservation`] holds without its launch
+    /// (`[host] preflight_reservation_ttl_secs`, default
+    /// [`PREFLIGHT_RESERVATION_TTL`]).
+    capacity_reservation_ttl: Duration,
     /// The net-policy launch latch ([`crate::netpolicy::apply`]). `None`
     /// ⇒ no gate (tests, and agents without the net-policy route).
     net_policy_gate: Option<Arc<crate::netpolicy::NetPolicyEnforcer>>,
@@ -286,6 +301,94 @@ pub struct CvmLifecycle {
 
 /// How long a preflight's ASID reservation holds without a launch.
 pub const ASID_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Default hold of a passed preflight's CPU/RAM/disk-budget
+/// ([`CapacityReservation`]). vali's preflight → launch gap (launch-digest
+/// check + KBS register + order dispatch) is seconds; 180 s covers it with
+/// a wide margin while a VM vali gave up on frees its capacity soon.
+pub const PREFLIGHT_RESERVATION_TTL: Duration = Duration::from_secs(180);
+
+/// Capacity a passed tenant preflight holds for the launch of the same
+/// vm_id ([`CvmLifecycle::reserve_preflight_capacity`]).
+#[derive(Debug, Clone)]
+struct CapacityReservation {
+    cpu: u8,
+    memory_mb: u32,
+    /// Disk-budget GiB on `pool_id`.
+    disk_gb: u32,
+    pool_id: String,
+    at: std::time::Instant,
+    /// Unique per hold ([`RESERVATION_GENERATION`]).
+    generation: u64,
+}
+
+/// Source of [`CapacityReservation::generation`]; `0` is never issued.
+static RESERVATION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Capacity log lines collected while the `handles` / reservation mutexes
+/// are held, written to stderr when dropped — so no blocking write happens
+/// under those locks. Declare it BEFORE the guards: locals drop in reverse
+/// order, so it is written after them, on every return path.
+#[derive(Default)]
+struct DeferredLog(Vec<String>);
+
+impl DeferredLog {
+    fn push(&mut self, line: String) {
+        self.0.push(line);
+    }
+}
+
+impl Drop for DeferredLog {
+    fn drop(&mut self) {
+        for line in self.0.drain(..) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// What the live [`CapacityReservation`]s of OTHER VMs add to the used
+/// side of [`check_capacity`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reserved {
+    cpu: u64,
+    memory_mb: u64,
+    disk_gb: u64,
+}
+
+/// Sum the reservations that count against `own`'s check on `pool_id`:
+/// every one but `own`'s (a repeat preflight or the launch of the reserved
+/// VM sees its own hold as free, so nothing counts twice) and but those of
+/// VMs that already have a handle (the handle counts them). Disk counts
+/// only on the same pool. Overflow fails closed.
+fn reserved_totals(
+    reservations: &HashMap<VmId, CapacityReservation>,
+    handles: &HashMap<VmId, CvmHandle>,
+    own: Option<&VmId>,
+    pool_id: &str,
+) -> Result<Reserved> {
+    let overflow = || MinerAgentError::InsufficientResources;
+    let mut total = Reserved::default();
+    for (vm_id, r) in reservations {
+        if Some(vm_id) == own || handles.contains_key(vm_id) {
+            continue;
+        }
+        total.cpu = total
+            .cpu
+            .checked_add(u64::from(r.cpu))
+            .ok_or_else(overflow)?;
+        total.memory_mb = total
+            .memory_mb
+            .checked_add(u64::from(r.memory_mb))
+            .ok_or_else(overflow)?;
+        if r.pool_id == pool_id {
+            total.disk_gb = total
+                .disk_gb
+                .checked_add(u64::from(r.disk_gb))
+                .ok_or_else(overflow)?;
+        }
+    }
+    Ok(total)
+}
 
 /// First retry delay for an unverified re-adoption CID; doubles per
 /// failure up to [`CID_VERIFY_MAX_BACKOFF`].
@@ -399,6 +502,8 @@ impl CvmLifecycle {
             readopt_retry_due: std::sync::atomic::AtomicBool::new(false),
             asids: Arc::new(crate::sev_asid::SysfsAsidSource::default()),
             asid_reservations: Mutex::new(HashMap::new()),
+            capacity_reservations: Mutex::new(HashMap::new()),
+            capacity_reservation_ttl: PREFLIGHT_RESERVATION_TTL,
             net_policy_gate: None,
             guest_runs: Arc::new(power_policy::GuestRuns::new()),
             dhcp_lock: tokio::sync::Mutex::new(()),
@@ -1077,7 +1182,7 @@ impl CvmLifecycle {
                 // Before the download: a pool that cannot take the disk, or
                 // has no budget left for it, is refused now, not after.
                 self.admit_pool(pool)?;
-                self.check_pool_disk_budget(pool, disk_gb)?;
+                self.check_pool_disk_budget_for(pool, Some(vm_id), disk_gb)?;
                 vm_pool::VmPoolRecord {
                     pool_id: pool.id.clone(),
                     root: pool.path.clone(),
@@ -1232,6 +1337,13 @@ impl CvmLifecycle {
         enforcer: Arc<crate::netpolicy::NetPolicyEnforcer>,
     ) -> Self {
         self.net_policy_gate = Some(enforcer);
+        self
+    }
+
+    /// How long a passed preflight holds its capacity
+    /// (`[host] preflight_reservation_ttl_secs`; `ZERO` disables the hold).
+    pub fn with_preflight_reservation_ttl(mut self, ttl: Duration) -> Self {
+        self.capacity_reservation_ttl = ttl;
         self
     }
 
@@ -1654,11 +1766,19 @@ impl CvmLifecycle {
             // The second copy a live storage move holds on this pool.
             let move_held = u32::try_from(self.move_held_gb(&pool.path))
                 .map_err(|_| MinerAgentError::InsufficientResources)?;
+            // Before the guard: its lines are written once the guard is gone.
+            let mut log = DeferredLog::default();
             let mut handles = self.lock_handles()?;
             if handles.contains_key(&vm_id) {
                 return Err(MinerAgentError::AlreadyLaunched);
             }
             self.check_not_reclaiming(pool, &vm_id)?;
+            // Other VMs' passed preflights count as used; this VM's own
+            // hold does not (the handle inserted below replaces it).
+            let reserved = {
+                let reservations = self.lock_capacity_reservations(&mut log)?;
+                reserved_totals(&reservations, &handles, Some(&vm_id), &pool.id)?
+            };
             check_capacity(
                 &handles,
                 self.host,
@@ -1672,6 +1792,8 @@ impl CvmLifecycle {
                     .ok_or(MinerAgentError::InsufficientResources)?,
                 &pools,
                 pool,
+                Some(&vm_id),
+                reserved,
             )?;
             config.cid = self.cids.allocate(&vm_id)?;
             // A fresh launch supersedes any unverified re-adoption of this
@@ -1698,6 +1820,11 @@ impl CvmLifecycle {
                     guardian: guardian_route,
                 },
             );
+            // Admitted: the handle now counts this VM, so its preflight
+            // hold is consumed — still under the `handles` guard, so no
+            // capacity decision sees both or neither. A refusal above
+            // keeps the hold for vali's retry.
+            self.consume_preflight_reservation(&vm_id, &mut log);
         }
 
         // The pool record, durable BEFORE any disk is created: from here
@@ -2211,6 +2338,9 @@ impl CvmLifecycle {
     /// (`CvmBusy`) — it must not race the launch and leave an
     /// untracked running domain.
     pub async fn stop(&self, vm_id: &VmId, graceful: bool) -> Result<()> {
+        // A stop ends whatever launch a preflight held capacity for —
+        // also for a VM that never launched (the stop then 404s below).
+        self.release_preflight_reservation(vm_id, "stop");
         let domain_id = {
             let mut handles = self.lock_handles()?;
             let handle = handles.get_mut(vm_id).ok_or(MinerAgentError::VmNotFound)?;
@@ -2302,6 +2432,7 @@ impl CvmLifecycle {
         vm_id: &VmId,
         restore: Option<&crate::backup::staged::RestoreManager>,
     ) -> Result<()> {
+        self.release_preflight_reservation(vm_id, "destroy");
         // A live storage move stops first: no block job may still write
         // the copy the reclaim below unlinks (every pool's overlay). No
         // move step runs until the destroy is over.
@@ -3704,7 +3835,7 @@ impl CvmLifecycle {
     ) -> Result<()> {
         self.check_recorded_pool_mounted(vm_id)?;
         match self.preflight_pool(vm_id, os_pool)? {
-            Some(pool) => self.check_pool_disk_budget(&pool, add_disk_gb),
+            Some(pool) => self.check_pool_disk_budget_for(&pool, Some(vm_id), add_disk_gb),
             None => Ok(()),
         }
     }
@@ -3744,17 +3875,38 @@ impl CvmLifecycle {
     /// [`Self::check_disk_budget`] on one storage pool: the disks of the
     /// live tenant VMs on `pool` plus `add_disk_gb` against its budget
     /// (`default`: `[host] cvm_disk_gb_budget`, `0` disables it).
+    ///
+    /// Every live preflight reservation on `pool` counts as used.
     pub fn check_pool_disk_budget(
         &self,
         pool: &crate::storage::pools::Pool,
         add_disk_gb: u32,
     ) -> Result<()> {
+        self.check_pool_disk_budget_for(pool, None, add_disk_gb)
+    }
+
+    /// [`Self::check_pool_disk_budget`] for `own`'s disk: neither `own`'s
+    /// preflight reservation nor a handle it already has (a running VM's
+    /// re-dispatched preflight) is counted against it — `add_disk_gb`
+    /// replaces them.
+    pub fn check_pool_disk_budget_for(
+        &self,
+        pool: &crate::storage::pools::Pool,
+        own: Option<&VmId>,
+        add_disk_gb: u32,
+    ) -> Result<()> {
         let held = self.move_held_gb(&pool.path);
+        let mut log = DeferredLog::default();
         let handles = self.lock_handles()?;
-        let used_disk = used_disk_gb(&handles, &self.pools.pools(), pool)?;
+        let used_disk = used_disk_gb(&handles, &self.pools.pools(), pool, own)?;
+        let reserved = {
+            let reservations = self.lock_capacity_reservations(&mut log)?;
+            reserved_totals(&reservations, &handles, own, &pool.id)?.disk_gb
+        };
         let need_disk = used_disk
             .checked_add(u64::from(add_disk_gb))
             .and_then(|n| n.checked_add(held))
+            .and_then(|n| n.checked_add(reserved))
             .ok_or(MinerAgentError::InsufficientResources)?;
         let budget = pool_budget_gb(self.host, pool);
         if budget > 0 && need_disk > budget {
@@ -3816,30 +3968,48 @@ impl CvmLifecycle {
         Ok(())
     }
 
-    /// Read-only CPU + memory capacity check (no reservation) — the
-    /// **preflight fail-fast**, the cpu/mem twin of [`Self::check_disk_budget`].
+    /// CPU + memory + disk-budget capacity check that RESERVES what it
+    /// checked — the **preflight gate**, run before vali mints +
+    /// KBS-registers the ticket.
     ///
-    /// A launch whose vCPUs or RAM would push the live total past the
-    /// host's `total_cpus` / `total_memory_mb` budget is rejected at
-    /// PREFLIGHT (before vali mints + KBS-registers the ticket), so vali
-    /// re-places onto another miner. Without this, a capacity-constrained
-    /// miner accepted the preflight (only DATA-disk was gated there) and
-    /// only rejected at LAUNCH — AFTER KBS-register — which vali cannot
-    /// cleanly re-place (the vm_id→host binding is already fenced in the
-    /// KBS, so the re-placement's register 409s `kbs-admin-conflict`).
-    /// The launch path still re-checks AND reserves under the `handles`
-    /// lock ([`check_capacity`]) — that is the race-safe gate; this only
-    /// moves the COMMON rejection into the window where re-place works.
+    /// A launch whose vCPUs, RAM or writable disk would push the live
+    /// total past the host's budgets is rejected at PREFLIGHT, so vali
+    /// re-places onto another miner: once the KBS bound the vm_id to this
+    /// host, a launch-time `insufficient-resources` cannot be re-placed
+    /// (the re-placement's register 409s `kbs-admin-conflict`).
     ///
-    /// Delegates to [`check_capacity`] with `add_disk_gb = 0` so the
-    /// cpu/mem thresholds are the SAME code the launch reservation runs —
-    /// preflight can never admit a launch the reservation would reject on
-    /// cpu/mem grounds (the disk half is gated separately by
-    /// [`Self::check_disk_budget`]; passing `0` here only re-affirms the
-    /// already-admitted existing disk usage, never a new rejection).
+    /// "Live total" includes every OTHER VM's unexpired preflight
+    /// reservation, and a pass records one for `vm_id` (`add_cpu`,
+    /// `add_memory_mb`, `add_disk_gb` on the launch's pool), all under the
+    /// `handles` lock — so N concurrent preflights against the same free
+    /// capacity cannot all pass. A repeat for `vm_id` refreshes its own
+    /// hold instead of counting twice; its launch consumes it at admission
+    /// ([`Self::launch`]); a stop / destroy order, the preflight failing
+    /// after it reserved, or the TTL
+    /// ([`Self::with_preflight_reservation_ttl`]) releases it.
     ///
-    /// The disk half re-affirmed is that of the pool the launch will use
-    /// ([`Self::preflight_pool`], `default` when it is no declared pool).
+    /// The thresholds are [`check_capacity`]'s, the SAME code the launch
+    /// admission runs. The disk half is on the pool the launch will use
+    /// ([`Self::preflight_pool`]); a recorded root that is no declared
+    /// pool is not disk-gated here (as [`Self::check_disk_budget`]), only
+    /// cpu/mem.
+    ///
+    /// Returns the hold's generation (`0` when no hold was taken: a zero
+    /// TTL), for [`Self::release_preflight_reservation_if`].
+    pub fn reserve_preflight_capacity(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        add_cpu: u8,
+        add_memory_mb: u32,
+        add_disk_gb: u32,
+    ) -> Result<u64> {
+        self.preflight_capacity_gate(vm_id, os_pool, add_cpu, add_memory_mb, add_disk_gb, true)
+    }
+
+    /// Read-only cpu/mem half of [`Self::reserve_preflight_capacity`]: the
+    /// same decision (other VMs' reservations count as used) without a disk
+    /// amount and without taking a hold.
     pub fn check_cpu_mem_budget(
         &self,
         vm_id: &VmId,
@@ -3847,15 +4017,158 @@ impl CvmLifecycle {
         add_cpu: u8,
         add_memory_mb: u32,
     ) -> Result<()> {
+        self.preflight_capacity_gate(vm_id, os_pool, add_cpu, add_memory_mb, 0, false)
+            .map(|_| ())
+    }
+
+    fn preflight_capacity_gate(
+        &self,
+        vm_id: &VmId,
+        os_pool: Option<&str>,
+        add_cpu: u8,
+        add_memory_mb: u32,
+        add_disk_gb: u32,
+        reserve: bool,
+    ) -> Result<u64> {
         let pools = self.pools.pools();
-        let pool = self.preflight_pool(vm_id, os_pool)?;
-        let pool = pool.as_ref().unwrap_or_else(|| pools.launch_pool());
+        let preflight_pool = self.preflight_pool(vm_id, os_pool)?;
+        let (pool, disk_gb) = match preflight_pool.as_ref() {
+            Some(pool) => (pool, add_disk_gb),
+            None => (pools.launch_pool(), 0),
+        };
+        let move_held = u32::try_from(self.move_held_gb(&pool.path))
+            .map_err(|_| MinerAgentError::InsufficientResources)?;
+        // Before the guards: its lines are written once both are gone.
+        let mut log = DeferredLog::default();
         let handles = self.lock_handles()?;
-        check_capacity(&handles, self.host, add_cpu, add_memory_mb, 0, &pools, pool)
+        let mut reservations = self.lock_capacity_reservations(&mut log)?;
+        let reserved = reserved_totals(&reservations, &handles, Some(vm_id), &pool.id)?;
+        check_capacity(
+            &handles,
+            self.host,
+            add_cpu,
+            add_memory_mb,
+            disk_gb
+                .checked_add(move_held)
+                .ok_or(MinerAgentError::InsufficientResources)?,
+            &pools,
+            pool,
+            // A VM already running here (a re-dispatched preflight, or one
+            // re-adopted at startup): the request replaces its handle.
+            Some(vm_id),
+            reserved,
+        )
+        .inspect_err(|_| {
+            if reserve {
+                log.push(format!(
+                    "hippius-miner-agent: capacity: preflight refused vm={vm_id} \
+                     cpu={add_cpu} mem_mb={add_memory_mb} disk_gb={disk_gb} \
+                     reserved_by_others=cpu:{} mem_mb:{} disk_gb:{}",
+                    reserved.cpu, reserved.memory_mb, reserved.disk_gb
+                ));
+            }
+        })?;
+        if !reserve || self.capacity_reservation_ttl.is_zero() {
+            return Ok(0);
+        }
+        let generation = RESERVATION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let previous = reservations.insert(
+            vm_id.clone(),
+            CapacityReservation {
+                cpu: add_cpu,
+                memory_mb: add_memory_mb,
+                disk_gb,
+                pool_id: pool.id.clone(),
+                at: std::time::Instant::now(),
+                generation,
+            },
+        );
+        log.push(format!(
+            "hippius-miner-agent: capacity: reservation {} vm={vm_id} cpu={add_cpu} \
+             mem_mb={add_memory_mb} disk_gb={disk_gb} pool={} ttl_s={}",
+            if previous.is_some() {
+                "refreshed"
+            } else {
+                "taken"
+            },
+            pool.id,
+            self.capacity_reservation_ttl.as_secs()
+        ));
+        Ok(generation)
+    }
+
+    /// Drop `vm_id`'s preflight capacity reservation, if any (`why` is
+    /// logged: `stop`, `destroy`).
+    pub fn release_preflight_reservation(&self, vm_id: &VmId, why: &str) {
+        let mut log = DeferredLog::default();
+        self.remove_preflight_reservation(vm_id, None, why, &mut log);
+    }
+
+    /// Drop `vm_id`'s reservation only if it is still the hold of
+    /// `generation` (from [`Self::reserve_preflight_capacity`]): a failing
+    /// preflight must not drop the hold a newer one of the same VM took.
+    pub fn release_preflight_reservation_if(&self, vm_id: &VmId, generation: u64, why: &str) {
+        let mut log = DeferredLog::default();
+        self.remove_preflight_reservation(vm_id, Some(generation), why, &mut log);
+    }
+
+    /// The launch of `vm_id` was admitted: its handle counts it from now.
+    /// Called under the `handles` guard; `log` is written after it.
+    fn consume_preflight_reservation(&self, vm_id: &VmId, log: &mut DeferredLog) {
+        self.remove_preflight_reservation(vm_id, None, "consumed by the admitted launch", log);
+    }
+
+    fn remove_preflight_reservation(
+        &self,
+        vm_id: &VmId,
+        generation: Option<u64>,
+        why: &str,
+        log: &mut DeferredLog,
+    ) {
+        let Ok(mut reservations) = self.capacity_reservations.lock() else {
+            return;
+        };
+        let matches = reservations
+            .get(vm_id)
+            .is_some_and(|r| generation.is_none_or(|g| g == r.generation));
+        if matches {
+            reservations.remove(vm_id);
+            log.push(format!(
+                "hippius-miner-agent: capacity: reservation released vm={vm_id} ({why})"
+            ));
+        }
+    }
+
+    /// Lock the preflight reservations, dropping the expired ones first
+    /// (their log lines go to `log`, written once the caller's guards are
+    /// gone). Call with the `handles` guard held when the result feeds a
+    /// capacity decision (lock order handles → capacity_reservations).
+    fn lock_capacity_reservations(
+        &self,
+        log: &mut DeferredLog,
+    ) -> Result<MutexGuard<'_, HashMap<VmId, CapacityReservation>>> {
+        let mut reservations = self
+            .capacity_reservations
+            .lock()
+            .map_err(|_| MinerAgentError::LockPoisoned)?;
+        let ttl = self.capacity_reservation_ttl;
+        let now = std::time::Instant::now();
+        reservations.retain(|vm_id, r| {
+            let live = now.duration_since(r.at) < ttl;
+            if !live {
+                log.push(format!(
+                    "hippius-miner-agent: capacity: reservation expired vm={vm_id} \
+                     (no launch within {}s)",
+                    ttl.as_secs()
+                ));
+            }
+            live
+        });
+        Ok(reservations)
     }
 
     /// SEV-ES ASID fail-fast at PREFLIGHT (capacity v2 §2.3) — same
-    /// pre-register rationale as [`Self::check_cpu_mem_budget`]: an
+    /// pre-register rationale as [`Self::reserve_preflight_capacity`]: an
     /// exhausted ASID pool otherwise fails the launch inside
     /// `sev_common_kvm_init`, after the KBS registered the VM, where vali
     /// cannot re-place cleanly.
@@ -4731,7 +5044,15 @@ impl LaunchTarget {
 /// Refuse a launch that would overcommit the host CPU or memory
 /// budget. Every sum is `checked_add` on `u64`, so an accounting
 /// overflow fails closed (`InsufficientResources`) rather than
-/// wrapping into an apparent free budget.
+/// wrapping into an apparent free budget. `reserved` (other VMs' passed
+/// preflights) counts as used on top of the handles.
+///
+/// `own` is the VM the `add_*` amounts are for: a handle it already has
+/// (a re-dispatched preflight of a running or re-adopted VM) is NOT
+/// counted — the requested amounts replace it rather than add to it.
+// Each argument is one independent input of the decision; bundling them
+// would only move the list into a struct built at every call.
+#[allow(clippy::too_many_arguments)]
 fn check_capacity(
     handles: &HashMap<VmId, CvmHandle>,
     host: HostResources,
@@ -4740,15 +5061,18 @@ fn check_capacity(
     add_disk_gb: u32,
     pools: &crate::storage::StoragePools,
     pool: &crate::storage::pools::Pool,
+    own: Option<&VmId>,
+    reserved: Reserved,
 ) -> Result<()> {
-    let mut used_cpu: u64 = 0;
-    let mut used_memory: u64 = 0;
-    for handle in handles.values() {
+    // Other VMs' passed preflights ([`reserved_totals`]) start the used side.
+    let mut used_cpu: u64 = reserved.cpu;
+    let mut used_memory: u64 = reserved.memory_mb;
+    for (vm_id, handle) in handles {
         // The singleton Infra host-attestor is carved out of the tenant
         // budget separately (fixed 1 vCPU / 512 MiB) — never counted
         // against the operator's declared tenant capacity (blackbox
         // attestor plan: "filtered from capacity/heartbeat/billing").
-        if handle.is_infra() {
+        if handle.is_infra() || Some(vm_id) == own {
             continue;
         }
         used_cpu = used_cpu
@@ -4758,7 +5082,9 @@ fn check_capacity(
             .checked_add(u64::from(handle.memory_mb))
             .ok_or(MinerAgentError::InsufficientResources)?;
     }
-    let used_disk = used_disk_gb(handles, pools, pool)?;
+    let used_disk = used_disk_gb(handles, pools, pool, own)?
+        .checked_add(reserved.disk_gb)
+        .ok_or(MinerAgentError::InsufficientResources)?;
     let need_cpu = used_cpu
         .checked_add(u64::from(add_cpu))
         .ok_or(MinerAgentError::InsufficientResources)?;
@@ -4783,19 +5109,23 @@ fn check_capacity(
 /// GiB the live tenant VMs reserve on `pool`: the writable disk of every
 /// handle whose disk lives there ([`StoragePools::pool_of`]). Without
 /// `[[storage.pools]]` that is every tenant handle, as it always was.
-/// Overflow fails closed.
+/// Overflow fails closed. `own`'s handle is skipped (see [`check_capacity`]).
 ///
 /// [`StoragePools::pool_of`]: crate::storage::StoragePools::pool_of
 fn used_disk_gb(
     handles: &HashMap<VmId, CvmHandle>,
     pools: &crate::storage::StoragePools,
     pool: &crate::storage::pools::Pool,
+    own: Option<&VmId>,
 ) -> Result<u64> {
     let mut used: u64 = 0;
-    for handle in handles.values() {
+    for (vm_id, handle) in handles {
         // Infra is diskless — skip it (belt-and-suspenders; its
         // data_disk_size_gb is 0 anyway).
-        if handle.is_infra() || pools.pool_of(&handle.luks_disk_path).id != pool.id {
+        if handle.is_infra()
+            || Some(vm_id) == own
+            || pools.pool_of(&handle.luks_disk_path).id != pool.id
+        {
             continue;
         }
         used = used
@@ -4852,6 +5182,8 @@ mod tests {
             add_disk_gb,
             &pools,
             pools.launch_pool(),
+            None,
+            Reserved::default(),
         )
     }
 
@@ -5951,7 +6283,9 @@ mod tests {
             512,
             40,
             &lc.pools.pools(),
-            lc.pools.pools().launch_pool()
+            lc.pools.pools().launch_pool(),
+            None,
+            Reserved::default()
         )
         .is_ok());
         assert!(matches!(
@@ -5962,7 +6296,9 @@ mod tests {
                 512,
                 41,
                 &lc.pools.pools(),
-                lc.pools.pools().launch_pool()
+                lc.pools.pools().launch_pool(),
+                None,
+                Reserved::default()
             ),
             Err(MinerAgentError::InsufficientDisk)
         ));

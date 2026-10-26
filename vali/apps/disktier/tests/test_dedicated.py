@@ -194,7 +194,9 @@ def test_free_counts_take_every_qualifying_disk_of_a_capable_node() -> None:
     make_disk("wwn-0x02", tier="ssd")
     make_disk("wwn-0x03", tier="nvme")
     make_disk("wwn-0x04", node=OTHER)
-    assert dedicated.free_counts(REQ, [NODE, OTHER]) == {NODE: 3}
+    assert dedicated.free_counts(REQ, [NODE, OTHER]) == {NODE: 1}  # exact: hdd only
+    with override_settings(VALI_DEDICATED_TIER_MATCH="minimum"):
+        assert dedicated.free_counts(REQ, [NODE, OTHER]) == {NODE: 3}
 
 
 @override_settings(**ON)

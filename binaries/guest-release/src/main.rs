@@ -157,6 +157,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod dedicated;
+mod dedicated_init;
 mod guardian_leg;
 #[cfg(test)]
 mod keyed_tests;
@@ -172,7 +173,8 @@ const EXIT_RELEASE_FAILED: u8 = 3;
 /// `--integrity-wipe` failed: the device is NOT fully initialised and
 /// must not get a filesystem.
 const EXIT_WIPE_FAILED: u8 = 4;
-/// `--open-dedicated-disks` could not report (cmdline or state file).
+/// `--open-dedicated-disks` could not report (cmdline or state file), or
+/// `--dedicated-init-wipe` could not start (list, state file, volume).
 const EXIT_DEDICATED_FAILED: u8 = 5;
 
 #[derive(Parser, Debug)]
@@ -186,7 +188,7 @@ struct Cli {
     /// `https://kbs.hippius.network`. The release POST hits
     /// `${KBS_URL}/v1/kbs/release`. Required in every mode except
     /// `--integrity-wipe`, which talks to no KBS.
-    #[arg(long, required_unless_present_any = ["integrity_wipe", "open_dedicated_disks"])]
+    #[arg(long, required_unless_present_any = ["integrity_wipe", "open_dedicated_disks", "dedicated_init_wipe"])]
     kbs_url: Option<String>,
 
     /// Path to the raw COSE_Sign1 OrderTicket bytes (same bytes
@@ -465,6 +467,48 @@ struct Cli {
     /// (default `/dev/disk/by-id`).
     #[arg(long, hide = true, requires = "open_dedicated_disks")]
     dedicated_by_id: Option<std::path::PathBuf>,
+
+    /// DEDICATED INTEGRITY INIT MODE (guest release 8, booted OS, run by
+    /// `hippius-dedicated-init.service`). Wipes every integrity slot the
+    /// initramfs opener listed in `/run/hippius/dedicated/init` through
+    /// its `hippius-<slot>-init` mapping, records it `ready`, switches it
+    /// to the journal and renames it `hippius-<slot>`. Takes no key: the
+    /// mappings are already open. See [`dedicated_init`].
+    #[arg(long, conflicts_with_all = [
+        "kbs_url",
+        "ticket",
+        "userdata_out",
+        "lifecycle_key_out",
+        "last_counter_file",
+        "new_counter_file",
+        "volume_stamp_ctx_out",
+        "volume_stamp_expected_out",
+        "volume_stamp_transition_out",
+        "confirm_volume_stamp",
+        "share_c_version",
+        "share_c_version_out",
+        "instance_id_out",
+        "cdn_fleet_dir",
+        "integrity_wipe",
+        "open_dedicated_disks",
+    ])]
+    dedicated_init_wipe: bool,
+
+    /// Test seam for `--dedicated-init-wipe`: the slot-state file (default
+    /// `/run/hippius/dedicated/slots`; the init list is next to it).
+    #[arg(long, hide = true, requires = "dedicated_init_wipe")]
+    dedicated_init_state: Option<std::path::PathBuf>,
+
+    /// Test seam for `--dedicated-init-wipe`: an already-mounted OS volume
+    /// root, instead of mounting `/dev/mapper/hippius-upper`.
+    #[arg(long, hide = true, requires = "dedicated_init_wipe")]
+    dedicated_init_volume_root: Option<std::path::PathBuf>,
+
+    /// Test seam for both dedicated-disk modes: the smallest size class
+    /// accepted, in GiB (default 1000). The end-to-end test runs on small
+    /// loop devices; the boot never passes it.
+    #[arg(long, hide = true)]
+    dedicated_test_min_gib: Option<u64>,
 }
 
 /// The tmpfs subtree every SECRET-bearing `*_out` file must live under.
@@ -619,6 +663,9 @@ fn main() -> ExitCode {
     }
     if let Some(kek_file) = cli.open_dedicated_disks.as_deref() {
         return run_dedicated(&cli, kek_file);
+    }
+    if cli.dedicated_init_wipe {
+        return run_dedicated_init(&cli);
     }
     // `required_unless_present_any` guarantees this outside the
     // wipe and dedicated-disks modes.
@@ -1943,23 +1990,50 @@ fn run_dedicated(cli: &Cli, kek_file: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_DEDICATED_FAILED);
         }
     };
-    let mut host = dedicated::SysHost {
-        by_id: cli
-            .dedicated_by_id
+    let mut host = dedicated::SysHost::new(
+        cli.dedicated_by_id
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("/dev/disk/by-id")),
-        sys_block: std::path::PathBuf::from("/sys/class/block"),
-        volume_root: volume_root.to_path_buf(),
-        cryptsetup: std::path::PathBuf::from("cryptsetup"),
-        scratch: state_out.parent().map_or_else(
+        volume_root.to_path_buf(),
+        state_out.parent().map_or_else(
             || std::path::PathBuf::from("/run/hippius"),
             std::path::Path::to_path_buf,
         ),
-    };
+    );
+    host.min_gib = cli.dedicated_test_min_gib.unwrap_or(dedicated::MIN_GIB);
     match dedicated::run(&cmdline, kek_file, &mut host, state_out) {
         Ok(_) => ExitCode::from(EXIT_OK),
         Err(e) => {
             eprintln!("hippius-guest-release: dedicated: state file: {e}");
+            ExitCode::from(EXIT_DEDICATED_FAILED)
+        }
+    }
+}
+
+/// `--dedicated-init-wipe`: a slot problem is a slot state; exits
+/// non-zero only when the run cannot start (list, state file, volume).
+fn run_dedicated_init(cli: &Cli) -> ExitCode {
+    let state = cli
+        .dedicated_init_state
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(dedicated::DEFAULT_STATE_PATH));
+    let volume = match cli.dedicated_init_volume_root.clone() {
+        Some(dir) => dedicated_init::Volume::Dir(dir),
+        None => dedicated_init::Volume::Mount {
+            device: std::path::PathBuf::from(dedicated::UPPER_DEVICE),
+            at: std::path::PathBuf::from(dedicated::INIT_VOLUME_MOUNT),
+        },
+    };
+    let cfg = dedicated_init::Config {
+        list: dedicated::init_list_path(&state),
+        state,
+        volume,
+        min_gib: cli.dedicated_test_min_gib.unwrap_or(dedicated::MIN_GIB),
+    };
+    match dedicated_init::run(&cfg) {
+        Ok(()) => ExitCode::from(EXIT_OK),
+        Err(e) => {
+            eprintln!("hippius-guest-release: dedicated-init: {e}");
             ExitCode::from(EXIT_DEDICATED_FAILED)
         }
     }

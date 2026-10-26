@@ -445,6 +445,23 @@ def test_the_fence_quarantines_the_source_and_the_destination_restores_the_chain
     assert (job.state, vm.host, vm.generation) == (MigrationState.DONE.value, "node-dst", 6)
 
 
+@pytest.mark.parametrize(("other_pool", "sent"), [("ssd0", ["ssd0"]), (None, [])])
+def test_a_failover_never_names_a_default_of_another_tier(
+    fx: FakeEffects, world: _World, other_pool, sent
+) -> None:
+    """The destination's `default` does not hold the VM's tier: the order
+    names a pool that does, else none goes out."""
+    fx.arrival_default_refused = "the default pool (hdd) does not hold an OS disk at ssd"
+    fx.arrival_pool = other_pool
+    fx.dest_activation_status = "running"
+    vm = _golden_vm()
+    _chain(vm)
+    world.kill()
+    job = _advance(_failover(vm))
+    assert fx.activate_os_pools == sent
+    assert job.state == MigrationState.DEST_ACTIVATING.value, job.reason
+
+
 def test_a_failover_activation_gets_time_for_the_download(world: _World) -> None:
     vm = _golden_vm()
     _chain(vm)

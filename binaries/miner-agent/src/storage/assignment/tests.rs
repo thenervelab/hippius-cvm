@@ -841,6 +841,26 @@ fn the_measured_token_names_exactly_the_ordered_slots() {
         Ok(Some([0, 2].into()))
     );
     assert_eq!(cmdline_slots("quiet panic=0"), Ok(None));
+    // §9: an integrity slot (`:i`) is the same slot to the agent.
+    assert_eq!(
+        cmdline_slots("quiet hippius.dedicated=x0:16000:i,x2:22300 panic=0"),
+        Ok(Some([0, 2].into()))
+    );
+    assert_eq!(
+        cmdline_slots("hippius.dedicated=x0:16000:i,x2:22300:i"),
+        Ok(Some([0, 2].into()))
+    );
+    for bad in [
+        "hippius.dedicated=x0:16000:j",
+        "hippius.dedicated=x0:16000:i:i",
+        "hippius.dedicated=x0:16000i",
+        "hippius.dedicated=x0::i",
+        "hippius.dedicated=x0:i",
+        "hippius.dedicated=x0:0:i",
+        "hippius.dedicated=x0:100:i,x0:200",
+    ] {
+        assert_eq!(cmdline_slots(bad), Err("cmdline-malformed"), "{bad}");
+    }
     for bad in [
         "hippius.dedicated=",
         "hippius.dedicated=x0",

@@ -35,6 +35,11 @@ ROW_KEYS = {
     "schedulable",
     "schedulable_reason",
     "hosted_vm_count",
+    "hosted_runner_vm_count",
+    "hosted_customer_vm_count",
+    "cordoned",
+    "cordon_source",
+    "cordon_reason",
     "capacity",
     "recent_refusals",
     "refusal_count_30d",
@@ -236,6 +241,11 @@ def test_full_row_for_a_healthy_node(operator_client: APIClient) -> None:
         "schedulable": True,
         "schedulable_reason": None,
         "hosted_vm_count": 2,
+        "hosted_runner_vm_count": 0,
+        "hosted_customer_vm_count": 2,
+        "cordoned": False,
+        "cordon_source": None,
+        "cordon_reason": None,
         "capacity": {"total_units": 6, "committed_units": 2},
         "recent_refusals": [
             {"at": drained.failed_at.isoformat(), "reason": "heartbeat-stale", "detail": None}

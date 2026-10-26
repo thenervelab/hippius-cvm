@@ -9,8 +9,8 @@
 # boundary: on every change under `deploy/gitops/`, it extracts each
 # `ghcr.io/thenervelab/hippius-*` digest the charts reference and
 # `cosign verify`s that it was keyless-signed by a `*-image.yml` workflow
-# in THIS repo (GitHub OIDC → Sigstore). A digest that isn't so signed
-# fails the gate.
+# in THIS repo, run on main or a `v*` tag (GitHub OIDC → Sigstore). A
+# digest that isn't so signed fails the gate.
 #
 # This is the CI half; the cluster-admission half (a policy-controller
 # ClusterImagePolicy, which also covers a manual `kubectl set image`)
@@ -37,30 +37,26 @@ permissions:
   packages: read
 
 env:
-  # The signer identity: any `*-image.yml` workflow in this repo, signing
-  # via the GitHub Actions OIDC issuer. Ref-agnostic (main / tag / PR
-  # builds all qualify) — the guarantee is "built + signed by this repo's
-  # CI", not which branch.
+  # The signer identity: a `*-image.yml` workflow in this repo, run on
+  # `refs/heads/main` or a `refs/tags/v*` tag, signing via the GitHub
+  # Actions OIDC issuer.
   #
-  # BOTH repo names are accepted because this repo was renamed
-  # `hippius-compute` → `hippius-compute-internal`. A Fulcio certificate
-  # records the repo name AT BUILD TIME and is immutable, so the pinned
-  # images split into two eras: everything built before the rename is signed
-  # under the old name, everything after under the new one. An anchor naming
-  # only one era rejects the other — narrowing to `-internal` alone would
-  # fail all six previously-pinned images at once. The alternation is the
-  # only form that verifies both eras without rebuilding history.
+  # The ref IS anchored (hippius-audits#12). Until 2026-10 the image
+  # workflows pushed AND keyless-signed on `pull_request`, so an image built
+  # from unreviewed PR code (`...@refs/pull/<n>/merge`) carried a valid
+  # signature from the same workflow a main build signs under, and a
+  # ref-agnostic anchor passed it. Those images are still in GHCR (e.g. a
+  # PR-built `hippius-epoch-closer:sha-09c232db...`); this anchor rejects
+  # them, and the image workflows no longer publish anything from a PR or a
+  # non-main dispatch.
   #
-  # ⚠️ Safe ONLY while both names stay ours. The old name is a GitHub
-  # redirect today, and a redirected name becomes claimable once nothing
-  # occupies it — so a repo we do NOT control taking
-  # `thenervelab/hippius-compute` could mint certificates satisfying this
-  # anchor. Never give that name to a public or externally-contributed repo
-  # (the open-source repo is `hippius-cvm` precisely so this stays true).
-  #
-  # Cleanup, once every pinned image has been rebuilt post-rename: drop the
-  # alternation and anchor on `-internal` alone.
-  IDENTITY_RE: '^https://github\.com/thenervelab/hippius-compute(-internal)?/\.github/workflows/[a-z0-9-]+-image\.yml@'
+  # Only the CURRENT repo name (`hippius-compute-internal`). The pre-rename
+  # name `hippius-compute` is no longer accepted: every pinned digest is a
+  # post-rename main build (the exact-identity P3 step below proves it), and
+  # the old name is a GitHub redirect that becomes claimable once nothing
+  # occupies it — a repo we do not control could then mint certificates
+  # matching an anchor that still named it.
+  IDENTITY_RE: '^https://github\.com/thenervelab/hippius-compute-internal/\.github/workflows/[a-z0-9-]+-image\.yml@refs/(heads/main|tags/v[^/]+)$'
   OIDC_ISSUER: "https://token.actions.githubusercontent.com"
 
 jobs:
@@ -103,7 +99,7 @@ jobs:
                  "${ref}" > /dev/null; then
               echo "OK  ${ref}"
             else
-              echo "::error::UNVERIFIED — ${ref} is not keyless-signed by a thenervelab/hippius-compute *-image.yml workflow"
+              echo "::error::UNVERIFIED — ${ref} is not keyless-signed by a thenervelab/hippius-compute-internal *-image.yml workflow on main or a v* tag"
               fail=1
             fi
             echo "::endgroup::"
@@ -115,12 +111,12 @@ jobs:
           echo "All ${#REFS[@]} first-party image signatures verified."
 
       # ── P3: trust-critical images must match a DECLARED provenance ──────
-      # The gate above is deliberately ref-agnostic ("built + signed by this
-      # repo's CI, not which branch"). That is too weak for anything whose
-      # substitution matters, and the proof is in this repo's own history:
-      # the KBS ran a `refs/pull/897/merge` build for weeks — a tree not
-      # reachable from any commit here — and the check above passed it clean
-      # every time.
+      # The gate above pins the ref CLASS (main or a v* tag) but not which
+      # commit. Until hippius-audits#12 it was fully ref-agnostic, which is
+      # too weak for anything whose substitution matters, and the proof is in
+      # this repo's own history: the KBS ran a `refs/pull/897/merge` build for
+      # weeks — a tree not reachable from any commit here — and the check
+      # above passed it clean every time.
       #
       # This step tightens it to the EXACT declared build: `--certificate-
       # identity` (not -regexp, so the git ref is pinned too) and
@@ -131,8 +127,8 @@ jobs:
       # It covers EVERY first-party image the gitops charts pin, not just the
       # two at the confidentiality boundary it started with: vali, the Edge,
       # the tenant-baker and the epoch-closer were each guarded only by the
-      # ref-agnostic check above, i.e. by the one control with a documented
-      # blind spot for the failure mode we already hit. See
+      # (then ref-agnostic) check above, i.e. by the one control with a
+      # documented blind spot for the failure mode we already hit. See
       # `TRUST_CRITICAL_IMAGES` in the script.
       #
       # It does NOT prove the running pod pulled that digest, and it does not

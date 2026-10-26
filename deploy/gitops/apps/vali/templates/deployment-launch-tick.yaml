@@ -6,8 +6,8 @@
 # `POST /v1/vm/launch` enqueues a `LaunchJob(queued)` (the API call only
 # stages the userdata to Vault + records the non-secret intent — §20). This
 # worker runs `manage.py vali_launch_tick` on a fixed interval
-# (`VALI_LAUNCH_TICK_INTERVAL_S`, default 5s): each cycle CAS-claims one
-# queued job, reads the secrets back from Vault, and drives
+# (`VALI_LAUNCH_TICK_INTERVAL_S`, default 5s): each cycle CAS-claims
+# queued jobs, reads the secrets back from Vault, and drives
 # `launch.launch_vm` (scheduler place → preflight → §22 auto-pin →
 # L1 OrderTicket mint → KBS admin register → dispatch → re-place on
 # reject), then records the terminal outcome.
@@ -22,9 +22,20 @@
 # the S3 artifact URLs), and the `vali-config` knobs (Edge dispatch, KBS
 # admin, thebrain RPC for §23 placement). Worker posture: no HTTP
 # port/probes, replicas 1 + Recreate (the (id,version,state) CAS makes a
-# crash-restart safe, but two concurrent claim loops are not a supported
-# topology — same single-writer posture as vali-orchestration-tick). Sync
-# wave 3.
+# crash-restart safe; one claimer keeps the queue FIFO — same single-writer
+# posture as vali-orchestration-tick). Sync wave 3.
+#
+# Throughput: `launchTick.concurrency` (VALI_LAUNCH_TICK_CONCURRENCY) jobs
+# run at once inside this ONE pod — the main thread claims, a bounded
+# thread pool runs. A job is ~18 s of mostly I/O (Vault, the miner
+# preflight, dispatch) and only its placement decision (count boot cap /
+# capacity / owner sub-budget / dedicated disks → write the Pending
+# Placement) must not overlap: that step holds a Postgres advisory lock
+# (`apps.scheduler.decision_lock`), released by the commit that publishes
+# the Placement, so concurrent decisions never spend one slot twice — and
+# that would stay true across replicas. Scale with `concurrency`, not
+# `replicas`. On SIGTERM the worker stops claiming and drains its
+# in-flight jobs within `terminationGracePeriodSeconds`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -54,6 +65,7 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap-vali.yaml") . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.launchTick.terminationGracePeriodSeconds | default 60 }}
       nodeSelector:
         node-role.hippius.network/general-workloads: "true"
       serviceAccountName: {{ .Values.vaultAuth.serviceAccountName }}
@@ -86,6 +98,10 @@ spec:
                 secretKeyRef:
                   name: vali-django
                   key: secret-key
+            # Jobs run at once in this pod (see the header). Here, not in
+            # vali-config: only this worker reads it.
+            - name: VALI_LAUNCH_TICK_CONCURRENCY
+              value: {{ .Values.launchTick.concurrency | default "1" | quote }}
             # Vault: the KEK read-back + the §22 allowlist-root and L1
             # ticket signing seeds (fetched at use, #587 Phase 1A).
             {{- include "vali.vaultStaticTokenEnv" . | nindent 12 }}

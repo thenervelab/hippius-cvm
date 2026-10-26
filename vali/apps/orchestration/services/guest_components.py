@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 
 log = logging.getLogger("apps.orchestration.guest_components")
 
@@ -195,6 +195,50 @@ def _check_epoch_order(version: int, epoch: int) -> None:
         )
 
 
+#: The fields the initrd bytes determine (the base initrd the release cpio
+#: is appended to, and that cpio): every build of one initrd agrees on them,
+#: whichever base bake it is registered for.
+_INITRD_BOUND_FIELDS = ("family", "base_initrd_sha256", "release_cpio_sha256")
+
+
+#: `pg_advisory_xact_lock(int4, int4)` class key ("gibl" in ASCII). The
+#: two-int4 key space never overlaps the int8 one the other vali locks use.
+_INITRD_LOCK_CLASS = 0x6769626C
+
+
+def _initrd_lock(initrd_sha256: str) -> None:
+    """Serialize the registrations of one initrd until the enclosing
+    transaction ends (must be called inside `atomic()`): a transaction-
+    scoped advisory lock keyed on the initrd's first 32 bits, released by
+    the COMMIT that publishes the row. A no-op off Postgres (the SQLite
+    test DB serializes writers itself)."""
+    if connection.vendor != "postgresql":
+        return
+    key = int.from_bytes(bytes.fromhex(initrd_sha256[:8]), "big", signed=True)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", [_INITRD_LOCK_CLASS, key])
+
+
+def _check_initrd_siblings(parsed: BuildDocument, version: int) -> None:
+    """A byte-identical initrd may be registered once per base bake (two
+    bakes sharing one upstream kernel + initrd differ only by rootfs and
+    verity). Every build of that initrd must still name the same release,
+    family, base initrd and cpio: `build_for_initrd` answers those by the
+    initrd alone, and must not depend on which bake's row it reads."""
+    from apps.orchestration.models import GuestInitrdBuild
+
+    fields = _build_fields(parsed)
+    for sibling in GuestInitrdBuild.objects.filter(initrd_sha256=parsed.initrd_sha256):
+        differs = [f for f in _INITRD_BOUND_FIELDS if getattr(sibling, f) != fields[f]]
+        if sibling.release_id != version:
+            differs.append("release")
+        if differs:
+            raise BuildRejected(
+                f"initrd {parsed.initrd_sha256[:16]}… is already registered for base bake "
+                f"{sibling.source_bake_id!r} with other {', '.join(differs)}"
+            )
+
+
 def register_build(parsed: BuildDocument) -> tuple[Any, bool]:
     """Record `parsed` (and its release, the first time a build of it is
     registered). Returns `(build, created)`.
@@ -205,6 +249,10 @@ def register_build(parsed: BuildDocument) -> tuple[Any, bool]:
     from apps.orchestration.models import GuestComponentRelease, GuestInitrdBuild
 
     with transaction.atomic():
+        # Two first registrations of one initrd (for two bakes) both pass the
+        # sibling check unless serialized; the row lock below locks nothing
+        # on an empty table.
+        _initrd_lock(parsed.initrd_sha256)
         # One registration at a time: the epoch order reads every version.
         list(GuestComponentRelease.objects.select_for_update().all())
         release = GuestComponentRelease.objects.filter(version=parsed.version).first()
@@ -247,8 +295,12 @@ def register_build(parsed: BuildDocument) -> tuple[Any, bool]:
                 release.cpio_sha256 = known
                 release.save(update_fields=["cpio_sha256"])
         fields = _build_fields(parsed)
-        existing = GuestInitrdBuild.objects.filter(initrd_sha256=parsed.initrd_sha256).first()
-        if existing is not None:
+        existing = GuestInitrdBuild.objects.filter(
+            initrd_sha256=parsed.initrd_sha256, source_bake_id=parsed.source_bake_id
+        ).first()
+        if existing is None:
+            _check_initrd_siblings(parsed, release.version)
+        else:
             differs = [f for f in _BUILD_FIELDS if getattr(existing, f) != fields[f]]
             if existing.measurement != parsed.document:
                 differs.append("measurement")
@@ -283,7 +335,11 @@ def register_build(parsed: BuildDocument) -> tuple[Any, bool]:
 
 
 def build_for_initrd(initrd_sha256_hex: str) -> Any:
-    """The registered build whose initrd this is, or None."""
+    """A registered build whose initrd this is, or None. One initrd may be
+    registered for several base bakes: read only what the initrd itself
+    determines (release, family, base initrd, cpio — identical on every
+    such build, `_check_initrd_siblings`), never a base field (kernel,
+    rootfs, verity, prefix, measurement) — select those by base."""
     from apps.orchestration.models import GuestInitrdBuild
 
     if not initrd_sha256_hex:

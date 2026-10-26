@@ -196,6 +196,30 @@ def test_a_restricted_bake_is_refused_by_bake_id_too(make_golden_bake) -> None:
     assert _resolve({"bake_id": "gb-std", "tenant_id": "tenant-a"})["bake_id"] == "gb-std"
 
 
+@pytest.mark.parametrize("by", ["image", "bake_id"])
+def test_the_ubuntu_runner_image_launches_for_the_runner_tenant_only(
+    make_golden_bake, by: str
+) -> None:
+    """The CI-runner image, blessed through the command (which requires the
+    restriction), boots for the runners' tenant alone, by name or bake_id."""
+    make_golden_bake(bake_id="gb-runner", profile="ubuntu-runner")
+    call_command(
+        "vali_bless_golden_image",
+        "ubuntu-runner",
+        "gb-runner",
+        "--distro",
+        "ubuntu",
+        "--restricted-tenant",
+        "5Runner",
+    )
+    target = "ubuntu-runner" if by == "image" else "gb-runner"
+    assert _resolve({by: target, "tenant_id": "5Runner"})["bake_id"] == "gb-runner"
+    for tenant in ("5Other", ""):
+        with pytest.raises(LaunchIntentError) as exc:
+            _resolve({by: target, "tenant_id": tenant})
+        assert exc.value.category == "image-restricted"
+
+
 def test_the_cdn_node_image_launches_for_the_cdn_tenant(make_golden_bake) -> None:
     make_golden_bake(bake_id="gb-cdn", profile="cdn-node")
     _image("cdn-node", "gb-cdn", restricted=CDN)

@@ -1325,7 +1325,10 @@ async fn serve(config: Config, identity: MinerIdentity) -> Result<()> {
             ),
         ))
         .with_progress_sink(progress.clone())
-        .with_net_policy_gate(Arc::clone(&net_policy)),
+        .with_net_policy_gate(Arc::clone(&net_policy))
+        .with_preflight_reservation_ttl(std::time::Duration::from_secs(
+            config.host.preflight_reservation_ttl_secs,
+        )),
     );
 
     // Re-adopt any tenant CVMs that survived a prior agent lifetime

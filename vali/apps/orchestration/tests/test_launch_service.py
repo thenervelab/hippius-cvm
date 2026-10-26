@@ -407,6 +407,166 @@ def test_launch_vm_terminal_when_post_register_dispatch_keeps_failing(
     assert Placement.objects.filter(miner_node_id=node_id(2)).count() == 0
 
 
+def _two_miners(monkeypatch) -> ServiceClient:
+    actor = ServiceClient.objects.create(scope=PrincipalScope.OPERATOR.value, name="launcher")
+    _register_miner(1)
+    _register_miner(2)
+    monkeypatch.setattr(
+        chain, "read_miner_status",
+        lambda: make_snapshot(10, [make_miner(1), make_miner(2)]),
+    )
+    monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+    return actor
+
+
+def _preflight_503() -> launch.LaunchOutcome:
+    """A preflight refusal: it comes before the attempt's own KBS
+    register, so the attempt itself says `registered=False`."""
+    return launch.LaunchOutcome(
+        disposition=launch.RETRIABLE,
+        emit={
+            "ok": False,
+            "outcome": "preflight-failure",
+            "error": "503 insufficient-resources",
+        },
+        exit_code=2,
+        registered=False,
+    )
+
+
+def _launch_503() -> launch.LaunchOutcome:
+    return launch.LaunchOutcome(
+        disposition=launch.RETRIABLE,
+        emit={"ok": False, "outcome": "miner-rejected"},
+        exit_code=2,
+        registered=True,
+    )
+
+
+def test_a_registered_launch_whose_retry_fails_at_preflight_is_never_replaced(
+    monkeypatch,
+) -> None:
+    """Register OK on miner A → LAUNCH 503 → the same-miner retry's
+    PREFLIGHT 503 (`registered=False`, it never reached its own register)
+    was read as a pre-register refusal and the VM re-placed on miner B,
+    where `register-vm` 409'd on the CAS fence.
+    The register is the JOB's: the retry ends `dispatch-failed-after-
+    register` on the miner holding the registration, naming it and the
+    stage, with no second placement (hence no second register), and the
+    result says SPENT for the abandoned-launch reap."""
+    actor = _two_miners(monkeypatch)
+    monkeypatch.setattr(launch, "max_dispatch_retries", lambda: 1)
+    answers = [_launch_503(), _preflight_503()]
+    calls: list[str] = []
+
+    def fake(spec, miner, **_kw):
+        calls.append(miner.miner_id)
+        return answers.pop(0)
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.ok is False
+    assert result.outcome == "dispatch-failed-after-register"
+    assert result.registered is True
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert Placement.objects.count() == 1
+    assert result.miner_id == calls[0]
+    assert result.emit["failed_stage"] == "preflight-failure"
+    assert calls[0] in result.emit["error"]
+    assert "preflight-failure" in result.emit["error"]
+    # The abandoned-launch reap reads the vm_id as SPENT.
+    from apps.lifecycle.models import Vm
+
+    vm = Vm.objects.get(vm_id="vm-launch-1")
+    assert vm.launch_abandoned_outcome == "dispatch-failed-after-register"
+    assert vm.launch_abandoned_registered is True
+
+
+def test_a_registered_launch_keeps_retrying_the_same_miner_past_a_preflight_refusal(
+    monkeypatch,
+) -> None:
+    """A preflight refusal on a same-miner retry spends a retry, it does
+    not end them: the capacity it lacked may free up on the next one. And
+    every retry names the pool the REGISTERED attempt used: the preflight
+    refusal carries no `chosen_os_pool`, which must not drop the next
+    retry onto `default`."""
+    actor = _two_miners(monkeypatch)
+    monkeypatch.setattr(launch, "max_dispatch_retries", lambda: 3)
+    registered_on_nvme0 = launch.LaunchOutcome(
+        disposition=launch.RETRIABLE,
+        emit={"ok": False, "outcome": "miner-rejected"},
+        exit_code=2,
+        registered=True,
+        chosen_os_pool="nvme0",
+    )
+    answers = [
+        registered_on_nvme0,
+        _preflight_503(),
+        _preflight_503(),
+        _outcome(launch.ACCEPTED, "miner-a"),
+    ]
+    calls: list[tuple[str, object]] = []
+
+    def fake(spec, miner, *, os_pool=launch._CHOOSE_OS_POOL, **_kw):
+        calls.append((miner.miner_id, os_pool))
+        return answers.pop(0)
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.ok is True
+    assert len({m for m, _ in calls}) == 1
+    assert [pool for _, pool in calls] == [launch._CHOOSE_OS_POOL, "nvme0", "nvme0", "nvme0"]
+    assert Placement.objects.count() == 1
+
+
+def test_a_terminal_retry_after_register_still_reports_the_vm_spent(monkeypatch) -> None:
+    """A same-miner retry that ends TERMINAL before its own register still
+    follows a registered attempt: the result says `registered=True`, or
+    the abandoned-launch reap would leave the KEK live."""
+    actor = _two_miners(monkeypatch)
+    monkeypatch.setattr(launch, "max_dispatch_retries", lambda: 2)
+    answers = [
+        _launch_503(),
+        launch.LaunchOutcome(
+            disposition=launch.TERMINAL,
+            emit={"ok": False, "outcome": "vault-failure", "error": "boom"},
+            exit_code=launch.EXIT_VAULT_FAILURE,
+        ),
+    ]
+    monkeypatch.setattr(launch, "launch_on_miner", lambda spec, miner, **_kw: answers.pop(0))
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.outcome == "vault-failure"
+    assert result.registered is True
+    assert Placement.objects.count() == 1
+
+
+def test_an_unregistered_preflight_refusal_still_replaces(monkeypatch) -> None:
+    """The first attempt's preflight refusal touched nothing at the KBS:
+    exclude the miner and re-place, as before."""
+    actor = _two_miners(monkeypatch)
+    answers = [_preflight_503(), _outcome(launch.ACCEPTED, "miner-b")]
+    calls: list[str] = []
+
+    def fake(spec, miner, **_kw):
+        calls.append(miner.miner_id)
+        return answers.pop(0)
+
+    monkeypatch.setattr(launch, "launch_on_miner", fake)
+
+    result = launch.launch_vm(_spec(), actor)
+
+    assert result.ok is True
+    assert len(calls) == 2 and calls[0] != calls[1]
+    assert result.miner_id == calls[1]
+    assert Placement.objects.filter(status=PlacementStatus.FAILED.value).count() == 1
+
+
 def test_launch_vm_stops_on_terminal(monkeypatch) -> None:
     """A TERMINAL outcome (vault/mint/kbs error) is not the miner's
     fault — re-placing would hit the same wall, so launch_vm stops."""

@@ -932,11 +932,26 @@ def test_create_cdn_node_profile(authed_client: APIClient, settings) -> None:
     assert row.cdn_backend_url == "https://api.example.invalid"
 
 
+def test_create_ubuntu_runner_profile(authed_client: APIClient, settings) -> None:
+    """The CI-runner profile needs no CDN backend and records none."""
+    settings.VALI_CDN_BACKEND_URL = ""
+    p = _golden_create_payload("runner-bake-1")
+    p["profile"] = "ubuntu-runner"
+    resp = authed_client.post(reverse("tenant_bake_create"), p, format="json")
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    assert resp.json()["profile"] == "ubuntu-runner"
+    row = TenantBake.objects.get(bake_id=resp.json()["bake_id"])
+    assert row.profile == "ubuntu-runner"
+    assert row.cdn_backend_url == ""
+
+
 @pytest.mark.parametrize(
     "mutate,backend",
     [
         # Not golden.
         (lambda p: p.update(profile="cdn-node"), "https://api.example.invalid"),
+        (lambda p: p.update(profile="ubuntu-runner"), ""),
+        (lambda p: p.update(profile="ubuntu-runner", disk_mode="legacy_luks"), ""),
         # Golden but no backend URL configured.
         (lambda p: p.update(profile="cdn-node", disk_mode="golden_verity_overlay"), ""),
         # Unknown profile.

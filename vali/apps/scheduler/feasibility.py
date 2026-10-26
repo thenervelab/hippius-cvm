@@ -378,7 +378,9 @@ def assess(
     `dedicated` (a valid request, or `None`: the question as before
     dedicated disks) asks for a VM with dedicated disks (E4 contract §4):
     `never` / `dedicated-disks-not-offered` when they are not sold to this
-    owner; otherwise the scheduler is asked with gate (o), and the answer
+    owner, `never` / `dedicated-integrity-not-offered` (block `placeable:
+    false`) when it asks integrity that is not sold (§9); otherwise the
+    scheduler is asked with gate (o), and the answer
     carries `dedicated: {…, placeable, max_count_at_size}`, a not-placeable
     one reading `not-now` / `no-dedicated-capacity` or `no-host-fits-disks`.
 
@@ -399,6 +401,12 @@ def assess(
         if dedicated is not None and offered and not tier_why
         else ""
     )
+    # §9: integrity off, or at tier hdd — the console greys its checkbox.
+    integrity_why = (
+        disk_dedicated.integrity_not_offered(dedicated)
+        if dedicated is not None and offered and not tier_why and not dedicated_why
+        else ""
+    )
     # Every answer that names dedicated disks carries their block; the early
     # ones cannot place them.
     unplaceable = (
@@ -406,7 +414,7 @@ def assess(
         if dedicated is not None
         else None
     )
-    if not offered or tier_why or dedicated_why:
+    if not offered or tier_why or dedicated_why or integrity_why:
         # Not for sale, whatever the hardware could hold — the answer that
         # must stop a sale, so `never`, and before any chain read: the
         # verdict does not depend on the fleet.
@@ -425,8 +433,10 @@ def assess(
                 else "disk-tier-not-offered"
                 if tier_why
                 else disk_dedicated.CATEGORY_NOT_OFFERED
+                if dedicated_why
+                else disk_dedicated.CATEGORY_INTEGRITY_NOT_OFFERED
             ),
-            scheduler_error=tier_why or dedicated_why,
+            scheduler_error=tier_why or dedicated_why or integrity_why,
             region=region,
             os_disk_tier=os_disk_tier,
             dedicated=unplaceable,

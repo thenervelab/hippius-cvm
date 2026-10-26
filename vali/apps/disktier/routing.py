@@ -23,7 +23,7 @@ from django.utils import timezone
 
 from .models import DeclaredClass, DiskHealth, MinerStoragePool
 from .storage_config import agent_version, version_at_least
-from .tiers import SELLABLE_TIERS, DiskTier, rank, satisfies
+from .tiers import SELLABLE_TIERS, DiskTier, os_tier_fits, rank
 
 DEFAULT_POOL_ID = "default"
 #: A pool report older than this is not routed to: the node may have
@@ -77,10 +77,11 @@ def os_disk_tier_of(pool: MinerStoragePool) -> str | None:
 
 
 def serves_os_disk_tier(pool: MinerStoragePool, tier: str) -> bool:
-    """The pool may hold an OS disk sold at `tier` (a minimum): its own tier
-    is at least that. So an hdd pool holds only the OS disks sold hdd."""
+    """The pool may hold an OS disk sold at `tier` (`tiers.os_tier_fits`):
+    its own tier is at least that (`minimum`) or exactly that (`exact`). So
+    an hdd pool holds only the OS disks sold hdd."""
     own = os_disk_tier_of(pool)
-    return own is not None and satisfies(own, tier)
+    return own is not None and os_tier_fits(own, tier)
 
 
 def sold_as_os_disk_tier(pool: MinerStoragePool) -> bool:
@@ -102,16 +103,42 @@ def os_disk_pools(node_id: str) -> QuerySet[MinerStoragePool]:
     )
 
 
+def reports_pools(node_ids: set[str]) -> set[str]:
+    """Those of `node_ids` (lower-cased) that ever sent a v7 storage report
+    (`MinerCapacity.storage_reported_at`): they report their pools, so no
+    pool row means none known yet. One query; none for an empty set."""
+    from apps.scheduler.models import MinerCapacity
+
+    if not node_ids:
+        return set()
+    wanted = {n.lower() for n in node_ids} | set(node_ids)
+    return {
+        n.lower()
+        for n in MinerCapacity.objects.filter(
+            miner_node_id__in=wanted, storage_reported_at__isnull=False
+        ).values_list("miner_node_id", flat=True)
+    }
+
+
+def implicit_default(has_rows: bool, reports: bool) -> bool:
+    """Whether a node's `default` is the pre-v7 implicit nvme: only with
+    POSITIVE legacy evidence — no pool row at all AND never a v7 storage
+    report. Other rows but no `default` (heartbeats need not carry it;
+    ingest retires an omitted pool), or a v7 node whose report has not
+    landed (its recording may have failed): `default` holds nothing."""
+    return not has_rows and not reports
+
+
 def default_pool_tier(node_id: str) -> str | None:
     """The tier `default` holds OS disks at: its row's (`os_disk_tier_of`;
-    not one taking OS disks ⇒ `None`), or nvme for a node that reports no
-    such row — a pre-v7 agent's single pool, sold nvme as every OS disk
-    always was."""
-    pool = MinerStoragePool.objects.filter(
-        miner_node_id=node_id, pool_id=DEFAULT_POOL_ID, retired_at__isnull=True
-    ).first()
+    not one taking OS disks ⇒ `None`), or nvme for a legacy node
+    ([`implicit_default`]) — a pre-v7 agent's single pool, sold nvme as
+    every OS disk always was. Otherwise without a `default` row: `None`."""
+    pools = MinerStoragePool.objects.filter(miner_node_id=node_id, retired_at__isnull=True)
+    pool = pools.filter(pool_id=DEFAULT_POOL_ID).first()
     if pool is None:
-        return DiskTier.NVME
+        legacy = implicit_default(pools.exists(), bool(reports_pools({node_id})))
+        return DiskTier.NVME if legacy else None
     return os_disk_tier_of(pool) if pool.os_disks else None
 
 
@@ -140,6 +167,6 @@ def choose_os_pool(node_id: str, need_gb: int, tier: str = DiskTier.NVME) -> str
         return None
     if tier != DiskTier.NVME:
         own = default_pool_tier(node_id)
-        if own is not None and satisfies(own, tier) and rank(own) < best[0]:
+        if own is not None and os_tier_fits(own, tier) and rank(own) < best[0]:
             return None
     return best[2]

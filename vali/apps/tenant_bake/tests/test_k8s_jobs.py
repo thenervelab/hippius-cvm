@@ -480,3 +480,18 @@ def test_render_job_env_profile_only_for_cdn_node() -> None:
     env = {e["name"]: e for e in container["env"]}
     assert env["BAKE_PROFILE"]["value"] == "cdn-node"
     assert env["BAKE_CDN_BACKEND_URL"]["value"] == "https://api.example.invalid"
+
+
+def test_render_job_env_profile_for_ubuntu_runner() -> None:
+    """The CI-runner profile reaches the baker as BAKE_PROFILE, with no CDN
+    input (the entrypoint refuses an unknown profile, and would bake a plain
+    ubuntu golden if the profile were dropped)."""
+    import dataclasses
+
+    spec = dataclasses.replace(
+        _sample_spec(), disk_mode="golden_verity_overlay", profile="ubuntu-runner"
+    )
+    container = render_job(spec)["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e for e in container["env"]}
+    assert env["BAKE_PROFILE"]["value"] == "ubuntu-runner"
+    assert "BAKE_CDN_BACKEND_URL" not in env

@@ -44,7 +44,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libcryptsetup-dev clang libclang-dev \
-            cryptsetup-bin e2fsprogs bc
+            cryptsetup-bin dmsetup e2fsprogs bc
           cryptsetup --version
       - name: Install Rust toolchain (rust-toolchain.toml-pinned)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable-branch pin
@@ -62,9 +62,10 @@ jobs:
       # Dedicated physical disks (disk-tier-verification.md §4.2): the
       # opener against sparse 1000 GiB loop devices under virtio serial
       # names — first boot, reboot, swap, blank, missing, too small,
-      # signature, forged headers, malformed anchor.
+      # signature, forged headers, malformed anchor; an integrity slot (guest
+      # release 8): primed init mapping, booted-OS wipe, journal, tamper.
       - name: dedicated-disks end-to-end
         run: |
-          sudo modprobe dm_crypt loop
+          sudo modprobe dm_crypt dm_integrity loop
           sudo BIN="$PWD/target/release/hippius-guest-release" \
             bash scripts/dev/dedicated-disks-e2e.sh

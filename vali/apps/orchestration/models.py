@@ -1611,7 +1611,11 @@ class GuestInitrdBuild(models.Model):
     verity_root_hash = models.CharField(max_length=64)
     base_initrd_sha256 = models.CharField(max_length=64)
     release_cpio_sha256 = models.CharField(max_length=64)
-    initrd_sha256 = models.CharField(max_length=64, unique=True)
+    #: Unique per base bake (`orchestration_one_guest_build_per_initrd_and_bake`):
+    #: two bakes sharing one upstream kernel + initrd carry byte-identical
+    #: builds of a release, each on its own rootfs / verity / prefix. Its
+    #: leading column indexes the by-initrd lookups.
+    initrd_sha256 = models.CharField(max_length=64)
     s3_bucket = models.CharField(max_length=256)
     s3_key_prefix = models.CharField(max_length=512, unique=True)
     measurement = models.JSONField()
@@ -1631,7 +1635,11 @@ class GuestInitrdBuild(models.Model):
                     "base_initrd_sha256",
                 ],
                 name="orchestration_one_guest_build_per_release_and_base_initrd",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["initrd_sha256", "source_bake_id"],
+                name="orchestration_one_guest_build_per_initrd_and_bake",
+            ),
         ]
 
     def __str__(self) -> str:

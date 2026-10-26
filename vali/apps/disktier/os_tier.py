@@ -1,7 +1,8 @@
 """E1: the OS-disk tier a VM is sold at, and the nodes that can hold it
 (docs/design/disk-tier-verification.md §10.7, §10.14).
 
-- `os_disk_tier` on a launch is a MINIMUM (`nvme` > `ssd` > `hdd`); absent
+- `os_disk_tier` on a launch is a MINIMUM (`nvme` > `ssd` > `hdd`), or the
+  very tier under `VALI_OS_TIER_MATCH` `exact` (`tiers.os_tier_fits`); absent
   or `""` is nvme, what every OS disk was always sold as. Only a tier that
   is not nvme is written into `spec_json` (`launch_tier` reads `""` back
   as nvme), so every other launch's record is as before.
@@ -35,11 +36,13 @@ from .routing import (
     DEFAULT_POOL_ID,
     REPORT_MAX_AGE,
     free_gb,
+    implicit_default,
     os_disk_tier_of,
+    reports_pools,
     serves_os_disk_tier,
 )
 from .storage_config import version_at_least
-from .tiers import SELLABLE_TIERS, DiskTier, rank, satisfies
+from .tiers import SELLABLE_TIERS, DiskTier, os_tier_fits, rank
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +107,27 @@ def landing_tier(
         if not refusal_at(node_id, lower, need_gb, default_only):
             return lower
     return tier
+
+
+def default_refusal(
+    node_id: str, tier: str, need_gb: int = 0, owner: object = "", *, default_only: bool = False
+) -> str:
+    """Why an OS disk sold at `tier` may not land on `node_id`'s `default`
+    pool — an order naming no pool (`""` when it may): only under
+    `enforce`, when `default` does not hold the tier the disk lands at
+    ([`landing_tier`]: a fallback owner's may be lower) by [`os_tier_fits`].
+    A legacy node (`routing.implicit_default`) holds the pre-v7 nvme; any
+    other without a `default` row holds nothing there
+    (`routing.default_pool_tier`)."""
+    from .routing import default_pool_tier
+
+    if gate_mode() != GATE_ENFORCE:
+        return ""
+    at = landing_tier(node_id, tier, need_gb, owner, default_only=default_only)
+    own = default_pool_tier(node_id)
+    if own is not None and os_tier_fits(own, at):
+        return ""
+    return f"the default pool ({own or 'no OS disks'}) does not hold an OS disk at {at}"
 
 
 def refusal_at(node_id: str, tier: str, need_gb: int, default_only: bool = False) -> str:
@@ -304,22 +328,26 @@ def refusals(
     }
     minimum = str(getattr(settings, "VALI_POOL_ROUTING_MIN_AGENT_VERSION", "") or "")
     wanted = {nid for nid, pools in others.items() if pools}
-    versions = (
-        {
-            node.lower(): version
-            for node, version in MinerCapacity.objects.filter(
-                miner_node_id__in={n for n in ids if n.lower() in wanted}
-            ).values_list("miner_node_id", "agent_version")
-        }
-        if wanted and minimum
-        else {}
-    )
+    # Nodes with no pool row: whether they ever sent a v7 storage report
+    # (`routing.implicit_default`), read in the same query as the versions.
+    rowless = {n.lower() for n in ids} - set(by_node)
+    asked = {n for n in ids if n.lower() in wanted} if wanted and minimum else set()
+    asked |= {n for n in ids if n.lower() in rowless}
+    versions: dict[str, str] = {}
+    reporting: set[str] = set()
+    if asked:
+        for node, version, reported_at in MinerCapacity.objects.filter(
+            miner_node_id__in=asked
+        ).values_list("miner_node_id", "agent_version", "storage_reported_at"):
+            versions[node.lower()] = version
+            if reported_at is not None:
+                reporting.add(node.lower())
     out: dict[str, str] = {}
     for nid in ids:
         key = nid.lower()
         pools = by_node.get(key, [])
         default = next((p for p in pools if p.pool_id == DEFAULT_POOL_ID), None)
-        if _default_holds(default, tier):
+        if _default_holds(default, tier, legacy=implicit_default(bool(pools), key in reporting)):
             continue
         if others.get(key) and version_at_least(versions.get(key, ""), minimum):
             continue
@@ -335,10 +363,11 @@ def refusal(node_id: str, tier: str, need_gb: int) -> str:
 
 def ever_holding(node_ids: Iterable[str], tier: str) -> set[str]:
     """Those of `node_ids` (as given) with an OS-disk pool CONFIGURED at
-    `tier` or better — its verified (or overridden) tier, else its declared
-    class — whatever its room, health, report freshness or agent: what a
-    "never" must be judged on (missing data or a passing state is not
-    knowledge). A node with no `default` row has the pre-v7 nvme pool."""
+    `tier` (or better, unless `VALI_OS_TIER_MATCH` is `exact`) — its
+    verified (or overridden) tier, else its declared class — whatever its
+    room, health, report freshness or agent: what a "never" must be judged
+    on (missing data or a passing state is not knowledge). A legacy node
+    (`routing.implicit_default`) has the pre-v7 nvme pool."""
     ids = list(node_ids)
     by_node: dict[str, list[MinerStoragePool]] = {}
     for pool in MinerStoragePool.objects.filter(
@@ -349,22 +378,26 @@ def ever_holding(node_ids: Iterable[str], tier: str) -> set[str]:
     def configured(pool: MinerStoragePool) -> bool:
         own = pool.effective_tier if pool.effective_tier != DiskTier.UNKNOWN else ""
         own = own or pool.declared_class
-        return pool.os_disks and own in SELLABLE_TIERS and satisfies(own, tier)
+        return pool.os_disks and own in SELLABLE_TIERS and os_tier_fits(own, tier)
 
+    rowless = {nid.lower() for nid in ids} - set(by_node)
+    reporting = reports_pools(rowless)
     out: set[str] = set()
     for nid in ids:
         pools = by_node.get(nid.lower(), [])
-        has_default = any(p.pool_id == DEFAULT_POOL_ID for p in pools)
-        if (not has_default and satisfies(DEFAULT_TIER, tier)) or any(map(configured, pools)):
+        legacy = implicit_default(bool(pools), nid.lower() in reporting)
+        if (legacy and os_tier_fits(DEFAULT_TIER, tier)) or any(map(configured, pools)):
             out.add(nid)
     return out
 
 
-def _default_holds(default: MinerStoragePool | None, tier: str) -> bool:
-    """`default` takes the disk whatever the order says; no row for it (a
-    pre-v7 agent's single pool) is nvme, as every OS disk was sold."""
+def _default_holds(default: MinerStoragePool | None, tier: str, *, legacy: bool) -> bool:
+    """`default` takes the disk whatever the order says; with no row for it,
+    a `legacy` node (`routing.implicit_default`: a pre-v7 agent's single
+    pool) is nvme, as every OS disk was sold; any other holds nothing
+    there (`routing.default_pool_tier`)."""
     if default is None:
-        return satisfies(DEFAULT_TIER, tier)
+        return legacy and os_tier_fits(DEFAULT_TIER, tier)
     return default.os_disks and serves_os_disk_tier(default, tier)
 
 

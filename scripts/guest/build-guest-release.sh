@@ -145,6 +145,9 @@ install -d -m 0755 "${img}" "${img}/bin" "${img}/units" "${img}/etc"
 for b in "${AGENTS[@]}"; do
     install -m 0755 "${bin_dir}/${b}" "${img}/bin/${b}"
 done
+# The static guest-release binary also runs in the booted OS: the
+# dedicated integrity slots' first-boot wipe (hippius-dedicated-init.service).
+install -m 0755 "${bin_dir}/hippius-guest-release" "${img}/bin/hippius-guest-release"
 install -m 0755 "${SHIM}" "${img}/bin/hippius-keepalive-start"
 install -m 0755 "${DISKS}" "${img}/bin/hippius-disks"
 install -m 0644 "${COMPONENTS}/etc/keepalive.env" "${img}/etc/keepalive.env"
@@ -162,6 +165,22 @@ for f in "${COMPONENTS}"/units/*; do
     name="$(basename "${f}")"
     [[ -e "${img}/units/${name}" ]] || die "units/${name} is not enabled by release.conf (ship nothing unused)"
 done
+# udev rules: each `udev=<name>.rules` ships udev/<name>.rules, linked into
+# the guest's /etc/udev/rules.d by the boot step.
+while IFS= read -r line; do
+    case "${line}" in udev=*) ;; *) continue ;; esac
+    rules="${line#udev=}"
+    [[ "${rules}" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*\.rules$ ]] || die "release.conf: bad udev rules name '${rules}'"
+    [[ -r "${COMPONENTS}/udev/${rules}" ]] || die "release.conf links ${rules} but udev/${rules} is missing"
+    install -d -m 0755 "${img}/udev"
+    install -m 0644 "${COMPONENTS}/udev/${rules}" "${img}/udev/${rules}"
+done < "${COMPONENTS}/release.conf"
+if [[ -d "${COMPONENTS}/udev" ]]; then
+    for f in "${COMPONENTS}"/udev/*; do
+        name="$(basename "${f}")"
+        [[ -e "${img}/udev/${name}" ]] || die "udev/${name} is not linked by release.conf (ship nothing unused)"
+    done
+fi
 
 # Every entry gets a label from its top-level directory; none may lack one.
 declare -A label=()
@@ -201,7 +220,7 @@ squashfs_sha="$(sha256sum "${squashfs}" | cut -d' ' -f1)"
 record="${out}/release"
 {
     printf '# Hippius guest components release (build-guest-release.sh)\n'
-    grep -E '^(version|security_epoch|health_mask|enable|retire)=' "${COMPONENTS}/release.conf"
+    grep -E '^(version|security_epoch|health_mask|enable|retire|udev)=' "${COMPONENTS}/release.conf"
     printf 'commit=%s\n' "${commit}"
     printf 'squashfs_sha256=%s\n' "${squashfs_sha}"
 } > "${record}"

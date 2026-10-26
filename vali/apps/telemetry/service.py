@@ -950,7 +950,13 @@ def ingest_heartbeat(
             # must never cost the miner its liveness.
             if hb.declared_storage is not None and miner.chain_node_id:
                 from apps.disktier.ingest import record_storage_report
+                from apps.scheduler.models import MinerCapacity
 
+                # First, outside the report's savepoint: the node reports
+                # pools even when recording them fails below.
+                MinerCapacity.objects.filter(miner_node_id=miner.chain_node_id).update(
+                    storage_reported_at=now
+                )
                 try:
                     record_storage_report(miner.chain_node_id, hb.declared_storage, now)
                 except Exception:

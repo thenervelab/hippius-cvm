@@ -64,4 +64,47 @@ mountroot() {
     # environment), not assigned here.
     # shellcheck disable=SC2154
     hippius_golden_run "${rootmnt}"
+
+    hippius_golden_skip_post_mount_dhcp
+    hippius_golden_trace mountroot-done
+}
+
+# Turn off /init's post-mountroot DHCP. `/init` runs `configure_networking`
+# right after `mountroot` returns whenever IP is set, and the bake sets
+# `IP=dhcp` in initramfs.conf. On Ubuntu that is `udevadm settle
+# --timeout=10` + `dhcpcd -1KL -t 30 -4` with an ARP probe of the lease;
+# on Debian, klibc `ipconfig`. Golden needs none of it, and it is safe to
+# skip because:
+#   - the KBS release is over: hippius_golden_run returned, so the KEK was
+#     released over the static network (hippius_net_up) and the root is
+#     assembled. A failure exits before this line, so IP is untouched on
+#     any failing path;
+#   - the network before the release is unchanged: IP=dhcp stays in
+#     initramfs.conf (the initrd still carries virtio_net and the DHCP
+#     client) and hippius_net_up still runs unconditionally. Those are the
+#     two things whose removal hung the boot (#670/#673);
+#   - init-bottom still runs: hippius-net-teardown flushes the static
+#     192.168.122.253 before switch_root, as before;
+#   - the lease it took was thrown away by that same teardown. Its only
+#     lasting output was /run/net-<nic>.conf and, on Ubuntu,
+#     /run/netplan/<nic>.yaml, which made netplan generate the userspace
+#     .network. Without it, systemd-networkd brings the NIC up from the
+#     bake's 50-hippius-dhcp.network (DHCPv4, ClientIdentifier=mac), as on
+#     Debian, which has no netplan writer. cloud-init writes no network
+#     config (99-hippius-network.cfg: network config disabled) and reads
+#     /run/net-*.conf only with `ip=` on the cmdline, which golden has not.
+# `/init` reads IP in this same shell (mountroot is a function it calls), so
+# the assignment is enough; `off` is what its `case "$IP"` skips.
+hippius_golden_skip_post_mount_dhcp() {
+    # shellcheck disable=SC2034  # read by initramfs-tools' /init
+    IP=off
+}
+
+# One `hippius-trace` line with the uptime, for measuring the switch_root
+# gap from the console log. Cheap and unconditional (the cmdline is
+# measured, so it cannot be gated on a boot flag).
+hippius_golden_trace() {
+    _hgt_up=""
+    read -r _hgt_up _ < /proc/uptime 2>/dev/null || true
+    echo "hippius-trace: $1 up=${_hgt_up}" > /dev/kmsg 2>/dev/null || true
 }

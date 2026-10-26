@@ -16,10 +16,11 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, close_old_connections, connections, transaction
 from django.db.models import F
 from django.utils import timezone
 
@@ -1472,7 +1473,7 @@ def claim_one() -> LaunchJob | None:
     return LaunchJob.objects.select_related("decided_by").get(id=job.id)
 
 
-def run_job(job: LaunchJob) -> None:
+def run_job(job: LaunchJob, *, stopping: Callable[[], bool] | None = None) -> None:
     """Execute one claimed (`running`) launch job: read the userdata
     working copy back from Vault (and unwrap it), drive `launch_vm`, and
     CAS to a terminal state.
@@ -1519,6 +1520,9 @@ def run_job(job: LaunchJob) -> None:
                 job.decided_by,
                 on_phase=_phase_callback(job),
                 queued_for_s=(timezone.now() - job.started_at).total_seconds(),
+                # Only the concurrent worker passes one: the serial call is
+                # exactly what it was.
+                **({} if stopping is None else {"stopping": stopping}),
             )
         except launch.LaunchCancelled as exc:
             log.warning("launch job %s: %s", job.job_id, exc)
@@ -1911,3 +1915,45 @@ def tick_once() -> bool:
         return False
     run_job(job)
     return True
+
+
+#: Upper bound on `VALI_LAUNCH_TICK_CONCURRENCY`: each job holds a DB
+#: connection and a thread in one pod; past this a typo, not a plan.
+MAX_LAUNCH_TICK_CONCURRENCY = 32
+
+
+def launch_tick_concurrency() -> int:
+    """How many launch jobs the `vali_launch_tick` worker runs at once.
+
+    `1` (the default) is the serial loop. Above it, jobs overlap on a
+    thread pool; the one step that must not overlap — the placement
+    decision and its `Pending` row — is serialized by
+    `apps.scheduler.decision_lock`. Out of `1..MAX_LAUNCH_TICK_CONCURRENCY`
+    refuses to start rather than guess."""
+    value = int(getattr(settings, "VALI_LAUNCH_TICK_CONCURRENCY", 1))
+    if not 1 <= value <= MAX_LAUNCH_TICK_CONCURRENCY:
+        raise ValueError(
+            f"VALI_LAUNCH_TICK_CONCURRENCY must be 1..{MAX_LAUNCH_TICK_CONCURRENCY}, got {value}"
+        )
+    return value
+
+
+def run_claimed_job(job: LaunchJob, stopping: Callable[[], bool]) -> None:
+    """`run_job` on a pool thread of the concurrent launch tick.
+
+    Each thread owns its Django DB connections: drop any that went stale
+    before the job, and close them all after it, so an idle thread never
+    sits on a connection and a broken one never carries over to the next
+    job. A raise is logged, never propagated — it would only surface on a
+    future nobody reads; the job stays `running` for the orphan reaper,
+    exactly as when the serial loop catches it.
+
+    `stopping` is the worker's shutdown probe: a job still waiting for a
+    boot slot ends at once (`launch_vm(stopping=)`) so the drain is short."""
+    close_old_connections()
+    try:
+        run_job(job, stopping=stopping)
+    except Exception:  # noqa: BLE001 — one job must not take the pool down.
+        log.exception("launch job %s raised out of run_job", job.job_id)
+    finally:
+        connections.close_all()

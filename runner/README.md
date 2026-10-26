@@ -75,7 +75,7 @@ automatically. Those workflows currently still run on `ubuntu-latest`
 
   ```sh
   cosign verify ghcr.io/thenervelab/hippius-runner-k8s@<digest> \
-    --certificate-identity-regexp='^https://github.com/thenervelab/hippius-compute/' \
+    --certificate-identity-regexp='^https://github\.com/thenervelab/hippius-compute-internal/\.github/workflows/runner-image\.yml@refs/(heads/main|tags/v[^/]+)$' \
     --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
   ```
 
@@ -87,7 +87,7 @@ automatically. Those workflows currently still run on `ubuntu-latest`
 2. Bump `COSIGN_VERSION` + `COSIGN_SHA256` if a new cosign release
    carries a security fix (verify the sha against the release
    `checksums.txt`).
-3. PR. The `runner-image.yml` workflow runs on the PR and produces a
-   `sha-<commit>` image you can pin in a `kubectl` sanity check.
-4. Merge. Argo or the operator updates the runnerset values to the
-   new digest.
+3. PR. The `runner-image.yml` workflow builds the image on the PR to
+   validate it, but does not push or sign it (hippius-audits#12).
+4. Merge. The main build pushes + signs a `sha-<commit>` image; Argo or
+   the operator updates the runnerset values to the new digest.

@@ -6,19 +6,21 @@ docs/design/disk-tier-verification.md §4.2, §5.2, §6.1, §7, §8).
   `pinned_ack`, with the contract's 400 / 409 categories. Off
   (`VALI_DEDICATED_ENABLED`) ⇒ any value but null is today's 409
   `dedicated-disks-not-offered`. Kept in the launch spec only when present.
-- Tiers (contract §8): a request's `tier` is a MINIMUM among `hdd`, `ssd`,
-  `nvme` (anything else 400 `dedicated-invalid`); one not in
+- Tiers (contract §8): a request's `tier` is one of `hdd`, `ssd`, `nvme`
+  (anything else 400 `dedicated-invalid`), matched EXACTLY by default
+  (`VALI_DEDICATED_TIER_MATCH` `exact`: only disks verified at that tier) or
+  as a MINIMUM (`minimum`: a disk verified higher qualifies too); one not in
   `VALI_DEDICATED_SELLABLE_TIERS` is 409 `dedicated-disks-not-offered`. A
   disk is sold at the tier REQUESTED (`PlacementDisk.required_tier`), never
   at its higher verified tier: the read-back and the miner's pay carry it.
 - Capacity ([`free_counts`]): per node, the `free` disks a request could
-  take — active, verified at ≥ the sold tier, at least `min_size_gb` GiB,
+  take — active, verified at the sold tier (or above, `minimum`), at least `min_size_gb` GiB,
   reported free in a recent `v7` heartbeat — on a node whose agent takes
   `extra_disks` (`VALI_DEDICATED_MIN_AGENT_VERSION`, empty = none).
 - Assignment ([`assign`]): in the placement's own transaction, row-locked,
   the lowest qualifying verified tier first, then the smallest qualifying
-  disks (ties: most recently probed): an nvme disk is taken for an hdd
-  request only when no hdd or ssd disk qualifies. A disk can
+  disks (ties: most recently probed): under `minimum`, an nvme disk is
+  taken for an hdd request only when no hdd or ssd disk qualifies. A disk can
   never be assigned twice: the rows are locked and moved `free → assigned`
   under a compare-and-set.
 - The order and the measured cmdline ([`extra_disks`], [`cmdline_value`],
@@ -27,6 +29,14 @@ docs/design/disk-tier-verification.md §4.2, §5.2, §6.1, §7, §8).
   the same disks and the same `hippius.dedicated=` token.
 - The read-back ([`read_back`]): `pinned` + `disks[]`, only for a VM with
   a dedicated disk; never a disk id, path, serial or pool id.
+- Integrity (contract §9): `dedicated_disks.integrity: true` (ssd / nvme
+  only, `VALI_DEDICATED_INTEGRITY_ENABLED`, a guest release ≥
+  `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE`) marks every slot of the
+  launch (`PlacementDisk.integrity`, fixed by the slot's first assignment);
+  the measured anchor names such a slot `x<N>:<GiB>:i`. The guest wipes it
+  at first boot and says so in its receipt (`disk_io[].state`
+  `initializing`, optional `init_percent`), shown as `guest_state`
+  `initializing` + `init_percent` until it reports the slot `ok`.
 
 A disk's size is billed and measured as its SIZE CLASS: its real size
 floored to 100 GiB.
@@ -67,12 +77,24 @@ MAX_SIZE_CLASS_GIB = 1_048_576
 #: The tiers a request may name (a minimum), lowest first. Which of them are
 #: on sale is `VALI_DEDICATED_SELLABLE_TIERS` ([`sellable_tiers`]).
 REQUEST_TIERS: tuple[str, ...] = (DiskTier.HDD, DiskTier.SSD, DiskTier.NVME)
+#: `VALI_DEDICATED_TIER_MATCH` values ([`tier_match`]).
+TIER_MATCH_EXACT = "exact"
+TIER_MATCH_MINIMUM = "minimum"
 #: The measured cmdline token: `hippius.dedicated=x0:<GiB>,x1:<GiB>`.
 CMDLINE_KEY = "hippius.dedicated"
+#: The anchor suffix of an integrity slot: `x<N>:<GiB>:i` (contract §9).
+INTEGRITY_SUFFIX = ":i"
+#: The tiers an integrity launch may ask (contract §9: never `hdd`).
+INTEGRITY_TIERS: tuple[str, ...] = (DiskTier.SSD, DiskTier.NVME)
+#: `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE` unset: guest release 8, the
+#: first whose initramfs opens an integrity slot.
+DEFAULT_INTEGRITY_MIN_GUEST_RELEASE = 8
 #: The guest opens at most this many slots.
 MAX_SLOTS = 8
 
 _REQUEST_KEYS = frozenset({"tier", "count", "min_size_gb"})
+#: The optional keys of a request (contract §9).
+_OPTIONAL_REQUEST_KEYS = frozenset({"integrity"})
 _SLOT_RE = re.compile(r"^x(0|[1-9][0-9]?)$")
 
 # Launch intake (contract §1.1).
@@ -83,11 +105,18 @@ CATEGORY_ACK_REQUIRED = "dedicated-ack-required"
 CATEGORY_NOT_OFFERED = "dedicated-disks-not-offered"
 CATEGORY_NO_FAILOVER = "dedicated-no-failover"
 CATEGORY_NEEDS_RELEASE = "dedicated-needs-release"
+#: `integrity: true` while integrity is off, or at tier `hdd` (§9).
+CATEGORY_INTEGRITY_NOT_OFFERED = "dedicated-integrity-not-offered"
 #: A lifecycle operation that would move a pinned VM off its host (§5).
 CATEGORY_PINNED = "dedicated-pinned"
 #: The 409 categories of the intake (the rest are 400).
 CONFLICT_CATEGORIES = frozenset(
-    {CATEGORY_NOT_OFFERED, CATEGORY_NO_FAILOVER, CATEGORY_NEEDS_RELEASE}
+    {
+        CATEGORY_NOT_OFFERED,
+        CATEGORY_NO_FAILOVER,
+        CATEGORY_NEEDS_RELEASE,
+        CATEGORY_INTEGRITY_NOT_OFFERED,
+    }
 )
 # Asynchronous placement failures (contract §1.2).
 NO_DEDICATED_CAPACITY = "no-dedicated-capacity"
@@ -99,6 +128,8 @@ SLOT_MISSING = "missing"
 SLOT_FAILED = "failed"
 SLOT_MISMATCH = "mismatch"
 SLOT_RELEASED = "released"
+#: `guest_state` of an integrity slot during its first-boot wipe (§9).
+GUEST_INITIALIZING = "initializing"
 #: A held disk's `state` comes from HOST evidence only — the agent's own
 #: `v7` report on it (`_held_slot_state`). The guest's receipt verdicts are
 #: forgeable by root in the VM (a tenant could claim `mismatch` to stop a
@@ -106,7 +137,12 @@ SLOT_RELEASED = "released"
 #: `guest_state`.
 #: The guest's receipt verdicts for a dedicated slot (`disk_io[].state`),
 #: informational only (`guest_state`).
-_GUEST_TO_SLOT = {"ok": SLOT_ATTACHED, "missing": SLOT_MISSING, "mismatch": SLOT_MISMATCH}
+_GUEST_TO_SLOT = {
+    "ok": SLOT_ATTACHED,
+    "missing": SLOT_MISSING,
+    "mismatch": SLOT_MISMATCH,
+    GUEST_INITIALIZING: GUEST_INITIALIZING,
+}
 
 
 class DedicatedError(Exception):
@@ -129,9 +165,20 @@ class DedicatedRequest:
     tier: str
     count: int
     min_size_gb: int
+    #: Every slot of the launch is an integrity slot (contract §9).
+    integrity: bool = False
 
     def as_spec(self) -> dict[str, Any]:
-        return {"tier": self.tier, "count": self.count, "min_size_gb": self.min_size_gb}
+        """The request as stored and echoed: `integrity` only when true, so
+        every other launch's record is byte-identical to before §9."""
+        out: dict[str, Any] = {
+            "tier": self.tier,
+            "count": self.count,
+            "min_size_gb": self.min_size_gb,
+        }
+        if self.integrity:
+            out["integrity"] = True
+        return out
 
     @property
     def min_size_bytes(self) -> int:
@@ -141,11 +188,13 @@ class DedicatedRequest:
 @dataclass(frozen=True)
 class ExtraDisk:
     """One dedicated disk of a launch order: its slot, the miner's by-id
-    name (operator-side only) and its size class."""
+    name (operator-side only), its size class, and whether the guest opens
+    it with integrity (contract §9)."""
 
     slot: str
     disk_id: str
     size_gb: int
+    integrity: bool = False
 
 
 # ── settings ─────────────────────────────────────────────────────────
@@ -166,6 +215,15 @@ def max_per_vm() -> int:
 def min_guest_release() -> int | None:
     value = getattr(settings, "VALI_DEDICATED_MIN_GUEST_RELEASE", None)
     return int(value) if value is not None else None
+
+
+def integrity_enabled() -> bool:
+    return bool(getattr(settings, "VALI_DEDICATED_INTEGRITY_ENABLED", False))
+
+
+def integrity_min_guest_release() -> int:
+    value = getattr(settings, "VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE", None)
+    return int(value) if value is not None else DEFAULT_INTEGRITY_MIN_GUEST_RELEASE
 
 
 def min_agent_version() -> str:
@@ -201,11 +259,11 @@ def parse_request(raw: object) -> DedicatedRequest:
     if not isinstance(raw, dict):
         raise DedicatedError("dedicated_disks must be an object", CATEGORY_INVALID)
     keys = set(raw)
-    if keys != _REQUEST_KEYS:
-        unknown = sorted(str(k) for k in keys - _REQUEST_KEYS)
+    if not _REQUEST_KEYS <= keys <= _REQUEST_KEYS | _OPTIONAL_REQUEST_KEYS:
+        unknown = sorted(str(k) for k in keys - _REQUEST_KEYS - _OPTIONAL_REQUEST_KEYS)
         missing = sorted(_REQUEST_KEYS - keys)
         raise DedicatedError(
-            "dedicated_disks takes exactly tier, count and min_size_gb"
+            "dedicated_disks takes tier, count, min_size_gb and an optional integrity"
             + (f" (unknown: {', '.join(unknown)})" if unknown else "")
             + (f" (missing: {', '.join(missing)})" if missing else ""),
             CATEGORY_INVALID,
@@ -231,7 +289,10 @@ def parse_request(raw: object) -> DedicatedRequest:
             f"dedicated_disks.min_size_gb must be at least {MIN_SIZE_GB} (GiB)",
             CATEGORY_SIZE_INVALID,
         )
-    return DedicatedRequest(tier=tier, count=count, min_size_gb=size)
+    integrity = raw.get("integrity", False)
+    if not isinstance(integrity, bool):
+        raise DedicatedError("dedicated_disks.integrity must be a boolean", CATEGORY_INVALID)
+    return DedicatedRequest(tier=tier, count=count, min_size_gb=size, integrity=integrity)
 
 
 def not_offered(*, tenant_id: str, user_id: str) -> str:
@@ -243,6 +304,33 @@ def not_offered(*, tenant_id: str, user_id: str) -> str:
     if owners and not ({tenant_id, user_id} & owners):
         return "dedicated_disks is not offered to this owner"
     return ""
+
+
+def integrity_not_offered(request: DedicatedRequest) -> str:
+    """Why `request`'s integrity is not sold (`""` when it is, or when it
+    asks none): integrity off (`VALI_DEDICATED_INTEGRITY_ENABLED`), or a
+    tier outside ssd / nvme (contract §9)."""
+    if not request.integrity:
+        return ""
+    if not integrity_enabled():
+        return "dedicated_disks.integrity is not offered on this validator"
+    if request.tier not in INTEGRITY_TIERS:
+        return (
+            f"dedicated_disks.integrity is not offered at tier {request.tier} "
+            f"(only {', '.join(INTEGRITY_TIERS)})"
+        )
+    return ""
+
+
+def required_guest_release(request: DedicatedRequest) -> int | None:
+    """The oldest blessed guest release that may launch `request`:
+    `VALI_DEDICATED_MIN_GUEST_RELEASE`, raised to
+    `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE` for an integrity launch.
+    `None` (no release qualifies for dedicated disks at all) stays `None`."""
+    minimum = min_guest_release()
+    if minimum is None or not request.integrity:
+        return minimum
+    return max(minimum, integrity_min_guest_release())
 
 
 def check_launch(
@@ -258,7 +346,9 @@ def check_launch(
     contract's order: not offered (flag off, or an owner off the allowlist)
     before anything about the body, so a caller that may not buy learns
     nothing else; then the body (400); then the conflicts (409), the tier
-    not on sale (`dedicated-disks-not-offered`) first.
+    not on sale (`dedicated-disks-not-offered`) first, integrity not offered
+    (`dedicated-integrity-not-offered`) next; an integrity launch needs the
+    higher of the two guest-release floors ([`required_guest_release`]).
     `guest_release` is the blessed guest release of the launched image
     (`None` for a launch that is not by image)."""
     why = not_offered(tenant_id=tenant_id, user_id=user_id)
@@ -274,15 +364,19 @@ def check_launch(
     why = tier_not_sold(request.tier)
     if why:
         raise DedicatedError(why, CATEGORY_NOT_OFFERED)
+    why = integrity_not_offered(request)
+    if why:
+        raise DedicatedError(why, CATEGORY_INTEGRITY_NOT_OFFERED)
     if require_failover_peer:
         raise DedicatedError(
             "a VM with dedicated disks is pinned to its host: it cannot require a failover peer",
             CATEGORY_NO_FAILOVER,
         )
-    minimum = min_guest_release()
+    minimum = required_guest_release(request)
     if minimum is None or guest_release is None or int(guest_release) < minimum:
         raise DedicatedError(
             "the image's blessed guest release cannot open dedicated disks"
+            + (" with integrity" if request.integrity else "")
             + (f" (needs release {minimum} or later)" if minimum is not None else ""),
             CATEGORY_NEEDS_RELEASE,
         )
@@ -307,9 +401,17 @@ def spec_request(spec: Mapping[str, Any] | Any) -> DedicatedRequest | None:
         _strict_int(raw.get("count")),
         _strict_int(raw.get("min_size_gb")),
     )
-    if tier not in SELLABLE_TIERS or count is None or count < 1 or size is None or size < 1:
+    integrity = raw.get("integrity", False)
+    if (
+        tier not in SELLABLE_TIERS
+        or count is None
+        or count < 1
+        or size is None
+        or size < 1
+        or not isinstance(integrity, bool)
+    ):
         raise ValueError(f"malformed dedicated_disks in a launch spec: {dict(raw)!r}")
-    return DedicatedRequest(tier=str(tier), count=count, min_size_gb=size)
+    return DedicatedRequest(tier=str(tier), count=count, min_size_gb=size, integrity=integrity)
 
 
 # ── capacity ─────────────────────────────────────────────────────────
@@ -322,8 +424,17 @@ def size_class_gb(size_bytes: int | None) -> int:
     return (int(size_bytes) // GIB // SIZE_CLASS_GIB) * SIZE_CLASS_GIB
 
 
-def _tiers_at_least(tier: str) -> list[str]:
-    return [t for t in SELLABLE_TIERS if satisfies(t, tier)]
+def tier_match() -> str:
+    """`exact` (default: a tier-T request takes only disks verified at T, so
+    premium stock is never sold at a lower price) or `minimum` (a disk
+    verified at T or above qualifies) — `VALI_DEDICATED_TIER_MATCH`."""
+    return getattr(settings, "VALI_DEDICATED_TIER_MATCH", TIER_MATCH_EXACT)
+
+
+def _qualifying_tiers(tier: str) -> list[str]:
+    if tier_match() == TIER_MATCH_MINIMUM:
+        return [t for t in SELLABLE_TIERS if satisfies(t, tier)]
+    return [t for t in SELLABLE_TIERS if t == tier]
 
 
 def _placement_order(disk: DedicatedDisk) -> tuple[int, int, bool, float, str]:
@@ -341,7 +452,8 @@ def _placement_order(disk: DedicatedDisk) -> tuple[int, int, bool, float, str]:
 
 def qualifying(request: DedicatedRequest, *, now: datetime | None = None) -> QuerySet:
     """Every disk fleet-wide the request could take, ignoring the node's
-    agent: free and active in vali, verified at ≥ the tier and big enough
+    agent: free and active in vali, verified at the tier ([`tier_match`]:
+    exactly, or at or above it) and big enough
     BY THE PROBE (`verified_size_bytes`, never the miner's own figure), still
     reported at least that big, and reported free (no VM) in a recent `v7`
     heartbeat."""
@@ -353,7 +465,7 @@ def qualifying(request: DedicatedRequest, *, now: datetime | None = None) -> Que
         Q(freed_at__isnull=True) | Q(reported_at__gt=F("freed_at")),
         state=DedicatedDiskState.FREE,
         desired_state=DedicatedDiskDesiredState.ACTIVE,
-        verified_tier__in=_tiers_at_least(request.tier),
+        verified_tier__in=_qualifying_tiers(request.tier),
         verified_size_bytes__gte=request.min_size_bytes,
         verified_size_bytes__lt=(MAX_SIZE_CLASS_GIB + SIZE_CLASS_GIB) * GIB,
         size_bytes__gte=F("verified_size_bytes"),
@@ -490,6 +602,7 @@ def assign(placement: Any, vm: Any, request: DedicatedRequest) -> list[Placement
                 dedicated_disk=disk,
                 size_gb=size_class_gb(disk.verified_size_bytes),
                 required_tier=request.tier,
+                integrity=request.integrity,
             )
         )
     return out
@@ -505,29 +618,33 @@ def _reuse(
     placement: Any, held: list[DedicatedDisk], request: DedicatedRequest
 ) -> list[PlacementDisk]:
     """Record the disks the VM already holds on `placement`, with their
-    slots and the size classes they were measured at: only on their node,
-    and only when they are the disks the VM was sold."""
+    slots, the size classes they were measured at and the integrity mode
+    their first assignment gave them (a slot's mode never changes: the
+    guest formatted it so): only on their node, and only when they are the
+    disks the VM was sold."""
     node = placement.miner_node_id.lower()
     if {d.miner_node_id.lower() for d in held} != {node} or len(held) != request.count:
         raise DisksTaken(
             f"vm holds {len(held)} dedicated disk(s) on another node or of another count"
         )
-    sizes = {
-        r["dedicated_disk_id"]: r["size_gb"]
-        for r in PlacementDisk.objects.filter(
-            dedicated_disk__in=held, placement__vm_id=placement.vm_id
-        )
+    # The FIRST row per disk (oldest first; `setdefault` keeps it).
+    first: dict[Any, dict[str, Any]] = {}
+    for r in (
+        PlacementDisk.objects.filter(dedicated_disk__in=held, placement__vm_id=placement.vm_id)
         .order_by("created_at")
-        .values("dedicated_disk_id", "size_gb")
-    }
+        .values("dedicated_disk_id", "size_gb", "integrity")
+    ):
+        first.setdefault(r["dedicated_disk_id"], r)
     return [
         PlacementDisk.objects.create(
             placement=placement,
             slot=disk.assigned_slot,
             kind=DiskKind.DEDICATED,
             dedicated_disk=disk,
-            size_gb=sizes.get(disk.pk) or size_class_gb(disk.verified_size_bytes),
+            size_gb=first.get(disk.pk, {}).get("size_gb")
+            or size_class_gb(disk.verified_size_bytes),
             required_tier=request.tier,
+            integrity=bool(first.get(disk.pk, {}).get("integrity", request.integrity)),
         )
         for disk in held
     ]
@@ -595,7 +712,12 @@ def extra_disks(vm_id: str, node_id: str) -> list[ExtraDisk]:
         placement=placement, kind=DiskKind.DEDICATED
     ).select_related("dedicated_disk")
     disks = [
-        ExtraDisk(slot=r.slot, disk_id=r.dedicated_disk.disk_id, size_gb=r.size_gb)
+        ExtraDisk(
+            slot=r.slot,
+            disk_id=r.dedicated_disk.disk_id,
+            size_gb=r.size_gb,
+            integrity=r.integrity,
+        )
         for r in rows
         if r.dedicated_disk is not None
     ]
@@ -605,7 +727,8 @@ def extra_disks(vm_id: str, node_id: str) -> list[ExtraDisk]:
 def cmdline_value(disks: Iterable[ExtraDisk]) -> str | None:
     """`x0:<GiB>,x1:<GiB>` in the guest's grammar — slots `x0`..`x23` (no
     leading zero), 1 to 8 of them, unique; sizes as size classes, decimal,
-    1000..1048576 GiB — or `None` without disks. Anything else raises: a
+    1000..1048576 GiB; an integrity slot suffixed `:i` (contract §9) — or
+    `None` without disks. Anything else raises: a
     launch never measures a token the guest would refuse."""
     disks = list(disks)
     if not disks:
@@ -618,14 +741,16 @@ def cmdline_value(disks: Iterable[ExtraDisk]) -> str | None:
             raise ValueError(f"dedicated slot {d.slot} is past x{len(DEDICATED_SLOTS) - 1}")
         if not MIN_SIZE_GB <= d.size_gb <= MAX_SIZE_CLASS_GIB:
             raise ValueError(f"dedicated slot {d.slot} size {d.size_gb} GiB is out of range")
-    return ",".join(f"{d.slot}:{d.size_gb}" for d in disks)
+    return ",".join(f"{d.slot}:{d.size_gb}{INTEGRITY_SUFFIX if d.integrity else ''}" for d in disks)
 
 
 def stand_in_cmdline_value(request: DedicatedRequest) -> str:
     """A value at least as long as any real [`cmdline_value`] of
     `request`, for the measured-cmdline length checks run before the disks
     are assigned."""
-    widest = f"x{len(DEDICATED_SLOTS) - 1}:{MAX_SIZE_CLASS_GIB}"
+    widest = f"x{len(DEDICATED_SLOTS) - 1}:{MAX_SIZE_CLASS_GIB}" + (
+        INTEGRITY_SUFFIX if request.integrity else ""
+    )
     return ",".join([widest] * request.count)
 
 
@@ -728,13 +853,27 @@ def read_back_many(
                 "tier": row.required_tier,
                 "state": _slot_state(row, vm, destroyed=destroyed),
             }
-            # Additive to the contract: what the guest itself last said of
-            # the slot (forgeable, informational), once it said anything.
-            if not destroyed and row.observed_state in _GUEST_TO_SLOT:
-                entry["guest_state"] = _GUEST_TO_SLOT[row.observed_state]
+            if row.integrity:
+                # §9: only on an integrity slot, so every other one is
+                # byte-identical to before.
+                entry["integrity"] = True
+            entry.update(_guest_fields(row, destroyed=destroyed))
             disks.append(entry)
         out[vm.pk] = {"pinned": True, "disks": disks}
     return out
+
+
+def _guest_fields(row: PlacementDisk, *, destroyed: bool) -> dict[str, Any]:
+    """What the guest itself last said of the slot (forgeable,
+    informational), once it said anything: `guest_state`, and during an
+    integrity slot's first-boot wipe `initializing` + `init_percent` (0-100,
+    or `None` when the receipt carried no progress; only an integrity slot
+    records `initializing`, [`record_slot_verdicts`])."""
+    if destroyed or row.observed_state not in _GUEST_TO_SLOT:
+        return {}
+    if row.observed_state == GUEST_INITIALIZING:
+        return {"guest_state": GUEST_INITIALIZING, "init_percent": row.observed_percent}
+    return {"guest_state": _GUEST_TO_SLOT[row.observed_state]}
 
 
 def read_back(vm: Any, *, os_disk: tuple[int, str] | None = None) -> dict[str, Any]:
@@ -838,17 +977,40 @@ def is_pinned(vm: Any) -> bool:
 def guest_release_refusal(vm: Any, release: int | None) -> str:
     """Why `vm` must not boot guest release `release` (`""` when it may):
     a VM with dedicated disks never boots a guest below
-    `VALI_DEDICATED_MIN_GUEST_RELEASE` (an older guest ignores its disks) —
-    guest upgrades, initrd swaps. `None` = a build of no known release."""
+    `VALI_DEDICATED_MIN_GUEST_RELEASE` (an older guest ignores its disks),
+    nor, with an integrity slot, below
+    `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE` (an older guest cannot open
+    it, §9) — guest upgrades, initrd swaps. `None` = a build of no known
+    release."""
     if not is_pinned(vm):
         return ""
     minimum = min_guest_release()
+    integrity = has_integrity_slot(vm)
+    if minimum is not None and integrity:
+        minimum = max(minimum, integrity_min_guest_release())
     if minimum is not None and release is not None and int(release) >= minimum:
         return ""
     return (
-        f"vm {vm.vm_id} has dedicated disks: its guest must stay at release "
+        f"vm {vm.vm_id} has dedicated disks{' with integrity' if integrity else ''}: its "
+        f"guest must stay at release "
         f"{minimum if minimum is not None else '(none set)'} or later, not {release}"
     )
+
+
+def has_integrity_slot(vm: Any) -> bool:
+    """`vm` holds (or was sold) a dedicated slot opened with integrity (§9).
+    Fails closed on a malformed launch record."""
+    if PlacementDisk.objects.filter(
+        placement__vm=vm, kind=DiskKind.DEDICATED, integrity=True
+    ).exists():
+        return True
+    from apps.scheduler.service import _launch_spec
+
+    try:
+        request = spec_request(_launch_spec(vm.vm_id))
+    except ValueError:
+        return True
+    return request is not None and request.integrity
 
 
 def pinned_message(vm: Any, operation: str) -> str:
@@ -1028,7 +1190,13 @@ def audit_transition(
 # ── the receipt's slot verdicts ──────────────────────────────────────
 
 
-_VERDICTS = frozenset({"ok", "missing", "mismatch"})
+_VERDICTS = frozenset({"ok", "missing", "mismatch", GUEST_INITIALIZING})
+
+
+def _dedicated_slot_of(delta: Any) -> str:
+    serial = str(getattr(delta, "serial", "") or "")
+    slot = serial[len("hippius-") :] if serial.startswith("hippius-") else ""
+    return slot if _SLOT_RE.match(slot) else ""
 
 
 def slot_verdicts(disk_io: Iterable[Any]) -> dict[str, str]:
@@ -1036,31 +1204,60 @@ def slot_verdicts(disk_io: Iterable[Any]) -> dict[str, str]:
     a verified receipt's `disk_io` reports on. Pure."""
     out: dict[str, str] = {}
     for delta in disk_io:
-        serial = str(getattr(delta, "serial", "") or "")
-        slot = serial[len("hippius-") :] if serial.startswith("hippius-") else ""
+        slot = _dedicated_slot_of(delta)
         state = str(getattr(delta, "state", "") or "")
-        if _SLOT_RE.match(slot) and state in _VERDICTS:
+        if slot and state in _VERDICTS:
             out[slot] = state
     return out
 
 
-def record_slot_verdicts(placement_id: Any, verdicts: Mapping[str, str], at: datetime) -> int:
+def slot_progress(disk_io: Iterable[Any]) -> dict[str, int]:
+    """`{slot: percent}` for the dedicated slots a verified receipt reports
+    `initializing` WITH a progress (`init_percent`, 0-100); a slot without
+    one (an older wire, or a guest that does not count) is absent. Pure."""
+    out: dict[str, int] = {}
+    for delta in disk_io:
+        slot = _dedicated_slot_of(delta)
+        percent = getattr(delta, "init_percent", None)
+        if (
+            slot
+            and str(getattr(delta, "state", "") or "") == GUEST_INITIALIZING
+            and isinstance(percent, int)
+            and not isinstance(percent, bool)
+            and 0 <= percent <= 100
+        ):
+            out[slot] = percent
+    return out
+
+
+def record_slot_verdicts(
+    placement_id: Any,
+    verdicts: Mapping[str, str],
+    at: datetime,
+    progress: Mapping[str, int] | None = None,
+) -> int:
     """Store the guest's latest verdict per dedicated slot of the
-    placement (`ok` | `missing` | `mismatch`, from a verified receipt's
-    `disk_io`, `at` the end of its window). Every newer window advances the
-    slot's `observed_at`, the same verdict included, so a late older
-    window can never overwrite it. Returns rows updated."""
+    placement (`ok` | `missing` | `mismatch` | `initializing`, from a
+    verified receipt's `disk_io`, `at` the end of its window), with the
+    wipe's `progress` for an `initializing` slot (`None` when the receipt
+    carried none; cleared with every other verdict). Every newer window
+    advances the slot's `observed_at`, the same verdict included, so a late
+    older window can never overwrite it. Returns rows updated."""
     from django.db.models import Q
 
+    progress = progress or {}
     n = 0
     for slot, verdict in verdicts.items():
         if verdict not in _VERDICTS:
             continue
-        n += (
-            PlacementDisk.objects.filter(
-                placement_id=placement_id, slot=slot, kind=DiskKind.DEDICATED
-            )
-            .filter(Q(observed_at__isnull=True) | Q(observed_at__lt=at))
-            .update(observed_state=verdict, observed_at=at)
-        )
+        rows = PlacementDisk.objects.filter(
+            placement_id=placement_id, slot=slot, kind=DiskKind.DEDICATED
+        ).filter(Q(observed_at__isnull=True) | Q(observed_at__lt=at))
+        percent = None
+        if verdict == GUEST_INITIALIZING:
+            # Only an integrity slot has a first-boot wipe: on any other
+            # slot the (forgeable) claim is dropped, its last verdict kept.
+            rows = rows.filter(integrity=True)
+            percent = progress.get(slot)
+        n += rows.update(observed_state=verdict, observed_at=at, observed_percent=percent)
     return n

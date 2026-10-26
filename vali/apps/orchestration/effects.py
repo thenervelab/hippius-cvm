@@ -1517,6 +1517,46 @@ def _arrival_os_pool(
     return routing.choose_os_pool(node_id, need_gb, tier)
 
 
+def _arrival_default_refusal(
+    dest_miner_id: str, cmdline: str, tier: str = "nvme", owner: str = ""
+) -> str:
+    """Why a VM sold at OS-disk `tier` arriving on `dest_miner_id` may not
+    be sent there naming no pool (`default`): `os_tier.default_refusal`
+    (`""` when it may, and for a dest vali knows no node of). A legacy
+    LUKS disk can only land on `default`."""
+    from apps.disktier import os_tier
+    from apps.miners.models import MinerIdentity
+    from apps.orchestration.services.flavors import ROOTFS_DISK_GB
+
+    node_id = (
+        MinerIdentity.objects.filter(miner_id=dest_miner_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+    )
+    if not node_id:
+        return ""
+    tokens = dict(t.split("=", 1) for t in cmdline.split() if "=" in t)
+    legacy = "dm-verity.root" not in tokens or "hippius.luks_header_sha256" in tokens
+    try:
+        disk_gb = int(tokens.get("hippius.disk_gb", "0"))
+    except ValueError:
+        disk_gb = 0
+    need_gb = disk_gb + ROOTFS_DISK_GB if disk_gb > 0 and not legacy else 0
+    return os_tier.default_refusal(node_id, tier, need_gb, owner, default_only=legacy)
+
+
+def arrival_default_refusal(vm: Vm, dest_miner_id: str) -> str:
+    """`_arrival_default_refusal` for `vm`'s measured cmdline."""
+    from apps.disktier import os_tier
+
+    return _arrival_default_refusal(
+        dest_miner_id,
+        _launch_paths(vm)["cmdline"],
+        os_tier.launch_tier(vm.vm_id),
+        os_tier.fallback_owner_of(vm.vm_id),
+    )
+
+
 def arrival_os_pool(vm: Vm, dest_miner_id: str) -> str | None:
     """`_arrival_os_pool` for `vm`'s measured cmdline (its launch record)."""
     from apps.disktier import os_tier

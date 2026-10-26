@@ -1,0 +1,11 @@
+# Hippius guest components release 8 — linked into /etc/udev/rules.d by the
+# measured initramfs (hippius_golden_mount_components).
+#
+# /dev/vsock root-only. Every Hippius guest component that talks to the host
+# over AF_VSOCK runs as root (keepalive, tenant telemetry, eol-sign,
+# disk probe; hippius-guest-release and hippius-vsock-ticket in the
+# initramfs), and none of them opens /dev/vsock: it only answers the
+# local-CID ioctl. AF_VSOCK sockets themselves do not go through this node,
+# so this is hygiene, not the access control (the host relay authenticates
+# what it is sent).
+KERNEL=="vsock", SUBSYSTEM=="misc", OWNER:="root", GROUP:="root", MODE:="0600"

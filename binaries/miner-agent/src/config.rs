@@ -354,6 +354,15 @@ pub struct HostSection {
     /// WARNING at startup when it does.
     #[serde(default = "default_skip_shutdown_teardown")]
     pub skip_shutdown_teardown: bool,
+    /// How long, in seconds, a passed `tenant-preflight` holds the
+    /// CPU/RAM/disk-budget it checked for its launch. Other preflights and
+    /// launches count it as used, so two VMs racing for the same free
+    /// capacity cannot both pass preflight and the second one fail at
+    /// LAUNCH, after vali bound its vm_id to this host in the KBS.
+    /// Reservations live in memory only (an agent restart drops them).
+    /// Default 180; `0` disables the reservation.
+    #[serde(default = "default_preflight_reservation_ttl_secs")]
+    pub preflight_reservation_ttl_secs: u64,
 }
 
 /// `[heartbeat]` — the §K periodic liveness heartbeat (PR-MA-6).
@@ -437,6 +446,10 @@ impl Default for HeartbeatSection {
 
 fn default_skip_shutdown_teardown() -> bool {
     true
+}
+
+fn default_preflight_reservation_ttl_secs() -> u64 {
+    crate::lifecycle::PREFLIGHT_RESERVATION_TTL.as_secs()
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -1390,6 +1403,18 @@ cvm_memory_mb_budget = 16384
         assert!(!VALID.contains("skip_shutdown_teardown"));
         let c = parse(VALID).unwrap();
         assert!(c.host.skip_shutdown_teardown);
+    }
+
+    #[test]
+    fn preflight_reservation_ttl_absent_key_takes_the_default() {
+        assert!(!VALID.contains("preflight_reservation_ttl_secs"));
+        // An old config without the key still parses (`deny_unknown_fields`
+        // is about unknown keys, not missing ones) and gets 180 s.
+        let c = parse(VALID).unwrap();
+        assert_eq!(c.host.preflight_reservation_ttl_secs, 180);
+        let cfg = format!("{VALID}preflight_reservation_ttl_secs = 60\n");
+        let c = parse(&cfg).unwrap();
+        assert_eq!(c.host.preflight_reservation_ttl_secs, 60);
     }
 
     #[test]

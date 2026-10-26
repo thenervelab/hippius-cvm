@@ -603,8 +603,11 @@ hippius_golden_install_seed() {
 # this step is a strict no-op. With it, `hippius-guest-release
 # --open-dedicated-disks` derives each slot's key from the KEK keyfile
 # (HKDF, never written anywhere: it goes down a pipe to cryptsetup), formats
-# a slot's disk on its first boot (LUKS2 aes-xts-plain64, no integrity),
-# opens every slot as /dev/mapper/hippius-<slot>, and keeps its record
+# a slot's disk on its first boot (LUKS2 aes-xts-plain64; an `:i` slot with
+# AEAD integrity, guest release 8), opens every slot as
+# /dev/mapper/hippius-<slot> (an integrity slot on its first boot as
+# hippius-<slot>-init, for the booted OS's wipe: the mapping crosses
+# switch_root, its key does not), and keeps its record
 # (slot, LUKS UUID, size) at the guest-keyed volume's root, next to the
 # anti-rollback stamp. It runs HERE, in the initramfs, because:
 #   - the KEK exists only here (shredded right after); handing it, or
@@ -658,6 +661,12 @@ _hippius_golden_open_dedicated_from() {
     done <<HIPPIUS_DEDICATED_EOF
 ${_hgod_out}
 HIPPIUS_DEDICATED_EOF
+    # The opener pauses udev's event queue around an integrity slot's
+    # first activation and restarts it; restart it again whatever happened
+    # to the opener (idempotent), so a stuck queue never outlives it.
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --start-exec-queue >/dev/null 2>&1 || true
+    fi
     if [ "${_hgod_rc}" -eq 0 ]; then
         hippius_log "golden: dedicated: slots processed (states in ${HIPPIUS_DEDICATED_STATE})"
     else
@@ -889,6 +898,32 @@ hippius_golden_may_reinit() {
     [ "${_hgmr_exp}" -eq 0 ]
 }
 
+# The upper keyslot's KDF flags for this boot's key mode (echoed; empty =
+# cryptsetup's default argon2id).
+#
+# M0 (no customer keys): `--pbkdf pbkdf2 --pbkdf-force-iterations 1000`.
+# The keyslot passphrase is then the per-VM 256-bit KEK the KBS generates,
+# so key stretching buys nothing, while argon2id costs ~2 s of memory-hard
+# work per operation on a 1-vCPU guest: at format, at the wipe open and at
+# the post-wipe open (~6 s of every first boot), then once on every later
+# boot. Same choice as the dedicated disks
+# (binaries/guest-release/src/dedicated.rs, the luksFormat argv).
+#
+# Customer keys (split / customer): the default argon2id, deliberately. In
+# customer mode the passphrase derives from share_C alone (HKDF with the
+# public vm_id), and nothing in the guardian protocol proves share_C came
+# from a CSPRNG: a weak share behind a 1000-iteration PBKDF2 would leave a
+# cheap offline verifier in the LUKS header. Split mode mixes in the random
+# share_H and would be safe, but the rule stays "fast KDF in M0 only", one
+# line nobody has to re-derive.
+#
+# New volumes only: an existing volume keeps the keyslot it was formatted
+# with, whose parameters `open` reads from the header — no migration, and
+# no header rewrite (see the INVARIANT above).
+hippius_golden_upper_pbkdf_args() {
+    [ -n "${HIPPIUS_GOLDEN_KEY_MODE:-}" ] || echo "--pbkdf pbkdf2 --pbkdf-force-iterations 1000"
+}
+
 # Format the upper (fresh in-guest MK, init label), wipe it, mkfs, mark it
 # ready. Leaves it open (journaled).
 hippius_golden_format_upper() {
@@ -896,9 +931,13 @@ hippius_golden_format_upper() {
     # so a miner tampering the upper ciphertext read-faults (EIO)
     # rather than silently corrupting — same guarantee as vde.
     # The MK is generated fresh from the kernel CSPRNG INSIDE this
-    # SNP guest; only the KEK (per-VM) protects the keyslot.
+    # SNP guest; only the KEK (per-VM) protects the keyslot. KDF: see
+    # hippius_golden_upper_pbkdf_args (word-split on purpose: its output
+    # is a fixed set of flags, or nothing).
+    # shellcheck disable=SC2046
     cryptsetup luksFormat --type luks2 --integrity hmac-sha256 \
         --integrity-no-wipe --sector-size 4096 --label "${HIPPIUS_GOLDEN_INIT_LABEL}" \
+        $(hippius_golden_upper_pbkdf_args) \
         --batch-mode "${HIPPIUS_GOLDEN_UPPER}" --key-file "$1" >>/dev/kmsg 2>&1 \
         || hippius_die "golden: upper luksFormat failed — fail-closed"
     hippius_golden_write_keymode_token
@@ -2127,6 +2166,9 @@ hippius_golden_harden_root() {
 #   enable=<unit>:<target>   (repeatable) link the unit + its .wants link
 #   retire=<unit>            (repeatable) mask a unit an earlier release
 #                            (or the base) shipped
+#   udev=<name>.rules        (repeatable) link the image's udev/<name>.rules
+#                            into the root's /etc/udev/rules.d (release 8:
+#                            the /dev/vsock permissions)
 #
 # Policy:
 #   - no record ⇒ strict no-op (every initrd built before this design):
@@ -2154,10 +2196,19 @@ hippius_golden_valid_unit_name() {
     return 1
 }
 
+# Pure predicate: a udev rules file name we accept in a record.
+hippius_golden_valid_rules_name() {
+    case "$1" in
+        '' | *[!A-Za-z0-9._-]* | .* ) return 1 ;;
+        *.rules ) return 0 ;;
+    esac
+    return 1
+}
+
 # Pure parser (testable): validate a release record and print it back as
 # normalised lines (`version N`, `security_epoch N`, `commit H`,
-# `squashfs_sha256 H`, then `enable <unit> <target>` / `retire <unit>` in
-# record order). Non-zero on any malformed line, unknown or repeated
+# `squashfs_sha256 H`, then `enable <unit> <target>` / `retire <unit>` /
+# `udev <name>.rules` in record order). Non-zero on any malformed line, unknown or repeated
 # scalar key, or a missing required key.
 hippius_golden_parse_release() (
     set -f
@@ -2216,6 +2267,10 @@ hippius_golden_parse_release() (
                 hippius_golden_valid_unit_name "${_hgpr_val}" || exit 1
                 _hgpr_out="${_hgpr_out}retire ${_hgpr_val}${_hgpr_nl}"
                 ;;
+            udev)
+                hippius_golden_valid_rules_name "${_hgpr_val}" || exit 1
+                _hgpr_out="${_hgpr_out}udev ${_hgpr_val}${_hgpr_nl}"
+                ;;
             *) exit 1 ;;
         esac
     done < "${_hgpr_file}"
@@ -2239,6 +2294,18 @@ _hippius_golden_label_strict() {
         || hippius_die "golden: components: could not label ${_hgls_dst}"
     [ "$(_hippius_golden_selinux_ctx "${_hgls_dst}")" = "${_hgls_ctx}" ] \
         || hippius_die "golden: components: label of ${_hgls_dst} did not take"
+}
+
+# The context udev rule links get on this base: the label of the LOWER's
+# /etc/udev/rules.d, or nothing on a base without SELinux. Non-zero (no
+# link is written) when the base is SELinux but has no such directory or
+# label: a missing hardening rule never bricks a boot.
+_hippius_golden_udev_ctx() {
+    [ -e "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/selinux/config" ] || return 0
+    command -v getfattr >/dev/null 2>&1 && command -v setfattr >/dev/null 2>&1 || return 1
+    _hgudc_ctx="$(_hippius_golden_selinux_ctx "${HIPPIUS_GOLDEN_LOWER_MNT}/etc/udev/rules.d")"
+    [ -n "${_hgudc_ctx}" ] || return 1
+    printf '%s' "${_hgudc_ctx}"
 }
 
 # The context unit links get on this base: the label of the LOWER's
@@ -2354,6 +2421,8 @@ _hippius_golden_components_run() {
     fi
     _hgcr_parsed="$(hippius_golden_parse_release "${_hgcr_rec}")" \
         || hippius_die "golden: components: malformed release record ${_hgcr_rec} — fail-closed"
+    _hgcr_nl='
+'
     _hgcr_version="" _hgcr_epoch="" _hgcr_commit="" _hgcr_sha=""
     while read -r _hgcr_k _hgcr_v _hgcr_rest; do
         case "${_hgcr_k}" in
@@ -2409,6 +2478,14 @@ HIPPIUS_REC_EOF
     done <<HIPPIUS_REC_EOF
 ${_hgcr_parsed}
 HIPPIUS_REC_EOF
+    # The udev rule links (release 8+): same discipline as the unit links,
+    # into /etc/udev/rules.d (which takes precedence over the base's
+    # /usr/lib/udev/rules.d). Best-effort, never fatal: a rule is
+    # hardening, and refusing the boot over it would leave the tenant with
+    # nothing.
+    case "${_hgcr_parsed}" in
+        *"${_hgcr_nl}udev "*) _hippius_golden_components_udev "${_hgcr_root}" "${_hgcr_parsed}" ;;
+    esac
     # For the agents to report; nothing at boot reads it.
     printf 'version=%s\nsecurity_epoch=%s\ncommit=%s\nmounted=%s\n' \
         "${_hgcr_version}" "${_hgcr_epoch}" "${_hgcr_commit}" "${_hgcr_mounted}" \
@@ -2419,6 +2496,37 @@ HIPPIUS_REC_EOF
     else
         hippius_log "golden: components: WARN release ${_hgcr_version} NOT mounted — no Hippius agent runs this boot"
     fi
+}
+
+# Link each `udev <name>.rules` record line: ${root}/etc/udev/rules.d/<name>
+# -> ${HIPPIUS_GUEST_RUN}/guest/udev/<name> (the path the booted system
+# sees). Skips, with a WARN, when the directory is not a plain one in the
+# guest root or the SELinux label cannot be had.
+_hippius_golden_components_udev() {
+    _hgcu_root="$1"
+    _hgcu_ctx="$(_hippius_golden_udev_ctx)" || {
+        hippius_log "golden: components: WARN no SELinux label for /etc/udev/rules.d — udev rules not linked"
+        return 0
+    }
+    _hippius_golden_real_dir "${_hgcu_root}" etc/udev/rules.d || {
+        hippius_log "golden: components: WARN /etc/udev/rules.d is not a plain directory in the guest root — udev rules not linked"
+        return 0
+    }
+    while read -r _hgcu_k _hgcu_name _hgcu_rest; do
+        [ "${_hgcu_k}" = udev ] || continue
+        _hgcu_path="${_hgcu_root}/etc/udev/rules.d/${_hgcu_name}"
+        rm -rf "${_hgcu_path}" 2>/dev/null || true
+        if ln -s "${HIPPIUS_GUEST_RUN}/${HIPPIUS_GUEST_MOUNT_NAME}/udev/${_hgcu_name}" "${_hgcu_path}" 2>/dev/null; then
+            if [ -n "${_hgcu_ctx}" ]; then
+                setfattr -h -n security.selinux -v "${_hgcu_ctx}" "${_hgcu_path}" 2>/dev/null \
+                    || hippius_log "golden: components: WARN could not label ${_hgcu_path}"
+            fi
+        else
+            hippius_log "golden: components: WARN could not link ${_hgcu_path}"
+        fi
+    done <<HIPPIUS_REC_EOF
+$2
+HIPPIUS_REC_EOF
 }
 
 hippius_golden_mount_components() {

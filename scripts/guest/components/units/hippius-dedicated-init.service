@@ -1,0 +1,30 @@
+# Hippius guest components release 8 — the first-boot wipe of a dedicated
+# INTEGRITY slot (docs/design/disk-tier-verification.md §4.2.1). Dormant in
+# every VM but one whose initramfs opener just formatted such a slot: it
+# starts only when the opener's init list exists. The opener already opened
+# the slot (as /dev/mapper/hippius-<slot>-init); this unit takes no key, it
+# writes every sector through that mapping, records the slot ready on the
+# guest-keyed OS volume, then hands it to the tenant as hippius-<slot>.
+[Unit]
+Description=Hippius dedicated integrity disks: first-boot wipe
+ConditionPathExists=/run/hippius/dedicated/init
+After=local-fs.target
+DefaultDependencies=yes
+# The release image this unit runs from.
+RequiresMountsFor=/run/hippius/guest
+
+[Service]
+# Started at once (Type=exec): an hour of wipe never holds the boot.
+Type=exec
+# `-`: a run that cannot start is reported in the slot states; the unit is
+# never failed, and with RemainAfterExit it never runs twice in a boot (an
+# interrupted wipe starts again from scratch on the next boot).
+ExecStart=-/run/hippius/guest/bin/hippius-guest-release --dedicated-init-wipe
+RemainAfterExit=yes
+# The OS volume is mounted a second time to reach the slot record: in this
+# unit's own mount namespace only, never visible to the tenant.
+PrivateMounts=yes
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

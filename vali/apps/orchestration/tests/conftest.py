@@ -92,6 +92,8 @@ class FakeEffects:
         #: What `arrival_os_pool` chooses, and the `os_pool` each
         #: `dispatch_migrate_activate` named, in order.
         self.arrival_pool: str | None = None
+        #: What `arrival_default_refusal` answers ("" = `default` holds the tier).
+        self.arrival_default_refused = ""
         self.activate_os_pools: list[str | None] = []
         # §25 M4 — what `poll_dest_activation` returns (the dest's async
         # restore/boot outcome). Defaults to a happy `done`.
@@ -219,6 +221,10 @@ class FakeEffects:
     def arrival_os_pool(self, vm: Any, dest_miner_id: str) -> str | None:
         self._maybe_fail("arrival_os_pool")
         return self.arrival_pool
+
+    def arrival_default_refusal(self, vm: Any, dest_miner_id: str) -> str:
+        self._maybe_fail("arrival_default_refusal")
+        return self.arrival_default_refused
 
     def dispatch_migrate_activate(
         self,
@@ -399,6 +405,7 @@ def fx(monkeypatch: pytest.MonkeyPatch) -> FakeEffects:
         "kbs_activate_dest",
         "resolve_boot_artifacts",
         "arrival_os_pool",
+        "arrival_default_refusal",
         "dispatch_migrate_activate",
         "poll_dest_activation",
         "poll_dest_activation_status",

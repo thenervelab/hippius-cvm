@@ -56,8 +56,8 @@ def test_the_free_disks_per_size_class(operator_client: APIClient) -> None:
     assert by_region["DE"]["dedicated_disks"] == {"hdd": {"sizes": []}}
 
 
-@override_settings(**ON)
-def test_by_default_only_hdd_is_listed_and_every_faster_disk_counts_under_it(
+@override_settings(**{**ON, "VALI_DEDICATED_TIER_MATCH": "minimum"})
+def test_minimum_only_hdd_is_listed_and_every_faster_disk_counts_under_it(
     operator_client: APIClient,
 ) -> None:
     _fleet()
@@ -74,8 +74,14 @@ def test_by_default_only_hdd_is_listed_and_every_faster_disk_counts_under_it(
     }
 
 
-@override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["nvme", "hdd", "ssd"]})
-def test_each_sold_tier_lists_every_disk_that_qualifies_for_it(
+@override_settings(
+    **{
+        **ON,
+        "VALI_DEDICATED_SELLABLE_TIERS": ["nvme", "hdd", "ssd"],
+        "VALI_DEDICATED_TIER_MATCH": "minimum",
+    }
+)
+def test_minimum_each_sold_tier_lists_every_disk_that_qualifies_for_it(
     operator_client: APIClient,
 ) -> None:
     _fleet()
@@ -95,6 +101,44 @@ def test_each_sold_tier_lists_every_disk_that_qualifies_for_it(
         "nvme": {"sizes": [{"size_gb": 22300, "free": 1, "max_per_host": 1}]},
     }
     assert list(fr["dedicated_disks"]) == ["hdd", "ssd", "nvme"]
+
+
+@override_settings(**ON)
+def test_exact_hdd_lists_only_hdd_disks(operator_client: APIClient) -> None:
+    _fleet()
+    from apps.disktier.models import DedicatedDisk
+
+    DedicatedDisk.objects.filter(disk_id="wwn-0x11").update(verified_tier="nvme")
+    DedicatedDisk.objects.filter(disk_id="wwn-0x12").update(verified_tier="ssd")
+    fr = {r["region"]: r for r in operator_client.get(URL).json()["regions"]}["FR"]
+    assert fr["dedicated_disks"] == {
+        "hdd": {
+            "sizes": [
+                {"size_gb": 16000, "free": 1, "max_per_host": 1},
+                {"size_gb": 22300, "free": 1, "max_per_host": 1},
+            ]
+        }
+    }
+
+
+@override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["nvme", "hdd", "ssd"]})
+def test_exact_each_sold_tier_lists_only_its_own_disks(operator_client: APIClient) -> None:
+    _fleet()
+    from apps.disktier.models import DedicatedDisk
+
+    DedicatedDisk.objects.filter(disk_id="wwn-0x11").update(verified_tier="nvme")
+    DedicatedDisk.objects.filter(disk_id="wwn-0x12").update(verified_tier="ssd")
+    fr = {r["region"]: r for r in operator_client.get(URL).json()["regions"]}["FR"]
+    assert fr["dedicated_disks"] == {
+        "hdd": {
+            "sizes": [
+                {"size_gb": 16000, "free": 1, "max_per_host": 1},
+                {"size_gb": 22300, "free": 1, "max_per_host": 1},
+            ]
+        },
+        "ssd": {"sizes": [{"size_gb": 22300, "free": 1, "max_per_host": 1}]},
+        "nvme": {"sizes": [{"size_gb": 22300, "free": 1, "max_per_host": 1}]},
+    }
 
 
 @override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["ssd"]})

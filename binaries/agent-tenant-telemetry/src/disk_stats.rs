@@ -21,7 +21,10 @@
 //!   anchored slot in `/run/hippius/dedicated/slots`. A slot it refused is
 //!   reported `mismatch` (on its device), one it could not find `missing`
 //!   (no device, zero counters), and so is an opened slot whose device has
-//!   since disappeared; an opened slot is its device, `ok`. Every slot rides
+//!   since disappeared; an opened slot is its device, `ok`. An integrity
+//!   slot whose first-boot wipe is running (guest release 8; the booted
+//!   OS's `--dedicated-init-wipe` keeps the line's `init-<percent>` reason
+//!   current) is `initializing` on its device, with `init_percent`. Every slot rides
 //!   every receipt, the first one included (zero counters when there is no
 //!   window), and survives a window dropped for a counter going backwards.
 //!
@@ -255,6 +258,7 @@ pub fn deltas(before: &Snapshot, now: &Snapshot) -> Option<Vec<DiskIoDelta>> {
             io_ticks_ms: d(9)?,
             tiq_ms: d(10)?,
             inflight: n[8],
+            init_percent: None,
         });
     }
     // Two devices claiming one slot serial cannot both be that slot.
@@ -289,6 +293,19 @@ pub enum SlotVerdictState {
     Attached,
     Missing,
     Mismatch,
+    /// The first-boot integrity wipe is running; its progress (0..=100)
+    /// when the line's reason carries one (`init-<percent>`).
+    Initializing(Option<u8>),
+}
+
+/// The progress an `initializing` line's reason carries: `init-<0..=100>`
+/// (no leading zero). Anything else is no progress, never a guess.
+fn init_percent_of(reason: &str) -> Option<u8> {
+    let n = reason.strip_prefix("init-")?;
+    if n.is_empty() || n.len() > 3 || (n.len() > 1 && n.starts_with('0')) {
+        return None;
+    }
+    n.parse::<u8>().ok().filter(|p| *p <= 100)
 }
 
 /// Parse the opener's state file (`<slot> <state> <gib> <dev|-> <reason>`
@@ -302,7 +319,7 @@ pub fn parse_slot_verdicts(text: &str) -> Vec<SlotVerdict> {
             continue;
         }
         let f: Vec<&str> = line.split(' ').collect();
-        let [slot, state, _gib, _dev, _reason] = f.as_slice() else {
+        let [slot, state, _gib, _dev, reason] = f.as_slice() else {
             continue;
         };
         let serial = format!("{SLOT_SERIAL_PREFIX}{slot}");
@@ -313,6 +330,7 @@ pub fn parse_slot_verdicts(text: &str) -> Vec<SlotVerdict> {
             "attached" => SlotVerdictState::Attached,
             "missing" => SlotVerdictState::Missing,
             "mismatch" => SlotVerdictState::Mismatch,
+            "initializing" => SlotVerdictState::Initializing(init_percent_of(reason)),
             _ => continue,
         };
         if out.iter().any(|v| v.serial == serial) {
@@ -339,7 +357,12 @@ pub fn read_slot_verdicts(path: &Path) -> Vec<SlotVerdict> {
         .unwrap_or_default()
 }
 
-fn zero_counters(dev: String, serial: String, state: DiskIoState) -> DiskIoDelta {
+fn zero_counters(
+    dev: String,
+    serial: String,
+    state: DiskIoState,
+    init_percent: Option<u8>,
+) -> DiskIoDelta {
     DiskIoDelta {
         dev,
         serial,
@@ -353,6 +376,7 @@ fn zero_counters(dev: String, serial: String, state: DiskIoState) -> DiskIoDelta
         io_ticks_ms: 0,
         tiq_ms: 0,
         inflight: 0,
+        init_percent,
     }
 }
 
@@ -366,6 +390,9 @@ fn zero_counters(dev: String, serial: String, state: DiskIoState) -> DiskIoDelta
 ///   opened it);
 /// - `attached`: its device `ok` (zero counters when the window has none
 ///   for it, so the first receipt already names every slot); gone ⇒
+///   `missing`;
+/// - `initializing`: its device `initializing` with the line's
+///   `init_percent` (counters as usual: the wipe's writes); gone ⇒
 ///   `missing`.
 ///
 /// The result keeps the wire's order and limits; a list that would not
@@ -387,21 +414,23 @@ pub fn with_slot_verdicts(
     let mut add = Vec::new();
     for v in verdicts {
         let dev = dev_of(&v.serial);
-        let state = match (v.state, &dev) {
-            (SlotVerdictState::Attached, Some(_)) => DiskIoState::Ok,
-            (SlotVerdictState::Mismatch, Some(_)) => DiskIoState::Mismatch,
-            _ => DiskIoState::Missing,
+        let (state, init_percent) = match (v.state, &dev) {
+            (SlotVerdictState::Attached, Some(_)) => (DiskIoState::Ok, None),
+            (SlotVerdictState::Mismatch, Some(_)) => (DiskIoState::Mismatch, None),
+            (SlotVerdictState::Initializing(p), Some(_)) => (DiskIoState::Initializing, p),
+            _ => (DiskIoState::Missing, None),
         };
         if state != DiskIoState::Missing {
             if let Some(d) = list.iter_mut().find(|d| d.serial == v.serial) {
                 d.state = state;
+                d.init_percent = init_percent;
                 continue;
             }
             // No counters for it in this window (the first receipt, or a
             // window dropped for a counter going backwards): the verdict
             // still goes out, on its device, with zero counters.
             if let Some(dev) = dev {
-                add.push(zero_counters(dev, v.serial.clone(), state));
+                add.push(zero_counters(dev, v.serial.clone(), state, init_percent));
             }
             continue;
         }
@@ -410,6 +439,7 @@ pub fn with_slot_verdicts(
             String::new(),
             v.serial.clone(),
             DiskIoState::Missing,
+            None,
         ));
     }
     // Verdicts first when the list is full: they are what vali acts on.
@@ -508,6 +538,7 @@ mod tests {
                     io_ticks_ms: 30,
                     tiq_ms: 40,
                     inflight: 3,
+                    init_percent: None,
                 }]
             );
         }
@@ -693,6 +724,57 @@ mod tests {
     }
 
     #[test]
+    fn an_initializing_slot_rides_on_its_device_with_its_percent() {
+        let v = verdicts(
+            "x0 initializing 1000 vdb init-42\nx1 initializing 1000 vdc init-0\n\
+             x2 initializing 1000 vdd -\nx3 initializing 1000 vde init-101\n\
+             x4 initializing 1000 vdf init-042\nx5 initializing 1000 - init-7\n",
+        );
+        assert_eq!(
+            v.iter().map(|v| v.state).collect::<Vec<_>>(),
+            [
+                SlotVerdictState::Initializing(Some(42)),
+                SlotVerdictState::Initializing(Some(0)),
+                SlotVerdictState::Initializing(None),
+                SlotVerdictState::Initializing(None),
+                SlotVerdictState::Initializing(None),
+                SlotVerdictState::Initializing(Some(7)),
+            ]
+        );
+        // On its device (the wipe's writes are its counters); a slot whose
+        // device is gone is `missing`, never `initializing`.
+        let before = snap(&[("vdb", "hippius-x0", [0; 11])]);
+        let now = snap(&[
+            ("vdb", "hippius-x0", [5; 11]),
+            ("vdc", "hippius-x1", [1; 11]),
+        ]);
+        let out = with_slot_verdicts(deltas(&before, &now), &now, &v).unwrap();
+        assert!(validate_disk_io(&out).is_ok());
+        let got: Vec<_> = out
+            .iter()
+            .map(|d| (d.dev.as_str(), d.serial.as_str(), d.state, d.init_percent))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("", "hippius-x2", DiskIoState::Missing, None),
+                ("", "hippius-x3", DiskIoState::Missing, None),
+                ("", "hippius-x4", DiskIoState::Missing, None),
+                ("", "hippius-x5", DiskIoState::Missing, None),
+                ("vdb", "hippius-x0", DiskIoState::Initializing, Some(42)),
+                ("vdc", "hippius-x1", DiskIoState::Initializing, Some(0)),
+            ]
+        );
+        assert_eq!(out[4].w_ios, 5, "counters as usual");
+        // Once the wipe is done the same slot is plain `ok`, no percent.
+        let done = with_slot_verdicts(None, &now, &verdicts("x0 attached 1000 vdb -\n")).unwrap();
+        assert_eq!(
+            (done[0].state, done[0].init_percent),
+            (DiskIoState::Ok, None)
+        );
+    }
+
+    #[test]
     fn a_device_appearing_under_a_missing_slot_stays_missing() {
         let now = snap(&[
             ("vda", "hippius-os", [1; 11]),
@@ -732,7 +814,7 @@ mod tests {
             .collect();
         let full: Vec<DiskIoDelta> = names
             .iter()
-            .map(|n| zero_counters(n.clone(), String::new(), DiskIoState::Ok))
+            .map(|n| zero_counters(n.clone(), String::new(), DiskIoState::Ok, None))
             .collect();
         let out = with_slot_verdicts(
             Some(full),

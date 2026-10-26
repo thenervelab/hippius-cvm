@@ -9,6 +9,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from apps.miners.models import MinerStatus
+from apps.scheduler import cordon as cordon_policy
 from apps.scheduler.reasons import REFUSAL_REASONS, SCHEDULABLE_REASONS
 from apps.telemetry.models import HostAttestorStatus
 
@@ -19,6 +20,21 @@ _NODE_STATUS = sorted(s.value for s in MinerStatus)
 _ATTESTOR_STATUS = sorted(s.value for s in HostAttestorStatus)
 _SCHEDULABLE_REASON = sorted(SCHEDULABLE_REASONS)
 _REFUSAL_REASON = sorted(REFUSAL_REASONS)
+_CORDON_SOURCES = [cordon_policy.OWNER, cordon_policy.STAFF, cordon_policy.AUTO]
+_CORDONED_HELP = (
+    "A cordon is in force: the node takes no NEW placement. The VMs already on it "
+    "run on — nothing is stopped or moved. Other holds (pending approval, no "
+    "storage) are not cordons; they show in `schedulable_reason`."
+)
+_CORDON_SOURCE_HELP = (
+    "Who holds the cordon: `owner` (the node's family, via `POST …/maintenance` — the "
+    "only one the owner may lift), `staff` (Hippius operators) or `auto` (a vali "
+    "state machine, e.g. disk tier). Null when not cordoned."
+)
+_CORDON_REASON_HELP = (
+    "`owner`: the owner's own reason (may be empty). `staff`: `operator-hold`. "
+    "`auto`: a short code (`disk-tier`, …). Null when not cordoned."
+)
 
 
 class OperatorAttestorSerializer(serializers.Serializer):
@@ -167,8 +183,9 @@ class OperatorLaunchErrorSerializer(serializers.Serializer):
             "The finest reason known, a static code matching `[a-z0-9][a-z0-9._:/-]*` "
             "(max 128): the agent's own reason (`libvirt-driver/define`, "
             "`tenant-preflight/ovmf-missing`, `cvm-launch-failed/timeout`, …) when it "
-            "sends one, else `class`. vali's own codes: `miner-unreachable` (the Edge "
-            "could not reach the node, or timed out waiting on it), `unclassified` (an "
+            "sends one, else `class`. vali's own codes: `launch-timeout` / `preflight-timeout` "
+            "(the Edge got no answer to that order in time: a slow or lost order, not the node's "
+            "reachability), `unclassified` (an "
             "answer with no code), `invalid` (the node sent something that is not a code)."
         ),
     )
@@ -311,6 +328,20 @@ class OperatorNodeSerializer(serializers.Serializer):
         ),
     )
     hosted_vm_count = serializers.IntegerField(help_text="Active placements on the node.")
+    hosted_runner_vm_count = serializers.IntegerField(
+        help_text="Of `hosted_vm_count`, CI runner VMs — they finish on their own."
+    )
+    hosted_customer_vm_count = serializers.IntegerField(
+        help_text=(
+            "Of `hosted_vm_count`, every other VM. A cordon never stops or moves them: "
+            "they stay until migrated or stopped by their owners."
+        )
+    )
+    cordoned = serializers.BooleanField(help_text=_CORDONED_HELP)
+    cordon_source = serializers.ChoiceField(
+        choices=_CORDON_SOURCES, allow_null=True, help_text=_CORDON_SOURCE_HELP
+    )
+    cordon_reason = serializers.CharField(allow_null=True, help_text=_CORDON_REASON_HELP)
     capacity = OperatorCapacitySerializer(allow_null=True)
     recent_refusals = OperatorRefusalSerializer(
         many=True,
@@ -782,6 +813,14 @@ class FleetMinerSerializer(serializers.Serializer):
     schedulable_reason = serializers.CharField(
         allow_null=True, help_text="The first hard gate failed."
     )
+    cordoned = serializers.BooleanField(help_text=_CORDONED_HELP)
+    cordon_source = serializers.ChoiceField(
+        choices=_CORDON_SOURCES, allow_null=True, help_text=_CORDON_SOURCE_HELP
+    )
+    cordon_reason = serializers.CharField(
+        allow_null=True,
+        help_text="Owner: their reason. Staff / auto: the stored reason, verbatim (staff readout).",
+    )
     chain = serializers.DictField(
         allow_null=True,
         help_text="On-chain status/quality/price; `source` says chain read or DB mirror.",
@@ -827,3 +866,38 @@ class OperatorFleetSerializer(serializers.Serializer):
         help_text="Hosted VMs whose `Vm.host` names no known miner.",
     )
     generated_at = serializers.DateTimeField()
+
+
+class OperatorMaintenanceRequestSerializer(serializers.Serializer):
+    """`POST /v1/operator/miners/{node_id}/maintenance` body."""
+
+    cordon = serializers.BooleanField(
+        help_text="`true` sets the owner's maintenance cordon, `false` lifts it."
+    )
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=cordon_policy.OWNER_REASON_MAX,
+        help_text=f"Optional, printable, at most {cordon_policy.OWNER_REASON_MAX} characters.",
+    )
+
+
+class OperatorMaintenanceSerializer(serializers.Serializer):
+    """`POST /v1/operator/miners/{node_id}/maintenance` 200 body."""
+
+    node_id = serializers.CharField()
+    changed = serializers.BooleanField(help_text="False when the call was a no-op (idempotent).")
+    cordoned = serializers.BooleanField(help_text=_CORDONED_HELP)
+    cordon_source = serializers.ChoiceField(
+        choices=_CORDON_SOURCES, allow_null=True, help_text=_CORDON_SOURCE_HELP
+    )
+    cordon_reason = serializers.CharField(allow_null=True, help_text=_CORDON_REASON_HELP)
+    cordoned_at = serializers.DateTimeField(allow_null=True)
+    hosted_vm_count = serializers.IntegerField(
+        help_text="Active placements still on the node; wait for 0 before maintenance."
+    )
+    hosted_runner_vm_count = serializers.IntegerField()
+    hosted_customer_vm_count = serializers.IntegerField(
+        help_text="Customer VMs stay until migrated or stopped by their owners."
+    )

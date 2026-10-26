@@ -1,5 +1,5 @@
 # §23 periodic epoch-close worker — node + @polkadot/api.
-FROM mirror.gcr.io/library/node:22-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+FROM mirror.gcr.io/library/node:22.23.4-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 # Links the GHCR package to this repo so the `epoch-closer-image`
 # workflow's GITHUB_TOKEN can push + cosign-sign it (RA-N7). Every other
 # hippius image is repo-linked; this one was pushed off-CI and orphaned.

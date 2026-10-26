@@ -148,7 +148,10 @@ class DiskIoDelta:
     receipt key `disk_io`, docs/design/disk-tier-verification.md §3.5).
     Passive evidence: in-VM root controls it, so it may only ever schedule
     a probe. `state` is `ok`, or `mismatch` / `missing` for a dedicated
-    slot the guest refused or could not find."""
+    slot the guest refused or could not find, or `initializing` for an
+    integrity slot the guest is wiping at first boot (dedicated-disks
+    contract §9), with its progress `init_percent` (0-100) when the wire
+    carries one (`None` otherwise)."""
 
     dev: str
     serial: str
@@ -162,6 +165,7 @@ class DiskIoDelta:
     io_ticks_ms: int
     tiq_ms: int
     inflight: int
+    init_percent: int | None = None
 
 
 _DISK_IO_COUNTERS: tuple[str, ...] = (
@@ -175,7 +179,7 @@ _DISK_IO_COUNTERS: tuple[str, ...] = (
     "tiq_ms",
     "inflight",
 )
-_DISK_IO_STATES = frozenset({"ok", "mismatch", "missing"})
+_DISK_IO_STATES = frozenset({"ok", "mismatch", "missing", "initializing"})
 # Mirrors of the `hippius_types::disk_stats` rules the binary enforced,
 # re-checked as defence in depth (the values land in the DB later).
 _SLOT_RE = re.compile(r"os|x(?:[0-9]|1[0-9]|2[0-3])")
@@ -185,6 +189,8 @@ _PROFILE_RE = re.compile(r"[a-z0-9]{1,8}")
 _METRIC_RE = re.compile(r"[a-z0-9_]{1,32}")
 _DISK_CODE_RE = re.compile(r"[a-z0-9-]{0,48}")
 _DISK_IO_KEYS = frozenset({"dev", "serial", "state", *_DISK_IO_COUNTERS})
+#: Optional on an entry: only an `initializing` one carries it (§9).
+_DISK_IO_INIT_PERCENT = "init_percent"
 _PROBE_KEYS = frozenset(
     {
         "run_id_hex",
@@ -353,16 +359,26 @@ def _disk_io(raw: object) -> tuple[DiskIoDelta, ...]:
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError("disk_io entry is not an object")
-        _exact_keys(item, _DISK_IO_KEYS, "disk_io entry")
+        _exact_keys(
+            {k: v for k, v in item.items() if k != _DISK_IO_INIT_PERCENT},
+            _DISK_IO_KEYS,
+            "disk_io entry",
+        )
         state = _text(item.get("state"), "disk_io.state")
         if state not in _DISK_IO_STATES:
             raise ValueError("disk_io.state is unknown")
+        init_percent = None
+        if _DISK_IO_INIT_PERCENT in item:
+            if state != "initializing":
+                raise ValueError("disk_io.init_percent outside an initializing slot")
+            init_percent = _uint(item[_DISK_IO_INIT_PERCENT], "disk_io.init_percent", 100)
         out.append(
             DiskIoDelta(
                 dev=_text(item.get("dev"), "disk_io.dev"),
                 serial=_text(item.get("serial"), "disk_io.serial"),
                 state=state,
                 **{k: _uint(item.get(k), f"disk_io.{k}") for k in _DISK_IO_COUNTERS},
+                init_percent=init_percent,
             )
         )
     for d in out:

@@ -176,9 +176,15 @@ pub fn cmdline_is_pinned(cmdline: &str) -> bool {
 /// [`cmdline_slots`]'s refusal.
 const MALFORMED: &str = "cmdline-malformed";
 
+/// The suffix of an integrity slot's anchor, `x<N>:<GiB>:i` (dedicated-disks
+/// contract §9): the guest opens that slot with integrity; to the agent it
+/// is the same slot (the order's `extra_disks` are unchanged).
+const INTEGRITY_SUFFIX: &str = ":i";
+
 /// The slots the measured `hippius.dedicated=x0:<GiB>,x1:<GiB>,…` token
-/// names: `Ok(None)` without the token, `Err` when it is malformed (twice,
-/// empty, a bad slot, a size that is not a positive integer, a slot twice).
+/// names (an entry may end in `:i`, an integrity slot): `Ok(None)` without
+/// the token, `Err` when it is malformed (twice, empty, a bad slot, a size
+/// that is not a positive integer, any other suffix, a slot twice).
 pub fn cmdline_slots(cmdline: &str) -> std::result::Result<Option<BTreeSet<usize>>, &'static str> {
     let mut tokens = cmdline
         .split_ascii_whitespace()
@@ -191,7 +197,8 @@ pub fn cmdline_slots(cmdline: &str) -> std::result::Result<Option<BTreeSet<usize
     }
     let mut slots = BTreeSet::new();
     for entry in value.split(',') {
-        let (slot, gib) = entry.split_once(':').ok_or(MALFORMED)?;
+        let (slot, size) = entry.split_once(':').ok_or(MALFORMED)?;
+        let gib = size.strip_suffix(INTEGRITY_SUFFIX).unwrap_or(size);
         let index = slot_index(slot).ok_or(MALFORMED)?;
         if !gib.bytes().all(|b| b.is_ascii_digit()) {
             return Err(MALFORMED);

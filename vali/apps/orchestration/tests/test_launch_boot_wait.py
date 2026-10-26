@@ -126,3 +126,52 @@ def test_queue_time_is_spent_from_the_wait(monkeypatch: pytest.MonkeyPatch, cloc
     clock.slept.clear()
     assert launch.launch_vm(_spec(vm_id="vm-2"), actor, queued_for_s=500).ok is False
     assert clock.slept == []  # past the bound already: fail at once
+
+
+@override_settings(VALI_SCHEDULER_BOOT_WAIT_S=120, VALI_SCHEDULER_BOOT_WAIT_POLL_S=15)
+def test_the_wait_sleeps_outside_the_placement_decision_lock(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    """A launch waiting for a boot slot must not hold the fleet-wide decision
+    lock (`scheduler.decision_lock`): with concurrent launch jobs, it would
+    stall every other decision for the whole wait."""
+    from django.db import connection
+
+    from apps.scheduler import decision_lock
+
+    _register_miner(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    monkeypatch.setattr(service, "booting_by_node", lambda: {node_id(1): 3})
+    depth = len(connection.atomic_blocks)
+    held: list[tuple[int, bool]] = []
+
+    def sleep(s: float) -> None:
+        held.append((len(connection.atomic_blocks) - depth, decision_lock._PROCESS_LOCK.locked()))
+        clock.sleep(s)
+
+    monkeypatch.setattr(launch.time, "sleep", sleep)
+
+    assert launch.launch_vm(_spec(), _actor()).outcome == "miners-booting"
+    assert held and set(held) == {(0, False)}
+
+
+@override_settings(VALI_SCHEDULER_BOOT_WAIT_S=900, VALI_SCHEDULER_BOOT_WAIT_POLL_S=15)
+def test_a_stopping_worker_ends_the_wait_at_once(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    """On shutdown the concurrent worker's jobs still waiting for a slot end
+    as a wait that ran out would — nothing was placed — instead of holding
+    the drain for up to 15 min. The probe is read every second."""
+    _register_miner(1)
+    monkeypatch.setattr(chain, "read_miner_status", lambda: make_snapshot(10, [make_miner(1)]))
+    monkeypatch.setattr(service, "booting_by_node", lambda: {node_id(1): 3})
+    monkeypatch.setattr(
+        launch, "launch_on_miner", lambda spec, miner: pytest.fail("must not dispatch")
+    )
+
+    result = launch.launch_vm(_spec(), _actor(), stopping=lambda: len(clock.slept) >= 3)
+
+    assert result.ok is False
+    assert result.outcome == "miners-booting"
+    assert result.emit["error"].startswith("launch worker stopping: ")
+    assert clock.slept == [1.0, 1.0, 1.0]

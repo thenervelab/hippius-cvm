@@ -19,7 +19,8 @@ added 2026-10-23).
   "dedicated_disks": {      // optional; absent or null ⇒ no dedicated disk
     "tier": "hdd",          // required; "hdd" | "ssd" | "nvme" (§8)
     "count": 2,             // required; 1..8
-    "min_size_gb": 16000    // required; GiB, ≥ 1000; every assigned disk ≥ this
+    "min_size_gb": 16000,   // required; GiB, ≥ 1000; every assigned disk ≥ this
+    "integrity": false      // optional, default false; ssd / nvme only (§9)
   },
   "pinned_ack": true        // required, and true, whenever dedicated_disks is present
 }
@@ -46,6 +47,9 @@ Body `{"error": "<msg>", "category": "<code>"}`.
 | `tier` valid but not on sale (`VALI_DEDICATED_SELLABLE_TIERS`, §8) | 409 | `dedicated-disks-not-offered` |
 | together with `require_failover_peer: true` | 409 | `dedicated-no-failover` |
 | the image's blessed guest release cannot open dedicated disks | 409 | `dedicated-needs-release` |
+| `integrity` not a boolean (§9) | 400 | `dedicated-invalid` |
+| `integrity: true` while integrity is off, or with `tier` `hdd` (§9) | 409 | `dedicated-integrity-not-offered` |
+| `integrity: true` and the image's blessed guest release below the integrity floor (§9) | 409 | `dedicated-needs-release` |
 
 ### 1.2 Asynchronous placement failures
 
@@ -141,7 +145,10 @@ Counts are advisory; the launch is authoritative.
 | `VALI_DEDICATED_ALLOWED_OWNERS` | empty | when set, only these owners may launch with dedicated disks (internal canary) |
 | `VALI_DEDICATED_MAX_PER_VM` | `8` | the upper bound of `count` |
 | `VALI_DEDICATED_SELLABLE_TIERS` | `hdd` | the tiers on sale (§8) |
+| `VALI_DEDICATED_TIER_MATCH` | `exact` | `exact` = only disks verified at the requested tier; `minimum` = that tier or above (§8.0) |
 | `VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER` | empty | miner pay per sold tier (§8) |
+| `VALI_DEDICATED_INTEGRITY_ENABLED` | `false` | integrity sold (§9); off ⇒ `integrity: true` ⇒ 409 `dedicated-integrity-not-offered` |
+| `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE` | `8` | the guest-release floor of an integrity launch (§9) |
 
 The backend keeps its own `COMPUTE_DEDICATED_ENABLED`; both are flipped in
 the same window, after the internal end-to-end test passes.
@@ -157,23 +164,34 @@ public launch intake (`disk-probe-id-reserved`).
 
 ## 8. Tiers (added 2026-10-23, additive)
 
-1. **Launch.** `dedicated_disks.tier` is `hdd` | `ssd` | `nvme`, a
-   MINIMUM. Anything else ⇒ 400 `dedicated-invalid`. A valid tier not in
+0. **Tier match (`VALI_DEDICATED_TIER_MATCH`, chart
+   `dedicatedDisks.tierMatch`).** `exact` (the DEFAULT): a request for tier
+   T is served ONLY by disks whose verified tier (item 5) is exactly T — an
+   `hdd` order never takes an ssd or nvme disk, an `ssd` order never takes
+   nvme, so premium stock is never sold at a lower price. `minimum`: a disk
+   verified at T or above qualifies (the #1780 behaviour, kept for later).
+   The reasons are unchanged: no exact-tier disk ⇒ `no-dedicated-capacity`
+   / `no-host-fits-disks`, as for any missing disk.
+1. **Launch.** `dedicated_disks.tier` is `hdd` | `ssd` | `nvme` (matched
+   per item 0). Anything else ⇒ 400 `dedicated-invalid`. A valid tier not in
    `VALI_DEDICATED_SELLABLE_TIERS` (comma-separated, default `hdd`) ⇒ 409
    `dedicated-disks-not-offered`, after the 400s and before the other 409s.
-2. **Placement.** Among the free disks whose VERIFIED tier is ≥ the
-   requested one: the lowest qualifying tier first, then the smallest
-   qualifying size, then the existing tie-break (most recently probed).
+2. **Placement.** Among the free disks whose VERIFIED tier qualifies
+   (item 0: equal to the requested one under `exact`; ≥ it under
+   `minimum`, the lowest qualifying tier first): the smallest qualifying
+   size first, then the existing tie-break (most recently probed).
    Same transaction and row locks as before.
 3. **Read-back.** `disks[].tier` is the SOLD (requested) tier, never the
-   disk's higher verified tier; vali records it per slot. The backend's
+   disk's higher verified tier (only possible under `minimum`); vali records it per slot. The backend's
    ledger line is `dedicated_disk_gb_hour:<sold tier>`.
 4. **Feasibility and regions.** `dedicated_tier` takes `hdd` | `ssd` |
    `nvme`; a tier not on sale reads `never` / `dedicated-disks-not-offered`.
    `regions` lists `dedicated_disks.<tier>.sizes[]` for each tier on sale
-   only, each counting every free disk that QUALIFIES for it (an nvme disk
-   appears under nvme, ssd and hdd). With the default setting both
-   answers are byte-identical to before (only `hdd`).
+   only, each counting every free disk that QUALIFIES for it (item 0): under
+   `exact` a disk appears under its own verified tier only, and
+   `max_count_at_size` / `placeable` count only exact-tier disks; under
+   `minimum` an nvme disk appears under nvme, ssd and hdd. With the default
+   tiers on sale (`hdd`) the answers carry only `hdd`, counting hdd disks.
 5. **Verified tier = min(d1 probe grade, the operator's declared
    class).** Downgrade-only; a disk with no declared class is capped at
    `hdd`. The class is an optional `class` (`hdd` | `ssd` | `nvme`) on a
@@ -213,3 +231,67 @@ public launch intake (`disk-probe-id-reserved`).
    (`tier:milliunits,...`), an unlisted tier at
    `VALI_DEDICATED_MILLIUNITS_PER_GB`. Empty (the default) ⇒ one rate for
    every tier, so accrual is byte-identical until it is set.
+
+## 9. Integrity (added 2026-10-23, additive)
+
+1. **Launch.** `dedicated_disks.integrity` is an optional boolean, default
+   `false`; `true` applies to every slot of the launch. Not a boolean ⇒
+   400 `dedicated-invalid`. Allowed only with `tier` `ssd` or `nvme`: with
+   `hdd` ⇒ 409 `dedicated-integrity-not-offered`. `VALI_DEDICATED_INTEGRITY_ENABLED`
+   (default `false`) off ⇒ any `integrity: true` ⇒ 409
+   `dedicated-integrity-not-offered`. An integrity launch needs the image's
+   blessed guest release ≥ the higher of `VALI_DEDICATED_MIN_GUEST_RELEASE`
+   and `VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE` (default `8`), else 409
+   `dedicated-needs-release`. Order: after the §1.1 400s and the tier not
+   on sale (§8), before `dedicated-no-failover` and the release check. All
+   of it before any Vault write, as every §1.1 check. vali stores
+   `integrity: true` in the launch spec only when true (a launch without
+   it is byte-identical), and a later launch of the same vm_id must ask
+   the same (`conflict` otherwise).
+2. **Placement.** Unchanged (tier and size rules, §8). The integrity mode
+   is recorded per slot and fixed by the slot's first assignment: every
+   later placement of the VM (relaunch, reboot recovery, power start,
+   guest upgrade, in-place resize) carries it, whatever a later request
+   says. A VM with an integrity slot never boots a guest below the
+   integrity floor either (guest upgrade, initrd swap: 409
+   `dedicated-needs-release`).
+3. **Measured cmdline.** An integrity slot's anchor is `x<N>:<GiB>:i`;
+   every other slot keeps `x<N>:<GiB>`, so a launch without integrity
+   measures exactly the token it measured before. The order's
+   `extra_disks` are unchanged. The C2 digest recompute covers the anchor
+   as before. The miner agent's anchor check and vali's order encoder
+   take the `:i` suffix (and no other); integrity is switched on only once
+   the miners holding dedicated disks run that agent.
+4. **Read-back** (`GET /v1/vm/{vm_id}`, the list, the launch job's
+   `result`). An integrity slot carries `"integrity": true` (absent on
+   every other slot, which stays byte-identical). During the guest's
+   first-boot wipe of an integrity slot, `guest_state` is `initializing`
+   with `init_percent` (0-100, or `null` when the guest's receipt carries
+   no progress); then `attached`. `state` stays host-evidenced (§2), and
+   `initializing` never drives it, billing or miner pay.
+
+   ```jsonc
+   {"slot": "x0", "kind": "dedicated", "size_gb": 7100, "tier": "nvme",
+    "state": "attached", "integrity": true,
+    "guest_state": "initializing", "init_percent": 42}
+   ```
+
+   Carriage: the guest's signed receipt reports the slot's `disk_io` entry
+   (`hippius-x<N>`) with `state: "initializing"` and an optional
+   `init_percent` (integer 0-100), only on that state; vali keeps the
+   latest per slot (an older window never overwrites a newer one), and
+   records `initializing` on an integrity slot only. The receipt verifier
+   (`hippius-types` `disk_stats`, the ticket-validator's receipt output)
+   must carry the new state and key before integrity is switched on: an
+   older one refuses such a receipt whole.
+5. **Billing.** Unchanged: the backend bills the sold size from the
+   host-evidenced `state` (§3), whatever `guest_state` says.
+6. **Feasibility.** `GET /v1/scheduler/feasibility` takes
+   `dedicated_integrity=true|false` (default `false`; anything else ⇒ 400
+   `dedicated-invalid`; like the other `dedicated_*` parameters it needs
+   `dedicated_count` and `dedicated_min_size_gb`). When integrity is not
+   offered (switch off, or `tier` `hdd`) the answer is `never` /
+   `dedicated-integrity-not-offered` with the `dedicated` block
+   `placeable: false`, so the console can grey the checkbox; otherwise
+   the answer is the plain request's, its block echoing
+   `"integrity": true`. `regions` is unchanged.

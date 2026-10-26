@@ -1,0 +1,26 @@
+#!/bin/sh
+# `hippius-trace-after-udev` — initramfs-tools `init-bottom` script
+# (`/scripts/init-bottom/hippius-trace-after-udev` in the initrd).
+#
+# Switch_root gap trace. PREREQ="udev" orders it after the stock
+# init-bottom/udev script, which stops udevd (`udevadm control --exit`;
+# Debian settles first) and moves /dev into the real root. It logs one
+# uptime line, so the console log shows how long the udev stop took
+# between hippius-net-teardown's line and this one. What follows it in
+# /init is only the /run, /sys and /proc moves and run-init.
+#
+# Logs only; never fails the boot. /dev is a symlink into the real root's
+# /dev by now, so /dev/kmsg still resolves.
+
+PREREQ="udev"
+
+case "${1:-}" in
+    prereqs)
+        echo "$PREREQ"
+        exit 0
+        ;;
+esac
+
+read -r _htau_up _ < /proc/uptime 2>/dev/null || true
+echo "hippius-trace: after-udev up=${_htau_up:-}" > /dev/kmsg 2>/dev/null || true
+exit 0

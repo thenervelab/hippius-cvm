@@ -47,7 +47,7 @@ jobs:
       # only ubuntu-latest preinstalls them.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "22"
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.22.0
@@ -189,6 +189,10 @@ jobs:
           # Root-free; needs python3 (tomllib) only.
           shellcheck -S warning scripts/cdn-node/install-cdn-node.sh scripts/dev/cdn-node-profile-test.sh
           bash scripts/dev/cdn-node-profile-test.sh
+          # ubuntu-runner bake profile: gate, pinned Docker key, Docker +
+          # runner deps, post-install gate, data-path glue. Root-free.
+          shellcheck -S warning scripts/ubuntu-runner/install-ubuntu-runner.sh scripts/dev/ubuntu-runner-profile-test.sh
+          bash scripts/dev/ubuntu-runner-profile-test.sh
           # cdn-node ephemeral root: the marker-gated discard of the golden
           # upper, data/ scrub + noexec, panic=10 and M0-only in the golden
           # overlay library; inert without the marker. Root-free.
@@ -217,8 +221,14 @@ jobs:
           bash scripts/dev/tenant-image-bake-m0-harden-test.sh
           # golden-bake PR3: the guest overlay boot library — GOLDEN-mode
           # detection (both-tokens fail-closed) + param validation.
-          shellcheck -S error -s sh scripts/initramfs/hippius-golden-overlay.sh scripts/initramfs/hippius-golden-boot scripts/initramfs/hippius-golden-hook
+          shellcheck -S error -s sh scripts/initramfs/hippius-golden-overlay.sh scripts/initramfs/hippius-golden-boot scripts/initramfs/hippius-golden-hook scripts/initramfs/hippius-trace-after-udev
           bash scripts/dev/golden-overlay-test.sh
+          # Ubuntu switch_root gap: mountroot ends with IP=off, so the
+          # real /init skips its post-mountroot DHCP; plus the trace lines.
+          dpkg-query -W initramfs-tools-core >/dev/null 2>&1 \
+            || sudo apt-get install -y -q --no-install-recommends initramfs-tools-core
+          shellcheck -S error scripts/dev/golden-boot-ip-off-test.sh
+          bash scripts/dev/golden-boot-ip-off-test.sh
           # golden overlay SELinux root-inode label (CS10/Fedora): the fresh
           # ext4 upper would give the merged "/" `unlabeled_t` → enforcing
           # guest denies confined domains `search /`. Assert the RHEL-gated
@@ -768,6 +778,7 @@ jobs:
           apps/images/tests/test_rebake_queue_lock.py
           apps/orchestration/tests/test_idempotency.py
           apps/orchestration/tests/test_decommission_before_launch.py
+          apps/orchestration/tests/test_launch_decision_race.py
           apps/disktier/tests/test_passive_ingest.py
           apps/disktier/tests/test_passive_evaluate.py
           apps/scheduler/tests/test_usage_disk_hook.py

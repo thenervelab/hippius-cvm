@@ -3403,3 +3403,235 @@ async fn a_disk_removed_mid_launch_of_a_vm_that_ran_is_refused_not_recreated() {
     assert!(!overlay.exists(), "never recreated blank");
     assert_eq!(driver.defined_count().unwrap(), 0);
 }
+
+// ── Preflight capacity reservation ───────────────────────────────────
+//
+// vali KBS-registers the vm_id to the host between preflight and launch,
+// irreversibly: a passed preflight must hold the capacity it checked, or
+// two concurrent launches can both pass preflight and the second one fail
+// 503 at LAUNCH, where it can no longer be re-placed.
+
+/// A lifecycle on `root` that fits exactly one `order()` (2 vCPU /
+/// 2048 MiB) and has a `disk_gb` disk budget.
+fn one_slot_lifecycle(root: &std::path::Path, disk_gb: u64) -> CvmLifecycle {
+    seed_snp_probe();
+    CvmLifecycle::new_with_poll(
+        Arc::new(MockLibvirtDriver::new()),
+        ok_digest(),
+        HostResources {
+            total_cpus: 2,
+            total_memory_mb: 2048,
+            total_disk_gb: disk_gb,
+        },
+        Duration::from_millis(1),
+        5,
+    )
+    .with_state_disk_root(root.to_path_buf())
+    .skip_state_disk_provision_for_tests()
+}
+
+fn vm(id: &str) -> VmId {
+    VmId::new(id).unwrap()
+}
+
+#[test]
+fn a_second_preflight_that_only_fits_alone_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0);
+    // Each fits the empty host alone…
+    assert!(lc.check_cpu_mem_budget(&vm("vm-b"), None, 2, 2048).is_ok());
+    lc.reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    // …but not together: A's passed preflight holds the slot.
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("vm-b"), None, 1, 0, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("vm-b"), None, 0, 1, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+}
+
+#[test]
+fn a_second_preflight_over_the_disk_budget_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 15);
+    lc.reserve_preflight_capacity(&vm("vm-a"), None, 0, 0, 10)
+        .unwrap();
+    // The read-only disk gate and the reservation agree: 507 class.
+    assert!(matches!(
+        lc.check_disk_budget(&vm("vm-b"), None, 10),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("vm-b"), None, 0, 0, 10),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    lc.reserve_preflight_capacity(&vm("vm-b"), None, 0, 0, 5)
+        .unwrap();
+    // A's own hold never counts against A.
+    assert!(lc.check_disk_budget(&vm("vm-a"), None, 10).is_ok());
+}
+
+#[tokio::test]
+async fn a_reserved_launch_consumes_its_reservation_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0);
+    lc.reserve_preflight_capacity(&vm("cvm-a"), None, 2, 2048, 0)
+        .unwrap();
+    // The launch of the reserved VM finds its capacity (not counted twice).
+    lc.launch(order("cvm-a")).await.unwrap();
+    // The slot is used once, by the handle: another VM is refused…
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("cvm-b"), None, 1, 0, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    // …and once the VM stops, nothing of it is left (the reservation was
+    // consumed by the launch, not merely shadowed by the handle).
+    lc.stop(&vm("cvm-a"), false).await.unwrap();
+    lc.reserve_preflight_capacity(&vm("cvm-b"), None, 2, 2048, 0)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn another_vms_launch_counts_a_live_reservation_as_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0);
+    lc.reserve_preflight_capacity(&vm("cvm-a"), None, 2, 2048, 0)
+        .unwrap();
+    assert!(matches!(
+        lc.launch(order("cvm-b")).await,
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    // A's hold survived B's refused launch.
+    lc.launch(order("cvm-a")).await.unwrap();
+}
+
+#[test]
+fn an_expired_reservation_frees_its_capacity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc =
+        one_slot_lifecycle(tmp.path(), 0).with_preflight_reservation_ttl(Duration::from_millis(50));
+    lc.reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    assert!(lc
+        .reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0)
+        .is_err());
+    std::thread::sleep(Duration::from_millis(80));
+    lc.reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0)
+        .unwrap();
+}
+
+#[test]
+fn a_zero_ttl_takes_no_reservation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0).with_preflight_reservation_ttl(Duration::ZERO);
+    lc.reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    lc.reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_preflight_refreshes_instead_of_double_counting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 4);
+    // vali re-drives the same miner after a post-register failure.
+    for _ in 0..3 {
+        lc.reserve_preflight_capacity(&vm("cvm-a"), None, 2, 2048, 4)
+            .unwrap();
+    }
+    // Still exactly one slot held: other VMs refused, A's launch admitted.
+    assert!(lc
+        .reserve_preflight_capacity(&vm("cvm-b"), None, 1, 0, 0)
+        .is_err());
+    lc.launch(order("cvm-a")).await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_and_destroy_free_the_reservation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0);
+    // A stop of a reserved, never-launched VM: nothing to stop (404), but
+    // the hold is gone.
+    lc.reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    assert!(matches!(
+        lc.stop(&vm("vm-a"), true).await,
+        Err(MinerAgentError::VmNotFound)
+    ));
+    lc.reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0)
+        .unwrap();
+    // A §24 destroy of B frees B's.
+    lc.destroy(&vm("vm-b"), None).await.unwrap();
+    lc.reserve_preflight_capacity(&vm("vm-c"), None, 2, 2048, 0)
+        .unwrap();
+}
+
+#[test]
+fn a_failing_older_preflight_keeps_the_newer_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 0);
+    let older = lc
+        .reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    let newer = lc
+        .reserve_preflight_capacity(&vm("vm-a"), None, 2, 2048, 0)
+        .unwrap();
+    assert_ne!(older, newer);
+    // The older preflight fails after the newer one passed: the hold stays.
+    lc.release_preflight_reservation_if(&vm("vm-a"), older, "preflight-failed");
+    assert!(lc
+        .reserve_preflight_capacity(&vm("vm-b"), None, 1, 0, 0)
+        .is_err());
+    lc.release_preflight_reservation_if(&vm("vm-a"), newer, "preflight-failed");
+    lc.reserve_preflight_capacity(&vm("vm-b"), None, 2, 2048, 0)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_preflight_for_a_running_vm_fits_a_full_host() {
+    // vali may re-dispatch the preflight of a VM already running here
+    // (a re-driven launch job, a startup-adopted VM). Its handle must be
+    // replaced by the request, not counted next to it, or a full host
+    // refuses its own tenant 503/507.
+    let tmp = tempfile::tempdir().unwrap();
+    let lc = one_slot_lifecycle(tmp.path(), 10);
+    let mut running = order("cvm-a");
+    running.data_disk_size_gb = 10;
+    lc.launch(running).await.unwrap();
+    // The host is now full on cpu, memory and disk budget.
+    lc.check_disk_budget(&vm("cvm-a"), None, 10).unwrap();
+    lc.check_cpu_mem_budget(&vm("cvm-a"), None, 2, 2048)
+        .unwrap();
+    lc.reserve_preflight_capacity(&vm("cvm-a"), None, 2, 2048, 10)
+        .unwrap();
+    // A NEW VM is still refused, with the same classes as before.
+    assert!(matches!(
+        lc.check_disk_budget(&vm("cvm-b"), None, 1),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    assert!(matches!(
+        lc.check_cpu_mem_budget(&vm("cvm-b"), None, 1, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("cvm-b"), None, 1, 0, 0),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("cvm-b"), None, 0, 0, 1),
+        Err(MinerAgentError::InsufficientDisk)
+    ));
+    // The running VM asking for MORE than its handle is still bounded by
+    // the host: replace, not ignore.
+    assert!(matches!(
+        lc.reserve_preflight_capacity(&vm("cvm-a"), None, 3, 2048, 10),
+        Err(MinerAgentError::InsufficientResources)
+    ));
+}

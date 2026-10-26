@@ -268,20 +268,16 @@ def _on_this_base(initrd: str, build: GuestInitrdBuild) -> bool:
     the same base (a VM on release N moving to N+1)."""
     if initrd == build.base_initrd_sha256:
         return True
-    other = guest_components.build_for_initrd(initrd)
-    return other is not None and (
-        other.kernel_sha256,
-        other.rootfs_img_sha256,
-        other.rootfs_verity_sha256,
-        other.verity_root_hash,
-        other.base_initrd_sha256,
-    ) == (
-        build.kernel_sha256,
-        build.rootfs_img_sha256,
-        build.rootfs_verity_sha256,
-        build.verity_root_hash,
-        build.base_initrd_sha256,
-    )
+    # By base, not by initrd alone: the same initrd may be registered for
+    # several base bakes, each with its own rootfs / verity.
+    return GuestInitrdBuild.objects.filter(
+        initrd_sha256=initrd,
+        kernel_sha256=build.kernel_sha256,
+        rootfs_img_sha256=build.rootfs_img_sha256,
+        rootfs_verity_sha256=build.rootfs_verity_sha256,
+        verity_root_hash=build.verity_root_hash,
+        base_initrd_sha256=build.base_initrd_sha256,
+    ).exists()
 
 
 def anchor_job(vm: Vm) -> GuestUpgradeJob | None:
@@ -434,12 +430,12 @@ def components_of(vm: Vm) -> dict[str, Any]:
 
     record = _record(vm)
     # The release the VM BOOTED: a swapped record not relaunched yet keeps
-    # the running boot under `booted_artifacts`.
-    current = (
-        guest_components.build_for_initrd(launch_record.booted_artifacts(record)[1].lower())
-        if record
-        else None
-    )
+    # the running boot under `booted_artifacts`. The release comes off the
+    # initrd (the same on every bake's build of it); the prefix off the
+    # record — one initrd may be registered for several bakes, each with
+    # its own prefix.
+    booted_prefix, booted_initrd = launch_record.booted_artifacts(record) if record else ("", "")
+    current = guest_components.build_for_initrd(booted_initrd.lower()) if record else None
     epochs = VmGuestComponents.objects.filter(vm=vm).first()
     newest = None
     for release in GuestComponentRelease.objects.filter(withdrawn_at__isnull=True).order_by(
@@ -461,7 +457,7 @@ def components_of(vm: Vm) -> dict[str, Any]:
         "vm_id": vm.vm_id,
         "release": int(current.release_id) if current is not None else None,
         "security_epoch": int(current.release.security_epoch) if current is not None else 0,
-        "build_prefix": current.s3_key_prefix if current is not None else None,
+        "build_prefix": booted_prefix.strip("/") if current is not None else None,
         "required_epoch": int(epochs.required_epoch) if epochs else 0,
         "attested_epoch": int(epochs.attested_epoch) if epochs else 0,
         "newest_release": int(newest.release_id) if newest is not None else None,

@@ -633,6 +633,17 @@ class SchedulerFeasibilityView(APIView):
                 required=False,
                 type=str,
             ),
+            OpenApiParameter(
+                name="dedicated_integrity",
+                description=(
+                    "With `dedicated_count`: `true` asks for disks with integrity (ssd / "
+                    "nvme only), `false` the default. Not offered (off, or tier `hdd`) reads "
+                    "`never` / `dedicated-integrity-not-offered`, the block `placeable: "
+                    "false`. 400 `dedicated-invalid` on anything but true / false."
+                ),
+                required=False,
+                type=str,
+            ),
         ],
         responses={
             200: FeasibilityListSerializer,
@@ -700,15 +711,20 @@ class SchedulerFeasibilityView(APIView):
 
 
 #: The feasibility query parameters naming dedicated disks (E4 contract §4).
-_DEDICATED_PARAMS = ("dedicated_count", "dedicated_min_size_gb", "dedicated_tier")
+_DEDICATED_PARAMS = (
+    "dedicated_count",
+    "dedicated_min_size_gb",
+    "dedicated_tier",
+    "dedicated_integrity",
+)
 
 
 def _dedicated_query(params: Any) -> disk_dedicated.DedicatedRequest | None:
     """The dedicated-disk request the feasibility query names, `None` when
     it names none (the answer then stays byte-identical). Validated like a
     launch's `dedicated_disks` (`DedicatedError`, the §1.1 400 categories):
-    count and size are required with any of the three, the tier defaults to
-    `hdd`."""
+    count and size are required with any of them, the tier defaults to
+    `hdd`, `dedicated_integrity` (§9) is `true` or `false` (default)."""
     if not any(params.get(p) is not None for p in _DEDICATED_PARAMS):
         return None
 
@@ -726,11 +742,17 @@ def _dedicated_query(params: Any) -> disk_dedicated.DedicatedRequest | None:
                 f"{name} must be an integer", disk_dedicated.CATEGORY_INVALID
             ) from None
 
+    raw_integrity = params.get("dedicated_integrity") or ""
+    if raw_integrity not in ("", "true", "false"):
+        raise disk_dedicated.DedicatedError(
+            "dedicated_integrity must be true or false", disk_dedicated.CATEGORY_INVALID
+        )
     return disk_dedicated.parse_request(
         {
             "tier": (params.get("dedicated_tier") or "").strip() or disk_dedicated.REQUEST_TIERS[0],
             "count": number("dedicated_count"),
             "min_size_gb": number("dedicated_min_size_gb"),
+            "integrity": raw_integrity == "true",
         }
     )
 

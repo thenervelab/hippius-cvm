@@ -3966,6 +3966,53 @@ def _pin_dest_os_pool(job: MigrationJob) -> str | None:
     return job.dest_os_pool or None
 
 
+def _dest_os_pool_for_dispatch(job: MigrationJob) -> str | None:
+    """The pool a NEW activate order names: the pinned one
+    ([`_pin_dest_os_pool`]). None pinned (`default`) only when `default`
+    holds the VM's landing tier (`effects.arrival_default_refusal`, both
+    tier-match modes); otherwise a pool of the dest that holds it, chosen
+    again and pinned (write-ahead, like the first: compare-and-set, then
+    whatever is persisted — an overlapping tick's choice wins); none ⇒ the
+    attempt is not dispatched (`EffectError`, retried until the phase
+    deadline fails the job) — never a disk on a pool of another tier.
+    A restore is staged: [`_staged_restore_os_pool`] instead."""
+    from apps.disktier import os_tier
+
+    os_pool = _pin_dest_os_pool(job)
+    if os_pool is not None:
+        return os_pool
+    why = effects.arrival_default_refusal(job.vm, job.dest_node_id)
+    if not why:
+        return None
+    chosen = effects.arrival_os_pool(job.vm, job.dest_node_id)
+    if chosen:
+        MigrationJob.objects.filter(pk=job.pk, dest_os_pool="").update(dest_os_pool=chosen)
+        job.refresh_from_db(fields=["dest_os_pool"])
+        if job.dest_os_pool:
+            return job.dest_os_pool
+    raise EffectError(
+        f"{os_tier.CATEGORY_NO_MINER_AT_TIER}: destination {job.dest_node_id!r}: {why}, "
+        "and no other pool of it can take the disk"
+    )
+
+
+def _staged_restore_os_pool(job: MigrationJob) -> None:
+    """A restore's activate order names no pool, and its job records
+    `default` (pinned ""): the destination staged the disk before the
+    activation (`restore._dispatch_stage`), on `default` for a VM it holds
+    no record of, and the activation reuses that record whatever the order
+    names. So the destination was admitted only if its `default` holds the
+    VM's landing tier (`restore.staged_default_refusal`, at intake and
+    before the stage order).
+
+    Follow-up: carry the pinned pool into the stage order so a restore can
+    land on a pool other than `default`."""
+    MigrationJob.objects.filter(pk=job.pk).exclude(
+        dest_os_pool="", dest_os_pool_pinned=True
+    ).update(dest_os_pool="", dest_os_pool_pinned=True)
+    job.dest_os_pool, job.dest_os_pool_pinned = "", True
+
+
 def _record_dest_os_pool(job: MigrationJob, placement: Any) -> None:
     """A4b: the destination placement's OS disk is on the pool the activate
     order named (none named: `default`, no row). Attribution only (passive
@@ -6283,6 +6330,18 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
     too_late = timezone.now().timestamp() >= _activate_settle_by_unix(job) - _DEST_SETTLE_WINDOW_S
     _warn_if_activate_timeout_too_small()
     if not exhausted and not paced and not too_late:
+        # The pool FIRST: a new order never names no pool when `default`
+        # does not hold the VM's tier, and an order the guard holds back
+        # must not be noted as dispatched below (an already-sent one is not
+        # re-sent: its pin stands).
+        if restoring:
+            os_pool = _staged_restore_os_pool(job)
+        else:
+            os_pool = (
+                _pin_dest_os_pool(job)
+                if _attempt_dispatched(job, attempt)
+                else _dest_os_pool_for_dispatch(job)
+            )
         if restoring:
             # Write-ahead: absent, it proves no ticket at `new_gen` ever
             # left vali (`restore.commit_state`).
@@ -6294,7 +6353,6 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
             # chain is set.
             backup_chain = _restore().failover_chain(job)
             get_url = backup_chain["full"]["url"]
-        os_pool = _pin_dest_os_pool(job)
         _guarded(
             _mig_key(job, _dispatch_step(attempt)),
             lambda: effects.dispatch_migrate_activate(
@@ -6363,17 +6421,7 @@ def _h_mig_dest_activating(job: MigrationJob) -> StepResult:
         # depends on the class: a restore that failed before any boot
         # (`dest-settle-by-passed`, a snapshot download, artifact staging, …)
         # is a real failed attempt but says nothing about starting a CVM.
-        _guarded(
-            _mig_key(job, _failure_step(attempt)),
-            lambda: _record_dest_activation_failure(job, failure_class),
-        )
-        refused = (failure_class or "").strip().lower()
-        if refused.startswith(_DEST_POOL_REFUSED_BEFORE_RECORD) and job.dest_os_pool:
-            # The dest refused the named pool before recording anything
-            # (A4b, as a launch's `_retry_os_pool`): the next attempt names
-            # none, the dest's launch pool.
-            MigrationJob.objects.filter(pk=job.pk).update(dest_os_pool="")
-            job.dest_os_pool = ""
+        _record_failed_attempt(job, attempt, failure_class)
         if (
             job.kind != MigrationKind.MIGRATE.value
             and failure_class in _TERMINAL_RESTORE_ACTIVATION_CLASSES
@@ -6471,6 +6519,34 @@ def _dispatch_step(attempt: int) -> str:
 
 def _failure_step(attempt: int) -> str:
     return f"cvm-start-failure:r{attempt}"
+
+
+def _record_failed_attempt(job: MigrationJob, attempt: int, failure_class: str) -> None:
+    """Record `attempt`'s reported failure (its `_failure_step` key, which
+    publishes the next attempt), first clearing a pin the dest refused.
+
+    The dest refused the named pool before recording anything (A4b, as a
+    launch's `_retry_os_pool`): the next attempt names none, the dest's
+    launch pool — when `default` holds the VM's tier, else another pool
+    that does (`_dest_os_pool_for_dispatch`). The clear is owned by the
+    attempt, not the pool's value: under the job's row lock, and only while
+    `attempt`'s failure key is unrecorded — the very key the next attempt's
+    re-pin waits on. A stale handler of an attempt already recorded never
+    touches the pin, even when the next attempt re-pinned the same pool."""
+    refused = (failure_class or "").strip().lower()
+    key = _mig_key(job, _failure_step(attempt))
+    with transaction.atomic():
+        MigrationJob.objects.select_for_update().filter(pk=job.pk).first()
+        if (
+            refused.startswith(_DEST_POOL_REFUSED_BEFORE_RECORD)
+            and job.dest_os_pool
+            and idempotency.recall(key) is None
+        ):
+            MigrationJob.objects.filter(pk=job.pk, dest_os_pool=job.dest_os_pool).update(
+                dest_os_pool=""
+            )
+        _guarded(key, lambda: _record_dest_activation_failure(job, failure_class))
+    job.refresh_from_db(fields=["dest_os_pool"])
 
 
 def _attempt_dispatched(job: MigrationJob, attempt: int) -> bool:

@@ -411,6 +411,7 @@ mod tests {
             io_ticks_ms: 2,
             tiq_ms: 2,
             inflight: 0,
+            init_percent: None,
         }
     }
 
@@ -515,6 +516,7 @@ mod tests {
                 io_ticks_ms: u64::MAX,
                 tiq_ms: u64::MAX,
                 inflight: u64::MAX,
+                init_percent: None,
             })
             .collect();
         let slots: Vec<String> = core::iter::once("os".to_string())

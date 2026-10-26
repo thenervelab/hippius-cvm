@@ -135,9 +135,12 @@ def test_default_wins_when_it_is_the_lower_adequate_tier() -> None:
     assert routing.choose_os_pool(NODE, 10, "ssd") is None, "default (ssd) before nvme0"
     assert routing.choose_os_pool(NODE, 10) == "nvme0", "an nvme disk is not held by default"
     MinerStoragePool.objects.filter(pool_id="default").delete()
-    # A node with no row for `default` (a pre-v7 single pool) reads it nvme.
-    assert routing.default_pool_tier(NODE) == "nvme"
+    # Other rows but none for `default`: it holds nothing (only a node with
+    # no pool row at all, a pre-v7 single pool, reads it nvme).
+    assert routing.default_pool_tier(NODE) is None
     assert routing.choose_os_pool(NODE, 10, "ssd") == "nvme0"
+    MinerStoragePool.objects.all().delete()
+    assert routing.default_pool_tier(NODE) == "nvme"
     _pool("ssd0", declared_class="ssd")
     assert routing.choose_os_pool(NODE, 10, "ssd") == "ssd0"
 
@@ -191,10 +194,12 @@ def test_refusals_is_two_queries_for_many_nodes(django_assert_num_queries) -> No
     _pool("default", declared_class="ssd")
     _pool("default", node_id=other, declared_class="ssd")
     _pool("nvme0", node_id=other)
-    _pool("nvme0", node_id=third)  # its agent reports no version
+    # Its agent reports no version (no `os_pool`), and a node with pool rows
+    # but no `default` row holds nothing there: refused.
+    _pool("nvme0", node_id=third)
     with django_assert_num_queries(2):
         out = os_tier.refusals([NODE, other, third, "9" * 64], "nvme", 10)
-    assert set(out) == {NODE}
+    assert set(out) == {NODE, third}
 
 
 # ── gate (n) in `decide_placement` ──────────────────────────────────
