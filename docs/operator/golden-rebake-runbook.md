@@ -19,7 +19,7 @@ The machine does the bake and a first boot test. A human does the bless.
 ## 1. The re-bake (`vali_scheduled_golden_rebake`)
 
 For each image (`VALI_GOLDEN_REBAKE_IMAGES`, default
-`ubuntu,debian,cs10,fedora,cdn-node`) the command:
+`ubuntu,debian,cs10,fedora,cdn-node,ubuntu-runner`) the command:
 
 - clones the **currently blessed** bake's inputs (dated base image URL +
   sha256, size, bucket) into a new golden `TenantBake`:
@@ -240,3 +240,48 @@ tenant-baker image, then this re-bake picks it up.
   cdn-node`, vali replaces the CDN nodes; check one new node's
   `/__hippius/health` (200, `canary: true`), its journal (`geoip database
   loaded: DBIP-Country-Lite ...`) and a usage sample's `geoip_db`.
+
+## ubuntu-runner
+
+`ubuntu-runner` (the CI-runner image: the ubuntu golden plus Docker and the
+GitHub Actions runner's dependencies) is re-baked with the others, cloned
+with `profile=ubuntu-runner`. The refresh updates Docker's packages too
+(Docker's apt repo is configured in the image).
+
+The image also carries the GitHub Actions runner tarball, not extracted, at
+`/opt/actions-runner/actions-runner-linux-x64-<version>.tar.gz` (the runner
+bootstrap in hippius-backend finds it there and skips its download; the
+registered runner still self-updates).
+
+- Bump it: change the 3 pinned values at the top of
+  `scripts/tenant-image-bake.sh` together, `RUNNER_TARBALL_VERSION`,
+  `RUNNER_TARBALL_URL` and `RUNNER_TARBALL_SHA256` (sha256 from the
+  release notes, cross-checked against the GitHub asset digest). The
+  consumer's `GITHUB_RUNNER_VERSION` must match, or it misses the baked
+  file and downloads again. The new pin busts the stage-1 cache; a wrong
+  sha256 fails the bake.
+
+The image bakes `/etc/docker/daemon.json` as
+`{"features": {"containerd-snapshotter": false}, "log-driver": "json-file",
+"log-opts": {"max-size": "50m", "max-file": "2"}}`, with no `data-root`
+(`RUNNER_DOCKER_DAEMON_JSON` in `scripts/tenant-image-bake.sh`). These keys
+are exactly what the runner bootstrap in hippius-backend enforces (it drops
+`data-root`, forces the snapshotter off, adds the log settings when absent)
+and it restarts Docker (~10 s, every boot) whenever that changes the file;
+a baked file that already matches skips the restart. Keep the two in sync:
+a change on either side brings the restart back. Docker stays on the
+overlay2 graph driver under `/var/lib/docker` (on the data disk);
+containerd keeps its own `/var/lib/containerd` bind.
+
+- Until it is first blessed the run logs it as not blessed and skips it; no
+  alert fires.
+- The synthetic e2e runs on it like on `ubuntu` (the new bake is not
+  blessed yet, so its tenant restriction does not apply).
+- Bless it with its tenant: `vali_bless_golden_image ubuntu-runner <bake_id>
+  --distro ubuntu` keeps the restriction already on the image; a first bless
+  needs `--restricted-tenant <SS58 of the runners' account>`, and
+  `--unrestrict` is refused.
+- Real-boot check: launch one runner VM on the bake by `bake_id`; in it,
+  `findmnt /var/lib/docker` shows `/dev/mapper/hippius-upper[/data/docker]`,
+  `systemctl is-active hippius-runner-data docker containerd` is all
+  `active`, and `docker run --rm hello-world` works.

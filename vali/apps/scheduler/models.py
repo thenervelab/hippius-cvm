@@ -404,6 +404,12 @@ class MinerCapacity(models.Model):
     # omit the column, still satisfy NOT NULL during a roll).
     agent_version = models.CharField(max_length=32, blank=True, default="", db_default="")
     agent_version_reported_at = models.DateTimeField(null=True, blank=True, default=None)
+    # ── the last heartbeat carrying a v7 storage report (pools), set
+    # BEFORE the report is recorded, so a report whose recording failed
+    # still counts. Set ⇒ the node reports its pools: no pool row then
+    # means none known yet, never the pre-v7 implicit nvme `default`
+    # (`routing.default_pool_tier`). NULL = never sent one.
+    storage_reported_at = models.DateTimeField(null=True, blank=True, default=None)
     # ── operator placement controls (audited writes only, see
     # `capacity_admin`). `max_booting` overrides
     # `VALI_SCHEDULER_MAX_BOOTING_PER_MINER` for this miner (NULL = the

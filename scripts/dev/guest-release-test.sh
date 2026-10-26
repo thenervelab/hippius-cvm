@@ -73,6 +73,14 @@ rec "${good[@]}" health_mask=15
 got="$(parse)" || err "a record with health_mask was refused"
 [[ "${got}" == "${want}" ]] || err "health_mask changed the parser output: '${got}'"
 ok "health_mask is accepted and not part of what the boot uses"
+rec "${good[@]}" udev=99-hippius-vsock.rules
+got="$(parse)" || err "a record with a udev rule was refused"
+[[ "${got}" == "${want}"$'\n'"udev 99-hippius-vsock.rules" ]] || err "udev parser output: '${got}'"
+for bad in ../x.rules .rules x.conf 'a b.rules' 'x/y.rules' ''; do
+    rec "${good[@]}" "udev=${bad}"
+    if parse >/dev/null 2>&1; then err "parser accepted udev='${bad}'"; fi
+done
+ok "udev=<name>.rules lines parse; a path, a dot file or another suffix is refused"
 bad_cases=(
     "missing version|security_epoch=1 commit=${COMMIT} squashfs_sha256=${SHA_A}"
     "missing epoch|version=1 commit=${COMMIT} squashfs_sha256=${SHA_A}"
@@ -224,6 +232,30 @@ for what in mount image busybox; do
     grep -q 'mounted=no' "${C}/run/guest-components" || err "${what} missing: status says mounted"
 done
 ok "mount failure, missing image, missing busybox: boot goes on, links written, nothing mounted"
+
+# B5b. udev rules (release 8): linked into the root's /etc/udev/rules.d,
+# naming the final path; a symlinked rules dir is never followed and never
+# fails the boot.
+new_case udev
+mkdir -p "${C}/tree/udev"; printf 'KERNEL=="vsock"\n' > "${C}/tree/udev/99-hippius-vsock.rules"
+write_record "$(img_sha)" udev=99-hippius-vsock.rules
+boot || err "udev boot failed: $(cat "${T}/log")"
+link_is "${C}/root/etc/udev/rules.d/99-hippius-vsock.rules" /run/hippius/guest/udev/99-hippius-vsock.rules \
+    || err "udev rule not linked: $(ls -l "${C}/root/etc/udev/rules.d" 2>&1)"
+link_is "${C}/root/etc/systemd/system/hippius-keepalive.service" /run/hippius/guest/units/hippius-keepalive.service \
+    || err "udev case: units not linked"
+new_case udev-symlink
+write_record "$(img_sha)" udev=99-hippius-vsock.rules
+mkdir -p "${C}/outside" "${C}/root/etc/udev"; : > "${C}/outside/sentinel"
+ln -s "${C}/outside" "${C}/root/etc/udev/rules.d"
+boot || err "a symlinked rules dir failed the boot"
+[[ "$(ls "${C}/outside")" == sentinel ]] || err "symlinked rules dir: the step wrote through it"
+grep -q 'udev rules not linked' "${T}/log" || err "symlinked rules dir: no WARN"
+new_case udev-none
+write_record "$(img_sha)"
+boot || err "no-udev boot failed"
+[[ ! -e "${C}/root/etc/udev" ]] || err "a record without udev lines created /etc/udev"
+ok "udev rules: linked to the final path; a symlinked rules dir is skipped with a WARN; none ⇒ nothing"
 
 # B6. An image without units/ is not used.
 new_case nounits
@@ -427,16 +459,18 @@ else
     boot || err "the boot step refused the builder's record: $(cat "${T}/log")"
     grep -q 'mounted=yes' "${C}/run/guest-components" || err "the builder's image did not pass the sha check"
     for u in hippius-keepalive.service hippius-tenant-telemetry.service hippius-eol-sign.service \
-             hippius-disk-probe.service hippius-disk-probe.path; do
+             hippius-disk-probe.service hippius-disk-probe.path hippius-dedicated-init.service; do
         link_is "${C}/root/etc/systemd/system/${u}" "/run/hippius/guest/units/${u}" \
             || err "the builder's record does not enable ${u}"
     done
+    link_is "${C}/root/etc/udev/rules.d/99-hippius-vsock.rules" /run/hippius/guest/udev/99-hippius-vsock.rules \
+        || err "the builder's record does not link the vsock udev rule"
     # The probe's path unit watches from paths.target, before cloud-init
     # writes the request.
     link_is "${C}/root/etc/systemd/system/paths.target.wants/hippius-disk-probe.path" \
         "../hippius-disk-probe.path" \
         || err "the builder's record does not link hippius-disk-probe.path into paths.target"
-    ok "builder: its record is accepted by the boot step and enables the five units"
+    ok "builder: its record is accepted by the boot step, enables the six units and links the udev rule"
 
     # Member contents: exactly the expected leaves + the one new dir.
     want_common="lib/hippius/guest
@@ -492,7 +526,11 @@ PY
     while read -r p; do
         l="$(rdsquashfs -x "${p}" "${T}/out1/components.squashfs" | sed -n 's/^security\.selinux=//p')"
         [[ -n "${l}" ]] || err "image entry ${p} is unlabelled"
-    done < <(printf '/\n/bin\n/units\n/etc\n/bin/hippius-agent-keepalive\n/bin/hippius-disks\n/units/hippius-eol-sign.service\n/etc/keepalive.env\n')
+    done < <(printf '/\n/bin\n/units\n/etc\n/udev\n/bin/hippius-agent-keepalive\n/bin/hippius-disks\n/bin/hippius-guest-release\n/units/hippius-eol-sign.service\n/units/hippius-dedicated-init.service\n/udev/99-hippius-vsock.rules\n/etc/keepalive.env\n')
+    [[ "$(rdsquashfs -x /udev/99-hippius-vsock.rules "${T}/out1/components.squashfs")" == "security.selinux=system_u:object_r:udev_rules_t:s0" ]] \
+        || err "udev rule label"
+    cmp -s <(rdsquashfs -c /bin/hippius-guest-release "${T}/out1/components.squashfs") "${B}/hippius-guest-release" \
+        || err "the image does not carry hippius-guest-release (the booted OS's integrity wipe)"
     cmp -s <(rdsquashfs -c /bin/hippius-disks "${T}/out1/components.squashfs") "${HERE}/../guest/hippius-disks" \
         || err "the image does not carry scripts/guest/hippius-disks as bin/hippius-disks"
     [[ "$(rdsquashfs -x /bin/hippius-agent-keepalive "${T}/out1/components.squashfs")" == "security.selinux=system_u:object_r:bin_t:s0" ]] \

@@ -9,7 +9,8 @@
 //!   to a disk slot. Passive evidence: in-VM root controls it, so vali
 //!   only ever uses it to schedule a probe. A dedicated-disk slot the
 //!   guest refused (`mismatch`) or could not find (`missing`) is reported
-//!   here too.
+//!   here too, and so is one whose first-boot integrity wipe is still
+//!   running (`initializing`, with an optional `init_percent`).
 //! - `disk_probe` — the result of a vali-owned probe VM's benchmark, one
 //!   entry per disk it measured. vali accepts it only from a VM it
 //!   launched as a probe, bound by `run_id` + `nonce` + `vm_id`.
@@ -71,6 +72,10 @@ pub enum DiskIoState {
     Mismatch,
     /// A dedicated slot named on the measured cmdline with no device.
     Missing,
+    /// A dedicated integrity slot whose first-boot wipe is still running:
+    /// not yet handed to the tenant. The only state that may carry
+    /// `init_percent`.
+    Initializing,
 }
 
 impl DiskIoState {
@@ -79,6 +84,7 @@ impl DiskIoState {
             DiskIoState::Ok => "ok",
             DiskIoState::Mismatch => "mismatch",
             DiskIoState::Missing => "missing",
+            DiskIoState::Initializing => "initializing",
         }
     }
 
@@ -87,6 +93,7 @@ impl DiskIoState {
             "ok" => Ok(DiskIoState::Ok),
             "mismatch" => Ok(DiskIoState::Mismatch),
             "missing" => Ok(DiskIoState::Missing),
+            "initializing" => Ok(DiskIoState::Initializing),
             _ => Err(schema("disk_io: unknown state")),
         }
     }
@@ -96,7 +103,9 @@ impl DiskIoState {
 /// (`inflight` is the instantaneous gauge at the window's end).
 ///
 /// A `missing` slot has no device: `dev` is empty, `serial` names the slot
-/// and every counter is zero.
+/// and every counter is zero. `init_percent` (0..=100) is set only on an
+/// `initializing` slot, and is encoded only when set, so an entry without
+/// it is byte-identical to before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskIoDelta {
     pub dev: String,
@@ -111,7 +120,11 @@ pub struct DiskIoDelta {
     pub io_ticks_ms: u64,
     pub tiq_ms: u64,
     pub inflight: u64,
+    pub init_percent: Option<u8>,
 }
+
+/// The optional key of an `initializing` entry.
+const INIT_PERCENT_KEY: &str = "init_percent";
 
 const DISK_IO_KEYS: [&str; 12] = [
     "dev",
@@ -176,6 +189,12 @@ impl DiskIoDelta {
                 "disk_io: a slot verdict needs a dedicated slot serial",
             ));
         }
+        if self.init_percent.is_some_and(|p| p > 100) {
+            return Err(schema("disk_io: init_percent above 100"));
+        }
+        if self.init_percent.is_some() && self.state != DiskIoState::Initializing {
+            return Err(schema("disk_io: init_percent on a slot not initializing"));
+        }
         if self.state == DiskIoState::Missing {
             if !self.dev.is_empty() {
                 return Err(schema("disk_io: a missing slot has no dev"));
@@ -200,11 +219,23 @@ impl DiskIoDelta {
                 .iter()
                 .map(|(k, v)| kv(k, Value::Integer((*v).into()))),
         );
+        if let Some(p) = self.init_percent {
+            entries.push(kv(INIT_PERCENT_KEY, Value::Integer(p.into())));
+        }
         Value::Map(entries)
     }
 
     fn from_value(v: &Value) -> Result<Self> {
-        let e = exact_map(v, &DISK_IO_KEYS, "disk_io entry").map_err(schema)?;
+        let has_percent = matches!(v, Value::Map(m)
+            if m.iter().any(|(k, _)| matches!(k, Value::Text(n) if n == INIT_PERCENT_KEY)));
+        let e = if has_percent {
+            let mut keys = DISK_IO_KEYS.to_vec();
+            keys.push(INIT_PERCENT_KEY);
+            exact_map(v, &keys, "disk_io entry")
+        } else {
+            exact_map(v, &DISK_IO_KEYS, "disk_io entry")
+        }
+        .map_err(schema)?;
         let u = |k: &str| u64_at(e, k).map_err(schema);
         let out = DiskIoDelta {
             dev: text_at(e, "dev").map_err(schema)?,
@@ -219,6 +250,12 @@ impl DiskIoDelta {
             io_ticks_ms: u("io_ticks_ms")?,
             tiq_ms: u("tiq_ms")?,
             inflight: u("inflight")?,
+            init_percent: if has_percent {
+                let p = u(INIT_PERCENT_KEY)?;
+                Some(u8::try_from(p).map_err(|_| schema("disk_io: init_percent above 100"))?)
+            } else {
+                None
+            },
         };
         out.validate()?;
         Ok(out)
@@ -558,6 +595,7 @@ mod tests {
             io_ticks_ms: 12,
             tiq_ms: 13,
             inflight: 1,
+            init_percent: None,
         }
     }
 
@@ -667,6 +705,59 @@ mod tests {
         let mut with_dev = io("vdc", "hippius-x1");
         with_dev.state = DiskIoState::Missing;
         assert!(validate_disk_io(&[with_dev]).is_err());
+    }
+
+    #[test]
+    fn an_initializing_slot_round_trips_with_and_without_its_percent() {
+        let mut init = io("vdb", "hippius-x0");
+        init.state = DiskIoState::Initializing;
+        assert_eq!(round_trip_io(&[init.clone()]), vec![init.clone()]);
+        for p in [0u8, 42, 100] {
+            init.init_percent = Some(p);
+            assert_eq!(round_trip_io(&[init.clone()]), vec![init.clone()]);
+        }
+        // An entry without the key encodes exactly as before.
+        let plain = io("vdb", "hippius-x0");
+        let Value::Map(m) = plain.to_value() else {
+            panic!()
+        };
+        assert_eq!(m.len(), DISK_IO_KEYS.len());
+    }
+
+    #[test]
+    fn init_percent_belongs_to_an_initializing_dedicated_slot_only() {
+        let mut over = io("vdb", "hippius-x0");
+        over.state = DiskIoState::Initializing;
+        over.init_percent = Some(101);
+        assert!(validate_disk_io(&[over]).is_err());
+        for state in [DiskIoState::Ok, DiskIoState::Mismatch] {
+            let mut m = io("vdb", "hippius-x0");
+            m.state = state;
+            m.init_percent = Some(5);
+            assert!(validate_disk_io(&[m]).is_err(), "{state:?}");
+        }
+        // `initializing` is a dedicated-slot verdict, on a device.
+        for serial in ["", "hippius-os"] {
+            let mut m = io("vdb", serial);
+            m.state = DiskIoState::Initializing;
+            assert!(validate_disk_io(&[m]).is_err(), "{serial:?}");
+        }
+        let mut no_dev = io("", "hippius-x0");
+        no_dev.state = DiskIoState::Initializing;
+        assert!(validate_disk_io(&[no_dev]).is_err());
+        // Decoding: a percent above 100, or on another state, is refused.
+        let mut init = io("vdb", "hippius-x0");
+        init.state = DiskIoState::Initializing;
+        let Value::Map(mut m) = init.to_value() else {
+            panic!()
+        };
+        m.push(kv(INIT_PERCENT_KEY, Value::Integer(300.into())));
+        assert!(disk_io_from_value(&Value::Array(vec![Value::Map(m)])).is_err());
+        let Value::Map(mut m) = io("vdb", "hippius-x0").to_value() else {
+            panic!()
+        };
+        m.push(kv(INIT_PERCENT_KEY, Value::Integer(3.into())));
+        assert!(disk_io_from_value(&Value::Array(vec![Value::Map(m)])).is_err());
     }
 
     #[test]

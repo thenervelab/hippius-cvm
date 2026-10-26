@@ -220,6 +220,10 @@ bake_family() {
         grep -qxF "${kv}" "${sshd}" 2>/dev/null || err "${family}: 00-hippius-harden.conf lacks '${kv}'"
     done
     [[ "$(stat -c %a "${sshd}" 2>/dev/null)" == 644 ]] || err "${family}: 00-hippius-harden.conf is not mode 0644"
+    [[ "$(readlink "${root}/etc/systemd/system/sshd-keygen.service" 2>/dev/null)" == /dev/null ]] \
+        || err "${family}: sshd-keygen.service not masked to /dev/null (Debian's first-boot ssh-keygen -A makes an RSA key)"
+    [[ ! -e "${root}/etc/systemd/system/sshd-keygen@.service" ]] \
+        || err "${family}: the templated sshd-keygen@.service was touched (cloud-init's drop-in owns it)"
     local want_dir=755
     [[ "${family}" == apt ]] || want_dir=700
     [[ "$(stat -c %a "${root}/etc/ssh/sshd_config.d")" == "${want_dir}" ]] \
@@ -279,6 +283,17 @@ assert_rejects "sshd drop-in missing"             "rm -f etc/ssh/sshd_config.d/0
 assert_rejects "sshd drop-in allows passwords"    "sed -i 's/^PasswordAuthentication no\$/PasswordAuthentication yes/' etc/ssh/sshd_config.d/00-hippius-harden.conf"
 assert_rejects "sshd drop-in lost PermitRootLogin" "sed -i '/^PermitRootLogin no\$/d' etc/ssh/sshd_config.d/00-hippius-harden.conf"
 assert_rejects "a base drop-in sorts before ours" "printf 'PasswordAuthentication yes\\n' > etc/ssh/sshd_config.d/00-aaa.conf"
+assert_rejects "sshd_config names an RSA HostKey" "printf 'HostKey /etc/ssh/ssh_host_rsa_key\\n' > etc/ssh/sshd_config"
+assert_rejects "sshd-keygen.service unmasked"      "rm -f etc/systemd/system/sshd-keygen.service"
+assert_rejects "a drop-in names an RSA HostKey"   "printf '  hostkey /etc/ssh/ssh_host_rsa_key\\n' > etc/ssh/sshd_config.d/50-hk.conf"
+# The stock configs name their host keys commented out: that is accepted.
+root="$(new_root "hostkey-commented")"
+run_in "${root}" cloud && run_in "${root}" net && run_in "${root}" apt && run_in "${root}" sshd && run_in "${root}" mask \
+    || err "hostkey-commented: could not build the hardened base tree"
+printf '#HostKey /etc/ssh/ssh_host_rsa_key\nHostKey /etc/ssh/ssh_host_ed25519_key\n' > "${root}/etc/ssh/sshd_config"
+set +e; run_in "${root}" assert; rc=$?; set -e
+[[ ${rc} -eq 0 ]] && ok "a commented RSA HostKey (the stock sshd_config) and an ed25519 HostKey pass" \
+    || err "a commented RSA HostKey was rejected (rc=${rc}): $(cat "${root}/.out-assert")"
 assert_rejects "growpart left on"                 "sed -i \"s/^  mode: 'off'\$/  mode: auto/\" etc/cloud/cloud.cfg.d/99-hippius-noresize.cfg"
 assert_rejects "multipathd.socket unmasked"       "rm -f etc/systemd/system/multipathd.socket"
 assert_rejects "cloud-init network re-enabled"    "sed -i 's/^  config: disabled\$/  config: enabled/' etc/cloud/cloud.cfg.d/99-hippius-network.cfg"

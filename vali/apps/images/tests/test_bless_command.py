@@ -181,6 +181,39 @@ def test_reblessing_another_bake_clears_the_guest_release(make_golden_bake) -> N
     assert GoldenImage.objects.get(image_name="ubuntu").guest_release is None
 
 
+def test_bless_guest_release_for_a_second_bake_sharing_the_initrd(make_golden_bake) -> None:
+    """Bake gb-2 reuses gb-1's kernel and initrd (one upstream base) on its
+    own rootfs: its build of release 7 is byte-identical to gb-1's. Each
+    bake blesses, and launches, its own build — never the other's prefix."""
+    from apps.orchestration.launch_jobs import _apply_guest_release
+
+    gb1 = make_golden_bake(bake_id="gb-1")
+    gb2 = make_golden_bake(
+        bake_id="gb-2",
+        rootfs_img_sha256="a9" * 32,
+        rootfs_verity_sha256="b9" * 32,
+        verity_root_hash="c9" * 32,
+    )
+    shared = "77" * 32
+    _guest_build(7, initrd_sha256=shared)
+    _guest_build(
+        7,
+        initrd_sha256=shared,
+        source_bake_id="gb-2",
+        rootfs_img_sha256=gb2.rootfs_img_sha256,
+        rootfs_verity_sha256=gb2.rootfs_verity_sha256,
+        verity_root_hash=gb2.verity_root_hash,
+        s3_key_prefix="golden/gb-2-gr7/",
+    )
+    call_command("vali_bless_golden_image", "ubuntu-b2", "gb-2")
+    call_command("vali_bless_guest_release", "ubuntu-b2", "--release", "7", "--blessed-by", "ops")
+    assert GoldenImage.objects.get(image_name="ubuntu-b2").guest_release == 7
+    for bake, prefix in ((gb1, "golden/gb-1-gr7/"), (gb2, "golden/gb-2-gr7/")):
+        intent: dict = {}
+        _apply_guest_release(intent, bake, 7)
+        assert (intent["s3_key_prefix"], intent["initrd_sha256_hex"]) == (prefix, shared)
+
+
 def test_release_zero_is_refused(make_golden_bake) -> None:
     make_golden_bake(bake_id="gb-1")
     call_command("vali_bless_golden_image", "ubuntu", "gb-1")
@@ -208,3 +241,53 @@ def test_bless_cdn_node_profile_only_under_its_reserved_name(make_golden_bake) -
         "hippius-cdn",
     )
     assert GoldenImage.objects.get(image_name="cdn-node").bake_id == "gb-cdn"
+
+
+def test_bless_ubuntu_runner_profile_only_under_its_reserved_name(make_golden_bake) -> None:
+    """The CI-runner bake is blessed only as `ubuntu-runner`, and nothing else
+    may take that name."""
+    make_golden_bake(bake_id="gb-runner", profile="ubuntu-runner")
+    make_golden_bake(bake_id="gb-std")
+    for name, bake in (("ubuntu", "gb-runner"), ("ubuntu-runner", "gb-std")):
+        with pytest.raises(SystemExit) as exc:
+            call_command(
+                "vali_bless_golden_image", name, bake, "--restricted-tenant", "5Runner"
+            )
+        assert exc.value.code == 9
+    assert GoldenImage.objects.count() == 0
+    call_command(
+        "vali_bless_golden_image",
+        "ubuntu-runner",
+        "gb-runner",
+        "--distro",
+        "ubuntu",
+        "--restricted-tenant",
+        "5Runner",
+    )
+    row = GoldenImage.objects.get(image_name="ubuntu-runner")
+    assert (row.bake_id, row.distro, row.restricted_tenant) == ("gb-runner", "ubuntu", "5Runner")
+
+
+@pytest.mark.parametrize("extra", [[], ["--restricted-tenant", " "], ["--unrestrict"]])
+def test_bless_ubuntu_runner_needs_a_restricted_tenant(make_golden_bake, extra) -> None:
+    """The CI-runner image is never open to every tenant."""
+    make_golden_bake(bake_id="gb-runner", profile="ubuntu-runner")
+    with pytest.raises(SystemExit) as exc:
+        call_command("vali_bless_golden_image", "ubuntu-runner", "gb-runner", *extra)
+    assert exc.value.code == 9
+    assert not GoldenImage.objects.filter(image_name="ubuntu-runner").exists()
+
+
+def test_rebless_ubuntu_runner_keeps_its_restriction(make_golden_bake) -> None:
+    """A re-bless without the flag keeps the tenant; --unrestrict is refused."""
+    make_golden_bake(bake_id="gb-runner-1", profile="ubuntu-runner")
+    make_golden_bake(bake_id="gb-runner-2", profile="ubuntu-runner")
+    call_command(
+        "vali_bless_golden_image", "ubuntu-runner", "gb-runner-1", "--restricted-tenant", "5Runner"
+    )
+    call_command("vali_bless_golden_image", "ubuntu-runner", "gb-runner-2")
+    row = GoldenImage.objects.get(image_name="ubuntu-runner")
+    assert (row.bake_id, row.restricted_tenant) == ("gb-runner-2", "5Runner")
+    with pytest.raises(SystemExit):
+        call_command("vali_bless_golden_image", "ubuntu-runner", "gb-runner-2", "--unrestrict")
+    assert GoldenImage.objects.get(image_name="ubuntu-runner").restricted_tenant == "5Runner"

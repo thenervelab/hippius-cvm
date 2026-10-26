@@ -278,6 +278,7 @@ mod tests {
             io_ticks_ms: 7,
             tiq_ms: 8,
             inflight: 0,
+            init_percent: None,
         }]
     }
 

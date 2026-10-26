@@ -196,6 +196,7 @@ fn vector_served_delivery_receipt_disk_io() {
             io_ticks_ms: 0,
             tiq_ms: 0,
             inflight: 0,
+            init_percent: None,
         },
         DiskIoDelta {
             dev: "vda".into(),
@@ -210,6 +211,7 @@ fn vector_served_delivery_receipt_disk_io() {
             io_ticks_ms: 1_100,
             tiq_ms: 1_250,
             inflight: 2,
+            init_percent: None,
         },
         DiskIoDelta {
             dev: "vde".into(),
@@ -224,6 +226,7 @@ fn vector_served_delivery_receipt_disk_io() {
             io_ticks_ms: 600,
             tiq_ms: 610,
             inflight: 0,
+            init_percent: None,
         },
     ];
     let r = ServedDeliveryReceipt {
@@ -248,6 +251,56 @@ fn vector_served_delivery_receipt_disk_io() {
         "served_delivery_receipt.disk_io",
         &body,
         "7712fa8220685dce4c53cd5fa36f4b4f10c7dba195678f1f1d65f4033b84138f",
+    );
+}
+
+/// The `basic` receipt plus `disk_io`: a dedicated integrity slot whose
+/// first-boot wipe is 42 % done (`initializing` + `init_percent`, guest
+/// release 8), and one that just started (no percent yet).
+#[test]
+fn vector_served_delivery_receipt_disk_io_initializing() {
+    let nonce = [0x44u8; 32];
+    let slot = |dev: &str, serial: &str, init_percent: Option<u8>| DiskIoDelta {
+        dev: dev.into(),
+        serial: serial.into(),
+        state: DiskIoState::Initializing,
+        r_ios: 0,
+        r_sectors: 0,
+        r_ticks_ms: 0,
+        w_ios: 4_096,
+        w_sectors: 33_554_432,
+        w_ticks_ms: 52_000,
+        io_ticks_ms: 59_000,
+        tiq_ms: 410_000,
+        inflight: 8,
+        init_percent,
+    };
+    let io = [
+        slot("vdb", "hippius-x0", Some(42)),
+        slot("vdc", "hippius-x1", None),
+    ];
+    let r = ServedDeliveryReceipt {
+        validator_id: b"validator-1",
+        validator_nonce: &nonce,
+        epoch: 42,
+        vm_id: "abc",
+        lease_id: "lease-1",
+        family_id: b"family-1",
+        node_id: b"node-1",
+        resource_class: "std",
+        monotonic_seq: 1,
+        observed_degradation_bps: 0,
+        period_start: 1_000,
+        period_end: 1_060,
+        expiry: 2_000,
+        disk_io: Some(&io),
+        disk_probe: None,
+    };
+    let body = r.canonical().unwrap();
+    check(
+        "served_delivery_receipt.disk_io_initializing",
+        &body,
+        "99a95e50d9d594519059147740bca7a77f2e04636642f1c38937b11a2cd48855",
     );
 }
 

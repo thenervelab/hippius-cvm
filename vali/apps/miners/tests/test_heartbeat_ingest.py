@@ -1346,6 +1346,11 @@ def test_v7_storage_record_failure_never_costs_the_heartbeat(
     assert MinerCapacity.objects.get(miner_node_id=node).agent_version == "v2026.10.15"
     assert not MinerStoragePool.objects.exists()
     assert logged and "storage report not recorded" in logged[0]
+    # The node reports pools: no row is no longer the pre-v7 implicit nvme.
+    assert MinerCapacity.objects.get(miner_node_id=node).storage_reported_at is not None
+    from apps.disktier import routing
+
+    assert routing.default_pool_tier(node) is None
 
 
 def test_v7_heartbeat_without_bridge_records_no_storage(

@@ -1066,13 +1066,13 @@ def _default_pool_refusal(miner: MinerIdentity, spec: LaunchSpec) -> str:
     (`""` when it may): only while `VALI_SCHEDULER_DISK_TIER_GATE` is
     `enforce`, when `default` does not hold the VM's tier."""
     from apps.disktier import os_tier
-    from apps.disktier.tiers import satisfies
+    from apps.disktier.tiers import os_tier_fits
 
     if os_tier.gate_mode() != os_tier.GATE_ENFORCE:
         return ""
     tier = _landing_tier(spec)
     own = disk_routing.default_pool_tier(miner.chain_node_id or "")
-    if own is not None and satisfies(own, tier):
+    if own is not None and os_tier_fits(own, tier):
         return ""
     return (
         f"the miner's default pool ({own or 'no OS disks'}) does not hold an OS disk at "
@@ -2958,6 +2958,7 @@ def launch_vm(
     max_attempts: int | None = None,
     on_phase: Callable[[str], None] | None = None,
     queued_for_s: float = 0.0,
+    stopping: Callable[[], bool] | None = None,
 ) -> LaunchResult:
     """Scheduler-driven launch — [`_place_and_launch`], plus the
     abandoned-launch marker on any non-`ok` terminal.
@@ -2970,13 +2971,32 @@ def launch_vm(
     host marks its row" a property of the function, not of its authors.
     """
     result = _place_and_launch(
-        spec, decided_by, max_attempts=max_attempts, on_phase=on_phase, queued_for_s=queued_for_s
+        spec,
+        decided_by,
+        max_attempts=max_attempts,
+        on_phase=on_phase,
+        queued_for_s=queued_for_s,
+        stopping=stopping,
     )
     if not result.ok:
         _mark_launch_abandoned(
             spec.vm_id, outcome=result.outcome, registered=result.registered
         )
     return result
+
+
+def _boot_wait_sleep(seconds: float, stopping: Callable[[], bool] | None) -> None:
+    """One boot-slot poll interval. With a `stopping` probe, sleep in 1 s
+    steps so a worker shutdown is seen within a second, not a poll."""
+    if stopping is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while not stopping():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
 
 
 def _place_and_launch(
@@ -2986,6 +3006,7 @@ def _place_and_launch(
     max_attempts: int | None = None,
     on_phase: Callable[[str], None] | None = None,
     queued_for_s: float = 0.0,
+    stopping: Callable[[], bool] | None = None,
 ) -> LaunchResult:
     """Scheduler-driven launch: pick a miner, launch, re-place on reject.
 
@@ -3015,6 +3036,12 @@ def _place_and_launch(
 
     `queued_for_s` is how long the request already waited in the launch
     queue; it is spent from the boot-slot wait (`boot_wait_s`).
+
+    `stopping` (optional) says the worker is shutting down: a launch still
+    waiting for a boot slot — nothing placed, nothing dispatched — gives up
+    at once as `miners-booting`, the same terminal a wait that ran out
+    reaches, instead of holding the shutdown for up to `boot_wait_s`. It
+    never interrupts a launch past its placement.
     """
     def _emit_phase(name: str) -> None:
         if on_phase is None:
@@ -3026,6 +3053,7 @@ def _place_and_launch(
     from django.db import IntegrityError, transaction
 
     from apps.scheduler import chain, service
+    from apps.scheduler.decision_lock import placement_decision_lock
     from apps.scheduler.models import (
         ACTIVE_PLACEMENT_STATES,
         Placement,
@@ -3049,6 +3077,16 @@ def _place_and_launch(
     attempts_used = 0
     pin_busy_retries = 0
     boot_wait_until: float | None = None
+    # JOB-scoped, sticky: once ANY attempt of this launch got past the KBS
+    # `register-vm`, the vm_id is bound to that miner's host for good. A
+    # later attempt's own `out.registered` is NOT enough: a same-miner
+    # retry refused at PREFLIGHT returns `registered=False` (the refusal
+    # comes before its own register), and reading that as "safe to
+    # re-place" sent the VM to another miner straight into the KBS CAS
+    # fence (`kbs-admin-conflict`, 2026-10-26). Never reset: every path
+    # after a registered attempt returns, so no re-place, no boot-slot
+    # wait, no second placement ever follows it.
+    kbs_registered = False
     while attempts_used < cap_attempts:
         attempts_used += 1
         # Progress: the scheduler is (re-)choosing a miner for this VM.
@@ -3065,37 +3103,90 @@ def _place_and_launch(
             )
 
         service.refresh_miner_capacity(snapshot)
-        cap, load, fam = service.decision_inputs(spec.tenant_id)
-        try:
-            # Every gate, assembled in ONE place so the feasibility
-            # check (`apps.scheduler.feasibility`) asks the scheduler
-            # the identical question. A preflight built from its own
-            # copy of these arguments drifts, and a drifted preflight
-            # is worse than none: the caller sells on its answer.
-            arguments = service.placement_arguments(
-                snapshot=snapshot,
-                tenant_id=spec.tenant_id,
-                user_id=spec.user_id,
-                flavor=spec.flavor,
-                excluded=frozenset(excluded),
-                region=spec.region,
-                platform_id=spec.platform_id,
-                boot_gate=True,
-                vm_id=spec.vm_id,
-                power_policy_stop=(
-                    getattr(spec, "on_guest_poweroff", power_policy.RESTART)
-                    == power_policy.STOP
-                ),
-                require_failover_peer=getattr(spec, "require_failover_peer", False),
-                os_disk_tier=_os_disk_tier(spec),
-                dedicated=dedicated_request,
-            )
-            node_id = decide_placement(snapshot=snapshot, **arguments)
-        except PlacementError as exc:
+        # The decide → Pending-placement step runs under the fleet-wide
+        # placement-decision lock: every count the decision reads (boot cap,
+        # capacity, owner sub-budget, free dedicated disks) and the Pending
+        # row the next decision counts are one step, so concurrent launches
+        # (`VALI_LAUNCH_TICK_CONCURRENCY`) never spend the same slot twice.
+        # Only this step: the chain read above and the boot wait, preflight
+        # and dispatch below run unlocked. See `apps.scheduler.decision_lock`.
+        placement_error: PlacementError | None = None
+        miner: MinerIdentity | None = None
+        placement: Placement | None = None
+        disks_taken: disk_dedicated.DisksTaken | None = None
+        placement_conflict = False
+        reusing_disks = False
+        with placement_decision_lock():
+            try:
+                # Every gate, assembled in ONE place so the feasibility
+                # check (`apps.scheduler.feasibility`) asks the scheduler
+                # the identical question. A preflight built from its own
+                # copy of these arguments drifts, and a drifted preflight
+                # is worse than none: the caller sells on its answer.
+                arguments = service.placement_arguments(
+                    snapshot=snapshot,
+                    tenant_id=spec.tenant_id,
+                    user_id=spec.user_id,
+                    flavor=spec.flavor,
+                    excluded=frozenset(excluded),
+                    region=spec.region,
+                    platform_id=spec.platform_id,
+                    boot_gate=True,
+                    vm_id=spec.vm_id,
+                    power_policy_stop=(
+                        getattr(spec, "on_guest_poweroff", power_policy.RESTART)
+                        == power_policy.STOP
+                    ),
+                    require_failover_peer=getattr(spec, "require_failover_peer", False),
+                    os_disk_tier=_os_disk_tier(spec),
+                    dedicated=dedicated_request,
+                )
+                node_id = decide_placement(snapshot=snapshot, **arguments)
+            except PlacementError as exc:
+                placement_error = exc
+            else:
+                # Bridge the chain node_id → the dispatchable identity (#463).
+                miner = MinerIdentity.objects.filter(chain_node_id=node_id).first()
+            if miner is not None:
+                # E4: disks the VM already holds (an earlier attempt got past
+                # the KBS register) are taken again, never given back by this
+                # attempt.
+                reusing_disks = dedicated_request is not None and bool(
+                    disk_dedicated.held_disks(vm)
+                )
+                # Record the Pending placement. The partial unique index makes
+                # this the race boundary; a pre-existing active placement for
+                # this VM is a conflict the caller must resolve.
+                try:
+                    with transaction.atomic():
+                        placement = Placement.objects.create(
+                            vm=vm,
+                            vm_family=spec.tenant_id,
+                            owner=spec.user_id,
+                            purpose=spec.purpose,
+                            resource_class=spec.flavor,
+                            miner_node_id=node_id,
+                            status=PlacementStatus.PENDING.value,
+                            chain_epoch=snapshot.current_epoch,
+                            decided_by=decided_by,
+                        )
+                        # E4: the VM's dedicated disks, in THIS transaction,
+                        # row-locked: the placement and its disks commit
+                        # together or not at all.
+                        if dedicated_request is not None:
+                            disk_dedicated.assign(placement, vm, dedicated_request)
+                except disk_dedicated.DisksTaken as exc:
+                    disks_taken = exc
+                except IntegrityError:
+                    placement_conflict = True
+
+        if placement_error is not None:
+            exc = placement_error
             # Every eligible miner is busy booting: a boot slot frees up in
             # minutes, so wait for it — without spending a miner attempt —
             # rather than fail a launch the fleet can take.
-            if exc.category == MINERS_BOOTING:
+            stop = stopping is not None and stopping()
+            if exc.category == MINERS_BOOTING and not stop:
                 now = time.monotonic()
                 if boot_wait_until is None:
                     boot_wait_until = now + boot_wait_s() - max(0.0, queued_for_s)
@@ -3107,18 +3198,19 @@ def _place_and_launch(
                         exc.message,
                     )
                     attempts_used -= 1
-                    time.sleep(min(boot_wait_poll_s(), boot_wait_until - now))
+                    _boot_wait_sleep(min(boot_wait_poll_s(), boot_wait_until - now), stopping)
                     continue
+            error = exc.message
+            if stop and exc.category == MINERS_BOOTING:
+                error = f"launch worker stopping: {error}"
             return LaunchResult(
                 ok=False,
                 outcome=exc.category,
                 vm_id=spec.vm_id,
-                emit={"ok": False, "outcome": exc.category, "error": exc.message},
+                emit={"ok": False, "outcome": exc.category, "error": error},
                 attempts=audit,
             )
 
-        # Bridge the chain node_id → the dispatchable identity (#463).
-        miner = MinerIdentity.objects.filter(chain_node_id=node_id).first()
         if miner is None:
             # The scheduler picked a chain node with no registered
             # MinerIdentity — vali cannot recover its netbird_ip to
@@ -3132,36 +3224,15 @@ def _place_and_launch(
             audit.append({"miner_node_id": node_id, "disposition": "no-identity"})
             continue
 
-        # E4: disks the VM already holds (an earlier attempt got past the KBS
-        # register) are taken again, never given back by this attempt.
-        reusing_disks = dedicated_request is not None and bool(disk_dedicated.held_disks(vm))
-        # Record the Pending placement. The partial unique index makes
-        # this the race boundary; a pre-existing active placement for
-        # this VM is a conflict the caller must resolve.
-        try:
-            with transaction.atomic():
-                placement = Placement.objects.create(
-                    vm=vm,
-                    vm_family=spec.tenant_id,
-                    owner=spec.user_id,
-                    purpose=spec.purpose,
-                    resource_class=spec.flavor,
-                    miner_node_id=node_id,
-                    status=PlacementStatus.PENDING.value,
-                    chain_epoch=snapshot.current_epoch,
-                    decided_by=decided_by,
-                )
-                # E4: the VM's dedicated disks, in THIS transaction, row-locked:
-                # the placement and its disks commit together or not at all.
-                if dedicated_request is not None:
-                    disk_dedicated.assign(placement, vm, dedicated_request)
-        except disk_dedicated.DisksTaken as exc:
+        if disks_taken is not None:
             # The node's disks went to a concurrent placement since the
             # scheduler counted them: nothing was written (the placement
             # rolled back with them). Ask again WITHOUT spending a miner
             # attempt — gate (o) recounts, so the node is chosen again only
             # if it still has enough — and stop asking about it after a few.
-            log.warning("launch: vm_id=%s dedicated disks on %s: %s", spec.vm_id, node_id, exc)
+            log.warning(
+                "launch: vm_id=%s dedicated disks on %s: %s", spec.vm_id, node_id, disks_taken
+            )
             audit.append({"miner_node_id": node_id, "disposition": "dedicated-disks-taken"})
             dedicated_races += 1
             if dedicated_races <= _MAX_DEDICATED_RACES:
@@ -3169,7 +3240,7 @@ def _place_and_launch(
             else:
                 excluded.add(node_id)
             continue
-        except IntegrityError:
+        if placement_conflict or placement is None:
             existing = Placement.objects.filter(
                 vm=vm, status__in=ACTIVE_PLACEMENT_STATES
             ).first()
@@ -3193,6 +3264,7 @@ def _place_and_launch(
         # through the attempt (pool choice, refusal, billing, disk row).
         attempt_spec = _at_decided_tier(spec, arguments.get("disk_tier_fit"), node_id)
         out = launch_on_miner(attempt_spec, miner)
+        kbs_registered = kbs_registered or out.registered
 
         # Post-register dispatch failure: the KBS has already bound this
         # vm_id to THIS miner's host (step 8), so re-placing to another
@@ -3204,9 +3276,15 @@ def _place_and_launch(
         # for the same host so the retry does not re-conflict.
         dispatch_retries = 0
         dispatched: list[dict[str, Any]] = []
+        # The pool the retries name. Derived from a REGISTERED outcome only:
+        # a retry refused at preflight (before its own register) carries no
+        # `chosen_os_pool`, and deriving from it would drop the next retry
+        # onto `default` — a different pool than the registered attempt's,
+        # or `no-os-pool-at-tier`. Its predecessor's pool is kept instead.
+        retry_pool: str | None = None
         while (
             out.disposition == RETRIABLE
-            and out.registered
+            and kbs_registered
             and dispatch_retries < max_dispatch_retries()
         ):
             dispatch_retries += 1
@@ -3221,7 +3299,19 @@ def _place_and_launch(
             )
             time.sleep(dispatch_retry_backoff_s())
             dispatched.extend(_candidate_of(spec, out))
-            out = launch_on_miner(attempt_spec, miner, os_pool=_retry_os_pool(spec, out))
+            if out.registered:
+                retry_pool = _retry_os_pool(spec, out)
+            out = launch_on_miner(attempt_spec, miner, os_pool=retry_pool)
+            if out.disposition != ACCEPTED and not out.registered:
+                log.warning(
+                    "launch: vm_id=%s same-miner retry %d on miner=%s refused at %s "
+                    "(before its own register) — the vm stays KBS-bound to this "
+                    "miner, never re-placed",
+                    spec.vm_id,
+                    dispatch_retries,
+                    miner.miner_id,
+                    out.emit.get("outcome", "?"),
+                )
         _own_retry_pool(out, dispatch_retries)
         if answered_already_launched(out):
             _await_the_attested_boot(
@@ -3289,16 +3379,18 @@ def _place_and_launch(
         if (
             dedicated_request is not None
             and not reusing_disks
-            and not out.registered
-            and dispatch_retries == 0
+            and not kbs_registered
         ):
             disk_dedicated.revert_unused(placement)
 
-        # A post-register dispatch failure that survived the same-miner
-        # retries is TERMINAL: the vm is KBS-bound to this miner and the
-        # miner won't accept, but we cannot re-place (the CAS fence). Stop
-        # rather than loop into a guaranteed kbs-admin-conflict.
-        if out.disposition == RETRIABLE and out.registered:
+        # A post-register failure that survived the same-miner retries is
+        # TERMINAL: the vm is KBS-bound to this miner and the miner won't
+        # accept, but we cannot re-place (the CAS fence). Stop rather than
+        # loop into a guaranteed kbs-admin-conflict. Keyed on the JOB's
+        # register, not the last attempt's: a retry refused at preflight
+        # (e.g. 503 insufficient-resources) lands here too.
+        if out.disposition == RETRIABLE and kbs_registered:
+            stage = out.emit.get("outcome", "dispatch")
             return LaunchResult(
                 ok=False,
                 outcome="dispatch-failed-after-register",
@@ -3310,9 +3402,13 @@ def _place_and_launch(
                     **out.emit,
                     "outcome": "dispatch-failed-after-register",
                     "error": (
-                        "miner rejected the launch after the KBS registered "
-                        "the vm to it; cannot re-place (anti-migration fence)"
+                        f"miner {miner.miner_id} refused the launch at {stage} "
+                        f"after the KBS registered the vm to it "
+                        f"({dispatch_retries} same-miner retr"
+                        f"{'y' if dispatch_retries == 1 else 'ies'}); "
+                        "cannot re-place (anti-migration fence)"
                     ),
+                    "failed_stage": stage,
                 },
                 attempts=audit,
                 registered=True,
@@ -3328,6 +3424,8 @@ def _place_and_launch(
             # POST timed out while the miner was still starting the domain"
             # (a guest that is now alive). Only the flag says whether the
             # KBS was touched; only a live probe says whether a guest runs.
+            # It is the JOB's flag: a terminal same-miner retry still
+            # follows a registered attempt, whatever its own flag says.
             return LaunchResult(
                 ok=False,
                 outcome=out.emit.get("outcome", "terminal"),
@@ -3337,7 +3435,7 @@ def _place_and_launch(
                 placement_id=str(placement.id),
                 emit=out.emit,
                 attempts=audit,
-                registered=out.registered,
+                registered=kbs_registered,
             )
 
         # A busy allowlist pin is vali's own queue, not a verdict on the

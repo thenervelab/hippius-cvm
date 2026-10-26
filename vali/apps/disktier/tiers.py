@@ -2,11 +2,14 @@
 
 `nvme` > `ssd` > `hdd`; `unfit` (probed, below every floor) and `unknown`
 (never probed) rank below all three and qualify for nothing. A requested
-tier is a MINIMUM: a disk qualifies for every tier at or below its own.
+tier is a MINIMUM: a disk qualifies for every tier at or below its own —
+except an OS disk under `VALI_OS_TIER_MATCH` `exact` ([`os_tier_fits`])
+and a dedicated disk under `VALI_DEDICATED_TIER_MATCH` `exact`.
 """
 
 from __future__ import annotations
 
+from django.conf import settings
 from django.db import models
 
 
@@ -46,6 +49,30 @@ def satisfies(actual: str, required: str) -> bool:
     if required not in SELLABLE_TIERS:
         raise ValueError(f"not a sellable tier: {required!r}")
     return rank(actual) > 0 and rank(actual) >= rank(required)
+
+
+#: `VALI_OS_TIER_MATCH` values ([`os_tier_match`]).
+OS_TIER_MATCH_EXACT = "exact"
+OS_TIER_MATCH_MINIMUM = "minimum"
+
+
+def os_tier_match() -> str:
+    """How an OS disk's sold tier matches a pool's: `minimum` (that tier or
+    above) or `exact` (that very tier) — `VALI_OS_TIER_MATCH`."""
+    return str(getattr(settings, "VALI_OS_TIER_MATCH", OS_TIER_MATCH_MINIMUM) or "")
+
+
+def os_tier_fits(own: str, sold: str) -> bool:
+    """Whether a pool holding OS disks at `own` may hold one sold at `sold`:
+    [`satisfies`], or, under `VALI_OS_TIER_MATCH` `exact`, `own == sold`
+    only (an hdd order never lands on an ssd or nvme pool). `sold` must be
+    a sellable tier. Every OS-disk comparison goes through this one; the
+    dedicated disks have their own (`dedicated.tier_match`)."""
+    if os_tier_match() == OS_TIER_MATCH_EXACT:
+        if sold not in SELLABLE_TIERS:
+            raise ValueError(f"not a sellable tier: {sold!r}")
+        return own == sold
+    return satisfies(own, sold)
 
 
 def capped(classified: str, declared: str | None) -> str:

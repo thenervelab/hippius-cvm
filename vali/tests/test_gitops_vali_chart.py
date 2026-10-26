@@ -781,24 +781,33 @@ def test_pool_routing_min_agent_version_is_one_shared_value() -> None:
     assert off["VALI_POOL_ROUTING_MIN_AGENT_VERSION"] == ""
 
 
+_DISK_TIER_SHIPPED = {
+    "VALI_SCHEDULER_DISK_TIER_GATE": "enforce",
+    "VALI_SELLABLE_OS_TIERS": "nvme,ssd,hdd",
+    "VALI_HDD_OS_MAX_FLAVOR": "large",
+    "VALI_DISK_TIER_FALLBACK_OWNERS": "",
+    "VALI_OS_TIER_MATCH": "exact",
+}
+
 _DISK_TIER_KEYS = {
     "VALI_SCHEDULER_DISK_TIER_GATE": "off",
     "VALI_SELLABLE_OS_TIERS": "nvme",
     "VALI_HDD_OS_MAX_FLAVOR": "large",
     "VALI_DISK_TIER_FALLBACK_OWNERS": "",
+    "VALI_OS_TIER_MATCH": "minimum",
 }
 
 
 @_needs_helm
-def test_the_os_disk_tier_keys_render_at_the_code_defaults() -> None:
+def test_the_os_disk_tier_keys_render_from_the_shared_configmap() -> None:
     """Every process that places a VM (web, launch tick, orchestration
     tick) reads the tier gate, the sold tiers and the runner fallback from
-    the shared ConfigMap, never a per-pod override — and as shipped they
-    are the settings.py defaults: the gate off, nvme only, nobody falls
-    back. Unset values render the same."""
+    the shared ConfigMap, never a per-pod override. As shipped: the gate
+    enforces, nvme, ssd and hdd are sold, nobody falls back.
+    Unset values render the settings.py defaults: off, nvme, nobody."""
     docs = _docs()
     data = _configmap_data(docs)
-    assert {k: data[k] for k in _DISK_TIER_KEYS} == _DISK_TIER_KEYS
+    assert {k: data[k] for k in _DISK_TIER_SHIPPED} == _DISK_TIER_SHIPPED
     for label, env in _env_by_workload(docs).items():
         assert not set(_DISK_TIER_KEYS) & set(env), label
     unset = _configmap_data(
@@ -807,32 +816,37 @@ def test_the_os_disk_tier_keys_render_at_the_code_defaults() -> None:
             "--set", "scheduler.sellableOsTiers=null",
             "--set", "scheduler.hddOsMaxFlavor=null",
             "--set", "scheduler.diskTierFallbackOwners=null",
+            "--set", "scheduler.osTierMatch=null",
         )
     )
     assert {k: unset[k] for k in _DISK_TIER_KEYS} == _DISK_TIER_KEYS
     on = _configmap_data(
         _docs(
             "--set", "scheduler.diskTierGate=enforce",
-            "--set", "scheduler.diskTierFallbackOwners={1334,77}",
+            "--set", "scheduler.diskTierFallbackOwners={1001,77}",
         )
     )
     assert on["VALI_SCHEDULER_DISK_TIER_GATE"] == "enforce"
-    assert on["VALI_DISK_TIER_FALLBACK_OWNERS"] == "1334,77"
+    assert on["VALI_DISK_TIER_FALLBACK_OWNERS"] == "1001,77"
+    minimum = _configmap_data(_docs("--set", "scheduler.osTierMatch=minimum"))
+    assert minimum["VALI_OS_TIER_MATCH"] == "minimum"
 
 
 def test_the_os_disk_tier_defaults_match_settings() -> None:
-    """The chart's stated values ARE the code defaults, so stating them
-    changes nothing a pod does."""
+    """settings.py keeps every tier switch off; the chart states the
+    rollout values (enforce, nvme+ssd+hdd, no fallback owner)."""
     src = SETTINGS.read_text()
     assert '_env_list("VALI_SELLABLE_OS_TIERS", ["nvme"])' in src
     assert 'os.environ.get("VALI_SCHEDULER_DISK_TIER_GATE", "off")' in src
     assert 'os.environ.get("VALI_HDD_OS_MAX_FLAVOR", "large")' in src
     assert '_env_list("VALI_DISK_TIER_FALLBACK_OWNERS", [])' in src
+    assert 'os.environ.get("VALI_OS_TIER_MATCH", "minimum")' in src
     scheduler = yaml.safe_load(VALUES.read_text())["scheduler"]
-    assert scheduler["diskTierGate"] == "off"
-    assert scheduler["sellableOsTiers"] == ["nvme"]
+    assert scheduler["diskTierGate"] == "enforce"
+    assert scheduler["sellableOsTiers"] == ["nvme", "ssd", "hdd"]
     assert scheduler["hddOsMaxFlavor"] == "large"
     assert scheduler["diskTierFallbackOwners"] == []
+    assert scheduler["osTierMatch"] == "exact"
 
 
 @_needs_helm
@@ -1274,7 +1288,7 @@ def test_dedicated_tiers_ship_hdd_only_with_one_pay_rate() -> None:
     shipped and when the key is emptied (today's offer, the settings.py
     default); the per-tier pay rates render only when set."""
     shipped = _configmap_data(_docs())
-    assert shipped["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd"
+    assert shipped["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd,ssd,nvme"
     assert "VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER" not in shipped
     emptied = _configmap_data(_docs("--set", "dedicatedDisks.sellableTiers="))
     assert emptied["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd"
@@ -1286,6 +1300,17 @@ def test_dedicated_tiers_ship_hdd_only_with_one_pay_rate() -> None:
     )
     assert set_["VALI_DEDICATED_SELLABLE_TIERS"] == "hdd,ssd,nvme"
     assert set_["VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER"] == "ssd:150,nvme:250"
+
+
+@_needs_helm
+def test_dedicated_tier_match_ships_exact() -> None:
+    """Contract §8: VALI_DEDICATED_TIER_MATCH always renders, "exact" as
+    shipped and when the key is emptied (the settings.py default)."""
+    assert _configmap_data(_docs())["VALI_DEDICATED_TIER_MATCH"] == "exact"
+    emptied = _configmap_data(_docs("--set", "dedicatedDisks.tierMatch="))
+    assert emptied["VALI_DEDICATED_TIER_MATCH"] == "exact"
+    minimum = _configmap_data(_docs("--set", "dedicatedDisks.tierMatch=minimum"))
+    assert minimum["VALI_DEDICATED_TIER_MATCH"] == "minimum"
 
 
 @_needs_helm
@@ -1639,3 +1664,29 @@ def test_agent_release_watch_on_renders_the_cronjob_and_its_egress() -> None:
     assert "VALI_AGENT_RELEASE_WATCH" not in cm["data"]
     # The CNP that selects every vali pod opens world:443 for it.
     assert len(_world_443_rules(docs)) == 1
+
+
+@_needs_helm
+def test_dedicated_integrity_ships_off_at_release_8() -> None:
+    """Contract §9: both integrity keys always render — "false" / "8" as
+    shipped and when emptied (the settings.py defaults) — and take a set
+    value."""
+    shipped = _configmap_data(_docs())
+    assert shipped["VALI_DEDICATED_INTEGRITY_ENABLED"] == "false"
+    assert shipped["VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE"] == "8"
+    emptied = _configmap_data(
+        _docs(
+            "--set", "dedicatedDisks.integrityEnabled=",
+            "--set", "dedicatedDisks.integrityMinGuestRelease=",
+        )
+    )
+    assert emptied["VALI_DEDICATED_INTEGRITY_ENABLED"] == "false"
+    assert emptied["VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE"] == "8"
+    set_ = _configmap_data(
+        _docs(
+            "--set-string", "dedicatedDisks.integrityEnabled=true",
+            "--set", "dedicatedDisks.integrityMinGuestRelease=9",
+        )
+    )
+    assert set_["VALI_DEDICATED_INTEGRITY_ENABLED"] == "true"
+    assert set_["VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE"] == "9"

@@ -92,6 +92,7 @@ class Command(BaseCommand):
             help=(
                 "Only this tenant may launch the image or see it in the catalog. "
                 "Required for a cdn-node bake, and must then be VALI_CDN_TENANT_ID. "
+                "Required for an ubuntu-runner bake (the CI runners' tenant). "
                 "Omitted: a re-bless keeps the image's restriction, a first bless "
                 "opens it to every tenant."
             ),
@@ -213,6 +214,17 @@ class Command(BaseCommand):
                 )
             )
             sys.exit(EXIT_BAKE_NOT_BLESSABLE)
+        # The CI-runner image likewise: an ubuntu-runner bake is blessed only
+        # as `ubuntu-runner`, and only it can be.
+        if (bake.profile == "ubuntu-runner") != (image_name == "ubuntu-runner"):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"bake {bake_id!r} (profile={bake.profile!r}) cannot be blessed as "
+                    f"{image_name!r}: the ubuntu-runner profile and the image name "
+                    "'ubuntu-runner' go together"
+                )
+            )
+            sys.exit(EXIT_BAKE_NOT_BLESSABLE)
         previous = GoldenImage.objects.filter(image_name=image_name).first()
         if restricted_tenant is None:
             restricted_tenant = previous.restricted_tenant if previous is not None else ""
@@ -226,6 +238,17 @@ class Command(BaseCommand):
                     f"bake {bake_id!r} is a cdn-node bake: bless it with "
                     f"--restricted-tenant set to VALI_CDN_TENANT_ID ({cdn_tenant_id()!r}), "
                     f"not {restricted_tenant!r}"
+                )
+            )
+            sys.exit(EXIT_BAKE_NOT_BLESSABLE)
+        # The CI-runner image is for the runners' tenant only: never open to
+        # every tenant (a first bless needs --restricted-tenant; --unrestrict
+        # is refused; a re-bless without the flag keeps the restriction).
+        if bake.profile == "ubuntu-runner" and not restricted_tenant:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"bake {bake_id!r} is an ubuntu-runner bake: bless it with "
+                    "--restricted-tenant set to the CI runners' tenant"
                 )
             )
             sys.exit(EXIT_BAKE_NOT_BLESSABLE)

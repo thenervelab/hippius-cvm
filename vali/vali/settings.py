@@ -684,6 +684,11 @@ VALI_LAUNCH_JOB_ORPHAN_S = _env_int("VALI_LAUNCH_JOB_ORPHAN_S", 10800)
 # Silence (no boot milestone, no in-guest frame) after which a launch that
 # died in `dispatching` with no host is concluded to have started no guest.
 VALI_LAUNCH_JOB_SILENT_GUEST_S = _env_int("VALI_LAUNCH_JOB_SILENT_GUEST_S", 86400)
+# Launch jobs the `vali_launch_tick` worker runs at once, each on its own
+# thread (`launch_jobs.launch_tick_concurrency`). The placement decision is
+# serialized by `scheduler.decision_lock`; everything else (Vault, preflight,
+# dispatch) overlaps. `1` = the serial loop, one job at a time.
+VALI_LAUNCH_TICK_CONCURRENCY = _env_int("VALI_LAUNCH_TICK_CONCURRENCY", 1)
 
 # §23 placement concentration cap (soft): a miner already hosting
 # `≥ this fraction` of ALL active placements is de-prioritised so tenant
@@ -2393,7 +2398,8 @@ VALI_SYNTHETIC_PER_MINER_RESOURCE_TIMEOUT_S = _env_int(
 # read-only and runs regardless).
 VALI_GOLDEN_REBAKE_ENABLED = _env_bool("VALI_GOLDEN_REBAKE_ENABLED", False)
 VALI_GOLDEN_REBAKE_IMAGES = _env_list(
-    "VALI_GOLDEN_REBAKE_IMAGES", ["ubuntu", "debian", "cs10", "fedora", "cdn-node"]
+    "VALI_GOLDEN_REBAKE_IMAGES",
+    ["ubuntu", "debian", "cs10", "fedora", "cdn-node", "ubuntu-runner"],
 )
 # Run the synthetic full e2e against each new, unblessed bake.
 VALI_GOLDEN_REBAKE_E2E = _env_bool("VALI_GOLDEN_REBAKE_E2E", False)
@@ -2717,6 +2723,15 @@ if VALI_SCHEDULER_DISK_TIER_GATE not in ("off", "record", "enforce"):
 # `os_tier.may_fall_back`). Our own runners only, never a customer. Empty =
 # nobody, placement exactly as without it.
 VALI_DISK_TIER_FALLBACK_OWNERS = _env_list("VALI_DISK_TIER_FALLBACK_OWNERS", [])
+# How an OS disk's sold tier matches a pool's tier (`tiers.os_tier_fits`):
+# `minimum` (default, today's placement) = that tier or above, so an hdd
+# order may land on an ssd or nvme pool; `exact` = only a pool at that very
+# tier, so a faster disk is never sold at a slower tier's price. The runner
+# fallback above is unchanged: it takes the first LOWER tier a candidate
+# holds (exactly, under `exact`).
+VALI_OS_TIER_MATCH = os.environ.get("VALI_OS_TIER_MATCH", "minimum").strip().lower()
+if VALI_OS_TIER_MATCH not in {"exact", "minimum"}:
+    raise RuntimeError("VALI_OS_TIER_MATCH must be exact or minimum")
 # The largest flavor sold on the hdd OS tier: its first boot wipes the whole
 # integrity overlay on a spindle (design §10.18, Q-D15).
 VALI_HDD_OS_MAX_FLAVOR = os.environ.get("VALI_HDD_OS_MAX_FLAVOR", "large").strip()
@@ -2745,6 +2760,13 @@ VALI_DEDICATED_SELLABLE_TIERS = [
 ]
 if not set(VALI_DEDICATED_SELLABLE_TIERS) <= {"nvme", "ssd", "hdd"}:
     raise RuntimeError("VALI_DEDICATED_SELLABLE_TIERS lists only nvme, ssd, hdd")
+# How a request's tier matches a disk's verified tier (contract §8): `exact`
+# (default) = only disks verified at that tier, so an ssd or nvme disk is
+# never sold at the hdd price; `minimum` = that tier or above (the lowest
+# qualifying tier placed first).
+VALI_DEDICATED_TIER_MATCH = os.environ.get("VALI_DEDICATED_TIER_MATCH", "exact").strip().lower()
+if VALI_DEDICATED_TIER_MATCH not in {"exact", "minimum"}:
+    raise RuntimeError("VALI_DEDICATED_TIER_MATCH must be exact or minimum")
 # The oldest blessed guest release whose guest opens dedicated disks. An image
 # blessed at a lower release (or none) ⇒ 409 `dedicated-needs-release`. Empty
 # = every launch is refused so (nothing launches before the guest exists).
@@ -2754,6 +2776,22 @@ VALI_DEDICATED_MIN_GUEST_RELEASE: int | None = (
 )
 if VALI_DEDICATED_MIN_GUEST_RELEASE is not None and VALI_DEDICATED_MIN_GUEST_RELEASE < 1:
     raise RuntimeError("VALI_DEDICATED_MIN_GUEST_RELEASE must be a release number >= 1")
+# Dedicated disks with integrity (contract §9): `dedicated_disks.integrity:
+# true`, ssd / nvme only. Off ⇒ any `integrity: true` is refused 409
+# `dedicated-integrity-not-offered` (feasibility: not placeable, same
+# reason). Flip only once the miners holding dedicated disks run an agent
+# whose anchor parser takes `x<N>:<GiB>:i`, and vali's receipt verifier
+# carries the guest's `initializing` slot state (else the wipe's receipts
+# are refused whole).
+VALI_DEDICATED_INTEGRITY_ENABLED = _env_bool("VALI_DEDICATED_INTEGRITY_ENABLED", False)
+# The oldest blessed guest release whose initramfs opens an integrity slot
+# (release 8); an integrity launch needs the higher of this and
+# VALI_DEDICATED_MIN_GUEST_RELEASE, else 409 `dedicated-needs-release`.
+VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE = _env_int(
+    "VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE", 8
+)
+if VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE < 1:
+    raise RuntimeError("VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE must be a release number >= 1")
 # The oldest agent release (`vYYYY.MM.DD[.N]`) that takes `extra_disks` on its
 # launch order. Empty = no node qualifies; `*` = any agent (test hosts only).
 VALI_DEDICATED_MIN_AGENT_VERSION = os.environ.get("VALI_DEDICATED_MIN_AGENT_VERSION", "").strip()

@@ -24,6 +24,7 @@ concurrently.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -373,10 +374,18 @@ def test_a_dest_that_fails_every_attempt_becomes_incapable(
     assert cvm_capability.capability_of(DST_NODE) == cvm_capability.INCAPABLE
 
 
-def _fail_one_attempt_with(fx: FakeEffects, failure_class: str) -> MigrationJob:
+def _fail_one_attempt_with(
+    fx: FakeEffects,
+    failure_class: str,
+    before_retry: Callable[[], None] | None = None,
+    prepare: Callable[[], None] | None = None,
+) -> MigrationJob:
     """Drive a migration to `DestActivating`, have the dest report attempt 0
-    `failed` with `failure_class`, and let the retry go out."""
+    `failed` with `failure_class`, and let the retry go out (`prepare` run
+    once the dest's capacity row exists, `before_retry` between the two)."""
     _mirror(DST_NODE)
+    if prepare is not None:
+        prepare()
     vm = make_vm(generation=5, host="node-src")
     job = service.start_migration(
         vm=vm, dest_node_id="node-dst", decided_by=make_service_client()
@@ -385,6 +394,8 @@ def _fail_one_attempt_with(fx: FakeEffects, failure_class: str) -> MigrationJob:
     fx.dest_activation_class = failure_class
     _drive_until(job, MigrationState.DEST_ACTIVATING.value)
     service.tick_once()  # attempt 0 — dispatched, dest says failed
+    if before_retry is not None:
+        before_retry()
     _age_phase(job, 130)
     service.tick_once()  # attempt 1 — the retry
     job.refresh_from_db()
@@ -803,13 +814,147 @@ def test_a_dest_that_refused_the_named_pool_is_retried_on_none(
     fx: FakeEffects, failure_class: str
 ) -> None:
     """#1639: the arrival's own admission refused the pool before the dest
-    recorded anything: the retry names none (its launch pool). Not a SEV
-    start failure either."""
+    recorded anything: the retry names none (its launch pool) — `default`
+    holds the VM's tier here. Not a SEV start failure either."""
     fx.arrival_pool = "nvme0"
     job = _fail_one_attempt_with(fx, failure_class)
     assert fx.activate_os_pools[:2] == ["nvme0", None]
     assert (job.dest_os_pool, job.dest_os_pool_pinned) == ("", True)
     assert MinerCapacity.objects.get(miner_node_id=DST_NODE).cvm_fail_streak == 0
+
+
+@pytest.mark.parametrize("failure_class", ["cvm-pool-unavailable:nvme0", "cvm-insufficient-disk"])
+def test_a_refused_pool_is_never_traded_for_a_default_of_another_tier(
+    fx: FakeEffects, failure_class: str
+) -> None:
+    """`default` does not hold the VM's tier: the retry names a pool of the
+    dest that does (chosen again, pinned), never none."""
+    fx.arrival_pool = "nvme0"
+    fx.arrival_default_refused = "the default pool (hdd) does not hold an OS disk at nvme"
+    _fail_one_attempt_with(fx, failure_class)
+    assert fx.activate_os_pools[:2] == ["nvme0", "nvme0"]
+    assert None not in fx.activate_os_pools
+
+
+def test_the_refused_pin_is_cleared_before_the_next_attempt_is_published(
+    fx: FakeEffects, monkeypatch
+) -> None:
+    """An overlapping tick re-pins as soon as the failure makes the next
+    attempt visible: the refusal's clear happened before it and never wipes
+    that re-pin."""
+    real = service._record_dest_activation_failure
+
+    def publish_then_repin(job, failure_class):
+        real(job, failure_class)
+        MigrationJob.objects.filter(pk=job.pk, dest_os_pool="").update(dest_os_pool="other0")
+
+    monkeypatch.setattr(service, "_record_dest_activation_failure", publish_then_repin)
+    fx.arrival_pool = "nvme0"
+    _mirror(DST_NODE)
+    vm = make_vm(generation=5, host="node-src")
+    job = service.start_migration(vm=vm, dest_node_id="node-dst", decided_by=make_service_client())
+    fx.dest_activation_status = "failed"
+    fx.dest_activation_class = "cvm-pool-unavailable:nvme0"
+    _drive_until(job, MigrationState.DEST_ACTIVATING.value)
+    service.tick_once()  # attempt 0: dispatched on nvme0, refused
+    job.refresh_from_db()
+    assert fx.activate_os_pools == ["nvme0"]
+    assert job.dest_os_pool == "other0", "the overlapping re-pin survives"
+
+
+def test_a_stale_handler_never_clears_the_next_attempts_same_pool_pin(fx: FakeEffects) -> None:
+    """ABA: attempt 0's refusal of nvme0 is recorded (pin cleared), attempt
+    1 legitimately re-pins nvme0, then a stale attempt-0 handler (it read
+    the job before) runs its refusal again: the clear is owned by attempt
+    0's unrecorded failure key, so the new pin survives."""
+    from apps.orchestration.tests.factories import make_migration_job
+
+    job = make_migration_job(make_vm("vm-aba"))
+    MigrationJob.objects.filter(pk=job.pk).update(dest_os_pool="nvme0", dest_os_pool_pinned=True)
+    stale = MigrationJob.objects.get(pk=job.pk)
+    job.refresh_from_db()
+    service._record_failed_attempt(job, 0, "cvm-pool-unavailable:nvme0")
+    job.refresh_from_db()
+    assert job.dest_os_pool == ""
+    assert service._dest_activate_attempt(job, 3) == 1
+    # Attempt 1 re-pins the same pool.
+    MigrationJob.objects.filter(pk=job.pk, dest_os_pool="").update(dest_os_pool="nvme0")
+    # The stale attempt-0 handler.
+    assert stale.dest_os_pool == "nvme0"
+    service._record_failed_attempt(stale, 0, "cvm-pool-unavailable:nvme0")
+    job.refresh_from_db()
+    assert job.dest_os_pool == "nvme0"
+    assert service._dest_activate_attempt(job, 3) == 1, "recorded once"
+
+
+def test_with_no_pool_at_the_tier_left_the_retry_is_not_sent(fx: FakeEffects) -> None:
+    """`default` does not hold the tier and no other pool can: no order goes
+    out (retried until the phase deadline fails the job)."""
+    fx.arrival_pool = "nvme0"
+    fx.arrival_default_refused = "the default pool (hdd) does not hold an OS disk at nvme"
+
+    def pool_gone() -> None:
+        fx.arrival_pool = None
+
+    job = _fail_one_attempt_with(fx, "cvm-pool-unavailable:nvme0", before_retry=pool_gone)
+    assert fx.activate_os_pools == ["nvme0"]
+    assert job.state == MigrationState.DEST_ACTIVATING.value
+    service.tick_once()
+    assert fx.activate_os_pools == ["nvme0"]
+
+
+_GOLDEN = f"ro dm-verity.root={'e' * 64} hippius.disk_gb=40"
+
+
+@pytest.mark.parametrize(
+    ("match", "sold", "default", "pool", "retry"),
+    [
+        # Exact: an hdd customer VM never falls onto an nvme `default`.
+        ("exact", "hdd", "nvme", "hdd", "hdd0"),
+        # Minimum: an nvme `default` holds hdd, as ever.
+        ("minimum", "hdd", "nvme", "hdd", None),
+        # Either mode: an nvme VM never falls onto an ssd `default`.
+        ("minimum", "nvme", "ssd", "nvme", "nvme0"),
+        ("exact", "nvme", "ssd", "nvme", "nvme0"),
+        ("exact", "ssd", "ssd", "ssd", None),
+    ],
+)
+def test_a_pool_refusal_retry_keeps_the_tier_with_the_real_routing(
+    fx: FakeEffects, monkeypatch, settings, match, sold, default, pool, retry
+) -> None:
+    """The real choosers (`effects._arrival_os_pool`,
+    `_arrival_default_refusal`) on the dest's pools: `default` at
+    `default`, `<pool>0` at `pool`. The first order names `<pool>0`, the
+    dest refuses it, the retry names none only when `default` holds the
+    tier."""
+    from apps.disktier.tests.test_os_tier import _pool
+    from apps.orchestration import effects
+
+    settings.VALI_SCHEDULER_DISK_TIER_GATE = "enforce"
+    settings.VALI_OS_TIER_MATCH = match
+    settings.VALI_POOL_ROUTING_MIN_AGENT_VERSION = "v2026.10.17"
+    named = f"{pool}0"
+    monkeypatch.setattr(
+        effects, "arrival_os_pool", lambda vm, dest: effects._arrival_os_pool(dest, _GOLDEN, sold)
+    )
+    monkeypatch.setattr(
+        effects,
+        "arrival_default_refusal",
+        lambda vm, dest: effects._arrival_default_refusal(dest, _GOLDEN, sold),
+    )
+
+    # The intake gate (`_reject_disk_tier_dest`) is tested on its own.
+    monkeypatch.setattr(service, "_reject_disk_tier_dest", lambda vm, dest: None)
+
+    def pools() -> None:
+        MinerCapacity.objects.filter(miner_node_id=DST_NODE).update(
+            agent_version="v2026.10.17", agent_version_reported_at=timezone.now()
+        )
+        _pool("default", node_id=DST_NODE, declared_class=default)
+        _pool(named, node_id=DST_NODE, declared_class=pool)
+
+    _fail_one_attempt_with(fx, f"cvm-pool-unavailable:{named}", prepare=pools)
+    assert fx.activate_os_pools[:2] == [named, retry]
 
 
 @pytest.mark.parametrize(

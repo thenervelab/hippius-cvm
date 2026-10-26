@@ -593,7 +593,47 @@ def test_the_placement_assigns_the_disks_of_the_chosen_node(monkeypatch) -> None
 
 
 @override_settings(**{**ON, "VALI_DEDICATED_SELLABLE_TIERS": ["hdd", "ssd", "nvme"]})
-def test_an_ssd_launch_takes_qualifying_disks_and_is_sold_at_ssd(monkeypatch) -> None:
+def test_exact_an_ssd_launch_takes_only_ssd_disks(monkeypatch) -> None:
+    from .test_launch_service import _spec as service_spec
+
+    m1, m2 = _fleet(monkeypatch, 1, 2)
+    # Node 1: one ssd and one nvme — two disks, but only one exact match.
+    make_disk("wwn-0x11", node=m1.chain_node_id, tier="ssd")
+    make_disk("wwn-0x12", node=m1.chain_node_id, tier="nvme")
+    make_disk("wwn-0x21", node=m2.chain_node_id, tier="nvme", size_gib=16384)
+    make_disk("wwn-0x22", node=m2.chain_node_id, tier="ssd", size_gib=30000)
+    make_disk("wwn-0x23", node=m2.chain_node_id, tier="ssd", size_gib=16384)
+    monkeypatch.setattr(launch, "launch_on_miner", lambda spec, miner, **_k: _outcome("accepted"))
+    ssd = {**GOOD, "tier": "ssd"}
+    result = launch.launch_vm(service_spec(dedicated_disks=ssd, pinned_ack=True), _actor())
+    assert result.ok and result.miner_node_id == m2.chain_node_id
+    rows = PlacementDisk.objects.filter(kind="dedicated").order_by("slot")
+    assert [(r.slot, r.dedicated_disk.disk_id, r.required_tier) for r in rows] == [
+        ("x0", "wwn-0x23", "ssd"),
+        ("x1", "wwn-0x22", "ssd"),
+    ]
+    assert DedicatedDisk.objects.get(disk_id="wwn-0x21").state == "free"
+
+
+@override_settings(**ON)
+def test_exact_an_hdd_launch_with_only_nvme_free_is_no_dedicated_capacity(monkeypatch) -> None:
+    (m1,) = _fleet(monkeypatch, 1)
+    make_disk("wwn-0x11", node=m1.chain_node_id, tier="nvme")
+    make_disk("wwn-0x12", node=m1.chain_node_id, tier="nvme")
+    monkeypatch.setattr(launch, "launch_on_miner", lambda *a, **k: pytest.fail("dispatched"))
+    result = launch.launch_vm(_plain_spec(), _actor())
+    assert (result.ok, result.outcome) == (False, "no-dedicated-capacity")
+    assert not Placement.objects.exists()
+
+
+@override_settings(
+    **{
+        **ON,
+        "VALI_DEDICATED_SELLABLE_TIERS": ["hdd", "ssd", "nvme"],
+        "VALI_DEDICATED_TIER_MATCH": "minimum",
+    }
+)
+def test_minimum_an_ssd_launch_takes_qualifying_disks_and_is_sold_at_ssd(monkeypatch) -> None:
     from .test_launch_service import _spec as service_spec
 
     m1, m2 = _fleet(monkeypatch, 1, 2)

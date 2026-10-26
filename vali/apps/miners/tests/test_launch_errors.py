@@ -73,9 +73,9 @@ def test_an_older_agent_without_a_reason_reports_its_class() -> None:
 
 
 @pytest.mark.parametrize("status", [502, 504])
-def test_a_bodiless_edge_answer_is_miner_unreachable(status: int) -> None:
+def test_a_bodiless_edge_answer_at_launch_is_a_launch_timeout(status: int) -> None:
     entry = launch_errors.failure_entry(stage="launch", http_status=status, classifier="")
-    assert entry["code"] == launch_errors.CODE_UNREACHABLE
+    assert entry["code"] == launch_errors.CODE_LAUNCH_TIMEOUT == "launch-timeout"
     assert entry["class"] is None
 
 
@@ -188,7 +188,7 @@ def test_a_bodiless_edge_answer_to_a_preflight_is_a_preflight_timeout(status: in
 
 @pytest.mark.parametrize("status", [502, 504])
 def test_a_bodiless_edge_answer_to_a_launch_stays_miner_unreachable(status: int) -> None:
-    assert _edge_timeout(launch_errors.STAGE_LAUNCH, status)["code"] == "miner-unreachable"
+    assert _edge_timeout(launch_errors.STAGE_LAUNCH, status)["code"] == "launch-timeout"
 
 
 def test_a_preflight_answer_with_a_class_is_never_a_timeout() -> None:
@@ -245,8 +245,23 @@ def test_another_error_breaks_a_run_of_preflight_timeouts() -> None:
     launch_errors.record_failure(miner, _edge_timeout(launch_errors.STAGE_LAUNCH))
     launch_errors.record_failure(miner, _edge_timeout())
     view = launch_errors.readout(MinerLaunchErrors.objects.get(miner=miner))
-    assert _codes(view) == ["miner-unreachable"]
+    assert _codes(view) == ["launch-timeout"]
     assert view["launch_fail_streak"] == 1
+
+
+@pytest.mark.django_db
+def test_a_stored_pre_rename_miner_unreachable_reads_as_launch_timeout() -> None:
+    """Rows written before the rename keep `miner-unreachable` in the DB;
+    the operator view shows the current code, the row is not rewritten."""
+    miner = make_dispatchable_identity(1)
+    launch_errors.record_failure(miner, _edge_timeout(launch_errors.STAGE_LAUNCH))
+    row = MinerLaunchErrors.objects.get(miner=miner)
+    row.errors = [{**row.errors[0], "code": "miner-unreachable"}]
+    row.save(update_fields=["errors"])
+    view = launch_errors.readout(MinerLaunchErrors.objects.get(miner=miner))
+    assert _codes(view) == ["launch-timeout"]
+    assert view["last_launch_error"]["code"] == "launch-timeout"
+    assert MinerLaunchErrors.objects.get(miner=miner).errors[0]["code"] == "miner-unreachable"
 
 
 @pytest.mark.django_db

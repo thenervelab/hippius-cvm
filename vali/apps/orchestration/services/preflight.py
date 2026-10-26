@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import time
 from dataclasses import dataclass
@@ -356,6 +357,9 @@ def _parse_preflight_response(body: str) -> PreflightResult:
 
 
 def fresh_order_id(prefix: str = "ord-preflight") -> str:
-    """`ord-preflight-<unix>-<pid>` is unique enough for the smoke
-    paths; production callers supply their own."""
-    return f"{prefix}-{int(time.time())}-{os.getpid()}"
+    """`ord-preflight-<unix>-<random hex>`, unique per call. The miner
+    de-duplicates orders by id and answers a repeat with the FIRST answer,
+    so two preflights must never share one: with concurrent launch jobs
+    (`VALI_LAUNCH_TICK_CONCURRENCY`), `<unix>-<pid>` repeated within a
+    second and handed one VM's preflight (and launch digest) to another."""
+    return f"{prefix}-{int(time.time())}-{secrets.token_hex(8)}"

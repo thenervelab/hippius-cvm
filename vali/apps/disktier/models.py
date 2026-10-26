@@ -398,11 +398,19 @@ class PlacementDisk(models.Model):
     size_gb = models.PositiveIntegerField()
     required_tier = models.CharField(max_length=8, choices=DiskTier.choices)
     #: A dedicated slot's latest verdict from the guest's signed receipt
-    #: (`disk_io`): `ok`, `missing` or `mismatch`; blank until one arrives.
+    #: (`disk_io`): `ok`, `missing`, `mismatch` or `initializing` (an
+    #: integrity slot's first-boot wipe, contract §9); blank until one arrives.
     #: Forgeable by root in the VM: shown as the slot's `guest_state` only, never
     #: its `state` (host evidence decides that, `apps.disktier.dedicated`).
-    observed_state = models.CharField(max_length=10, blank=True, default="", db_default="")
+    observed_state = models.CharField(max_length=12, blank=True, default="", db_default="")
     observed_at = models.DateTimeField(null=True, blank=True)
+    #: The wipe's progress (0-100) with an `initializing` verdict, `None`
+    #: when the receipt carried none or with any other verdict (§9).
+    observed_percent = models.PositiveSmallIntegerField(null=True, blank=True)
+    #: The guest opens this dedicated slot with integrity (`x<N>:<GiB>:i` on
+    #: its measured cmdline, contract §9). Fixed by the slot's first
+    #: assignment: every later placement of the VM copies it.
+    integrity = models.BooleanField(default=False, db_default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -426,6 +434,15 @@ class PlacementDisk(models.Model):
             models.CheckConstraint(
                 condition=Q(required_tier__in=["nvme", "ssd", "hdd"]),
                 name="disktier_placementdisk_required_tier_sellable",
+            ),
+            models.CheckConstraint(
+                condition=Q(observed_percent__isnull=True) | Q(observed_percent__lte=100),
+                name="disktier_placementdisk_observed_percent_range",
+            ),
+            # Only a dedicated slot is opened with integrity.
+            models.CheckConstraint(
+                condition=Q(integrity=False) | Q(kind="dedicated"),
+                name="disktier_placementdisk_integrity_dedicated_only",
             ),
         ]
 

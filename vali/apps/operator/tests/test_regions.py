@@ -348,6 +348,47 @@ def test_os_disk_tiers_count_the_hosts_with_an_os_pool_at_each_tier(
     assert tiers["DE"]["hdd"] == {"placeable": True, "hosts": 1}
 
 
+def test_exact_a_tier_is_placeable_only_where_a_pool_holds_it_exactly(
+    operator_client: APIClient, settings
+) -> None:
+    """`VALI_OS_TIER_MATCH` exact: an nvme or ssd pool no longer counts for
+    hdd (nor nvme for ssd), so hdd is placeable only in a region with an hdd
+    pool; a miner with no pool rows stays the pre-v7 nvme."""
+    for seed, region, declared in ((1, "FR", "nvme"), (2, "FR", "ssd"), (3, "DE", "hdd")):
+        _located(seed, region)
+        _capacity(seed)
+        _default_pool(seed, declared)
+    _located(4, "PL")
+    _capacity(4)
+    settings.VALI_SCHEDULER_DISK_TIER_GATE = "enforce"
+    settings.VALI_SELLABLE_OS_TIERS = ["nvme", "ssd", "hdd"]
+    settings.VALI_OS_TIER_MATCH = "exact"
+    tiers = {r["region"]: r["os_disk_tiers"] for r in operator_client.get(URL).json()["regions"]}
+    assert tiers["FR"] == {
+        "nvme": {"placeable": True, "hosts": 1},
+        "ssd": {"placeable": True, "hosts": 1},
+        "hdd": {"placeable": False, "hosts": 0},
+    }
+    assert tiers["DE"] == {
+        "nvme": {"placeable": False, "hosts": 0},
+        "ssd": {"placeable": False, "hosts": 0},
+        "hdd": {"placeable": True, "hosts": 1},
+    }
+    assert tiers["PL"] == {
+        "nvme": {"placeable": True, "hosts": 1},
+        "ssd": {"placeable": False, "hosts": 0},
+        "hdd": {"placeable": False, "hosts": 0},
+    }
+    # Minimum: hdd placeable everywhere, as before.
+    settings.VALI_OS_TIER_MATCH = "minimum"
+    tiers = {r["region"]: r["os_disk_tiers"] for r in operator_client.get(URL).json()["regions"]}
+    assert {region: t["hdd"]["placeable"] for region, t in tiers.items()} == {
+        "FR": True,
+        "DE": True,
+        "PL": True,
+    }
+
+
 def test_enforced_a_tier_no_host_holds_is_not_placeable(
     operator_client: APIClient, settings
 ) -> None:

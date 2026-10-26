@@ -55,7 +55,7 @@ sha256sum "${TMP}/openresty.tar.gz" | awk '{print $1}' > "${TMP}/openresty.tar.g
 CDN_OK=(--cdn-agent-bin "${TMP}/agent" --cdn-openresty-tarball "${TMP}/openresty.tar.gz"
         --cdn-config-dir "${CFG}" --cdn-backend-url https://api.example.invalid)
 
-expect_die "--profile must be standard or cdn-node" --profile bogus
+expect_die "--profile must be standard, cdn-node or ubuntu-runner" --profile bogus
 expect_die "--cdn-* flags need --profile cdn-node" --cdn-backend-url https://api.example.invalid
 expect_die "needs --disk-mode golden_verity_overlay" --profile cdn-node "${CDN_OK[@]}"
 expect_die "needs an executable --cdn-agent-bin" --profile cdn-node --disk-mode golden_verity_overlay \

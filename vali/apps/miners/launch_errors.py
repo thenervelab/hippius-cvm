@@ -14,7 +14,10 @@ What is recorded, and from where:
   relays (`libvirt-driver/define`, `tenant-preflight/ovmf-missing`, …);
 - an Edge 502/504 with no body: the Edge could not reach the miner, or gave
   up waiting on it — code `preflight-timeout` for a `tenant-preflight`
-  order, `miner-unreachable` for a `launch` order.
+  order, `launch-timeout` for a `launch` order. Both are the Edge's view of
+  one slow or lost order, not the node's reachability (that is the
+  scheduler's `unreachable` / `heartbeat-stale`). Rows written before the
+  rename hold `miner-unreachable`; `readout` shows them as `launch-timeout`.
 
 A `preflight-timeout` is usually the Edge's 30 s forward giving up on a
 preflight that is still staging a cold artefact set — the miner did nothing
@@ -65,7 +68,9 @@ STAGE_LAUNCH = "launch"
 
 #: vali's own codes, for answers that carry no miner code.
 CODE_INVALID = "invalid"
-CODE_UNREACHABLE = "miner-unreachable"
+CODE_LAUNCH_TIMEOUT = "launch-timeout"
+#: The pre-rename code for `CODE_LAUNCH_TIMEOUT`, still in stored rows.
+CODE_LEGACY_UNREACHABLE = "miner-unreachable"
 CODE_PREFLIGHT_TIMEOUT = "preflight-timeout"
 CODE_UNCLASSIFIED = "unclassified"
 
@@ -104,12 +109,12 @@ def failure_entry(
 
     `code` is the finest thing known: the miner's reason code, else its
     class, else, for a bodiless Edge 502/504, `preflight-timeout` at the
-    preflight stage and `miner-unreachable` at the launch stage, else
+    preflight stage and `launch-timeout` at the launch stage, else
     `unclassified`. `class` is the body class as vali branched on it."""
     cls = sanitize_code(classifier)
     code = sanitize_code(reason) or cls
     if not code and http_status in _EDGE_STATUSES:
-        code = CODE_PREFLIGHT_TIMEOUT if stage == STAGE_PREFLIGHT else CODE_UNREACHABLE
+        code = CODE_PREFLIGHT_TIMEOUT if stage == STAGE_PREFLIGHT else CODE_LAUNCH_TIMEOUT
     elif not code:
         code = CODE_UNCLASSIFIED
     oid = order_id if len(order_id) <= MAX_ORDER_ID_LEN and _ORDER_ID_RE.fullmatch(order_id) else ""
@@ -206,9 +211,17 @@ def _visible(errors: list[Any], last_ok_at: datetime | None) -> tuple[list[Any],
     return visible, since_ok
 
 
+def _current_code(entry: Any) -> Any:
+    """`entry` with a pre-rename `miner-unreachable` read as `launch-timeout`."""
+    if isinstance(entry, dict) and entry.get("code") == CODE_LEGACY_UNREACHABLE:
+        return {**entry, "code": CODE_LAUNCH_TIMEOUT}
+    return entry
+
+
 def readout(row: Any) -> dict[str, Any]:
     """The operator-API view of a `MinerLaunchErrors` row (or `None`)."""
-    errors = list(row.errors) if row is not None and isinstance(row.errors, list) else []
+    raw = list(row.errors) if row is not None and isinstance(row.errors, list) else []
+    errors = [_current_code(e) for e in raw]
     last_ok = getattr(row, "last_ok_at", None) if row is not None else None
     visible, timeouts = _visible(errors, last_ok)
     visible = visible[:MAX_RECENT]

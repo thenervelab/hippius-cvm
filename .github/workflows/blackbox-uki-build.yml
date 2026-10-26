@@ -200,9 +200,10 @@ jobs:
         # open :"); we keep the detached --output-signature/-certificate
         # so vali's cosign_verify.py (verify-blob --signature/--certificate)
         # stays compatible.
-        # Only on real pushes/tags (PR runs skip, matching the image
-        # workflows — fork PRs cannot mint the OIDC token).
-        if: steps.guard.outputs.pins_resolved == 'true' && github.event_name != 'pull_request'
+        # Only for main / `v*` tag builds, matching the image workflows'
+        # PUBLISH gate: a workflow_dispatch from any other branch must not
+        # mint a signature for unreviewed code (hippius-audits#12).
+        if: steps.guard.outputs.pins_resolved == 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           COSIGN_YES: "true"
         run: |

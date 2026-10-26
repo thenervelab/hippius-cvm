@@ -207,14 +207,17 @@ class LaunchIntentSerializer(serializers.Serializer):
         allow_null=True,
         help_text=(
             "Whole physical disks passed to the VM: `{\"tier\": \"hdd\" | \"ssd\" | "
-            "\"nvme\" (a minimum), \"count\": 1..8, \"min_size_gb\": >= 1000}` (GiB; every "
-            "disk at least that). Null or absent ⇒ none. Not offered (feature off, an "
+            "\"nvme\" (a minimum), \"count\": 1..8, \"min_size_gb\": >= 1000, "
+            "\"integrity\": false}` (GiB; every disk at least that; `integrity` optional, "
+            "ssd / nvme only: every disk opened with integrity, wiped at first boot). "
+            "Null or absent ⇒ none. Not offered (feature off, an "
             "owner off the allowlist, or a tier not on sale) ⇒ 409 "
             "`dedicated-disks-not-offered`; malformed ⇒ 400 `dedicated-invalid` / "
             "`dedicated-count-invalid` / `dedicated-size-invalid`; with "
             "`require_failover_peer` ⇒ 409 `dedicated-no-failover`; on an image whose "
-            "guest cannot open them ⇒ 409 `dedicated-needs-release`. The VM is then "
-            "PINNED to its host: no migration, no failover, no backup. A launch no "
+            "guest cannot open them ⇒ 409 `dedicated-needs-release`; `integrity: true` "
+            "not offered (off, or tier hdd) ⇒ 409 `dedicated-integrity-not-offered`. "
+            "The VM is then PINNED to its host: no migration, no failover, no backup. A launch no "
             "node can place fails with `no-dedicated-capacity` or `no-host-fits-disks`."
         ),
     )

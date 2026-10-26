@@ -22,6 +22,18 @@ name: tenant-bake-e2e
 # runner has neither of, so the initramfs is checked for the cdn-node
 # pieces but not booted.
 #
+# The `ubuntu-runner` leg bakes the CI-runner image (golden, `--profile
+# ubuntu-runner`) and smoke-boots its root under systemd-nspawn: systemd
+# comes up, the pinned actions-runner tarball sits at
+# /opt/actions-runner/ with its sha256, /etc/docker/daemon.json turns the
+# containerd snapshotter off, docker/containerd/buildx/compose answer
+# --version, the
+# data-path unit binds /var/lib/docker and /var/lib/containerd onto the
+# stand-in for /var/lib/hippius-data, and both daemons run there, Docker
+# on overlay2. A daemon the nspawn sandbox
+# refuses (cgroup/iptables privileges, matched in its journal) is a
+# reported skip; any other daemon failure fails the leg.
+#
 # Self-maintaining: each leg downloads the (moving) cloud image, computes
 # its sha256 at runtime, and feeds that to the bake's mandatory
 # `--base-image-sha256` gate. The point is to exercise the bake
@@ -92,6 +104,11 @@ jobs:
             url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
             family: debian
             profile: cdn-node
+          - id: ubuntu
+            label: ubuntu-runner
+            url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+            family: debian
+            profile: ubuntu-runner
     name: bake ${{ matrix.label || matrix.id }}
     steps:
       - name: Skip if not in requested subset
@@ -154,7 +171,7 @@ jobs:
           echo "base image sha256=$sha ($(du -h "$dest" | cut -f1))"
 
       - name: Bake (random throwaway KEK, baker:latest)
-        if: steps.gate.outputs.run == 'true' && matrix.profile != 'cdn-node'
+        if: steps.gate.outputs.run == 'true' && !matrix.profile
         run: |
           set -euo pipefail
           docker pull "$IMG"
@@ -187,7 +204,7 @@ jobs:
           cat /mnt/e2e/out/bake.json
 
       - name: Assert artifacts + LUKS2/integrity header
-        if: steps.gate.outputs.run == 'true' && matrix.profile != 'cdn-node'
+        if: steps.gate.outputs.run == 'true' && !matrix.profile
         run: |
           set -uo pipefail   # NOT -e: the asserts handle their own failures
           OUT="/mnt/e2e/out"
@@ -413,3 +430,173 @@ jobs:
           dump
           sudo machinectl poweroff "$M" || true
           echo "E2E CDN-NODE SMOKE OK"
+
+      - name: Bake ubuntu-runner (golden, baker:latest)
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'ubuntu-runner'
+        run: |
+          set -euo pipefail
+          docker pull "$IMG"
+          docker run --rm --privileged \
+            -v /dev:/dev \
+            -v /mnt/e2e/work:/work \
+            -v /mnt/e2e/out:/out \
+            -v /mnt/e2e/tmp:/tmp \
+            --entrypoint /usr/local/bin/tenant-image-bake.sh \
+            "$IMG" \
+            --base-image-url "file:///work/base.img" \
+            --base-image-sha256 "${{ steps.img.outputs.sha256 }}" \
+            --hippius-release-bin /usr/sbin/hippius-guest-release \
+            --hippius-vsock-bin /usr/sbin/hippius-vsock-ticket \
+            --distro "${{ matrix.id }}" \
+            --kbs-url "vsock://2:19266" \
+            --output-dir /out \
+            --disk-mode golden_verity_overlay \
+            --profile ubuntu-runner
+
+      - name: Assert ubuntu-runner artifacts
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'ubuntu-runner'
+        run: |
+          set -uo pipefail   # NOT -e: the asserts handle their own failures
+          OUT="/mnt/e2e/out"
+          fail() { echo "ASSERT FAIL: $1" >&2; exit 1; }
+          for ext in rootfs.img rootfs.verity vmlinuz initrd.img measurement.json; do
+            f="$(find "$OUT" -maxdepth 1 -name "golden-*.${ext}" | head -1)"
+            [ -s "$f" ] || fail "missing/empty golden artifact: *.${ext}"
+          done
+          m="$(find "$OUT" -maxdepth 1 -name 'golden-*.measurement.json' | head -1)"
+          jq -e '.disk_mode == "golden_verity_overlay"' "$m" >/dev/null || fail "measurement disk_mode != golden_verity_overlay"
+          img="$(find "$OUT" -maxdepth 1 -name 'golden-*.rootfs.img' | head -1)"
+          echo "ubuntu-runner artifacts OK (rootfs.img $(du -h "$img" | cut -f1))"
+
+      - name: Boot smoke (systemd-nspawn, docker + containerd up on the data path)
+        if: steps.gate.outputs.run == 'true' && matrix.profile == 'ubuntu-runner'
+        run: |
+          set -uo pipefail   # NOT -e: the asserts handle their own failures
+          fail() { echo "ASSERT FAIL: $1" >&2; dump; exit 1; }
+          M=runnersmoke
+          in_guest() { sudo systemd-run -M "$M" --quiet --wait --pipe "$@"; }
+          dump() {
+            echo "=== system state: $(sudo systemctl -M "$M" is-system-running 2>&1)"
+            sudo systemctl -M "$M" --no-pager --failed 2>&1 || true
+            for u in hippius-runner-data containerd docker; do
+              sudo systemctl -M "$M" --no-pager status "$u.service" 2>&1 | head -20 || true
+            done
+            echo "=== nspawn"; tail -40 /mnt/e2e/nspawn.log || true
+          }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq systemd-container squashfs-tools >/dev/null
+
+          ROOT=/mnt/e2e/root
+          img="$(find /mnt/e2e/out -maxdepth 1 -name 'golden-*.rootfs.img' | head -1)"
+          sudo unsquashfs -q -d "$ROOT" "$img" || fail "unsquashfs failed"
+          [ -x "$ROOT/usr/sbin/sshd" ] || fail "the runner root lost sshd (it is a normal VM)"
+          # The pinned runner tarball, as-is where the consumer looks for it.
+          rv="$(sed -n 's/^RUNNER_TARBALL_VERSION="\(.*\)"$/\1/p' scripts/tenant-image-bake.sh)"
+          rs="$(sed -n 's/^RUNNER_TARBALL_SHA256="\(.*\)"$/\1/p' scripts/tenant-image-bake.sh)"
+          [ -n "$rv" ] && [ -n "$rs" ] || fail "no RUNNER_TARBALL_VERSION/SHA256 pin in scripts/tenant-image-bake.sh"
+          tb="$ROOT/opt/actions-runner/actions-runner-linux-x64-${rv}.tar.gz"
+          [ -s "$tb" ] || fail "the runner tarball is missing: ${tb#"$ROOT"}"
+          [ "$(sudo stat -c '%u:%g %a' "$tb")" = "0:0 644" ] || fail "${tb#"$ROOT"} is not root:root 0644"
+          [ "$(sudo stat -c '%u:%g %a' "$(dirname "$tb")")" = "0:0 755" ] || fail "/opt/actions-runner is not root:root 0755"
+          got="$(sudo sha256sum "$tb" | awk '{print $1}')"
+          [ "$got" = "$rs" ] || fail "${tb#"$ROOT"} has sha256 $got, want $rs"
+          echo "runner tarball ${tb#"$ROOT"} present (sha256 $got)"
+          dj="$ROOT/etc/docker/daemon.json"
+          [ -s "$dj" ] || fail "/etc/docker/daemon.json is missing"
+          sudo jq -e '. == {"features": {"containerd-snapshotter": false}, "log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "2"}}' "$dj" >/dev/null \
+            || fail "/etc/docker/daemon.json is not the backend bootstrap's document: $(sudo cat "$dj")"
+          echo "/etc/docker/daemon.json present: snapshotter off, json-file 50m/2, no data-root"
+          # The data volume the initramfs binds on a real VM.
+          sudo install -d -m 0755 /mnt/e2e/data
+          # dockerd in the guest needs these, and an nspawn guest cannot
+          # load kernel modules itself.
+          sudo modprobe -a overlay br_netfilter nf_tables nft_chain_nat nf_nat \
+            xt_MASQUERADE xt_addrtype iptable_nat iptable_filter \
+            || fail "could not load the kernel modules dockerd needs"
+
+          # Full capabilities and the keyring/bpf syscalls nspawn filters by
+          # default: what dockerd/containerd need beyond a plain guest.
+          sudo nohup systemd-nspawn --quiet --boot --private-network --console=passive \
+            --machine "$M" -D "$ROOT" \
+            --capability=all --system-call-filter='@keyring bpf' \
+            --bind=/mnt/e2e/data:/var/lib/hippius-data \
+            >/mnt/e2e/nspawn.log 2>&1 &
+          nspawn_pid=$!
+
+          state=""
+          for _ in $(seq 1 150); do
+            sudo kill -0 "$nspawn_pid" 2>/dev/null || fail "systemd-nspawn exited during boot"
+            state="$(sudo systemctl -M "$M" is-system-running 2>/dev/null || true)"
+            case "$state" in running|degraded) break ;; esac
+            sleep 2
+          done
+          echo "system state after boot: ${state:-<none>}"
+          case "$state" in running|degraded) ;; *) fail "the runner root did not finish booting (${state:-no answer})" ;; esac
+
+          for cmd in "/usr/bin/docker --version" "/usr/bin/containerd --version" \
+                     "/usr/bin/docker buildx version" "/usr/bin/docker compose version"; do
+            # shellcheck disable=SC2086 # word-split on purpose
+            out="$(in_guest $cmd 2>&1)" || fail "'$cmd' failed: $out"
+            echo "$cmd: $out"
+          done
+
+          [ "$(sudo systemctl -M "$M" is-active hippius-runner-data.service)" = active ] \
+            || fail "hippius-runner-data.service is not active"
+          for d in docker containerd; do
+            in_guest /usr/bin/mountpoint -q "/var/lib/$d" || fail "/var/lib/$d is not bound onto the data path"
+          done
+          echo "hippius-runner-data.service active, /var/lib/docker + /var/lib/containerd bound"
+          # The daemons must come up on the data path. The one tolerated
+          # failure is the container sandbox itself refusing dockerd or
+          # containerd (cgroup or iptables privileges an nspawn guest may
+          # lack): detected from the unit's journal and reported as a skip
+          # with the matched line. Any other failure, including a storage
+          # driver error (what the bind exists to prevent), fails the leg.
+          sandbox_limit='cgroup.*(permission denied|operation not permitted|read-only file system)|iptables.*(permission denied|you must be root)|can.t initialize iptables table'
+          daemons_skipped=""
+          for u in containerd docker; do
+            st=""
+            for _ in $(seq 1 45); do
+              st="$(sudo systemctl -M "$M" is-active "$u.service" 2>/dev/null)"
+              case "$st" in active|failed) break ;; esac
+              sleep 2
+            done
+            [ "$st" = active ] && { echo "$u.service active"; continue; }
+            if [ "$u" = docker ] && [ -n "$daemons_skipped" ]; then
+              echo "::warning::ubuntu-runner smoke: docker.service SKIPPED, containerd was refused by the sandbox"
+              continue
+            fi
+            journal="$(in_guest /usr/bin/journalctl --no-pager -o cat -u "$u.service" 2>&1)"
+            echo "=== $u.service journal (state ${st:-unknown})"; tail -40 <<<"$journal"
+            why="$(grep -iE "$sandbox_limit" <<<"$journal" | head -1)"
+            [ -n "$why" ] || fail "$u.service is ${st:-unknown}, not for a sandbox reason (journal above)"
+            echo "::warning::ubuntu-runner smoke: $u.service SKIPPED, the nspawn sandbox refused it: $why"
+            daemons_skipped=1
+          done
+          if [ -z "$daemons_skipped" ]; then
+            info="$(in_guest /usr/bin/docker info --format '{{.Driver}}|{{.DockerRootDir}}' 2>&1)" \
+              || fail "docker info failed: $info"
+            driver="${info%%|*}"; droot="${info#*|}"
+            echo "docker info: driver=$driver root=$droot"
+            # overlay2 only: the baked daemon.json turns the containerd image
+            # store (driver "overlayfs") off.
+            [ "$driver" = overlay2 ] || fail "docker storage driver is '$driver', want overlay2 (daemon.json sets containerd-snapshotter false)"
+            [ "$droot" = /var/lib/docker ] || fail "docker root dir is '$droot', want /var/lib/docker"
+            for d in docker containerd; do
+              src="$(in_guest /usr/bin/findmnt -n -o SOURCE --mountpoint "/var/lib/$d" 2>&1)" \
+                || fail "findmnt /var/lib/$d failed: $src"
+              grep -qE "\[.*/data/$d\]$" <<<"$src" || fail "/var/lib/$d is '$src', not the data-path bind"
+              echo "/var/lib/$d on $src"
+            done
+          fi
+          # No failed unit but the one a private network always fails.
+          failed="$(sudo systemctl -M "$M" --failed --plain --no-legend 2>/dev/null \
+            | awk '{print $1}' | grep -vx 'systemd-networkd-wait-online.service' || true)"
+          if [ -n "$daemons_skipped" ]; then
+            failed="$(grep -vxE '(containerd|docker)\.(service|socket)' <<<"$failed" || true)"
+          fi
+          [ -z "$failed" ] || fail "failed units: $(echo "$failed" | tr '\n' ' ')"
+
+          dump
+          sudo machinectl poweroff "$M" || true
+          echo "E2E UBUNTU-RUNNER SMOKE OK"

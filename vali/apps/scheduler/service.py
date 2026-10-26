@@ -219,8 +219,10 @@ def booting_by_node(*, now: datetime | None = None) -> dict[str, int]:
     admission control for scheduled launches, not a global boot cap.
 
     A count at decision time, not a reservation: two placements decided at
-    the same instant could both see room. The launch tick runs one job at a
-    time (deployed as a single instance), so the bound holds in practice.
+    the same instant could both see room. The launch path therefore decides
+    and writes its `Pending` row under `decision_lock.placement_decision_lock`,
+    so concurrent launch jobs (`VALI_LAUNCH_TICK_CONCURRENCY`) count each
+    other's placements and the bound holds.
 
     Past its deadline a boot is STALLED, not booting, and stops counting:
     a guest that never comes up cannot hold its host's boot slots forever.
@@ -2076,30 +2078,34 @@ def resource_fit(
     enforce = capacity_config.resource_admission_enabled()
     disk_mode = capacity_config.disk_gate_mode()
     try:
-        cpus, mem = flavor_size(resource_class)
-        disk_gb = flavor_disk_gb(resource_class) if disk_gb is None else disk_gb
-        budgets = host_budgets_by_node() if budgets is None else budgets
-        saturated = inflight_saturated_node_ids()
-        return ResourceFit(
-            resource_class=resource_class,
-            fits_by_node={
-                nid: fits(b, cpu_count=cpus, memory_mb=mem, disk_gb=disk_gb)
-                and nid not in saturated
-                for nid, b in budgets.items()
-            },
-            free_fraction_by_node={nid: free_fraction(b) for nid, b in budgets.items()},
-            enforce=enforce,
-            shadow_log=shadow_log,
-            # The disk gate runs under BOTH admission models: the verdict
-            # `enforce` would reach, per node (`""` = admits).
-            disk_mode=disk_mode,
-            disk_gb=disk_gb,
-            disk_refusal_by_node=(
-                {}
-                if disk_mode == "off"
-                else {nid: disk_refusal(b.disk, disk_gb) for nid, b in budgets.items()}
-            ),
-        )
+        # A savepoint: under the launch's placement-decision lock this runs
+        # inside its transaction, and a swallowed DB error must not leave
+        # that transaction aborted for the queries after it.
+        with transaction.atomic():
+            cpus, mem = flavor_size(resource_class)
+            disk_gb = flavor_disk_gb(resource_class) if disk_gb is None else disk_gb
+            budgets = host_budgets_by_node() if budgets is None else budgets
+            saturated = inflight_saturated_node_ids()
+            return ResourceFit(
+                resource_class=resource_class,
+                fits_by_node={
+                    nid: fits(b, cpu_count=cpus, memory_mb=mem, disk_gb=disk_gb)
+                    and nid not in saturated
+                    for nid, b in budgets.items()
+                },
+                free_fraction_by_node={nid: free_fraction(b) for nid, b in budgets.items()},
+                enforce=enforce,
+                shadow_log=shadow_log,
+                # The disk gate runs under BOTH admission models: the verdict
+                # `enforce` would reach, per node (`""` = admits).
+                disk_mode=disk_mode,
+                disk_gb=disk_gb,
+                disk_refusal_by_node=(
+                    {}
+                    if disk_mode == "off"
+                    else {nid: disk_refusal(b.disk, disk_gb) for nid, b in budgets.items()}
+                ),
+            )
     except Exception:
         if enforce or disk_mode == "enforce":
             raise
@@ -2487,8 +2493,9 @@ def swap_placement_class(
     lock and raises [`ResizeNoRoom`] instead of swapping: the admission
     and the reservation are one step, so two resizes on one host cannot
     both spend the same free room. (A concurrent LAUNCH decision does not
-    take this lock — the same "count at decision time" bound every
-    placement has; the miner's preflight gate stays the last word.)
+    take this lock — launches serialize among themselves on
+    `decision_lock.placement_decision_lock`, not against a resize; the
+    miner's preflight gate stays the last word.)
 
     Idempotent: a row already at `new_class` is returned as is. Raises
     [`PlacementSwapConflict`] when the VM does not hold exactly one active
@@ -2830,9 +2837,14 @@ def _carry_placement_disks(src: Placement, dst: Placement) -> None:
                 "dedicated_disk_id": disk.dedicated_disk_id,
                 "size_gb": disk.size_gb,
                 "required_tier": disk.required_tier,
-                # A dedicated slot's last guest verdict (E4 `guest_state`).
+                # A dedicated slot's last guest verdict (E4 `guest_state`)
+                # and its first-boot wipe progress (§9 `init_percent`).
                 "observed_state": disk.observed_state,
                 "observed_at": disk.observed_at,
+                "observed_percent": disk.observed_percent,
+                # The slot's integrity mode (§9): the relaunch measures the
+                # same `x<N>:<GiB>:i` anchor the guest formatted it under.
+                "integrity": disk.integrity,
             },
         )
 

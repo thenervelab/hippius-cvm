@@ -8,7 +8,8 @@ OWN overlay upper — so the running root diverges from the measured golden
 and every VM pays the download. Re-baking on a schedule moves the patch
 into the measured base.
 
-What a run does, per golden image (ubuntu, debian, cs10, fedora, cdn-node):
+What a run does, per golden image (ubuntu, debian, cs10, fedora, cdn-node,
+ubuntu-runner):
 
 1. Clones the CURRENTLY BLESSED bake's inputs (base image URL + sha,
    size, bucket) into a new golden `TenantBake` row whose
@@ -61,7 +62,16 @@ log = logging.getLogger("apps.images.rebake")
 
 # cdn-node too: its monthly re-bake is how a node gets the new GeoIP
 # database (and the distro updates); vali replaces the nodes once blessed.
-DEFAULT_IMAGES: tuple[str, ...] = ("ubuntu", "debian", "cs10", "fedora", "cdn-node")
+# ubuntu-runner (the CI-runner image) too: Docker and the runner's
+# dependencies get their updates in the measured base, like the distro.
+DEFAULT_IMAGES: tuple[str, ...] = (
+    "ubuntu",
+    "debian",
+    "cs10",
+    "fedora",
+    "cdn-node",
+    "ubuntu-runner",
+)
 REQUESTER_NAME = "vali_scheduled_golden_rebake"
 # The stamp is the vm_id suffix, so it takes the vm_id charset (a subset
 # of what the baker's `--package-refresh` accepts): no case folding, no

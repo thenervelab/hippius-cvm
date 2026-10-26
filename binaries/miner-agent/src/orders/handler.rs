@@ -1143,23 +1143,60 @@ pub async fn handle_tenant_preflight(
     if let Err(err) = lifecycle.check_disk_space(&order.vm_id, os_pool, add_disk_gb) {
         return Err(reject_dispatch(&err, &vm_id_str));
     }
-    // CPU + memory capacity fail-fast — SAME pre-register rationale as the
-    // DATA-disk gate above. Without this, a CPU/RAM-constrained miner
-    // passed preflight (only disk was gated) and rejected at LAUNCH, after
+    // CPU + memory + disk-budget gate that RESERVES what it checked — SAME
+    // pre-register rationale as the DATA-disk gate above. Without the
+    // reservation two concurrent preflights could both pass against the
+    // same free capacity and the second VM be refused at LAUNCH, after
     // KBS-register, which vali can't cleanly re-place (the register 409s
-    // `kbs-admin-conflict`). The preflight order carries the measured
-    // `cpu_count` but not the RAM figure; vCPU counts are unique per
-    // flavor, so recover `memory_mb` via `Flavor::from_vcpus`. An unknown
-    // vCPU count (never emitted by vali; caught later by the launch-order
-    // vCPU match) skips the RAM half but still gates CPU.
+    // `kbs-admin-conflict`). The hold lasts until this vm_id's launch is
+    // admitted, a stop/destroy, a failure below, or the TTL. The preflight
+    // order carries the measured `cpu_count` but not the RAM figure; vCPU
+    // counts are unique per flavor, so recover `memory_mb` via
+    // `Flavor::from_vcpus`. An unknown vCPU count (never emitted by vali;
+    // caught later by the launch-order vCPU match) skips the RAM half but
+    // still gates CPU.
     let add_memory_mb = hippius_types::flavor::Flavor::from_vcpus(order.cpu_count)
         .map(|f| f.memory_mb())
         .unwrap_or(0);
-    if let Err(err) =
-        lifecycle.check_cpu_mem_budget(&order.vm_id, os_pool, order.cpu_count, add_memory_mb)
-    {
+    let vm_id = order.vm_id.clone();
+    let os_pool = order.os_pool.clone();
+    let cpu_count = order.cpu_count;
+    let reserve = || {
+        lifecycle.reserve_preflight_capacity(
+            &vm_id,
+            os_pool.as_deref(),
+            cpu_count,
+            add_memory_mb,
+            add_disk_gb,
+        )
+    };
+    // Taken BEFORE staging, so concurrent preflights cannot all pass while
+    // this one downloads…
+    let held = reserve().map_err(|err| reject_dispatch(&err, &vm_id_str))?;
+    let result = preflight_after_reservation(lifecycle, order, &vm_id_str).await;
+    if result.is_err() {
+        // Only a preflight that answers OK holds capacity (unless a newer
+        // preflight of the same VM replaced this hold meanwhile).
+        lifecycle.release_preflight_reservation_if(&vm_id, held, "preflight-failed");
+        return result;
+    }
+    // …and refreshed on the answer, so the TTL runs from when vali hears OK
+    // (staging may have taken a while). Our hold kept others out, so this
+    // only fails if it expired during staging and the capacity is gone:
+    // still before the KBS register, so vali re-places.
+    if let Err(err) = reserve() {
+        lifecycle.release_preflight_reservation_if(&vm_id, held, "preflight-failed");
         return Err(reject_dispatch(&err, &vm_id_str));
     }
+    result
+}
+
+/// The rest of [`handle_tenant_preflight`] once its capacity is reserved.
+async fn preflight_after_reservation(
+    lifecycle: &CvmLifecycle,
+    order: TenantPreflightOrder,
+    vm_id_str: &str,
+) -> std::result::Result<String, OrderRejection> {
     // P9/#16 — a preflight for a vm_id whose domain is ALREADY UP may only
     // re-stage bytes that are byte-identical to what is on disk. Vali can
     // legitimately re-dispatch a preflight (a re-driven launch job, an
@@ -1183,7 +1220,7 @@ pub async fn handle_tenant_preflight(
             if let Err(err) =
                 lifecycle.reserve_asid(&order.vm_id, crate::lifecycle::DomainProfile::Tenant)
             {
-                return Err(reject_dispatch(&err, &vm_id_str));
+                return Err(reject_dispatch(&err, vm_id_str));
             }
             crate::lifecycle::preflight::StagePolicy::Replace
         }
@@ -1193,7 +1230,7 @@ pub async fn handle_tenant_preflight(
     };
     match crate::lifecycle::preflight::run(order, policy).await {
         Ok(json) => Ok(json),
-        Err(err) => Err(reject_dispatch(&err, &vm_id_str)),
+        Err(err) => Err(reject_dispatch(&err, vm_id_str)),
     }
 }
 

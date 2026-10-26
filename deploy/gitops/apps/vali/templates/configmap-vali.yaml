@@ -370,6 +370,7 @@ data:
   VALI_SELLABLE_OS_TIERS: {{ .Values.scheduler.sellableOsTiers | default (list "nvme") | join "," | quote }}
   VALI_HDD_OS_MAX_FLAVOR: {{ .Values.scheduler.hddOsMaxFlavor | default "large" | quote }}
   VALI_DISK_TIER_FALLBACK_OWNERS: {{ .Values.scheduler.diskTierFallbackOwners | default list | join "," | quote }}
+  VALI_OS_TIER_MATCH: {{ .Values.scheduler.osTierMatch | default "minimum" | quote }}
   # External-miner approval gate — see values.yaml `scheduler.minerApprovalRequired`.
   VALI_MINER_APPROVAL_REQUIRED: {{ .Values.scheduler.minerApprovalRequired | default "false" | toString | quote }}
   # Automatic approval after an attested soak — see values.yaml `scheduler.minerAutoApprove`.
@@ -458,6 +459,11 @@ data:
   VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER: {{ . | quote }}
   {{- end }}
   VALI_DEDICATED_SELLABLE_TIERS: {{ (.Values.dedicatedDisks).sellableTiers | default "hdd" | quote }}
+  VALI_DEDICATED_TIER_MATCH: {{ (.Values.dedicatedDisks).tierMatch | default "exact" | quote }}
+  {{- /* Dedicated disks with integrity (contract §9): both always render,
+         "false" / "8" by default (the settings.py defaults). */}}
+  VALI_DEDICATED_INTEGRITY_ENABLED: {{ (.Values.dedicatedDisks).integrityEnabled | default "false" | toString | quote }}
+  VALI_DEDICATED_INTEGRITY_MIN_GUEST_RELEASE: {{ (.Values.dedicatedDisks).integrityMinGuestRelease | default "8" | toString | quote }}
   # §18.10 host inventory ingest — see values.yaml `hostInventory.ingest`.
   VALI_HOST_INVENTORY_INGEST: {{ (.Values.hostInventory).ingest | default "false" | toString | quote }}
   VALI_VAULT_KV_MAX_VERSIONS: {{ .Values.userdataRestage.kvMaxVersions | quote }}

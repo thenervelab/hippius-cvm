@@ -14,9 +14,10 @@ code inside it"):
   runtime gate on the KBS's own identity — cannot tell them apart.
 
   Nothing here changes that. What this DOES close is the weaker, adjacent
-  gap that the ref-agnostic `verify-gitops-signatures` gate leaves open: it
-  proves a pinned digest was signed by *some* build of this repo, on *any*
-  ref, and says nothing about WHICH source produced the binary. The digest's
+  gap that the `verify-gitops-signatures` regexp gate leaves open: it
+  proves a pinned digest was signed by *some* main or tag build of this repo
+  (until hippius-audits#12, on *any* ref), and says nothing about WHICH
+  source produced the binary. The digest's
   human-readable provenance lived only in a YAML comment — and that comment
   was wrong by three weeks and one branch when this check was written.
 
@@ -60,7 +61,7 @@ import yaml
 #
 # It started as two — the KBS, which releases every tenant disk KEK, and the
 # broker, which mints the Vault capability that lets it. The other four were
-# covered only by the deliberately ref-AGNOSTIC gate in
+# covered only by the then ref-AGNOSTIC gate in
 # `verify-gitops-signatures.yml`, whose own comment calls it too weak for
 # trust-critical images: it pins neither the branch nor the commit, so the
 # exact failure this file was written for — the KBS running a
@@ -88,36 +89,30 @@ TRUST_CRITICAL_IMAGES = (
     ("deploy/gitops/apps/vali/values.yaml", "epochClose.image"),
 )
 
-# BOTH names are accepted because this repo was renamed `hippius-compute` →
-# `hippius-compute-internal`. A Fulcio certificate records the repo name AT
-# BUILD TIME and is immutable, so the pinned images split into two eras:
-# everything built before the rename is signed under the old name, everything
-# after under the new one. Accepting only one era rejects the other.
-#
-# ⚠️ Safe ONLY while both names stay ours. The old name is a GitHub redirect
-# today, and a redirected name becomes claimable once nothing occupies it — so
-# a repo we do NOT control taking `thenervelab/hippius-compute` could mint
-# certificates satisfying this check. Never give that name to a public or
-# externally-contributed repo (the open-source repo is `hippius-cvm`
-# precisely so this stays true).
-#
-# Cleanup, once every pinned image has been rebuilt post-rename: collapse
-# REPOS to the `-internal` name alone.
-REPOS = ("thenervelab/hippius-compute", "thenervelab/hippius-compute-internal")
+# Only the CURRENT repo name. The pre-rename name `thenervelab/hippius-compute`
+# was accepted while pinned images from before the rename existed; every pin is
+# now a post-rename main build, and the old name is a GitHub redirect that
+# becomes claimable once nothing occupies it — a repo we do not control could
+# then mint certificates satisfying a check that still named it
+# (hippius-audits#12).
+REPOS = ("thenervelab/hippius-compute-internal",)
 REPO = REPOS[-1]  # the CURRENT name — used in operator-facing message text
 _REPO_ALT = "(?:" + "|".join(re.escape(r) for r in REPOS) + ")"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 MAIN_REF = "refs/heads/main"
 
 # The Fulcio SAN a `*-image.yml` workflow in THIS repo signs under. The `ref`
-# group is the git ref the build ran on — `refs/heads/main` for a merged
-# build, `refs/pull/<n>/merge` for a pre-merge PR build. The `repo` group is
+# group is the ref the build ran on, and only two kinds are acceptable:
+# `refs/heads/main` (a merged build) or a `refs/tags/v*` release tag. A
+# `refs/pull/<n>/merge` identity is REFUSED outright, acknowledgement or not:
+# until hippius-audits#12 the image workflows signed PR builds of unreviewed
+# code, and those signatures are still valid in GHCR. The `repo` group is
 # captured rather than assumed: cosign pins the signing repository by EXACT
 # match (not a pattern), so the value it is given must come from the identity
 # this regex just validated, never from a constant that names only one era.
 WORKFLOW_REF_RE = re.compile(
     r"^https://github\.com/(?P<repo>" + _REPO_ALT + r")"
-    + r"/\.github/workflows/[a-z0-9-]+-image\.yml@(?P<ref>refs/\S+)$"
+    + r"/\.github/workflows/[a-z0-9-]+-image\.yml@(?P<ref>refs/heads/main|refs/tags/v[^/\s]+)$"
 )
 RUN_URL_RE = re.compile(
     r"^https://github\.com/" + _REPO_ALT + r"/actions/runs/\d+(/attempts/\d+)?$"
@@ -171,8 +166,9 @@ def check_declaration(source: str, image: Any) -> dict[str, Any]:
     if not m:
         raise ProvenanceError(
             f"{source}: image.provenance.workflowRef must be a "
-            f"`{REPO}/.github/workflows/<name>-image.yml@<ref>` identity, "
-            f"got {workflow_ref!r}"
+            f"`{REPO}/.github/workflows/<name>-image.yml@<ref>` identity with "
+            f"<ref> = {MAIN_REF} or refs/tags/v* (a pull_request build is never "
+            f"deployable), got {workflow_ref!r}"
         )
     ref = m.group("ref")
     repo = m.group("repo")
@@ -198,10 +194,9 @@ def check_declaration(source: str, image: Any) -> dict[str, Any]:
             f"true/false, got {merged!r}"
         )
     # The load-bearing consistency rule: `mergedSource` is not a free-text
-    # claim, it is a restatement of the ref. A build on any ref other than
-    # main was made from a tree that is NOT in this repo's history (a
-    # `refs/pull/<n>/merge` commit is ephemeral and unrecoverable), so the
-    # running binary cannot be re-derived from source.
+    # claim, it is a restatement of the ref. The only non-main ref the regex
+    # admits is a `v*` tag, whose commit is not guaranteed to be on main, so
+    # it must be acknowledged like any other source outside main's history.
     if merged != (ref == MAIN_REF):
         raise ProvenanceError(
             f"{source}: image.provenance.mergedSource={merged} contradicts "
@@ -216,7 +211,7 @@ def check_declaration(source: str, image: Any) -> dict[str, Any]:
                 f"{source}: this chart pins an image built from {ref!r}, i.e. from "
                 "source that is NOT in this repo's history. That is permitted only "
                 "with an explicit image.provenance.unmergedSourceAck explaining "
-                f"which PR it came from and when it will be re-pinned (>= "
+                f"where that source came from and when it will be re-pinned (>= "
                 f"{MIN_ACK_LEN} chars), got {ack!r}"
             )
     elif ack is not None:

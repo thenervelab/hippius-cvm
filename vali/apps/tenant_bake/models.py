@@ -144,10 +144,15 @@ class TenantBakeProfile(models.TextChoices):
     - `cdn-node`: the CDN cache-node image (OpenResty + cdn-agent, no
       sshd, the public-IP inbound guard and input firewall baked).
       Golden only (`tenant-image-bake.sh --profile cdn-node`).
+    - `ubuntu-runner`: the CI-runner image — the standard ubuntu golden
+      plus Docker (docker-ce, containerd, buildx, compose) and the GitHub
+      Actions runner's dependencies. Golden + Ubuntu only
+      (`tenant-image-bake.sh --profile ubuntu-runner`).
     """
 
     STANDARD = "standard", "Standard tenant image"
     CDN_NODE = "cdn-node", "CDN cache node"
+    UBUNTU_RUNNER = "ubuntu-runner", "Ubuntu CI runner"
 
 
 # In-flight states for the "one active bake per vm_id" rule —

@@ -8,3 +8,4 @@
 bin     system_u:object_r:bin_t:s0
 units   system_u:object_r:systemd_unit_file_t:s0
 etc     system_u:object_r:etc_t:s0
+udev    system_u:object_r:udev_rules_t:s0

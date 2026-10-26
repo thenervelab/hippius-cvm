@@ -98,7 +98,7 @@ from apps.scheduler.reasons import REASON_NO_STORAGE
 from apps.telemetry import guest_resources, release_service
 from apps.telemetry.models import HostAttestor, HostAttestorRelease
 
-from .service import _attestor_sort_key, _iso, _location_of, _serialize_location
+from .service import _attestor_sort_key, _iso, _location_of, _serialize_location, cordon_fields
 
 #: Look-back of the per-miner backup summary.
 BACKUP_WINDOW = timedelta(hours=24)
@@ -1187,6 +1187,9 @@ def _row(
         "dispatchable_reason": dispatch_reason,
         "schedulable": schedulable,
         "schedulable_reason": reason,
+        # The explicit cordon and who holds it (owner / staff / auto). Staff
+        # see the stored reason verbatim; `/v1/operator/nodes` shows a code.
+        **cordon_fields(mirror, staff_view=True),
         "chain": chain_row,
         "location": _serialize_location(location),
         "capacity": cap,

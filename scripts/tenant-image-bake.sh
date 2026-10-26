@@ -214,6 +214,39 @@ GOLDEN_DRACUT_MODULE_SRC="${SCRIPT_DIR}/dracut/95hippius-golden"
 # and EXECUTE the exact bytes the guest runs.
 KEEPALIVE_SHIM_SRC="${SCRIPT_DIR}/guest/hippius-keepalive-start"
 CDN_INSTALL_SRC="${SCRIPT_DIR}/cdn-node/install-cdn-node.sh"
+# ubuntu-runner profile: the Docker data-path glue (hippius-runner-data).
+RUNNER_INSTALL_SRC="${SCRIPT_DIR}/ubuntu-runner/install-ubuntu-runner.sh"
+# ubuntu-runner profile: the GitHub Actions runner tarball, pinned here and
+# only here. The consumer (hippius-backend's runner bootstrap) looks for
+# exactly ${RUNNER_TARBALL_DEST} and skips its download when it is there, so
+# a bump changes all three values together and the consumer's
+# GITHUB_RUNNER_VERSION must match (docs/operator/golden-rebake-runbook.md).
+# Only the tarball is baked, never extracted: the consumer extracts it, and
+# the registered runner still self-updates.
+RUNNER_TARBALL_VERSION="2.337.0"
+RUNNER_TARBALL_URL="https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz"
+RUNNER_TARBALL_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+RUNNER_TARBALL_DEST="/opt/actions-runner/actions-runner-linux-x64-${RUNNER_TARBALL_VERSION}.tar.gz"
+# ubuntu-runner profile: /etc/docker/daemon.json, written by the chroot.
+# hippius-backend's runner bootstrap removes data-root, forces
+# features.containerd-snapshotter=false, adds log-driver/log-opts when
+# absent, and restarts Docker (~10 s, every boot) when that changes the
+# file. This is exactly the document it converges to, so the restart is
+# skipped: keep the two in sync (no data-root; log-opts values are
+# strings). The containerd image store off keeps Docker on the overlay2
+# graph driver under /var/lib/docker (bound onto the data path by
+# install-ubuntu-runner.sh; containerd keeps its own /var/lib/containerd
+# bind).
+RUNNER_DOCKER_DAEMON_JSON='{
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "2"
+  }
+}'
 # #289 — init-bottom DHCP/static teardown. Installed into the guest's
 # `/etc/initramfs-tools/scripts/init-bottom/` (NOT hook-copied into
 # DESTDIR — mkinitramfs generates the `ORDER` execution manifest from
@@ -222,6 +255,10 @@ CDN_INSTALL_SRC="${SCRIPT_DIR}/cdn-node/install-cdn-node.sh"
 # flushes IPv4 state on every non-`lo` interface so userspace starts
 # with a clean NIC.
 NET_TEARDOWN_SRC="${SCRIPT_DIR}/initramfs/hippius-net-teardown"
+# init-bottom, after the stock udev script: one `hippius-trace` uptime line
+# for measuring the switch_root gap (installed like the teardown, so it is
+# in ORDER).
+TRACE_AFTER_UDEV_SRC="${SCRIPT_DIR}/initramfs/hippius-trace-after-udev"
 
 base_image_url=""
 base_image_sha256=""
@@ -368,6 +405,14 @@ package_refresh="${HCC_BAKE_PKG_REFRESH:-}"
 # removes sshd and bakes the public-IP inbound guard and input firewall —
 # golden_verity_overlay + Debian family only. Its inputs are required
 # with it and refused without it.
+# `ubuntu-runner` is the CI-runner image: the standard ubuntu golden plus
+# Docker (docker-ce, containerd.io, buildx, compose, from Docker's apt repo
+# with its signing key pinned by fingerprint) and the GitHub Actions
+# runner's dependencies, Docker's state bound onto the non-overlay data
+# path, plus the pinned runner tarball (RUNNER_TARBALL_*, not extracted) and
+# Docker's daemon.json (RUNNER_DOCKER_DAEMON_JSON, containerd snapshotter off) —
+# golden_verity_overlay + Ubuntu only, no extra input. The extracted runner
+# is not baked (it self-updates at registration).
 profile="${HCC_BAKE_PROFILE:-standard}"
 cdn_agent_bin=""
 cdn_openresty_tarball=""
@@ -389,6 +434,39 @@ VERITY_BLOCK_SIZE="4096"
 
 log() { printf '%s: %s\n' "${PROG}" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Fetch the pinned runner tarball (RUNNER_TARBALL_URL) to $1 and verify it
+# against RUNNER_TARBALL_SHA256. The URL is a constant of this script, not a
+# request input, and GitHub serves release assets through a redirect, so
+# this is a plain curl, not ssrf_safe_https_fetch (--max-redirs 0). Up to 3
+# attempts, each from scratch (curl's own --retry does not cover a
+# truncated body). A sha256 mismatch is not retried: the bytes are wrong,
+# the bake fails. Run by scripts/dev/ubuntu-runner-profile-test.sh against
+# a fake curl.
+runner_tarball_fetch() {
+    local out="$1" attempt rc=0 got
+    for attempt in 1 2 3; do
+        rm -f -- "${out}"
+        rc=0
+        curl -fsSL --proto '=https' --retry 3 --retry-delay 2 \
+            -o "${out}" "${RUNNER_TARBALL_URL}" || rc=$?
+        [[ ${rc} -eq 0 ]] && break
+        log "ubuntu-runner: runner tarball download attempt ${attempt}/3 failed (curl exit ${rc})"
+        if [[ ${attempt} -lt 3 ]]; then sleep "${RUNNER_TARBALL_RETRY_SLEEP:-3}"; fi
+    done
+    if [[ ${rc} -ne 0 ]]; then
+        rm -f -- "${out}"
+        log "ERROR: ubuntu-runner: could not download ${RUNNER_TARBALL_URL} (curl exit ${rc})"
+        return 3
+    fi
+    got="$(sha256sum "${out}" | awk '{print $1}')"
+    if [[ "${got}" != "${RUNNER_TARBALL_SHA256}" ]]; then
+        rm -f -- "${out}"
+        log "ERROR: ubuntu-runner: ${RUNNER_TARBALL_URL} has sha256 ${got}, want ${RUNNER_TARBALL_SHA256}"
+        return 3
+    fi
+    log "ubuntu-runner: runner tarball ${RUNNER_TARBALL_VERSION} verified (sha256 ${got})"
+}
 
 # SSRF-safe HTTPS fetch (audit RA-M1). The vali intake check validated
 # base_image_url at POST time, but this baker runs LATER in a DIFFERENT
@@ -823,12 +901,15 @@ Optional:
                           so a new STAMP always rebuilds with current
                           packages. Default: \$HCC_BAKE_PKG_REFRESH, else
                           empty (no upgrade).
-  --profile NAME          standard (default) or cdn-node: the CDN cache
-                          node image (golden_verity_overlay, Debian
-                          family): OpenResty + cdn-agent staged, no
-                          sshd, public-IP inbound guard + input firewall
-                          baked. Default: \$HCC_BAKE_PROFILE, else
-                          standard.
+  --profile NAME          standard (default), cdn-node or ubuntu-runner.
+                          cdn-node: the CDN cache node image
+                          (golden_verity_overlay, Debian family):
+                          OpenResty + cdn-agent staged, no sshd,
+                          public-IP inbound guard + input firewall baked.
+                          ubuntu-runner: the CI-runner image
+                          (golden_verity_overlay, Ubuntu): Docker +
+                          the GitHub Actions runner's dependencies.
+                          Default: \$HCC_BAKE_PROFILE, else standard.
   --cdn-agent-bin PATH    cdn-node: the hippius-cdn-agent binary.
   --cdn-openresty-tarball PATH
                           cdn-node: the OpenResty tree (build-openresty.sh
@@ -957,9 +1038,17 @@ fi
 # ── Resolve --profile (CDN plan I3) ─────────────────────────────────
 # Gated here, root-free, like --disk-mode (scripts/dev/cdn-node-profile-test.sh).
 case "${profile}" in
-    standard)
+    standard|ubuntu-runner)
         if [[ -n "${cdn_agent_bin}${cdn_openresty_tarball}${cdn_config_dir}${cdn_backend_url}${cdn_fleet_wildcard}" ]]; then
             die "--cdn-* flags need --profile cdn-node (exit 1)"
+        fi
+        if [[ "${profile}" == "ubuntu-runner" ]]; then
+            [[ "${disk_mode}" == "golden_verity_overlay" ]] \
+                || die "--profile ubuntu-runner needs --disk-mode golden_verity_overlay (exit 1)"
+            [[ "${distro}" == "auto" || "${distro}" == "ubuntu" ]] \
+                || die "--profile ubuntu-runner needs an Ubuntu base (got --distro ${distro}) (exit 1)"
+            [[ -r "${RUNNER_INSTALL_SRC}" ]] \
+                || die "${RUNNER_INSTALL_SRC}: ubuntu-runner installer missing (exit 1)"
         fi
         ;;
     cdn-node)
@@ -978,7 +1067,7 @@ case "${profile}" in
             || die "--cdn-fleet-wildcard must be *.<domain> in lower case (got '${cdn_fleet_wildcard}') (exit 1)"
         [[ -r "${CDN_INSTALL_SRC}" ]] || die "${CDN_INSTALL_SRC}: cdn-node installer missing (exit 1)"
         ;;
-    *) die "--profile must be standard or cdn-node (got '${profile}') (exit 1)";;
+    *) die "--profile must be standard, cdn-node or ubuntu-runner (got '${profile}') (exit 1)";;
 esac
 
 # ── Resolve the §23 keepalive cadence knobs ─────────────────────────
@@ -1042,6 +1131,7 @@ fi
 [[ -r "${HOST_STATE_HOOK_SRC}" ]] || die "${HOST_STATE_HOOK_SRC}: initramfs host-state hook missing"
 [[ -r "${DHCP_CLIENTID_HOOK_SRC}" ]] || die "${DHCP_CLIENTID_HOOK_SRC}: initramfs DHCP client-id hook missing"
 [[ -r "${NET_TEARDOWN_SRC}" ]]    || die "${NET_TEARDOWN_SRC}: init-bottom teardown missing"
+[[ -r "${TRACE_AFTER_UDEV_SRC}" ]] || die "${TRACE_AFTER_UDEV_SRC}: init-bottom trace missing"
 [[ "${output_qcow2_gb}" =~ ^[1-9][0-9]*$ ]] || die "--output-qcow2-gb must be a positive integer"
 
 # Tooling — fail fast (exit 2 per header).
@@ -1145,7 +1235,7 @@ if [[ -n "${stage1_cache_dir}" ]]; then
         {
             sha256sum \
                 "${BASH_SOURCE[0]}" \
-                "${KEYSCRIPT_SRC}" "${CORE_SRC}" "${HOOK_SRC}" "${HOST_STATE_HOOK_SRC}" "${DHCP_CLIENTID_HOOK_SRC}" "${NET_TEARDOWN_SRC}" \
+                "${KEYSCRIPT_SRC}" "${CORE_SRC}" "${HOOK_SRC}" "${HOST_STATE_HOOK_SRC}" "${DHCP_CLIENTID_HOOK_SRC}" "${NET_TEARDOWN_SRC}" "${TRACE_AFTER_UDEV_SRC}" \
                 "${DRACUT_MODULE_SRC}"/* \
                 "${GOLDEN_OVERLAY_SRC}" "${GOLDEN_BOOT_SRC}" "${GOLDEN_HOOK_SRC}" \
                 "${GOLDEN_DRACUT_MODULE_SRC}"/* \
@@ -1210,6 +1300,11 @@ if [[ -n "${stage1_cache_dir}" ]]; then
                     | xargs -0 sha256sum) | sha256sum | awk '{print "cdn-config="$1}'
                 echo "cdn-backend=${cdn_backend_url}"
                 echo "cdn-fleet-wildcard=${cdn_fleet_wildcard}"
+            fi
+            if [[ "${profile}" == "ubuntu-runner" ]]; then
+                sha256sum "${RUNNER_INSTALL_SRC}" | awk '{print "ubuntu-runner="$1}'
+                echo "runner-tarball=${RUNNER_TARBALL_VERSION} ${RUNNER_TARBALL_SHA256} ${RUNNER_TARBALL_URL}"
+                printf '%s\n' "${RUNNER_DOCKER_DAEMON_JSON}" | sha256sum | awk '{print "runner-daemon-json="$1}'
             fi
             # schema marker — bump on any change that alters stage-1
             # bytes but isn't captured by the hashed file list above
@@ -1906,6 +2001,9 @@ detect_distro "${MNT_ROOT}/etc/os-release"
 if [[ "${profile}" == "cdn-node" && "${DISTRO_FAMILY}" != "debian" ]]; then
     die "--profile cdn-node supports the Debian family only (got ${DISTRO_ID}) (exit 3)"
 fi
+if [[ "${profile}" == "ubuntu-runner" && "${DISTRO_ID}" != "ubuntu" ]]; then
+    die "--profile ubuntu-runner supports Ubuntu only (got ${DISTRO_ID}) (exit 3)"
+fi
 
 mount_boot_if_separate "${MNT_ROOT}"
 
@@ -2245,13 +2343,28 @@ fi
 # on FIRST boot (unique per VM) stable for the VM's lifetime. The confidential
 # trust anchor is the SNP attestation, not the SSH host key — this only fixes
 # operator UX, it does not weaken any guarantee.
+#
+# `ssh_genkeytypes: [ed25519, ecdsa]`: no RSA host key. cloud-init's default
+# list (code default on Ubuntu/Debian/Fedora, cloud.cfg on CS10) includes
+# rsa, and an RSA-3072 keygen is the slow one on a 1-vCPU first boot. No
+# client that speaks to these VMs needs it (OpenSSH has preferred ed25519 /
+# ecdsa host keys for a decade). Nothing else brings RSA back: no base
+# sshd_config names a HostKey (all four ship them commented, so sshd tries
+# the defaults and skips a missing file silently), and the Fedora / CS10
+# sshd-keygen@rsa unit is skipped by cloud-init's own drop-in
+# (sshd-keygen@.service.d/disable-sshd-keygen-if-cloud-init-active.conf)
+# whenever cloud-init runs, which is every boot here. New VMs only: an
+# existing VM keeps the keys it has (ssh_deletekeys: false).
 sudo install -d -m 0755 "${MNT_ROOT}/etc/cloud/cloud.cfg.d"
-sudo tee "${MNT_ROOT}/etc/cloud/cloud.cfg.d/99-hippius-ssh-hostkeys.cfg" >/dev/null <<'EOF'
+sudo tee "${MNT_ROOT}/etc/cloud/cloud.cfg.d/99-hippius-ssh-hostkeys.cfg" >/dev/null <<'HIPPIUS_SSH_HOSTKEYS'
 # hippius-bake-managed: keep SSH host keys stable across reboots.
 # (cloud-init re-runs per-instance modules every boot via a per-boot
 # instance-id; without this it would regenerate host keys each reboot.)
 ssh_deletekeys: false
-EOF
+# No RSA host key: ed25519 + ecdsa only (RSA-3072 keygen is the slow one
+# on a 1-vCPU first boot).
+ssh_genkeytypes: [ed25519, ecdsa]
+HIPPIUS_SSH_HOSTKEYS
 
 # Deterministically pin cloud-init to the NoCloud seed on the initramfs
 # tmpfs (§20-safe: userdata NEVER touches disk). The §21 release-core
@@ -2447,6 +2560,8 @@ if [[ "${DISTRO_FAMILY}" == "debian" ]]; then
     sudo install -d -m 0755 "${MNT_ROOT}/etc/initramfs-tools/scripts/init-bottom"
     sudo install -m 0755 "${NET_TEARDOWN_SRC}" \
         "${MNT_ROOT}/etc/initramfs-tools/scripts/init-bottom/hippius-net-teardown"
+    sudo install -m 0755 "${TRACE_AFTER_UDEV_SRC}" \
+        "${MNT_ROOT}/etc/initramfs-tools/scripts/init-bottom/hippius-trace-after-udev"
     sudo install -d -m 0755 "${MNT_ROOT}/etc/initramfs-tools/hooks"
     sudo install -m 0755 "${HOOK_SRC}" "${MNT_ROOT}/etc/initramfs-tools/hooks/hippius-luks"
     # Runs after every stock hook (/etc hooks follow /usr/share ones):
@@ -2903,6 +3018,90 @@ if [ "${HIPPIUS_PROFILE:-standard}" = "cdn-node" ]; then
     apt-get install -y --no-install-recommends nftables openssl
 fi
 
+# ── ubuntu-runner profile packages ──────────────────────────────────
+# Docker from Docker's own apt repo, and the GitHub Actions runner's
+# dependencies (the set its bin/installdependencies.sh installs on Ubuntu),
+# so a CI-runner VM does not install them at first boot. The pinned runner
+# tarball is staged after the chroot, from the host (RUNNER_TARBALL_*).
+# Env-gated: every other bake installs nothing more.
+if [ "${HIPPIUS_PROFILE:-standard}" = "ubuntu-runner" ]; then
+    # Docker's release signing key, pinned by fingerprint: a key served
+    # with any other primary key (or more than one) fails the bake.
+    DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+    # Print the primary-key fingerprint of the key file $1. Fails if gpg
+    # fails (even after printing a fingerprint: the chroot has no
+    # pipefail, so gpg's status is checked on its own, never through a
+    # pipe) or if the file holds anything but exactly one primary key.
+    # Run by scripts/dev/ubuntu-runner-profile-test.sh against a fake gpg.
+    docker_key_primary_fpr() {
+        _dk_home=$(mktemp -d)
+        _dk_rc=0
+        GNUPGHOME="${_dk_home}" gpg --batch --with-colons --show-keys "$1" > "${_dk_home}/colons" || _dk_rc=$?
+        _dk_out=$(cat "${_dk_home}/colons")
+        rm -r "${_dk_home}"
+        if [ "${_dk_rc}" -ne 0 ]; then
+            echo "FATAL: gpg --show-keys failed on $1 (exit ${_dk_rc})" >&2
+            return 1
+        fi
+        _dk_pubs=$(printf '%s\n' "${_dk_out}" | awk -F: '$1 == "pub" {n++} END {print n + 0}')
+        if [ "${_dk_pubs}" -ne 1 ]; then
+            echo "FATAL: $1 holds ${_dk_pubs} primary keys, want exactly 1" >&2
+            return 1
+        fi
+        printf '%s\n' "${_dk_out}" | awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+    }
+    command -v gpg >/dev/null 2>&1 || apt-get install -y --no-install-recommends gpg
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.asc
+    DOCKER_KEY_FPRS=$(docker_key_primary_fpr /tmp/docker.asc) || exit 3
+    if [ "${DOCKER_KEY_FPRS}" != "${DOCKER_KEY_FPR}" ]; then
+        echo "FATAL: Docker's apt key has primary fingerprint(s) '${DOCKER_KEY_FPRS}', want ${DOCKER_KEY_FPR}" >&2
+        exit 3
+    fi
+    install -m 0644 /tmp/docker.asc /etc/apt/keyrings/docker.asc
+    rm -f /tmp/docker.asc
+    DOCKER_SUITE=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+    [ -n "${DOCKER_SUITE}" ] || { echo "FATAL: no Ubuntu codename in /etc/os-release" >&2; exit 3; }
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${DOCKER_SUITE} stable" \
+        > /etc/apt/sources.list.d/docker.list
+    apt-get update
+    # First real (not purely virtual) package of each candidate list: the
+    # t64-renamed libraries exist from noble on, the plain names before.
+    pick_pkg() {
+        for p in "$@"; do
+            if apt-cache show --no-all-versions "${p}" >/dev/null 2>&1; then
+                echo "${p}"
+                return 0
+            fi
+        done
+        echo "FATAL: none of $* is installable" >&2
+        return 1
+    }
+    LTTNG_PKG=$(pick_pkg liblttng-ust1t64 liblttng-ust1 liblttng-ust0)
+    SSL_PKG=$(pick_pkg libssl3t64 libssl3)
+    # libicu is versioned per release (libicu74 on noble): the newest one.
+    ICU_PKG=$(pick_pkg $(apt-cache pkgnames libicu | grep -E '^libicu[0-9]+(t64)?$' | sort -rV))
+    # The daemons must not start inside the bake chroot (a process rooted in
+    # the mountpoint makes the teardown umount fail): policy-rc.d refuses
+    # every start for the duration of the install.
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod 0755 /usr/sbin/policy-rc.d
+    apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        "${ICU_PKG}" libkrb5-3 "${LTTNG_PKG}" "${SSL_PKG}" zlib1g \
+        git jq curl ca-certificates
+    rm -f /usr/sbin/policy-rc.d
+    # Docker's daemon.json (RUNNER_DOCKER_DAEMON_JSON, pinned on the host):
+    # the containerd image store off, so Docker stays on overlay2.
+    [ -n "${RUNNER_DOCKER_DAEMON_JSON:-}" ] || { echo "FATAL: RUNNER_DOCKER_DAEMON_JSON not passed to the chroot" >&2; exit 3; }
+    install -d -m 0755 /etc/docker
+    printf '%s\n' "${RUNNER_DOCKER_DAEMON_JSON}" > /etc/docker/daemon.json
+    chown root:root /etc/docker/daemon.json
+    chmod 0644 /etc/docker/daemon.json
+    systemctl enable containerd.service docker.service docker.socket
+    echo "ubuntu-runner: docker $(dpkg-query -W -f='${Version}' docker-ce), containerd.io $(dpkg-query -W -f='${Version}' containerd.io), ${ICU_PKG} ${LTTNG_PKG} ${SSL_PKG}"
+fi
+
 # ── NetBird pre-install (held-curl first-boot fix) ──────────────────
 # Install the NetBird overlay agent HERE, in the measured chroot (which
 # has internet), at the PINNED NETBIRD_VERSION — NOT at first boot. The
@@ -3186,6 +3385,7 @@ sudo chroot "${MNT_ROOT}" /usr/bin/env \
     NETBIRD_VERSION="${netbird_version}" \
     PKG_REFRESH="${package_refresh}" \
     HIPPIUS_PROFILE="${profile}" \
+    RUNNER_DOCKER_DAEMON_JSON="${RUNNER_DOCKER_DAEMON_JSON}" \
     /bin/bash /tmp/hippius-chroot-install.sh
 sudo rm -f "${MNT_ROOT}/tmp/hippius-chroot-install.sh"
 
@@ -3520,6 +3720,18 @@ GSSAPIKeyExchange no
 HIPPIUS_SSHD_HARDEN
 sudo chmod 0644 "${MNT_ROOT}/etc/ssh/sshd_config.d/00-hippius-harden.conf"
 
+# Host keys come from cloud-init only (99-hippius-ssh-hostkeys.cfg:
+# ed25519 + ecdsa). Debian 13's openssh-server ships and enables
+# sshd-keygen.service (ConditionFirstBoot=yes, `ssh-keygen -A`), and the
+# golden base's emptied machine-id makes the first boot a systemd first
+# boot, so it would generate RSA anyway. Masked in every family: Ubuntu
+# 24.04 does not ship the unit and Fedora / CS10 ship only the templated
+# sshd-keygen@.service (left alone; cloud-init's own drop-in skips it),
+# so there the mask is a no-op. cloud-init still writes the keys before
+# sshd starts (cloud-init-network.service is Before=sshd.service).
+sudo install -d -m 0755 "${MNT_ROOT}/etc/systemd/system"
+sudo ln -sfn /dev/null "${MNT_ROOT}/etc/systemd/system/sshd-keygen.service"
+
 # The root never grows in place, in either disk mode: a golden root is an
 # overlay whose upper is the guest-keyed /dev/mapper/hippius-overlay, and a
 # legacy root is LUKS2 --integrity, which `cryptsetup resize` refuses
@@ -3607,6 +3819,16 @@ done
 sshd_first="$(sudo find "${MNT_ROOT}/etc/ssh/sshd_config.d" -maxdepth 1 -name '*.conf' -printf '%f\n' | LC_ALL=C sort | head -n1)"
 [[ "${sshd_first}" == "${sshd_dropin##*/}" ]] \
     || { echo "FATAL: /etc/ssh/sshd_config.d/${sshd_first} sorts before ${sshd_dropin##*/} and would override it" >&2; exit 3; }
+# No RSA host key is generated (99-hippius-ssh-hostkeys.cfg): a base whose
+# sshd config names one explicitly would print a load error on every sshd
+# start. The default list (no HostKey line) skips a missing file silently.
+if sudo grep -rqsiE '^[[:space:]]*HostKey[[:space:]]+[^[:space:]]*rsa' \
+    "${MNT_ROOT}/etc/ssh/sshd_config" "${MNT_ROOT}/etc/ssh/sshd_config.d"; then
+    echo "FATAL: the guest's sshd config names an RSA HostKey, but cloud-init generates ed25519 + ecdsa only" >&2
+    exit 3
+fi
+[[ "$(sudo readlink "${MNT_ROOT}/etc/systemd/system/sshd-keygen.service")" == /dev/null ]] \
+    || { echo "FATAL: /etc/systemd/system/sshd-keygen.service is not masked to /dev/null (Debian's first-boot ssh-keygen -A would bring the RSA host key back)" >&2; exit 3; }
 # The root does not grow in place, and the headless masks are in place.
 sudo grep -qx "  mode: 'off'" "${MNT_ROOT}/etc/cloud/cloud.cfg.d/99-hippius-noresize.cfg" 2>/dev/null \
     && sudo grep -qx 'resize_rootfs: false' "${MNT_ROOT}/etc/cloud/cloud.cfg.d/99-hippius-noresize.cfg" \
@@ -3738,6 +3960,65 @@ if [[ "${profile}" == "cdn-node" ]]; then
     SUDO="${cdn_sudo}" bash "${CDN_INSTALL_SRC}" "${MNT_ROOT}" "${cdn_agent_bin}" \
         "${cdn_openresty_tarball}" "${cdn_config_dir}" "${cdn_backend_url}" "${cdn_fleet_wildcard}" \
         || die "cdn-node: data-plane staging failed (exit 3)"
+fi
+
+# ── ubuntu-runner profile ────────────────────────────────────────────
+# A normal tenant VM (sshd, unattended-upgrades and the rest unchanged)
+# with Docker and the runner's dependencies installed by the chroot above.
+# Gate that they landed and are enabled, then stage the data-path glue
+# (scripts/ubuntu-runner/install-ubuntu-runner.sh): Docker's and
+# containerd's state cannot sit on the overlay root. Then the pinned runner
+# tarball (RUNNER_TARBALL_*), as-is at RUNNER_TARBALL_DEST: in the
+# read-only verity base, which is fine for a file that is only read.
+if [[ "${profile}" == "ubuntu-runner" ]]; then
+    log "ubuntu-runner: checking Docker + runner dependencies, staging the data-path glue"
+    for f in /usr/bin/docker /usr/bin/dockerd /usr/bin/containerd /usr/bin/runc \
+             /usr/libexec/docker/cli-plugins/docker-buildx /usr/libexec/docker/cli-plugins/docker-compose \
+             /usr/bin/git /usr/bin/jq /usr/bin/curl; do
+        sudo test -x "${MNT_ROOT}${f}" || die "ubuntu-runner: ${f} missing from the guest (exit 3)"
+    done
+    for link in multi-user.target.wants/containerd.service multi-user.target.wants/docker.service \
+                sockets.target.wants/docker.socket; do
+        sudo test -L "${MNT_ROOT}/etc/systemd/system/${link}" \
+            || die "ubuntu-runner: ${link} is not enabled (exit 3)"
+    done
+    sudo test ! -e "${MNT_ROOT}/usr/sbin/policy-rc.d" \
+        || die "ubuntu-runner: the bake's policy-rc.d was left in the image (exit 3)"
+    sudo test -r "${MNT_ROOT}/etc/apt/keyrings/docker.asc" \
+        || die "ubuntu-runner: Docker's apt key missing from the guest (exit 3)"
+    runner_daemon_json="${MNT_ROOT}/etc/docker/daemon.json"
+    [[ "$(sudo stat -c '%u:%g %a' "${runner_daemon_json}" 2>/dev/null)" == "0:0 644" ]] \
+        || die "ubuntu-runner: /etc/docker/daemon.json missing or not root:root 0644 (exit 3)"
+    # Exact (semantic) match: snapshotter false, log-driver json-file,
+    # log-opts max-size "50m" / max-file "2" as strings, no data-root.
+    sudo cat "${runner_daemon_json}" | jq -e '. == {"features": {"containerd-snapshotter": false}, "log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "2"}}' >/dev/null \
+        || die "ubuntu-runner: /etc/docker/daemon.json is not the backend bootstrap's document (snapshotter false, json-file, 50m/2, no data-root) (exit 3)"
+    runner_sudo=sudo
+    if [[ ${EUID} -eq 0 ]]; then runner_sudo=""; fi
+    SUDO="${runner_sudo}" bash "${RUNNER_INSTALL_SRC}" "${MNT_ROOT}" \
+        || die "ubuntu-runner: data-path staging failed (exit 3)"
+    for f in /usr/local/sbin/hippius-runner-data \
+             /etc/systemd/system/hippius-runner-data.service \
+             /etc/systemd/system/multi-user.target.wants/hippius-runner-data.service \
+             /etc/systemd/system/docker.service.d/10-hippius-runner-data.conf \
+             /etc/systemd/system/containerd.service.d/10-hippius-runner-data.conf; do
+        sudo test -e "${MNT_ROOT}${f}" || die "ubuntu-runner: ${f} missing after staging (exit 3)"
+    done
+    runner_tarball="${WORK_DIR}/actions-runner.tar.gz"
+    log "ubuntu-runner: fetching runner tarball ${RUNNER_TARBALL_VERSION}"
+    runner_tarball_fetch "${runner_tarball}" || die "ubuntu-runner: runner tarball fetch failed (exit 3)"
+    runner_dest_dir="$(dirname -- "${RUNNER_TARBALL_DEST}")"
+    sudo install -d -m 0755 -o root -g root "${MNT_ROOT}${runner_dest_dir}"
+    sudo install -m 0644 -o root -g root "${runner_tarball}" "${MNT_ROOT}${RUNNER_TARBALL_DEST}"
+    rm -f -- "${runner_tarball}"
+    [[ "$(sudo stat -c '%u:%g %a' "${MNT_ROOT}${runner_dest_dir}")" == "0:0 755" ]] \
+        || die "ubuntu-runner: ${runner_dest_dir} is not root:root 0755 (exit 3)"
+    [[ "$(sudo stat -c '%u:%g %a' "${MNT_ROOT}${RUNNER_TARBALL_DEST}")" == "0:0 644" ]] \
+        || die "ubuntu-runner: ${RUNNER_TARBALL_DEST} is not root:root 0644 (exit 3)"
+    runner_got="$(sudo sha256sum "${MNT_ROOT}${RUNNER_TARBALL_DEST}" | awk '{print $1}')"
+    [[ "${runner_got}" == "${RUNNER_TARBALL_SHA256}" ]] \
+        || die "ubuntu-runner: ${RUNNER_TARBALL_DEST} has sha256 ${runner_got}, want ${RUNNER_TARBALL_SHA256} (exit 3)"
+    log "ubuntu-runner: ${RUNNER_TARBALL_DEST} staged (sha256 ${runner_got})"
 fi
 
 log "chroot install complete; root partition customised"

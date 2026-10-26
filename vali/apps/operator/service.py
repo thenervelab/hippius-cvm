@@ -68,9 +68,11 @@ from apps.miners.models import (
     MinerLaunchErrors,
     MinerLocation,
 )
+from apps.orchestration.services.flavors import RUNNER_FLAVOR_NAMES
+from apps.scheduler import cordon, storage_requirement
 from apps.scheduler import service as scheduler_service
-from apps.scheduler import storage_requirement
 from apps.scheduler.models import (
+    ACTIVE_PLACEMENT_STATES,
     MinerCapacity,
     Placement,
     PlacementFailureSource,
@@ -258,6 +260,39 @@ def _refusal_breakdown_by_node(
     return {nid: dict(sorted(counts.items())) for nid, counts in folded.items()}
 
 
+def hosted_runner_counts(node_ids: list[str]) -> dict[str, int]:
+    """`{lower-case node_id: active placements of a runner flavor}`."""
+    counts: dict[str, int] = {}
+    for nid in (
+        Placement.objects.annotate(nid=Lower("miner_node_id"))
+        .filter(
+            nid__in=node_ids,
+            status__in=ACTIVE_PLACEMENT_STATES,
+            resource_class__in=RUNNER_FLAVOR_NAMES,
+        )
+        .values_list("nid", flat=True)
+    ):
+        counts[nid] = counts.get(nid, 0) + 1
+    return counts
+
+
+def cordon_fields(row: MinerCapacity | None, *, staff_view: bool = False) -> dict[str, Any]:
+    """The cordon (`apps.scheduler.cordon`): whether one is in force, who
+    holds it, and why. As the node's owner may see it by default — their
+    own reason, or a short code for a staff / automatic one; `staff_view`
+    (the staff-only fleet readout) gives a staff / automatic cordon's stored
+    reason verbatim."""
+    view = cordon.view_of(row)
+    reason = view.public_reason
+    if staff_view and row is not None and view.source in (cordon.STAFF, cordon.AUTO):
+        reason = row.cordon_reason
+    return {
+        "cordoned": view.cordoned,
+        "cordon_source": view.source,
+        "cordon_reason": reason,
+    }
+
+
 def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
     """The status rows for `node_ids` (64-hex, any case). A `node_id` with
     no `MinerIdentity` bridged to it is simply absent from the result —
@@ -289,12 +324,14 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
     capacity_by_node, load_by_node, _family = scheduler_service.decision_inputs("")
 
     by_id = {m.nid: m for m in identities}  # type: ignore[attr-defined]
-    agent_version_by_node = {
-        nid.lower(): (version or None)
-        for nid, version in MinerCapacity.objects.annotate(nid=Lower("miner_node_id"))
-        .filter(nid__in=list(by_id))
-        .values_list("nid", "agent_version")
+    capacity_rows = {
+        row.nid: row  # type: ignore[attr-defined]  # annotated column
+        for row in MinerCapacity.objects.annotate(nid=Lower("miner_node_id")).filter(
+            nid__in=list(by_id)
+        )
     }
+    agent_version_by_node = {nid: (row.agent_version or None) for nid, row in capacity_rows.items()}
+    runners_by_node = hosted_runner_counts(list(by_id))
     refusals_by_node = _recent_refusals_by_node(list(by_id))
     breakdown_by_node = _refusal_breakdown_by_node(list(by_id), since=now - REFUSAL_COUNT_WINDOW)
     probes_by_node = per_miner.operator_readout(list(by_id))
@@ -329,6 +366,13 @@ def operator_node_rows(node_ids: list[str]) -> list[dict[str, Any]]:
                 # Active placements (pending + bound) — vali's own ledger of
                 # what it put on this host; never the miner's claim.
                 "hosted_vm_count": load,
+                # Of those, the backend's CI runner VMs (they finish on their
+                # own) and everything else — customer VMs, which a cordon
+                # never stops or moves: they stay until migrated or stopped
+                # by their owners.
+                "hosted_runner_vm_count": runners_by_node.get(nid, 0),
+                "hosted_customer_vm_count": max(0, load - runners_by_node.get(nid, 0)),
+                **cordon_fields(capacity_rows.get(nid)),
                 "capacity": (
                     {"total_units": total, "committed_units": load} if total is not None else None
                 ),

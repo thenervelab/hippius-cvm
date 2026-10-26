@@ -31,4 +31,15 @@ ignore = [
     # The only 0.26 consumer is ureq 2.x (every 2.x release pins 0.26);
     # remove this entry when ureq >= 3.1 lands (#1721).
     "RUSTSEC-2026-0381",
+    # RUSTSEC-2026-0387 — timing variability in crypto-bigint 0.5.5
+    # "constant-time" ops; fixed in >= 0.7.6. Reached only via
+    # elliptic-curve 0.13 from (a) p384, which kbs-core uses solely to
+    # VERIFY the AMD VCEK signature on SNP reports (public key, public
+    # data — signing with p384 exists only in a unit test), and (b) k256
+    # pulled by frame-support/sp-core (polkadot-sdk stable2407) for the
+    # pallets, where no node-side secret-key EC operation runs from our
+    # binaries. A timing leak needs a secret operand, so not exploitable
+    # here. The 0.7 line needs elliptic-curve 0.14 (p384 0.14 + a
+    # polkadot-sdk bump); remove this entry when both land.
+    "RUSTSEC-2026-0387",
 ]

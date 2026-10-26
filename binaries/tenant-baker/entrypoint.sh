@@ -141,10 +141,19 @@ esac
 # flag passed). `cdn-node` bakes the CDN cache-node image from the data
 # plane this image carries (/usr/sbin/hippius-cdn-agent and
 # /usr/local/share/hippius/cdn-node/), and needs BAKE_CDN_BACKEND_URL
-# (vali's VALI_CDN_BACKEND_URL) and the golden disk mode.
+# (vali's VALI_CDN_BACKEND_URL) and the golden disk mode. `ubuntu-runner`
+# bakes the CI-runner image (standard ubuntu golden + Docker + the GitHub
+# Actions runner's dependencies); it needs the golden disk mode and takes
+# no extra input (the bake itself refuses a non-Ubuntu base).
 BAKE_PROFILE="${BAKE_PROFILE:-standard}"
 case "${BAKE_PROFILE}" in
     standard) ;;
+    ubuntu-runner)
+        if [[ "${BAKE_DISK_MODE}" != "golden_verity_overlay" ]]; then
+            log "FATAL: BAKE_PROFILE=ubuntu-runner needs BAKE_DISK_MODE=golden_verity_overlay"
+            exit 64
+        fi
+        ;;
     cdn-node)
         if [[ "${BAKE_DISK_MODE}" != "golden_verity_overlay" || -z "${BAKE_CDN_BACKEND_URL:-}" ]]; then
             log "FATAL: BAKE_PROFILE=cdn-node needs BAKE_DISK_MODE=golden_verity_overlay and BAKE_CDN_BACKEND_URL"
@@ -152,7 +161,7 @@ case "${BAKE_PROFILE}" in
         fi
         ;;
     *)
-        log "FATAL: BAKE_PROFILE must be standard or cdn-node (got '${BAKE_PROFILE}')"
+        log "FATAL: BAKE_PROFILE must be standard, cdn-node or ubuntu-runner (got '${BAKE_PROFILE}')"
         exit 64
         ;;
 esac
@@ -435,6 +444,9 @@ if [[ "${BAKE_PROFILE}" == "cdn-node" ]]; then
     if [[ -n "${BAKE_CDN_FLEET_WILDCARD:-}" ]]; then
         BAKE_ARGS+=(--cdn-fleet-wildcard "${BAKE_CDN_FLEET_WILDCARD}")
     fi
+fi
+if [[ "${BAKE_PROFILE}" == "ubuntu-runner" ]]; then
+    BAKE_ARGS+=(--profile ubuntu-runner)
 fi
 if [[ "${BAKE_DISK_MODE}" == "golden_verity_overlay" ]]; then
     /usr/local/bin/tenant-image-bake.sh "${BAKE_ARGS[@]}"

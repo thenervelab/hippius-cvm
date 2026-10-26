@@ -57,10 +57,13 @@ Two signals, with different trust and different jobs:
 | Operator-requested probe (announced by definition) | un-throttle for it | It runs at a random time 6-48 h later, at most once per 7 days per node. It may lower or confirm a tier; an upgrade, or lifting `degraded`, needs the next unannounced probe to pass too. |
 | Swap or substitute a dedicated disk | serve another disk's data, or an empty one | The agent binds the by-id name to the device WWN/serial (honest agent). The guest records each slot's LUKS UUID on the integrity-protected OS disk and refuses to format or open a slot whose header is missing or different (`dedicated-disk-mismatch`). The miner cannot forge that record. It CAN replay this slot's own ciphertext (header included) onto another disk: that is the corruption/rollback residual risk below, never a confidentiality loss (§4.2.1). |
 
-**Dedicated disks, residual risk.** They use LUKS2 AES-XTS without
-dm-integrity (an integrity wipe at 18+ TB is not workable). The miner never
-reads the data, but it **can corrupt sectors or roll them back** to older
-ciphertext undetected, and it sees which blocks are written. Customers who
+**Dedicated disks, residual risk.** By default they use LUKS2 AES-XTS
+without dm-integrity (an integrity wipe at 18+ TB is not workable). An
+integrity slot (`:i`, guest release 8, §4.2.1) adds AEAD (hmac-sha256): a
+corrupted or relocated sector reads as an I/O error, but a sector rolled
+back to an OLDER version of itself still verifies. Without it the miner
+never reads the data, but it **can corrupt sectors or roll them back** to
+older ciphertext undetected, and it sees which blocks are written. Customers who
 need authenticity run ZFS/btrfs checksums or dm-integrity on top; the
 console says so. On release the LUKS header areas are overwritten and the
 disk is re-probed before reuse; even without that, the old keyslot is
@@ -279,7 +282,8 @@ A **pool** is a miner-declared mounted filesystem:
   every slot; erasing `kek-<vm_id>` crypto-erases every slot, in the
   customer-held key modes too. First boot of a slot: LUKS2 AES-XTS-plain64,
   512-bit, no integrity (instant), with `{slot, luks_uuid, size}` recorded
-  on the OS disk. Later boots open by virtual serial and require the
+  on the OS disk; an integrity slot (`:i`) adds hmac-sha256 and a
+  first-boot wipe in the booted OS (§4.2.1). Later boots open by virtual serial and require the
   recorded UUID. **No filesystem is created**: RAID and filesystems are the
   customer's; a `hippius-disks` helper lists slots and prints example
   mdadm/ZFS commands (never runs them).
@@ -289,7 +293,7 @@ A **pool** is a miner-declared mounted filesystem:
   absent slot is `missing`: boot continues, the customer's array runs
   degraded, an alert fires.
 
-### 4.2.1 Guest implementation (G3/G4, guest release 6)
+### 4.2.1 Guest implementation (G3/G4, guest release 6; integrity slots, release 8)
 
 **Where it runs: the golden initramfs.** `hippius_golden_open_dedicated`
 (`scripts/initramfs/hippius-golden-overlay.sh`) runs inside the boot
@@ -309,11 +313,19 @@ every slot, reported `mismatch` on each `virtio-hippius-x*` device, and
 nothing is opened):
 
 ```
-hippius.dedicated=<slot>:<GiB>[,<slot>:<GiB>]…      exactly one token
+hippius.dedicated=<entry>[,<entry>]…                exactly one token
+  <entry> = <slot>:<GiB>          a plain slot (exactly as in release 6/7)
+          | <slot>:<GiB>:i        an integrity slot (release 8)
   <slot> = x[0-9]{1,2}, no leading zero, ≤ x23 (what the receipt wire carries)
   <GiB>  = decimal, no leading zero, 1000 ≤ GiB ≤ 1048576 (the size class)
   1..8 entries, slots unique; hippius.vm_id= present exactly once
 ```
+
+vali emits `:i` only for integrity slots, so a cmdline without one is
+byte-identical. Any other suffix (`:I`, `:`, `:ii`, a fourth field) refuses
+every slot (`anchor-mode` / `anchor-entry`). A release before 8 reads
+`x0:22300:i` as a bad size and refuses every slot too: it never formats or
+opens an integrity slot.
 
 A `/proc/cmdline` at the kernel limit (2047) whose last token is the
 anchor is refused (it may have lost its tail).
@@ -361,9 +373,14 @@ covered by the stamp, outside the tenant's merged root:
 hippius-dedicated-disks v1
 x0 ready 0b6f8a52-61d4-4c9e-9f2b-3f6e0a1c2d4e 22300
 x1 formatting 7c1e0d9a-2b3f-4a5c-8d6e-9f0a1b2c3d4e 22300
+x2 ready 5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d 3500 integrity
 ```
 
-Entries are never removed (slots are never reused). An unreadable or
+An integrity slot's line carries a 5th field, `integrity`; a plain slot's
+line is exactly release 6/7's (a release-7 guest reading a record with an
+integrity line refuses the record: it never opens anything). The anchor
+and the record must agree on the mode, else `mismatch mode-mismatch`,
+untouched. Entries are never removed (slots are never reused). An unreadable or
 malformed record opens and formats nothing (every present slot
 `mismatch record-*`).
 
@@ -384,7 +401,117 @@ close itself fail, the slot is reported `record-write-failed-mapped`; a
 later re-format of that slot writes the same header, same UUID, same
 derived key and data offset, and touches no data sector.)
 
+**Integrity slots (`:i`, guest release 8).** LUKS2 with AEAD, the OS
+overlay volume's family: aes-xts-plain64 + hmac-sha256, the same pinned
+layout (16 MiB, 4096-byte sectors). The 96-byte volume key (512-bit XTS ‖
+256-bit HMAC, the keyslot reports 768 bits) is `HKDF-SHA256(KEK, salt =
+"hippius-dedicated-disk-aead-v1", info = vm_id‖slot)`, its own salt so it
+shares no byte with a plain derivation; the keyslot passphrase is the same
+96 bytes. The metadata check requires the segment's `integrity` to be
+exactly `{"type": "hmac(sha256)", "journal_encryption": "none",
+"journal_integrity": "none"}` (and a plain slot's to be absent), so the
+host can neither strip the AEAD off a slot nor add one. The live check
+requires `cryptsetup status` to say hmac(sha256), a 768-bit key and 4096-byte
+sectors, and the stack in sysfs to be the crypt mapping on exactly one
+`<name>_dif` dm-integrity layer on exactly the slot's device. Both modes
+(release 8) also require the header's segment to be `"size": "dynamic"`,
+`"iv_tweak": "0"`, and the ACTIVE mapping to be at least `GiB × 2^30 − 16
+MiB` (97 % of that for an integrity slot, whose tags and journal take ≤ 1.6
+%): the host could otherwise shrink a slot under its size class through
+the header's segment size or the dm-integrity superblock.
+
+dm-integrity reads a never-written sector as an I/O error, so every sector
+is written once on the first boot (about an hour for 3.5 TB of NVMe). That
+must not hold the boot, and the KEK must not leave the initramfs, so:
+
+1. *Initramfs* (`--open-dedicated-disks`): record `formatting <U>
+   integrity` first, `luksFormat --integrity hmac-sha256
+   --integrity-no-wipe` (instant), then — udev's event queue paused — open
+   by volume key from the verified header copy as
+   `hippius-<slot>-init` with `--integrity-no-journal`, check the live
+   stack, write zeros through it at both ends (8 MiB each: everything
+   blkid / md / LVM / ZFS probes for), resume udev. No probe ever reads an
+   unwritten sector (each would log an AEAD error, and an integrity error
+   must only ever mean tampering). The slot is reported `initializing`
+   (`init-0`) and listed in `/run/hippius/dedicated/init`.
+2. *Booted OS* (`hippius-dedicated-init.service`, started by that list,
+   `Type=exec`, off the boot path): `hippius-guest-release
+   --dedicated-init-wipe` checks each listed slot (state `initializing`,
+   record `formatting <U> integrity`, the `-init` mapping's dm UUID names
+   LUKS volume `<U>`; else closed, `mismatch init-mismatch`), writes zeros
+   through the mapping (the OS overlay's parallel wipe, all slots at once
+   within its 8 × 4 MiB writers budget), keeping `init-<percent>` in the
+   state file current, then records `ready` (fsync'd), switches the
+   dm-integrity layer to its journal (`dmsetup` table reload, mode `D` →
+   `J`: the integrity layer holds no key) and renames the stack
+   `hippius-<slot>` (+ `_dif`), and reports `attached`. The record is
+   reached by mounting the OS volume's device again in the unit's private
+   mount namespace (`PrivateMounts=yes`), never through the tenant's root.
+   A failed journal switch or rename only degrades that boot
+   (`attached no-journal-this-boot` / `attached init-name`); every later
+   boot opens journaled, by name.
+
+This is cryptsetup's own end state (every sector written once through the
+AEAD under our key, every tag valid), as for the OS overlay; only the
+writers and the place differ. Record transitions:
+
+| record says | header | initramfs does |
+|---|---|---|
+| nothing | blank (no header, no signature) | `formatting U integrity`, format, open `-init`, prime ⇒ `initializing` |
+| `formatting U integrity` | none, or ours (`U`) | the wipe never finished, nothing was ever handed over: format again (same U, same key), open `-init` ⇒ `initializing` (from scratch) |
+| `ready U integrity` | `U` | open journaled as `hippius-<slot>` ⇒ `attached` (never re-wiped) |
+| `ready U integrity` | none / `U'` | `mismatch no-header` / `uuid-mismatch` |
+| either, plain line | — | `mismatch mode-mismatch` |
+
+*Key hand-over: none.* The KEK and the slot key stay in the initramfs
+process (`Zeroizing`, down a pipe to `cryptsetup`) exactly as for a plain
+slot; what crosses `switch_root` is the open device-mapper mapping, which is
+what the tenant gets anyway. A kernel-keyring hand-over was considered and
+rejected: cryptsetup verifies a volume key against the header digest in
+userspace, so `--volume-key-keyring` needs a readable `user` key, not a
+`logon` one; a root-readable slot key would sit in the tenant's own trust
+domain (it already reads the plaintext), but there is no reason to put it
+anywhere when the mapping suffices. Nothing booted ever holds the KEK, so
+no other slot or VM is exposed. (In-guest root can read kernel memory, the
+dm-crypt keys included, as for every open volume: within the tenant's own
+domain.)
+
+**HKDF vector, integrity slots** (same independent computation),
+salt = `hippius-dedicated-disk-aead-v1`, L = 96:
+
+| info | OKM |
+|---|---|
+| `vm-0123456789abcdefx0` | `b1f729170f6760e4c0fb526a682611c23ab3d149a59344fe9ef9047d0fe1371053a1943cd139ab58e22b657cbd42713a9462620505a44504b1cfe7d4a1a6529265c0533a6eebd3573206a18ee6d30cd8e621c176d3d77fab97d45540b03ab9ae` |
+| `vm-0123456789abcdefx1` | `37e755d526b5d9edf239d994f0e2879691dc092a903ec5720c8d0600e0eed56c3170065cfecc1e7e65a52f14afbaf25cd4114750ae5a71f3aaa3a454f8191f52ce10810cfec1bd6f5df2d2f63decf4bc89ad994a30961ac092c5d4464559d9e2` |
+| `vm-fedcba9876543210x0` | `3402c6a31afda15640e47a7d77d9976dc247729c4e5ba84632a8ecbcffdc32f4084fd41050e8e5c83c62f3ccab1036bd56cd55d6c0a85201ae0a0806eb876f977d1be677f5e439e26199c526cfad7bc8edd31d82321f879d7c02815cbe9891a7` |
+
 **Residual limits** (none gives the miner plaintext or a key):
+
+- *Integrity slots: per-sector rollback.* The tag binds a sector's
+  ciphertext to its position and key, not to time: the host can put back
+  an older version of a sector (with its older tag) and it verifies.
+  Tampering, relocation and a blank disk read as I/O errors. The
+  dm-integrity superblock and journal are unauthenticated metadata, as on
+  the OS overlay: forging them can only make sectors unreadable or replay
+  old (sector, tag) pairs.
+- *Integrity slots: a rolled-back record re-initialises the slot.* The
+  record is on the OS volume, whose AEAD is per sector: a host that puts
+  back the record file's older sectors (from before `ready`) gets the guest
+  to treat the slot as never initialised and format + wipe it again. That
+  is destruction the host could always cause, but it then looks like a
+  first boot (`initializing`) instead of leaving I/O errors. vali sees it:
+  a slot never goes from `attached` back to `initializing` honestly (slots
+  are never reused), so that transition in the receipts is tamper evidence
+  and must alert.
+- *Integrity slots: the booted OS needs `dmsetup`.* Every golden base has
+  it (Debian/Ubuntu's cryptsetup depends on it, dracut's dm module needs
+  it). A tenant that removes it gets `attached no-journal-this-boot` /
+  `init-name` for that boot only.
+- *Integrity slots: one boot without a journal.* The wipe runs journal-less
+  (as cryptsetup's does); a crash during it restarts the wipe anyway. If
+  the journal switch fails after the wipe, that boot runs journal-less
+  (`no-journal-this-boot`): a crash mid-write can then leave a torn
+  sector that reads as an I/O error.
 
 - *Replay.* Without integrity, nothing binds a header to the data behind
   it. A miner can copy this slot's own header (or any of its ciphertext)
@@ -416,11 +543,16 @@ derived key and data offset, and touches no data sector.)
   for a forged one).
 
 **Reporting.** The opener writes `/run/hippius/dedicated/slots` (tmpfs,
-`<slot> <attached|missing|mismatch> <GiB> <dev|-> <reason>` per line). The
-telemetry agent folds it into every receipt's `disk_io` (T1 wire, no type
-change): an attached slot is its device with state `ok`, `mismatch` on the
-slot's device, `missing` with no device and zero counters, and an attached
-slot whose device later vanishes becomes `missing`. Every slot rides the
+`<slot> <attached|missing|mismatch|initializing> <GiB> <dev|-> <reason>`
+per line; an `initializing` line's reason is `init-<percent>`, kept current
+by the booted OS's wipe). The telemetry agent folds it into every receipt's
+`disk_io`: an attached slot is its device with state `ok`, `mismatch` on the
+slot's device, `missing` with no device and zero counters, `initializing`
+on the slot's device with its counters and the optional integer
+`init_percent` (0..=100; release 8, an additive key of the T1 wire, absent
+on every other entry so older entries are byte-identical; the ticket
+validator passes it through to vali only when set), and an attached or
+initializing slot whose device later vanishes becomes `missing`. Every slot rides the
 first receipt (zero counters when there is no window yet) and wins a full
 list. vali maps receipt `ok` to `attached`; `failed` stays vali's own
 verdict. Like all `disk_io`, these are in-VM-root-forgeable: a tenant can
@@ -458,6 +590,43 @@ formats). Steps, in order:
    pinned VM onto a build below 6 (the epoch floor does not hold it there).
 6. X2′ on an internal VM with a spare disk: first boot formats, reboot
    reopens, `hippius-disks` lists, receipts carry the slot, §24 erases.
+
+**Shipping (guest components release 8: integrity slots, `/dev/vsock`
+0600).** Same artefact shape as release 6/7, plus, in
+`components.squashfs`, `bin/hippius-guest-release` (the booted-OS wipe),
+`units/hippius-dedicated-init.service` and `udev/99-hippius-vsock.rules`
+(linked into `/etc/udev/rules.d` by the boot step from the record's new
+`udev=` line). `security_epoch` stays 1: release 8 changes no volume a
+release 7 cannot read back — a plain slot, its record line and its format
+are byte-identical, and an older release refuses an integrity anchor or
+record line outright (never formats, never opens). vali holds integrity
+slots to release 8 instead (below). The hippius-types `disk_io` change
+moves the UKI KATs (re-pinned in the PR from its own CI). Steps, in order:
+
+1. Merge (release.conf `version=8`); the `tenant-baker-image` workflow
+   builds and signs the baker image at that commit (note its digest).
+2. Per live base (as for release 6/7: ubuntu-b5, ubuntu-b4, debian-b5,
+   debian-3 initrd, fedora-b5, cs10-b5): the one-off `guest-initrd-build.sh
+   --build-release --commit <C> --source-date-epoch <commit time>` Job,
+   output prefix `tenant/<base prefix>-gr8-<short>/`; then
+   `vali_guest_build_register --from-s3-prefix tenant/<base prefix>-gr8-<short>/`.
+3. Canary per family (ubuntu, debian, fedora, cs10): `vali_guest_upgrade
+   --vm-id <throwaway> --release 8` (dry-run, `--apply`, `--status`); check
+   health 15, receipts flowing, `stat -c '%a %U:%G' /dev/vsock` = `600
+   root:root`, every agent active, and on a VM without dedicated disks no
+   `dedicated` line in the boot log and `hippius-dedicated-init.service`
+   skipped (condition).
+4. `vali_bless_guest_release <image> --release 8 --blessed-by …` per image.
+5. vali: integrity slots need `guest_release ≥ 8`
+   (`dedicated-needs-release`, as the release-6 gate for plain slots), and
+   a pinned VM with an integrity slot is never relaunched onto a build
+   below 8. Receipts: `disk_io` state `initializing` + `init_percent` ⇒
+   `guest_state: initializing` + its percent; a slot going `attached` →
+   `initializing` alerts (tamper evidence, residual limits above).
+6. X2′ with `:i` on an internal VM with a spare disk: boot is not held,
+   `initializing` with a rising percent in receipts, then `attached`; a
+   reboot during the wipe restarts it; a full read after it succeeds;
+   reboot reopens (same UUID); §24 erases.
 
 ### 4.3 Data model (`vali/apps/disktier`)
 

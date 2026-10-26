@@ -307,6 +307,7 @@ COPY scripts/initramfs/hippius-luks-keyscript \
      scripts/initramfs/hippius-host-state-hook \
      scripts/initramfs/hippius-dhcp-clientid-hook \
      scripts/initramfs/hippius-net-teardown \
+     scripts/initramfs/hippius-trace-after-udev \
      scripts/initramfs/hippius-release-core.sh \
      scripts/initramfs/hippius-golden-overlay.sh \
      scripts/initramfs/hippius-golden-boot \
@@ -321,6 +322,7 @@ RUN chmod 0755 \
         /usr/local/bin/initramfs/hippius-host-state-hook \
         /usr/local/bin/initramfs/hippius-dhcp-clientid-hook \
         /usr/local/bin/initramfs/hippius-net-teardown \
+        /usr/local/bin/initramfs/hippius-trace-after-udev \
         /usr/local/bin/initramfs/hippius-release-core.sh \
         /usr/local/bin/initramfs/hippius-golden-overlay.sh \
         /usr/local/bin/initramfs/hippius-golden-boot \
@@ -418,6 +420,9 @@ COPY packer/cdn-node/openresty/lua/ /usr/local/share/hippius/cdn-node/openresty-
 COPY packer/cdn-node/openresty/nginx.conf.in packer/cdn-node/openresty/origin.conf packer/cdn-node/openresty/render.sh /usr/local/share/hippius/cdn-node/openresty-config/
 COPY --from=openresty-builder /out/geoip/ /usr/local/share/hippius/cdn-node/openresty-config/geoip/
 COPY scripts/cdn-node/ /usr/local/bin/cdn-node/
+# The ubuntu-runner bake profile's data-path glue (Docker state off the
+# overlay root). Inert for every other bake.
+COPY scripts/ubuntu-runner/ /usr/local/bin/ubuntu-runner/
 
 WORKDIR /work
 

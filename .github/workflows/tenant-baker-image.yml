@@ -54,6 +54,7 @@ on:
       - "scripts/guest/**"
       - "packer/cdn-node/openresty/**"
       - "scripts/cdn-node/**"
+      - "scripts/ubuntu-runner/**"
       - "binaries/cdn-agent/**"
       - "binaries/guest-release/**"
       - "binaries/vsock-ticket/**"
@@ -79,6 +80,7 @@ on:
       - "scripts/guest/**"
       - "packer/cdn-node/openresty/**"
       - "scripts/cdn-node/**"
+      - "scripts/ubuntu-runner/**"
       - "binaries/cdn-agent/**"
       - "binaries/guest-release/**"
       - "binaries/vsock-ticket/**"
@@ -104,6 +106,14 @@ permissions:
 
 env:
   IMAGE: ghcr.io/thenervelab/hippius-tenant-baker
+  # Publish = push to GHCR + cosign-sign. ONLY a build of reviewed code may
+  # publish: a push to main, a `v*` tag, or a workflow_dispatch run ON main.
+  # A pull_request (or a dispatch from any other branch) builds and discards:
+  # a pushed + keyless-signed image of unreviewed code would carry the same
+  # workflow identity as a main build (hippius-audits#12).
+  # verify-gitops-signatures.yml only accepts `@refs/heads/main` /
+  # `@refs/tags/v*` identities, so nothing else could be deployed anyway.
+  PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
 
 jobs:
   tenant-baker-image:
@@ -130,6 +140,7 @@ jobs:
       # — needs HIPPIUS_REGISTRY_USERNAME/PASSWORD secrets +
       # a parallel cluster pull secret bootstrapped first.
       - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -137,6 +148,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign (version pinned)
+        if: env.PUBLISH == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: "v3.0.6"
@@ -165,12 +177,10 @@ jobs:
           context: .
           file: binaries/tenant-baker/Dockerfile
           platforms: linux/amd64
-          # Skip the push on pull_request — every PR run validates
-          # the build but only main + tags ship a registry-pushed
-          # image. Same posture as vali-image.yml's GitHub-hosted
-          # runner (PRs from forks would hit `permission: packages:
-          # write` denial if `push: true` here).
-          push: ${{ github.event_name != 'pull_request' }}
+          # Skip the push unless PUBLISH (see `env:`) — every PR run
+          # validates the build but only main + tags ship a
+          # registry-pushed image.
+          push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.tags.outputs.tags }}
           # Single-arch image, no provenance manifest — keeps the
           # pushed digest a plain image digest the Helm chart pins
@@ -178,13 +188,13 @@ jobs:
           provenance: false
 
       - name: Sign the image (cosign keyless)
-        if: ${{ github.event_name != 'pull_request' }}
+        if: env.PUBLISH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Report the pushed digest
-        if: ${{ github.event_name != 'pull_request' }}
+        if: env.PUBLISH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |

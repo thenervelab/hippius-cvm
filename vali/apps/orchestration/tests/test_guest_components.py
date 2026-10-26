@@ -427,12 +427,199 @@ def test_epochs_never_decrease_with_the_version() -> None:
 
 
 def test_a_build_re_registered_with_another_base_is_refused() -> None:
+    """Another bake id on the same base and prefix is no second base: the
+    release-per-base and prefix uniques refuse it."""
     _register()
     forged = _doc(initrd_rebuild__source_bake_id="another-bake")
-    with pytest.raises(guest_components.BuildRejected, match="source_bake_id"):
+    with pytest.raises(guest_components.BuildRejected, match="already registered"):
         guest_components.register_build(
             guest_components.parse_build(forged, bucket=BUCKET, prefix=PREFIX)
         )
+    assert GuestInitrdBuild.objects.count() == 1
+
+
+# ── one initrd, several base bakes ───────────────────────────────────
+
+B2 = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+B2_PREFIX = "tenant/golden-ubuntu-b2-gr1-abcdef"
+
+
+def _b2_doc(**overrides: Any) -> dict[str, Any]:
+    """Bake b2 reuses b1's kernel and initrd: the same release build is
+    byte-identical, on b2's own rootfs / verity / prefix."""
+    fields = {
+        "bake_id": B2,
+        "initrd_rebuild__source_bake_id": B2,
+        "rootfs_img_sha256": "a2" * 32,
+        "rootfs_verity_sha256": "b2" * 32,
+        "verity_root_hash": "c2" * 32,
+        "s3_key_prefix": B2_PREFIX,
+    }
+    fields.update(overrides)
+    return _doc(**fields)
+
+
+def _register_b2(doc: dict[str, Any] | None = None) -> tuple[GuestInitrdBuild, bool]:
+    doc = doc or _b2_doc()
+    return guest_components.register_build(
+        guest_components.parse_build(doc, bucket=BUCKET, prefix=doc["s3_key_prefix"])
+    )
+
+
+def test_one_initrd_registers_once_per_base_bake() -> None:
+    b1 = _register()
+    b2, created = _register_b2()
+    assert created
+    assert b1.initrd_sha256 == b2.initrd_sha256
+    assert GuestInitrdBuild.objects.count() == 2
+    for bake, prefix, rootfs in (
+        (DOC["bake_id"], PREFIX, DOC["rootfs_img_sha256"]),
+        (B2, B2_PREFIX, "a2" * 32),
+    ):
+        row = GuestInitrdBuild.objects.get(initrd_sha256=b1.initrd_sha256, source_bake_id=bake)
+        assert (row.s3_key_prefix, row.rootfs_img_sha256) == (prefix, rootfs)
+        assert row.measurement["s3_key_prefix"] == prefix
+        assert row.measurement["rootfs_img_sha256"] == rootfs
+    # Both resolve the initrd-bound answers alike, whichever row is read.
+    assert guest_components.base_initrd_of(b1.initrd_sha256) == b1.base_initrd_sha256
+    assert guest_components.epoch_of_initrd(b1.initrd_sha256) == b1.release.security_epoch
+
+
+def test_the_same_initrd_and_bake_is_idempotent_and_immutable() -> None:
+    _register()
+    b2, _ = _register_b2()
+    again, created = _register_b2()
+    assert (again.pk, created) == (b2.pk, False)
+    for overrides, needle in (
+        ({"rootfs_img_sha256": "a3" * 32}, "rootfs_img_sha256"),
+        ({"verity_root_hash": "c3" * 32}, "verity_root_hash"),
+        ({"extra_field": "tampered"}, "measurement"),
+    ):
+        with pytest.raises(guest_components.BuildRejected, match=needle):
+            _register_b2(_b2_doc(**overrides))
+    moved = _b2_doc(s3_key_prefix=B2_PREFIX + "-copy")
+    with pytest.raises(guest_components.BuildRejected, match="s3_key_prefix"):
+        _register_b2(moved)
+    assert GuestInitrdBuild.objects.count() == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"initrd_rebuild__source_initrd_sha256": "4e" * 32}, "base_initrd_sha256"),
+        (
+            {
+                "guest_release__family": "dracut",
+                "initrd_rebuild__family": "dracut",
+                "guest_release__release_cpio_sha256": "7a" * 32,
+            },
+            "family, release_cpio_sha256",
+        ),
+    ],
+)
+def test_another_bake_cannot_give_one_initrd_other_initrd_bound_fields(overrides, needle) -> None:
+    """What the initrd bytes determine is the same on every bake's build:
+    `build_for_initrd` reads it off whichever row it finds."""
+    _register()
+    with pytest.raises(guest_components.BuildRejected, match=needle):
+        _register_b2(_b2_doc(**overrides))
+    assert GuestInitrdBuild.objects.count() == 1
+
+
+def test_another_bake_cannot_give_one_initrd_another_release() -> None:
+    _register()
+    later = _b2_doc(
+        guest_release__version=DOC["guest_release"]["version"] + 1,
+        guest_release__security_epoch=DOC["guest_release"]["security_epoch"],
+    )
+    with pytest.raises(guest_components.BuildRejected, match="release"):
+        _register_b2(later)
+    assert GuestInitrdBuild.objects.count() == 1
+
+
+def test_a_registration_holds_the_initrd_lock_before_its_sibling_check(monkeypatch) -> None:
+    """Postgres: the per-initrd advisory lock is taken inside the
+    registration's transaction, before the sibling check reads and the
+    build is inserted (statement order captured; the lock SQL itself is
+    not run on the SQLite test DB)."""
+    from django.db import connection, connections
+
+    monkeypatch.setattr(connections["default"], "vendor", "postgresql")
+    seen: list[tuple[str, Any]] = []
+
+    def wrapper(execute, sql, params, many, context):
+        seen.append((sql, params))
+        if "pg_advisory_xact_lock" in sql:
+            return None
+        return execute(sql, params, many, context)
+
+    with connection.execute_wrapper(wrapper):
+        _register()
+    locks = [i for i, (sql, _) in enumerate(seen) if "pg_advisory_xact_lock" in sql]
+    assert len(locks) == 1
+    assert seen[locks[0]][1] == [
+        guest_components._INITRD_LOCK_CLASS,
+        int.from_bytes(bytes.fromhex(DOC["initrd_sha256"][:8]), "big", signed=True),
+    ]
+    insert = next(
+        i
+        for i, (sql, _) in enumerate(seen)
+        if sql.startswith("INSERT") and "guestinitrdbuild" in sql.lower()
+    )
+    sibling_read = next(
+        i
+        for i, (sql, _) in enumerate(seen)
+        if sql.startswith("SELECT") and "guestinitrdbuild" in sql.lower()
+    )
+    assert locks[0] < sibling_read < insert
+
+
+def test_status_reports_the_prefix_the_vm_booted_not_another_bakes() -> None:
+    """A VM on b2's build of a shared initrd: the newest row for that
+    initrd is b1's (registered last), but the status names b2's prefix."""
+    from apps.orchestration import guest_upgrade
+
+    b2_r1, _ = _register_b2()
+    b1_r1 = _register()
+    assert guest_components.build_for_initrd(b1_r1.initrd_sha256).pk == b1_r1.pk
+    vm = _running_vm("vm-on-b2")
+    record = make_launch_record(vm, disk_mode="golden_verity_overlay")
+    record.spec_json = {
+        **(record.spec_json or {}),
+        "s3_key_prefix": b2_r1.s3_key_prefix,
+        "initrd_sha256_hex": b2_r1.initrd_sha256,
+    }
+    record.save(update_fields=["spec_json"])
+    status = guest_upgrade.components_of(vm)
+    assert status["build_prefix"] == B2_PREFIX
+    assert status["release"] == b2_r1.release_id
+
+
+def test_on_this_base_reads_the_vms_own_bake_build_of_a_shared_initrd() -> None:
+    """A VM on b2's r1 moving to b2's r2: its current initrd is also b1's
+    r1 build. The newest row for that initrd is b1's (registered last); the
+    check must still find b2's, and never accept another base."""
+    from apps.orchestration import guest_upgrade
+
+    b2_r1, _ = _register_b2()
+    b1_r1 = _register()
+    assert guest_components.build_for_initrd(b1_r1.initrd_sha256).pk == b1_r1.pk
+    b2_r2, _ = _register_b2(
+        _b2_doc(
+            guest_release__version=2,
+            initrd_sha256="d2" * 32,
+            s3_key_prefix=B2_PREFIX + "-r2",
+        )
+    )
+    assert guest_upgrade._on_this_base(b2_r1.initrd_sha256, b2_r2)
+    other_base = GuestInitrdBuild(
+        kernel_sha256=b2_r2.kernel_sha256,
+        rootfs_img_sha256="a9" * 32,
+        rootfs_verity_sha256="b9" * 32,
+        verity_root_hash="c9" * 32,
+        base_initrd_sha256=b2_r2.base_initrd_sha256,
+    )
+    assert not guest_upgrade._on_this_base(b2_r1.initrd_sha256, other_base)
 
 
 # ── the floor at the register, under the row lock ────────────────────

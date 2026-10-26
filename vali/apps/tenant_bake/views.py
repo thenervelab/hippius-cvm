@@ -587,15 +587,22 @@ def _parse_create(body: dict[str, Any]) -> dict[str, Any]:
     # CDN plan I3 — optional bake profile. Absent ⇒ `standard` (every
     # existing caller unchanged). `cdn-node` is golden-only and needs the
     # backend URL the agent config bakes in (VALI_CDN_BACKEND_URL).
+    # `ubuntu-runner` is golden-only too (the bake refuses a non-Ubuntu
+    # base itself, once it has read the image's os-release).
     profile = body.get("profile", TenantBakeProfile.STANDARD.value)
     if profile not in TenantBakeProfile.values:
-        raise FinalizeError("profile must be 'standard' or 'cdn-node'", CAT_BAD_FIELD)
+        raise FinalizeError(
+            "profile must be 'standard', 'cdn-node' or 'ubuntu-runner'", CAT_BAD_FIELD
+        )
+    if (
+        profile != TenantBakeProfile.STANDARD.value
+        and disk_mode != TenantBakeDiskMode.GOLDEN_VERITY_OVERLAY.value
+    ):
+        raise FinalizeError(
+            f"profile {profile!r} needs disk_mode 'golden_verity_overlay'",
+            CAT_BAD_FIELD,
+        )
     if profile == TenantBakeProfile.CDN_NODE.value:
-        if disk_mode != TenantBakeDiskMode.GOLDEN_VERITY_OVERLAY.value:
-            raise FinalizeError(
-                "profile 'cdn-node' needs disk_mode 'golden_verity_overlay'",
-                CAT_BAD_FIELD,
-            )
         if not cdn_backend_url():
             raise FinalizeError(
                 "profile 'cdn-node' needs VALI_CDN_BACKEND_URL set to a bare https origin "

@@ -1753,3 +1753,49 @@ def test_host_inventory_contract_drift_is_unavailable(
 ) -> None:
     with pytest.raises(verifier.VerifierUnavailable):
         _hi(monkeypatch, payload)
+
+
+# ── dedicated-disk integrity (contract §9) ────────────────────────────
+
+_INIT = {**_DISK_IO, "state": "initializing"}
+
+
+@pytest.mark.parametrize(
+    ("entry", "percent"),
+    [
+        ({**_INIT, "init_percent": 0}, 0),
+        ({**_INIT, "init_percent": 42}, 42),
+        ({**_INIT, "init_percent": 100}, 100),
+        # Tolerant: no progress on the wire ⇒ None.
+        (_INIT, None),
+    ],
+)
+def test_an_initializing_slot_parses_with_its_optional_progress(entry, percent) -> None:
+    (dev,) = verifier._served_receipt_fields({**_RECEIPT_OK, "disk_io": [entry]}).disk_io
+    assert (dev.state, dev.init_percent) == ("initializing", percent)
+
+
+def test_an_entry_without_init_percent_parses_as_before() -> None:
+    (dev,) = verifier._served_receipt_fields({**_RECEIPT_OK, "disk_io": [_DISK_IO]}).disk_io
+    assert dev.init_percent is None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {**_INIT, "init_percent": 101},
+        {**_INIT, "init_percent": -1},
+        {**_INIT, "init_percent": True},
+        {**_INIT, "init_percent": "5"},
+        # Absent is the only no-progress form (the binary emits it only when set).
+        {**_INIT, "init_percent": None},
+        # Only an initializing slot carries a progress.
+        {**_DISK_IO, "init_percent": 5},
+        # Initializing is a dedicated slot's verdict, with its device.
+        {**_INIT, "serial": "hippius-os"},
+        {**_INIT, "dev": ""},
+    ],
+)
+def test_an_initializing_entry_breaking_a_wire_rule_is_contract_drift(entry) -> None:
+    with pytest.raises(verifier.VerifierUnavailable, match="unexpected shape"):
+        verifier._served_receipt_fields({**_RECEIPT_OK, "disk_io": [entry]})

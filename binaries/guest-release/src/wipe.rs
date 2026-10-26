@@ -291,6 +291,51 @@ pub fn progress_every_tenth(path: &Path) -> impl Fn(u64, u64) + Sync + '_ {
     }
 }
 
+/// The byte ranges [`zero_ends`] writes on a device of `size` bytes: the
+/// first and last `ends` bytes, or the whole device when they would meet.
+pub fn end_ranges(size: u64, ends: u64) -> Vec<(u64, u64)> {
+    if size <= ends.saturating_mul(2) {
+        vec![(0, size)]
+    } else {
+        vec![(0, ends), (size - ends, ends)]
+    }
+}
+
+/// Zero `ranges` of `dev`, one [`BLOCK`] at a time (aligned like
+/// [`wipe`]: every offset and length a multiple of [`ALIGN`]).
+pub fn zero_ranges<W: WriteAt + ?Sized>(dev: &W, ranges: &[(u64, u64)]) -> Result<(), WipeError> {
+    let align = ALIGN as u64;
+    if ranges
+        .iter()
+        .any(|(o, l)| !o.is_multiple_of(align) || !l.is_multiple_of(align))
+    {
+        return Err(WipeError::Target(format!(
+            "a range is not aligned to {ALIGN} — O_DIRECT would fail"
+        )));
+    }
+    let zeros = AlignedZeros::new(BLOCK);
+    for &(offset, len) in ranges {
+        let mut done = 0u64;
+        while done < len {
+            let n = (len - done).min(BLOCK as u64);
+            write_all_at(dev, &zeros.as_slice()[..n as usize], offset + done)?;
+            done += n;
+        }
+    }
+    Ok(())
+}
+
+/// Write zeros through a mapping at each end (`ends` bytes), then
+/// `fdatasync`: an integrity slot's first and last MiB carry valid tags
+/// before anything probes it (`dedicated` priming). Same target rules and
+/// `O_DIRECT | O_EXCL` open as the full wipe.
+pub fn zero_ends(path: &Path, ends: u64) -> Result<(), WipeError> {
+    check_target(path)?;
+    let (file, size) = open_device(path)?;
+    zero_ranges(&file, &end_ranges(size, ends))?;
+    file.sync_data().map_err(|e| WipeError::Sync(e.to_string()))
+}
+
 /// The whole `--integrity-wipe` mode: check, open, wipe, `fdatasync`.
 pub fn run(path: &Path) -> Result<u64, WipeError> {
     check_target(path)?;
@@ -534,6 +579,31 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    #[test]
+    fn the_ends_are_written_exactly_and_meet_on_a_small_device() {
+        assert_eq!(
+            end_ranges(100 * MIB, 8 * MIB),
+            [(0, 8 * MIB), (92 * MIB, 8 * MIB)]
+        );
+        assert_eq!(end_ranges(16 * MIB, 8 * MIB), [(0, 16 * MIB)]);
+        assert_eq!(end_ranges(4 * MIB, 8 * MIB), [(0, 4 * MIB)]);
+        let rec = Recorder::default();
+        zero_ranges(&rec, &end_ranges(100 * MIB, 6 * MIB)).unwrap();
+        let mut spans = rec.spans.lock().unwrap().clone();
+        spans.sort_unstable();
+        let total: u64 = spans.iter().map(|(_, l)| l).sum();
+        assert_eq!(total, 12 * MIB);
+        assert_eq!(spans.first(), Some(&(0, 4 * MIB)));
+        assert_eq!(spans.last(), Some(&(98 * MIB, 2 * MIB)));
+        // Unaligned: refused before any write.
+        let rec = Recorder::default();
+        assert!(matches!(
+            zero_ranges(&rec, &[(0, 4096), (100, 4096)]),
+            Err(WipeError::Target(_))
+        ));
+        assert!(rec.spans.lock().unwrap().is_empty());
     }
 
     /// In-memory device that records what was written and can inject

@@ -457,8 +457,13 @@ fn is_dedicated_slot(slot: &str) -> bool {
         .is_some_and(|i| i <= u64::from(MAX_SLOT_INDEX))
 }
 
+/// The suffix of an integrity slot's anchor, `x<N>:<GiB>:i` (dedicated-disks
+/// contract §9): the guest opens that slot with integrity.
+const INTEGRITY_SUFFIX: &str = ":i";
+
 /// The slots the measured `hippius.dedicated=x0:<GiB>,…` token names, in
-/// order; empty without the token. A malformed token is refused.
+/// order; empty without the token. An entry is `x<N>:<GiB>`, or
+/// `x<N>:<GiB>:i` for an integrity slot. A malformed token is refused.
 fn cmdline_dedicated_slots(cmdline: &str) -> Result<Vec<String>, &'static str> {
     let tokens: Vec<&str> = cmdline
         .split_ascii_whitespace()
@@ -468,14 +473,16 @@ fn cmdline_dedicated_slots(cmdline: &str) -> Result<Vec<String>, &'static str> {
         [] => Ok(Vec::new()),
         [value] => value
             .split(',')
-            .map(|entry| match entry.split_once(':') {
-                Some((slot, gib))
-                    if is_dedicated_slot(slot)
-                        && canonical_decimal(gib).is_some_and(|g| DEDICATED_GIB.contains(&g)) =>
+            .map(|entry| {
+                let (slot, size) = entry.split_once(':').ok_or("bad-dedicated-cmdline")?;
+                let gib = size.strip_suffix(INTEGRITY_SUFFIX).unwrap_or(size);
+                if is_dedicated_slot(slot)
+                    && canonical_decimal(gib).is_some_and(|g| DEDICATED_GIB.contains(&g))
                 {
                     Ok(slot.to_string())
+                } else {
+                    Err("bad-dedicated-cmdline")
                 }
-                _ => Err("bad-dedicated-cmdline"),
             })
             .collect(),
         _ => Err("bad-dedicated-cmdline"),
@@ -4453,6 +4460,26 @@ mod tests {
         );
     }
 
+    /// §9: an integrity slot's anchor `x<N>:<GiB>:i` names the same slot;
+    /// mixed with plain slots too. The cmdline is carried as measured.
+    #[test]
+    fn integrity_anchors_name_their_slots() {
+        for cmdline in [
+            "console=hvc0 hippius.dedicated=x0:22300:i,x1:16000:i",
+            "console=hvc0 hippius.dedicated=x0:22300,x1:16000:i",
+            "console=hvc0 hippius.dedicated=x0:1048576:i,x1:1000:i",
+        ] {
+            let json = launch_json_with(cmdline, TWO_DISKS);
+            let bytes = build(&args("g", "launch"), json.as_bytes())
+                .unwrap_or_else(|e| panic!("{cmdline}: {e}"));
+            assert_canonical(&bytes).unwrap();
+            assert_eq!(
+                cmdline_dedicated_slots(cmdline).unwrap(),
+                vec!["x0".to_string(), "x1".to_string()]
+            );
+        }
+    }
+
     #[test]
     fn extra_disks_out_of_step_with_the_cmdline_are_refused_never_dropped() {
         let one = r#""extra_disks": [{"slot": "x0", "kind": "dedicated", "disk_id": "wwn-0x01"}],"#;
@@ -4505,6 +4532,42 @@ mod tests {
                 "console=hvc0 hippius.dedicated=x0:1048577",
                 one,
                 "bad-dedicated-cmdline",
+            ),
+            // §9: the only suffix is `:i`, once, after a valid size.
+            (
+                "console=hvc0 hippius.dedicated=x0:1000:j",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:1000:i:i",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:1000i",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0::i",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:999:i",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x0:i",
+                one,
+                "bad-dedicated-cmdline",
+            ),
+            (
+                "console=hvc0 hippius.dedicated=x1:1000:i,x0:1000:i",
+                TWO_DISKS,
+                "extra-disks-mismatch",
             ),
         ] {
             let json = launch_json_with(cmdline, extra);

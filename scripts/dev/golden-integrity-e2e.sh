@@ -24,6 +24,9 @@
 #      the volume root (stamp) from both the merged root and the bind,
 #      carries an overlay whose upperdir lives under it (what containerd's
 #      snapshotter mounts), and is rebound with its data on reboot.
+#   7. the keyslot is pbkdf2 x1000 on every fresh format (first boot and
+#      re-init); a volume formatted earlier with argon2id still reopens and
+#      its header is not rewritten.
 #
 # Usage: sudo WIPE_BIN=/path/to/hippius-guest-release bash golden-integrity-e2e.sh
 set -euo pipefail
@@ -105,6 +108,12 @@ echo "golden-integrity-e2e: first boot of ${SIZE_MB} MiB took $(echo "$t1 - $t0"
 [ "$(label_of "$A")" = hippius-upper ] && ok "first boot: ready label" || err "label is '$(label_of "$A")'"
 dump "$A" | grep -qE '^[[:space:]]*sector:[[:space:]]*4096' && ok "4096-byte sectors" || err "sector size not 4096: $(dump "$A" | grep -i sector)"
 dump "$A" | grep -qE 'integrity:[[:space:]]*hmac\(sha256\)' && ok "hmac(sha256) integrity" || err "integrity not hmac(sha256)"
+# Keyslots section only: the Digests section prints its own Iterations.
+pbkdf_of() { dump "$1" | sed -n '/^Keyslots:/,/^Tokens:/s/^[[:space:]]*PBKDF:[[:space:]]*//p'; }
+iter_of() { dump "$1" | sed -n '/^Keyslots:/,/^Tokens:/s/^[[:space:]]*Iterations:[[:space:]]*//p'; }
+[ "$(pbkdf_of "$A")" = pbkdf2 ] && [ "$(iter_of "$A")" = 1000 ] \
+    && ok "keyslot PBKDF is pbkdf2 x1000 (the KEK is random; no argon2 on boot)" \
+    || err "keyslot PBKDF '$(pbkdf_of "$A")' iterations '$(iter_of "$A")', want pbkdf2 / 1000"
 # Zero verification failures across the WHOLE first boot — including the
 # window before the wipe, where udev would probe the fresh mapping if the
 # library did not pause it — and the full read-back after it.
@@ -253,6 +262,7 @@ mark2="$(dmesg_mark)"
 if open_upper "$B" 0; then
     [ "$(cryptsetup luksUUID "$B")" != "${uuid_before}" ] && ok "interrupted first boot: formatted again (new header)" || err "re-init kept the old header"
     [ "$(label_of "$B")" = hippius-upper ] || err "re-init did not end with the ready label"
+    [ "$(pbkdf_of "$B")" = pbkdf2 ] && ok "re-init writes a pbkdf2 keyslot" || err "re-init keyslot PBKDF is '$(pbkdf_of "$B")'"
     if full_read; then ok "re-initialised volume fully readable"; else err "re-init read-back failed: $(cat "${WORK}/rd")"; fi
     new_errs="$(dmesg_errors_since "${mark2}")"
     [ -z "${new_errs}" ] && ok "zero verification failures during the re-init" || err "re-init logged verification failures:
@@ -260,6 +270,22 @@ $(printf '%s\n' "${new_errs}" | head -n 20)"
     cryptsetup close "${MAPPER}"
 else
     err "interrupted first boot with expectation 0 failed"
+fi
+
+# ── 7. a volume formatted before the pbkdf2 change ───────────────────
+# Its argon2id keyslot is read from the header on open: it reopens as it
+# is, and nothing rewrites the header (no migration).
+C="$(new_loop c)"; LOOPS+=("$C")
+cryptsetup luksFormat --type luks2 --integrity hmac-sha256 --integrity-no-wipe \
+    --sector-size 4096 --label hippius-upper --pbkdf argon2id --batch-mode "$C" --key-file "${WORK}/kek"
+hdr_before="$(dump "$C" | sha256sum)"
+if open_upper "$C" 1; then
+    [ "$(pbkdf_of "$C")" = argon2id ] && [ "$(dump "$C" | sha256sum)" = "${hdr_before}" ] \
+        && ok "argon2id volume (pre-pbkdf2): reopened, header untouched" \
+        || err "argon2id volume: header changed on reopen (PBKDF now '$(pbkdf_of "$C")')"
+    cryptsetup close "${MAPPER}"
+else
+    err "argon2id volume (pre-pbkdf2) failed to reopen"
 fi
 
 [ "${fail}" -eq 0 ] && echo "golden-integrity-e2e: OK (all checks passed)" || exit 1

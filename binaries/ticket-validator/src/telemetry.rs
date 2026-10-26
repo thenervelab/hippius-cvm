@@ -134,6 +134,10 @@ struct DiskIoJson {
     io_ticks_ms: u64,
     tiq_ms: u64,
     inflight: u64,
+    /// Only on an `initializing` dedicated slot; ABSENT otherwise, so an
+    /// entry without it is byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    init_percent: Option<u8>,
 }
 
 impl From<DiskIoDelta> for DiskIoJson {
@@ -151,6 +155,7 @@ impl From<DiskIoDelta> for DiskIoJson {
             io_ticks_ms: d.io_ticks_ms,
             tiq_ms: d.tiq_ms,
             inflight: d.inflight,
+            init_percent: d.init_percent,
         }
     }
 }
@@ -658,6 +663,7 @@ mod tests {
             io_ticks_ms: 9,
             tiq_ms: 11,
             inflight: 1,
+            init_percent: None,
         }]
     }
 
@@ -711,6 +717,24 @@ mod tests {
         assert_eq!(p["targets"][0]["slot"], "os");
         assert_eq!(p["targets"][0]["metrics"]["seq_read_mbps"], 2100);
         assert_eq!(p["targets"][0]["hist_qd1"].as_array().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn init_percent_rides_only_on_an_initializing_slot() {
+        use hippius_types::disk_stats::DiskIoState;
+        let mut io = sample_io();
+        let f = extract_receipt_fields(&disk_receipt_body(Some(&io), None)).unwrap();
+        let json = serde_json::to_value(ReceiptOutput::Ok(Box::new(f))).unwrap();
+        assert!(!json["disk_io"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("init_percent"));
+        io[0].state = DiskIoState::Initializing;
+        io[0].init_percent = Some(42);
+        let f = extract_receipt_fields(&disk_receipt_body(Some(&io), None)).unwrap();
+        let json = serde_json::to_value(ReceiptOutput::Ok(Box::new(f))).unwrap();
+        assert_eq!(json["disk_io"][0]["state"], "initializing");
+        assert_eq!(json["disk_io"][0]["init_percent"], 42);
     }
 
     /// Splice `key: value` into a real receipt body (a hand-rolled body

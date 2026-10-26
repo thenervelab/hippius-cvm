@@ -749,6 +749,97 @@ def test_a_destination_that_fails_to_boot_reverts(
     assert job.reason.startswith("activate-failed")
 
 
+SRC_NODE_ID, DST_NODE_ID = "a1" * 32, "b2" * 32
+
+
+def _tiered(monkeypatch, *, src: dict[str, str], dst: dict[str, str]) -> None:
+    """The tier gate enforced, both miners bridged, their pools as given
+    (`{pool_id: declared class}`); another destination always valid."""
+    from apps.disktier.tests.test_os_tier import _pool
+
+    monkeypatch.setattr(settings, "VALI_SCHEDULER_DISK_TIER_GATE", "enforce")
+    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, **kw: None)
+    for miner_id, node, pools in (("node-src", SRC_NODE_ID, src), ("node-dst", DST_NODE_ID, dst)):
+        MinerIdentity.objects.filter(miner_id=miner_id).update(chain_node_id=node)
+        for pool_id, declared in pools.items():
+            _pool(pool_id, node_id=node, declared_class=declared)
+
+
+@pytest.mark.parametrize(
+    ("dst", "admitted"),
+    [
+        # An nvme VM: an nvme pool beside an hdd `default` does not count —
+        # the stage order lands the disk on `default`.
+        ({"default": "hdd", "nvme0": "nvme"}, False),
+        ({"default": "nvme"}, True),
+        ({"default": "nvme", "hdd0": "hdd"}, True),
+    ],
+)
+def test_a_cross_host_restore_needs_a_default_at_the_vms_tier(monkeypatch, dst, admitted) -> None:
+    _tiered(monkeypatch, src={"default": "nvme"}, dst=dst)
+    vm = _golden_vm()
+    if admitted:
+        assert _start(vm, _chain(vm)[-1], dest_node_id="node-dst").dest_node_id == "node-dst"
+        return
+    with pytest.raises(restore.RestoreError) as exc:
+        _start(vm, _chain(vm)[-1], dest_node_id="node-dst")
+    assert exc.value.code == "no-eligible-miner"
+    assert "default pool (hdd)" in exc.value.detail
+
+
+def test_a_same_host_restore_needs_a_default_at_the_vms_tier_too(monkeypatch) -> None:
+    """vali cannot tell whether the host still holds the VM's record; a
+    restore it lost is staged on `default`."""
+    _tiered(monkeypatch, src={"default": "hdd", "nvme0": "nvme"}, dst={})
+    vm = _golden_vm()
+    with pytest.raises(restore.RestoreError) as exc:
+        _start(vm, _chain(vm)[-1])
+    assert exc.value.code == "no-eligible-miner"
+
+
+def test_unenforced_a_restore_ignores_the_tier(monkeypatch) -> None:
+    _tiered(monkeypatch, src={"default": "hdd"}, dst={})
+    monkeypatch.setattr(settings, "VALI_SCHEDULER_DISK_TIER_GATE", "record")
+    vm = _golden_vm()
+    assert _start(vm, _chain(vm)[-1]).dest_node_id == "node-src"
+
+
+def test_a_default_that_lost_the_tier_before_the_stage_order_fails_untouched(
+    fx: FakeEffects, pwr: _Power, monkeypatch
+) -> None:
+    from apps.disktier.models import MinerStoragePool
+
+    _tiered(monkeypatch, src={"default": "nvme"}, dst={"default": "nvme"})
+    vm = _golden_vm()
+    job = _start(vm, _chain(vm)[-1], dest_node_id="node-dst")
+    MinerStoragePool.objects.filter(miner_node_id=DST_NODE_ID).update(declared_class="hdd")
+    fx.restore_status = {}
+    job = _advance(job)
+    assert job.state == MigrationState.FAILED.value
+    assert job.reason == "stage-no-os-pool-at-tier" and not job.reverted
+    assert fx.restore_orders == [], "nothing staged"
+    vm.refresh_from_db()
+    assert (vm.state, vm.generation) == (VmState.ACTIVE, 5)
+    assert pwr.stopped == [] and not fx.did("kbs_activate_dest")
+
+
+@pytest.mark.parametrize("dest", ["node-src", "node-dst"])
+def test_a_restore_activation_names_no_pool_and_records_default(
+    fx: FakeEffects, pwr: _Power, monkeypatch, dest
+) -> None:
+    """The disk was staged on `default` and the activation reuses it: the
+    order names no pool and the job records `default`, whatever a pool
+    chooser or the tier guard would say."""
+    monkeypatch.setattr(restore, "_validate_other_dest", lambda vm, dest, **kw: None)
+    fx.arrival_pool = "nvme0"
+    fx.arrival_default_refused = "the default pool (hdd) does not hold an OS disk at nvme"
+    vm = _golden_vm()
+    job = _start(vm, _chain(vm)[-1], dest_node_id=dest)
+    job = _to_verifying(fx, pwr, job)
+    assert fx.activate_os_pools == [None]
+    assert (job.dest_os_pool, job.dest_os_pool_pinned) == ("", True)
+
+
 @pytest.mark.parametrize(
     "failure_class",
     [

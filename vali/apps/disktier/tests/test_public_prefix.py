@@ -31,6 +31,9 @@ EXPECTED = {
     "v1/operator/miners/<str:node_id>/hardware/history": "OperatorHardwareHistoryView",
     "v1/operator/miners/<str:node_id>/disk-inventory": "OperatorDiskInventoryView",
     "v1/operator/miners/<str:node_id>/host-disk-advisories": "OperatorHostDiskAdvisoriesView",
+    # The node owner's maintenance cordon (apps.operator): a write, so the
+    # config principal + the family re-checked fresh on chain.
+    "v1/operator/miners/<str:node_id>/maintenance": "OperatorMaintenanceView",
 }
 
 

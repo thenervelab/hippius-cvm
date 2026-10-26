@@ -605,6 +605,28 @@ class TestOsDiskTier:
         result = feasibility.assess("small", os_disk_tier="ssd")
         assert (result.verdict, result.reason) == ("not-now", "no-miner-at-tier")
 
+    @override_settings(
+        VALI_SELLABLE_OS_TIERS=["nvme", "ssd", "hdd"],
+        VALI_SCHEDULER_DISK_TIER_GATE="enforce",
+        VALI_OS_TIER_MATCH="exact",
+    )
+    def test_exact_hdd_is_placeable_only_where_an_hdd_pool_exists(
+        self, real_fleet
+    ) -> None:  # noqa: ANN001
+        from apps.disktier.models import MinerStoragePool
+
+        for seed, declared in ((1, "nvme"), (2, "ssd"), (3, "nvme")):
+            MinerStoragePool.objects.create(
+                miner_node_id=node_id(seed), pool_id="default", declared_class=declared
+            )
+        result = feasibility.assess("small", os_disk_tier="hdd")
+        assert (result.verdict, result.reason) == ("never", "no-miner-at-tier")
+        assert feasibility.assess("small", os_disk_tier="ssd").verdict == "yes"
+        with override_settings(VALI_OS_TIER_MATCH="minimum"):
+            assert feasibility.assess("small", os_disk_tier="hdd").verdict == "yes"
+        MinerStoragePool.objects.filter(miner_node_id=node_id(3)).update(declared_class="hdd")
+        assert feasibility.assess("small", os_disk_tier="hdd").verdict == "yes"
+
     @override_settings(VALI_SCHEDULER_DISK_TIER_GATE="record")
     def test_recorded_the_gate_never_unsells(self, real_fleet) -> None:  # noqa: ANN001
         from apps.disktier.models import MinerStoragePool

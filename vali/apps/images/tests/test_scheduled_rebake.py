@@ -634,6 +634,45 @@ def test_cdn_node_is_rebaked_by_default(settings) -> None:
     assert "cdn-node" in settings.VALI_GOLDEN_REBAKE_IMAGES
 
 
+def test_ubuntu_runner_is_rebaked_by_default(settings) -> None:
+    assert "ubuntu-runner" in rebake.DEFAULT_IMAGES
+    assert "ubuntu-runner" in settings.VALI_GOLDEN_REBAKE_IMAGES
+
+
+@pytest.mark.django_db
+def test_an_ubuntu_runner_rebake_keeps_its_profile_and_runs_the_e2e(make_golden_bake) -> None:
+    """The CI-runner image is a tenant image: re-baked as itself, e2e'd like ubuntu."""
+    _bless_all(make_golden_bake)
+    bake = make_golden_bake(
+        bake_id="blessed-ubuntu-runner",
+        vm_id="golden-ubuntu-runner-dp",
+        s3_output_prefix="tenant/golden-ubuntu-runner-dp/",
+        profile="ubuntu-runner",
+        finished_at=timezone.now() - timedelta(days=30),
+    )
+    GoldenImage.objects.create(
+        image_name="ubuntu-runner",
+        distro="ubuntu",
+        bake_id=bake.bake_id,
+        blessed_at=timezone.now() - timedelta(days=29),
+        blessed_by="ops",
+        restricted_tenant="5Runner",
+    )
+    calls: list[str] = []
+    outcome = rebake.run_rebake(
+        images=("ubuntu-runner",),
+        stamp=STAMP,
+        timing=_timing(FakeWorker()),
+        e2e=lambda image, bake_id: calls.append(image) or True,
+    )
+    assert calls == ["ubuntu-runner"]
+    assert outcome.success
+    row = TenantBake.objects.get(vm_id=f"golden-ubuntu-runner-rebake-{STAMP}")
+    assert row.profile == "ubuntu-runner"
+    assert row.cdn_backend_url == ""
+    assert row.rebake_e2e_passed is True
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("backend", "queued"),

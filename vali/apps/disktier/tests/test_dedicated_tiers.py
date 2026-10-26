@@ -38,6 +38,8 @@ from .test_dedicated_probe import (  # noqa: F401 — `ded_on` is a fixture
 pytestmark = pytest.mark.django_db
 
 ALL = ["hdd", "ssd", "nvme"]
+#: The default is `exact`; the `minimum` tests pin the #1780 behaviour.
+MINIMUM = {**ON, "VALI_DEDICATED_TIER_MATCH": "minimum"}
 GOOD = {"tier": "hdd", "count": 2, "min_size_gb": 16000}
 
 
@@ -75,6 +77,7 @@ def _reloaded(monkeypatch: pytest.MonkeyPatch, **env: str) -> Any:
         return SimpleNamespace(
             VALI_DEDICATED_SELLABLE_TIERS=got.VALI_DEDICATED_SELLABLE_TIERS,
             VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER=got.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER,
+            VALI_DEDICATED_TIER_MATCH=got.VALI_DEDICATED_TIER_MATCH,
         )
     finally:
         for name in env:
@@ -87,12 +90,15 @@ def test_the_settings_parse_the_tier_lists(monkeypatch: pytest.MonkeyPatch) -> N
         monkeypatch,
         VALI_DEDICATED_SELLABLE_TIERS="hdd, NVMe",
         VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER="ssd:150, nvme:250",
+        VALI_DEDICATED_TIER_MATCH=" Minimum ",
     )
     assert got.VALI_DEDICATED_SELLABLE_TIERS == ["hdd", "nvme"]
     assert got.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER == {"ssd": 150, "nvme": 250}
+    assert got.VALI_DEDICATED_TIER_MATCH == "minimum"
     shipped = _reloaded(monkeypatch)
     assert shipped.VALI_DEDICATED_SELLABLE_TIERS == ["hdd"]
     assert shipped.VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER == {}
+    assert shipped.VALI_DEDICATED_TIER_MATCH == "exact"
 
 
 @pytest.mark.parametrize(
@@ -103,6 +109,7 @@ def test_the_settings_parse_the_tier_lists(monkeypatch: pytest.MonkeyPatch) -> N
         {"VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER": "sas:1"},
         {"VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER": "ssd:-1"},
         {"VALI_DEDICATED_MILLIUNITS_PER_GB_BY_TIER": "ssd:1,ssd:2"},
+        {"VALI_DEDICATED_TIER_MATCH": "at-least"},
     ],
 )
 def test_the_settings_refuse_a_bad_value(monkeypatch: pytest.MonkeyPatch, env: dict) -> None:
@@ -179,7 +186,7 @@ def _taken(rows: list[Any]) -> list[tuple[str, str, str]]:
     return [(r.slot, r.dedicated_disk.disk_id, r.required_tier) for r in rows]
 
 
-@override_settings(**ON)
+@override_settings(**MINIMUM)
 def test_the_lowest_qualifying_tier_goes_first_whatever_its_size() -> None:
     capable(NODE)
     make_disk("wwn-0xnvme", tier="nvme", size_gib=16000)
@@ -191,7 +198,7 @@ def test_the_lowest_qualifying_tier_goes_first_whatever_its_size() -> None:
     assert DedicatedDisk.objects.get(disk_id="wwn-0xnvme").state == "free"
 
 
-@override_settings(**ON)
+@override_settings(**MINIMUM)
 def test_within_a_tier_the_smallest_goes_first() -> None:
     capable(NODE)
     make_disk("wwn-0xn1", tier="nvme", size_gib=20000)
@@ -208,7 +215,7 @@ def test_within_a_tier_the_smallest_goes_first() -> None:
     ]
 
 
-@override_settings(**ON)
+@override_settings(**MINIMUM)
 def test_a_tier_above_every_free_disk_is_not_placed() -> None:
     capable(NODE)
     make_disk("wwn-0xs1", tier="ssd")
@@ -220,7 +227,7 @@ def test_a_tier_above_every_free_disk_is_not_placed() -> None:
     assert dedicated.free_counts(DedicatedRequest("ssd", 1, 16000), [NODE]) == {NODE: 1}
 
 
-@override_settings(**ON)
+@override_settings(**MINIMUM)
 def test_the_read_back_carries_the_sold_tier_never_the_disks() -> None:
     capable(NODE)
     make_disk("wwn-0xnvme", tier="nvme")
@@ -230,6 +237,46 @@ def test_the_read_back_carries_the_sold_tier_never_the_disks() -> None:
     (slot,) = [d for d in body["disks"] if d["kind"] == "dedicated"]
     assert (slot["slot"], slot["tier"]) == ("x0", "hdd")
     assert DedicatedDisk.objects.get().verified_tier == "nvme"
+
+
+def test_the_default_matches_the_tier_exactly(settings) -> None:
+    assert settings.VALI_DEDICATED_TIER_MATCH == "exact"
+    assert dedicated.tier_match() == "exact"
+
+
+@override_settings(**ON)
+def test_exact_an_hdd_order_never_takes_a_faster_disk() -> None:
+    capable(NODE)
+    make_disk("wwn-0xnvme", tier="nvme")
+    make_disk("wwn-0xssd", tier="ssd")
+    placement, vm = _placement()
+    with pytest.raises(dedicated.DisksTaken):
+        dedicated.assign(placement, vm, DedicatedRequest("hdd", 1, 16000))
+    assert dedicated.free_counts(DedicatedRequest("hdd", 1, 16000), [NODE]) == {}
+    assert set(DedicatedDisk.objects.values_list("state", flat=True)) == {"free"}
+
+
+@override_settings(**ON)
+@pytest.mark.parametrize("tier", ALL)
+def test_exact_mixed_stock_takes_only_the_requested_tier(tier: str) -> None:
+    capable(NODE)
+    for t in ALL:
+        make_disk(f"wwn-0x{t}1", tier=t, size_gib=16000)
+        make_disk(f"wwn-0x{t}2", tier=t, size_gib=18000)
+    placement, vm = _placement()
+    rows = dedicated.assign(placement, vm, DedicatedRequest(tier, 2, 16000))
+    assert _taken(rows) == [("x0", f"wwn-0x{tier}1", tier), ("x1", f"wwn-0x{tier}2", tier)]
+    left = {t: dedicated.free_counts(DedicatedRequest(t, 1, 16000), [NODE]) for t in ALL}
+    assert left == {t: ({} if t == tier else {NODE: 2}) for t in ALL}
+
+
+@override_settings(**ON)
+def test_exact_a_disk_without_a_declared_class_sells_as_hdd() -> None:
+    """The verified tier is min(probe grade, declared class); no class = hdd."""
+    capable(NODE)
+    make_disk("wwn-0xundeclared", tier=capped("nvme", None))
+    assert dedicated.free_counts(DedicatedRequest("hdd", 1, 16000), [NODE]) == {NODE: 1}
+    assert dedicated.free_counts(DedicatedRequest("nvme", 1, 16000), [NODE]) == {}
 
 
 # ── the declared cap (R3) ───────────────────────────────────────────

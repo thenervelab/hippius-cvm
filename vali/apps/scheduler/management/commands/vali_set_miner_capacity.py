@@ -20,6 +20,9 @@ What it sets (any combination in one call, applied atomically):
   placement from any caller, while everything already on it runs on —
   no status change, no telemetry change, no drain or migration (that is
   what `QUARANTINED` is for). `--reason` becomes the `cordon_reason`;
+  the cordon then reads as a STAFF cordon, which the node owner's
+  maintenance API can never lift (`apps.scheduler.cordon`); `--uncordon`
+  lifts any cordon, the owner's included;
 - an operator note that changes nothing (`--note`), e.g. to record a
   decision retroactively.
 
@@ -106,7 +109,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
-from apps.scheduler import capacity_admin, capacity_config
+from apps.scheduler import capacity_admin, capacity_config, cordon
 from apps.scheduler.models import (
     ACTIVE_PLACEMENT_STATES,
     CapacityTrustClass,
@@ -296,13 +299,13 @@ class Command(BaseCommand):
             action="store_true",
             help="Drop the per-miner cap; follow VALI_SCHEDULER_MAX_BOOTING_PER_MINER.",
         )
-        cordon = parser.add_mutually_exclusive_group()
-        cordon.add_argument(
+        cordon_group = parser.add_mutually_exclusive_group()
+        cordon_group.add_argument(
             "--cordon",
             action="store_true",
             help="No new placements on this miner (the running VMs are untouched).",
         )
-        cordon.add_argument(
+        cordon_group.add_argument(
             "--uncordon",
             action="store_true",
             help="Lift the cordon.",
@@ -359,16 +362,19 @@ class Command(BaseCommand):
             raise CommandError("--note records --reason; pass one")
         if opts["cordon"] and not reason:
             raise CommandError("--cordon records --reason as the cordon_reason; pass one")
+        if opts["cordon"] and reason.startswith(cordon.OWNER_REASON_PREFIX):
+            # A staff cordon must read as staff (`apps.scheduler.cordon`):
+            # an owner-prefixed reason would hand its lifting to the owner.
+            raise CommandError(
+                f"--reason may not start with {cordon.OWNER_REASON_PREFIX!r} "
+                "(that marks a node owner's own maintenance cordon)"
+            )
         anchor = self._desired_anchor(opts)
         static = self._static_changes(opts)
         node_id = self._resolve_node_id(opts)
 
         with transaction.atomic():
-            row = (
-                MinerCapacity.objects.select_for_update()
-                .filter(miner_node_id=node_id)
-                .first()
-            )
+            row = MinerCapacity.objects.select_for_update().filter(miner_node_id=node_id).first()
             if row is None:
                 raise CommandError(
                     f"no MinerCapacity row for node {node_id} — it is created by "
@@ -614,9 +620,7 @@ class Command(BaseCommand):
             f"{'committed (vali ledger)':<30} {committed.placements} VMs / "
             f"{committed.cpus} vCPU / {committed.memory_mb} MiB"
         )
-        self.stdout.write(
-            f"{'global cpu ratio':<30} {capacity_config.cpu_overcommit_default()}"
-        )
+        self.stdout.write(f"{'global cpu ratio':<30} {capacity_config.cpu_overcommit_default()}")
         from apps.scheduler import capacity_report
 
         for report in capacity_report.fleet_report(node_ids={node_id}):
@@ -729,4 +733,3 @@ class Command(BaseCommand):
                     "or the wrong host?"
                 )
             )
-

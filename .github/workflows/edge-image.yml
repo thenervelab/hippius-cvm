@@ -9,10 +9,9 @@
 # Trigger:
 #   - push to `main` / `v*` tags touching the build inputs — keeps the
 #     `latest` / tag images current;
-#   - pull_request touching the build inputs — builds + pushes a
-#     `sha-<commit>` image so the chart can be pinned to a real digest
-#     and live-tested before merge (and validates the Dockerfile);
-#   - `workflow_dispatch` — manual rebuilds.
+#   - pull_request touching the build inputs — builds only (validates the
+#     Dockerfile); nothing is pushed or signed (see `PUBLISH` below);
+#   - `workflow_dispatch` — manual rebuilds (publish only when run on main).
 #
 # Supply-chain discipline (§F): every GitHub Action is pinned by commit
 # SHA; the image's own base layers are digest-pinned in the Dockerfile;
@@ -59,6 +58,14 @@ permissions:
 
 env:
   IMAGE: ghcr.io/thenervelab/hippius-edge-gateway
+  # Publish = push to GHCR + cosign-sign. ONLY a build of reviewed code may
+  # publish: a push to main, a `v*` tag, or a workflow_dispatch run ON main.
+  # A pull_request (or a dispatch from any other branch) builds and discards:
+  # a pushed + keyless-signed image of unreviewed code would carry the same
+  # workflow identity as a main build (hippius-audits#12).
+  # verify-gitops-signatures.yml only accepts `@refs/heads/main` /
+  # `@refs/tags/v*` identities, so nothing else could be deployed anyway.
+  PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
 
 jobs:
   edge-image:
@@ -75,6 +82,7 @@ jobs:
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -82,6 +90,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign (version pinned)
+        if: env.PUBLISH == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: "v3.0.6"
@@ -109,7 +118,7 @@ jobs:
           context: .
           file: binaries/edge-gateway/Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.tags.outputs.tags }}
           # Single-arch image, no provenance manifest — keeps the
           # pushed digest a plain image digest the Helm chart can pin
@@ -117,21 +126,17 @@ jobs:
           provenance: false
 
       - name: Sign the image (cosign keyless)
+        if: env.PUBLISH == 'true'
         # Keyless: the ambient GitHub OIDC token (`id-token: write`) →
         # a short-lived Fulcio cert → a Rekor transparency-log entry.
         # Signs the immutable digest, never a tag.
-        #
-        # `push` events only — a `pull_request` build still pushes its
-        # image (so a PR branch can pin a digest + live-test), but
-        # signing unmerged code with the repo's OIDC identity would
-        # mint a "trusted" artifact from un-reviewed code. Only
-        # main / tag builds are signed.
-        if: github.event_name == 'push'
+        # Gated on PUBLISH (see `env:`): only main / tag builds are signed.
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Report the pushed digest
+        if: env.PUBLISH == 'true'
         # The chart pins `image@sha256:<digest>`; surface it here so the
         # value is one click away from the run.
         env:

@@ -190,6 +190,44 @@ def job_timeout_s(job: MigrationJob) -> float | None:
 # ─── intake ──────────────────────────────────────────────────────────
 
 
+def staged_default_refusal(vm: Vm, dest_node_id: str) -> str:
+    """Why a restore may not be staged on `dest_node_id` (`""` when it may):
+    the stage order names no pool, so the destination stages a VM it holds
+    no record of on `default`, and the activation reuses that record
+    (`service._staged_restore_os_pool`). Its `default` must then hold the
+    VM's landing tier (`os_tier.default_refusal`, a fallback owner's lower
+    one included). Applied to a same-host restore too: vali cannot tell
+    whether the host still holds the VM's record. Only under the enforced
+    tier gate; a destination vali knows no node of: its own gate decides.
+
+    Follow-up: carry the pinned pool into the stage order."""
+    from apps.disktier import os_tier
+    from apps.miners.models import MinerIdentity
+    from apps.scheduler import service as sched
+    from apps.scheduler.models import ACTIVE_PLACEMENT_STATES, Placement
+
+    if os_tier.gate_mode() != os_tier.GATE_ENFORCE:
+        return ""
+    node = (
+        MinerIdentity.objects.filter(miner_id=dest_node_id)
+        .values_list("chain_node_id", flat=True)
+        .first()
+        or ""
+    )
+    if not node:
+        return ""
+    row = (
+        Placement.objects.filter(vm=vm, status__in=ACTIVE_PLACEMENT_STATES)
+        .values_list("resource_class", "data_disk_gb", "owner")
+        .first()
+    )
+    need_gb = sched.placement_disk_gb(row[0], row[1]) if row is not None else 0
+    owner = row[2] if row is not None else ""
+    return os_tier.default_refusal(
+        node, os_tier.launch_tier(vm.vm_id), need_gb, owner, default_only=True
+    )
+
+
 def _validate_other_dest(
     vm: Vm, dest_node_id: str, *, source: str | None = None, region: str | None = None
 ) -> None:
@@ -402,6 +440,12 @@ def start_restore(
             "bad-request", "allow_cross_region applies to a restore onto another miner"
         )
     region, region_stated, crossed = _move_region(vm, region, cross_region)
+    staged_why = staged_default_refusal(vm, dest)
+    if staged_why:
+        raise RestoreError(
+            "no-eligible-miner",
+            f"destination {dest!r}: {staged_why} (a restore is staged on the default pool)",
+        )
     if dest != vm.host:
         _validate_other_dest(vm, dest, region=region)
     else:
@@ -903,6 +947,10 @@ def _dispatch_stage(job: MigrationJob, now: Any) -> None:
     except backup_service.BackupError as exc:
         # The point is no longer restorable (the VM rebooted since, …).
         raise StepFailed(f"stage-{exc.code}") from exc
+    if staged_default_refusal(job.vm, job.dest_node_id):
+        # The destination's `default` lost the VM's tier since intake:
+        # nothing staged, the VM untouched.
+        raise StepFailed("stage-no-os-pool-at-tier")
     attempt = job.restore_dispatches
     # Recorded BEFORE the dispatch: a crash after it must still count the
     # attempt, never re-send it at once.

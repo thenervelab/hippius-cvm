@@ -285,7 +285,9 @@ class VmSerializer(serializers.Serializer):
             "`state` attached | missing | failed | mismatch | released, from host "
             "evidence only). A dedicated slot may add `guest_state` (attached | "
             "missing | mismatch): what the guest itself last reported — "
-            "informational, never billing-relevant (root in the VM can forge it)."
+            "informational, never billing-relevant (root in the VM can forge it). "
+            "An integrity slot adds `integrity: true`, and during its first-boot "
+            "wipe `guest_state` `initializing` with `init_percent` (0-100 or null)."
         ),
     )
 
