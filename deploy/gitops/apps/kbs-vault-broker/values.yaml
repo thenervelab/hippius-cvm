@@ -1,7 +1,12 @@
 # Values for the `kbs-vault-broker` chart. #102 PR C.
 
 image:
-  repository: ghcr.io/thenervelab/hippius-kbs-vault-broker
+  # Moved from ghcr.io/thenervelab/hippius-kbs-vault-broker. The digest
+  # below and its cosign signature are copied from there byte for byte
+  # (`cosign copy`), so the digest and the provenance block still describe
+  # the same build. Its blobs are served by redirect to s3.hippius.com, so
+  # the guest needs egress there on 443 as well as to the registry.
+  repository: registry.hippius.com/hippius-infra/hippius-kbs-vault-broker
   # SHA-256 digest — NOT a tag (§F supply-chain discipline: the
   # deployed image is content-addressed). Produced by the
   # `broker-image.yml` workflow.

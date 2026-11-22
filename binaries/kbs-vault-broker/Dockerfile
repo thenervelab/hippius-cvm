@@ -18,7 +18,7 @@
 #
 #   docker buildx build --platform linux/amd64 \
 #     -f binaries/kbs-vault-broker/Dockerfile \
-#     -t ghcr.io/thenervelab/hippius-kbs-vault-broker:<tag> .
+#     -t registry.hippius.com/hippius-infra/hippius-kbs-vault-broker:<tag> .
 
 # ── builder ─────────────────────────────────────────────────────────
 # Rust 1.93.0 — matches rust-toolchain.toml. Pinned by digest (§F

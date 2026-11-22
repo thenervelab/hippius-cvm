@@ -7,7 +7,9 @@
 # gitops `values.yaml` would ArgoCD-sync unchecked (audit "M-cosign-
 # admission", governance gap). This gate closes that at the gitops
 # boundary: on every change under `deploy/gitops/`, it extracts each
-# `ghcr.io/thenervelab/hippius-*` digest the charts reference and
+# first-party digest the charts reference (`FIRST_PARTY_PREFIXES` in
+# `.github/scripts/gitops_image_refs.py`: GHCR and the public
+# `registry.hippius.com/hippius-infra` namespace) and
 # `cosign verify`s that it was keyless-signed by a `*-image.yml` workflow
 # in THIS repo, run on main or a `v*` tag (GitHub OIDC → Sigstore). A
 # digest that isn't so signed fails the gate.
@@ -29,9 +31,11 @@ on:
   workflow_dispatch:
 
 # Read the repo + read packages (cosign fetches the signature manifest
-# from GHCR, and some first-party images are private). An OIDC token is
-# NOT needed — verification checks the Fulcio cert against a fixed
-# identity, it does not sign.
+# from GHCR, and some first-party images are private there). The
+# registry.hippius.com images are in the PUBLIC hippius-infra namespace and
+# need no credential; the extractor does not accept the private hub
+# namespace for that reason. An OIDC token is NOT needed — verification
+# checks the Fulcio cert against a fixed identity, it does not sign.
 permissions:
   contents: read
   packages: read
@@ -67,6 +71,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install cosign (version pinned)
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -85,7 +91,7 @@ jobs:
           set -euo pipefail
           mapfile -t REFS < <(python3 .github/scripts/gitops_image_refs.py deploy/gitops)
           if [ "${#REFS[@]}" -eq 0 ]; then
-            echo "::error::no ghcr.io/thenervelab/hippius-* image digests found under deploy/gitops — the extractor or the manifests changed shape"
+            echo "::error::no first-party image digests found under deploy/gitops — the extractor or the manifests changed shape"
             exit 1
           fi
           echo "Verifying ${#REFS[@]} first-party image signature(s):"

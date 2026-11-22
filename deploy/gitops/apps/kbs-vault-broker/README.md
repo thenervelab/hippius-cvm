@@ -12,10 +12,11 @@ Design + trust model (incl. the documented v1 bootstrap residual):
 
 ## Image
 
-`ghcr.io/thenervelab/hippius-kbs-vault-broker`, built + cosign-signed
-by `.github/workflows/broker-image.yml`, pinned by digest in
-`values.yaml`. PUBLIC — the kata-qemu-snp guest pulls it itself (CoCo
-guest-pull); it carries no secrets.
+`registry.hippius.com/hippius-infra/hippius-kbs-vault-broker`, built +
+cosign-signed by `.github/workflows/broker-image.yml`, pinned by digest
+in `values.yaml`. PUBLIC — the kata-qemu-snp guest pulls it itself (CoCo
+guest-pull); it carries no secrets. The registry answers a blob GET with
+a redirect to `s3.hippius.com`, so the guest needs HTTPS egress to both.
 
 ## Operator setup (once)
 

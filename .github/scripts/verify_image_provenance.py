@@ -56,6 +56,10 @@ from typing import Any
 
 import yaml
 
+# The script's own directory is on sys.path when it runs as a script, which
+# is how CI and the tests load it.
+from gitops_image_refs import FIRST_PARTY_PREFIXES
+
 # EVERY first-party image this repo's gitops deploys, as
 # `(values.yaml, dotted key of the image block)`.
 #
@@ -107,9 +111,11 @@ MAIN_REF = "refs/heads/main"
 # `refs/pull/<n>/merge` identity is REFUSED outright, acknowledgement or not:
 # until hippius-audits#12 the image workflows signed PR builds of unreviewed
 # code, and those signatures are still valid in GHCR. The `repo` group is
-# captured rather than assumed: cosign pins the signing repository by EXACT
-# match (not a pattern), so the value it is given must come from the identity
-# this regex just validated, never from a constant that names only one era.
+# captured rather than assumed: cosign pins the signing GitHub repository
+# (`--certificate-github-workflow-repository`; the image repository is a
+# separate thing and may be on GHCR or registry.hippius.com) by EXACT match
+# (not a pattern), so the value it is given must come from the identity this
+# regex just validated, never from a constant that names only one era.
 WORKFLOW_REF_RE = re.compile(
     r"^https://github\.com/(?P<repo>" + _REPO_ALT + r")"
     + r"/\.github/workflows/[a-z0-9-]+-image\.yml@(?P<ref>refs/heads/main|refs/tags/v[^/\s]+)$"
@@ -119,7 +125,6 @@ RUN_URL_RE = re.compile(
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-REPOSITORY_PREFIX = "ghcr.io/thenervelab/hippius-"
 
 # An acknowledgement has to carry an actual explanation — a "yes" or a "n/a"
 # is a rubber stamp, and this repo has shipped enough of those.
@@ -139,10 +144,13 @@ def check_declaration(source: str, image: Any) -> dict[str, Any]:
         raise ProvenanceError(f"{source}: no `image:` mapping")
 
     repository = image.get("repository")
-    if not isinstance(repository, str) or not repository.startswith(REPOSITORY_PREFIX):
+    if not isinstance(repository, str) or not repository.startswith(
+        FIRST_PARTY_PREFIXES
+    ):
+        allowed = ", ".join(f"{p}*" for p in FIRST_PARTY_PREFIXES)
         raise ProvenanceError(
-            f"{source}: image.repository must be a first-party "
-            f"{REPOSITORY_PREFIX}* reference, got {repository!r}"
+            f"{source}: image.repository must be a first-party reference "
+            f"({allowed}), got {repository!r}"
         )
     digest = image.get("digest")
     if not isinstance(digest, str) or not DIGEST_RE.match(digest):

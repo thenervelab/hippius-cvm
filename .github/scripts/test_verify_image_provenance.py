@@ -19,7 +19,10 @@ One test per CLAIM the gate makes. The claims are:
   C11 only `refs/heads/main` and `refs/tags/v*` identities are declarable —
       a `refs/pull/<n>/merge` build (signed by the image workflows until
       hippius-audits#12) or any other branch is REFUSED, ack or not, and so
-      is the pre-rename repo name.
+      is the pre-rename repo name;
+  C12 the extractor finds refs under every first-party prefix (GHCR and the
+      public hub namespace), split and combined, and nothing under the
+      private hub namespace or a third-party registry.
 
 Run: `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`
 (also wired into the required `rust` CI job via
@@ -35,6 +38,8 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from gitops_image_refs import FIRST_PARTY_PREFIXES  # noqa: E402
+from gitops_image_refs import main as refs_main  # noqa: E402
 from verify_image_provenance import (  # noqa: E402
     MAIN_REF,
     OIDC_ISSUER,
@@ -128,6 +133,20 @@ class C2_DigestPinning(unittest.TestCase):
     def test_third_party_repository_refused(self):
         img = copy.deepcopy(MERGED)
         img["repository"] = "docker.io/library/alpine"
+        with self.assertRaisesRegex(ProvenanceError, "first-party"):
+            check_declaration("x", img)
+
+    def test_public_hub_namespace_accepted(self):
+        hub = "registry.hippius.com/hippius-infra/hippius-kbs-vault-broker"
+        img = copy.deepcopy(MERGED)
+        img["repository"] = hub
+        self.assertEqual(check_declaration("x", img)["ref"], f"{hub}@{DIGEST}")
+
+    def test_private_hub_namespace_refused(self):
+        """verify-gitops-signatures reads signatures with no hub credential,
+        so a private hub image could never pass it; refuse it here, by name."""
+        img = copy.deepcopy(MERGED)
+        img["repository"] = "registry.hippius.com/hip-team-private/hippius-runner-k8s"
         with self.assertRaisesRegex(ProvenanceError, "first-party"):
             check_declaration("x", img)
 
@@ -310,9 +329,6 @@ class C10_CoverageIsEveryFirstPartyGitopsImage(unittest.TestCase):
     """
 
     def test_no_first_party_gitops_digest_is_uncovered(self):
-        sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
-        from gitops_image_refs import main as refs_main  # noqa: E402
-
         import contextlib
         import io
 
@@ -332,6 +348,42 @@ class C10_CoverageIsEveryFirstPartyGitopsImage(unittest.TestCase):
         )
 
 
+class C12_ExtractorFindsEveryFirstPartyRegistry(unittest.TestCase):
+    """The extractor feeds both the signature gate and C10. An image under a
+    first-party prefix it does not know is dropped from both, silently: the
+    gate verifies one image fewer and still passes."""
+
+    def _extract(self, text: str) -> set[str]:
+        import contextlib
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "values.yaml").write_text(text)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                refs_main([tmp])
+        return {line for line in buf.getvalue().split() if line}
+
+    def test_split_and_combined_hub_refs_extracted(self):
+        hub = "registry.hippius.com/hippius-infra/hippius-kbs-vault-broker"
+        other = "registry.hippius.com/hippius-infra/hippius-epoch-closer"
+        refs = self._extract(
+            f"image:\n  repository: {hub}\n  digest: {DIGEST}\n"
+            f'cron:\n  image: "{other}:sha-1234@{DIGEST}"\n'
+        )
+        self.assertEqual(refs, {f"{hub}@{DIGEST}", f"{other}@{DIGEST}"})
+
+    def test_private_hub_and_third_party_refs_ignored(self):
+        refs = self._extract(
+            "image:\n"
+            "  repository: registry.hippius.com/hip-team-private/hippius-runner-k8s\n"
+            f"  digest: {DIGEST}\n"
+            f'relay: "docker.io/alpine/socat:1.8@{DIGEST}"\n'
+        )
+        self.assertEqual(refs, set())
+
+
 class C8_RealCharts(unittest.TestCase):
     def test_committed_trust_critical_charts_declare_provenance(self):
         declarations = load_declarations(REPO_ROOT)
@@ -340,7 +392,7 @@ class C8_RealCharts(unittest.TestCase):
         for rel, key in TRUST_CRITICAL_IMAGES:
             self.assertIn(f"{rel} [{key}]", by_source)
         for d in declarations:
-            self.assertTrue(d["ref"].startswith("ghcr.io/thenervelab/hippius-"))
+            self.assertTrue(d["ref"].startswith(FIRST_PARTY_PREFIXES), d["ref"])
             # Every declaration must produce a runnable, fully-constrained argv.
             argv = cosign_args(d)
             self.assertIn("--certificate-identity", argv)

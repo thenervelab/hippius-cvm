@@ -2,8 +2,8 @@
 #
 # Builds the `hippius-kbs-vault-broker` container image (the
 # SNP-attestation-bound Vault broker, §8 / #102) and pushes it to the
-# GitHub Container Registry. The broker runs as a `kata-qemu-snp`
-# confidential pod on the k3s cluster
+# public `hippius-infra` namespace on registry.hippius.com. The broker
+# runs as a `kata-qemu-snp` confidential pod on the k3s cluster
 # (deploy/gitops/apps/kbs-vault-broker/); the chart pins the image by
 # SHA-256 digest, so this workflow's job is to produce that digest
 # reproducibly.
@@ -50,17 +50,21 @@ on:
       - ".github/workflows/broker-image.yml"
   workflow_dispatch:
 
-# Minimal: read the repo, write packages (push to GHCR), and an OIDC
-# token for cosign keyless signing. Nothing else.
+# Minimal: read the repo and an OIDC token for cosign keyless signing.
+# Nothing else; the registry push uses HIPPIUS_REGISTRY_PUSH_KEY, not a
+# GitHub token.
 permissions:
   contents: read
-  packages: write
   id-token: write
 
 env:
-  IMAGE: ghcr.io/thenervelab/hippius-kbs-vault-broker
-  # Publish = push to GHCR + cosign-sign. ONLY a build of reviewed code may
-  # publish: a push to main, a `v*` tag, or a workflow_dispatch run ON main.
+  # PUBLIC namespace, on purpose: the kata-qemu-snp guest pulls the image
+  # itself through the CDH, and pull secrets do not reach that path (see
+  # `pullSecret` in deploy/gitops/apps/kbs-vault-broker/values.yaml).
+  IMAGE: registry.hippius.com/hippius-infra/hippius-kbs-vault-broker
+  # Publish = push to registry.hippius.com + cosign-sign. ONLY a build of
+  # reviewed code may publish: a push to main, a `v*` tag, or a
+  # workflow_dispatch run ON main.
   # A pull_request (or a dispatch from any other branch) builds and discards:
   # a pushed + keyless-signed image of unreviewed code would carry the same
   # workflow identity as a main build (hippius-audits#12).
@@ -74,6 +78,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -82,13 +88,22 @@ jobs:
           # pull limit 429s shared runners; same digest as Hub's buildx-stable-1).
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
-      - name: Log in to GHCR
+      - name: Log in to registry.hippius.com
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        # HIPPIUS_REGISTRY_PUSH_KEY is a full hub key, `hip_<id>:<secret>`,
+        # scoped on the hub to write hip-team-private and hippius-infra only.
+        # The registry takes any username with the whole key as the
+        # password. It goes through env and stdin, never into the script
+        # text: a `$` in a secret expanded inside a double-quoted `run:` line
+        # is rewritten by bash. buildx and cosign both read the credential
+        # this writes to the docker config.
+        env:
+          PUSH_KEY: ${{ secrets.HIPPIUS_REGISTRY_PUSH_KEY }}
+        run: |
+          set -euo pipefail
+          : "${PUSH_KEY:?the HIPPIUS_REGISTRY_PUSH_KEY repository secret is not set}"
+          printf '%s' "${PUSH_KEY}" \
+            | docker login registry.hippius.com --username ci --password-stdin
 
       - name: Install cosign (version pinned)
         if: env.PUBLISH == 'true'
@@ -131,6 +146,11 @@ jobs:
         # Keyless: the ambient GitHub OIDC token (`id-token: write`) → a
         # short-lived Fulcio cert → a Rekor transparency-log entry.
         # Signs the immutable digest, never a tag.
+        #
+        # The hub has no OCI referrers API (404), so cosign v3 falls back to
+        # the tag scheme (`sha256-<digest>` tag in the same repository) on
+        # its own. Verified against registry.hippius.com on 2026-11-22:
+        # `cosign sign` and `cosign verify` both pass with no extra flag.
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
@@ -142,7 +162,15 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          echo "### kbs-vault-broker image pushed" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${IMAGE}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### kbs-vault-broker image pushed"
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of registry.hippius.com
+        # The build pool may be self-hosted: do not leave the write key in
+        # the runner's docker config after the job.
+        if: always() && env.PUBLISH == 'true'
+        run: docker logout registry.hippius.com

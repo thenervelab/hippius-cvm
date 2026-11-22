@@ -44,7 +44,8 @@ spec:
   egress:
     # Public DNS — `dnsPolicy: None` points the pod at public
     # resolvers (a kata SEV-SNP guest cannot reach the CoreDNS
-    # ClusterIP, PR-K5). Used by guest-pull for `ghcr.io`.
+    # ClusterIP, PR-K5). Used by guest-pull for `registry.hippius.com`
+    # and `s3.hippius.com`.
     - toEntities:
         - world
       toPorts:
@@ -54,8 +55,8 @@ spec:
             - port: "53"
               protocol: TCP
     # HTTPS to the public internet — the kata-qemu-snp GUEST-PULL of
-    # the PUBLIC broker image from ghcr.io + GitHub's blob CDN at
-    # pod-create time. The binary itself makes no outbound 443.
+    # the PUBLIC broker image from registry.hippius.com, whose blob GETs
+    # redirect to s3.hippius.com, at pod-create time. The binary itself makes no outbound 443.
     - toEntities:
         - world
       toPorts:
