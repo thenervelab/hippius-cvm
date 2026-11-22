@@ -1,14 +1,11 @@
 # `hippius-runner-k8s` — self-hosted GitHub Actions runner image
 
-Image: `ghcr.io/thenervelab/hippius-runner-k8s` (canonical build target,
-cosign-signed) mirrored to `registry.hippius.com/hip-team-private/hippius-runner-k8s`
-(what the k8s cluster pulls — GHCR packages default to private and the
-arc-runners pull secret is for `registry.hippius.com`). Built by
+Image: `registry.hippius.com/hip-team-private/hippius-runner-k8s`
+(private namespace, cosign-signed; the arc-runners pull secret is for
+`registry.hippius.com`). Built, pushed and signed by
 `.github/workflows/runner-image.yml` on every push to `main` that
-touches `runner/` or the workspace's `rust-toolchain.toml`. The mirror
-to `registry.hippius.com` is currently a manual step (`docker pull` +
-`docker tag` + `docker push`) — to be automated when the image-build
-workflows migrate off `ubuntu-latest`.
+touches `runner/` or the workspace's `rust-toolchain.toml`. The workflow
+logs in with the `HIPPIUS_REGISTRY_PUSH_KEY` repository secret.
 
 Used by the `mon-runner-k8s` AutoscalingRunnerSet in the operator's k8s
 cluster (`arc-runners` namespace). Live values: `runner/values.yaml`.
@@ -46,9 +43,8 @@ helm upgrade --install mon-runner-k8s \
 
 The values file pins the image by digest (NOT by `sha-<commit>` tag)
 so a registry retag cannot silently swap the runner the workflows
-execute on. To roll a new image: rebuild via `runner-image.yml`,
-mirror to `registry.hippius.com`, then edit the digest in
-`runner/values.yaml` and re-apply.
+execute on. To roll a new image: rebuild via `runner-image.yml`, then
+edit the digest in `runner/values.yaml` and re-apply.
 
 For workflows that need a docker daemon (`kbs-image`, `vali-image`,
 `edge-image`, `ovmf-build`, `*-uki-build`): enable ARC's
@@ -71,10 +67,12 @@ automatically. Those workflows currently still run on `ubuntu-latest`
 - Rust toolchain pinned by `rust-toolchain.toml`.
 - The pushed image is cosign-signed (keyless, GitHub OIDC →
   Sigstore Rekor entry) by `runner-image.yml`. Operators MAY verify
-  before deploy:
+  before deploy. The namespace is private, so cosign needs a read
+  credential for `registry.hippius.com` in the docker config first
+  (`docker login registry.hippius.com`):
 
   ```sh
-  cosign verify ghcr.io/thenervelab/hippius-runner-k8s@<digest> \
+  cosign verify registry.hippius.com/hip-team-private/hippius-runner-k8s@<digest> \
     --certificate-identity-regexp='^https://github\.com/thenervelab/hippius-compute-internal/\.github/workflows/runner-image\.yml@refs/(heads/main|tags/v[^/]+)$' \
     --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
   ```
